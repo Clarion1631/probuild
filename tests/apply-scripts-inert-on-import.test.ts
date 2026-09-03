@@ -12,15 +12,19 @@
  *  1. Source (TypeScript AST, evaluated synchronously at load and asserted
  *     BEFORE any child process is spawned). This is an ALLOWLIST, not a list of
  *     dangerous spellings: at module scope a script may contain only
- *       - `import` declarations with bindings from non-relative modules
- *         (no side-effect-only `import "./x.mjs"`),
+ *       - `import` declarations with bindings, from an exact allowlist of
+ *         modules (no side-effect-only or relative imports, no `dotenv/config`,
+ *         no `data:` URLs),
  *       - function declarations (their bodies never run on import),
  *       - `const` / `let` / `var` declarations whose initialisers are inert
  *         (literals, arrays, objects, arrows/function expressions that are not
  *         invoked, and calls only to a few pure path helpers bound by import),
  *       - `export { ... }` lists without a `from` (a re-export loads a module),
  *       - exactly one guard: `const isMainModule = <exact expression>;` then
- *         `if (isMainModule) { ... }` with no `else`.
+ *         `if (isMainModule) { ... }` with no `else`, whose block may hold
+ *         preflight statements that never mention `main` and must END with
+ *         exactly one unconditional `await main();` or
+ *         `main().catch(...)[.finally(...)]` chain.
  *     Anything else at module scope (an expression statement, `try`, a loop, a
  *     class, an IIFE, `await`, `new`, a call to anything not on the tiny
  *     allowlist, any reference to `main` outside the guard) is a violation.
@@ -76,7 +80,9 @@ const ALLOWED_CALLEES: Record<string, string[]> = {
     join: ["node:path", "path"],
     resolve: ["node:path", "path"],
 };
-const ALLOWED_GLOBAL_CALLEES = new Set(["process.argv.includes", "process.argv.indexOf", "Object.freeze"]);
+const ALLOWED_GLOBAL_CALLEES = new Set(["process.argv.includes", "process.argv.indexOf"]);
+/** The only modules an apply script may import. Anything else (a `data:` URL, `dotenv/config`, a driver) runs code on import. */
+const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto"]);
 /** Names a script may never declare itself (they would let a guard or helper be spoofed). */
 const RESERVED_NAMES = new Set(["process", "import", "pathToFileURL", "fileURLToPath", "dirname", "join", "resolve", "isMainModule"]);
 
@@ -103,7 +109,7 @@ function analyse(name: string, text: string): SourceReport {
         if (ts.isImportDeclaration(st)) {
             const spec = ts.isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : "";
             if (!st.importClause) bad(st, `side-effect-only import "${spec}" at module scope`);
-            if (spec.startsWith(".") || spec.startsWith("/") || spec.startsWith("file:")) bad(st, `relative import "${spec}" at module scope (could carry side effects)`);
+            if (!ALLOWED_IMPORTS.has(spec)) bad(st, `import from "${spec}" is not on the allowlist (${[...ALLOWED_IMPORTS].join(", ")})`);
             const clause = st.importClause;
             if (clause?.name) importBindings.set(clause.name.text, spec);
             if (clause?.namedBindings) {
@@ -133,6 +139,9 @@ function analyse(name: string, text: string): SourceReport {
     function checkInert(node: ts.Node): void {
         if (ts.isAwaitExpression(node)) return bad(node, "top-level await");
         if (ts.isNewExpression(node)) return bad(node, `new ${node.expression.getText(sf)}(...) at module scope`);
+        if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) return bad(node, "assignment at module scope");
+        if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) return bad(node, "update expression at module scope");
+        if (ts.isDeleteExpression(node) || ts.isYieldExpression(node)) return bad(node, "effectful operator at module scope");
         if (ts.isTaggedTemplateExpression(node)) return bad(node, "tagged template at module scope is a call");
         if (ts.isClassExpression(node)) return bad(node, "class expression at module scope");
         if (ts.isIdentifier(node) && node.text === "main") return bad(node, "reference to `main` outside the main-module guard");
@@ -149,15 +158,45 @@ function analyse(name: string, text: string): SourceReport {
         ts.forEachChild(node, checkInert);
     }
 
-    /** Inside the guard branch or any function body: only account for main() calls and nested guards. */
-    function scanExecutable(node: ts.Node, inGuard: boolean): void {
-        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "main") {
-            if (inGuard) report.mainCallsInGuard += 1;
-            else bad(node, "main() called outside the main-module guard");
-        } else if (ts.isIdentifier(node) && node.text === "main" && !inGuard && !(ts.isFunctionDeclaration(node.parent) && node.parent.name === node)) {
+    const mentionsMain = (n: ts.Node): boolean =>
+        (ts.isIdentifier(n) && n.text === "main") || ts.forEachChild(n, mentionsMain) === true;
+    const isBareMainCall = (n: ts.Node): boolean =>
+        ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "main" && n.arguments.length === 0;
+
+    /** Any function body outside the guard: `main` may not be referenced at all. */
+    function scanExecutable(node: ts.Node): void {
+        if (ts.isIdentifier(node) && node.text === "main" && !(ts.isFunctionDeclaration(node.parent) && node.parent.name === node)) {
             bad(node, "reference to `main` outside the main-module guard");
         }
-        ts.forEachChild(node, (child) => scanExecutable(child, inGuard && !ts.isFunctionLike(child)));
+        ts.forEachChild(node, scanExecutable);
+    }
+
+    /**
+     * The guard body may hold preflight statements (flag checks, `prisma = new PrismaClient(...)`)
+     * that never mention `main`, and must END with exactly one unconditional entry:
+     * `await main();` or a `main().catch(...)[.finally(...)]` chain whose handlers do not mention `main`.
+     */
+    function checkGuardBody(body: ts.Statement): void {
+        if (!ts.isBlock(body)) return bad(body, "the main-module guard body must be a `{ ... }` block");
+        const stmts = body.statements;
+        if (stmts.length === 0) return bad(body, "the main-module guard body is empty — main() never runs");
+        const last = stmts[stmts.length - 1];
+        for (const st of stmts.slice(0, -1)) if (mentionsMain(st)) bad(st, "`main` may only appear in the guard's final statement");
+        if (!ts.isExpressionStatement(last)) return bad(last, "the guard's final statement must be `await main();` or a `main().catch(...)` chain");
+        const expr = last.expression;
+        if (ts.isAwaitExpression(expr)) {
+            if (!isBareMainCall(expr.expression)) return bad(last, "the guard's final statement must be exactly `await main();`");
+            report.mainCallsInGuard = 1;
+            return;
+        }
+        let cur: ts.Expression = expr;
+        const chainMethods = new Set(["catch", "finally", "then"]);
+        while (ts.isCallExpression(cur) && ts.isPropertyAccessExpression(cur.expression) && chainMethods.has(cur.expression.name.text)) {
+            for (const arg of cur.arguments) if (mentionsMain(arg)) bad(arg, "a chain handler may not reference `main`");
+            cur = cur.expression.expression;
+        }
+        if (!isBareMainCall(cur)) return bad(last, "the guard's final statement must be `await main();` or a `main().catch(...)[.finally(...)]` chain");
+        report.mainCallsInGuard = 1;
     }
 
     // Pass 2: every module-level statement must be one of the allowed kinds.
@@ -169,7 +208,7 @@ function analyse(name: string, text: string): SourceReport {
             continue;
         }
         if (ts.isFunctionDeclaration(st)) {
-            if (st.body) scanExecutable(st.body, false);
+            if (st.body) scanExecutable(st.body);
             continue;
         }
         if (ts.isVariableStatement(st)) {
@@ -183,7 +222,7 @@ function analyse(name: string, text: string): SourceReport {
                 }
                 if (d.initializer) {
                     checkInert(d.initializer);
-                    if (isFunctionLike(d.initializer)) scanExecutable(d.initializer, false);
+                    if (isFunctionLike(d.initializer)) scanExecutable(d.initializer);
                 }
             }
             continue;
@@ -191,7 +230,7 @@ function analyse(name: string, text: string): SourceReport {
         if (ts.isIfStatement(st) && ts.isIdentifier(st.expression) && st.expression.text === "isMainModule") {
             report.guardIfs += 1;
             if (st.elseStatement) bad(st, "the main-module guard must not have an else branch");
-            scanExecutable(st.thenStatement, true);
+            checkGuardBody(st.thenStatement);
             continue;
         }
         bad(st, `statement of kind ${ts.SyntaxKind[st.kind]} is not allowed at module scope`);
@@ -323,6 +362,56 @@ async function main() {}
 export default main();
 ${GUARD_LINE}
 if (isMainModule) { await main(); }`,
+        dotenvConfigImport: `${URL_IMPORT} import loaded from "dotenv/config";
+async function main() {}
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        dataUrlImport: `${URL_IMPORT} import x from "data:text/javascript,globalThis.pwned=1";
+async function main() {}
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        unlistedImport: `${URL_IMPORT} import pg from "pg";
+async function main() {}
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        objectFreezeSpoof: `${URL_IMPORT}
+async function main() {}
+const Object = { freeze: () => main() };
+const started = Object.freeze();
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        assignmentInInitialiser: `${URL_IMPORT}
+async function main() {}
+let hook;
+const y = (hook = main);
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        updateExpression: `${URL_IMPORT}
+async function main() {}
+let n = 0;
+const m = n++;
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        guardConditional: `${URL_IMPORT}
+async function main() {}
+${GUARD_LINE}
+if (isMainModule) { if (false) await main(); }`,
+        guardTwice: `${URL_IMPORT}
+async function main() {}
+${GUARD_LINE}
+if (isMainModule) { await main(); await main(); }`,
+        guardMainNotLast: `${URL_IMPORT}
+async function main() {}
+${GUARD_LINE}
+if (isMainModule) { await main(); console.log("done"); }`,
+        guardMainWithArgs: `${URL_IMPORT}
+async function main() {}
+${GUARD_LINE}
+if (isMainModule) { await main(process.argv); }`,
+        guardThenMain: `${URL_IMPORT}
+async function main() {}
+${GUARD_LINE}
+if (isMainModule) { Promise.resolve().then(main); }`,
         helperInvoked: `${URL_IMPORT}
 async function main() {}
 function run() { return main(); }
@@ -352,9 +441,14 @@ if (isMainModule) { url = process.env.DATABASE_URL; prisma = new PrismaClient({ 
     assert.deepEqual(problemsOf(analyse("goodChain", goodChain)), [], "source check rejected the catch/finally chain shape");
     const goodLegacy = `import { PrismaClient } from "@prisma/client"; import { fileURLToPath } from "node:url";
 const withIndexes = process.argv.includes("--with-indexes");
+let prisma;
 async function main() {}
 const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
-if (isMainModule) { main().catch(error => { console.error(error); process.exitCode = 1; }); }`;
+if (isMainModule) {
+    if (!process.argv.includes("--yes")) { console.error("Refusing to run without --yes"); process.exit(1); }
+    prisma = new PrismaClient();
+    main().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => prisma.$disconnect());
+}`;
     assert.deepEqual(problemsOf(analyse("goodLegacy", goodLegacy)), [], "source check rejected the legacy guard shape");
 });
 
