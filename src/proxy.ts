@@ -70,13 +70,22 @@ const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?
  * others, now gated; see tests/server-action-gates.test.ts). An action id is
  * not an authorization token: it is a public build artefact.
  *
- * So a dispatch through these trees now requires the tree's own session
- * cookie. That is PRESENCE, not validity — the proxy runs on the edge and
- * cannot verify a JWT without the signing secret, and it is not the
- * authorization boundary: every action still authorizes itself (the portal
- * ones through `resolveSessionClientId` / `getSubPortalSession`, which DO
- * verify). What this closes is the anonymous vector: no cookie, no dispatch,
- * anywhere in the bypass.
+ * So a dispatch through these trees now requires SESSION EVIDENCE. That is
+ * PRESENCE, not validity — the proxy runs on the edge and cannot verify a JWT
+ * without the signing secret, and it is not the authorization boundary:
+ * every action still authorizes itself (the portal ones through
+ * `resolveSessionClientId` / `getSubPortalSession`, which DO verify). What
+ * this closes is the anonymous vector: no session evidence at all, no
+ * dispatch, anywhere in the bypass.
+ *
+ * EITHER the tree's own token cookie OR a NextAuth session cookie counts,
+ * because `resolveSessionClientId` accepts both: path 1 is a NextAuth
+ * session (a client who signs in with Google, or staff previewing the
+ * portal) and path 2 is the `client_portal_token` magic-link cookie. An
+ * earlier version of this check demanded the magic-link cookie alone, which
+ * refused every Google-authenticated client — it broke estimate signing on
+ * the portal, which is a client-facing money path. A stale or disabled staff
+ * cookie is already rejected above, before this runs.
  */
 const ANONYMOUS_ACTION_COOKIE: ReadonlyArray<{ pattern: RegExp; cookie: string }> = [
     { pattern: /^\/portal(?:\/|$)/, cookie: "client_portal_token" },
@@ -135,6 +144,29 @@ export function isPublicProxyBypass(pathname: string) {
 /** True when the route handler at `pathname` verifies mobile Bearer tokens itself. */
 export function isMobileAuthenticatedRoute(pathname: string) {
     return MOBILE_AUTHENTICATED_ROUTE_PATTERNS.some((pattern) => pattern.test(pathname));
+}
+
+/**
+ * May this bypassed path dispatch a Server Action at all?
+ *
+ * Exported so it can be tested directly: reaching this branch through the
+ * whole proxy requires a real signed NextAuth JWT (the stale-staff-cookie check
+ * above decodes one), which a unit test cannot mint, so a test driven only
+ * through the front door could never exercise the NextAuth arm of this rule.
+ * The rule itself is the part worth pinning.
+ *
+ * EITHER the tree's own token cookie OR a NextAuth session cookie counts,
+ * because `resolveSessionClientId` accepts both: path 1 is a NextAuth session
+ * (a client who signs in with Google, or staff previewing the portal) and path
+ * 2 is the `client_portal_token` magic-link cookie. An earlier version demanded
+ * the magic-link cookie alone, which refused every Google-authenticated client
+ * and broke estimate SIGNING on the portal — a client-facing money path.
+ */
+export function mayDispatchAction(req: any, pathname: string): boolean {
+    const tree = ANONYMOUS_ACTION_COOKIE.find((t) => t.pattern.test(pathname));
+    if (!tree) return false;
+    if (req?.cookies?.get?.(tree.cookie)?.value) return true;
+    return hasNextAuthSessionCookie(req);
 }
 
 function hasNextAuthSessionCookie(req: any) {
@@ -217,9 +249,7 @@ export default async function proxy(req: any, event: any) {
         // Which tree is this, and does the caller hold its session cookie? A
         // path that is not one of the two client-facing trees can never
         // dispatch; one that is still needs the cookie.
-        const tree = ANONYMOUS_ACTION_COOKIE.find((t) => t.pattern.test(pathname));
-        const hasCookie = !!tree && !!req.cookies?.get?.(tree.cookie)?.value;
-        if (!tree || !hasCookie) {
+        if (!mayDispatchAction(req, pathname)) {
             return new NextResponse("Forbidden", { status: 403 });
         }
     }

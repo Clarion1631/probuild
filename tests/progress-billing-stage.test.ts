@@ -55,6 +55,32 @@ function draftRow(overrides: Row = {}): Row {
 }
 
 /** In-memory ProgressBilling delegate: real WHERE matching, real count semantics. */
+/**
+ * Prisma WHERE semantics, as far as this stage actually uses them.
+ *
+ * Round 50 added a compensation CLAIM whose predicate uses `OR` and `in`. A
+ * fake comparing only strict equality would fail every claim, and these tests
+ * would then pass against a stage that compensated nothing at all — so the
+ * matcher is shared by both `updateMany` and `count` rather than written twice.
+ */
+function matchWhere(row: any, where: any): boolean {
+    const matchOne = (rowValue: any, cond: any): boolean => {
+        if (cond !== null && typeof cond === "object") {
+            if ("in" in cond) return (cond as any).in.includes(rowValue);
+            if ("not" in cond) return rowValue !== (cond as any).not;
+            if ("startsWith" in cond) {
+                return typeof rowValue === "string" && rowValue.startsWith((cond as any).startsWith);
+            }
+            throw new Error(`unsupported condition: ${JSON.stringify(cond)}`);
+        }
+        return rowValue === cond;
+    };
+    return Object.entries(where ?? {}).every(([k, v]) =>
+        k === "OR"
+            ? (v as any[]).some((clause) => matchWhere(row, clause))
+            : matchOne(row[k], v));
+}
+
 function makeDb(row: Row, opts?: { failUpdateNo?: number; loseClaimNo?: number }) {
     let updates = 0;
     const seen: any[] = [];
@@ -65,12 +91,21 @@ function makeDb(row: Row, opts?: { failUpdateNo?: number; loseClaimNo?: number }
             async findUnique(_args: any) {
                 return { ...row };
             },
+            async count(args: any) {
+                // Round 50: compensation asks whether the row still points at the
+                // invoice it created (to tell a settled row from one that simply
+                // moved on) and whether its claim is still held. Shares the matcher
+                // with updateMany — a count that understood fewer operators than the
+                // write would answer 0 for predicates the write matches, and the
+                // claim would refuse itself.
+                return matchWhere(row, args?.where) ? 1 : 0;
+            },
             async updateMany(args: any) {
                 updates++;
                 if (opts?.failUpdateNo === updates) throw new Error("database unavailable");
                 seen.push(args);
                 if (opts?.loseClaimNo === updates) return { count: 0 };
-                const matches = Object.entries(args.where).every(([k, v]) => row[k] === v);
+                const matches = matchWhere(row, args.where);
                 if (!matches) return { count: 0 };
                 Object.assign(row, args.data);
                 return { count: 1 };

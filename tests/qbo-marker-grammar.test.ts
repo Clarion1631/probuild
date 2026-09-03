@@ -288,3 +288,137 @@ test("round 49: the CI driver builds a pre-marker database and proves idempotenc
     assert.match(src, /information_schema\.columns/, "and the resulting shape is asserted");
     assert.match(src, /REFUSING: APPLY_E2E_SERVER_URL looks like production/);
 });
+
+/**
+ * The production guard, as a decision rather than as source text.
+ *
+ * Codex round 50, finding 1. Every check below was already written and looked
+ * right; one of them was inverted in effect. `new URL(url).host` INCLUDES the
+ * port, and production is `aws-0-us-west-2.pooler.supabase.com:6543`, so the
+ * `$`-anchored `/pooler\.supabase\.com$/` never matched and the guard refused
+ * the ONE database it exists to let through. The pre-deploy DDL — the thing
+ * that has to run before the build that selects the column goes live — could
+ * not be run at all. `--target ci` skips this branch, so CI stayed green, and
+ * no test could reach the logic because it lived inside `main()`.
+ *
+ * So the guard is now a pure exported function, and the first test here is the
+ * one that was missing: the REAL production URL, in full, must be ACCEPTED.
+ * A guard is only half-tested when every case asserted is a rejection.
+ */
+const PROD_REF = "ghzdbzdnwjxazvmcefbh";
+const PROD_URL = `postgresql://postgres.${PROD_REF}:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`;
+
+test("round 50: the REAL production URL is ACCEPTED by the production guard", async () => {
+    const { productionGuardProblems } = await import("../scripts/apply-qb-sync-marker.mjs" as string);
+    // Exactly what `vercel env pull` writes into .env.production.local, with the
+    // transaction-pooler port and the pgbouncer flag CLAUDE.md requires.
+    const problems = productionGuardProblems({
+        url: PROD_URL,
+        database: "postgres",
+        baselineFound: true,
+        expectedRef: PROD_REF,
+    });
+    assert.deepEqual(problems, [], `production must be recognised as production, got: ${problems.join("; ")}`);
+});
+
+test("round 50: a host that is not the Supabase pooler is refused", async () => {
+    const { productionGuardProblems } = await import("../scripts/apply-qb-sync-marker.mjs" as string);
+    const problems = productionGuardProblems({
+        url: `postgresql://postgres.${PROD_REF}:pw@127.0.0.1:5432/postgres`,
+        database: "postgres",
+        baselineFound: true,
+        expectedRef: PROD_REF,
+    });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /is not the Supabase pooler/);
+    // And the port must not leak into the compared value — that was the bug.
+    assert.ok(!problems[0].includes(":5432"), `the guard compares hostname only: ${problems[0]}`);
+});
+
+test("round 50: the IPv6-only direct host is refused too", async () => {
+    const { productionGuardProblems } = await import("../scripts/apply-qb-sync-marker.mjs" as string);
+    // db.<ref>.supabase.co:5432 is DIRECT_URL. It is the right project and the
+    // right database, and this machine cannot reach it at all (AAAA record
+    // only, per CLAUDE.md "Schema migrations"). Loosening the pooler check to
+    // any `supabase` host would let it through and hang the deploy.
+    const problems = productionGuardProblems({
+        url: `postgresql://postgres.${PROD_REF}:pw@db.${PROD_REF}.supabase.co:5432/postgres`,
+        database: "postgres",
+        baselineFound: true,
+        expectedRef: PROD_REF,
+    });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /is not the Supabase pooler/);
+});
+
+test("round 50: the project ref must be present AND match", async () => {
+    const { productionGuardProblems } = await import("../scripts/apply-qb-sync-marker.mjs" as string);
+    // The pooler hostname is shared by every project in the region and
+    // current_database() is `postgres` on all of them, so the ref in the
+    // username is the ONLY thing in the URL saying which project this is.
+    const mismatched = productionGuardProblems({
+        url: `postgresql://postgres.someotherproject:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres`,
+        database: "postgres",
+        baselineFound: true,
+        expectedRef: PROD_REF,
+    });
+    assert.equal(mismatched.length, 1);
+    assert.match(mismatched[0], /project ref is "someotherproject", not the expected "ghzdbzdnwjxazvmcefbh"/);
+
+    // Unset is a REFUSAL, not a skip: an unset variable is the default state of
+    // any shell, so treating it as "no expectation" would make the check opt-in.
+    const unset = productionGuardProblems({
+        url: PROD_URL,
+        database: "postgres",
+        baselineFound: true,
+        expectedRef: undefined,
+    });
+    assert.equal(unset.length, 1);
+    assert.match(unset[0], /APPLY_EXPECT_PROJECT_REF is not set/);
+});
+
+test("round 50: a database that is not `postgres` is refused", async () => {
+    const { productionGuardProblems } = await import("../scripts/apply-qb-sync-marker.mjs" as string);
+    const problems = productionGuardProblems({
+        url: PROD_URL,
+        database: "probuild_shadow",
+        baselineFound: true,
+        expectedRef: PROD_REF,
+    });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /current_database\(\) is "probuild_shadow", not "postgres"/);
+});
+
+test("round 50: a database without the production baseline migration is refused", async () => {
+    const { productionGuardProblems } = await import("../scripts/apply-qb-sync-marker.mjs" as string);
+    // A branch database or a fresh restore has no 20260814000000_baseline_production
+    // row; production does, because it was marked applied there deliberately.
+    const problems = productionGuardProblems({
+        url: PROD_URL,
+        database: "postgres",
+        baselineFound: false,
+        expectedRef: PROD_REF,
+    });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /20260814000000_baseline_production is not recorded/);
+});
+
+test("round 50: the guard is a pure function main() calls, not inline logic", async () => {
+    // The reason the bug shipped: the decision lived inside main(), which no
+    // test executes. If it moves back inline, this fails.
+    const src = readFileSync("scripts/apply-qb-sync-marker.mjs", "utf8");
+    assert.match(src, /export function productionGuardProblems\(/);
+    assert.match(src, /const problems = productionGuardProblems\(\{/, "main() must delegate to it");
+    // Below main(), so nothing executable moves above the main() declaration
+    // (tests/apply-scripts-inert-on-import.test.ts reads that positionally).
+    assert.ok(
+        src.indexOf("export function productionGuardProblems(") > src.indexOf("async function main()"),
+        "the guard must be declared below main()",
+    );
+    // hostname for the COMPARISON, host for what a human is shown.
+    assert.match(src, /new URL\(url\)\.hostname/, "the pooler check must compare hostname, without the port");
+    assert.ok(
+        !/const host = \(\(\) => \{ try \{ return new URL\(url\)\.host;/.test(src),
+        "the old port-carrying `host` must not be what the guard compares",
+    );
+});

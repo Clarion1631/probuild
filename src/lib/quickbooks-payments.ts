@@ -68,6 +68,7 @@ import {
     PENDING_DELETION_MARKER,
     PENDING_DELETION_SETTLED_MARKER,
     deletionClaimMarker,
+    compensationClaimMarker,
     PENDING_DELETION_CLAIMED_PREFIX,
 } from "./qbo-create-markers";
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
@@ -384,6 +385,24 @@ export function milestonePrivateNote(invoiceCode: string, scheduleName: string, 
 /** The one write the compensation step needs; either rail's delegate satisfies it. */
 export interface CompensatableDelegate {
     updateMany(args: any): Promise<{ count: number }>;
+    count?(args: any): Promise<number>;
+}
+
+/**
+ * What a compensation must still be true of before it deletes anything.
+ *
+ * The caller names the parent invoice (so the claim can take the same money
+ * locks a settle takes) and the columns that say THIS ROW HAS NOT SETTLED.
+ * They differ per rail: a milestone is `status: Pending` with a null
+ * `qbPaymentId`; a progress billing must not have reached Paid.
+ */
+export interface CompensationClaim {
+    /** The parent invoice, for `lockMoneyParents`. */
+    invoiceId: string | null;
+    /** Extra WHERE the claim AND the clear must both satisfy. */
+    unsettled: Record<string, unknown>;
+    /** Runs the claim in a transaction. Injectable so tests drive the real rule. */
+    transaction?: <T>(fn: (tx: any) => Promise<T>) => Promise<T>;
 }
 
 /**
@@ -423,18 +442,117 @@ export async function compensateAndUnlink(
     extraClearData: Record<string, unknown> = {},
     /** The in-flight marker this caller wrote before the create, if any. */
     ownedInFlightMarker?: string,
-): Promise<{ deleted: boolean; unlinked: boolean; alreadyAbsent?: boolean }> {
+    /**
+     * What must still be true for this compensation to be allowed to delete.
+     * Optional only so the seam stays testable; every production caller
+     * supplies it, and `tests/qbo-compensation-claim.test.ts` pins that.
+     */
+    claim?: CompensationClaim,
+): Promise<{ deleted: boolean; unlinked: boolean; alreadyAbsent?: boolean; refused?: boolean }> {
+    // CLAIM BEFORE THE IRREVERSIBLE CALL.
+    //
+    // Round 50 (P0): this used to delete first and then clear pinned only to
+    // `{ id, qbInvoiceId }`. A settlement committing after the finalize
+    // released its locks, but before that clear, meant the QuickBooks invoice
+    // of a milestone that had just been PAID was deleted — and the paid row
+    // was cleared anyway (a progress billing was additionally reset to Draft).
+    //
+    // The claim runs in its own short transaction under the same money locks a
+    // settle takes, pinned to the row's link, the marker this caller owns and
+    // the caller's own `unsettled` columns. A settle that got there first
+    // makes it fail, and then nothing is deleted at all.
+    let claimMarker: string | null = null;
+    if (claim) {
+        const marker = compensationClaimMarker(randomUUID().slice(0, 8));
+        const runTx = claim.transaction
+            ?? (<T,>(fn: (tx: any) => Promise<T>) => (prisma as any).$transaction(fn));
+        const won = await withTxRetry(() => runTx(async (tx: any) => {
+            // The lock is taken when there is a real transaction to take it in.
+            // An injected in-memory table has no `$queryRaw` and no locks at all
+            // — the same shape `finalizeProgressBillingLinkWithDb` already uses for
+            // its twin: the CAS below is the part those tests exercise, and the
+            // DB-gated tests are what prove the locking.
+            if (claim.invoiceId && typeof tx?.$queryRaw === "function") {
+                await lockMoneyParents(tx, { invoiceId: claim.invoiceId });
+            }
+            // Either shape the row can legitimately be in: already carrying our
+            // provisional link, or still unlinked and holding only our marker.
+            const claimed = await delegate.updateMany({
+                where: {
+                    id: rowId,
+                    ...claim.unsettled,
+                    ...(ownedInFlightMarker
+                        ? { OR: [{ qbInvoiceId }, { qbInvoiceId: null, qbSyncError: ownedInFlightMarker }] }
+                        : { qbInvoiceId }),
+                },
+                data: { qbSyncError: marker },
+            });
+            return claimed.count === 1;
+        })).catch(() => false);
+        if (!won) {
+            // The claim lost. TWO very different situations look identical here,
+            // and telling them apart is the whole job:
+            //
+            //   • the row still POINTS AT our invoice and could not be claimed
+            //     — it settled. Deleting would destroy the invoice behind a
+            //     payment, which is the P0 this claim exists for. Refuse.
+            //
+            //   • the row has MOVED ON — another owner took the marker, or it was
+            //     re-staged onto a different invoice. Ours is then an orphan that
+            //     nothing references and nothing ever will, and leaving it in
+            //     QuickBooks is the very litter compensation exists to sweep up.
+            //     Delete it, and touch no local row.
+            const stillOurs = delegate.count
+                ? await delegate.count({ where: { id: rowId, qbInvoiceId } }).catch(() => 1)
+                : 1;
+            if (stillOurs > 0) {
+                return { deleted: false, unlinked: false, refused: true };
+            }
+            try {
+                const result = await deleteInvoice();
+                // Deleted, but deliberately NOT unlinked: the row points somewhere
+                // else now, and this compensation has no business writing to it.
+                return { deleted: true, unlinked: false, alreadyAbsent: result === false };
+            } catch {
+                return { deleted: false, unlinked: false };
+            }
+        }
+        claimMarker = marker;
+        // Last look before the irreversible call: a settle racing us cancels the
+        // claim, and cancelling is the only thing that can.
+        if (delegate.count) {
+            const held = await delegate.count({
+                where: { id: rowId, qbSyncError: marker, ...claim.unsettled },
+            }).catch(() => 0);
+            if (held !== 1) return { deleted: false, unlinked: false, refused: true };
+        }
+    }
     let alreadyAbsent = false;
     try {
         const result = await deleteInvoice();
         alreadyAbsent = result === false;
     } catch {
         // Thrown: the delete's outcome is genuinely unknown — the remote
-        // invoice may still exist. Do not touch the row.
+        // invoice may still exist. Do not touch the row, but give the claim
+        // back so the row is not left in a state only this path understands.
+        if (claimMarker) {
+            await delegate.updateMany({
+                where: { id: rowId, qbSyncError: claimMarker },
+                data: { qbSyncError: ownedInFlightMarker ?? null },
+            }).catch(() => ({ count: 0 }));
+        }
         return { deleted: false, unlinked: false };
     }
     const cleared = await delegate.updateMany({
-        where: { id: rowId, qbInvoiceId },
+        // The COMPLETE claimed state, not just the link: the claim token proves
+        // no settle cancelled it, and the caller's `unsettled` columns prove the
+        // row is still the unsettled row this compensation was decided for.
+        where: {
+            id: rowId,
+            qbInvoiceId,
+            ...(claimMarker ? { qbSyncError: claimMarker } : {}),
+            ...(claim?.unsettled ?? {}),
+        },
         data: {
             qbInvoiceId: null,
             qbInvoiceLink: null,
@@ -450,7 +568,13 @@ export async function compensateAndUnlink(
     // The row never got as far as carrying qbInvoiceId — clear by the marker we
     // own instead, so a confirmed delete still releases the claim.
     const clearedByMarker = await delegate.updateMany({
-        where: { id: rowId, qbInvoiceId: null, qbSyncError: ownedInFlightMarker },
+        where: {
+            id: rowId,
+            qbInvoiceId: null,
+            // The claim if we took one, else the marker we own.
+            qbSyncError: claimMarker ?? ownedInFlightMarker,
+            ...(claim?.unsettled ?? {}),
+        },
         data: {
             qbInvoiceLink: null,
             qbSyncedAt: null,
@@ -2169,6 +2293,12 @@ export async function pushMilestoneToQuickBooks(
             () => deleteQBInvoice(tokens, qbId, cleanupDeadline),
             {},
             inFlightMarker,
+            {
+                invoiceId: schedule.invoiceId,
+                // NOT SETTLED, in the two columns that say so. A settle sets both,
+                // so a compensation racing one loses its claim and deletes nothing.
+                unsettled: { status: "Pending", qbPaymentId: null },
+            },
         );
         if (compensated && claimedLink.count === 1 && !unlinked) {
             // The invoice is gone but the row still points at it. Say so rather

@@ -1272,6 +1272,17 @@ export async function stageProgressBillingToQuickBooksCore(
             () => qbo.deleteInvoice(tokens, qbId, cleanupDeadline),
             { status: "Draft" },
             inFlightMarker,
+            {
+                // An injected table (tests) runs the claim inline; the real client
+                // gets a real transaction, and with it the money locks.
+                transaction: deps?.db ? (async (fn: any) => fn(deps.db)) : undefined,
+                invoiceId: billing.invoiceId,
+                // A billing that has been PAID or VOIDED is not one this stage may
+                // reset to Draft and strip the link from — round 50: the clear used
+                // to pin only the link, so a settle racing it was overwritten and
+                // the paid row came back as a Draft with no invoice.
+                unsettled: { status: { in: ["Draft", "Staged", "Sent"] } },
+            },
         );
         compensationUnlinkFailed = deleted && !unlinked;
         return deleted;

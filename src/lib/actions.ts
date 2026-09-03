@@ -26,7 +26,7 @@ import { normalizePercentCompleteInput } from "./percent-complete";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { assertActiveStaff, canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, isAdminOrManager, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
+import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, isAdminOrManager, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
@@ -4454,7 +4454,23 @@ async function currentStaffUserOrNull(): Promise<any | null> {
     return currentStaffViewerOrNull();
 }
 
-
+/**
+ * The staff gate, PRIVATE to this module.
+ *
+ * Deliberately not exported and deliberately not imported from
+ * permissions.ts: this file begins with `"use server"`, so every export is a
+ * registered Server Action with a public id, and e2e/financial-action-auth.spec.ts
+ * pins this declaration HERE — it slices from `currentStaffUserOrNull` to this
+ * function to prove the resolver does not swallow infrastructure errors.
+ * The four-line twin in permissions.ts exists for the action modules that
+ * cannot reach a private helper; both call the same resolver and throw the
+ * same error.
+ */
+async function assertActiveStaff(): Promise<any> {
+    const user = await currentStaffUserOrNull();
+    if (!user) throw new Error("Unauthorized");
+    return user;
+}
 
 async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts" | "manageVendors") {
     const user = await assertActiveStaff();

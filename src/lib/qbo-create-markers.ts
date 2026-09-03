@@ -208,6 +208,32 @@ export const PENDING_DELETION_SETTLED_MARKER = "pending-deletion:settled";
  */
 export const PENDING_DELETION_CLAIMED_PREFIX = "pending-deletion:claimed:";
 
+/**
+ * A COMPENSATION the create path has claimed and is about to perform.
+ *
+ * The prefix of `compensating:<token>`. Round 50: `compensateAndUnlink` did
+ * the irreversible QuickBooks delete FIRST and then cleared the row pinned
+ * only to `{ id, qbInvoiceId }`. A settlement landing after the finalize
+ * released its locks but before that clear meant the invoice of a milestone
+ * that had just been PAID was deleted, and the paid row was cleared anyway
+ * — a progress billing was additionally reset to Draft.
+ *
+ * Same shape as the deletion sweep's claim: taken under the canonical money
+ * locks, pinned to the full state the decision was made from, re-checked
+ * immediately before the remote call, and cancelled by a settle.
+ */
+export const COMPENSATION_CLAIMED_PREFIX = "compensating:";
+
+/** Is this row claimed by a compensation right now? */
+export function isCompensationClaimed(marker: string | null | undefined): boolean {
+    return typeof marker === "string" && marker.startsWith(COMPENSATION_CLAIMED_PREFIX);
+}
+
+/** The claim marker for one compensation attempt on one row. */
+export function compensationClaimMarker(token: string): string {
+    return `${COMPENSATION_CLAIMED_PREFIX}${token}`;
+}
+
 /** Is this row claimed by a deletion sweep right now? */
 export function isDeletionClaimed(marker: string | null | undefined): boolean {
     return typeof marker === "string" && marker.startsWith(PENDING_DELETION_CLAIMED_PREFIX);

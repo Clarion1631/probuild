@@ -222,3 +222,57 @@ test("round 46: an ordinary GET to the health paths still passes through (contro
         assert.equal(response.headers.get("x-middleware-next"), "1");
     });
 });
+
+// --- Round 50: which sessions may dispatch a portal action ---
+
+/**
+ * `resolveSessionClientId` accepts TWO shapes of portal session: a NextAuth
+ * session (a client who signed in with Google, or staff previewing the portal)
+ * and the `client_portal_token` magic-link cookie. Round 49's proxy rule
+ * demanded the magic-link cookie ALONE, which refused every Google-authenticated
+ * client and broke estimate SIGNING on the portal — a client-facing money path,
+ * and exactly the kind of collateral damage a security fix must not cause.
+ *
+ * Tested against the rule directly: reaching this branch through the whole
+ * proxy requires a real signed NextAuth JWT (the stale-staff-cookie check
+ * decodes one), which a unit test cannot mint, so a front-door test could never
+ * exercise the NextAuth arm at all.
+ */
+function fakeReq(cookies: Record<string, string>) {
+    const entries = Object.entries(cookies).map(([name, value]) => ({ name, value }));
+    return {
+        cookies: {
+            get: (name: string) => entries.find((c) => c.name === name),
+            getAll: () => entries,
+        },
+    };
+}
+
+test("round 50: either portal session shape may dispatch; nothing else may", async () => {
+    const { mayDispatchAction } = await loadProxy();
+
+    // The magic-link client.
+    assert.equal(mayDispatchAction(fakeReq({ client_portal_token: "t" }), "/portal/estimates/a"), true);
+    // The Google-authenticated client, and staff previewing the portal.
+    assert.equal(mayDispatchAction(fakeReq({ "__Secure-next-auth.session-token": "t" }), "/portal/estimates/a"), true);
+    assert.equal(mayDispatchAction(fakeReq({ "next-auth.session-token": "t" }), "/portal/estimates/a"), true);
+    // The subcontractor.
+    assert.equal(mayDispatchAction(fakeReq({ sub_portal_token: "t" }), "/sub-portal/projects/a"), true);
+
+    // No session evidence at all — the anonymous vector this rule exists to close.
+    assert.equal(mayDispatchAction(fakeReq({}), "/portal/estimates/a"), false);
+    assert.equal(mayDispatchAction(fakeReq({ unrelated: "1" }), "/portal/estimates/a"), false);
+
+    // The wrong tree's cookie does not open the other tree.
+    assert.equal(mayDispatchAction(fakeReq({ sub_portal_token: "t" }), "/portal/estimates/a"), false);
+    assert.equal(mayDispatchAction(fakeReq({ client_portal_token: "t" }), "/sub-portal/projects/a"), false);
+
+    // And no non-portal bypassed path may dispatch, however authenticated.
+    for (const path of ["/api/health/pipeline", "/api/version", "/login", "/privacy", "/share/room/t"]) {
+        assert.equal(
+            mayDispatchAction(fakeReq({ "__Secure-next-auth.session-token": "t", client_portal_token: "t" }), path),
+            false,
+            `${path} must never dispatch an action`,
+        );
+    }
+});

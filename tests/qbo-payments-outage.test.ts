@@ -2228,7 +2228,24 @@ test("round 29 gate: the final link write proves ownership of the in-flight mark
     // by qbInvoiceId — the pre-link CAS can lose before the row ever carries one.
     assert.match(
         push,
-        /compensateAndUnlink\(\s*prisma\.paymentSchedule,\s*schedule\.id,\s*qbId,\s*\(\)\s*=>\s*deleteQBInvoice\(tokens, qbId, cleanupDeadline\),\s*\{\},\s*inFlightMarker,\s*\)/,
+        /compensateAndUnlink\(\s*prisma\.paymentSchedule,\s*schedule\.id,\s*qbId,\s*\(\)\s*=>\s*deleteQBInvoice\(tokens, qbId, cleanupDeadline\),\s*\{\},\s*inFlightMarker,/,
+    );
+    // ...and, since round 50, it must hand over what makes the compensation
+    // SAFE: the parent invoice to lock, and the columns that say this milestone
+    // has not settled. Without them the delete happened first and the clear
+    // pinned only the link, so a settlement landing in between had its invoice
+    // deleted and its paid row cleared anyway.
+    const compensateCall = push.slice(push.indexOf("compensateAndUnlink("));
+    assert.ok(push.includes("compensateAndUnlink("), "the compensation call must exist to be pinned");
+    assert.match(
+        compensateCall.slice(0, 700),
+        /invoiceId: schedule\.invoiceId/,
+        "the claim must name the parent invoice so it can take the same money locks a settle takes",
+    );
+    assert.match(
+        compensateCall.slice(0, 700),
+        /unsettled: \{ status: "Pending", qbPaymentId: null \}/,
+        "the claim must pin BOTH columns a settle writes",
     );
 });
 

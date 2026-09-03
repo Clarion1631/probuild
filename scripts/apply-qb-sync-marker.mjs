@@ -147,36 +147,69 @@ async function main() {
         // can be stale, rewritten, or pointed at a branch database; these three
         // facts are what production actually looks like.
         const [{ current_database: database }] = await prisma.$queryRawUnsafe("SELECT current_database()");
-        const host = (() => { try { return new URL(url).host; } catch { return ""; } })();
         const baseline = await prisma.$queryRawUnsafe(
             `SELECT migration_name FROM "_prisma_migrations" WHERE migration_name = '${PROD_BASELINE_MIGRATION}'`,
         );
-        // WHICH project, not just which shape of database. Everything else here
-        // is true of every Supabase project in the region, and of a staging
-        // clone restored from a production dump.
-        const expectedRef = process.env.APPLY_EXPECT_PROJECT_REF;
+        // The decision itself is productionGuardProblems() — a pure, exported,
+        // TESTED function. It used to be written out inline here, which is
+        // exactly why a broken check shipped: nothing can reach main().
         const actualRef = projectRefOf(url);
-        const problems = [];
-        if (!expectedRef) {
-            problems.push(
-                "APPLY_EXPECT_PROJECT_REF is not set " + "—" + " it must name the production Supabase project ref, " +
-                "so this script can prove it is talking to that project and not a clone"
-            );
-        } else if (actualRef !== expectedRef) {
-            problems.push(`project ref is "${actualRef ?? "unreadable"}", not the expected "${expectedRef}"`);
-        }
-        if (database !== "postgres") problems.push(`current_database() is "${database}", not "postgres"`);
-        if (!/pooler\.supabase\.com$/.test(host)) problems.push(`host "${host}" is not the Supabase pooler`);
-        if (baseline.length !== 1) problems.push(`${PROD_BASELINE_MIGRATION} is not recorded in _prisma_migrations`);
+        const problems = productionGuardProblems({
+            url,
+            database,
+            baselineFound: baseline.length === 1,
+            expectedRef: process.env.APPLY_EXPECT_PROJECT_REF,
+        });
         if (problems.length) {
             console.error(`Refusing to run: this is not production.\n  - ${problems.join("\n  - ")}`);
             process.exit(1);
         }
-        console.log(`verified: project ${actualRef}, ${database} on ${host}, baselined`);
+        // Shown WITH the port, unlike the guard's comparison: a human reading
+        // this line wants to see 6543 (the transaction pooler) and not 5432.
+        const shownHost = (() => { try { return new URL(url).host; } catch { return ""; } })();
+        console.log(`verified: project ${actualRef}, ${database} on ${shownHost}, baselined`);
         await applyAndVerify(prisma);
     } finally {
         await prisma.$disconnect();
     }
+}
+
+/**
+ * Is the database this connected to REALLY production? One human-readable
+ * string per reason it is not; an empty array means yes, go ahead.
+ *
+ * Codex round 50, finding 1. This decision used to be inline in main(), and it
+ * was WRONG in the one direction nothing would notice until deploy day: the
+ * hostname check read `new URL(url).host`, which INCLUDES the port. Production
+ * is `...aws-0-us-west-2.pooler.supabase.com:6543`, so the `$`-anchored
+ * `/pooler\.supabase\.com$/` could never match, and the guard rejected the only
+ * database it exists to accept — the mandatory pre-deploy DDL could not be run
+ * at all. `--target ci` skips this branch, so CI never saw it, and no unit test
+ * could reach it because it lived inside main(). Hence: pure, exported, tested.
+ *
+ * @param {{ url: string, database: string, baselineFound: boolean, expectedRef: string | undefined }} facts
+ * @returns {string[]} empty iff every production check passed
+ */
+export function productionGuardProblems({ url, database, baselineFound, expectedRef }) {
+    // hostname, NOT host: `host` carries `:6543` and defeats the `$` anchor.
+    const hostname = (() => { try { return new URL(url).hostname; } catch { return ""; } })();
+    // WHICH project, not just which shape of database. Everything else here
+    // is true of every Supabase project in the region, and of a staging
+    // clone restored from a production dump.
+    const actualRef = projectRefOf(url);
+    const problems = [];
+    if (!expectedRef) {
+        problems.push(
+            "APPLY_EXPECT_PROJECT_REF is not set " + "—" + " it must name the production Supabase project ref, " +
+            "so this script can prove it is talking to that project and not a clone"
+        );
+    } else if (actualRef !== expectedRef) {
+        problems.push(`project ref is "${actualRef ?? "unreadable"}", not the expected "${expectedRef}"`);
+    }
+    if (database !== "postgres") problems.push(`current_database() is "${database}", not "postgres"`);
+    if (!/pooler\.supabase\.com$/.test(hostname)) problems.push(`host "${hostname}" is not the Supabase pooler`);
+    if (!baselineFound) problems.push(`${PROD_BASELINE_MIGRATION} is not recorded in _prisma_migrations`);
+    return problems;
 }
 
 // Declared AFTER main() on purpose: tests/apply-scripts-inert-on-import.test.ts
