@@ -230,7 +230,12 @@ test("CI runs the apply script against a real database, with seeded rows", () =>
     // nothing else, and both the memo quarantine and the delivery backfill are
     // statements ABOUT EXISTING DATA that would report "ok" over an empty table.
     assert.match(driver, /INSERT INTO "ReviewIssue"/);
-    assert.match(driver, /'memo-signed'/);
+    // The resolution lives INSIDE displayDetails — there is no such column —
+    // and the seed makes two issues claim the SAME pdfId, which is the shape
+    // the quarantine repair exists for.
+    assert.match(driver, /resolution: "memo-signed"/);
+    assert.match(driver, /details\("ci-shared-pdf"\), details\("ci-shared-pdf"\)/);
+    assert.match(driver, /the losing memo-signed claim was not quarantined/);
     assert.match(driver, /INSERT INTO "ReceiptRequestCard"/);
     assert.match(driver, /"deliveredOn"/);
     // Run twice, for idempotency.

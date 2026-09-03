@@ -76,26 +76,39 @@ try {
      * to be wrong about.
      */
     const now = new Date().toISOString();
+
+    /**
+     * TWO ISSUES CLAIMING THE SAME MEMO. The resolution and the pdfId live
+     * INSIDE `displayDetails` — there is no `resolution` column — which is what
+     * the quarantine statement parses out. The older one wins the artifact; the
+     * younger keeps a `memo-signed` claim with no evidence, and is exactly the
+     * row the repair has to reopen.
+     */
+    const details = pdfId => JSON.stringify({ resolution: "memo-signed", pdfId, owner: "CJ" });
     await client.$executeRawUnsafe(`
         INSERT INTO "ReviewIssue" ("id", "targetType", "targetKey", "reasonCodes", "reasonHash",
-                                   "acknowledgedCodes", "resolution", "firstObservedAt", "updatedAt")
+                                   "acknowledgedCodes", "displayDetails", "clearedAt",
+                                   "firstObservedAt", "updatedAt")
         VALUES ('ci-issue-1', 'bank-line', 'ci-line-1', '["MISSING_RECEIPT"]', 'ci-hash-1',
-                '[]', 'memo-signed', '${now}', '${now}'),
+                '[]', $1, $3, '2026-08-01T00:00:00Z', $3),
                ('ci-issue-2', 'bank-line', 'ci-line-2', '["MISSING_RECEIPT"]', 'ci-hash-2',
-                '[]', 'memo-signed', '${now}', '${now}')
-        ON CONFLICT ("id") DO NOTHING`);
+                '[]', $2, $3, '2026-08-02T00:00:00Z', $3)
+        ON CONFLICT ("id") DO NOTHING`,
+        details("ci-shared-pdf"), details("ci-shared-pdf"), now);
 
-    // Two legacy cards carrying a delivery claim, one of them for the same
-    // owner on a different day, so the backfill has to produce two rows and the
-    // unique index has to accept both.
+    /**
+     * And two legacy cards carrying a delivery claim, plus one without — so the
+     * backfill has to produce exactly two rows and the unique index has to
+     * accept two different days for the same owner.
+     */
     await client.$executeRawUnsafe(`
         INSERT INTO "ReceiptRequestCard" ("id", "owner", "pacificDate", "itemsJson", "overflow",
                                           "overflowExact", "status", "postedAt", "deliveredOn",
                                           "attempts", "createdAt", "updatedAt")
-        VALUES ('ci-card-1', 'CJ', '2026-08-01', '[]', 0, true, 'POSTED', '${now}', '2026-08-01', 1, '${now}', '${now}'),
-               ('ci-card-2', 'CJ', '2026-08-02', '[]', 0, true, 'POSTED', '${now}', '2026-08-02', 1, '${now}', '${now}'),
-               ('ci-card-3', 'Richard', '2026-08-01', '[]', 0, true, 'PENDING', NULL, NULL, 0, '${now}', '${now}')
-        ON CONFLICT ("id") DO NOTHING`);
+        VALUES ('ci-card-1', 'CJ', '2026-08-01', '[]', 0, true, 'POSTED', $1, '2026-08-01', 1, $1, $1),
+               ('ci-card-2', 'CJ', '2026-08-02', '[]', 0, true, 'POSTED', $1, '2026-08-02', 1, $1, $1),
+               ('ci-card-3', 'Richard', '2026-08-01', '[]', 0, true, 'PENDING', NULL, NULL, 0, $1, $1)
+        ON CONFLICT ("id") DO NOTHING`, now);
 } finally {
     await client.$disconnect();
 }
@@ -196,13 +209,20 @@ try {
         console.error(`✖ the delivery backfill copied ${deliveries.n} rows; the seed had 2 claims.`);
         process.exit(1);
     }
-    const [stillSigned] = await verify.$queryRawUnsafe(
-        `SELECT COUNT(*)::int AS n FROM "ReviewIssue" WHERE "resolution" = 'memo-signed'`);
+    const [artifacts] = await verify.$queryRawUnsafe(
+        `SELECT COUNT(*)::int AS n FROM "ReceiptMemoArtifact"`);
     const [quarantined] = await verify.$queryRawUnsafe(
-        `SELECT COUNT(*)::int AS n FROM "ReviewIssue" WHERE "resolution" = 'memo-conflict'`);
-    console.log(`delivery rows: ${deliveries.n}; memo-signed left: ${stillSigned.n}; quarantined: ${quarantined.n}`);
-    if (stillSigned.n + quarantined.n !== 2) {
-        console.error("✖ the seeded memo-signed issues were neither kept nor quarantined.");
+        `SELECT COUNT(*)::int AS n FROM "ReviewIssue" WHERE "displayDetails" LIKE '%memo-conflict%'`);
+    console.log(`delivery rows: ${deliveries.n}; memo artifacts: ${artifacts.n}; quarantined: ${quarantined.n}`);
+    // The two seeded issues claimed the SAME pdfId: one binds the artifact, the
+    // other must be reopened as memo-conflict. Both halves, or the repair did
+    // nothing and the "ok" line meant nothing.
+    if (artifacts.n !== 1) {
+        console.error(`✖ expected exactly one memo artifact from two issues sharing a pdfId; got ${artifacts.n}.`);
+        process.exit(1);
+    }
+    if (quarantined.n !== 1) {
+        console.error(`✖ the losing memo-signed claim was not quarantined; got ${quarantined.n}.`);
         process.exit(1);
     }
 } finally {
