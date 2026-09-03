@@ -24,6 +24,8 @@ function row(overrides: Partial<BankRegisterRow> = {}): BankRegisterRow {
         // The GL memo cell: usually the original POS descriptor. Absent here.
         memo: null,
         amountCents: -15000,
+        // These fixtures are about merge/verdict classification, not clearance.
+        clearedStatus: "Unknown",
         ...overrides,
     };
 }

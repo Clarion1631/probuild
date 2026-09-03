@@ -54,7 +54,20 @@ test("maps a normal expense row to an ingest line", () => {
         rawDescriptor: "LOWES",
         checkNumber: null,
         qbTxnId: "txn-1",
+        // A row nobody asked QuickBooks about carries "Unknown" — never a
+        // guess, and never a value that would let it mint.
+        clearedStatus: "Unknown",
     });
+});
+
+test("clearance passes through, and an absent one is Unknown rather than a guess", () => {
+    assert.equal(mapped({ clearedStatus: "Reconciled" }).clearedStatus, "Reconciled");
+    assert.equal(mapped({ clearedStatus: "Cleared" }).clearedStatus, "Cleared");
+    assert.equal(mapped({ clearedStatus: "Uncleared" }).clearedStatus, "Uncleared");
+    // Absent and explicitly null both mean "we did not ask", which is the one
+    // answer that can never be mistaken for evidence the money moved.
+    assert.equal(mapped().clearedStatus, "Unknown");
+    assert.equal(mapped({ clearedStatus: null }).clearedStatus, "Unknown");
 });
 
 test("rows without a transaction identity are skipped", async t => {
@@ -167,11 +180,11 @@ test("the posted date is passed through verbatim — no Date object, no tz shift
  * under the SAME qbTxnId.
  */
 const FIVE_ROW_FIXTURE: BankRegisterRowLike[] = [
-    { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: "1sEISJBJaGRYpivooQJBR", name: "Lowes", memo: "LOWES #02516 POS DEB C#8516", amountCents: -12_345 },
-    { date: "2026-08-11", qbType: "Check", qbTxnId: "6610", docNum: "01027", name: "PACIFIC PLUMBING", memo: null, amountCents: -250_000 },
-    { date: "2026-08-10", qbType: "Deposit", qbTxnId: "6598", docNum: null, name: "MUELLER REMODEL", memo: null, amountCents: 565_760 },
+    { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: "1sEISJBJaGRYpivooQJBR", name: "Lowes", memo: "LOWES #02516 POS DEB C#8516", amountCents: -12_345, clearedStatus: "Reconciled" },
+    { date: "2026-08-11", qbType: "Check", qbTxnId: "6610", docNum: "01027", name: "PACIFIC PLUMBING", memo: null, amountCents: -250_000, clearedStatus: "Uncleared" },
+    { date: "2026-08-10", qbType: "Deposit", qbTxnId: "6598", docNum: null, name: "MUELLER REMODEL", memo: null, amountCents: 565_760, clearedStatus: "Cleared" },
     { date: "2026-08-01", qbType: "", qbTxnId: null, docNum: null, name: null, memo: null, amountCents: 0 },
-    { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: "1sEISJBJaGRYpivooQJBR", name: "Lowes", memo: "LOWES #02516 POS DEB C#8516", amountCents: -12_345 },
+    { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: "1sEISJBJaGRYpivooQJBR", name: "Lowes", memo: "LOWES #02516 POS DEB C#8516", amountCents: -12_345, clearedStatus: "Reconciled" },
 ];
 
 test("convertRegisterRows maps the fixture, skips identity-less rows, collapses split repeats", () => {
@@ -180,9 +193,12 @@ test("convertRegisterRows maps the fixture, skips identity-less rows, collapses 
     assert.equal(result.collapsed, 1, "the repeated 6625 split is ONE observation");
     assert.deepEqual(result.lines, [
         // The memo wins over the name, and the type is never appended.
-        { postedDate: "2026-08-12", amountCents: -12_345, rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null, qbTxnId: "6625" },
-        { postedDate: "2026-08-11", amountCents: -250_000, rawDescriptor: "PACIFIC PLUMBING", checkNumber: "1027", qbTxnId: "6610" },
-        { postedDate: "2026-08-10", amountCents: 565_760, rawDescriptor: "MUELLER REMODEL", checkNumber: null, qbTxnId: "6598" },
+        { postedDate: "2026-08-12", amountCents: -12_345, rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null, qbTxnId: "6625", clearedStatus: "Reconciled" },
+        // The UNCLEARED check survives conversion unchanged. It is not dropped
+        // here — it becomes an observation like any other; what it may not do
+        // is mint a canonical line (see planQboMint).
+        { postedDate: "2026-08-11", amountCents: -250_000, rawDescriptor: "PACIFIC PLUMBING", checkNumber: "1027", qbTxnId: "6610", clearedStatus: "Uncleared" },
+        { postedDate: "2026-08-10", amountCents: 565_760, rawDescriptor: "MUELLER REMODEL", checkNumber: null, qbTxnId: "6598", clearedStatus: "Cleared" },
     ]);
 });
 

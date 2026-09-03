@@ -32,6 +32,18 @@ export const dynamic = "force-dynamic";
  * immutable snapshot that WAS posted, so it is what gets exported; the issues
  * are joined in only for the display fields (payee, amount, date).
  *
+ * THE WHOLE RETENTION WINDOW, ANSWERED OR NOT (Codex PR #443 gate, finding 2).
+ * Cleared issues used to be dropped from the join, so an item that had been
+ * answered vanished from its own thread — and with it the numbering a reply
+ * resolves against. A crew member replying "sign 2" to a card whose item 1 had
+ * closed in the meantime was answering a list that no longer existed, and a
+ * card whose items had ALL closed disappeared entirely, taking its thread
+ * routing with it. `itemsJson` is the immutable record of what was posted, so
+ * every posted item is exported for the full window and the answered ones are
+ * marked `cleared: true` for the bridge to render as resolved. Suppressing a
+ * re-ask is the bridge's job; renumbering the message it is reading is not
+ * something this endpoint gets to do.
+ *
  * The response shape is EXACTLY sweepChatReceipts.js:108-110. It is not ours to
  * improve: the sweep indexes by `thread.name` and reads those five keys.
  *
@@ -77,18 +89,26 @@ export async function GET(request: Request) {
         return NextResponse.json(serializeThreads([], parseOwnerChatUsers(process.env.RECEIPT_OWNER_CHAT_USERS)));
     }
 
-    // Join the issues in for display fields only. A CLEARED issue is dropped:
-    // it has been answered, and the sweep must never chase it again — but the
-    // thread itself stays, carrying whatever items are still open.
+    // Join the issues in for display fields only — INCLUDING cleared ones, which
+    // ship marked `cleared: true` rather than being dropped (see the note
+    // above). The only rows excluded are ones that are not ours.
     const issueIds = [...new Set(cards.flatMap(card => parseItems(card.itemsJson).map(item => item.issueId)))];
     const issues = await prisma.reviewIssue.findMany({
-        where: { id: { in: issueIds }, targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null },
-        select: { id: true, targetKey: true, reasonCodes: true, displayDetails: true },
+        where: { id: { in: issueIds }, targetType: RECEIPT_REQUEST_TARGET_TYPE },
+        select: { id: true, targetKey: true, reasonCodes: true, displayDetails: true, clearedAt: true },
     });
     const detailsById = new Map(
         issues
-            .filter(issue => decodeReasonCodes(issue.reasonCodes).length > 0)
-            .map(issue => [issue.id, { targetKey: issue.targetKey, details: parseMissingReceiptDetails(issue.displayDetails) }]),
+            // An OPEN issue with no reason codes is not a live chase, so it is
+            // still filtered out. A CLEARED one legitimately has none — clearing
+            // IS the empty-codes lifecycle step — and dropping it here would
+            // reintroduce the very gap this change closes.
+            .filter(issue => issue.clearedAt !== null || decodeReasonCodes(issue.reasonCodes).length > 0)
+            .map(issue => [issue.id, {
+                targetKey: issue.targetKey,
+                details: parseMissingReceiptDetails(issue.displayDetails),
+                cleared: issue.clearedAt !== null,
+            }]),
     );
 
     const posted: PostedCardRecord[] = [];
@@ -96,7 +116,7 @@ export async function GET(request: Request) {
         const items: ThreadRecordItem[] = [];
         for (const item of parseItems(card.itemsJson)) {
             const joined = detailsById.get(item.issueId);
-            if (!joined) continue; // answered since, or never ours
+            if (!joined) continue; // never ours, or the issue row is gone
             const details = joined.details;
             const amountCents = typeof details.amountCents === "number" ? details.amountCents : item.cents;
             items.push({
@@ -108,9 +128,13 @@ export async function GET(request: Request) {
                 vendor: typeof details.payee === "string" ? details.payee : item.vendor,
                 cents: Math.abs(amountCents),
                 amount: (Math.abs(amountCents) / 100).toFixed(2),
+                cleared: joined.cleared,
             });
         }
-        if (items.length === 0) continue; // every item answered — nothing left to chase
+        // Only when NOTHING on the card resolves to an issue at all — the thread
+        // has no items to route a reply to. A card whose items are merely all
+        // answered still ships: its thread is still where a late reply lands.
+        if (items.length === 0) continue;
         posted.push({
             threadName: card.threadName as string,
             messageName: card.messageName ?? "",

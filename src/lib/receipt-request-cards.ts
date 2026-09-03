@@ -273,6 +273,17 @@ export interface ThreadRecordItem {
     vendor: string;
     cents: number;
     amount: string;
+    /**
+     * True when the issue behind this item has since been ANSWERED.
+     *
+     * The item still ships. `itemsJson` is the immutable record of what the
+     * message said, and "sign 2" means the second item of THAT message
+     * whether or not item 2 has been resolved since — so dropping resolved
+     * items renumbered the list the replier is reading from and left a valid
+     * reply with nothing to resolve against. The flag is what lets the bridge
+     * render it as already done instead of asking again.
+     */
+    cleared?: boolean;
 }
 
 export interface ThreadRecord {
@@ -313,6 +324,10 @@ export function serializeThreads(
                 vendor: item.vendor,
                 cents: item.cents,
                 amount: item.amount,
+                // An EXTRA key, which the comment above says is harmless — the
+                // sweep indexes the five it knows and ignores the rest. Only a
+                // renamed key would break it.
+                cleared: item.cleared === true,
             })),
         };
     }

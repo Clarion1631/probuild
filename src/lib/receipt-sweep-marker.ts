@@ -31,6 +31,21 @@ export interface SweepMarker {
     phase: SweepPhase;
     /** ISO instant of the last CLEAN, COMPLETE cycle, or null. */
     chaserCompletedAt: string | null;
+    /**
+     * Why the most recent run deliberately did NOT stamp a completion, or null
+     * when nothing is holding it back. Today the only value is
+     * "bank-pull-stale".
+     *
+     * It rides the marker rather than a key of its own because refusing to
+     * finish and having finished are the SAME fact about the same cycle, and
+     * splitting them across two rows is how they come to disagree. The health
+     * check already reads this row, so it costs no extra probe.
+     *
+     * OPTIONAL on the way IN so a caller that has nothing to say need not say
+     * "null"; `parseSweepMarker` always returns it, so a reader never has to
+     * distinguish absent from null.
+     */
+    blockedReason?: string | null;
 }
 
 export function isSweepPhase(value: unknown): value is SweepPhase {
@@ -43,28 +58,35 @@ export function isSweepPhase(value: unknown): value is SweepPhase {
  *   `{"phase":"done","chaserCompletedAt":"…"}`  — written by this one
  */
 export function parseSweepMarker(value: string | null | undefined): SweepMarker {
-    if (!value) return { phase: "done", chaserCompletedAt: null };
-    if (isSweepPhase(value)) return { phase: value, chaserCompletedAt: null };
+    if (!value) return { phase: "done", chaserCompletedAt: null, blockedReason: null };
+    if (isSweepPhase(value)) return { phase: value, chaserCompletedAt: null, blockedReason: null };
     try {
         const parsed: unknown = JSON.parse(value);
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-            return { phase: "done", chaserCompletedAt: null };
+            return { phase: "done", chaserCompletedAt: null, blockedReason: null };
         }
-        const record = parsed as { phase?: unknown; chaserCompletedAt?: unknown };
+        const record = parsed as { phase?: unknown; chaserCompletedAt?: unknown; blockedReason?: unknown };
         return {
             phase: isSweepPhase(record.phase) ? record.phase : "done",
             chaserCompletedAt: typeof record.chaserCompletedAt === "string" ? record.chaserCompletedAt : null,
+            // A row from an older build has no such field, and that must read
+            // as "nothing is blocking", not as an unknown that alarms.
+            blockedReason: typeof record.blockedReason === "string" && record.blockedReason ? record.blockedReason : null,
         };
     } catch {
         // An unparseable marker is not a licence to assume anything. "done"
         // with no completion is the reading that BLOCKS the cards cron, which
         // is the safe direction.
-        return { phase: "done", chaserCompletedAt: null };
+        return { phase: "done", chaserCompletedAt: null, blockedReason: null };
     }
 }
 
 export function formatSweepMarker(marker: SweepMarker): string {
-    return JSON.stringify({ phase: marker.phase, chaserCompletedAt: marker.chaserCompletedAt });
+    return JSON.stringify({
+        phase: marker.phase,
+        chaserCompletedAt: marker.chaserCompletedAt,
+        blockedReason: marker.blockedReason,
+    });
 }
 
 /**

@@ -2924,6 +2924,21 @@ model BankLineObservation {
   rawDescriptor String
   checkNumber   String?
 
+  /// What QuickBooks says about this row's BANK CLEARANCE, on QBO_REGISTER
+  /// rows: "Reconciled", "Cleared", "Uncleared" or "Unknown". Obtained from the
+  /// TransactionList report's `cleared` FILTER — it is not available as a column
+  /// on any report — and joined back on to the GL rows by transaction id. See
+  /// the honesty contract at the top of src/lib/qbo-bank-register.ts.
+  ///
+  /// MUTABLE STATE, NOT IDENTITY. Deliberately outside
+  /// computeQboLineContentHash: an uncleared row that later clears is the SAME
+  /// transaction, and hashing it would answer that ordinary transition with a
+  /// 409 restatement conflict. NULL means nobody has asked yet, which is a
+  /// different fact from "uncleared" — and neither may mint a canonical
+  /// BankLine (isClearedForMint). Always NULL on STATEMENT rows: a statement
+  /// line IS the bank's own record and has nothing left to clear.
+  clearedStatus String?
+
   // Reconciliation target (see the reconcile route). NULL until an explicit
   // reconcileObservations() link is persisted; STATEMENT rows get theirs at
   // ingest time (the canonical line minted alongside them). At most one

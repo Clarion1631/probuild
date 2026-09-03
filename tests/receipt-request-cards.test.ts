@@ -180,14 +180,36 @@ test("the threads serializer emits EXACTLY sweepChatReceipts.js's shape", () => 
                 owner: "CJ",
                 owner_user: "users/111",
                 message_name: "spaces/AAQAKhvMYtg/messages/def",
-                items: [{ n: 1, fingerprint: "pb-bl-1", date: "2026-08-16", vendor: "LOWES #02516", cents: 12_345, amount: "123.45" }],
+                // `cleared` is an ADDED key, not a renamed one — the sweep
+                // indexes the five it knows and ignores the rest. It is what
+                // lets an ANSWERED item stay in its thread (so "sign 2" still
+                // means item 2 of the message that was posted) while the bridge
+                // renders it resolved instead of asking again.
+                items: [{ n: 1, fingerprint: "pb-bl-1", date: "2026-08-16", vendor: "LOWES #02516", cents: 12_345, amount: "123.45", cleared: false }],
             },
         },
     });
     // Key order/name matters to the sweep — assert the keys, not just the values.
     assert.deepEqual(Object.keys(out.threads["spaces/AAQAKhvMYtg/threads/abc"]), ["owner", "owner_user", "message_name", "items"]);
+    // The five the sweep reads come FIRST and unrenamed; `cleared` is appended.
     assert.deepEqual(Object.keys(out.threads["spaces/AAQAKhvMYtg/threads/abc"].items[0]),
-        ["n", "fingerprint", "date", "vendor", "cents", "amount"]);
+        ["n", "fingerprint", "date", "vendor", "cents", "amount", "cleared"]);
+});
+
+test("an answered item still ships, marked cleared — the numbering must not move", () => {
+    // The failure this guards: item 1 of a two-item card is answered, the
+    // export drops it, and item 2 is now the only entry — so a crew member
+    // replying "sign 2" to the message they can still see resolves nothing.
+    const out = serializeThreads([{
+        threadName: "t/1",
+        messageName: "m/1",
+        owner: "CJ",
+        items: [
+            { n: 1, fingerprint: "pb-bl-1", date: "2026-08-16", vendor: "LOWES", cents: 100, amount: "1.00", cleared: true },
+            { n: 2, fingerprint: "pb-bl-2", date: "2026-08-16", vendor: "ARCO", cents: 200, amount: "2.00" },
+        ],
+    }], {});
+    assert.deepEqual(out.threads["t/1"].items.map(i => [i.n, i.cleared]), [[1, true], [2, false]]);
 });
 
 test("a missing owner_user is an empty string, never undefined — the JSON must stay valid", () => {
@@ -559,8 +581,14 @@ test("itemsMissingCardRecord finds exactly the items with no record", async () =
         "legacy": { displayDetails: legacySlot, clearedAt: null },
         "other-card": { displayDetails: withOther, clearedAt: null },
         "empty": { displayDetails: "{}", clearedAt: null },
-        // A cleared issue is never touched: its answer outranks its history.
+        // A CLEARED issue with no record is repaired too. Skipping it left the
+        // one case that most needs repair permanently unrepairable: an item
+        // whose issue closed before its thread record was written has no record
+        // AND no way to get one, so a memo signed in that thread has nothing to
+        // resolve against.
         "answered": { displayDetails: "{}", clearedAt: new Date() },
+        // Cleared AND already recorded is still not missing.
+        "answered-with-record": { displayDetails: withRecord, clearedAt: new Date() },
     };
     const client = {
         reviewIssue: {
@@ -573,7 +601,7 @@ test("itemsMissingCardRecord finds exactly the items with no record", async () =
 
     assert.deepEqual(
         await itemsMissingCardRecord(Object.keys(rows), "req-1", client),
-        ["other-card", "empty"],
+        ["other-card", "empty", "answered"],
     );
     assert.deepEqual(await itemsMissingCardRecord([], "req-1", client), []);
 });

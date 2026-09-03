@@ -38,6 +38,7 @@
  */
 
 import type { ReconcileAmbiguousGroup } from "@/lib/bank-ledger";
+import type { ClearedStatus } from "@/lib/register-types";
 
 export interface BankRegisterRowLike {
     date: string;
@@ -53,6 +54,12 @@ export interface BankRegisterRowLike {
      * resolved to `office` and the crew was never asked (Codex round-4 item 7).
      */
     memo?: string | null;
+    /**
+     * What QuickBooks says about this row's bank clearance. Optional so a
+     * caller that cannot ask (a fixture, the standalone script) simply does not
+     * claim to know; absent reads as "Unknown", which never mints.
+     */
+    clearedStatus?: ClearedStatus | null;
 }
 
 export interface BankRegisterIngestLine {
@@ -61,6 +68,13 @@ export interface BankRegisterIngestLine {
     rawDescriptor: string;
     checkNumber: string | null;
     qbTxnId: string;
+    /**
+     * Carried to the ingest so the observation can record it. It is MUTABLE
+     * state, not identity: an uncleared row clears later, and that must be an
+     * update rather than a restatement conflict — so it is deliberately absent
+     * from `lineContent` below and from the ingest's content hash.
+     */
+    clearedStatus: ClearedStatus;
 }
 
 /** The one bank account this register describes. */
@@ -109,7 +123,14 @@ export function registerRowToIngestLine(row: BankRegisterRowLike): BankRegisterI
     const isCheckish = /check/i.test(row.qbType || "");
     const docNum = (row.docNum || "").trim();
     const checkNumber = isCheckish && /^\d+$/.test(docNum) ? String(Number(docNum)) : null;
-    return { postedDate: row.date, amountCents: row.amountCents, rawDescriptor, checkNumber, qbTxnId: row.qbTxnId };
+    return {
+        postedDate: row.date,
+        amountCents: row.amountCents,
+        rawDescriptor,
+        checkNumber,
+        qbTxnId: row.qbTxnId,
+        clearedStatus: row.clearedStatus ?? "Unknown",
+    };
 }
 
 export interface ConvertedRegisterRows {
@@ -126,7 +147,13 @@ export interface ConvertedRegisterRows {
     conflicts: string[];
 }
 
-/** The content that makes two rows under one qbTxnId the same observation. */
+/**
+ * The content that makes two rows under one qbTxnId the same observation.
+ *
+ * `clearedStatus` is NOT part of it. It is a fact about the row's lifecycle,
+ * not about which transaction the row is, and hashing it would turn the
+ * ordinary uncleared-then-cleared transition into a duplicate conflict.
+ */
 function lineContent(line: BankRegisterIngestLine): string {
     return JSON.stringify([line.postedDate, line.amountCents, line.rawDescriptor, line.checkNumber]);
 }

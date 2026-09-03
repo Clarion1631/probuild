@@ -313,6 +313,43 @@ Planner output for the executor: build exactly this; do not guess.
      available without changing that external script. Date/vendor sanitization is not
      checked; it is not this route's to pin down.
 
+## 4b. Bank clearance — what makes a QBO row "bank truth" (round-32 gate)
+
+The nightly pull mints a canonical `BankLine` from a QuickBooks register row, and a
+canonical line is a claim that money left the account. Age alone was never evidence of
+that: a manually entered or still-uncleared check aged past the two-day grace and minted,
+and the chaser then asked somebody for a receipt for a transaction the bank had never
+seen. Raised three review rounds running before it was fixed.
+
+**QuickBooks does have the answer, and will only give it one way.** `cleared` is a
+FILTER, never a returnable column, and only the `TransactionList` report accepts it — so
+it cannot ride the `GeneralLedger` call the register already makes. The pull therefore
+issues three extra filtered `TransactionList` calls per window (`Uncleared`, `Cleared`,
+`Reconciled`) over the same account and date range, and joins their transaction ids back
+onto the GL rows.
+
+**Verified against the live realm, 2026-09-02** (account 154):
+
+| window | GL rows | Reconciled | Cleared | Uncleared | in neither |
+|---|---|---|---|---|---|
+| 2026-07-01 → 2026-07-10 | 78 (76 ids) | 85 | 0 | 5 | 1 — id 6557, a Journal Entry |
+| 2026-08-20 → 2026-09-02 | — | 0 | 0 | 55 | — |
+
+Two things that settles. The id spaces MATCH (TransactionList carries the transaction id
+on the same `txn_type` cell the GL does), so the join is an identity join and not a
+heuristic. And a manually entered Journal Entry — the reviewer's exact fake-bank-truth
+case — is classified by NEITHER filter, so it comes back `Unknown` and can never mint.
+
+**The rule.** `BankLineObservation.clearedStatus` carries the answer; `isClearedForMint`
+is POSITIVE, so only `Reconciled` and `Cleared` mint. Uncleared, Unknown, and NULL
+(never asked) all stay observations: visible on the Bank page and in
+`pipeline-health.bankPull.unclearedCount`, absent from the canonical ledger, and
+therefore never chased. Clearance is MUTABLE STATE, deliberately outside
+`computeQboLineContentHash` — an uncleared row that clears later is the same transaction
+and must be an update, not a 409 restatement. `Unknown` never overwrites a stored
+answer, so a failed probe stops new mints rather than erasing what QuickBooks already
+said.
+
 ## 5. Crons — `vercel.json` additions
 
 - **AS BUILT — the chaser runs as TWO invocations of one route.**
@@ -330,6 +367,27 @@ Planner output for the executor: build exactly this; do not guess.
   - Open issues are reconciled in their OWN pass on every run, before the cursor
     is even read: closing must never wait for the cursor to lap round to an
     issue opened months ago.
+  - **A cycle may only stamp itself complete over a FRESH register pull**
+    (round-32 gate). `/api/cron/bank-register-pull` (02:00 UTC) withholds its
+    success marker when it failed, errored a batch, ran out of budget mid-window,
+    or left an ambiguous reconcile group — all of which mean the register is
+    INCOMPLETE — and nothing used to check it, so the sweep could certify a
+    half-populated ledger and release the 14:30 cards over it. The sweep now
+    requires `BANK_PULL_LAST_SUCCESS_KEY` to be within
+    `BANK_PULL_CHASER_WINDOW_HOURS` (24h, defined next to `BANK_PULL_STALE_HOURS`
+    in `pipeline-health.ts`). At the 13:00 slot that separates a healthy pull
+    (~11h old) from last night's (~35h, meaning tonight's failed).
+    When it is stale the run still reconciles — every close it makes is still
+    right — but it does not stamp, the phase is held at `"lines"` so
+    `shouldResumeSweep` keeps answering yes, and `reason: "bank-pull-stale"` goes
+    in both the summary and the marker's `blockedReason` (surfaced as
+    `chaser-blocked:bank-pull-stale`, distinct from `chaser-stale` because
+    otherwise a chaser refusing ON PURPOSE looks merely slow for the two hours
+    before `chaser-stale` fires — and the cards are gone by then).
+    THE CONTINUATION SLOT THIS DEPENDS ON ALREADY EXISTS: the `?continue=1` pass
+    at `*/15 * * * *` runs six times between 13:00 and the 14:30 cards, so a
+    cycle held open at 13:00 by a pull that recovers at 13:20 still completes and
+    still delivers. No new cron was needed.
 - ORIGINAL PLAN (superseded by the two entries above):
   `/api/cron/receipt-requests`, `"0 13 * * *"` (6 AM Pacific, after the overnight QBO
   register push lands; NOTE: no in-repo register cron exists yet — ordering vs the
@@ -430,6 +488,17 @@ Planner output for the executor: build exactly this; do not guess.
    QBO_REGISTER observations also feed the matcher — deliberately NOT done here, to avoid
    dual-identity issues when a statement later mints the canonical line). Confirm Phase 6
    ordering is acceptable, or ask for the observation-feed variant as a follow-up.
+1b. **Reply routing must outlive the answer** (round-32 gate, CLOSED). `itemsJson` is
+   the immutable record of what a card said, and "sign N" resolves against THAT — so the
+   thread export now covers the full 14-day retention window regardless of whether an
+   item has since cleared, marking answered ones `cleared: true` rather than dropping
+   them (dropping renumbered the list the replier was reading from, and a card whose
+   items had all closed vanished with its thread routing). Card history is likewise
+   recorded on an issue that cleared between the confirmed post and the history write —
+   the version CAS is the whole guard, and the write names only `displayDetails` and
+   `version`, so a resolution can never be un-answered by it. A valid signed memo for an
+   already-answered chase is an idempotent `200 {ok:true, alreadyResolved:true}`;
+   `422 not-requested` survives only for a still-OPEN issue nobody ever asked about.
 2. **Beverly companion change** (§4 sign step) lives outside every repo here (Hermes
    runner on Justin's PC). Until it ships, "sign N" replies are recorded but no sign card
    appears — photo/job replies work day one. HUMAN DECISION on sequencing.

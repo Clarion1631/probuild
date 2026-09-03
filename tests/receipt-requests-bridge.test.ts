@@ -226,7 +226,19 @@ test("a signed memo is recorded even when the issue was already auto-closed", ()
     assert.doesNotMatch(source, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
     // A cleared issue still gets the record, and is not re-cleared.
     assert.match(source, /alreadyCleared: issue\.clearedAt !== null/);
-    assert.match(source, /alreadyCleared: true, memoRecorded: true/);
+    assert.match(source, /alreadyCleared: true,[\s\S]{0,200}memoRecorded: true/);
+    // AND a memo for an issue that is already answered but carries NO record of
+    // ever having been asked is the card-history race, not an unrequested memo:
+    // 200 with `alreadyResolved`, never 422 not-requested (Codex PR #443 gate,
+    // finding 2). `never-requested` survives only for a still-OPEN issue.
+    assert.match(source, /if \(!requested && issue\.clearedAt === null\) return \{ kind: "never-requested" \};/);
+    assert.match(source, /alreadyResolved: true/);
+    // The artifact must still MATCH. The mismatch check is what stops a memo
+    // for a different charge being waved through as "already resolved".
+    const mismatchAt = source.indexOf('return { kind: "mismatch" };');
+    const resolvedAt = source.indexOf("alreadyResolved: !requested");
+    assert.ok(mismatchAt > 0 && resolvedAt > 0 && mismatchAt < resolvedAt,
+        "the name/amount match is checked BEFORE a cleared issue is reported as already resolved");
 });
 
 test("the cards cron writes history through a CAS, never through the lifecycle", () => {
@@ -243,8 +255,21 @@ test("the cards cron writes history through a CAS, never through the lifecycle",
     const writer = readFileSync(join(repoRoot, "src/lib/receipt-card-history.ts"), "utf8");
     // A CALL, not the word: the module comment explains why it is not used.
     assert.doesNotMatch(writer, /await evaluateReviewIssue\(/);
-    assert.match(writer, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
-    assert.match(writer, /if \(!issue \|\| issue\.clearedAt !== null\) \{ skipped\+\+; continue; \}/);
+    // THE VERSION IS THE CAS, and it is the ONLY guard. `clearedAt: null` used
+    // to be in the where and in a pre-check, which made the write a no-op the
+    // moment an issue cleared — so an item whose issue closed between the
+    // confirmed post and this write ended up with no thread record, and the
+    // memo later signed in that thread came back 422 not-requested (Codex PR
+    // #443 gate, finding 2).
+    assert.match(writer, /where: \{ id: issue\.id, version: issue\.version \}/);
+    assert.doesNotMatch(writer, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
+    assert.match(writer, /if \(!issue\) \{ skipped\+\+; continue; \}/);
+    // And the write still cannot un-answer anything: it names displayDetails
+    // and version, and nothing else. A resolution field appearing in this data
+    // block is the regression this line exists to catch.
+    assert.match(writer, /data: \{ displayDetails: JSON\.stringify\(details\), version: \{ increment: 1 \} \}/);
+    assert.doesNotMatch(writer, /data: \{[^}]*clearedAt/);
+    assert.doesNotMatch(writer, /data: \{[^}]*resolution/);
 });
 
 test("card history is written only AFTER a validated post", () => {

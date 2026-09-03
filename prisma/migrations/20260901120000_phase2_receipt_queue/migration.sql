@@ -36,6 +36,14 @@ BEGIN
   END IF;
 END $$;
 
+-- 1b. What QuickBooks says about a register row's BANK CLEARANCE
+-- ('Reconciled' | 'Cleared' | 'Uncleared' | 'Unknown'). Nullable with no
+-- default on purpose: every observation stored before this column existed was
+-- written without anybody asking QuickBooks the question, so NULL means "never
+-- asked" — a different fact from "uncleared", and the only truthful backfill.
+-- Both keep the row out of the canonical ledger (see isClearedForMint).
+ALTER TABLE "BankLineObservation" ADD COLUMN IF NOT EXISTS "clearedStatus" TEXT;
+
 -- Adoption looks lines up by (account, postedDate, amountCents) and then filters
 -- in memory on payee/check#/sourceOfRecord — index the lookup, not the flag.
 CREATE INDEX IF NOT EXISTS "BankLine_account_postedDate_amountCents_idx"

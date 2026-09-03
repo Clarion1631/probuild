@@ -213,11 +213,12 @@ test("contended work keeps the cycle unfinished and resumable", () => {
 test("only a done phase carries the stamp, and contention cannot reach done", () => {
     // The stamp is written ONLY on "done" (that expression is asserted in
     // receipt-sweep-marker.test.ts), so blocking "done" is what blocks the card.
-    assert.match(sweepSource, /await writePhase\(phase, phase === "done" \? new Date\(\)\.toISOString\(\) : undefined\);/);
+    assert.match(sweepSource, /await writePhase\(\s*phase,\s*decision\.complete \? new Date\(\)\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
     // And the contention counts actually reach the decision.
-    assert.match(sweepSource, /const phase = sweepPhaseAfter\(\{[\s\S]{0,240}openContended,[\s\S]{0,240}lineContended,/);
-    // A run that left contended work says so, and says there is more to do.
-    assert.match(sweepSource, /moreToProcess: !exhausted \|\| !openExhausted \|\| openContended > 0 \|\| lineContended > 0/);
+    assert.match(sweepSource, /const computedPhase = sweepPhaseAfter\(\{[\s\S]{0,240}openContended,[\s\S]{0,240}lineContended,/);
+    // A run that left contended work says so, and says there is more to do —
+    // and so does one held open because the register pull was stale.
+    assert.match(sweepSource, /moreToProcess: !exhausted \|\| !openExhausted \|\| openContended > 0 \|\| lineContended > 0 \|\| bankPullStale/);
 });
 
 test("a STABLE non-verdict does not block the cycle for ever", () => {

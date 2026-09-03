@@ -833,7 +833,7 @@ test("the bank-pull read runs inside the Promise.all, as a probe", () => {
         join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
         "utf8",
     );
-    assert.match(source, /probe<\{ enabled: boolean; lastSuccessAt: string \| null; ambiguousCount: number \}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
+    assert.match(source, /probe<\{ enabled: boolean; lastSuccessAt: string \| null; ambiguousCount: number; unclearedCount: number \}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
     assert.doesNotMatch(source, /bankPull: await readBankPullState\(\)/, "the unprobed await is gone");
     // The read no longer swallows its own failure — the probe reports it.
     const fn = source.slice(source.indexOf("async function readBankPullState("));
@@ -933,5 +933,5 @@ test("the chaser probe reads the sweep's own marker row", () => {
         "utf8",
     );
     assert.match(source, /"chaser",\s*\n\s*async \(\) => \{[\s\S]{0,400}parseSweepMarker\(row\?\.value\)/);
-    assert.match(source, /\{ phase: "unknown", completedAt: null \}/, "an unreadable marker is not 'done'");
+    assert.match(source, /\{ phase: "unknown", completedAt: null, blockedReason: null \}/, "an unreadable marker is not 'done'");
 });

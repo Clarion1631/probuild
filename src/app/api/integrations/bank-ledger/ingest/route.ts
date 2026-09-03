@@ -12,6 +12,7 @@ import {
     isSafeCents,
 } from "@/lib/bank-ledger";
 import { BANK_LINE_IDENTITY_LOCK, bankLineIdentityPayee, planStatementAdoption } from "@/lib/bank-line-mint";
+import { isClearedStatusValue, type ClearedStatus } from "@/lib/register-types";
 
 export const dynamic = "force-dynamic";
 // Statements now post as ONE complete request (see MAX_LINES_PER_REQUEST) and
@@ -85,6 +86,7 @@ interface IngestLineInput {
     rawDescriptor?: unknown;
     checkNumber?: unknown;
     qbTxnId?: unknown; // QBO_REGISTER only
+    clearedStatus?: unknown; // QBO_REGISTER only — see ValidatedQboLine
 }
 
 interface IngestBody {
@@ -112,6 +114,17 @@ interface ValidatedLineBase {
 
 interface ValidatedQboLine extends ValidatedLineBase {
     qbTxnId: string;
+    /**
+     * QuickBooks' own bank-clearance answer for this row.
+     *
+     * MUTABLE STATE, NOT IDENTITY. It is deliberately absent from
+     * `computeQboLineContentHash`: an uncleared row that later clears is the
+     * SAME transaction, and hashing this would answer that ordinary transition
+     * with a 409 restatement conflict and stall the nightly pull forever.
+     * "Unknown" means the caller could not ask — it never overwrites a stored
+     * answer (see the refresh below).
+     */
+    clearedStatus: ClearedStatus;
 }
 
 /** Never echoes the raw line back — only its index and the offending field. */
@@ -147,7 +160,14 @@ function validateQboLine(raw: IngestLineInput, index: number): { ok: true; value
     if (typeof raw.qbTxnId !== "string" || !raw.qbTxnId.trim() || raw.qbTxnId.length > MAX_QB_TXN_ID_LEN) {
         return { ok: false, error: { index, field: "qbTxnId" } };
     }
-    return { ok: true, value: { ...common.value, qbTxnId: raw.qbTxnId } };
+    // Absent is legal and means "Unknown" — a caller that cannot ask must not
+    // be forced to invent an answer. A PRESENT but unrecognised value is a
+    // caller bug and is refused, so a typo can never read as a clearance.
+    if (raw.clearedStatus !== undefined && raw.clearedStatus !== null && !isClearedStatusValue(raw.clearedStatus)) {
+        return { ok: false, error: { index, field: "clearedStatus" } };
+    }
+    const clearedStatus: ClearedStatus = isClearedStatusValue(raw.clearedStatus) ? raw.clearedStatus : "Unknown";
+    return { ok: true, value: { ...common.value, qbTxnId: raw.qbTxnId, clearedStatus } };
 }
 
 /** Thrown by createStatementImport when a concurrent request wins the (account, periodStart, periodEnd) unique constraint first. */
@@ -173,6 +193,12 @@ export interface ExistingQboObservation {
     amountCents: number;
     rawDescriptor: string;
     checkNumber: string | null;
+    /**
+     * The stored clearance answer, or null on rows written before the column
+     * existed. Read only to decide whether a refresh is needed — it is not part
+     * of `computeQboLineContentHash` and must never make a row a restatement.
+     */
+    clearedStatus?: string | null;
 }
 
 export interface StatementImportLineInput {
@@ -233,7 +259,20 @@ export interface BankLedgerIngestHandlerDependencies {
         rawDescriptor: string;
         checkNumber: string | null;
         qbTxnId: string;
+        clearedStatus: ClearedStatus;
     }>): Promise<number>;
+
+    /**
+     * Moves the stored clearance answer on observations that already exist.
+     * Returns how many rows were touched.
+     *
+     * No identity lock: `clearedStatus` takes no part in the identity key that
+     * minting, reconcile and statement adoption plan against, so unlike
+     * `refreshQboDescriptors` this cannot fork a line. It also never touches
+     * the canonical BankLine — a line that was minted was minted from a cleared
+     * row, and a later status change does not un-mint it.
+     */
+    refreshQboClearedStatus(account: string, rows: Array<{ qbTxnId: string; clearedStatus: ClearedStatus }>): Promise<number>;
 }
 
 export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHandlerDependencies) {
@@ -367,11 +406,37 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
             descriptorsRefreshed = await dependencies.refreshQboDescriptors(account, refreshDescriptors);
         }
 
+        // CLEARANCE MOVES; IDENTITY DOES NOT. Every uncleared row is expected
+        // to clear eventually, so this is an UPDATE on an existing observation,
+        // never a restatement — which is why clearedStatus is outside the
+        // content hash and why this runs for every existing row, not only the
+        // ones whose descriptor changed.
+        //
+        // "Unknown" NEVER OVERWRITES. It is what a failed clearance probe
+        // produces, and letting it land would wipe every stored answer on the
+        // first bad night — after which nothing could mint until QuickBooks was
+        // asked again. Absence of evidence does not erase evidence.
+        const refreshCleared: Array<{ qbTxnId: string; clearedStatus: ClearedStatus }> = [];
+        const clearedSeen = new Set<string>();
+        for (const line of validated) {
+            const prior = existing.get(line.qbTxnId);
+            if (!prior) continue;
+            if (line.clearedStatus === "Unknown") continue;
+            if (prior.clearedStatus === line.clearedStatus) continue;
+            if (clearedSeen.has(line.qbTxnId)) continue;
+            clearedSeen.add(line.qbTxnId);
+            refreshCleared.push({ qbTxnId: line.qbTxnId, clearedStatus: line.clearedStatus });
+        }
+        let clearedRefreshed = 0;
+        if (refreshCleared.length > 0) {
+            clearedRefreshed = await dependencies.refreshQboClearedStatus(account, refreshCleared);
+        }
+
         // Content-identical repeats (already stored, or duplicated within this
         // request) collapse to a single insert attempt per qbTxnId — sequence
         // has no meaning here (unlike STATEMENT lines): qbTxnId IS the identity.
         const insertedQbTxnIds = new Set<string>();
-        const rows: Array<{ account: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber: string | null; qbTxnId: string }> = [];
+        const rows: Array<{ account: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber: string | null; qbTxnId: string; clearedStatus: ClearedStatus }> = [];
         for (const line of validated) {
             if (existing.has(line.qbTxnId)) continue;
             if (insertedQbTxnIds.has(line.qbTxnId)) continue;
@@ -383,6 +448,7 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
                 rawDescriptor: line.rawDescriptor,
                 checkNumber: line.checkNumber,
                 qbTxnId: line.qbTxnId,
+                clearedStatus: line.clearedStatus,
             });
         }
 
@@ -403,7 +469,7 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
         }
         const existingCount = validated.length - inserted;
 
-        return NextResponse.json({ ok: true, inserted, existing: existingCount, descriptorsRefreshed });
+        return NextResponse.json({ ok: true, inserted, existing: existingCount, descriptorsRefreshed, clearedRefreshed });
     }
 
     return {
@@ -635,7 +701,7 @@ const handlers = createBankLedgerIngestHandlers({
     findExistingQboObservations: async (account, qbTxnIds) => {
         const rows = await prisma.bankLineObservation.findMany({
             where: { source: "QBO_REGISTER", account, sourceDocumentId: "QBO_REGISTER", sourceLineId: { in: qbTxnIds } },
-            select: { sourceLineId: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+            select: { sourceLineId: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, clearedStatus: true },
         });
         const result = new Map<string, ExistingQboObservation>();
         for (const row of rows) {
@@ -644,9 +710,44 @@ const handlers = createBankLedgerIngestHandlers({
                 amountCents: row.amountCents,
                 rawDescriptor: row.rawDescriptor,
                 checkNumber: row.checkNumber,
+                clearedStatus: row.clearedStatus,
             });
         }
         return result;
+    },
+
+    refreshQboClearedStatus: async (account, rows) => {
+        let touched = 0;
+        for (const row of rows) {
+            // A PLAIN UPDATE, no identity lock and no BankLine write. Clearance
+            // is not part of the identity key minting and adoption plan
+            // against, so there is nothing here for a concurrent planner to
+            // disagree with — and a canonical line that was already minted
+            // stays minted: it was minted from a cleared row, and QuickBooks
+            // moving that row back to uncleared is a human's problem, not
+            // grounds for this cron to unpick a canonical line.
+            //
+            // Guarded on the stored value so the count reports real movement.
+            // The guard is spelled out as an explicit OR rather than a bare
+            // `not`: the column is nullable, and in SQL a NULL row does not
+            // satisfy `clearedStatus <> 'Cleared'` — which is precisely the
+            // row that has never been asked about and most needs the update.
+            const result = await prisma.bankLineObservation.updateMany({
+                where: {
+                    source: "QBO_REGISTER",
+                    account,
+                    sourceDocumentId: "QBO_REGISTER",
+                    sourceLineId: row.qbTxnId,
+                    OR: [
+                        { clearedStatus: null },
+                        { clearedStatus: { not: row.clearedStatus } },
+                    ],
+                },
+                data: { clearedStatus: row.clearedStatus },
+            });
+            touched += result.count;
+        }
+        return touched;
     },
 
     refreshQboDescriptors: async (account, rows) => {
@@ -757,6 +858,7 @@ const handlers = createBankLedgerIngestHandlers({
                     amountCents: row.amountCents,
                     rawDescriptor: row.rawDescriptor,
                     checkNumber: row.checkNumber,
+                    clearedStatus: row.clearedStatus,
                 })),
                 skipDuplicates: true,
             });
@@ -776,6 +878,10 @@ const handlers = createBankLedgerIngestHandlers({
                     where: { source: "QBO_REGISTER", account, sourceDocumentId: "QBO_REGISTER", sourceLineId: { in: attemptedIds } },
                     select: { sourceLineId: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
                 });
+                // clearedStatus is deliberately NOT read here: the comparison
+                // below is a CONTENT-IDENTITY check, and clearance is not part
+                // of identity. A concurrent writer that stored a newer
+                // clearance is not a conflict.
                 const postInsert = new Map<string, ExistingQboObservation>();
                 for (const row of postInsertRows) {
                     postInsert.set(row.sourceLineId, {

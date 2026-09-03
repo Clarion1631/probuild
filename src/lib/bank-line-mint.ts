@@ -60,6 +60,7 @@
  * mints and never adopts.
  */
 import { bankLineIdentity, bankLineIdentityPayee } from "./bank-ledger";
+import { isClearedForMint } from "./register-types";
 
 /**
  * How old a QBO row must be before it may mint. QuickBooks shows pending and
@@ -68,6 +69,14 @@ import { bankLineIdentity, bankLineIdentityPayee } from "./bank-ledger";
  * settle. Two days is the same "let it settle" instinct as the matcher's
  * three-day grace, one notch tighter because minting is reversible only by a
  * human.
+ *
+ * AGE IS A DELAY, NOT EVIDENCE. On its own this rule minted every unlinked
+ * observation once it was two days old, which is how a manually entered or
+ * still-uncleared check became "bank truth" and started a receipt chase for
+ * money that had never left the account (Codex PR #443, three rounds running).
+ * The age gate now runs ALONGSIDE `isClearedForMint`: waiting is what stops a
+ * row that is about to change, and QuickBooks' own clearance answer is what
+ * says the money moved. Neither replaces the other.
  */
 export const QBO_MINT_MIN_AGE_DAYS = 2;
 
@@ -87,6 +96,12 @@ export interface MintCandidateObservation {
     rawDescriptor: string;
     normalizedPayee: string;
     checkNumber: string | null;
+    /**
+     * QuickBooks' own bank-clearance answer, as stored on the observation.
+     * NULL on rows written before the column existed — which reads as "never
+     * asked" and, like "Uncleared" and "Unknown", never mints.
+     */
+    clearedStatus: string | null;
     /** Non-null means it is already linked to a canonical line. */
     bankLineId: string | null;
 }
@@ -110,6 +125,13 @@ export interface MintPlan {
     skipped: {
         alreadyLinked: number;
         tooRecent: number;
+        /**
+         * QuickBooks does not say this row has cleared the bank — it is
+         * uncleared, unclassified (a manually entered journal), or was never
+         * asked about. It stays an observation: visible in the register, never
+         * a canonical line, and therefore never a receipt chase.
+         */
+        notCleared: number;
         emptyPayee: number;
         statementLineExists: number;
         duplicateWithinBatch: number;
@@ -140,8 +162,15 @@ export { bankLineIdentityPayee };
  * Which unlinked QBO observations should mint a canonical line.
  *
  * A candidate must be unlinked, at least `QBO_MINT_MIN_AGE_DAYS` calendar days
- * old, carry a real payee identity, and have NO existing line on the same
- * identity — of either source. "Of either source" is load-bearing: an existing
+ * old, CLEARED AT THE BANK ACCORDING TO QUICKBOOKS, carry a real payee
+ * identity, and have NO existing line on the same identity — of either source.
+ *
+ * The clearance test is POSITIVE (`isClearedForMint`), so every absence of
+ * evidence — uncleared, unclassified, never asked, a probe that failed — lands
+ * on the side that does not mint. That is the whole point: a canonical BankLine
+ * is a claim that money left the account, and a chase built on a manually
+ * entered check that never cleared costs somebody a morning hunting a receipt
+ * for a transaction the bank never saw. "Of either source" is load-bearing: an existing
  * QBO-minted line means a previous run already did this (so a re-run mints
  * nothing, which is the idempotency promise), and an existing STATEMENT line
  * means the statement beat us to it and reconcile will link the observation to
@@ -158,7 +187,7 @@ export function planQboMint(
 ): MintPlan {
     const plan: MintPlan = {
         mint: [],
-        skipped: { alreadyLinked: 0, tooRecent: 0, emptyPayee: 0, statementLineExists: 0, duplicateWithinBatch: 0 },
+        skipped: { alreadyLinked: 0, tooRecent: 0, notCleared: 0, emptyPayee: 0, statementLineExists: 0, duplicateWithinBatch: 0 },
     };
     const todayDay = dayNumber(now.toISOString().slice(0, 10));
 
@@ -188,6 +217,16 @@ export function planQboMint(
         const day = dayNumber(obs.postedDate);
         if (day === null || todayDay === null || todayDay - day < QBO_MINT_MIN_AGE_DAYS) {
             plan.skipped.tooRecent++;
+            continue;
+        }
+
+        // BEFORE the identity accounting, exactly like `tooRecent`. An
+        // uncleared observation must not consume one of the available canonical
+        // lines below: it is not a claim on a line, it is a row that has not
+        // earned one yet, and decrementing here would make a genuinely
+        // unaccounted-for cleared charge look already covered.
+        if (!isClearedForMint(obs.clearedStatus)) {
+            plan.skipped.notCleared++;
             continue;
         }
 

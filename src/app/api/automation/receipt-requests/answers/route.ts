@@ -306,6 +306,8 @@ export async function POST(request: Request) {
     // committed resolution earns the clear.
     let recorded: { targetKey: string } | null = null;
     let alreadyCleared = false;
+    /** The card-history race: answered already, and never carrying a record of the ask. */
+    let alreadyResolved = false;
     let missing = false;
     let neverRequested = false;
     let mismatch = false;
@@ -316,7 +318,7 @@ export async function POST(request: Request) {
         | { kind: "reused" }
         | { kind: "never-requested" }
         | { kind: "mismatch" }
-        | { kind: "recorded"; alreadyCleared: boolean }
+        | { kind: "recorded"; alreadyCleared: boolean; alreadyResolved: boolean }
         | { kind: "lost-race" };
 
     for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !mismatch && !reused; attempt++) {
@@ -357,9 +359,23 @@ export async function POST(request: Request) {
             // a corrected amount written since must survive.
             const details = parseMissingReceiptDetails(issue.displayDetails);
 
-            if (!hasRecordedMemoRequest(details)) return { kind: "never-requested" };
+            // NO RECORD OF THE ASK, on an issue that is ALREADY ANSWERED, is
+            // the card-history race — not an unrequested memo (Codex PR #443
+            // gate, finding 2). The card went out, the issue cleared before its
+            // thread record was written, and the person who then signed the
+            // memo in that thread got a 422 telling them nobody had asked. The
+            // ask is not in doubt here: the issue exists, it is resolved, and
+            // the artifact still has to match it. So this is reported as the
+            // idempotent success it is, and the memo is recorded exactly as it
+            // would be on any other cleared issue — nothing is CLOSED by it,
+            // because it is closed already.
+            const requested = hasRecordedMemoRequest(details);
+            if (!requested && issue.clearedAt === null) return { kind: "never-requested" };
             const amountCents = typeof details.amountCents === "number" ? details.amountCents : null;
             if (amountCents === null || !affidavitNameMatchesIssue(probe.name, amountCents)) {
+                // Checked BEFORE the already-resolved answer below, so a memo
+                // for a DIFFERENT charge can never be waved through as "already
+                // resolved" just because this issue happens to be closed.
                 return { kind: "mismatch" };
             }
 
@@ -383,7 +399,11 @@ export async function POST(request: Request) {
                 data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
             });
             if (written.count === 1) {
-                return { kind: "recorded", alreadyCleared: issue.clearedAt !== null };
+                return {
+                    kind: "recorded",
+                    alreadyCleared: issue.clearedAt !== null,
+                    alreadyResolved: !requested,
+                };
             }
             return { kind: "lost-race" };
         });
@@ -396,6 +416,7 @@ export async function POST(request: Request) {
             case "recorded":
                 recorded = { targetKey: bankLineId };
                 alreadyCleared = outcome.alreadyCleared;
+                alreadyResolved = outcome.alreadyResolved;
                 break;
             case "lost-race":
                 // Loop again for a fresh read — still under a fresh lock.
@@ -452,8 +473,20 @@ export async function POST(request: Request) {
     // The issue was already closed by the matcher; the memo is now recorded on
     // it, which is the whole point — a later reopen is suppressed. Nothing to
     // clear.
+    //
+    // `alreadyResolved` distinguishes the card-history race: the issue carried
+    // no record of ever having been asked, and it was already answered, so this
+    // signature is a valid late reply to a chase that has closed. A 200 with
+    // that flag, never a 422 — the forwarder must be able to retry it and get
+    // the same answer.
     if (alreadyCleared) {
-        return NextResponse.json({ ok: true, alreadyCleared: true, memoRecorded: true, targetKey: bankLineId });
+        return NextResponse.json({
+            ok: true,
+            alreadyCleared: true,
+            ...(alreadyResolved ? { alreadyResolved: true } : {}),
+            memoRecorded: true,
+            targetKey: bankLineId,
+        });
     }
 
     // Empty codes = lifecycle step 1 = clear, and it cancels any open episode.

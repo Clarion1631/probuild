@@ -375,9 +375,10 @@ test("a resume already past the open pass does not redo it", () => {
     assert.match(source, /while \(startPhase !== "lines" && Date\.now\(\) - startedAt < RUN_BUDGET_MS\)/);
     assert.match(source, /let openExhausted = startPhase === "lines";/);
     // The phase is persisted from what actually happened, in one place.
-    assert.match(source, /const phase = sweepPhaseAfter\(\{/);
-    // It also stamps the completion the morning cards cron waits for.
-    assert.match(source, /await writePhase\(phase, phase === "done" \? new Date\(\)\.toISOString\(\) : undefined\);/);
+    assert.match(source, /const computedPhase = sweepPhaseAfter\(\{/);
+    // It also stamps the completion the morning cards cron waits for — and
+    // ONLY when the register pull that fed this cycle was current.
+    assert.match(source, /await writePhase\(\s*phase,\s*decision\.complete \? new Date\(\)\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
     // A scheduled (non-resume) run always starts a fresh cycle.
     assert.match(source, /runSweep\(now, continueOnly \? resumePhase : "open-issues"\)/);
 });

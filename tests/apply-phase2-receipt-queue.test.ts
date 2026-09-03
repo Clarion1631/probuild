@@ -149,6 +149,28 @@ test("the round-2 columns are in the script, the migration AND schema.prisma", a
     }
 });
 
+test("BankLineObservation.clearedStatus is in the script, the migration AND schema.prisma", () => {
+    // Codex PR #443 gate, finding 1: the mint gate reads this column, so the
+    // apply script (prod) and the migration (CI's replayed database) must agree
+    // — a drift here is green CI over a production the client cannot query.
+    const ddl = 'ALTER TABLE "BankLineObservation" ADD COLUMN IF NOT EXISTS "clearedStatus" TEXT';
+    assert.ok((statements as string[]).some(s => normalize(s) === normalize(ddl)), "the apply script");
+    assert.ok(normalizedMigration.includes(normalize(ddl)), "and the committed migration");
+    assert.match(schemaPrisma, /clearedStatus String\?/, "and schema.prisma");
+});
+
+test("clearedStatus is verified NULLABLE and DEFAULTLESS, because NULL means 'never asked'", () => {
+    // The script does not just run DDL — it reads information_schema back. A
+    // DEFAULT of 'Uncleared' would be a claim QuickBooks never made, and a NOT
+    // NULL would force one onto every row written before the column existed.
+    const table = (expectedColumns as Record<string, Array<{ name: string; type: string; nullable: boolean; default: string | null }>>).BankLineObservation;
+    const column = table?.find(c => c.name === "clearedStatus");
+    assert.ok(column, "clearedStatus must be verified, not just created");
+    assert.equal(column.type, "text");
+    assert.equal(column.nullable, true, "NULL is 'nobody has asked', which is not 'uncleared'");
+    assert.equal(column.default, null, "there is no truthful backfill for a question never put");
+});
+
 test("the three-column BankLine index exists in all three places", () => {
     // Declared in schema.prisma too, or `prisma migrate diff` proposes creating
     // it on every future run and the committed migrations stop being TRUE.

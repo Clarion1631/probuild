@@ -34,6 +34,11 @@ const obs = (over: Partial<MintCandidateObservation> = {}): MintCandidateObserva
     rawDescriptor: "LOWES #02516 POS DEB C#8516",
     normalizedPayee: "LOWES #02516",
     checkNumber: null,
+    // The DEFAULT is cleared, so every test written before the clearance gate
+    // keeps testing what it was written to test — identity, cardinality,
+    // idempotency — rather than silently all becoming "does not mint". The gate
+    // itself gets its own tests below.
+    clearedStatus: "Reconciled",
     bankLineId: null,
     ...over,
 });

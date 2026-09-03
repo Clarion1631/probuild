@@ -80,7 +80,7 @@ test("a first-ever run is a full sweep", () => {
 
 test("highWaterOf takes the newest TxnDate and never moves backwards", () => {
     const line = (postedDate: string): BankRegisterIngestLine =>
-        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId: postedDate });
+        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId: postedDate, clearedStatus: "Reconciled" });
     assert.equal(highWaterOf([line("2026-08-30"), line("2026-09-01")], "2026-08-20"), "2026-09-01");
     assert.equal(highWaterOf([line("2026-08-01")], "2026-08-20"), "2026-08-20", "an older batch cannot rewind it");
     assert.equal(highWaterOf([], "2026-08-20"), "2026-08-20");
@@ -194,7 +194,7 @@ test("the deep sweep stamps its own date so the next one is a week away", async 
 
 test("resumeAfter drops the prefix already posted, in (date, qbTxnId) order", () => {
     const l = (postedDate: string, qbTxnId: string): BankRegisterIngestLine =>
-        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId });
+        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId, clearedStatus: "Reconciled" });
     const lines = [l("2026-08-02", "b"), l("2026-08-01", "z"), l("2026-08-02", "a")];
 
     // No resume point: everything, but ORDERED — the order is what makes
@@ -368,7 +368,7 @@ test("a row restated BEHIND the cursor (same qbTxnId, different content) is flag
 
 test("splitAtCursor: the prefix is everything resumeAfter would have discarded", () => {
     const l = (postedDate: string, qbTxnId: string): BankRegisterIngestLine =>
-        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId });
+        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId, clearedStatus: "Reconciled" });
     const lines = [l("2026-08-02", "b"), l("2026-08-01", "z"), l("2026-08-02", "a")];
 
     const noCursor = splitAtCursor(lines, null);
@@ -399,7 +399,7 @@ test("a COMPLETE run clears the continuation point", async () => {
 
 test("advanceScanBoundary moves to the window end, and never backwards", () => {
     const line = (postedDate: string): BankRegisterIngestLine =>
-        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId: postedDate });
+        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId: postedDate, clearedStatus: "Reconciled" });
     // An EMPTY window still advances the mark: we looked, and there was nothing.
     assert.equal(advanceScanBoundary("2026-01-01", "2026-03-01", []), "2026-03-01");
     assert.equal(advanceScanBoundary(null, "2026-03-01", []), "2026-03-01");
@@ -576,7 +576,7 @@ test("exhaustion at the LAST ingest batch checkpoints the batch before it", asyn
     const ordered = resumeAfter(
         ROWS.map(r => ({
             postedDate: r.date, amountCents: r.amountCents,
-            rawDescriptor: r.name ?? "", checkNumber: null, qbTxnId: r.qbTxnId as string,
+            rawDescriptor: r.name ?? "", checkNumber: null, qbTxnId: r.qbTxnId as string, clearedStatus: "Reconciled" as const,
         })),
         null,
     );

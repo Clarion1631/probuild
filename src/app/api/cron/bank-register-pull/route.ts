@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
-import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_AMBIGUOUS_KEY } from "@/lib/pipeline-health";
+import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_AMBIGUOUS_KEY, BANK_PULL_UNCLEARED_KEY } from "@/lib/pipeline-health";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { fetchBankRegister } from "@/lib/qbo-bank-register";
 import {
@@ -181,7 +181,7 @@ async function mintFromQbo(
             const [observations, existingLines] = await Promise.all([
                 tx.bankLineObservation.findMany({
                     where: { source: "QBO_REGISTER", account, postedDate: { gte: since } },
-                    select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, bankLineId: true },
+                    select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, clearedStatus: true, bankLineId: true },
                 }),
                 tx.bankLine.findMany({
                     where: { account, postedDate: { gte: since } },
@@ -198,6 +198,7 @@ async function mintFromQbo(
                     rawDescriptor: row.rawDescriptor,
                     normalizedPayee: bankLineIdentityPayee({ memo: row.rawDescriptor }),
                     checkNumber: row.checkNumber,
+                    clearedStatus: row.clearedStatus,
                     bankLineId: row.bankLineId,
                 })),
                 existingLines.map(row => ({
@@ -321,6 +322,37 @@ async function runPull() {
         // "enabled" branch inside the pull to get wrong.
         ...(process.env.BANK_LINE_MINT_FROM_QBO === "true" ? { mintFromQbo } : {}),
     });
+
+    // HOW MANY OBSERVATIONS QUICKBOOKS HAS NOT CLEARED.
+    //
+    // Counted directly, not read off the mint pass, because the mint pass only
+    // runs when BANK_LINE_MINT_FROM_QBO is on and this number is true either
+    // way. These rows are the honest residue of the clearance gate: real
+    // QuickBooks postings that stay observations — visible on the Bank page,
+    // absent from the canonical ledger, and therefore never chased — until
+    // QuickBooks says they cleared. A read failure leaves the previous count
+    // alone rather than writing a reassuring zero.
+    try {
+        const uncleared = await prisma.bankLineObservation.count({
+            where: {
+                source: "QBO_REGISTER",
+                account: BANK_REGISTER_ACCOUNT,
+                postedDate: { gte: registerWindowStart(new Date(), MINT_LOOKBACK_DAYS) },
+                bankLineId: null,
+                OR: [
+                    { clearedStatus: null },
+                    { clearedStatus: { notIn: ["Reconciled", "Cleared"] } },
+                ],
+            },
+        });
+        await prisma.automationSetting.upsert({
+            where: { key: BANK_PULL_UNCLEARED_KEY },
+            update: { value: String(uncleared) },
+            create: { key: BANK_PULL_UNCLEARED_KEY, value: String(uncleared) },
+        });
+    } catch (error) {
+        console.error("[cron/bank-register-pull] uncleared-count write failed", error instanceof Error ? error.message : "UnknownError");
+    }
 
     // Same-identity groups reconcile refused to guess a pairing for — a human
     // call, never auto-resolved. `summary.reconciled` is only absent when

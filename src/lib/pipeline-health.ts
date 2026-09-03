@@ -110,6 +110,34 @@ export interface PipelineHealth {
          */
         unassigned: CountProbe;
     };
+    /**
+     * THE REGISTER SECTION. The nightly QBO pull, and the honest residue of the
+     * clearance gate: `unclearedCount` is how many QuickBooks postings are
+     * sitting as observations because QuickBooks has not said they cleared the
+     * bank. They are not lost and they are not failures — they simply are not
+     * canonical lines yet, so nothing chases them. Reported so that number is
+     * SEEN rather than inferred from an absence of chases.
+     *
+     * OPTIONAL because `evaluatePipelineHealth` is testable with a partial
+     * snapshot and the digest only renders what it is given; `getPipelineHealth`
+     * always fills both in.
+     */
+    bankPull?: {
+        status: ProbeStatus;
+        reason?: string;
+        enabled: boolean;
+        lastSuccessAt: string | null;
+        ambiguousCount: number;
+        unclearedCount?: number;
+    };
+    /** The missing-receipt sweep's marker, including why it is holding back. */
+    chaser?: {
+        status: ProbeStatus;
+        reason?: string;
+        phase: string;
+        completedAt: string | null;
+        blockedReason?: string | null;
+    };
 }
 
 /** A row this old in a working state has not been picked up, it has jammed. */
@@ -263,7 +291,7 @@ export function evaluatePipelineHealth(input: {
      * as "the pull is switched off", i.e. as HEALTH — and the one check that
      * watches the chaser's whole input went quiet exactly when it was needed.
      */
-    bankPull: { status: ProbeStatus; reason?: string; enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number };
+    bankPull: { status: ProbeStatus; reason?: string; enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number; unclearedCount?: number };
     /** Chat cards whose delivery was never confirmed and which nobody has resolved. */
     uncertainCards: CountProbe;
     /** Can we authenticate to Drive at all? Gates the signed-memo path. */
@@ -272,7 +300,18 @@ export function evaluatePipelineHealth(input: {
      * The missing-receipt sweep's own marker: which half it is in, and when it
      * last finished a clean cycle.
      */
-    chaser: { status: ProbeStatus; reason?: string; phase: string; completedAt: string | null };
+    chaser: {
+        status: ProbeStatus;
+        reason?: string;
+        phase: string;
+        completedAt: string | null;
+        /**
+         * Why the sweep is deliberately NOT stamping its completion, when that
+         * is the case. Optional: a marker written by an older build carries no
+         * such field, and absent must read as "not blocked", never as unknown.
+         */
+        blockedReason?: string | null;
+    };
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -378,6 +417,19 @@ export function evaluatePipelineHealth(input: {
         reasons.push(`bank-pull-ambiguous:${input.bankPull.ambiguousCount}`);
     }
 
+    // THE CHASER REFUSING TO FINISH ON PURPOSE.
+    //
+    // Distinct from `chaser-stale`, and it has to be: the sweep stops stamping
+    // its completion when the nightly register pull is not fresh (see
+    // BANK_PULL_CHASER_WINDOW_HOURS), which is correct — cards built on a stale
+    // register ask for the wrong receipts — but on its own it is SILENT. The
+    // chaser looks like it is merely slow, `bank-pull-stale` does not fire for
+    // another eleven hours (36h vs 24h), and the 14:30 UTC cards simply never
+    // go out. This says which of the two it is, immediately.
+    if (input.chaser.status === "ok" && input.chaser.blockedReason) {
+        reasons.push(`chaser-blocked:${input.chaser.blockedReason}`);
+    }
+
     // A CHASER THAT HAS NOT FINISHED is the input every other receipt surface
     // depends on. Reported in HOURS so the digest says how long, rather than
     // just that something is wrong.
@@ -417,6 +469,24 @@ export function evaluatePipelineHealth(input: {
 export const BANK_PULL_STALE_HOURS = 36;
 
 /**
+ * How fresh the register pull's last SUCCESS must be for the missing-receipt
+ * chaser to call its own cycle complete and release the morning cards.
+ *
+ * TIGHTER THAN THE ALARM ABOVE, and for a different job. `BANK_PULL_STALE_HOURS`
+ * asks "is the pull dead?" and is deliberately slack so one slow night does not
+ * page anybody. This asks "did the pull that feeds TODAY'S chase actually run?"
+ * and must not be slack at all.
+ *
+ * From vercel.json: `/api/cron/bank-register-pull` runs at 02:00 UTC daily and
+ * `/api/cron/receipt-requests` at 13:00 UTC, with `?continue=1` resumes every
+ * 15 minutes and the cards going out at 14:30 UTC on weekdays. So at chaser
+ * time a healthy pull is ~11h old, and last night's pull — the one that means
+ * tonight's failed — is ~35h old. 24h separates those two cleanly while still
+ * tolerating a pull that ran late.
+ */
+export const BANK_PULL_CHASER_WINDOW_HOURS = 24;
+
+/**
  * The chaser runs a full sweep daily (plus 15-minute resume passes), so 26h is
  * one missed night with room for a slow morning — short enough that the alarm
  * lands BEFORE the next day's cards are due, which is the whole point of
@@ -439,6 +509,20 @@ export const BANK_PULL_LAST_SUCCESS_KEY = "bankRegisterPullLastSuccess";
 export const BANK_PULL_AMBIGUOUS_KEY = "bankRegisterPullAmbiguousCount";
 
 /**
+ * Where the pull records how many QBO_REGISTER observations QuickBooks has NOT
+ * cleared, inside the mint lookback window and not yet linked to a canonical
+ * line.
+ *
+ * NOT A FAILURE, and deliberately not a `reason`. These are real postings that
+ * are honestly still in flight: an uncleared card charge, a check nobody has
+ * cashed, a manually entered journal QuickBooks classifies as neither. They
+ * stay observations — on the Bank page, out of the canonical ledger, never
+ * chased — until QuickBooks says the money moved. It is reported so the number
+ * is VISIBLE rather than inferred from the absence of chases.
+ */
+export const BANK_PULL_UNCLEARED_KEY = "bankRegisterPullUnclearedCount";
+
+/**
  * Is the nightly pull on, and when did it last SUCCEED?
  *
  * A read failure reports `enabled: false` rather than "enabled and stale":
@@ -452,21 +536,24 @@ export const BANK_PULL_AMBIGUOUS_KEY = "bankRegisterPullAmbiguousCount";
  * knows how to say "we could not read this" (`probe-failed:bankPull`) and how
  * to give up on a hung database instead of holding the whole health check open.
  */
-async function readBankPullState(): Promise<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number }> {
+async function readBankPullState(): Promise<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number; unclearedCount: number }> {
     // ENABLED BECAUSE THE CRON EXISTS. The previous gate keyed off
     // BANK_LINE_MINT_FROM_QBO — an undocumented env var that controls MINTING,
     // not the pull — so with minting off (its shipped default) the pull could
     // be dead for weeks and health stayed green. The pull is scheduled in
     // vercel.json unconditionally, so it is expected to run unconditionally.
-    const [successRow, ambiguousRow] = await Promise.all([
+    const [successRow, ambiguousRow, unclearedRow] = await Promise.all([
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_UNCLEARED_KEY } }),
     ]);
     const parsedAmbiguous = ambiguousRow?.value ? Number.parseInt(ambiguousRow.value, 10) : 0;
+    const parsedUncleared = unclearedRow?.value ? Number.parseInt(unclearedRow.value, 10) : 0;
     return {
         enabled: true,
         lastSuccessAt: successRow?.value || null,
         ambiguousCount: Number.isFinite(parsedAmbiguous) ? parsedAmbiguous : 0,
+        unclearedCount: Number.isFinite(parsedUncleared) ? parsedUncleared : 0,
     };
 }
 
@@ -698,10 +785,10 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // IN the Promise.all, and probed: it used to be an unprobed `await`
         // after it, so a hung database held the whole health check open past
         // every other probe's deadline and then answered "switched off".
-        probe<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number }>(
+        probe<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number; unclearedCount: number }>(
             "bankPull",
             readBankPullState,
-            { enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
+            { enabled: false, lastSuccessAt: null, ambiguousCount: 0, unclearedCount: 0 },
         ),
         // Can we authenticate to Drive? Asked here rather than at the moment a
         // memo arrives, because the answer "no" produces no symptom anywhere
@@ -710,15 +797,15 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // The chaser's own marker. Everything on the Receipts tab and every
         // morning card is downstream of it, and a stalled one is otherwise
         // silent: the cards cron answers 200 with `skipped:"chaser-incomplete"`.
-        probe<{ phase: string; completedAt: string | null }>(
+        probe<{ phase: string; completedAt: string | null; blockedReason: string | null }>(
             "chaser",
             async () => {
                 const { SWEEP_MARKER_KEY, parseSweepMarker } = await import("./receipt-sweep-marker");
                 const row = await prisma.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } });
                 const marker = parseSweepMarker(row?.value);
-                return { phase: marker.phase, completedAt: marker.chaserCompletedAt };
+                return { phase: marker.phase, completedAt: marker.chaserCompletedAt, blockedReason: marker.blockedReason ?? null };
             },
-            { phase: "unknown", completedAt: null },
+            { phase: "unknown", completedAt: null, blockedReason: null },
         ),
         probe<{ ok: boolean; source: string }>(
             "driveCredentials",
@@ -780,6 +867,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             reason: chaser.reason,
             phase: chaser.value.phase,
             completedAt: chaser.value.completedAt,
+            blockedReason: chaser.value.blockedReason,
         },
         driveCredentials: {
             status: driveCredentials.status,
@@ -793,6 +881,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             enabled: bankPull.value.enabled,
             lastSuccessAt: bankPull.value.lastSuccessAt,
             ambiguousCount: bankPull.value.ambiguousCount,
+            unclearedCount: bankPull.value.unclearedCount,
         },
     };
 
@@ -815,6 +904,12 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             needsReview: snapshot.intakeNeedsReview,
             unassigned: snapshot.intakeUnassigned,
         },
+        // The register section. `unclearedCount` is the honest residue of the
+        // clearance gate — postings QuickBooks has not cleared, which stay
+        // observations rather than becoming canonical lines — and it belongs
+        // where somebody can see it, not only in a cron log.
+        bankPull: snapshot.bankPull,
+        chaser: snapshot.chaser,
     };
 }
 

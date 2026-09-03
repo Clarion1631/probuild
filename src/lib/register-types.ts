@@ -27,3 +27,40 @@ export function isPurchaseType(t: string): boolean {
 export function isMoneyInType(t: string): boolean {
     return MONEY_IN_TYPES.has(t);
 }
+
+/**
+ * BANK CLEARANCE, as QuickBooks itself reports it.
+ *
+ * "Reconciled" — the row was matched during a completed bank reconciliation.
+ * "Cleared"    — marked cleared but not yet in a finished reconciliation.
+ * "Uncleared"  — QuickBooks has it as open from a reconciliation point of view.
+ * "Unknown"    — QuickBooks did not classify it either way, or we could not ask.
+ *
+ * "Unknown" is a real, common answer, not an error state: a Journal Entry
+ * touching the bank account appears in NONE of the three `cleared` buckets
+ * (verified against the live realm 2026-09-02 — GL row 6557, "Journal Entry",
+ * was in neither the Reconciled nor the Uncleared TransactionList). A manually
+ * entered journal is precisely the "fake bank truth" case, so it must read as
+ * unknown rather than be quietly folded into either side.
+ */
+export type ClearedStatus = "Reconciled" | "Cleared" | "Uncleared" | "Unknown";
+
+const CLEARED_STATUSES = new Set<string>(["Reconciled", "Cleared", "Uncleared", "Unknown"]);
+
+/** Narrows an arbitrary string to a `ClearedStatus`. */
+export function isClearedStatusValue(value: unknown): value is ClearedStatus {
+    return typeof value === "string" && CLEARED_STATUSES.has(value);
+}
+
+/**
+ * May a row in this state become a CANONICAL BankLine?
+ *
+ * Only a positively cleared row. Everything else — uncleared, unknown, a null
+ * from a row stored before this column existed — stays an observation. The
+ * predicate is POSITIVE on purpose: every absence of evidence lands on the
+ * safe side, which is what keeps an uncleared check from minting fake bank
+ * truth and starting a receipt chase for money that never left the account.
+ */
+export function isClearedForMint(value: string | null | undefined): boolean {
+    return value === "Reconciled" || value === "Cleared";
+}

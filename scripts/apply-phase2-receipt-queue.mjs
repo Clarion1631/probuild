@@ -103,6 +103,21 @@ export const statements = [
        END IF;
      END $$`,
 
+    // 1b. BankLineObservation.clearedStatus — what QuickBooks says about the
+    // row's BANK CLEARANCE ('Reconciled' | 'Cleared' | 'Uncleared' | 'Unknown').
+    //
+    // NULLABLE WITH NO DEFAULT, deliberately. Every observation that exists
+    // today was stored before anybody asked QuickBooks the question, so there
+    // is no truthful backfill: NULL means "never asked", and the mint gate
+    // (isClearedForMint) treats it exactly like "not cleared". Defaulting it to
+    // 'Uncleared' would be a claim QuickBooks never made.
+    //
+    // No CHECK constraint: the closed set is enforced at the one boundary that
+    // writes it (isClearedStatusValue, in the ingest route), and a CHECK here
+    // would turn a future fifth QuickBooks value into a nightly-pull outage
+    // rather than a row that simply does not mint.
+    `ALTER TABLE "BankLineObservation" ADD COLUMN IF NOT EXISTS "clearedStatus" TEXT`,
+
     // Adoption looks lines up by (account, postedDate, amountCents,
     // normalizedPayee) and then filters on sourceOfRecord — index the lookup,
     // not the flag.
@@ -211,6 +226,13 @@ export const statements = [
 export const expectedColumns = {
     BankLine: [
         { name: "sourceOfRecord", type: "text", nullable: false, default: "'STATEMENT'::text" },
+    ],
+    BankLineObservation: [
+        // NULLABLE and DEFAULTLESS is the load-bearing part: NULL means nobody
+        // has asked QuickBooks about this row's clearance yet, which is a
+        // different fact from "QuickBooks says it is uncleared". Both keep the
+        // row out of the canonical ledger; only one of them is a claim.
+        { name: "clearedStatus", type: "text", nullable: true, default: null },
     ],
     ReceiptRequestCard: [
         { name: "id", type: "text", nullable: false, default: null },

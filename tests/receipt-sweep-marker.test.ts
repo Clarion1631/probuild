@@ -48,23 +48,44 @@ test("the marker row still reads correctly when an older build wrote it", () => 
     // It used to hold a bare phase string. That must parse as "no completion
     // recorded" — the reading that BLOCKS selection — rather than throwing or
     // being taken as done.
-    assert.deepEqual(parseSweepMarker("lines"), { phase: "lines", chaserCompletedAt: null });
-    assert.deepEqual(parseSweepMarker("done"), { phase: "done", chaserCompletedAt: null });
+    // A bare phase carries no block either — absent must read as "nothing is
+    // holding this back", never as an unknown that alarms.
+    assert.deepEqual(parseSweepMarker("lines"), { phase: "lines", chaserCompletedAt: null, blockedReason: null });
+    assert.deepEqual(parseSweepMarker("done"), { phase: "done", chaserCompletedAt: null, blockedReason: null });
+    // And a JSON marker from the build BEFORE blockedReason existed.
+    assert.deepEqual(
+        parseSweepMarker(JSON.stringify({ phase: "done", chaserCompletedAt: "2026-09-02T13:20:00Z" })),
+        { phase: "done", chaserCompletedAt: "2026-09-02T13:20:00Z", blockedReason: null },
+    );
     assert.equal(chaserCompletedFor(parseSweepMarker("done"), "2026-09-02"), false);
     // Junk is not a licence to assume anything either.
     for (const junk of ["", "  ", "{not json", "[]", "null", undefined, null]) {
         assert.equal(chaserCompletedFor(parseSweepMarker(junk as string), "2026-09-02"), false, String(junk));
     }
-    // Round-trips.
-    const marker = { phase: "lines" as const, chaserCompletedAt: "2026-09-02T13:20:00Z" };
+    // Round-trips, block and all.
+    const marker = { phase: "lines" as const, chaserCompletedAt: "2026-09-02T13:20:00Z", blockedReason: null };
     assert.deepEqual(parseSweepMarker(formatSweepMarker(marker)), marker);
+    const blocked = { phase: "lines" as const, chaserCompletedAt: null, blockedReason: "bank-pull-stale" };
+    assert.deepEqual(parseSweepMarker(formatSweepMarker(blocked)), blocked);
+    // An empty string is not a reason.
+    assert.equal(parseSweepMarker(JSON.stringify({ phase: "done", blockedReason: "" })).blockedReason, null);
+    assert.equal(parseSweepMarker(JSON.stringify({ phase: "done", blockedReason: 7 })).blockedReason, null);
 });
 
 test("the sweep stamps only a clean cycle, and the cards cron refuses without one", () => {
     const sweep = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     // "done" stamps; anything else carries the previous stamp forward.
-    assert.match(sweep, /await writePhase\(phase, phase === "done" \? new Date\(\)\.toISOString\(\) : undefined\);/);
+    assert.match(sweep, /await writePhase\(\s*phase,\s*decision\.complete \? new Date\(\)\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
     assert.match(sweep, /chaserCompletedAt: completedAt \?\? previous\.chaserCompletedAt,/);
+    // A STALE BANK PULL CANNOT REACH "done". The phase is forced back to
+    // "lines" so `shouldResumeSweep` keeps saying yes and the every-15-minutes
+    // resume stamps as soon as the pull recovers — leaving it "done" would make
+    // the resume exit with "nothing-in-progress" and lose the day's cards to an
+    // outage that had already been fixed (Codex PR #443 gate, finding 3).
+    assert.match(sweep, /const decision = sweepCompletionDecision\(\{ computedPhase, bankPullStale \}\);/);
+    // The block reason is RESTATED on every write, never carried forward, or
+    // `chaser-blocked` would keep firing after the pull recovered.
+    assert.match(sweep, /blockedReason,/);
 
     const cards = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     // The gate is now a named verdict, because the RETRY pass consults it too:

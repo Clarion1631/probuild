@@ -32,6 +32,7 @@ import {
     type ReceiptRequestPlan,
 } from "@/lib/receipt-requests";
 import { REGISTER_WINDOW_DAYS, registerWindowStartYmd } from "@/lib/bank-register-pull";
+import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_CHASER_WINDOW_HOURS } from "@/lib/pipeline-health";
 import {
     SWEEP_MARKER_KEY,
     formatSweepMarker,
@@ -111,6 +112,98 @@ const OPEN_ISSUE_BATCH_SIZE = 100;
 
 /** Which half of the sweep is in progress. Persisted, so a resume knows. */
 const PHASE_KEY = SWEEP_MARKER_KEY;
+
+/**
+ * HOW FRESH THE BANK PULL MUST BE BEFORE THIS CYCLE MAY CALL ITSELF DONE.
+ *
+ * THE CRON SCHEDULE, from vercel.json, because the whole rule is about how
+ * these four lines relate:
+ *
+ *   0 2 * * *        /api/cron/bank-register-pull      the register this reads
+ *   0 13 * * *       /api/cron/receipt-requests        this sweep, full run
+ *   0/15 * * * *     /api/cron/receipt-requests?continue=1   its resume passes
+ *   30 14 * * 1-5    /api/cron/receipt-request-cards   the cards it releases
+ *
+ * The pull withholds its success marker when it failed, when a batch errored,
+ * when it ran out of budget mid-window, or when reconcile left an ambiguous
+ * group — all of which mean the register is INCOMPLETE. Nothing checked that.
+ * So the sweep could reconcile a half-populated ledger, stamp its cycle
+ * complete, and release the 14:30 cards: charges the pull never fetched are not
+ * chased, and nothing anywhere says why.
+ *
+ * A cycle may only stamp when the last COMPLETE pull success is inside this
+ * window. 24h at the 13:00 slot cleanly separates a healthy pull (~11h old)
+ * from last night's (~35h old, meaning tonight's failed), while tolerating a
+ * pull that ran late. It lives in pipeline-health beside BANK_PULL_STALE_HOURS
+ * so the two thresholds are read together and cannot drift apart.
+ */
+const BANK_PULL_CYCLE_WINDOW_MS = BANK_PULL_CHASER_WINDOW_HOURS * 60 * 60_000;
+
+/** The one `blockedReason` this sweep writes. */
+export const BANK_PULL_STALE_REASON = "bank-pull-stale";
+
+/**
+ * Is a recorded pull success fresh enough for this cycle? PURE, so the boundary
+ * is testable without a database.
+ *
+ * Four ways to be stale, and all of them are: never succeeded (null), an
+ * unparseable value, older than the window, and — less obviously — a mark in
+ * the FUTURE. A future timestamp is a clock nobody can trust, and treating it
+ * as fresh would hold the gate open for as long as it was wrong.
+ */
+export function bankPullFresh(lastSuccessAt: string | null, now: Date): boolean {
+    if (!lastSuccessAt) return false;
+    const at = Date.parse(lastSuccessAt);
+    if (!Number.isFinite(at)) return false;
+    if (at > now.getTime()) return false;
+    return now.getTime() - at <= BANK_PULL_CYCLE_WINDOW_MS;
+}
+
+/**
+ * What a finished run should write, given the phase it computed and whether its
+ * register input was current. PURE — the two decisions the cards depend on, in
+ * one place that can be tested directly.
+ *
+ * A stale pull may NOT reach "done". The phase is held at "lines" so
+ * `shouldResumeSweep` keeps answering yes: leaving it "done" without a stamp
+ * would make the every-15-minutes resume exit with "nothing-in-progress", and a
+ * pull that recovered at 03:00 could never be picked up — the day's cards lost
+ * to an outage that was already over. Held open, the next continuation stamps
+ * the moment the marker is fresh, hours before the 14:30 cards.
+ */
+export function sweepCompletionDecision(input: {
+    computedPhase: SweepPhase;
+    bankPullStale: boolean;
+}): { phase: SweepPhase; complete: boolean; blockedReason: string | null } {
+    const phase: SweepPhase = input.bankPullStale && input.computedPhase === "done" ? "lines" : input.computedPhase;
+    return {
+        phase,
+        complete: phase === "done",
+        // Restated every write, never carried forward, or `chaser-blocked`
+        // would keep firing after the pull recovered.
+        blockedReason: input.bankPullStale ? BANK_PULL_STALE_REASON : null,
+    };
+}
+
+/**
+ * Did the register pull last SUCCEED inside this cycle's window?
+ *
+ * A read failure is NOT fresh. The marker is the only evidence the sweep has
+ * that its input is complete, and "we could not check" is not evidence — the
+ * safe direction is the one that withholds the cards, because a missed morning
+ * is recoverable and a wrong one costs the owner their whole day (the card
+ * claim is per owner per Pacific day).
+ */
+async function readBankPullFreshness(now: Date): Promise<{ fresh: boolean; lastSuccessAt: string | null }> {
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } });
+        const value = row?.value || null;
+        return { fresh: bankPullFresh(value, now), lastSuccessAt: value };
+    } catch (error) {
+        console.error("[cron/receipt-requests] bank-pull marker read failed", error instanceof Error ? error.message : "UnknownError");
+        return { fresh: false, lastSuccessAt: null };
+    }
+}
 
 /**
  * The sweep's two passes, in order, plus "done".
@@ -200,12 +293,18 @@ async function readPhase(): Promise<SweepPhase> {
  * FORWARD on every other write — losing it would block tomorrow's cards on a
  * technicality.
  */
-async function writePhase(phase: SweepPhase, completedAt?: string): Promise<void> {
+async function writePhase(phase: SweepPhase, completedAt?: string, blockedReason: string | null = null): Promise<void> {
     try {
         const previous = await readMarker();
         const value = formatSweepMarker({
             phase,
             chaserCompletedAt: completedAt ?? previous.chaserCompletedAt,
+            // NOT carried forward. Unlike the completion stamp — which is a true
+            // statement about a cycle that really happened — a block is a
+            // statement about the run that is ending right now, so every write
+            // restates it or clears it. Carrying a stale one forward would keep
+            // `chaser-blocked` firing after the pull recovered.
+            blockedReason,
         });
         await prisma.automationSetting.upsert({
             where: { key: PHASE_KEY },
@@ -1537,7 +1636,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     // pass just cleared cannot, and a run that finished the open pass and then
     // spent its budget parked NEITHER cursor, so `?continue=1` saw nothing in
     // progress and the line half waited for tomorrow.
-    const phase = sweepPhaseAfter({
+    const computedPhase = sweepPhaseAfter({
         openExhausted,
         openErrors: openPass.errors,
         openContended,
@@ -1545,6 +1644,32 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         lineErrors: totals.errors - openPass.errors,
         lineContended,
     });
+
+    // THE REGISTER THIS CYCLE READ HAS TO HAVE BEEN CURRENT.
+    //
+    // Read at the END, not the start: the pull runs on its own schedule and can
+    // land while this sweep is working, and the question is whether the ledger
+    // the cycle is about to certify is complete — not whether it was complete
+    // when the cycle began.
+    //
+    // A stale pull does NOT stop the sweep. Every close it just made is still
+    // right (a receipt that arrived is a receipt that arrived), and so is every
+    // chase it opened against a line that does exist. What is not right is
+    // calling the cycle finished: the pull's failure means lines are MISSING,
+    // and those charges would go unchased while the morning card said the list
+    // was complete.
+    //
+    // So the completion stamp is withheld AND the phase is held open at
+    // "lines". Leaving it "done" would make `shouldResumeSweep` answer false,
+    // the every-15-minutes resume would exit with "nothing-in-progress", and a
+    // pull that recovered at 03:00 could never be picked up — today's cards
+    // would be lost to a pull outage that had already been fixed. Held at
+    // "lines", the next continuation re-runs the line pass and stamps as soon
+    // as the marker is fresh, with hours to spare before the 14:30 cards.
+    const bankPull = await readBankPullFreshness(new Date());
+    const bankPullStale = !bankPull.fresh;
+    const decision = sweepCompletionDecision({ computedPhase, bankPullStale });
+    const phase = decision.phase;
     // A CLEAN, COMPLETE cycle stamps the clock the cards cron reads. Anything
     // else leaves the previous stamp alone: yesterday's completion is still a
     // true statement about yesterday, and the cards cron compares it to TODAY.
@@ -1552,11 +1677,20 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     // "Anything else" INCLUDES a run that left contended work behind. The stamp
     // is a claim that tonight's issue set is reconciled, and a component nobody
     // could reconcile makes that claim false.
-    await writePhase(phase, phase === "done" ? new Date().toISOString() : undefined);
+    await writePhase(
+        phase,
+        decision.complete ? new Date().toISOString() : undefined,
+        decision.blockedReason,
+    );
 
     const result = {
         ok: totals.errors === 0,
         phase,
+        // Why this cycle is not stamping complete, when that is the reason.
+        // Named in the summary as well as the marker so a cron log answers the
+        // question without a database read.
+        ...(bankPullStale ? { reason: BANK_PULL_STALE_REASON } : {}),
+        bankPull: { fresh: bankPull.fresh, lastSuccessAt: bankPull.lastSuccessAt },
         window: { start: windowStart, end: windowEnd },
         batches,
         openBatches,
@@ -1572,8 +1706,9 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         contended: openContended + lineContended,
         exhausted,
         // Work remains if EITHER pass has more to do — including a pass that
-        // exhausted its pages but left a component unreconciled.
-        moreToProcess: !exhausted || !openExhausted || openContended > 0 || lineContended > 0,
+        // exhausted its pages but left a component unreconciled, and including a
+        // cycle held open because the register it read was not current.
+        moreToProcess: !exhausted || !openExhausted || openContended > 0 || lineContended > 0 || bankPullStale,
         cursor,
         elapsedMs: Date.now() - startedAt,
         ...totals,

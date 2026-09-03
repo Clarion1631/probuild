@@ -10,6 +10,20 @@
  * This is HISTORY, not a lifecycle event: it rides `displayDetails`, which is
  * deliberately not part of the reason hash, so writing it opens no generation
  * and sends no second alert.
+ *
+ * A CLEARED ISSUE STILL GETS ITS RECORD (Codex PR #443 gate, finding 2). This
+ * used to skip them, on the reasoning that touching an answered issue could
+ * overwrite its resolution. The reasoning was right; the remedy was too broad.
+ * An issue that clears between the webhook confirming the post and this
+ * transaction running is a RACE, not a decision — and skipping it left the item
+ * with no thread record at all, so `hasRecordedMemoRequest` was false and a
+ * memo signed in that thread came back 422 `not-requested`. The record is
+ * therefore written on cleared issues too, and the write is narrowly scoped to
+ * make the original fear impossible: the details are merged from the row read
+ * INSIDE the CAS, `appendCardRecord` only appends to `cards[]`, and the update
+ * touches `displayDetails` and `version` alone. `clearedAt`, `resolution` and
+ * every other lifecycle field are never named in the write, so a resolution
+ * cannot be un-answered by it.
  */
 import { prisma } from "@/lib/prisma";
 import { appendCardRecord } from "@/lib/receipt-requests";
@@ -68,9 +82,12 @@ export async function recordCardOnIssues(
             where: { id: item.issueId },
             select: { id: true, version: true, displayDetails: true, clearedAt: true },
         });
-        // Answered while the card was posting. The card mentions it; that is
-        // cosmetic and self-correcting. Touching the issue is not.
-        if (!issue || issue.clearedAt !== null) { skipped++; continue; }
+        // Only a MISSING issue is skipped. A cleared one still gets its record
+        // — see the note at the top of this file: the card really was posted
+        // about it, and the thread record is how a reply in that thread is
+        // resolved. Losing it because the answer landed a few hundred
+        // milliseconds early is the race this closes.
+        if (!issue) { skipped++; continue; }
 
         const details = appendCardRecord(
             parseMissingReceiptDetails(issue.displayDetails),
@@ -82,8 +99,16 @@ export async function recordCardOnIssues(
         // meant handing it a codes array, and any stale array is a reopen
         // waiting to happen. Losing the CAS costs one thread record — the next
         // card re-records it — and never costs a resolution.
+        //
+        // THE VERSION IS THE WHOLE GUARD; `clearedAt: null` is deliberately NOT
+        // in it any more. It made the write a no-op the instant an issue
+        // cleared, which is the race above. The version CAS already refuses any
+        // row that moved since the read, and the `data` names only
+        // `displayDetails` and `version` — so a clear that commits between the
+        // read and this line loses the CAS and is retried by the next card,
+        // while a clear that already committed is preserved untouched.
         const written = await client.reviewIssue.updateMany({
-            where: { id: issue.id, version: issue.version, clearedAt: null },
+            where: { id: issue.id, version: issue.version },
             data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
         });
         if (written.count === 0) {
@@ -125,13 +150,17 @@ export async function itemsMissingCardRecord(
     if (itemIds.length === 0) return [];
     const issues = await client.reviewIssue.findMany({
         where: { id: { in: [...itemIds] } },
-        select: { id: true, displayDetails: true, clearedAt: true },
+        select: { id: true, displayDetails: true },
     });
     const missing: string[] = [];
     for (const issue of issues) {
-        // A cleared issue is deliberately never touched — its answer outranks
-        // its history.
-        if (issue.clearedAt !== null) continue;
+        // CLEARED ISSUES ARE REPAIRED TOO. This used to skip them, which meant
+        // the repair path could never fix the one case that most needs fixing:
+        // an item whose issue cleared before its thread record was written has
+        // no record AND no way to get one, so a memo signed in that thread has
+        // nothing to resolve against. Recording is safe on a cleared issue (see
+        // recordCardOnIssues above) — it appends history and never touches the
+        // resolution.
         if (!issueHasCardRecord(parseMissingReceiptDetails(issue.displayDetails), requestId)) {
             missing.push(issue.id);
         }
