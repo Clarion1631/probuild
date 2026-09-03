@@ -610,10 +610,33 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
         // is not an error at all — it means a human already booked this payment,
         // which is exactly what the guard is for. Say so, in words, once.
         if (isDeterministicQboGuardFailure(built.reason)) {
+            // G1: once the sweep STAGED this milestone's invoice, a QuickBooks
+            // document definitely exists. `unmatched` sits outside the partial
+            // reservation index, so it would hand the milestone to the next
+            // deposit that wanted it. Reconcile, holding the hold.
+            //
+            // Re-read: `row` was loaded BEFORE stageInvoicePush wrote the
+            // marker in this same request, so the in-memory copy is stale on
+            // exactly the path this rule exists for. Only on a guard failure,
+            // so the happy path pays nothing for it.
+            const persisted = await prisma.depositIngest.findUnique({
+                where: { id: row.id },
+                select: { extracted: true },
+            });
+            if (stagedScheduleIdOf(persisted?.extracted ?? row.extracted)) {
+                return await finalizeReconcile(row,
+                    `${qboGuardNote(built, schedule.invoiceCode)}; the sweep had already created the QuickBooks invoice ` +
+                    `for ${schedule.invoiceCode}, so this milestone stays held — check QuickBooks before recording it`, {});
+            }
             return await finalizeUnmatched(row, qboGuardNote(built, schedule.invoiceCode));
         }
         throw new Error(`QuickBooks guard failed (${built.reason}) for invoice ${schedule.invoiceCode}`);
     }
+
+    // Last chance to notice a human took this deposit's review task (G2): the
+    // next statement is the QuickBooks money boundary.
+    const lostTask = await assertSweepOwnsTask(row);
+    if (lostTask) return lostTask;
 
     // Persist the EXACT bytes BEFORE the network call fires — a crash/timeout on the
     // send still leaves the row able to replay byte-identically with the same requestid.
@@ -1306,38 +1329,115 @@ function describeBoundaryMarkers(row: DepositIngest): string[] {
 }
 
 /**
- * Is the review task this row filed still the SWEEP's to answer?
+ * REVIEW-TASK OWNERSHIP (gate review G2).
  *
  * An `unmatched` row has already asked a human. Re-evaluating it while that
- * human is working the same deposit is how two writers end up booking one
- * payment — they could be creating the QBO invoice by hand at the very moment
- * the sweep passes its balance check. OfficeTask carries no explicit "claimed"
- * flag, so the rule is built from the signals it does have:
+ * human works the same deposit is how two writers book one payment — they
+ * could be creating the QBO invoice by hand at the very moment the sweep passes
+ * its balance check. Reading the task and hoping was a check-then-act race; the
+ * sweep now CLAIMS the task, and re-asserts that claim immediately before every
+ * money boundary, so both parties contend on ONE database row.
  *
- *   - `archivedAt` set   → somebody finished with it (the board's done marker,
- *                          archiveOfficeTask in src/lib/actions.ts);
- *   - `assigneeId` set   → somebody owns it;
- *   - moved off the INTAKE column (the first column, which is where
- *                          createDepositReviewTask files every one of these)
- *                        → somebody is working it.
+ * THE MARKER, and why it is `status`. OfficeTask has no ownership column, and
+ * `assigneeId` is a foreign key to User — claiming with it would mean seeding
+ * a synthetic bot user (there is none: nothing in actions.ts, the activity log
+ * or the seeds uses one), and that user would then surface in the team list,
+ * the dispatch board and every assignee picker. `status` is the least-abusive
+ * column that exists: schema.prisma calls it LEGACY, "kept in sync with
+ * column.name on create/move ... reads should use columnId", and nothing in
+ * src/ branches on it or renders it (TasksBoardClient carries it in its type
+ * and never shows it). A claim written there costs nothing a human can see.
  *
- * Any of those, and the row stays terminal. No task at all (never filed, or the
- * create failed) means nobody is holding it, so the sweep may look again.
+ * WHY THIS IS CONTENTION AND NOT A SECOND READ: every human action writes the
+ * very fields the claim pins, on the same row —
+ *   updateOfficeTask  (src/lib/actions.ts) → assigneeId
+ *   moveOfficeTask    (src/lib/actions.ts) → columnId AND status (= the target
+ *                                            column's name, which overwrites
+ *                                            the claim outright)
+ *   archiveOfficeTask (src/lib/actions.ts) → archivedAt
+ * so a human assigning, moving or archiving makes every later re-assert miss.
+ * A human assign deliberately WINS over the sweep's claim: that is the
+ * contention this exists to have.
  */
-async function reviewTaskIsUntouched(officeTaskId: string | null): Promise<boolean> {
-    if (!officeTaskId) return true;
-    const task = await prisma.officeTask.findUnique({
-        where: { id: officeTaskId },
-        select: { archivedAt: true, assigneeId: true, columnId: true },
-    });
-    if (!task) return true; // deleted out from under the row — nobody is holding it
-    if (task.archivedAt || task.assigneeId) return false;
-    const intake = await prisma.officeBoardColumn.findFirst({
+const SWEEP_TASK_CLAIM = "Deposit sweep working";
+
+/** The column createDepositReviewTask files every deposit review into. */
+async function intakeColumn(): Promise<{ id: string; name: string } | null> {
+    return await prisma.officeBoardColumn.findFirst({
         orderBy: [{ position: "asc" }, { createdAt: "asc" }],
-        select: { id: true },
+        select: { id: true, name: true },
     });
-    // No intake column resolvable means "cannot prove untouched" — stay terminal.
-    return !!intake && task.columnId === intake.id;
+}
+
+/**
+ * Take ownership of the review task before re-evaluating its row. Zero rows
+ * updated means a human has it, and the row stays terminal.
+ *
+ * A NULL officeTaskId is the ONLY "nobody is holding this" case — it means the
+ * task was never filed (the create failed), which self-heals. A non-null id
+ * that no longer RESOLVES is terminal (gate review G3): deleting a review is a
+ * supported human action and usually means the deposit was dealt with by hand,
+ * so treating it like a task that never existed would silently re-book it.
+ */
+async function claimReviewTask(officeTaskId: string | null): Promise<boolean> {
+    if (!officeTaskId) return true;
+    const intake = await intakeColumn();
+    // No intake column resolvable means the claim cannot be expressed at all,
+    // and "cannot prove ownership" is terminal, not permission.
+    if (!intake) return false;
+    const claimed = await prisma.officeTask.updateMany({
+        where: { id: officeTaskId, archivedAt: null, assigneeId: null, columnId: intake.id },
+        data: { status: SWEEP_TASK_CLAIM },
+    });
+    return claimed.count > 0;
+}
+
+/**
+ * Re-assert the claim as a WRITE, so it takes the row lock and answers with a
+ * count rather than reading a value that can change a microsecond later.
+ */
+async function sweepStillOwnsTask(officeTaskId: string | null): Promise<boolean> {
+    if (!officeTaskId) return true;
+    const intake = await intakeColumn();
+    if (!intake) return false;
+    const held = await prisma.officeTask.updateMany({
+        where: {
+            id: officeTaskId, archivedAt: null, assigneeId: null,
+            columnId: intake.id, status: SWEEP_TASK_CLAIM,
+        },
+        data: { status: SWEEP_TASK_CLAIM },
+    });
+    return held.count > 0;
+}
+
+/**
+ * The money-boundary gate. Bank rows only: a bank row that reaches a money
+ * write while carrying an officeTaskId is, by construction, a re-evaluated one.
+ * A lost claim reconciles with the reservation RETAINED — whoever holds the
+ * task now owns both it and the milestone.
+ */
+async function assertSweepOwnsTask(row: DepositIngest): Promise<NextResponse | null> {
+    if (row.source !== BANK_DEPOSIT_SOURCE || !row.officeTaskId) return null;
+    if (await sweepStillOwnsTask(row.officeTaskId)) return null;
+    return await finalizeReconcile(row,
+        "a human took the review task for this deposit while the sweep was working it, so the sweep stopped before " +
+        "writing anything — whoever holds that task now owns this credit", {});
+}
+
+/** Hand the task back when a re-evaluation ended without writing money. Pinned
+ *  to our own marker, so releasing a claim we no longer hold is a no-op. */
+async function releaseReviewTask(row: DepositIngest): Promise<void> {
+    if (row.source !== BANK_DEPOSIT_SOURCE || !row.officeTaskId) return;
+    try {
+        const intake = await intakeColumn();
+        if (!intake) return;
+        await prisma.officeTask.updateMany({
+            where: { id: row.officeTaskId, archivedAt: null, status: SWEEP_TASK_CLAIM },
+            data: { status: intake.name },
+        });
+    } catch (e) {
+        console.error("[deposit-ingest] could not release the review-task claim:", e);
+    }
 }
 
 type BankClaim = { kind: "claimed"; row: DepositIngest } | { kind: "settled"; response: NextResponse };
@@ -1477,7 +1577,7 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
         && row.source === BANK_DEPOSIT_SOURCE
         && !isNotCustomerDepositReason(row.lastError)
         && !boundaryMarked
-        && await reviewTaskIsUntouched(row.officeTaskId);
+        && await claimReviewTask(row.officeTaskId);
 
     if ((row.status === "unmatched" && !reEvaluable) || row.status === "reconcile") {
         const kind = row.status === "reconcile" ? "reconcile" : "unmatched";
@@ -1770,6 +1870,8 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
         // and the reservation, so recovery goes through the reserved branch
         // above rather than round the daily re-look forever (Codex round 1, C3).
         const tokens = await getFreshQBTokens();
+        const lostTask = await assertSweepOwnsTask(row);
+        if (lostTask) return lostTask;
         const staged = await stageInvoicePush(row, payload, picked.id);
         if (staged) return staged;
         await pushMilestoneToQuickBooks(picked.id, tokens);
@@ -1941,6 +2043,8 @@ async function finalizeProposed(row: DepositIngest, scheduleId: string, note: st
         where: { id: row.id },
         data: { status: "proposed", paymentScheduleId: scheduleId, lastError: note.slice(0, 1000) },
     });
+    // Held back, nothing written: the task goes back to the board (G2).
+    await releaseReviewTask(row);
     return NextResponse.json({ ok: true, status: "proposed", scheduleId, reason: note });
 }
 
@@ -2079,6 +2183,10 @@ async function finalizeUnmatched(
     const fileTask = opts.fileTask ?? true;
     const officeTaskId = fileTask ? (row.officeTaskId ?? await ensureReviewTask(row, reason, "unmatched")) : row.officeTaskId;
 
+    // The re-evaluation ended without writing money, so hand the task back to
+    // the board exactly as it was found (G2).
+    await releaseReviewTask(row);
+
     if (fileTask) {
         const escalated = await escalateUnseenBankReview(row, reason, officeTaskId);
         if (escalated) return escalated;
@@ -2164,19 +2272,27 @@ async function closeReviewTask(officeTaskId: string, note: string): Promise<void
     try {
         const task = await prisma.officeTask.findUnique({
             where: { id: officeTaskId },
-            select: { notes: true, archivedAt: true },
+            select: { notes: true, archivedAt: true, assigneeId: true, columnId: true, updatedAt: true },
         });
         if (!task || task.archivedAt) return;
-        // Read-then-CONDITIONAL-write (Codex round 2, F6). Prisma cannot append
-        // to a text column in one statement, so the notes we are about to
-        // rewrite are pinned in the WHERE alongside `archivedAt: null`: a human
-        // who archived or edited the task in the gap wins, and this write
-        // simply finds nothing rather than clobbering their words.
+        // Read-then-CONDITIONAL-write. Prisma cannot append to a text column in
+        // one statement, so EVERY field read is pinned in the WHERE: notes and
+        // archivedAt (Codex round 2, F6) plus assigneeId, columnId and
+        // updatedAt (gate review G4) — assigning or moving a task changes
+        // neither notes nor archivedAt, so without those three the sweep could
+        // archive a review a human had just taken. `updatedAt` is @updatedAt,
+        // so it also catches an edit to any field not named here.
         const closed = await prisma.officeTask.updateMany({
-            where: { id: officeTaskId, archivedAt: null, notes: task.notes },
+            where: {
+                id: officeTaskId, archivedAt: null, notes: task.notes,
+                assigneeId: task.assigneeId, columnId: task.columnId, updatedAt: task.updatedAt,
+            },
             data: { archivedAt: new Date(), notes: [task.notes, note].filter(Boolean).join("\n") },
         });
-        if (closed.count === 0) return;
+        if (closed.count === 0) {
+            console.warn(`[deposit-ingest] review task ${officeTaskId} changed while the sweep was closing it — left open`);
+            return;
+        }
         revalidatePath("/tasks");
     } catch (e) {
         console.error("[deposit-ingest] could not close the review task after a re-evaluation applied:", e);

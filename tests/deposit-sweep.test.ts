@@ -325,12 +325,15 @@ let onOfficeTaskRead: ((id: string) => void) | null = null;
 /** Fires after a DepositIngest read, so a test can land a concurrent write in
  *  the gap between that read and the CAS which pins what it saw. */
 let onDepositRead: ((row: Row | null) => void) | null = null;
+/** When set, buildQBPaymentRequest rejects with this deterministic guard. */
+let qboGuardReason: string | null = null;
 
 let qboBalanceByInvoice = new Map<string, number>();
 
 const fakeQuickbooks = {
     buildQBPaymentRequest: async (_tokens: unknown, qbInvoiceId: string, opts: Row) => {
         calls.buildQBPaymentRequest.push({ qbInvoiceId, ...opts });
+        if (qboGuardReason) return { ok: false, reason: qboGuardReason };
         const balance = qboBalanceByInvoice.get(qbInvoiceId);
         if (balance != null && Math.round(balance * 100) !== Math.round(opts.amount * 100)) {
             return { ok: false, reason: "balance-mismatch", qbBalance: balance, expected: opts.amount };
@@ -553,6 +556,7 @@ beforeEach(() => {
     onDepositUpdateMany = null;
     onOfficeTaskRead = null;
     onDepositRead = null;
+    qboGuardReason = null;
     scheduleSeq = 0;
     tables.officeBoardColumn.rows.push({ id: "col-1", name: "To Do", position: 0, createdAt: new Date() });
     process.env.DEPOSIT_INGEST_SECRET = SECRET;
@@ -3181,5 +3185,214 @@ test("R2 gaps: staged recovery and the staging CAS", async t => {
         assert.equal(calls.buildQBPaymentRequest.length, 0);
         assert.notEqual(creditResult(body, ref).status, "applied");
         assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId, null);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. CI Codex Review Gate (PR #458): staged-invoice guards and task ownership
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** The task the sweep filed for `ref`, once its first POST went unmatched. */
+const reviewTaskFor = (ref: string) => tables.officeTask.rows.find(x => x.id === depositRow(ref)!.officeTaskId)!;
+
+/** Drive a credit to `unmatched` with a task, then make the evidence arrive so
+ *  the next POST wants to re-evaluate it. Returns the milestone and the task. */
+async function seedReEvaluableRow(ref: string) {
+    const { milestone, amount } = seedChristensen({ ref, image: null });
+    const first = await post(bankBatch([{ ref, amount }]));
+    assert.equal(creditResult(first.body, ref).status, "unmatched");
+    const task = reviewTaskFor(ref);
+    tables.bankImage.rows.push({
+        id: `img-${ref}`, source: "WTB_ONLINE", sourceExternalId: `${ref}:front`, kind: "CHECK_FRONT",
+        payerName: "SANDI CHRISTENSEN", memoText: null, normalizedCheckNumber: "1027",
+        amountCents: Math.round(amount * 100), documentDate: utc(SETTLED_DAY),
+    });
+    return { milestone, amount, task };
+}
+
+test("G1: a deterministic payment guard AFTER the invoice was staged keeps the hold", async t => {
+    for (const reason of ["invoice-not-found", "missing-customer", "balance-mismatch"]) {
+        await t.test(reason, async () => {
+            const ref = `REF-GUARD-${reason}`;
+            const { milestone, amount } = seedChristensen({ ref });
+            qboGuardReason = reason;
+
+            const { body } = await post(bankBatch([{ ref, amount }]));
+            const result = creditResult(body, ref);
+            // The invoice definitely exists by now, so `unmatched` would hand
+            // this milestone to the next deposit that wanted it.
+            assert.equal(result.status, "reconcile", `expected reconcile, got ${result.status}: ${result.reason}`);
+            assert.match(String(result.reason), /already created the QuickBooks invoice/);
+            assert.match(String(result.reason), /INV-CHRIS/, "the reason names the invoice");
+            assert.equal(calls.pushMilestoneToQuickBooks.length, 1);
+            assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "the guard rejects before any payment");
+            assert.equal(depositRow(ref)!.paymentScheduleId, milestone, "the reservation is retained");
+        });
+    }
+
+    await t.test("…but an UNSTAGED row still goes unmatched, as before", async () => {
+        // Same guard, no staging: nothing was created, so nothing is held.
+        seedMilestone({ amount: 1500, qbInvoiceId: "qb-inv-plain", invoiceCode: "INV-PLAIN" });
+        qboGuardReason = "balance-mismatch";
+
+        const { body } = await post(bankBatch([{ ref: "REF-GUARD-PLAIN", amount: 1500 }]));
+        assert.equal(creditResult(body, "REF-GUARD-PLAIN").status, "unmatched");
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    });
+});
+
+test("G2: the sweep and a human contend on the review task itself", async t => {
+    await t.test("untouched: the sweep claims it, applies, and archives it", async () => {
+        const { milestone, amount, task } = await seedReEvaluableRow("REF-OWN-CLEAN");
+
+        const { body } = await post(bankBatch([{ ref: "REF-OWN-CLEAN", amount }]));
+        const result = creditResult(body, "REF-OWN-CLEAN");
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+        const after = tables.officeTask.rows.find(x => x.id === task.id)!;
+        assert.ok(after.archivedAt, "an applied re-evaluation closes the task it owned");
+    });
+
+    await t.test("a human ASSIGNS between the claim and the staging: no invoice is created", async () => {
+        const { milestone, amount, task } = await seedReEvaluableRow("REF-OWN-ASSIGN");
+        // getFreshQBTokens fires immediately before the money-boundary re-assert.
+        onFreshTokens = () => {
+            const live = tables.officeTask.rows.find(x => x.id === task.id)!;
+            live.assigneeId = "user-marge";
+        };
+
+        const { body } = await post(bankBatch([{ ref: "REF-OWN-ASSIGN", amount }]));
+        const result = creditResult(body, "REF-OWN-ASSIGN");
+        assert.equal(result.status, "reconcile", `expected reconcile, got ${result.status}: ${result.reason}`);
+        assert.match(String(result.reason), /a human took the review task/);
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "nothing is created once the task is taken");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+        assert.equal(depositRow("REF-OWN-ASSIGN")!.paymentScheduleId, milestone, "the reservation is retained");
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+    });
+
+    await t.test("a human MOVES it between the staging and the payment: no payment is sent", async () => {
+        const { milestone, amount, task } = await seedReEvaluableRow("REF-OWN-MOVE");
+        tables.officeBoardColumn.rows.push({ id: "col-2", name: "In Progress", position: 1, createdAt: new Date() });
+        // Fires after the staging marker is written, before applyQboLinked's
+        // own re-assert — the last gate before QuickBooks takes money.
+        onStagedPush = () => {
+            const live = tables.officeTask.rows.find(x => x.id === task.id)!;
+            live.columnId = "col-2";
+            live.status = "In Progress"; // what moveOfficeTask writes
+        };
+
+        const { body } = await post(bankBatch([{ ref: "REF-OWN-MOVE", amount }]));
+        const result = creditResult(body, "REF-OWN-MOVE");
+        assert.equal(result.status, "reconcile", `expected reconcile, got ${result.status}: ${result.reason}`);
+        assert.match(String(result.reason), /a human took the review task/);
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 1, "the invoice was staged before they moved it");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "…but no payment is ever sent");
+        assert.equal(depositRow("REF-OWN-MOVE")!.paymentScheduleId, milestone);
+    });
+
+    await t.test("the claim CAS itself losing means no re-evaluation at all", async () => {
+        const { milestone, amount, task } = await seedReEvaluableRow("REF-OWN-CAS");
+        // Taken before the POST: claimReviewTask finds nothing to claim.
+        tables.officeTask.rows.find(x => x.id === task.id)!.assigneeId = "user-marge";
+        const queriesBefore = queries.paymentSchedule.length;
+
+        const { body } = await post(bankBatch([{ ref: "REF-OWN-CAS", amount }]));
+        assert.equal(creditResult(body, "REF-OWN-CAS").status, "unmatched", "the row stays terminal");
+        assert.equal(queries.paymentSchedule.length, queriesBefore, "the match never re-runs");
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+    });
+
+    await t.test("a re-evaluation that writes nothing hands the task straight back", async () => {
+        // No image arrives, so the re-look still fails — and must leave the
+        // board exactly as it found it.
+        const { amount } = seedChristensen({ ref: "REF-OWN-RELEASE", image: null });
+        await post(bankBatch([{ ref: "REF-OWN-RELEASE", amount }]));
+        const task = reviewTaskFor("REF-OWN-RELEASE");
+        const columnName = tables.officeBoardColumn.rows[0].name;
+
+        await post(bankBatch([{ ref: "REF-OWN-RELEASE", amount }]));
+        const after = tables.officeTask.rows.find(x => x.id === task.id)!;
+        assert.equal(after.status, columnName, "the claim marker must not be left on the board");
+        assert.equal(after.archivedAt ?? null, null);
+        assert.equal(after.assigneeId ?? null, null);
+    });
+});
+
+test("G3: a review task a human DELETED is terminal, not an invitation to re-run", async () => {
+    const { milestone, amount } = await seedReEvaluableRow("REF-TASK-DELETED");
+    const taskId = depositRow("REF-TASK-DELETED")!.officeTaskId;
+    // Deleting a review is a supported human action, and usually means the
+    // deposit was dealt with by hand.
+    tables.officeTask.rows = tables.officeTask.rows.filter(x => x.id !== taskId);
+
+    const { body } = await post(bankBatch([{ ref: "REF-TASK-DELETED", amount }]));
+    assert.equal(creditResult(body, "REF-TASK-DELETED").status, "unmatched", "a vanished task must not authorise a re-run");
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+});
+
+test("G4: closing a task loses to any human change, not just an edit", async t => {
+    /** An applied bank row whose task the crash left open, ready to be healed. */
+    const seedAppliedWithOpenTask = async (ref: string) => {
+        const milestone = seedMilestone({ amount: 4747.47 });
+        const task = await tables.officeTask.create({
+            data: {
+                title: "Deposit needs review (unmatched)", columnId: "col-1", status: "To Do",
+                position: 0, notes: "Reason: no match", assigneeId: null,
+            },
+        });
+        tables.depositIngest.rows.push({
+            id: `applied-${ref}`, fileId: bankFileId(ref), status: "applied", source: BANK_DEPOSIT_SOURCE,
+            bankReference: ref, extracted: JSON.stringify({ fileId: bankFileId(ref), amount: 4747.47 }),
+            attempts: 1, amountCents: 474_747, postDate: utc(SETTLED_DAY), paymentScheduleId: milestone,
+            officeTaskId: task.id, updatedAt: new Date(),
+        });
+        return task;
+    };
+
+    await t.test("a human ASSIGNS it between the read and the archive", async () => {
+        const task = await seedAppliedWithOpenTask("REF-CLOSE-ASSIGN");
+        onOfficeTaskRead = id => {
+            if (id !== task.id) return;
+            onOfficeTaskRead = null;
+            tables.officeTask.rows.find(x => x.id === task.id)!.assigneeId = "user-marge";
+        };
+
+        const { body } = await post(bankBatch([{ ref: "REF-CLOSE-ASSIGN", amount: 4747.47 }]));
+        assert.equal(creditResult(body, "REF-CLOSE-ASSIGN").status, "applied");
+        const after = tables.officeTask.rows.find(x => x.id === task.id)!;
+        assert.equal(after.archivedAt ?? null, null, "a task somebody just took must stay on their board");
+        assert.equal(after.assigneeId, "user-marge");
+    });
+
+    await t.test("a human MOVES it between the read and the archive", async () => {
+        tables.officeBoardColumn.rows.push({ id: "col-2", name: "In Progress", position: 1, createdAt: new Date() });
+        const task = await seedAppliedWithOpenTask("REF-CLOSE-MOVE");
+        onOfficeTaskRead = id => {
+            if (id !== task.id) return;
+            onOfficeTaskRead = null;
+            const live = tables.officeTask.rows.find(x => x.id === task.id)!;
+            live.columnId = "col-2";
+            live.status = "In Progress";
+        };
+
+        const { body } = await post(bankBatch([{ ref: "REF-CLOSE-MOVE", amount: 4747.47 }]));
+        assert.equal(creditResult(body, "REF-CLOSE-MOVE").status, "applied");
+        const after = tables.officeTask.rows.find(x => x.id === task.id)!;
+        assert.equal(after.archivedAt ?? null, null, "a task somebody just moved must stay where they put it");
+        assert.equal(after.columnId, "col-2");
+    });
+
+    await t.test("nobody touches it: the applied replay still archives it", async () => {
+        const task = await seedAppliedWithOpenTask("REF-CLOSE-CLEAN");
+
+        const { body } = await post(bankBatch([{ ref: "REF-CLOSE-CLEAN", amount: 4747.47 }]));
+        assert.equal(creditResult(body, "REF-CLOSE-CLEAN").status, "applied");
+        const after = tables.officeTask.rows.find(x => x.id === task.id)!;
+        assert.ok(after.archivedAt, "an untouched task is still closed by the replay");
+        assert.match(String(after.notes), /Closed by the deposit sweep/);
     });
 });
