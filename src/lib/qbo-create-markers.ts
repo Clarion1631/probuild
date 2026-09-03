@@ -58,6 +58,33 @@ export const PAYLINK_PENDING_MARKER = "paylink-pending";
 export const PENDING_CREATE_MARKERS: readonly string[] = [CREATE_IN_FLIGHT_MARKER, AMBIGUOUS_CREATE_MARKER];
 
 /**
+ * A human asked for this row's QuickBooks invoice to be DELETED, and the
+ * delete has not been confirmed yet.
+ *
+ * Break-QB-Link used to clear the local link first and then attempt the remote
+ * delete on an unbounded clock. That order is backwards: the moment the link
+ * is gone the milestone is freely re-sendable, so a re-send racing a delete
+ * that had not landed yet (or had been killed by the platform ceiling) could
+ * leave the client with TWO collectible invoices. The link now survives until
+ * the delete is confirmed, and this marker is what records the intent in the
+ * meantime.
+ *
+ * Deliberately NOT one of PENDING_CREATE_MARKERS. Those mean "an invoice may
+ * exist even though qbInvoiceId is null"; this row still HAS its qbInvoiceId,
+ * and that is what stops a second create. Listing it there would also offer it
+ * to the ambiguous-create resolver, which would helpfully adopt the very
+ * invoice somebody is trying to remove.
+ */
+export const PENDING_DELETION_MARKER = "pending-deletion";
+
+/** Is this row waiting for a QuickBooks delete to be confirmed? */
+export function isPendingDeletion(qbSyncError: string | null | undefined): boolean {
+    if (!qbSyncError) return false;
+    return qbSyncError === PENDING_DELETION_MARKER
+        || qbSyncError.startsWith(PENDING_DELETION_MARKER + MARKER_KIND_SEP);
+}
+
+/**
  * The identity a recovery needs to find the invoice a create may have made.
  *
  * It is captured in the MARKER, written before the POST, because both halves

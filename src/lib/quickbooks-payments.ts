@@ -59,6 +59,7 @@ import {
     isBlockedByAmbiguousCreate,
 } from "./qbo-create-markers";
 import { milestoneIssuanceHash, milestoneTaxSplit } from "./qbo-issuance";
+import { isPendingDeletion, PENDING_DELETION_MARKER } from "./qbo-create-markers";
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 // One definition of the reconnect-QuickBooks reason string, shared with the
 // health probe that counts it. A second literal here is how the row loop and
@@ -316,6 +317,8 @@ export {
     CREATE_IN_FLIGHT_STALE_MS,
     PAYLINK_PENDING_MARKER,
     PENDING_CREATE_MARKERS,
+    PENDING_DELETION_MARKER,
+    isPendingDeletion,
     composeCreateMarker,
     parseCreateMarker,
     markerKind,
@@ -590,6 +593,99 @@ export const PAYLINK_ORDER_KEY = "qbo-paylink-sweep.order";
  * failure, same rule as every other QBO loop here: the next row would fail the
  * same way at full cost.
  */
+export interface PendingDeletionSweepResult {
+    checked: number;
+    /** Deleted in QuickBooks (or already gone) AND unlinked here. */
+    finished: number;
+    /** Still linked: QuickBooks refused, or the sweep ran out of budget. */
+    stillPending: number;
+    reason: string | null;
+}
+
+/** The two calls this sweep needs; injectable so a test can drive the real loop. */
+export interface PendingDeletionSweepDeps {
+    db?: { paymentSchedule: { findMany(args: any): Promise<any[]>; count(args: any): Promise<number> } };
+    deleteInvoice?: (tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) => Promise<boolean>;
+    unlink?: (scheduleId: string, qbInvoiceId: string) => Promise<boolean>;
+}
+
+/**
+ * Finish the deletes Break QB Link could not confirm.
+ *
+ * A row carrying PENDING_DELETION_MARKER is one a human asked to unlink WITH
+ * the QuickBooks invoice removed, where the remote delete did not come back
+ * confirmed — out of budget, QuickBooks unreachable, or the process killed.
+ * It is still LINKED on purpose: that is what stops a re-send creating a
+ * second collectible invoice while the first one may still exist.
+ *
+ * So the state is not self-healing and it cannot be left to a human to
+ * notice. This retries the delete under the sweep's own budget and unlinks
+ * only once QuickBooks confirms. Rows it could not finish are REPORTED, so
+ * they make the maintenance run ok:false rather than sitting silently.
+ *
+ * A delete that answers false is not necessarily an error — QuickBooks refuses
+ * to delete an invoice with a payment attached, and that row genuinely needs a
+ * human. It stays pending and is counted.
+ */
+export async function sweepPendingDeletions(
+    tokens: QBTokens,
+    deadline?: RouteDeadline,
+    deps?: PendingDeletionSweepDeps,
+): Promise<PendingDeletionSweepResult> {
+    const db = deps?.db ?? prisma;
+    const remove = deps?.deleteInvoice ?? deleteQBInvoice;
+    const unlink = deps?.unlink
+        ?? ((scheduleId: string, qbInvoiceId: string) => claimQBInvoiceUnlink(prisma, scheduleId, qbInvoiceId));
+    const result: PendingDeletionSweepResult = { checked: 0, finished: 0, stillPending: 0, reason: null };
+
+    const where = { qbSyncError: PENDING_DELETION_MARKER, qbInvoiceId: { not: null } };
+    const rows = await db.paymentSchedule.findMany({
+        where,
+        select: { id: true, qbInvoiceId: true },
+        orderBy: { id: "asc" },
+        take: 50,
+    });
+
+    for (const row of rows) {
+        // Checked before EVERY row: the delete is a real round trip, and this
+        // sweep runs after the options loop and the pay-link sweep have already
+        // spent most of the route.
+        if (isBudgetExhausted(deadline)) {
+            result.reason = "budget-exhausted";
+            break;
+        }
+        result.checked++;
+        try {
+            const deleted = await remove(tokens, row.qbInvoiceId as string, deadline);
+            if (!deleted) {
+                // QuickBooks said no. The row keeps its marker and its link — the
+                // invoice is still there, so it must still be un-re-sendable.
+                result.stillPending++;
+                continue;
+            }
+            if (await unlink(row.id, row.qbInvoiceId as string)) result.finished++;
+            else result.stillPending++;
+        } catch (e) {
+            if (isQBBudgetExhaustedError(e)) {
+                result.reason = "budget-exhausted";
+                break;
+            }
+            if (isQboConnectionFailure(e)) {
+                // Shared connection: every remaining row fails the same way at
+                // full cost. Stop and say so.
+                result.reason = isQBTimeoutError(e) ? "qbo-timeout" : "qbo-unavailable";
+                break;
+            }
+            result.stillPending++;
+        }
+    }
+
+    // Counted from the database AFTER the loop, so it includes rows this run
+    // never reached as well as the ones it could not finish.
+    result.stillPending = await db.paymentSchedule.count({ where }).catch(() => result.stillPending);
+    return result;
+}
+
 export async function sweepPendingPayLinks(
     tokens: QBTokens,
     deadline?: RouteDeadline,
@@ -950,6 +1046,13 @@ export const MILESTONE_PUSH_WORK_BUDGET_MS = 45_000;
 export const MILESTONE_PUSH_ROUTE_BUDGET_MS = MILESTONE_PUSH_WORK_BUDGET_MS + MILESTONE_CLEANUP_BUDGET_MS;
 /** Never spend the last slice of the route: leave the platform room to respond. */
 export const PLATFORM_RESERVE_MS = 2_000;
+/**
+ * Whole-route budget for Break QB Link when it also deletes in QuickBooks.
+ * Two serial calls — a token refresh and the delete — whose own defaults are
+ * 45s and 20s, which together overrun the 60s ceiling and got the action killed
+ * mid-delete. One shared budget is what keeps the pair inside it.
+ */
+export const BREAK_QB_LINK_BUDGET_MS = 50_000;
 
 /**
  * How long compensation may take, measured when it BEGINS.
@@ -1363,7 +1466,13 @@ export async function pushMilestoneToQuickBooks(
         //     this call did not write) is cleared only on the original
         //     evidence, a reachable invoice.
         // A failed link read clears nothing: the marker stays for the sweep.
-        const clearFlag = !linkReadFailed && (claimedPending || (!!markerNow && !!status));
+        //   • a `pending-deletion` flag is cleared by NEITHER. A reachable
+        //     invoice is the whole reason that row is still waiting: somebody
+        //     asked for it to be deleted and the delete has not been confirmed,
+        //     so "we could read it" is evidence the intent is UNFINISHED, not
+        //     evidence to forget it.
+        const clearFlag = !linkReadFailed && !isPendingDeletion(markerNow)
+            && (claimedPending || (!!markerNow && !!status));
         if (linkChanged || clearFlag) {
             const written = await prisma.paymentSchedule.updateMany({
                 // Pinned to the link we read AND to the marker the claim left,

@@ -1956,6 +1956,17 @@ export function buildQBEstimateLines(items: readonly QBEstimateItem[], itemId: s
 }
 
 /** Push an estimate to QB. Returns the QB estimate ID. */
+/**
+ * Append QuickBooks own idempotency key to a create path.
+ *
+ * Intuit dedupes on ?requestid=: the same value re-POSTed returns the ORIGINAL
+ * response rather than creating a second document. Omitted when no key is
+ * supplied, so callers that have nothing durable to key off are unchanged.
+ */
+function qboCreatePath(path: string, requestId?: string): string {
+    return requestId ? path + "?requestid=" + encodeURIComponent(requestId) : path;
+}
+
 export async function syncEstimateToQB(
     tokens: QBTokens,
     estimate: {
@@ -1970,6 +1981,14 @@ export async function syncEstimateToQB(
     },
     glMappings: Record<string, string> = {},
     deadline?: RouteDeadline,
+    /**
+     * QuickBooks server-side idempotency key on the create (?requestid=...).
+     * The SAME value re-sent returns Intuit ORIGINAL response instead of
+     * creating a second document, which is what makes a replay of an
+     * unconfirmed create safe. Same mechanism the Payment create and the
+     * receipt push already use.
+     */
+    requestId?: string,
 ): Promise<{ qbId: string; qbUrl: string }> {
     const lines = buildQBEstimateLines(estimate.items, estimate.itemId);
 
@@ -1990,7 +2009,7 @@ export async function syncEstimateToQB(
 
     let res: Response;
     try {
-        res = await qbFetch("/estimate", tokens, {
+        res = await qbFetch(qboCreatePath("/estimate", requestId), tokens, {
             method: "POST",
             body: JSON.stringify(payload),
             qbDeadline: deadline,
@@ -2059,6 +2078,8 @@ export async function syncInvoiceToQB(
         items?: Array<{ description: string; amount: number }>;
     },
     deadline?: RouteDeadline,
+    /** See syncEstimateToQB requestId. */
+    requestId?: string,
 ): Promise<{ qbId: string; qbUrl: string }> {
     const lines: object[] = (invoice.items || []).map((item, i) => ({
         LineNum: i + 1,
@@ -2087,7 +2108,7 @@ export async function syncInvoiceToQB(
 
     let res: Response;
     try {
-        res = await qbFetch("/invoice", tokens, {
+        res = await qbFetch(qboCreatePath("/invoice", requestId), tokens, {
             method: "POST",
             body: JSON.stringify(payload),
             qbDeadline: deadline,

@@ -422,3 +422,133 @@ test("round 37 gate: pay-link counters cover BOTH rails and sum", async () => {
     assert.equal(body.payLinks.unresolved.progressBilling, 3);
     assert.equal(body.payLinks.unresolved.total, 5);
 });
+
+// ─── Round 38 gate, finding 6: Break QB Link must not unlink before the delete ──
+
+/**
+ * The action cleared the local link FIRST and then attempted the QuickBooks
+ * delete on an unbounded clock — a 45s token refresh followed by a 20s delete,
+ * which cannot fit the 60s ceiling. So the platform could kill it mid-delete,
+ * and by then the milestone was already unlinked and freely re-sendable: a
+ * re-send racing a delete that may or may not have landed is how one milestone
+ * ends up with two collectible invoices.
+ *
+ * The link now survives until the delete is CONFIRMED, and a row left
+ * `pending-deletion` is finished by this sweep rather than by nobody.
+ */
+function pendingDeletionDb(rows: Array<{ id: string; qbInvoiceId: string }>) {
+    const live = [...rows];
+    return {
+        db: {
+            paymentSchedule: {
+                async findMany() { return live.map((r) => ({ ...r })); },
+                async count() { return live.length; },
+            },
+        },
+        live,
+    };
+}
+
+test("round 38: a confirmed delete unlinks; a refused one leaves the row linked", async () => {
+    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const { db, live } = pendingDeletionDb([
+        { id: "ps-1", qbInvoiceId: "qb-1" },
+        { id: "ps-2", qbInvoiceId: "qb-2" },
+    ]);
+    const unlinked: string[] = [];
+
+    const res = await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        createRouteDeadline(30_000),
+        {
+            db: db as any,
+            // QuickBooks refuses the second one — an invoice with a payment
+            // attached cannot be deleted, and that row genuinely needs a human.
+            deleteInvoice: async (_t, qbId) => qbId === "qb-1",
+            unlink: async (id) => {
+                unlinked.push(id);
+                live.splice(live.findIndex((r) => r.id === id), 1);
+                return true;
+            },
+        },
+    );
+
+    assert.deepEqual(unlinked, ["ps-1"], "only the CONFIRMED delete may unlink");
+    assert.equal(res.checked, 2);
+    assert.equal(res.finished, 1);
+    assert.equal(res.stillPending, 1, "the refused one is still linked, and is reported");
+    assert.equal(res.reason, null);
+});
+
+test("round 38: the deadline stops the sweep, and the rows it never reached stay linked", async () => {
+    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const { db, live } = pendingDeletionDb([
+        { id: "ps-1", qbInvoiceId: "qb-1" },
+        { id: "ps-2", qbInvoiceId: "qb-2" },
+        { id: "ps-3", qbInvoiceId: "qb-3" },
+    ]);
+    const deleted: string[] = [];
+    // Already spent: the wall is hit before the first row.
+    const spent = createRouteDeadline(1_000, Date.now() - 5_000);
+
+    const res = await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        spent,
+        {
+            db: db as any,
+            deleteInvoice: async (_t, qbId) => { deleted.push(qbId); return true; },
+            unlink: async () => true,
+        },
+    );
+
+    assert.deepEqual(deleted, [], "out of budget is a clean stop, not a half-finished delete");
+    assert.equal(res.reason, "budget-exhausted");
+    assert.equal(res.stillPending, 3, "every row is still linked — none can be re-sent");
+    assert.equal(live.length, 3);
+});
+
+test("round 38: Break QB Link deletes BEFORE it unlinks, under one shared deadline", async () => {
+    // A source tripwire, because the ORDER is the invariant and it is invisible
+    // to any assertion about the outcome: an action that unlinked first and
+    // deleted second would look identical on the happy path and only diverge
+    // when the delete failed — which is precisely the case that shipped.
+    const src = await import("node:fs").then((fs) => fs.readFileSync("src/lib/actions.ts", "utf8"));
+    const start = src.indexOf("export async function breakQBInvoiceLink");
+    assert.ok(start > -1);
+    const fn = src.slice(start, src.indexOf("\nexport ", start + 10));
+
+    const marks = fn.indexOf("PENDING_DELETION_MARKER");
+    const del = fn.indexOf("deleteQBInvoice(tokens");
+    const unlink = fn.indexOf("claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId)");
+    assert.ok(marks > -1, "the intent must be recorded durably before the remote call");
+    assert.ok(del > -1 && unlink > -1);
+    assert.ok(marks < del, "mark the row BEFORE touching QuickBooks");
+    assert.ok(del < fn.indexOf("clearedAfterDelete"), "and only unlink once the delete came back confirmed");
+
+    // One budget, threaded into BOTH remote calls. Either one unbounded puts
+    // the pair back over the ceiling.
+    assert.match(fn, /createRouteDeadline\(BREAK_QB_LINK_BUDGET_MS\)/);
+    assert.match(fn, /getFreshQBTokens\(deadline\)/);
+    assert.match(fn, /deleteQBInvoice\(tokens, schedule\.qbInvoiceId, deadline\)/);
+});
+
+// ─── Round 38 gate, finding 8: a no-progress abort must keep its cursor ────
+
+test("round 38: a resumed run that aborts before finishing a row keeps the stored cursor", async () => {
+    // `lastCompletedId` started at null even when a cursor had been loaded, so
+    // an abort on the very first row wrote "" — "start from the top" — and threw
+    // away a checkpoint that was still good. The next run then re-walked the
+    // same leading rows and aborted in the same place: the tail starved
+    // forever, which is the exact failure the cursor exists to prevent.
+    const src = await import("node:fs").then((fs) =>
+        fs.readFileSync("src/app/api/integrations/qbo-maintenance/route.ts", "utf8"));
+    assert.match(src, /let checkpoint: string \| null = cursor;/,
+        "the checkpoint is SEEDED from what this run inherited");
+    assert.ok(!/let lastCompletedId: string \| null = null;/.test(src),
+        "and the old null-seeded variable is gone, not merely shadowed");
+    assert.match(src, /automationSettingCursorStore\.set\(SWEEP_CURSOR_KEY, abortedReason \? \(checkpoint \?\? ""\) : ""\)/);
+    assert.match(src, /where: checkpoint \? \{ \.\.\.scheduleWhere, id: \{ gt: checkpoint \} \} : scheduleWhere,/,
+        "and `remaining` is measured from the retained checkpoint");
+});

@@ -140,7 +140,15 @@ test("the QuickBooks sync route runs its call chain on one budget", () => {
     assert.ok(source.includes("createRouteDeadline"), "no route budget");
     // Token refresh, customer ensure, service-item ensure, document sync: the
     // whole serial chain has to be on it, not just the first call.
-    const deadlineArgs = source.match(/deadline\)/g) ?? [];
+    // Matched as an ARGUMENT rather than only in final position: since the
+    // round-38 idempotency work the two document-sync calls take a trailing
+    // QuickBooks requestid AFTER the deadline, so `deadline)` alone stopped
+    // seeing them while they were still perfectly well budgeted.
+    const deadlineArgs = source.match(/deadline[,)]/g) ?? [];
     assert.ok(deadlineArgs.length >= 5, `only ${deadlineArgs.length} calls carry the deadline`);
+    // ...and specifically the create on each rail, which is the call that costs
+    // money to get wrong.
+    assert.match(source, /qb\.glMappings \|\| \{\}, deadline, syncRequestId\(/);
+    assert.match(source, /\}, deadline, syncRequestId\(invoice\.id/);
     assert.ok(source.includes("isQboConnectionFailure"), "an outage still answers 500");
 });

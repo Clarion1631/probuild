@@ -28,12 +28,18 @@ const state: {
     user: any | null;
     estimates: Record<string, any>;
     invoices: Record<string, any>;
-} = { user: null, estimates: {}, invoices: {} };
+    /** Every document create the route actually dispatched, with its requestid. */
+    posts: Array<{ kind: "estimate" | "invoice"; requestId?: string }>;
+    /** What the next create should do. Reset between tests. */
+    createThrows: unknown;
+} = { user: null, estimates: {}, invoices: {}, posts: [], createThrows: null };
 
 function resetState() {
     state.user = null;
     state.estimates = {};
     state.invoices = {};
+    state.posts = [];
+    state.createThrows = null;
 }
 
 const fakePermissions = {
@@ -43,17 +49,40 @@ const fakePermissions = {
     canAccessEstimate,
 };
 
+/** Real WHERE matching and real count semantics — a CAS the fake cannot fake. */
+function table(rows: Record<string, any>) {
+    return {
+        findUnique: async (args: { where: { id: string } }) => rows[args.where.id] ?? null,
+        updateMany: async (args: { where: Record<string, any>; data: Record<string, any> }) => {
+            const row = rows[args.where.id];
+            if (!row) return { count: 0 };
+            const matches = Object.entries(args.where).every(([k, v]) => (row[k] ?? null) === v);
+            if (!matches) return { count: 0 };
+            Object.assign(row, args.data);
+            return { count: 1 };
+        },
+    };
+}
+
 const fakePrisma = {
-    estimate: {
-        findUnique: async (args: { where: { id: string } }) => state.estimates[args.where.id] ?? null,
-    },
-    invoice: {
-        findUnique: async (args: { where: { id: string } }) => state.invoices[args.where.id] ?? null,
-    },
+    get estimate() { return table(state.estimates); },
+    get invoice() { return table(state.invoices); },
+};
+
+const fakeQbPayments = {
+    getFreshQBTokens: async () => ({ accessToken: "a", refreshToken: "r", realmId: "realm-1" }),
+    resolveCustomerAndItem: async () => ({ customerId: "42", itemId: "7" }),
+};
+
+const fakeIntegrationStore = {
+    getQBSettings: async () => ({ connected: true, glMappings: {} }),
 };
 
 const PERMISSIONS_SPECIFIER = "@/lib/permissions";
 const PRISMA_SPECIFIER = "@/lib/prisma";
+const QB_PAYMENTS_SPECIFIER = "@/lib/quickbooks-payments";
+const INTEGRATION_STORE_SPECIFIER = "@/lib/integration-store";
+const QUICKBOOKS_SPECIFIER = "@/lib/quickbooks";
 
 let POST: (req: Request) => Promise<Response>;
 
@@ -72,6 +101,29 @@ before(async () => {
         if (id === PRISMA_SPECIFIER) {
             prismaPatchHit = true;
             return { prisma: fakePrisma };
+        }
+        if (id === QB_PAYMENTS_SPECIFIER) return fakeQbPayments;
+        if (id === INTEGRATION_STORE_SPECIFIER) return fakeIntegrationStore;
+        if (id === QUICKBOOKS_SPECIFIER) {
+            // SPREAD the real module: the route also imports the deadline helper
+            // and the whole error-classifier family from here, and a stub that
+            // dropped them would make these tests pass against a route that
+            // could not classify anything.
+            // eslint-disable-next-line prefer-rest-params
+            const real = originalRequire.apply(this, arguments as unknown as [string]) as Record<string, unknown>;
+            return {
+                ...real,
+                syncEstimateToQB: async (_t: unknown, _e: unknown, _gl: unknown, _d: unknown, requestId?: string) => {
+                    state.posts.push({ kind: "estimate", requestId });
+                    if (state.createThrows) throw state.createThrows;
+                    return { qbId: "qb-est-1", qbUrl: "https://qbo/est/1" };
+                },
+                syncInvoiceToQB: async (_t: unknown, _i: unknown, _d: unknown, requestId?: string) => {
+                    state.posts.push({ kind: "invoice", requestId });
+                    if (state.createThrows) throw state.createThrows;
+                    return { qbId: "qb-inv-1", qbUrl: "https://qbo/inv/1" };
+                },
+            };
         }
         // eslint-disable-next-line prefer-rest-params
         return originalRequire.apply(this, arguments as unknown as [string]);
@@ -155,4 +207,144 @@ test("unknown type: 400, before any auth check spends a session lookup", async (
     // type validation is cheap and happens first — no need to touch state.user.
     const res = await POST(postRequest({ type: "widget", id: "x" }));
     assert.equal(res.status, 400);
+});
+
+// ─── Round 38 gate, finding 5: the document sync was not idempotent ──────
+
+/**
+ * The route created a QuickBooks estimate or invoice, returned its id, and
+ * persisted NOTHING — it never checked for an existing link and left no trace
+ * of an attempt. `retry: false` on the ambiguous 503 is advice to a client, not
+ * a constraint: a refresh re-POSTed and QuickBooks had no reason to refuse it,
+ * so the client ended up with two documents and ProBuild pointed at neither.
+ */
+const ADMIN = { id: "u1", role: "ADMIN", permissions: null };
+
+function seedEstimate(overrides: Record<string, any> = {}) {
+    state.estimates["est-1"] = {
+        id: "est-1", code: "EST-00001", title: "Kitchen", status: "Sent",
+        qbEstimateId: null, qbSyncMarker: null, qbSyncedAt: null,
+        totalAmount: 1000, balanceDue: 1000, createdAt: new Date(),
+        projectId: "proj-1", leadId: null, items: [],
+        project: { name: "Kitchen", client: { id: "cli-1" } },
+        ...overrides,
+    };
+    return state.estimates["est-1"];
+}
+
+function seedInvoice(overrides: Record<string, any> = {}) {
+    state.invoices["inv-1"] = {
+        id: "inv-1", code: "INV-00001", projectId: "proj-1",
+        qbInvoiceId: null, qbSyncMarker: null, qbSyncedAt: null,
+        totalAmount: 1000, balanceDue: 1000,
+        client: { id: "cli-1" }, project: { name: "Kitchen" },
+        ...overrides,
+    };
+    return state.invoices["inv-1"];
+}
+
+test("round 38: an already-linked estimate answers with the id it holds and never POSTs", async () => {
+    state.user = ADMIN;
+    seedEstimate({ qbEstimateId: "qb-est-existing" });
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.qbId, "qb-est-existing");
+    assert.equal(body.alreadyLinked, true);
+    assert.deepEqual(state.posts, [], "no create, and not even a token refresh");
+});
+
+test("round 38: a successful sync persists the id, and the replay makes no second document", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+
+    const first = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(first.status, 200);
+    assert.equal((await first.json()).qbId, "qb-est-1");
+    assert.equal(row.qbEstimateId, "qb-est-1", "the id is persisted, not merely returned");
+    assert.equal(row.qbSyncMarker, null, "and the claim is cleared by the SAME write");
+    assert.ok(row.qbSyncedAt instanceof Date);
+    assert.equal(state.posts.length, 1);
+
+    const replay = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal((await replay.json()).qbId, "qb-est-1");
+    assert.equal(state.posts.length, 1, "the replay is served from the stored link");
+});
+
+test("round 38: the create carries a requestid keyed off the record and its claim", async () => {
+    // Intuit dedupes server-side on this. A fresh random value per attempt
+    // would dedupe nothing, so it has to come from the marker — the only part
+    // of the attempt that survives a process death.
+    state.user = ADMIN;
+    seedEstimate();
+    await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const sent = state.posts[0].requestId as string;
+    assert.ok(sent?.startsWith("est-1:"), `requestid must identify the record, got ${sent}`);
+    assert.ok(sent.length > "est-1:".length, "and carry the claim nonce");
+});
+
+test("round 38: an unconfirmed create parks the record, and the replay refuses", async () => {
+    const { QBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createThrows = new QBAmbiguousDocumentCreateError("QB estimate sync");
+
+    const first = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(first.status, 503);
+    assert.equal((await first.json()).reason, "ambiguous-create");
+    assert.ok(String(row.qbSyncMarker).startsWith("ambiguous-create:"),
+        `the claim is PROMOTED, not released, got ${row.qbSyncMarker}`);
+    assert.equal(row.qbEstimateId, null, "and nothing is linked — we never learned an id");
+
+    // The replay is the whole point: `retry: false` was advice, this is a rule.
+    state.createThrows = null;
+    const replay = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(replay.status, 409);
+    assert.equal((await replay.json()).reason, "ambiguous-create");
+    assert.equal(state.posts.length, 1, "no second document, however many times it is retried");
+});
+
+test("round 38: a definitive refusal RELEASES the claim, so the record can be synced again", async () => {
+    // The mutation control for the test above. If the marker were kept on
+    // every failure, a plain validation error would strand the record forever
+    // and that test would be proving nothing about ambiguity in particular.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createThrows = new Error("QB estimate sync failed: estimate has no billable line items");
+
+    const first = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(first.status, 500);
+    assert.equal(row.qbSyncMarker, null, "QuickBooks answered no — nothing was created");
+
+    state.createThrows = null;
+    const retry = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(retry.status, 200);
+    assert.equal(row.qbEstimateId, "qb-est-1");
+    assert.equal(state.posts.length, 2, "and the retry really did send");
+});
+
+test("round 38: the invoice rail behaves identically", async () => {
+    const { QBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    state.user = ADMIN;
+    const row = seedInvoice();
+
+    await POST(postRequest({ type: "invoice", id: "inv-1" }));
+    assert.equal(row.qbInvoiceId, "qb-inv-1");
+    assert.equal(row.qbSyncMarker, null);
+    assert.ok(String(state.posts[0].requestId).startsWith("inv-1:"));
+
+    const replay = await POST(postRequest({ type: "invoice", id: "inv-1" }));
+    assert.equal((await replay.json()).alreadyLinked, true);
+    assert.equal(state.posts.length, 1);
+
+    // ...and a parked invoice refuses too.
+    resetState();
+    state.user = ADMIN;
+    const parked = seedInvoice();
+    state.createThrows = new QBAmbiguousDocumentCreateError("QB invoice sync");
+    assert.equal((await POST(postRequest({ type: "invoice", id: "inv-1" }))).status, 503);
+    assert.ok(String(parked.qbSyncMarker).startsWith("ambiguous-create:"));
+    assert.equal((await POST(postRequest({ type: "invoice", id: "inv-1" }))).status, 409);
+    assert.equal(state.posts.length, 1);
 });

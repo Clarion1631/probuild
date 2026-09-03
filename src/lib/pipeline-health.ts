@@ -1,3 +1,4 @@
+import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { PAYLINK_PENDING_MARKER } from "@/lib/qbo-create-markers";
 
@@ -404,6 +405,80 @@ export interface ProbeResult<T> {
 }
 
 /**
+ * How many probes may hold a database connection at once.
+ *
+ * The pool this shares with the rest of the app is small (a connection limit of 5 in
+ * the Prisma client). Firing every probe at once meant the health check
+ * could take the whole pool for itself — so a slow database turned "report on
+ * the app" into "stall the app". Four at a time still finishes a nine-probe
+ * sweep in three waves.
+ */
+export const PROBE_CONCURRENCY = 4;
+
+/** The database handle a probe is given: a transaction client, not the pool. */
+export type ProbeDb = Prisma.TransactionClient;
+
+/** How a probe gets that handle. Injectable so a test needs no database. */
+export type ProbeRunner = <T>(timeoutMs: number, fn: (db: ProbeDb) => Promise<T>) => Promise<T>;
+
+/** A slot-limited gate. Exported so a test can drive one it can observe. */
+export interface Limiter {
+    acquire(): Promise<() => void>;
+}
+
+export function createLimiter(limit: number): Limiter {
+    let inFlight = 0;
+    const waiting: Array<() => void> = [];
+    const release = () => {
+        inFlight--;
+        const next = waiting.shift();
+        if (next) next();
+    };
+    return {
+        async acquire() {
+            if (inFlight >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
+            inFlight++;
+            let released = false;
+            // Idempotent: a double release would let the gate drift open.
+            return () => {
+                if (released) return;
+                released = true;
+                release();
+            };
+        },
+    };
+}
+
+const probeLimiter = createLimiter(PROBE_CONCURRENCY);
+
+/**
+ * The production runner: one short transaction per probe, carrying a
+ * SERVER-SIDE statement timeout.
+ *
+ * `SET LOCAL` scopes the timeout to this transaction, and Postgres itself
+ * cancels the statement when it expires — which is the part the JS race below
+ * cannot do. Losing a `Promise.race` abandons the promise, not the query: the
+ * connection stayed busy until the database finished whatever it was doing, so
+ * every timed-out probe leaked a pool slot for exactly as long as the wedge
+ * lasted. The race is still there as the backstop for a connection that never
+ * even reaches Postgres.
+ */
+export function statementTimeoutRunner(client: typeof prisma = prisma): ProbeRunner {
+    return <T>(timeoutMs: number, fn: (db: ProbeDb) => Promise<T>): Promise<T> => {
+        const ms = Math.max(1, Math.floor(timeoutMs));
+        return client.$transaction(
+            async (tx) => {
+                await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${ms}`);
+                return await fn(tx);
+            },
+            // A hair beyond the statement timeout, so the SERVER is what
+            // cancels and the error the probe reports is the real one.
+            { timeout: ms + 1_000, maxWait: ms + 1_000 },
+        );
+    };
+}
+
+/**
  * Run one probe under a deadline.
  *
  * A throwing query was already handled; a query that never SETTLES was not.
@@ -413,21 +488,31 @@ export interface ProbeResult<T> {
  * with no digest. Anything past the deadline is reported as a failed probe,
  * which forces ok:false the same way a thrown error does.
  *
+ * The deadline is enforced in TWO places on purpose. Postgres cancels the
+ * statement (statementTimeoutRunner), which is what actually frees the
+ * connection; the race here still answers the caller when the database never
+ * responds at all. And the slot is taken BEFORE the timer starts, so a probe
+ * queued behind three others is not marked timed-out for having waited.
+ *
  * Exported for tests: a never-settling fake is the only way to prove this.
  */
 export async function runProbe<T>(
     name: string,
-    run: () => Promise<T>,
+    run: (db: ProbeDb) => Promise<T>,
     onError: T,
     timeoutMs: number = PROBE_TIMEOUT_MS,
+    deps?: { withDb?: ProbeRunner; limiter?: Limiter },
 ): Promise<ProbeResult<T>> {
+    const withDb = deps?.withDb ?? statementTimeoutRunner();
+    const limiter = deps?.limiter ?? probeLimiter;
     const TIMED_OUT = Symbol("probe-timeout");
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const releaseSlot = await limiter.acquire();
     try {
         const deadline = new Promise<typeof TIMED_OUT>(resolve => {
             timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
         });
-        const result = await Promise.race([run(), deadline]);
+        const result = await Promise.race([withDb(timeoutMs, run), deadline]);
         if (result === TIMED_OUT) {
             console.error(`[pipeline-health] probe timed out after ${timeoutMs}ms: ${name}`);
             return { status: "error", reason: "timeout", value: onError };
@@ -439,6 +524,7 @@ export async function runProbe<T>(
     } finally {
         // Never leave a pending timer holding the event loop open.
         clearTimeout(timer);
+        releaseSlot();
     }
 }
 
@@ -455,8 +541,8 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // QBO purchase sync land" timestamp this is asking for.
         probe<Date | null>(
             "lastPurchaseSync",
-            async () =>
-                (await prisma.expense.aggregate({ where: { qbPurchaseId: { not: null } }, _max: { qbSyncedAt: true } }))
+            async (db) =>
+                (await db.expense.aggregate({ where: { qbPurchaseId: { not: null } }, _max: { qbSyncedAt: true } }))
                     ._max.qbSyncedAt ?? null,
             null,
         ),
@@ -467,9 +553,9 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // success is invisible.
         probe<{ createdAt: Date | null; latestStatus: string | null }>(
             "purchaseSyncRun",
-            async () => {
+            async (db) => {
                 const [fresh, latest] = await Promise.all([
-                    prisma.automationEvent.findFirst({
+                    db.automationEvent.findFirst({
                         where: {
                             kind: PURCHASE_SYNC_EVENT_KIND,
                             status: { in: PURCHASE_SYNC_HEARTBEAT_STATUSES },
@@ -478,7 +564,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                         orderBy: { createdAt: "desc" },
                         select: { createdAt: true },
                     }),
-                    prisma.automationEvent.findFirst({
+                    db.automationEvent.findFirst({
                         where: { kind: PURCHASE_SYNC_EVENT_KIND, source: PURCHASE_SYNC_CRON_SOURCE },
                         orderBy: { createdAt: "desc" },
                         select: { status: true },
@@ -490,9 +576,9 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         ),
         probe<Date | null>(
             "lastReceiptPush",
-            async () =>
+            async (db) =>
                 (
-                    await prisma.automationEvent.findFirst({
+                    await db.automationEvent.findFirst({
                         where: {
                             kind: "receipt-push",
                             OR: [
@@ -511,13 +597,13 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         ),
         probe<{ createdAt: Date | null; latestStatus: string | null }>(
             "lastPaymentsSync",
-            async () => {
+            async (db) => {
                 // TWO reads, deliberately. Freshness may only come from a run
                 // that actually ran (ok/partial), but the reason must reflect
                 // the LATEST event whatever it was — otherwise an error right
                 // after a success is invisible.
                 const [fresh, latest] = await Promise.all([
-                    prisma.automationEvent.findFirst({
+                    db.automationEvent.findFirst({
                         where: {
                             kind: PAYMENTS_SYNC_EVENT_KIND,
                             status: { in: PAYMENTS_SYNC_HEARTBEAT_STATUSES },
@@ -526,7 +612,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                         orderBy: { createdAt: "desc" },
                         select: { createdAt: true },
                     }),
-                    prisma.automationEvent.findFirst({
+                    db.automationEvent.findFirst({
                         where: { kind: PAYMENTS_SYNC_EVENT_KIND, source: PAYMENTS_SYNC_CRON_SOURCE },
                         orderBy: { createdAt: "desc" },
                         select: { status: true },
@@ -538,8 +624,8 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         ),
         probe<Array<{ status: string; _count: { _all: number } }>>(
             "receipts24h",
-            async () => {
-                const rows = await prisma.automationEvent.groupBy({
+            async (db) => {
+                const rows = await db.automationEvent.groupBy({
                     by: ["status"],
                     where: { kind: "receipt-push", createdAt: { gte: since24h } },
                     _count: { _all: true },
@@ -550,14 +636,14 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         ),
         probe<Date | null>(
             "bank",
-            async () => (await prisma.bankLine.aggregate({ _max: { postedDate: true } }))._max.postedDate ?? null,
+            async (db) => (await db.bankLine.aggregate({ _max: { postedDate: true } }))._max.postedDate ?? null,
             null,
         ),
         // ANY kind: a qbo-sync failure is exactly the thing this digest exists
         // to surface, even on a day with no receipt traffic at all.
         probe<number>(
             "stuck",
-            () => prisma.automationEvent.count({
+            (db) => db.automationEvent.count({
                 where: {
                     createdAt: { gte: since24h },
                     OR: [
@@ -585,7 +671,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // Separate from `stuck` on purpose: this one names the fix.
         probe<number>(
             "qboAuth",
-            () => prisma.automationEvent.count({
+            (db) => db.automationEvent.count({
                 where: { createdAt: { gte: since24h }, reason: { in: [...QBO_RECONNECT_EVENT_REASONS] } },
             }),
             0,
@@ -595,11 +681,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // here would only invite a caller to check one.
         probe<number>(
             "payLinksPending",
-            async () => {
+            async (db) => {
                 const where = { qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceId: { not: null } };
                 const [milestones, billings] = await Promise.all([
-                    prisma.paymentSchedule.count({ where }),
-                    prisma.progressBilling.count({ where }),
+                    db.paymentSchedule.count({ where }),
+                    db.progressBilling.count({ where }),
                 ]);
                 return milestones + billings;
             },

@@ -15,11 +15,24 @@ import {
     evaluatePipelineHealth,
     formatPipelineDigest,
     runProbe,
+    createLimiter,
+    statementTimeoutRunner,
+    PROBE_CONCURRENCY,
     BOOKED_PUSH_STATUSES,
     type PipelineHealth,
+    type ProbeRunner,
 } from "../src/lib/pipeline-health";
 
 const NOW = Date.parse("2026-09-01T14:00:00.000Z");
+
+/**
+ * The probe runner, without a database.
+ *
+ * Production hands each probe a transaction client carrying a server-side
+ * statement timeout; these tests are about the DEADLINE and the CONCURRENCY,
+ * so they inject a pass-through rather than a Postgres.
+ */
+const passThrough: ProbeRunner = <T,>(_ms: number, fn: (db: any) => Promise<T>) => fn({} as any);
 const HOUR = 3_600_000;
 
 function iso(msAgo: number): string {
@@ -300,23 +313,23 @@ test("a probe that never settles is reported as a timeout, not left hanging", as
     // the whole health check until the platform killed it — for a cron that
     // means a silent morning with no digest at all.
     const started = Date.now();
-    const result = await runProbe("wedged", () => new Promise<number>(() => {}), -1, 50);
+    const result = await runProbe("wedged", () => new Promise<number>(() => {}), -1, 50, { withDb: passThrough });
     assert.deepEqual(result, { status: "error", reason: "timeout", value: -1 });
     assert.ok(Date.now() - started < 2_000, "must return on its own deadline");
 });
 
 test("a probe that resolves in time reports ok with its value", async () => {
-    const result = await runProbe("fast", async () => 42, -1, 1_000);
+    const result = await runProbe("fast", async () => 42, -1, 1_000, { withDb: passThrough });
     assert.deepEqual(result, { status: "ok", value: 42 });
 });
 
 test("a throwing probe is an error with reason 'error', distinct from a timeout", async () => {
-    const result = await runProbe("boom", async () => { throw new Error("db down"); }, -1, 1_000);
+    const result = await runProbe("boom", async () => { throw new Error("db down"); }, -1, 1_000, { withDb: passThrough });
     assert.deepEqual(result, { status: "error", reason: "error", value: -1 });
 });
 
 test("a timed-out probe still forces ok:false through the verdict", async () => {
-    const timedOut = await runProbe("stuck", () => new Promise<number>(() => {}), 0, 20);
+    const timedOut = await runProbe("stuck", () => new Promise<number>(() => {}), 0, 20, { withDb: passThrough });
     const v = evaluatePipelineHealth(snapshot({ stuck: { status: timedOut.status, reason: timedOut.reason, count: timedOut.value } }));
     assert.equal(v.ok, false);
     assert.ok(v.reasons.includes("probe-failed:stuck"));
@@ -731,4 +744,93 @@ test("the digest prints the purchase-sync heartbeat on its own line", () => {
     // The data timestamp is still there, separately — the two answer different
     // questions and neither can stand in for the other.
     assert.match(text, /Last QBO purchase booked: /);
+});
+
+// ─── Round 38 gate: a timed-out probe must not keep a pool connection ─────
+
+/**
+ * The JS race answers the CALLER. It does not stop the QUERY: an abandoned
+ * promise is still a statement Postgres is running, on a connection nobody can
+ * use. With a pool of five and nine probes, a wedged database meant the health
+ * check stalled the application it was meant to report on.
+ *
+ * So the timeout is now set SERVER-side, and this asserts the statement really
+ * carries it — not merely that the probe returned in time, which the old race
+ * already did while leaking.
+ */
+test("round 38: each probe runs in a transaction carrying a server-side statement timeout", async () => {
+    const statements: string[] = [];
+    const fakeClient = {
+        async $transaction(fn: (tx: any) => Promise<unknown>) {
+            return fn({
+                async $executeRawUnsafe(sql: string) { statements.push(sql); return 0; },
+            });
+        },
+    };
+    const runner = statementTimeoutRunner(fakeClient as any);
+    const res = await runProbe("timed", async () => 7, -1, 250, { withDb: runner });
+
+    assert.deepEqual(res, { status: "ok", value: 7 });
+    assert.deepEqual(statements, ["SET LOCAL statement_timeout = 250"],
+        "the probe budget goes to Postgres, which is the only thing that can cancel the query");
+});
+
+test("round 38: a statement Postgres cancels is reported as a failed probe", async () => {
+    // What a server-side cancellation actually looks like to Prisma: the query
+    // REJECTS. That must read as a failed probe (forcing ok:false), not as a
+    // silent zero.
+    const runner = statementTimeoutRunner({
+        async $transaction(fn: (tx: any) => Promise<unknown>) {
+            return fn({ async $executeRawUnsafe() { return 0; } });
+        },
+    } as any);
+    const res = await runProbe(
+        "cancelled",
+        async () => { throw new Error("canceling statement due to statement timeout"); },
+        -1,
+        250,
+        { withDb: runner },
+    );
+    assert.deepEqual(res, { status: "error", reason: "error", value: -1 });
+});
+
+test("round 38: probes never exceed the concurrency cap, and none is failed for queueing", async () => {
+    const limiter = createLimiter(PROBE_CONCURRENCY);
+    let inFlight = 0;
+    let peak = 0;
+    const runner: ProbeRunner = async <T,>(_ms: number, fn: (db: any) => Promise<T>) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        try {
+            await new Promise((r) => setTimeout(r, 30));
+            return await fn({} as any);
+        } finally {
+            inFlight--;
+        }
+    };
+
+    // Nine probes, the real number getPipelineHealth fires, each slower than
+    // the others can start. A short per-probe budget is deliberate: a probe
+    // that WAITED for a slot must not be marked timed out for it, which is why
+    // the slot is taken before the timer starts.
+    const results = await Promise.all(
+        Array.from({ length: 9 }, (_, i) =>
+            runProbe(`p${i}`, async () => i, -1, 120, { withDb: runner, limiter })),
+    );
+
+    assert.ok(peak <= PROBE_CONCURRENCY, `at most ${PROBE_CONCURRENCY} at once, saw ${peak}`);
+    assert.ok(peak > 1, "and it really did run them in parallel, or this proves nothing");
+    assert.deepEqual(results.map((r) => r.status), Array(9).fill("ok"));
+    assert.deepEqual(results.map((r) => r.value), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+});
+
+test("round 38: a probe that times out still frees its slot", async () => {
+    // The release is in `finally`. Without it one wedged probe would
+    // permanently shrink the gate, and four of them would close it for good.
+    const limiter = createLimiter(1);
+    const wedged = await runProbe("wedged", () => new Promise<number>(() => {}), -1, 20,
+        { withDb: passThrough, limiter });
+    assert.equal(wedged.reason, "timeout");
+    const after = await runProbe("after", async () => 1, -1, 500, { withDb: passThrough, limiter });
+    assert.deepEqual(after, { status: "ok", value: 1 }, "the gate reopened");
 });

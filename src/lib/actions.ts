@@ -3837,33 +3837,94 @@ export async function breakQBInvoiceLink(
         return { success: false, error: "This milestone has no QuickBooks link to break." };
     }
 
-    // Claim the unlink atomically via the shared helper (also used by
+    const {
+        claimQBInvoiceUnlink, getFreshQBTokens, BREAK_QB_LINK_BUDGET_MS, PENDING_DELETION_MARKER,
+    } = await import("./quickbooks-payments");
+
+    // ORDER MATTERS, and it used to be backwards.
+    //
+    // The local unlink was taken FIRST and the QuickBooks delete attempted
+    // afterwards, on an unbounded clock: a 45s token refresh followed by a 20s
+    // delete, which together cannot fit the 60s ceiling. So the platform could
+    // kill this action mid-delete, and by then the milestone was already
+    // unlinked and freely re-sendable — a re-send racing a delete that may or
+    // may not have landed is how a client ends up with two collectible
+    // invoices for one milestone.
+    //
+    // The link now survives until the delete is CONFIRMED. What goes in first
+    // is a durable `pending-deletion` marker: the row stays linked (so nothing
+    // can re-send it), the intent is recorded (so a crash here is visible),
+    // and the maintenance sweep can finish what this call could not.
+    if (opts?.deleteInQBO === true) {
+        const { createRouteDeadline } = await import("./quickbooks");
+        const { deleteQBInvoice } = await import("./quickbooks");
+        // ONE budget for both remote calls, started here, so the pair cannot
+        // overrun the ceiling however slow either half is.
+        const deadline = createRouteDeadline(BREAK_QB_LINK_BUDGET_MS);
+
+        // CAS the intent in, pinned to the link and marker we read.
+        const claimed = await prisma.paymentSchedule.updateMany({
+            where: {
+                id: schedule.id,
+                qbInvoiceId: schedule.qbInvoiceId,
+                qbSyncError: schedule.qbSyncError,
+                status: { not: "Paid" },
+                qbPaymentId: null,
+            },
+            data: { qbSyncError: PENDING_DELETION_MARKER },
+        });
+        if (claimed.count !== 1) {
+            return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
+        }
+
+        const stillLinked = (reason: string) => {
+            revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+            revalidatePath(`/invoices`);
+            return {
+                success: false as const,
+                error: `${reason} The milestone is still linked to QuickBooks invoice ${schedule.qbInvoiceId} and cannot be re-sent — ` +
+                    `the maintenance sweep will retry the delete, or you can delete it in QuickBooks and try again.`,
+            };
+        };
+
+        let deleted = false;
+        try {
+            const tokens = await getFreshQBTokens(deadline);
+            deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId, deadline);
+        } catch (e) {
+            return stillLinked(`QuickBooks could not be reached to delete the invoice (${e instanceof Error ? e.message.slice(0, 160) : "unknown error"}).`);
+        }
+        if (!deleted) {
+            return stillLinked("QuickBooks refused to delete the invoice (it may have a payment attached).");
+        }
+
+        // Confirmed gone. NOW the link may go — through the same shared claim
+        // the local-only path uses, so both unlinks obey one set of rules.
+        const clearedAfterDelete = await claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId);
+        revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+        revalidatePath(`/invoices`);
+        revalidatePath(`/portal`);
+        return clearedAfterDelete
+            ? { success: true }
+            : {
+                success: true,
+                warning: `The QuickBooks invoice was deleted, but the link in ProBuild could not be cleared — ` +
+                    `the row moved while the delete was running. Refresh and break the link again.`,
+            };
+    }
+
+    // Local-only unlink: no QuickBooks write, so nothing to confirm first.
+    // Claimed atomically via the shared helper (also used by
     // updatePendingMilestoneAmountsCore) — see its doc comment for the race it closes.
-    const { claimQBInvoiceUnlink } = await import("./quickbooks-payments");
     const cleared = await claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId);
     if (!cleared) {
         return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
     }
 
-    // Only after we've claimed the local unlink do we (optionally) clean up QBO.
-    // Default OFF — we never issue a destructive QBO write unless asked.
-    let warning: string | undefined;
-    if (opts?.deleteInQBO === true) {
-        try {
-            const { getFreshQBTokens } = await import("./quickbooks-payments");
-            const { deleteQBInvoice } = await import("./quickbooks");
-            const tokens = await getFreshQBTokens();
-            const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
-            if (!deleted) warning = "Link cleared in ProBuild, but the QuickBooks invoice could not be deleted (it may already be gone, or has a linked payment — check QuickBooks).";
-        } catch {
-            warning = "Link cleared in ProBuild, but QuickBooks delete could not be attempted (QuickBooks unavailable).";
-        }
-    }
-
     revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
     revalidatePath(`/invoices`);
     revalidatePath(`/portal`);
-    return { success: true, warning };
+    return { success: true };
 }
 
 /**

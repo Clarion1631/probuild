@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getFreshQBTokens, QBNotConnectedError, sweepPendingPayLinks, automationSettingCursorStore } from "@/lib/quickbooks-payments";
+import { getFreshQBTokens, QBNotConnectedError, sweepPendingPayLinks, sweepPendingDeletions, automationSettingCursorStore } from "@/lib/quickbooks-payments";
 import {
     createRouteDeadline,
     isBudgetExhausted,
@@ -180,7 +180,19 @@ export async function POST(req: Request) {
     // "" is how "start from the top" is stored; it is never a real id.
     const storedCursor = await automationSettingCursorStore.get(SWEEP_CURSOR_KEY);
     let cursor: string | null = storedCursor && storedCursor.length > 0 ? storedCursor : null;
-    let lastCompletedId: string | null = null;
+    /**
+     * Where the NEXT run should resume from. Seeded with the checkpoint this
+     * run inherited, NOT with null.
+     *
+     * Starting it at null meant a resumed run that aborted before finishing a
+     * single row (out of budget on the very first invoice, or a QuickBooks
+     * outage on it) wrote `""` back — "start from the top" — throwing away a
+     * checkpoint that was still perfectly good. The next run then re-walked the
+     * same leading rows and aborted in the same place, and the tail starved
+     * exactly the way the cursor exists to prevent. Progress is only ever
+     * ADDED to what was already known.
+     */
+    let checkpoint: string | null = cursor;
 
     pager: while (!abortedReason) {
         const page: Array<{ id: string; qbInvoiceId: string | null; name: string; invoice: { code: string } }> =
@@ -204,17 +216,17 @@ export async function POST(req: Request) {
                 const current = await getQBInvoicePaymentOptions(tokens, qbId, deadline);
                 if (!current) {
                     results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: "not-found-in-qbo" });
-                    lastCompletedId = s.id;
+                    checkpoint = s.id;
                     continue;
                 }
                 if (current.card && current.ach) {
                     results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: "already-correct" });
-                    lastCompletedId = s.id;
+                    checkpoint = s.id;
                     continue;
                 }
                 const updated = await setQBInvoicePaymentOptions(tokens, qbId, current.syncToken, { card: true, ach: true }, deadline);
                 results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: updated ? "updated" : "update-failed" });
-                lastCompletedId = s.id;
+                checkpoint = s.id;
             } catch (e) {
                 if (isQBBudgetExhaustedError(e)) {
                     abortedReason = "budget-exhausted";
@@ -232,7 +244,7 @@ export async function POST(req: Request) {
                 results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: `error: ${e instanceof Error ? e.message.slice(0, 120) : "?"}` });
                 // A per-row business failure is finished as far as the cursor is
                 // concerned — the next run must not retry the same bad row forever.
-                lastCompletedId = s.id;
+                checkpoint = s.id;
             }
         }
         if (page.length < SWEEP_PAGE_SIZE) break;
@@ -245,14 +257,20 @@ export async function POST(req: Request) {
     // top ("") so the window rolls over the whole set rather than resuming
     // from the end forever. Never throws — a lost cursor costs one restart
     // from the top, never correctness (see automationSettingCursorStore).
-    await automationSettingCursorStore.set(SWEEP_CURSOR_KEY, abortedReason ? (lastCompletedId ?? "") : "");
+    // `checkpoint` is the inherited cursor until a row actually completes, so
+    // an abort with no progress writes back the value it started with rather
+    // than resetting the sweep to the top.
+    await automationSettingCursorStore.set(SWEEP_CURSOR_KEY, abortedReason ? (checkpoint ?? "") : "");
 
     // How many rows this run never reached. Counted from the database rather
     // than inferred from the page, so it includes everything past the cursor.
     let remaining = 0;
     if (abortedReason) {
         remaining = await prisma.paymentSchedule.count({
-            where: lastCompletedId ? { ...scheduleWhere, id: { gt: lastCompletedId } } : scheduleWhere,
+            // From the RETAINED checkpoint, so the figure describes what the next
+            // run will actually see — not the whole collection every time a
+            // resumed run aborts early.
+            where: checkpoint ? { ...scheduleWhere, id: { gt: checkpoint } } : scheduleWhere,
         }).catch(() => -1);
     }
     // Any row that actually failed, as opposed to being already correct.
@@ -290,11 +308,23 @@ export async function POST(req: Request) {
     const payLinkUnvisited = payLinks?.unvisited.total ?? 0;
     const payLinkUnresolved = payLinks?.unresolved.total ?? 0;
 
+    // Same pass, third repair: rows a Break QB Link left `pending-deletion`
+    // because the remote delete never came back confirmed. They are still
+    // LINKED on purpose (that is what stops a re-send making a second
+    // collectible invoice), so nothing else will ever move them — this is the
+    // only thing that finishes them.
+    let deletions: Awaited<ReturnType<typeof sweepPendingDeletions>> | null = null;
+    if (!abortedReason) {
+        deletions = await sweepPendingDeletions(tokens, deadline);
+        if (deletions.reason) abortedReason = deletions.reason;
+    }
+    const deletionsPending = deletions?.stillPending ?? 0;
+
     // Work left undone, by any route: the options loop stopped early, the
     // pay-link sweep hit its per-rail cap, rows were skipped inside it, or it
     // never reached rows that were eligible when it started.
     const truncated = abortedReason !== null || !!payLinks?.truncated
-        || (payLinks?.skipped ?? 0) > 0 || payLinkUnvisited > 0;
+        || (payLinks?.skipped ?? 0) > 0 || payLinkUnvisited > 0 || deletionsPending > 0;
 
     // `ok` reflects the RUN, not the fact that the handler returned. A run that
     // stopped early, left rows unvisited, or failed on a row has work

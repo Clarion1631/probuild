@@ -445,6 +445,11 @@ model Estimate {
   taxRateName            String?
   taxRatePercent         Decimal?  @db.Decimal
   qbEstimateId           String?
+  /// Set BEFORE the /api/quickbooks/sync create POST and cleared by the write that
+  /// records the returned id, so a crash between the two is visible instead of
+  /// invisible. Same vocabulary as PaymentSchedule.qbSyncError (qbo-create-markers.ts):
+  /// create-in-flight -> ambiguous-create, resolved by a human.
+  qbSyncMarker           String?
   qbSyncedAt             DateTime? @db.Timestamp(6)
   // Soft-delete columns adopted from prod (0 non-null rows). Soft delete is NOT implemented:
   // nothing filters on these. @ignore keeps them out of the generated client so no caller can
@@ -660,6 +665,11 @@ model Invoice {
   viewedAt    DateTime?
   createdAt   DateTime  @default(now())
   qbInvoiceId String?
+  /// Set BEFORE the /api/quickbooks/sync create POST and cleared by the write that
+  /// records the returned id, so a crash between the two is visible instead of
+  /// invisible. Same vocabulary as PaymentSchedule.qbSyncError (qbo-create-markers.ts):
+  /// create-in-flight -> ambiguous-create, resolved by a human.
+  qbSyncMarker String?
   qbSyncedAt  DateTime? @db.Timestamp(6)
 
   payments         PaymentSchedule[]
