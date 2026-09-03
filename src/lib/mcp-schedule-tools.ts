@@ -439,8 +439,8 @@ async function validateTaskDates(input: { taskId: string; startDate?: string; en
     const startDate = input.startDate === undefined ? task.startDate : parseStartDateInput(input.startDate);
     const requestedEndDate = input.endDate === undefined ? task.endDate : parseStartDateInput(input.endDate);
     const endDate = task.type === "milestone" ? startDate : requestedEndDate;
-    if (task.type !== "milestone" && endDate <= startDate) {
-        throw new Error("Task end date must be after its start date");
+    if (task.type !== "milestone" && endDate < startDate) {
+        throw new Error("Task end date cannot be before its start date");
     }
     return { task, startDate, endDate };
 }
