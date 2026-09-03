@@ -655,8 +655,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         //     NO sales tax -> "manual-none". Not an absence: it is the answer a
         //     null figure cannot express on its own, and booking must not write
         //     an OCR guess over it.
-        //   * any other tax-figure edit -> "manual".
-        //   * OMITTING both keys leaves the column alone, so a row nobody has
+        //   * any other `taxAmount` edit -> "manual".
+        //   * a `taxDeductibleBase`-ONLY edit does NOT stamp `taxSource`. The
+        //     base is a portion of the tax figure, not an answer about it —
+        //     stamping "manual" here would permanently block an OCR read from
+        //     ever filling `taxAmount` on a row nobody has actually spoken to
+        //     tax about (book.ts refuses to touch a human-sourced row).
+        //   * OMITTING `taxAmount` leaves the column alone, so a row nobody has
         //     spoken about stays open to an automated read.
         //
         // `installedAtCustomer` is NOT one of these — its own value is its
@@ -672,7 +677,9 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // automated read would ever be allowed to fill it.
         //
         // So it clears the provenance AND both figures together.
-        const stampsTaxProvenance = (editsTaxAmount || editsBase) && !taxIsUnknown;
+        // Otherwise, only a `taxAmount` edit stamps `taxSource` — a
+        // `taxDeductibleBase`-only edit leaves it untouched (see above).
+        const stampsTaxProvenance = editsTaxAmount && !taxIsUnknown;
         const nextTaxSource =
             editsTaxAmount && body.taxAmount === null ? "manual-none" : "manual";
 

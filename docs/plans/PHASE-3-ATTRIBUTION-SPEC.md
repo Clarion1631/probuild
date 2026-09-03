@@ -195,6 +195,19 @@ backfill > null. Nothing but a human edit may change a row whose `costCodeSource
    (`projectId` kept, `estimateId` overwritten → the row on job B for every reader and on
    job A's estimate for cascade-delete and billing). Re-pointing an estimate belongs to an
    explicit re-attribution path, not to an import.
+   **Follow-up: re-attribution.** Write-once means this phase ships with no
+   supported way to MOVE an already-attributed row — a fuzzy customer/job match
+   that landed on the wrong project has no in-app correction path. An
+   authorized atomic action that re-points `projectId` and `estimateId`
+   together (the same two-column, same-fact guarantee the writers keep) is
+   deferred to a follow-up rather than bolted on here under review pressure.
+   Until it exists, a bad match is corrected one of two ways: (1) fix the
+   customer/job field on the purchase in QBO and let it re-sync — this only
+   reaches the row if `projectId` is STILL null, since that is the guard's own
+   predicate, so it only helps a row nobody has attributed yet, not one
+   already locked onto the wrong job; or (2) a one-off script for a row that
+   is already locked in, run by hand against prod like the other scripts in
+   this doc.
    **Cost-code suggestion**: extract `VENDOR_RULES`, `LINE_RULES`, `suggestCode` from
    `scripts/suggest-expense-cost-codes.mjs` into a new pure module
    `src/lib/expense-cost-suggest.ts` (the script imports it back — one copy). After a
@@ -437,6 +450,17 @@ Steps:
     (still-NULL rows: id, project, date, vendor, amount, description head) to the CSV for
     Marge.
 Re-run after `--apply` must report 0 changes (backfill-estimate-item-cost-codes proof rule).
+
+**The backfill's before/after % is not the same number as the variance page's
+coverage, and should not be read as one.** The backfill's dollar share (step
+(d), the §1.6 metric it prints) measures STRICT write eligibility: rows this
+script is actually allowed to touch — `costCodeId` NULL, `costCodeSource` not
+capture/manual, project In Progress and non-overhead. The variance page's
+`coverage.attributedShare` counts a wider universe, including draft/archived
+jobs' coded items as attribution-only rows the backfill never scopes into.
+The backfill's number is therefore a CONSERVATIVE LOWER BOUND on the variance
+page's coverage, not an estimate of it — the variance page will read equal or
+higher, never lower, and the two should never be reconciled to match exactly.
 
 **AS BUILT — there is exactly ONE writer of `costCodeId` among the scripts.**
 `scripts/suggest-expense-cost-codes.ts` (the older rule-suggester) had its own

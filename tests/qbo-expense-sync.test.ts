@@ -2147,6 +2147,27 @@ test("a REDUCED refund that can no longer carry its tax is flagged, not aborted"
     assert.equal(plan.data.taxDeductibleBase, null);
     assert.equal(plan.data.installedAtCustomer, null);
     assert.equal(plan.data.needsTaxReview, true, "asked, never silently dropped");
+    assert.equal(plan.data.taxSource, null, "no human figures survive, so no human source does either");
+});
+
+test("invalidation clears taxSource too, whichever human answer it recorded", () => {
+    // Codex round 31: this branch used to null every tax FIGURE but leave
+    // `taxSource` standing as "manual" or "manual-none" — which book.ts reads
+    // as "a person already answered", permanently blocking an OCR read from
+    // ever refilling `taxAmount` on a row whose human answer no longer
+    // describes any receipt. Covers both states a human answer can leave.
+    for (const taxSource of ["manual", "manual-none"] as const) {
+        const plan = planQboExpenseUpdate(
+            {
+                projectId: "project-1", estimateId: "estimate-1",
+                amount: -50, taxAmount: -4, taxDeductibleBase: -40, taxSource,
+            },
+            { ...WRITE, amount: -3 },
+        );
+        assert.equal(plan.data.taxAmount, null, taxSource);
+        assert.equal(plan.data.taxDeductibleBase, null, taxSource);
+        assert.equal(plan.data.taxSource, null, taxSource);
+    }
 });
 
 test("a credit that FLIPS to a purchase invalidates the classification", () => {

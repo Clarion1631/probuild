@@ -629,6 +629,9 @@ export type QboExpenseUpdateData = Partial<QboExpenseWrite> & {
     taxAtSource?: false;
     installedAtCustomer?: null;
     needsTaxReview?: true;
+    // Cleared alongside the figures it was provenance for — see
+    // planQboExpenseUpdate's taxCannotFitGross branch.
+    taxSource?: null;
 };
 
 export interface QboExpenseUpdatePlan {
@@ -745,6 +748,13 @@ export function planQboExpenseUpdate(
         data.installedAtCustomer = null;
         data.taxDeductibleBase = null;
         data.needsTaxReview = true;
+        // THE PROVENANCE GOES WITH THE FIGURES IT DESCRIBED. Every human
+        // answer this row carried is cleared above — leaving `taxSource` as
+        // "manual"/"manual-none" would keep claiming a person spoke to a tax
+        // amount that no longer exists, and book.ts refuses to fill
+        // `taxAmount` on any row whose source is still human. Nulling it here
+        // is what lets the OCR pipeline reach the row again.
+        data.taxSource = null;
     } else if (existingBase !== null && existingBase !== 0) {
         // Same rule for the allocation: it points the way the money does and
         // never exceeds the pre-tax remainder in magnitude.

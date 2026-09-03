@@ -854,13 +854,19 @@ test("an OMITTED tax key leaves the provenance alone", async () => {
     assert.equal(updateArgs?.data.taxSource, undefined);
 });
 
-test("supplying either FIGURE stamps manual", async () => {
+test("supplying taxAmount stamps manual; a base-only edit does not", async () => {
+    // Codex round 31: `taxSource` governs `taxAmount` specifically. A
+    // `taxDeductibleBase`-only edit is not an answer about the tax figure
+    // itself, and stamping "manual" here would permanently block an OCR
+    // read from ever filling `taxAmount` on a row nobody actually spoke to
+    // (book.ts refuses to touch a human-sourced row).
     await patch({ taxAmount: 16.55 });
     assert.equal(updateArgs?.data.taxSource, "manual");
     const afterAmount = updateArgs;
     await patch({ taxDeductibleBase: 50 });
     assert.notEqual(updateArgs, afterAmount, "a second write happened");
-    assert.equal(updateArgs?.data.taxSource, "manual");
+    assert.equal(updateArgs?.data.taxDeductibleBase, 50, "the base edit still lands");
+    assert.equal(updateArgs?.data.taxSource, undefined, "taxSource is left untouched");
 });
 
 test("a phase-only edit touches neither the flag nor the provenance", async () => {
