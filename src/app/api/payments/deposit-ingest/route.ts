@@ -19,6 +19,7 @@ import {
     CLAIMING_STATUSES,
     CROSS_SOURCE_CLAIM_WINDOW_DAYS,
     MONEY_BOUNDARY_CLAIM_STATUSES,
+    TALLIED_SWEEP_STATUSES,
     PAID_UNION_WINDOW_DAYS,
     appliedTwinNote,
     bankCreditIsOldEnough,
@@ -857,9 +858,13 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
         }));
     }
 
-    // Every outcome, terminal and not. `replay` is orthogonal (a replay still has
-    // an outcome) and is reported so "ran but did nothing new" is
-    // distinguishable from "ran but saw nothing" — the failure mode a
+    // Every outcome, terminal and not, derived from the RAW per-credit results
+    // rather than from a list of statuses someone remembered to name: anything
+    // outside the tallied set (qbo_created after a settle threw, a busy
+    // processing row, a status that does not exist yet) lands in `unresolved`,
+    // so no credit can be silently counted as nothing. `replay` is orthogonal
+    // (a replay still has an outcome) and is reported so "ran but did nothing
+    // new" is distinguishable from "ran but saw nothing" — the failure mode a
     // browser-automated CSV export actually has.
     const tally = (status: string) => results.filter(r => r.status === status).length;
     const counts: SweepCounts = {
@@ -870,6 +875,7 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
         reconcile: tally("reconcile"),
         failed: tally("failed"),
         qboUnknown: tally("qbo_unknown"),
+        unresolved: results.filter(r => !TALLIED_SWEEP_STATUSES.includes(r.status as never)).length,
         replay: results.filter(r => r.replay).length,
     };
     // HTTP is still 200 — the batch WAS processed; 400 is reserved for a payload

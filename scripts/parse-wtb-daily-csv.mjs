@@ -507,30 +507,60 @@ export async function postSweep(baseUrl, secret, day, opts = {}) {
     return { status: res.status, body };
 }
 
+/** The statuses that mean a credit is finished with. Mirrors
+ *  CLEAN_SWEEP_STATUSES in src/lib/deposit-sweep.ts — this runner is plain
+ *  .mjs and cannot import the TypeScript module. */
+const CLEAN_SWEEP_STATUSES = ["applied", "proposed", "unmatched"];
+const SWEEP_BUCKETS = ["applied", "proposed", "unmatched", "reconcile", "failed", "qboUnknown", "unresolved"];
+
+const bucket = (counts, key) => {
+    const value = counts?.[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+};
+
 /** The one line the Hermes job copies into its Bot Health report. Reports every
  *  bucket: a day whose credits all failed on a QuickBooks outage must not read
  *  the same as a quiet day. */
 export function sweepSummaryLine(postDate, counts) {
-    const needHuman = (counts.unmatched ?? 0) + (counts.reconcile ?? 0);
+    const needHuman = bucket(counts, "unmatched") + bucket(counts, "reconcile");
     const line = `sweep ${postDate}: ${counts.credits} credits, ${counts.applied} applied, ` +
         `${needHuman} need-human, ${counts.proposed} proposed, ${counts.replay} replay`;
-    const unresolved = (counts.failed ?? 0) + (counts.qboUnknown ?? 0);
-    return unresolved > 0
-        ? `${line}, ${counts.failed ?? 0} failed, ${counts.qboUnknown ?? 0} qbo-unknown`
-        : line;
+    const failed = bucket(counts, "failed");
+    const qboUnknown = bucket(counts, "qboUnknown");
+    const unresolved = bucket(counts, "unresolved");
+    if (failed + qboUnknown + unresolved === 0) return line;
+    return `${line}, ${failed} failed, ${qboUnknown} qbo-unknown` +
+        (unresolved > 0 ? `, ${unresolved} unresolved` : "");
 }
 
 /**
  * Did this day's sweep finish cleanly? The endpoint already answers that in
- * `ok`, and that is the authority; the count check below is a second reading
- * for the case where an older deployment answers without the flag. `unmatched`
- * is NOT a failure — asking a human is the sweep working as designed.
+ * `ok`, and that is the authority; everything below is a second, independent
+ * reading, because the whole point of this check is that the run must never
+ * report success on a batch nobody fully accounted for. `unmatched` is NOT a
+ * failure — asking a human is the sweep working as designed.
+ *
+ * Three ways to fail, in the order they can go wrong:
+ *   1. the endpoint said so;
+ *   2. the buckets do not add up to the credit count, so some outcome went
+ *      uncounted (an older deployment, or a status added since);
+ *   3. any per-credit status outside the clean set — the raw result, not a
+ *      bucket, so a status nobody has a bucket for still fails the run.
  */
 export function sweepBatchFailed(body) {
     if (!body || typeof body !== "object") return true;
     if (body.ok === false) return true;
-    const counts = body.counts ?? {};
-    return ((counts.failed ?? 0) + (counts.qboUnknown ?? 0) + (counts.reconcile ?? 0)) > 0;
+
+    const counts = body.counts;
+    if (!counts || typeof counts !== "object") return true;
+    const sum = SWEEP_BUCKETS.reduce((total, key) => total + bucket(counts, key), 0);
+    if (sum !== bucket(counts, "credits")) return true;
+    if (bucket(counts, "reconcile") + bucket(counts, "failed") + bucket(counts, "qboUnknown") + bucket(counts, "unresolved") > 0) return true;
+
+    for (const credit of body.credits ?? []) {
+        if (!CLEAN_SWEEP_STATUSES.includes(credit?.status)) return true;
+    }
+    return false;
 }
 
 /**
@@ -563,8 +593,10 @@ async function sweepDay(args, sweepSecret, statement, stalled) {
     const summary = `  ${sweepSummaryLine(postDate, body.counts)}${args.sweepDryRun ? " (dry run)" : ""}`;
     const failed = sweepBatchFailed(body);
     (failed ? console.error : console.log)(summary);
+    // Anything that is not a clean outcome gets named, including a status this
+    // runner has never heard of — the catch-all is the point.
     for (const credit of body.credits ?? []) {
-        if (["unmatched", "reconcile", "failed", "qbo_unknown"].includes(credit.status)) {
+        if (!CLEAN_SWEEP_STATUSES.includes(credit?.status)) {
             console.log(`    ${credit.bankReference}: ${credit.status} — ${credit.reason ?? ""}`);
         }
     }

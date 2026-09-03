@@ -391,10 +391,31 @@ export function isDeterministicQboGuardFailure(reason: string): boolean {
 }
 
 /**
+ * The ONLY per-credit outcomes that mean this credit is finished with. A row
+ * left in any other state — mid-flight, retryable, or a status nobody thought
+ * of — is unresolved money by definition.
+ */
+export const CLEAN_SWEEP_STATUSES = ["applied", "proposed", "unmatched"] as const;
+
+/** The statuses that get their own named bucket. Everything else is counted by
+ *  the `unresolved` catch-all, so no outcome can go unreported. */
+export const TALLIED_SWEEP_STATUSES = [
+    "applied", "proposed", "unmatched", "reconcile", "failed", "qbo_unknown",
+] as const;
+
+/**
  * M2: every outcome a day's credits can land in. Reported in full because the
  * Hermes job is unattended: a batch whose credits all failed with a QuickBooks
  * outage used to answer `ok: true` with counts that mentioned none of it, so
  * the runner logged a healthy day and the watchdog never fired.
+ *
+ * `unresolved` is the CATCH-ALL, and it is the important one. Naming buckets
+ * one at a time is how the first cut of this stayed broken: a settle that threw
+ * after the QuickBooks payment existed came back as `qbo_created`, which was
+ * not one of the named buckets, so it counted as nothing at all and the batch
+ * still answered `ok: true` — over a real payment awaiting recovery. Anything
+ * outside CLEAN_SWEEP_STATUSES now lands here, including statuses that do not
+ * exist yet.
  */
 export interface SweepCounts {
     credits: number;
@@ -404,15 +425,25 @@ export interface SweepCounts {
     reconcile: number;
     failed: number;
     qboUnknown: number;
+    /** Catch-all: qbo_created, processing, claim-race, anything unknown. */
+    unresolved: number;
     replay: number;
 }
 
 /**
  * `ok` answers "did this batch finish cleanly?", NOT "did every credit get
  * booked?". `unmatched` is a clean finish — the sweep did its job and asked a
- * human. `failed` / `qbo_unknown` / `reconcile` are not: they mean the run hit
- * something it could not resolve, and a human (or the next run) must look.
+ * human. Everything else means the run hit something it could not resolve, and
+ * a human (or the next run) must look.
+ *
+ * The bucket sum is checked against `credits` first: the buckets are supposed
+ * to PARTITION the results, and if they ever stop doing so the honest answer is
+ * "not ok" rather than a success derived from an incomplete tally. That is the
+ * failure this whole function exists to make impossible.
  */
 export function sweepBatchOk(counts: SweepCounts): boolean {
-    return counts.failed === 0 && counts.qboUnknown === 0 && counts.reconcile === 0;
+    const bucketSum = counts.applied + counts.proposed + counts.unmatched
+        + counts.reconcile + counts.failed + counts.qboUnknown + counts.unresolved;
+    if (bucketSum !== counts.credits) return false;
+    return counts.reconcile === 0 && counts.failed === 0 && counts.qboUnknown === 0 && counts.unresolved === 0;
 }

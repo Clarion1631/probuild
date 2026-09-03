@@ -552,13 +552,27 @@ test("M1: a deterministic QuickBooks guard failure is explained, not retried", (
 });
 
 test("M2: `ok` means the batch finished cleanly, not that everything booked", () => {
-    const base = { credits: 3, applied: 1, proposed: 1, unmatched: 1, reconcile: 0, failed: 0, qboUnknown: 0, replay: 0 };
+    const base = { credits: 3, applied: 1, proposed: 1, unmatched: 1, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 };
     // Asking a human is the sweep working as designed.
     assert.equal(sweepBatchOk(base), true);
     // Unresolved money is not.
-    assert.equal(sweepBatchOk({ ...base, failed: 1 }), false);
-    assert.equal(sweepBatchOk({ ...base, qboUnknown: 1 }), false);
-    assert.equal(sweepBatchOk({ ...base, reconcile: 1 }), false);
+    assert.equal(sweepBatchOk({ ...base, credits: 4, failed: 1 }), false);
+    assert.equal(sweepBatchOk({ ...base, credits: 4, qboUnknown: 1 }), false);
+    assert.equal(sweepBatchOk({ ...base, credits: 4, reconcile: 1 }), false);
+    // The catch-all is what makes a status nobody named (qbo_created after a
+    // settle threw, a busy processing row) fail the batch instead of vanishing.
+    assert.equal(sweepBatchOk({ ...base, credits: 4, unresolved: 1 }), false);
+});
+
+test("M2: buckets that do not add up to the credit count can never report success", () => {
+    // The failure this function exists to prevent: a credit counted as nothing
+    // at all. If the partition is broken, the honest answer is "not ok" — never
+    // a success derived from an incomplete tally.
+    const short = { credits: 3, applied: 1, proposed: 1, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 };
+    assert.equal(sweepBatchOk(short), false, "2 buckets for 3 credits is not a clean batch");
+    assert.equal(sweepBatchOk({ ...short, unmatched: 1 }), true, "…and it is once every credit is accounted for");
+    // Double counting is a broken partition too.
+    assert.equal(sweepBatchOk({ ...short, applied: 2, unmatched: 1 }), false);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -603,7 +617,7 @@ test("the Hoppe case: three Pending milestones at the same amount, only one REQU
     assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
     assert.equal(result.scheduleId, requested);
     assert.deepEqual(body.counts, {
-        credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, replay: 0,
+        credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0,
     });
 
     // The candidate query itself must carry the requested filter — this is the
@@ -1060,7 +1074,7 @@ test("M2: a batch with unresolved credits answers ok:false with the full counts"
         assert.equal(body.ok, false, "an unattended runner must be able to tell this went wrong");
         assert.equal(creditResult(body, "REF-OUTAGE").status, "failed");
         assert.deepEqual(body.counts, {
-            credits: 1, applied: 0, proposed: 0, unmatched: 0, reconcile: 0, failed: 1, qboUnknown: 0, replay: 0,
+            credits: 1, applied: 0, proposed: 0, unmatched: 0, reconcile: 0, failed: 1, qboUnknown: 0, unresolved: 0, replay: 0,
         });
     } finally {
         fakeQuickbooks.buildQBPaymentRequest = realBuild;
@@ -1129,6 +1143,35 @@ test("M3: the SYNC path suppresses the client receipt on its own when a bank dep
     });
 });
 
+test("M2 (round 2): a credit left in qbo_created — a REAL payment awaiting recovery — fails the batch", async () => {
+    // The residual hole: settleAndFinalize persists qbo_created (the QuickBooks
+    // payment EXISTS) and then throws on the settle. That comes back as a
+    // per-credit `qbo_created`, which no named bucket counted, so the batch
+    // still answered ok:true and the runner logged a healthy day over a payment
+    // nobody had finished applying.
+    seedMilestone({ amount: 11111.11 });
+    const realSettle = fakeQuickbooksPayments.settleMilestoneFromQBPayment;
+    fakeQuickbooksPayments.settleMilestoneFromQBPayment = async () => { throw new Error("settle blew up after the QBO payment existed"); };
+    try {
+        const { res, body } = await post(bankBatch([{ ref: "REF-QBO-CREATED", amount: 11111.11 }]));
+        assert.equal(res.status, 200);
+        assert.equal(creditResult(body, "REF-QBO-CREATED").status, "qbo_created");
+        assert.equal(body.counts.unresolved, 1, "the catch-all must count it");
+        assert.equal(body.counts.applied, 0);
+        assert.equal(body.ok, false, "a batch holding an unfinished QuickBooks payment is NOT a clean run");
+        // The buckets still partition the batch.
+        const { credits: total, replay: _replay, ...buckets } = body.counts as Record<string, number>;
+        assert.equal(Object.values(buckets).reduce((a, b) => a + b, 0), total);
+    } finally {
+        fakeQuickbooksPayments.settleMilestoneFromQBPayment = realSettle;
+    }
+
+    // …and the row itself is left recoverable, holding the real payment.
+    const row = depositRow("REF-QBO-CREATED")!;
+    assert.equal(row.status, "qbo_created");
+    assert.ok(row.qbPaymentId, "the QuickBooks payment id is preserved for the resume");
+});
+
 test("the batch response carries the counts the Bot Health line is built from", async () => {
     seedMilestone({ amount: 100 });   // clean → applied
     seedMilestone({ amount: 250 });   // duplicated below → both human
@@ -1140,7 +1183,7 @@ test("the batch response carries the counts the Bot Health line is built from", 
         { ref: "R-DUP-2", amount: 250 },
     ]));
     assert.deepEqual(body.counts, {
-        credits: 3, applied: 1, proposed: 0, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, replay: 0,
+        credits: 3, applied: 1, proposed: 0, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0,
     });
     assert.equal(body.ok, true, "two credits sent to a human is still a clean batch");
 });

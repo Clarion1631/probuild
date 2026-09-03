@@ -417,7 +417,7 @@ test("sweep: the POST goes to the deposit endpoint as a bearer, with the day's b
 });
 
 test("sweep: the Bot Health line reports every outcome bucket", () => {
-    const clean = { credits: 4, applied: 1, proposed: 1, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, replay: 3 };
+    const clean = { credits: 4, applied: 1, proposed: 1, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 3 };
     assert.equal(
         sweepSummaryLine("2026-08-24", clean),
         "sweep 2026-08-24: 4 credits, 1 applied, 2 need-human, 1 proposed, 3 replay",
@@ -427,11 +427,17 @@ test("sweep: the Bot Health line reports every outcome bucket", () => {
         sweepSummaryLine("2026-08-24", { ...clean, failed: 2, qboUnknown: 1 }),
         "sweep 2026-08-24: 4 credits, 1 applied, 2 need-human, 1 proposed, 3 replay, 2 failed, 1 qbo-unknown",
     );
+    // …nor may a credit stuck mid-flight (a created QuickBooks payment whose
+    // settle threw) hide inside a line that mentions no such thing.
+    assert.equal(
+        sweepSummaryLine("2026-08-24", { ...clean, unresolved: 1 }),
+        "sweep 2026-08-24: 4 credits, 1 applied, 2 need-human, 1 proposed, 3 replay, 0 failed, 0 qbo-unknown, 1 unresolved",
+    );
 });
 
 test("sweep: unresolved credits are a JOB FAILURE, so the watchdog fires", async t => {
     const counts = (over: Record<string, number> = {}) => ({
-        credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, replay: 0, ...over,
+        credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0, ...over,
     });
 
     await t.test("a clean day is not a failure", () => {
@@ -464,5 +470,37 @@ test("sweep: unresolved credits are a JOB FAILURE, so the watchdog fires", async
         assert.equal(sweepBatchFailed(null), true);
         assert.equal(sweepBatchFailed(undefined), true);
         assert.equal(sweepBatchFailed("nope"), true);
+        assert.equal(sweepBatchFailed({ ok: true }), true, "no counts at all is not a clean day");
+    });
+
+    await t.test("the catch-all bucket fails the run", () => {
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ applied: 0, unresolved: 1 }) }), true);
+    });
+
+    await t.test("buckets that do not add up to the credit count are a failure", () => {
+        // Some outcome went uncounted — an older deployment, or a status added
+        // since. Reporting success off an incomplete tally is the exact bug.
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ credits: 3 }) }), true);
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ credits: 2, applied: 3 }) }), true);
+    });
+
+    await t.test("a per-credit status outside the clean set fails, whatever the counts claim", () => {
+        // The round-2 residual, seen from the runner: an endpoint that tallies
+        // qbo_created as nothing would still be caught here, on the RAW result.
+        assert.equal(
+            sweepBatchFailed({ ok: true, counts: counts(), credits: [{ bankReference: "A", status: "qbo_created" }] }),
+            true,
+        );
+        assert.equal(
+            sweepBatchFailed({ ok: true, counts: counts(), credits: [{ bankReference: "A", status: "something-new" }] }),
+            true,
+        );
+        for (const status of ["applied", "proposed", "unmatched"]) {
+            assert.equal(
+                sweepBatchFailed({ ok: true, counts: counts(), credits: [{ bankReference: "A", status }] }),
+                false,
+                `${status} is a clean outcome`,
+            );
+        }
     });
 });
