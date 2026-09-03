@@ -30,6 +30,14 @@ model User {
   /// Phase 5 — a bare DateTime maps to TIMESTAMP(3), which the
   /// migrations-reproduce-production check correctly flags as drift.
   lastRateSyncAt            DateTime?                @db.Timestamptz(6)
+  /// Monotonic counter, bumped on EVERY payroll-affecting write to this row
+  /// (a rate confirmation OR a pay-type-only change) — replay protection for
+  /// the Gusto rate-import preview/apply signature. lastRateSyncAt cannot do
+  /// this job: it means "a rate was actually confirmed", so a pay-type-only
+  /// write must NOT move it (round-31 gate finding) — but that leaves a
+  /// concurrent pay-type change undetectable by a signature keyed on
+  /// lastRateSyncAt alone. This value has no other meaning; never displayed.
+  payrollRevision           Int                      @default(0)
   mealWaiverSignedAt        DateTime? // signed WA meal-period waiver on file (skip-lunch approval precondition)
   showOnDispatch            Boolean                  @default(false) // Appears on the dispatch board bench/grid. Owner-controlled on Company → Team members.
   pinCode                   String? // Used for mobile app quick login

@@ -906,6 +906,59 @@ test("the telemetry write is conditional on the owner it was authorized for", ()
     assert.doesNotMatch(telemetry, /timeEntry\.update\(\{ where: \{ id \}, data \}\)/);
 });
 
+// ── the telemetry write is routed through the SAME payroll-period guard ────
+//
+// A raw `prisma.timeEntry.updateMany` in the telemetry branch used to bypass
+// the guard entirely — no 423, ever, for a locked period. It is now wrapped in
+// withPayrollWriteTx, which row-locks `id` and checks its STORED startTime
+// (src/lib/payroll-period.ts's assertEntriesUnlockedInTx) before the write.
+//
+// PATCH is not DI-factored (see the file header), so — same as the "PATCH and
+// DELETE... both still call the lock guard" wiring test above — this is a
+// source check that the write is wrapped, PLUS a real behavioural test of the
+// guard function it delegates to, with the EXACT target shape ({ entryIds }
+// only, no dayKeys/instants) the telemetry branch actually passes. That is
+// the strongest proof available without a live database: assertEntriesUnlockedInTx
+// is pure and injectable, and withPayrollWriteTx does nothing to a locked-period
+// call beyond invoke it under the shared advisory lock.
+
+test("the telemetry branch wraps its write in withPayrollWriteTx and maps a locked period to 423", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
+        "utf8"
+    );
+    const telemetry = source.slice(source.indexOf("if (hasTelemetry) {"), source.indexOf("// -------- Branch 2"));
+    assert.match(telemetry, /withPayrollWriteTx\(\{ entryIds: \[id\] \}, async \(tx\) => \{/);
+    assert.match(telemetry, /if \(isPeriodLockedError\(error\)\) return periodLockedResponse\(error\.period\);/);
+    // The claim itself stays conditioned on the owner (see the test above) —
+    // the guard wrapper does not replace that check, it runs alongside it.
+    assert.match(telemetry, /client\.timeEntry\.updateMany\(\{/);
+});
+
+test("a telemetry write on an entry whose STORED startTime is inside a locked period is refused by the SAME guard the edit/delete branches use", async () => {
+    const { assertEntriesUnlockedInTx, isPeriodLockedError } = await import("../src/lib/payroll-period");
+    // No dayKeys, no instants — exactly what { entryIds: [id] } produces, the
+    // target withPayrollWriteTx({ entryIds: [id] }, ...) passes through.
+    const lockedTx = {
+        $executeRawUnsafe: async () => 0,
+        $queryRawUnsafe: async () => [{ startTime: INSIDE }],
+        payrollPeriod: { findMany: async () => [period()] },
+    };
+    await assert.rejects(() => assertEntriesUnlockedInTx(lockedTx, ["te1"]), (e: Error) => isPeriodLockedError(e));
+
+    // The same shape, entry outside the locked period: the write proceeds.
+    const freeTx = {
+        $executeRawUnsafe: async () => 0,
+        $queryRawUnsafe: async () => [{ startTime: AFTER }],
+        payrollPeriod: { findMany: async () => [period()] },
+    };
+    await assertEntriesUnlockedInTx(freeTx, ["te1"]);
+
+    // And with no locked periods at all — the common case — it proceeds too.
+    const noLocksTx = { ...lockedTx, payrollPeriod: { findMany: async () => [] } };
+    await assertEntriesUnlockedInTx(noLocksTx, ["te1"]);
+});
+
 test("the project timeclock actions parse date-only input in the company zone", () => {
     // new Date("2026-07-27") is UTC midnight — the 26th here. The punch would
     // land on the wrong day, in the wrong workweek, possibly the wrong period.

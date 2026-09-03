@@ -7,13 +7,13 @@ import {
   checkHelpSubmission,
   claimProviderLease,
   completeUnderLease,
+  deriveMobileSubmissionId,
   providerDeadlineSignal,
   renewProviderLease,
   helpChatResponse,
   HELP_THROTTLED_MESSAGE,
   isMobileClient,
   isMobileSubmission,
-  MOBILE_SUBMISSION_ID_REQUIRED,
   readJsonBody,
   reserveHelpRequest,
   submissionMarker,
@@ -55,19 +55,19 @@ export async function POST(req: NextRequest) {
   // The label still follows what the app says about itself.
   const fromMobile = fromMobileClient || isMobileSubmission(currentPage);
 
-  // A mobile caller with no idempotency key cannot be retried safely: the app
-  // retries on network failure, and without a key every retry is a new report
-  // and a new GitHub issue. The web widget is a human clicking once, so it stays
-  // optional there.
-  if (fromMobileClient && !submissionId) {
-    return NextResponse.json(
-      {
-        error: "This version of the app can't report bugs safely. Please update it.",
-        code: MOBILE_SUBMISSION_ID_REQUIRED,
-      },
-      { status: 400 }
-    );
-  }
+  // A mobile caller with no idempotency key cannot be retried safely BY
+  // ITSELF: the app retries on network failure, and without a key every retry
+  // is a new report and a new GitHub issue. The crew app's bug-report screen
+  // does not send one (apps/mobile/lib/bugReport.ts posts
+  // title/description/currentPage only) — hard-rejecting the request 400'd
+  // every phone report. Derive a deterministic key from the content instead,
+  // bucketed to the minute (submission-guard.ts), so a client that omits the
+  // field still gets retry safety without an app update. The web widget is a
+  // human clicking once, so an explicit key there is passed through unchanged.
+  const effectiveSubmissionId =
+    fromMobileClient && !submissionId
+      ? deriveMobileSubmissionId(userId, title, description)
+      : submissionId;
 
   try {
     if (conversationId) {
@@ -95,7 +95,7 @@ export async function POST(req: NextRequest) {
       response: description,
       currentPage,
       conversationId,
-      submissionId,
+      submissionId: effectiveSubmissionId,
     });
     if (!reserved.ok) {
       return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
@@ -113,7 +113,7 @@ export async function POST(req: NextRequest) {
       return helpChatResponse({
         body: { request: prior, githubIssue: null, duplicate: true },
         filed: reserved.providerState === "created",
-        submissionId,
+        submissionId: effectiveSubmissionId,
       });
     }
     const requestId = reserved.id;
@@ -133,7 +133,7 @@ export async function POST(req: NextRequest) {
       return helpChatResponse({
         body: { request: inFlight, duplicate: true, inFlight: true },
         filed: inFlight?.providerState === "created",
-        submissionId,
+        submissionId: effectiveSubmissionId,
       });
     }
 
@@ -151,7 +151,7 @@ export async function POST(req: NextRequest) {
         return helpChatResponse({
             body: { request: lost, duplicate: true, inFlight: true, superseded: true },
             filed: lost?.providerState === "created",
-            submissionId,
+            submissionId: effectiveSubmissionId,
         });
     }
 
@@ -198,7 +198,7 @@ export async function POST(req: NextRequest) {
       // The STORED state decides, not "we got an issue back": a superseded
       // attempt's own issue number is not what the row points at.
       filed: request?.providerState === "created",
-      submissionId,
+      submissionId: effectiveSubmissionId,
     });
   } catch (error) {
     console.error("Feature request error:", error);

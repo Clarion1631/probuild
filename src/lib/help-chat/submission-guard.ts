@@ -8,7 +8,7 @@
 // Pure except for the throttle's row count, which is injected — so the limits
 // are testable without a database.
 
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "../prisma";
 
@@ -327,6 +327,33 @@ export function submissionMarker(requestId: string): string {
 
 /** A mobile caller with no idempotency key cannot be made safe to retry. */
 export const MOBILE_SUBMISSION_ID_REQUIRED = "submission-id-required";
+
+/**
+ * Deterministic idempotency key for a mobile caller that sends no
+ * submissionId — the crew app's bug-report screen does not
+ * (apps/mobile/lib/bugReport.ts posts title/description/currentPage only), so
+ * requiring one 400'd every phone report. Retry safety still matters: the app
+ * retries on network failure, and without SOME key each retry opens a second
+ * GitHub issue.
+ *
+ * Derived from the content itself, bucketed to the minute: two identical
+ * reports from the same user inside the same 60s window collapse onto one
+ * row (a retry); two reports a minute apart, or with different text, are
+ * treated as genuinely distinct — the right default for a key the client
+ * never sees or sets. sha256 hex is 64 characters, exactly
+ * HELP_SUBMISSION_ID_MAX, and matches the `[A-Za-z0-9_-]+` shape
+ * checkHelpSubmission requires.
+ */
+export function deriveMobileSubmissionId(
+    userId: string,
+    title: string,
+    description: string,
+    now: Date = new Date()
+): string {
+    const normalizedText = `${title}\n${description}`.trim().toLowerCase().replace(/\s+/g, " ");
+    const bucket = Math.floor(now.getTime() / 60_000);
+    return createHash("sha256").update(`${userId}:${normalizedText}:${bucket}`).digest("hex");
+}
 
 /** A `submitting` row older than this was abandoned mid-flight; a retry resumes it. */
 export const HELP_SUBMITTING_STALE_MS = 2 * 60 * 1000;

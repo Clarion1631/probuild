@@ -253,7 +253,7 @@ test("row claims are SIGNED — an unsigned fingerprint is not evidence", () => 
         userId: "u1",
         oldHourly: "25.00",
         oldPayType: null,
-        oldLastRateSyncAt: null,
+        oldPayrollRevision: 0,
         csvHash: "",
         newHourly: "32.50",
         payType: null,
@@ -265,7 +265,7 @@ test("row claims are SIGNED — an unsigned fingerprint is not evidence", () => 
             userId: "u1",
             oldHourly: "25.00",
             oldPayType: "SALARY",
-            oldLastRateSyncAt: null,
+            oldPayrollRevision: 0,
             csvHash: "",
             newHourly: "32.50",
             payType: null,
@@ -590,41 +590,45 @@ test("properly quoted fields still parse, including embedded commas and quotes",
 const A_TO_B_CSV = ["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,32.50"].join("\n");
 
 test("A -> B -> A: a spent approval does not verify again once the rate is set back by hand", () => {
-    // Tim is on 25.00 and has never been imported, so his stamp is null.
+    // Round-32 gate: lastRateSyncAt no longer moves on a pay-type-only write,
+    // so it cannot be the replay guard any more — payrollRevision is. Tim has
+    // never had a payroll-affecting write, so his revision is 0.
     const before: ImportableUser[] = [
-        { id: "u1", name: "Tim Brennan", email: "tim@example.com", hourlyRate: "25.00", status: "ACTIVE", payType: "HOURLY", lastRateSyncAt: null },
+        { id: "u1", name: "Tim Brennan", email: "tim@example.com", hourlyRate: "25.00", status: "ACTIVE", payType: "HOURLY", payrollRevision: 0 },
     ];
     const approved = diffRates(parseGustoRateCsv(A_TO_B_CSV).rows, before, rowFingerprint, "file-hash")[0];
     assert.equal(approved.rowHash, rowFingerprint({
         userId: "u1", oldHourly: "25.00", oldPayType: "HOURLY",
-        oldLastRateSyncAt: null, csvHash: "file-hash",
+        oldPayrollRevision: 0, csvHash: "file-hash",
         // The file has no pay-type column, so the row writes a rate only.
         newHourly: "32.50", payType: null,
     }));
 
-    // The import runs: 25.00 -> 32.50, and the stamp is set. Then somebody puts
-    // the rate back to 25.00 by hand on the team page. Rate and pay type are
-    // now EXACTLY what the old approval was signed over.
+    // The import runs: 25.00 -> 32.50, and the revision moves to 1. Then
+    // somebody puts the rate back to 25.00 by hand on the team page — a
+    // SECOND payroll-affecting write, so the revision moves to 2. Rate and
+    // pay type are now EXACTLY what the old approval was signed over.
     const backToA: ImportableUser[] = [
-        { id: "u1", name: "Tim Brennan", email: "tim@example.com", hourlyRate: "25.00", status: "ACTIVE", payType: "HOURLY", lastRateSyncAt: "2026-09-02T00:00:00.000Z" },
+        { id: "u1", name: "Tim Brennan", email: "tim@example.com", hourlyRate: "25.00", status: "ACTIVE", payType: "HOURLY", payrollRevision: 2 },
     ];
     const reSigned = diffRates(parseGustoRateCsv(A_TO_B_CSV).rows, backToA, rowFingerprint, "file-hash")[0];
 
-    // Without the stamp the old token would verify and silently re-apply a
+    // Without the counter the old token would verify and silently re-apply a
     // decision that was already made, and already undone.
     assert.notEqual(reSigned.rowHash, approved.rowHash, "the spent approval must not verify against the restored rate");
 });
 
-test("an absent stamp is bound as the literal \"null\", never as an empty field", () => {
+test("a never-touched revision (0) is bound literally, and differs from any moved revision", () => {
     const never = rowFingerprint({
         userId: "u1", oldHourly: "25.00", oldPayType: "HOURLY",
-        oldLastRateSyncAt: null, csvHash: "h", newHourly: "32.50", payType: null,
+        oldPayrollRevision: 0, csvHash: "h", newHourly: "32.50", payType: null,
     });
-    assert.match(never, /:null:h$/);
-    // and it is a DIFFERENT claim from any real stamp
+    assert.match(never, /:0:h$/);
+    // and it is a DIFFERENT claim once the counter has moved, even by one —
+    // including from a PAY-TYPE-ONLY write, which lastRateSyncAt could never see.
     assert.notEqual(never, rowFingerprint({
         userId: "u1", oldHourly: "25.00", oldPayType: "HOURLY",
-        oldLastRateSyncAt: "2026-09-02T00:00:00.000Z", csvHash: "h", newHourly: "32.50", payType: null,
+        oldPayrollRevision: 1, csvHash: "h", newHourly: "32.50", payType: null,
     }));
 });
 
@@ -652,7 +656,13 @@ test("apply REQUIRES the csv and re-parses it — the check cannot be skipped by
     // are re-signed with.
     assert.match(body, /const csvHash = hashImportCsv\(csvText\)/);
     assert.match(body, /csvHash,/);
-    // The stamp is in the signature AND in the compare-and-set.
-    assert.match(body, /oldLastRateSyncAt: live\.lastRateSyncAt/);
-    assert.match(body, /lastRateSyncAt: live\.lastRateSyncAt,/);
+    // The replay guard is in the signature AND in the compare-and-set —
+    // payrollRevision, not lastRateSyncAt (round-32 gate: the latter no
+    // longer moves on a pay-type-only write, so it cannot detect one).
+    assert.match(body, /oldPayrollRevision: live\.payrollRevision/);
+    assert.match(body, /payrollRevision: live\.payrollRevision,/);
+    // And the actual write bumps it, unconditionally — the CAS above is the
+    // guard that makes replay-then-verify-then-write atomic; this is what
+    // gives the NEXT preview a fresh value to be keyed on.
+    assert.match(body, /payrollRevision: \{ increment: 1 \}/);
 });

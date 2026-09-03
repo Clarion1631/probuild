@@ -17,8 +17,10 @@ import {
     helpChatResponse,
     reserveHelpRequest,
     isMobileSubmission,
+    deriveMobileSubmissionId,
     HELP_DESCRIPTION_MAX,
     HELP_SUBMISSIONS_PER_HOUR,
+    HELP_SUBMISSION_ID_MAX,
     HELP_THROTTLE_WINDOW_MS,
     HELP_TITLE_MAX,
     isThrottled,
@@ -292,20 +294,73 @@ test("a retry resumes a submission stranded mid-flight instead of returning earl
     }
 });
 
-test("a mobile caller with no submissionId is refused, with a coded error", () => {
-    // The app retries on network failure. Without an idempotency key every retry
-    // is a new report and a new GitHub issue, so there is no safe way to serve
-    // it — the web widget (a human clicking once) keeps the key optional.
+test("a mobile caller with no submissionId gets a DERIVED key, never a 400 for missing it", () => {
+    // Requiring one used to 400 every crew bug report: the real mobile payload
+    // (MOBILE_PAYLOAD below) has no submissionId, and there is no way for the
+    // phone to add one without an app update (apps/mobile/lib/bugReport.ts
+    // posts title/description/currentPage only). The route now derives a
+    // deterministic key from the content instead — see deriveMobileSubmissionId
+    // below for the pure-function contract.
     const source = readFileSync(
         path.join(__dirname, "..", "src", "app", "api", "help-chat", "request", "route.ts"),
         "utf8"
     );
-    // Derived from HOW THEY AUTHENTICATED, never from the posted body: a body
-    // field cannot establish anything about the client.
+    // Still derived from HOW THEY AUTHENTICATED, never from the posted body.
     assert.match(source, /const fromMobileClient = isMobileClient\(auth\)/);
     assert.match(source, /fromMobileClient && !submissionId/);
-    assert.match(source, /MOBILE_SUBMISSION_ID_REQUIRED/);
-    assert.match(source, /status: 400/);
+    assert.match(source, /deriveMobileSubmissionId\(userId, title, description\)/);
+    assert.doesNotMatch(
+        source,
+        /MOBILE_SUBMISSION_ID_REQUIRED/,
+        "the request route must no longer refuse a mobile caller for omitting submissionId"
+    );
+});
+
+// ---- deriveMobileSubmissionId ---------------------------------------------
+// The replacement for the hard 400: a deterministic idempotency key derived
+// from what the mobile caller actually sent, so a Bearer request that omits
+// submissionId still gets retry safety without an app update.
+
+test("deriveMobileSubmissionId is deterministic, per-user, per-content, and minute-bucketed", () => {
+    const now = new Date("2026-09-02T12:00:30.000Z");
+    const a = deriveMobileSubmissionId("u1", "Bug", "It broke", now);
+    const b = deriveMobileSubmissionId("u1", "Bug", "It broke", now);
+    assert.equal(a, b, "same user/content/minute must reproduce the same key");
+
+    // 64 hex chars — sha256 digest length, which is also exactly
+    // HELP_SUBMISSION_ID_MAX and satisfies checkHelpSubmission's
+    // [A-Za-z0-9_-]+ shape without any further encoding.
+    assert.equal(a.length, 64);
+    assert.equal(a.length, HELP_SUBMISSION_ID_MAX);
+    assert.match(a, /^[a-f0-9]{64}$/);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", submissionId: a }).ok, true);
+
+    // A different user, same content and minute — must not collide.
+    const otherUser = deriveMobileSubmissionId("u2", "Bug", "It broke", now);
+    assert.notEqual(a, otherUser);
+
+    // Different content, same user and minute — must not collide.
+    const otherText = deriveMobileSubmissionId("u1", "Bug", "Something else broke", now);
+    assert.notEqual(a, otherText);
+
+    // Same user/content, one minute later — a NEW report, not a replay.
+    const nextMinute = new Date(now.getTime() + 60_000);
+    const later = deriveMobileSubmissionId("u1", "Bug", "It broke", nextMinute);
+    assert.notEqual(a, later);
+
+    // Same user/content, one second later but same 60s bucket — still the SAME
+    // key, so a retry a few seconds after a network failure collapses onto the
+    // original report instead of filing a second one.
+    const secondsLater = new Date(now.getTime() + 5_000);
+    const retry = deriveMobileSubmissionId("u1", "Bug", "It broke", secondsLater);
+    assert.equal(a, retry, "a retry seconds later, inside the same minute, must reuse the key");
+});
+
+test("deriveMobileSubmissionId normalizes whitespace/case so retries with cosmetic differences still collapse", () => {
+    const now = new Date("2026-09-02T12:00:30.000Z");
+    const base = deriveMobileSubmissionId("u1", "Bug", "It broke", now);
+    const paddedAndCased = deriveMobileSubmissionId("u1", "  BUG  ", "  it   broke  ", now);
+    assert.equal(base, paddedAndCased);
 });
 
 test("a resume asks GitHub before filing, using the submission marker", () => {
@@ -588,3 +643,14 @@ test("a pending row stays resumable, so a later retry finishes it", () => {
     // same submissionId.
     assert.match(source, /existing\.providerState !== "created" && age > HELP_SUBMITTING_STALE_MS/);
 });
+
+// The REQUEST-LEVEL test (real Bearer token, real POST handler, mocked prisma
+// via a Module.prototype.require patch) lives in its own file,
+// tests/help-chat-request-route.test.ts — NOT here. This file's own top-level
+// `import { ... } from "../src/lib/help-chat/submission-guard"` above already
+// forces that module (and its "../prisma" import) to load and cache with the
+// REAL prisma client before any in-file before() hook could patch it; a
+// require() patch only works on a module's FIRST load. Keeping the
+// request-level test in a file that never statically imports that chain is
+// what makes the patch effective — see that file's header for the full
+// explanation.

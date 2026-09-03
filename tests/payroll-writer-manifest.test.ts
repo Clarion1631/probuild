@@ -11,17 +11,28 @@
  * the test fails when the set changes. A new writer cannot be added silently —
  * it has to be classified here, as guarded or as a documented exemption.
  *
+ * KEYED BY FILE + LINE + METHOD, not file + method. A file+method key
+ * collapses every call to e.g. `updateMany` in one file into ONE entry, whose
+ * "guarded" claim then has to be true of ALL of them or it is a lie about at
+ * least one. That is exactly how the geofence-telemetry PATCH branch in
+ * `app/api/time-entries/[id]/route.ts` stayed unguarded: its raw
+ * `prisma.timeEntry.updateMany` shared a method name with the properly-guarded
+ * edit-claim `updateMany` a few hundred lines below it, the file+method key
+ * collapsed them into one "guarded" entry, and the reason text for a
+ * DIFFERENT key (`::update`) even described the telemetry branch by name —
+ * misattributing it to a method it does not call. Line numbers make that
+ * collapse impossible: each call site gets its own entry, and a description
+ * can only be true of the one line it is written against.
+ *
  * What this proves: no TimeEntry write escapes review. Two things it does NOT
  * prove, stated plainly rather than implied:
  *
  *  - that a "guarded" entry really holds the locks at runtime. The behavioural
  *    tests in tests/payroll-period-lock.test.ts are what show that.
- *  - that each individual call site is guarded. Keys are file + method, so a
- *    file with two `updateMany` writers collapses to one entry and the reason
- *    has to cover both. Adding a THIRD `updateMany` to such a file would not
- *    trip this test — only a new file, or a new method in an existing one,
- *    does. Closing that would need real AST work; the gap is recorded here
- *    instead of being papered over.
+ *  - that line numbers are stable. Any edit above a call site shifts every
+ *    line number below it, so this file WILL need updating on unrelated
+ *    changes — that churn is the deliberate cost of a key that cannot lie by
+ *    collapsing two call sites into one.
  */
 
 import { test } from "node:test";
@@ -31,7 +42,7 @@ import path from "node:path";
 
 const SRC = path.join(__dirname, "..", "src");
 
-/** `file::matched-call` for every TimeEntry mutation in src/. */
+/** `file:line::matched-call` for every TimeEntry mutation in src/. */
 function findWriters(): string[] {
     const found: string[] = [];
     // ANY receiver. A wrapped writer reads
@@ -52,7 +63,8 @@ function findWriters(): string[] {
             const source = readFileSync(full, "utf8");
             const rel = path.relative(SRC, full).split(path.sep).join("/");
             for (const match of source.matchAll(pattern)) {
-                found.push(`${rel}::${match[1]}`);
+                const line = source.slice(0, match.index).split("\n").length;
+                found.push(`${rel}:${line}::${match[1]}`);
             }
         }
     };
@@ -71,65 +83,97 @@ function findWriters(): string[] {
  */
 const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     // ---- the payroll write paths -------------------------------------------
-    "app/api/time-entries/route.ts::create": {
+    "app/api/time-entries/route.ts:290::create": {
         kind: "guarded",
         why: "clock-in create, wrapped in withPayrollWriteTx (startTime is client-supplied, so it can aim at a locked period)",
     },
-    "app/api/time-entries/route.ts::updateMany": {
+    "app/api/time-entries/route.ts:120::updateMany": {
         kind: "guarded",
-        why: "the stale-DEFERRED review flag (withPayrollWrite) and the clock-out claim (inside closeTimeEntry's locked transaction)",
+        why: "the stale-DEFERRED review flag, wrapped in withPayrollWrite — it sets needsReview, which gates the export",
     },
-    "app/api/time-entries/route.ts::update": {
+    "app/api/time-entries/route.ts:862::updateMany": {
+        kind: "guarded",
+        why: "the clock-out claim, inside closeTimeEntry's locked transaction with a compare-and-set on startTime",
+    },
+    "app/api/time-entries/route.ts:880::update": {
         kind: "guarded",
         why: "settlement-failure flag, written inside the same locked transaction as the close it belongs to",
     },
-    "app/api/time-entries/[id]/route.ts::updateMany": {
+    "app/api/time-entries/[id]/route.ts:155::updateMany": {
+        kind: "guarded",
+        why: "the geofence telemetry branch — offsiteMs/isOffsite/lastLocationCheck touch no hours, cost or readiness flag, but it is still routed through withPayrollWriteTx (entryIds: [id]) so it cannot become a hole later without someone deliberately removing the wrapper",
+    },
+    "app/api/time-entries/[id]/route.ts:573::updateMany": {
         kind: "guarded",
         why: "the PATCH edit claim, inside withPayrollWriteTx with a compare-and-set on updatedAt",
     },
-    "app/api/time-entries/[id]/route.ts::update": {
+    "app/api/time-entries/[id]/route.ts:592::update": {
         kind: "guarded",
-        why: "two call sites: the settlement-failure flag inside the edit transaction, and the geofence telemetry branch, which refuses to run in the same request as an edit and touches no hours, cost or readiness flag",
+        why: "the settlement-failure flag, written inside the same locked edit transaction",
     },
-    "app/api/time-entries/[id]/meal-skip/route.ts::updateMany": {
+    "app/api/time-entries/[id]/meal-skip/route.ts:86::updateMany": {
         kind: "guarded",
-        why: "skip request and decision, both wrapped in withPayrollWrite — each changes what the day's settlement owes",
+        why: "the skip REQUEST, wrapped in withPayrollWrite — it sets mealSkipStatus, which changes what the day's settlement owes",
     },
-    "app/api/time-entries/[id]/logistics/route.ts::updateMany": {
+    "app/api/time-entries/[id]/meal-skip/route.ts:157::updateMany": {
+        kind: "guarded",
+        why: "the skip DECISION (approve/deny), wrapped in withPayrollWrite for the same reason as the request above",
+    },
+    "app/api/time-entries/[id]/logistics/route.ts:145::updateMany": {
         kind: "guarded",
         why: "voice-dump formalize and re-code, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs",
     },
 
     // ---- server actions -----------------------------------------------------
-    "lib/actions.ts::updateMany": {
-        kind: "guarded",
-        why: "the meal-skip decision and logistics routing are both wrapped in withPayrollWrite; the third site is the billing invoice claim, which stamps invoiceId/invoicedAt only and is covered by lib/billing-core.ts's reasoning",
+    "lib/actions.ts:3634::updateMany": {
+        kind: "exempt",
+        why: "createInvoiceFromTimeEntries's claim: stamps invoiceId/invoicedAt only inside the invoice-creation transaction. Same reasoning as lib/billing-core.ts's exemption below — it changes no hours, no cost and no readiness flag, and every payroll writer already refuses an entry once it is billed",
     },
-    "lib/time-expense-core.ts::create": {
+    "lib/actions.ts:14988::updateMany": {
+        kind: "guarded",
+        why: "markTimeEntryReviewed's reprice-and-stamp claim, wrapped in withPayrollWrite with a compare-and-set on updatedAt",
+    },
+    "lib/actions.ts:15176::updateMany": {
+        kind: "guarded",
+        why: "the meal-skip decision, wrapped in withPayrollWrite — it changes what the day's settlement owes",
+    },
+    "lib/actions.ts:15242::updateMany": {
+        kind: "guarded",
+        why: "logistics routing: restoring an entry to its prior project, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs",
+    },
+    "lib/actions.ts:15255::updateMany": {
+        kind: "guarded",
+        why: "logistics routing: routing an entry to a new project, wrapped in withPayrollWrite for the same reason as the restore above",
+    },
+    "lib/time-expense-core.ts:145::create": {
         kind: "guarded",
         why: "createTimeEntryCore, wrapped in withPayrollWriteTx — the canonical manual create every server action funnels through",
     },
-    "lib/time-expense-core.ts::updateMany": {
+    "lib/time-expense-core.ts:277::updateMany": {
         kind: "guarded",
         why: "tagTimeEntriesToChangeOrder, wrapped in withPayrollWrite — retagging changes which change order the hours bill against",
     },
-    "lib/time-expense-actions.ts::updateMany": {
+    "lib/time-expense-actions.ts:180::updateMany": {
         kind: "guarded",
         why: "the manual edit, wrapped in withPayrollWriteTx with the row re-read under FOR UPDATE",
     },
-    "lib/time-expense-actions.ts::deleteMany": {
+    "lib/time-expense-actions.ts:225::deleteMany": {
         kind: "guarded",
-        why: "single and bulk delete, both wrapped in withPayrollWriteTx over every affected row id",
+        why: "deleteTimeEntry (single delete), wrapped in withPayrollWriteTx over the one affected row id",
     },
-    "app/projects/[id]/timeclock/actions.ts::create": {
+    "lib/time-expense-actions.ts:278::deleteMany": {
+        kind: "guarded",
+        why: "deleteTimeEntries (bulk delete), wrapped in withPayrollWriteTx over every affected row id",
+    },
+    "app/projects/[id]/timeclock/actions.ts:110::create": {
         kind: "guarded",
         why: "project manual create, wrapped in withPayrollWriteTx, priced from stored rates",
     },
-    "app/projects/[id]/timeclock/actions.ts::updateMany": {
+    "app/projects/[id]/timeclock/actions.ts:190::updateMany": {
         kind: "guarded",
         why: "project manual edit, wrapped in withPayrollWriteTx; updateMany rather than update so the billing columns are part of the compare-and-set",
     },
-    "app/projects/[id]/timeclock/actions.ts::deleteMany": {
+    "app/projects/[id]/timeclock/actions.ts:222::deleteMany": {
         kind: "guarded",
         why: "project manual delete, wrapped in withPayrollWriteTx; deleteMany so invoiceId/invoicedAt are in the WHERE and a row billed mid-delete is detected",
     },
@@ -140,17 +184,25 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     // longer runs.
 
     // ---- the settlement protocol -------------------------------------------
-    "lib/wa-breaks-db.ts::update": {
+    "lib/wa-breaks-db.ts:282::update": {
         kind: "guarded",
-        why: "settleDayInTx's re-plan (payroll lock taken before the day lock by every caller) plus flagSettlementFailed, which only ever ADDS a review flag — that blocks the export rather than letting bad numbers through, and it must still run when the surrounding transaction has rolled back",
+        why: "settleDayInTx's re-plan of one entry's shift/meal/cost fields, run inside the caller's already-locked payroll transaction (every caller takes the payroll lock before the day lock)",
     },
-    "lib/wa-breaks-db.ts::delete": {
+    "lib/wa-breaks-db.ts:353::delete": {
         kind: "guarded",
         why: "deleteEntryAndSettle, whose guard hook runs the payroll assertion before anything is removed",
     },
+    "lib/wa-breaks-db.ts:381::update": {
+        kind: "exempt",
+        why: "flagSettlementFailed's already-flagged branch: only ADDS needsReview, which blocks the export rather than letting bad numbers through. Deliberately outside the payroll lock — it must still run when the surrounding settlement transaction has rolled back, which is precisely the failure it exists to flag",
+    },
+    "lib/wa-breaks-db.ts:384::update": {
+        kind: "exempt",
+        why: "flagSettlementFailed's first-flag branch — same reasoning as the already-flagged branch above: best-effort, ADDS-only, and must survive the surrounding transaction rolling back",
+    },
 
     // ---- billing ------------------------------------------------------------
-    "lib/billing-core.ts::updateMany": {
+    "lib/billing-core.ts:1370::updateMany": {
         kind: "exempt",
         why: "the invoice claim: stamps invoiceId/invoicedAt inside the billing transaction. It changes no hours, no cost and no readiness flag, and every payroll writer already refuses an entry once it is billed",
     },
@@ -170,9 +222,15 @@ test("every TimeEntry writer in src/ is classified", () => {
     );
 
     // The manifest must not rot either: an entry for a call site that no longer
-    // exists is a claim about code that is gone.
+    // exists (or whose line number moved because of an edit above it) is a
+    // claim about code that isn't there.
     const stale = [...known].filter((entry) => !actual.includes(entry));
-    assert.deepEqual(stale, [], "MANIFEST lists writers that no longer exist — delete them.");
+    assert.deepEqual(
+        stale,
+        [],
+        "MANIFEST lists writers that no longer exist at that file:line — delete them, or " +
+            "update the line number if the call site just moved."
+    );
 });
 
 test("every exemption states a reason, and guarded files import the helper", () => {
@@ -186,7 +244,13 @@ test("every exemption states a reason, and guarded files import the helper", () 
     const guardedFiles = new Set(
         Object.entries(MANIFEST)
             .filter(([, entry]) => entry.kind === "guarded")
-            .map(([site]) => site.split("::")[0])
+            .map(([site]) => {
+                // "file/path.ts:123::method" -> "file/path.ts". Split on "::"
+                // first (method), then drop the trailing ":<line>" — paths
+                // never contain a colon themselves, so the LAST one is it.
+                const [relLine] = site.split("::");
+                return relLine.slice(0, relLine.lastIndexOf(":"));
+            })
     );
     for (const file of guardedFiles) {
         const source = readFileSync(path.join(SRC, ...file.split("/")), "utf8");

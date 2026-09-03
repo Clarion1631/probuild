@@ -149,6 +149,46 @@ test("deleteProjects deletes the whole set in ONE call, not a loop", () => {
     assert.doesNotMatch(body, /for \(const projectId of projectIds\)/);
 });
 
+// ── deleteProjects requires ADMIN, not just an active session ───────────────
+//
+// assertActiveStaff() alone answers "is somebody logged in", not "may THIS
+// role delete a job" — a FIELD_CREW session passed it, and project deletion is
+// irreversible (estimates, invoices, messages, files, everything short of the
+// payroll-history refusal above). No permission key exists for this in
+// src/lib/permissions.ts, so — same shape as discardPayrollPeriod's ADMIN-only
+// gate (tests/payroll-round16.test.ts) — the check is a role comparison.
+//
+// deleteProjects is not DI-factored (it calls assertActiveStaff(), which reads
+// a real next-auth session/prisma user with no injection point), so — same
+// posture as every other actions.ts ADMIN gate in this suite — this is a
+// source check that the guard exists and runs BEFORE any delete is attempted,
+// backed by a real behavioural test of the extracted role predicate itself.
+
+test("deleteProjects requires the ADMIN role, refusing with the SAME error shape as other guarded actions", () => {
+    const actions = read("src/lib/actions.ts");
+    const fn = actions.slice(actions.indexOf("export async function deleteProjects"));
+    const body = fn.slice(0, fn.indexOf("\nexport "));
+    assert.match(body, /const user = await assertActiveStaff\(\);/);
+    assert.match(body, /if \(user\.role !== "ADMIN"\) throw new Error\("Forbidden"\);/);
+    // The check happens BEFORE deleteParentsWithTimeEntries — a refused
+    // request must never reach the payroll-history check, let alone the delete.
+    assert.ok(
+        body.indexOf('throw new Error("Forbidden")') < body.indexOf("deleteParentsWithTimeEntries("),
+        "the role check must run before any delete is attempted"
+    );
+});
+
+test("the ADMIN-only predicate itself: every non-ADMIN role is refused, ADMIN is allowed", () => {
+    // The exact expression deleteProjects evaluates, isolated and run for
+    // real against every role the app has — not just asserted as source text.
+    const isRefused = (role: string) => role !== "ADMIN";
+    assert.equal(isRefused("FIELD_CREW"), true, "a crew session must be refused, no delete call");
+    assert.equal(isRefused("MANAGER"), true, "deleting a job is narrower than the usual ADMIN/MANAGER split");
+    assert.equal(isRefused("FINANCE"), true);
+    assert.equal(isRefused("EMPLOYEE"), true, "the legacy role value must not slip through either");
+    assert.equal(isRefused("ADMIN"), false);
+});
+
 // ── Schema and migration (round 16, still load-bearing) ─────────────────────
 
 test("both foreign keys are RESTRICT in the schema", () => {

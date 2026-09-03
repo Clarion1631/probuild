@@ -4,6 +4,11 @@
 //   User.lastRateSyncAt   Last time this member's pay rate was CONFIRMED (via
 //                         the Gusto CSV rate import or a manual edit on
 //                         Company -> Team Members). Null = never confirmed.
+//   User.payrollRevision  Monotonic counter, bumped on every payroll-affecting
+//                         write (rate OR pay-type-only) — replay protection
+//                         for the rate-import signature. lastRateSyncAt alone
+//                         cannot do this, since a pay-type-only write must
+//                         not move it (round-32 gate).
 //   PayrollPeriod         A reviewed/exported pay period, half-open
 //                         [periodStart, periodEnd). lockedAt freezes every
 //                         time entry whose startTime falls inside it.
@@ -67,6 +72,7 @@ export const EXPECTED_SCHEMA = "public";
 export const EXPECTED_OBJECTS = [
     { kind: "column", table: "User", name: "lastRateSyncAt", type: "timestamp with time zone", nullable: true },
     { kind: "column", table: "User", name: "payType", type: "text", nullable: true },
+    { kind: "column", table: "User", name: "payrollRevision", type: "integer", nullable: false },
 
     { kind: "table", name: "PayrollPeriod" },
     { kind: "column", table: "PayrollPeriod", name: "periodStart", type: "timestamp with time zone", nullable: false },
@@ -636,6 +642,18 @@ async function main() {
         );
         await prisma.$executeRawUnsafe(
             `ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_discard_unlocked"`
+        );
+
+        // ----------------------------------------------------------------------
+        // Round-32 gate: lastRateSyncAt reverts to meaning "a rate was actually
+        // CONFIRMED" (a pay-type-only write must not move it), which reopens the
+        // replay hole it used to close for a concurrent pay-type-only change.
+        // payrollRevision is a plain monotonic counter, bumped on EVERY
+        // payroll-affecting write regardless of which fields it touches, and the
+        // rate-import signature is keyed on it instead.
+        // ----------------------------------------------------------------------
+        await prisma.$executeRawUnsafe(
+            `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payrollRevision" INTEGER NOT NULL DEFAULT 0`
         );
 
         // ONE verification, against the SAME list the dry run reports on.

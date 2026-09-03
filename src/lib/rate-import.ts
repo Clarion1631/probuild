@@ -80,13 +80,30 @@ export type ImportableUser = {
     /**
      * ISO text of User.lastRateSyncAt, or null if a rate was never imported.
      *
+     * Display only now — "last CONFIRMED", shown on the rates panel. It does
+     * NOT move on a pay-type-only write (round-32 gate), so it can no longer
+     * be trusted to detect an A -> B -> A replay on its own; payrollRevision
+     * below is what the signature is actually keyed on.
+     */
+    lastRateSyncAt?: string | null;
+    /**
+     * Monotonic counter, bumped on EVERY payroll-affecting write to this user
+     * (a rate confirmation OR a pay-type-only change) — see
+     * User.payrollRevision in prisma/schema.prisma.
+     *
      * Part of the row's identity, not decoration: it is what makes an A -> B -> A
      * replay detectable. Rate and pay type both return to their old values when
      * somebody sets them back by hand, so an old preview's token would verify
-     * again and silently re-apply a decision nobody made twice. The stamp only
-     * moves forward.
+     * again and silently re-apply a decision nobody made twice, if the
+     * fingerprint were keyed on the values alone. This counter only moves
+     * forward, unlike lastRateSyncAt, which a pay-type-only write leaves
+     * untouched.
+     *
+     * Optional here (test fixtures predate this field) — treated as 0 when
+     * absent, matching the column's own default for a row nothing has ever
+     * touched.
      */
-    lastRateSyncAt?: string | null;
+    payrollRevision?: number;
 };
 
 /** Highest rate the import will accept without a human overriding it by hand — a typo like "5500" instead of "55.00" must not reach payroll. */
@@ -455,7 +472,7 @@ export function diffRates(
                       userId: user.id,
                       oldHourly,
                       oldPayType,
-                      oldLastRateSyncAt: user.lastRateSyncAt ?? null,
+                      oldPayrollRevision: user.payrollRevision ?? 0,
                       csvHash,
                       newHourly: row.hourlyRate,
                       payType: row.payType,
@@ -519,8 +536,15 @@ export type RowFingerprintInput = {
     oldHourly: string | null;
     /** The member's pay type when the preview was built. */
     oldPayType: string | null;
-    /** ISO text of the member's lastRateSyncAt when the preview was built, or null. */
-    oldLastRateSyncAt: string | null;
+    /**
+     * The member's payrollRevision when the preview was built.
+     *
+     * The replay guard — NOT lastRateSyncAt, which is display-only now and
+     * does not move on a pay-type-only write (round-32 gate). This counter
+     * bumps on every payroll-affecting write regardless of which fields it
+     * touches, so it is what actually invalidates a stale approval.
+     */
+    oldPayrollRevision: number;
     /** sha256 of the CSV this preview was built from. Binds the row to one file. */
     csvHash: string;
     /** The rate about to be written, or null for a pay-type-only row. */
@@ -546,10 +570,7 @@ export function rowFingerprint(input: RowFingerprintInput): string {
         input.oldPayType ?? "",
         input.newHourly ?? "",
         input.payType ?? "",
-        // "null" rather than "": an absent stamp is a real, distinct state (a
-        // member whose rate was never imported), and collapsing it into the
-        // empty string would make it indistinguishable from a missing field.
-        input.oldLastRateSyncAt ?? "null",
+        String(input.oldPayrollRevision),
         input.csvHash,
     ].join(":");
 }

@@ -8,7 +8,8 @@
 //
 // Everything funnels through applyRateChange: one permission boundary (ADMIN or
 // financialReports — the same gate the payroll export and the rates panel use),
-// one exact-decimal parse, one lastRateSyncAt stamp, in one update.
+// one exact-decimal parse, one lastRateSyncAt stamp (rate confirmations only),
+// one payrollRevision bump (every payroll-affecting write), in one update.
 
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
@@ -127,11 +128,19 @@ export async function applyRateChangeInTx(
         data.payType = payType;
     }
 
-    // "Last confirmed", stamped by EVERY path that writes a rate OR pay type —
-    // a stale Gusto approval could otherwise be replayed by a pay-type-only
-    // write that never touches hourlyRate/burdenRate. The whole point of the
-    // staleness marker is that no payroll-affecting write can skip it.
-    if (touchesRates || touchesPayType) data.lastRateSyncAt = new Date();
+    // "Last confirmed" — ONLY when an actual rate is being confirmed. A
+    // pay-type-only write must not move this: the Payroll rates panel reads it
+    // as "somebody looked at and confirmed this rate", and stamping it for a
+    // write that never touched hourlyRate/burdenRate made that claim false.
+    if (touchesRates) data.lastRateSyncAt = new Date();
+
+    // Replay protection lives here instead: a plain monotonic counter, bumped
+    // on EVERY payroll-affecting write regardless of which fields it touches.
+    // The rate-import preview/apply signature is keyed on this, not on
+    // lastRateSyncAt — an A -> B -> A replay (rate OR pay type set back by
+    // hand) still moves this counter forward, so an old approval's signature
+    // stops verifying even though lastRateSyncAt cannot tell the difference.
+    if (touchesRates || touchesPayType) data.payrollRevision = { increment: 1 };
 
     // EXCLUSIVE row lock, then the write, on the CALLER's transaction.
     // Settlement reads the same row FOR SHARE while it reprices a day, so this

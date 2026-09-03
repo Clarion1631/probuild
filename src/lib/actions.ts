@@ -8646,7 +8646,13 @@ export async function resetProjectPercentCompleteToAuto(projectId: string) {
 }
 
 export async function deleteProjects(projectIds: string[]) {
-    await assertActiveStaff();
+    const user = await assertActiveStaff();
+    // ADMIN only — src/lib/permissions.ts has no dedicated project-delete
+    // permission key, and deleting a project is irreversible (it cascades
+    // through everything payroll_parent_delete refuses to let it touch, but
+    // still destroys estimates, invoices, messages, files). An active session
+    // alone let any staff role — FIELD_CREW included — remove a job.
+    if (user.role !== "ADMIN") throw new Error("Forbidden");
     const { deleteParentsWithTimeEntries } = await import("./payroll-parent-delete");
     // ONE transaction for the whole selection: every project is checked before
     // any project is deleted. Looping per project left the caller half-deleted
@@ -15333,7 +15339,7 @@ async function importableUsers() {
     const users = await prisma.user.findMany({
         select: {
             id: true, name: true, email: true, hourlyRate: true, status: true,
-            payType: true, lastRateSyncAt: true,
+            payType: true, lastRateSyncAt: true, payrollRevision: true,
         },
     });
     return users.map((u) => ({
@@ -15345,9 +15351,12 @@ async function importableUsers() {
         hourlyRate: u.hourlyRate.toFixed(2),
         status: u.status,
         payType: u.payType ?? null,
-        // ISO text, so the value signed at preview time and the value re-read at
-        // apply time are compared as the same thing.
+        // ISO text, DISPLAY ONLY — the "last confirmed" label. Not the replay
+        // guard any more; payrollRevision below is.
         lastRateSyncAt: u.lastRateSyncAt ? u.lastRateSyncAt.toISOString() : null,
+        // The value signed at preview time and re-read at apply time are
+        // compared as the same thing — this counter is the replay guard.
+        payrollRevision: u.payrollRevision,
     }));
 }
 
@@ -15438,7 +15447,7 @@ export async function applyGustoRateImport(
 
     const known = await prisma.user.findMany({
         where: { id: { in: clean.map((r) => r.userId) } },
-        select: { id: true, status: true, hourlyRate: true, payType: true, lastRateSyncAt: true },
+        select: { id: true, status: true, hourlyRate: true, payType: true, lastRateSyncAt: true, payrollRevision: true },
     });
     if (known.length !== clean.length) {
         return { success: false as const, error: "One of those team members no longer exists — re-run the preview." };
@@ -15457,10 +15466,12 @@ export async function applyGustoRateImport(
             userId: row.userId,
             oldHourly: live.hourlyRate.toFixed(2),
             oldPayType: live.payType ?? null,
-            // The stamp closes the A -> B -> A replay: setting a rate back by
-            // hand restores the rate and pay type this token was signed over,
-            // but never the stamp, so the old approval stops verifying.
-            oldLastRateSyncAt: live.lastRateSyncAt ? live.lastRateSyncAt.toISOString() : null,
+            // Closes the A -> B -> A replay: setting a rate (or pay type) back
+            // by hand restores the values this token was signed over, but this
+            // counter still moved when that happened, so the old approval
+            // stops verifying. lastRateSyncAt cannot do this any more — a
+            // pay-type-only write leaves it untouched (round-32 gate).
+            oldPayrollRevision: live.payrollRevision,
             csvHash,
             newHourly: row.newHourly,
             payType: row.payType,
@@ -15499,22 +15510,28 @@ export async function applyGustoRateImport(
                         id: row.userId,
                         hourlyRate: live.hourlyRate,
                         payType: live.payType,
-                        // Same three values the token was verified against, so
-                        // the check and the write cannot be split by a
-                        // concurrent import landing in between.
-                        lastRateSyncAt: live.lastRateSyncAt,
+                        // Same value the token was verified against, so the
+                        // check and the write cannot be split by a concurrent
+                        // import (or a rates-panel edit) landing in between.
+                        // payrollRevision, not lastRateSyncAt: the latter no
+                        // longer moves on a pay-type-only write, so it cannot
+                        // detect one happening concurrently (round-32 gate).
+                        payrollRevision: live.payrollRevision,
                         status: { not: "DISABLED" },
                     },
                     data: {
                         ...(row.newHourly != null ? { hourlyRate: new Prisma.Decimal(row.newHourly) } : {}),
                         ...(row.payType ? { payType: row.payType } : {}),
+                        // "Last confirmed" — ONLY for a row that actually
+                        // carries a rate. A pay-type-only row must not move
+                        // this, or the rates panel shows a rate as confirmed
+                        // when nobody looked at it.
+                        ...(row.newHourly != null ? { lastRateSyncAt: syncedAt } : {}),
                         // Every clean row carries a rate change, a pay-type
-                        // change, or both (checked above) — the stamp moves
-                        // whenever either does. A pay-type-only row used to
-                        // leave the "last confirmed" stamp untouched, which let
-                        // a stale approval get replayed through a payType-only
-                        // write later.
-                        lastRateSyncAt: syncedAt,
+                        // change, or both (checked above) — this counter moves
+                        // whenever either does, which is what makes it usable
+                        // as the next preview's replay guard.
+                        payrollRevision: { increment: 1 },
                     },
                 });
                 if (result.count !== 1) {
@@ -15559,12 +15576,14 @@ export async function setUserPayType(
     }
     const updated = await prisma.user.updateMany({
         where: options.historical ? { id: userId } : { id: userId, status: { not: "DISABLED" } },
-        // lastRateSyncAt moves too, not just payType. The rate-import token is
-        // signed over BOTH — that is the whole point of the stamp (see the
-        // comment on oldLastRateSyncAt in applyGustoRateImport) — so leaving it
-        // untouched here let a HOURLY -> SALARY -> HOURLY cycle restore the
-        // exact signed state and replay an old, already-shown approval.
-        data: { payType, lastRateSyncAt: new Date() },
+        // lastRateSyncAt is NOT touched here — it means "a rate was actually
+        // confirmed", and this write never touches hourlyRate/burdenRate.
+        // payrollRevision moves instead: the rate-import token is signed over
+        // it (see oldPayrollRevision in applyGustoRateImport), so a
+        // HOURLY -> SALARY -> HOURLY cycle still advances the counter and an
+        // old, already-shown approval's signature stops verifying even though
+        // payType (and lastRateSyncAt) end up back where they started.
+        data: { payType, payrollRevision: { increment: 1 } },
     });
     if (updated.count !== 1) return { success: false as const, error: "That team member is not available." };
 

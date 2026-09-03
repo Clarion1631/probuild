@@ -70,7 +70,7 @@ test("a caller without payroll access cannot change a rate", async () => {
     assert.equal(writes.length, 0);
 });
 
-test("every rate write stamps lastRateSyncAt and stores an exact decimal", async () => {
+test("every rate write stamps lastRateSyncAt, bumps payrollRevision, and stores an exact decimal", async () => {
     const { writes, client } = fakeClient();
     const result = await applyRateChange(ADMIN, "u1", { hourlyRate: "28.5", burdenRate: "6" }, client);
     assert.deepEqual(result, { ok: true, changed: true });
@@ -78,7 +78,8 @@ test("every rate write stamps lastRateSyncAt and stores an exact decimal", async
     // Prisma.Decimal, not a float — a rate must never round-trip through one.
     assert.equal(String(data.hourlyRate), "28.5");
     assert.equal(String(data.burdenRate), "6");
-    assert.ok(data.lastRateSyncAt instanceof Date, "the staleness stamp cannot be skipped");
+    assert.ok(data.lastRateSyncAt instanceof Date, "the staleness stamp cannot be skipped for an actual rate confirmation");
+    assert.deepEqual(data.payrollRevision, { increment: 1 }, "the replay counter moves on every payroll-affecting write");
 });
 
 test("sub-cent, exponent and out-of-range rates are refused, not rounded", async () => {
@@ -94,10 +95,13 @@ test("pay type rides the same path, and only accepts the two real values", async
     const { writes, client } = fakeClient();
     assert.equal((await applyRateChange(ADMIN, "u1", { payType: "SALARY" }, client)).ok, true);
     assert.equal(writes[0].data.payType, "SALARY");
-    // A pay-type-only change ALSO stamps lastRateSyncAt: a stale Gusto approval
-    // (signed over the old rate + pay type + old stamp) must not be replayable
-    // by a write that only touches payType — see the round-31 gate finding.
-    assert.ok(writes[0].data.lastRateSyncAt instanceof Date, "a pay-type-only write must also advance the staleness stamp");
+    // Round-32 gate: a pay-type-only change must NOT stamp lastRateSyncAt —
+    // that field means "a rate was actually confirmed", and this write never
+    // touches hourlyRate/burdenRate. A stale Gusto approval (signed over the
+    // old rate + pay type + old REVISION) still must not be replayable by a
+    // write that only touches payType — payrollRevision is what advances now.
+    assert.equal("lastRateSyncAt" in writes[0].data, false, "a pay-type-only write must not advance the rate-confirmed stamp");
+    assert.deepEqual(writes[0].data.payrollRevision, { increment: 1 }, "the replay counter still advances on a pay-type-only write");
     assert.equal((await applyRateChange(ADMIN, "u1", { payType: "GUESS" }, client)).ok, false);
 });
 
@@ -162,13 +166,15 @@ test("the rate import locks every affected row, in a stable order", () => {
     assert.ok(body.indexOf("lockOwnerRowForUpdate") < body.indexOf("tx.user.updateMany"));
 });
 
-test("a pay-type-only write through the user PATCH route's shape advances lastRateSyncAt", async () => {
+test("a pay-type-only write through the user PATCH route's shape leaves lastRateSyncAt alone and advances payrollRevision", async () => {
     // Mirrors exactly the payload src/app/api/users/[id]/route.ts (and the
     // manager employees / users POST routes) hand to applyRateChangeInTx: an
     // edit that carries payType but leaves hourlyRate and burdenRate
-    // undefined. Before the round-31 fix, only hourlyRate/burdenRate changes
-    // stamped lastRateSyncAt, so a stale Gusto-import approval could be
-    // replayed later by a payType-only PATCH that never touched a rate.
+    // undefined. Round-31 made this ALSO stamp lastRateSyncAt so a stale
+    // Gusto-import approval could not be replayed by a payType-only PATCH —
+    // but that broke lastRateSyncAt's OWN meaning ("a rate was confirmed"),
+    // which the round-32 gate flagged. payrollRevision now carries the replay
+    // protection instead, and lastRateSyncAt goes back to rate-only.
     const { writes, client } = fakeClient();
     const result = await applyRateChange(
         ADMIN,
@@ -178,7 +184,8 @@ test("a pay-type-only write through the user PATCH route's shape advances lastRa
     );
     assert.deepEqual(result, { ok: true, changed: true });
     assert.equal(writes[0].data.payType, "HOURLY");
-    assert.ok(writes[0].data.lastRateSyncAt instanceof Date);
+    assert.equal("lastRateSyncAt" in writes[0].data, false);
+    assert.deepEqual(writes[0].data.payrollRevision, { increment: 1 });
 });
 
 // ── The opener vs the in-transaction worker (review round 19, item 1) ───────

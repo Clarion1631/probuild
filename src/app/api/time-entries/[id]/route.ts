@@ -138,10 +138,29 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         // reassignment in between would let one worker's phone stamp geofence
         // data onto somebody else's punch — and telemetry is deliberately
         // owner-only, even for a manager.
-        const claimed = await prisma.timeEntry.updateMany({
-            where: { id, userId: user.id },
-            data,
-        });
+        //
+        // Routed through the same payroll-period guard every other TimeEntry
+        // writer uses (src/lib/payroll-period.ts), even though telemetry
+        // touches no hours, cost or readiness flag: withPayrollWriteTx row-locks
+        // `id` and checks its STORED startTime against any locked period before
+        // this write runs. An unguarded raw call here was the one writer the
+        // payroll-writer-manifest test could not tell apart from the guarded
+        // edit claim below — both call the same TimeEntry write method on this
+        // same file, and the manifest used to key on file+method, so one entry
+        // silently vouched for both.
+        let claimed: { count: number };
+        try {
+            claimed = await withPayrollWriteTx({ entryIds: [id] }, async (tx) => {
+                const client = tx as unknown as typeof prisma;
+                return client.timeEntry.updateMany({
+                    where: { id, userId: user.id },
+                    data,
+                });
+            });
+        } catch (error) {
+            if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
+            throw error;
+        }
         if (claimed.count !== 1) {
             return NextResponse.json(
                 {

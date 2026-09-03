@@ -298,3 +298,15 @@ ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_discard_unl
 ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_discard_unlocked"
     CHECK ("discardedAt" IS NULL OR "lockedAt" IS NULL) NOT VALID;
 ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_discard_unlocked";
+
+-- ---------------------------------------------------------------------------
+-- Round-32 gate: lastRateSyncAt is reverted to meaning "a rate was actually
+-- CONFIRMED" — a pay-type-only write must not move it, or the staleness
+-- marker the Payroll rates panel shows stops being true. That reopens the
+-- replay hole lastRateSyncAt used to (imperfectly) close: a signature keyed
+-- on it alone can no longer detect a concurrent pay-type-only change between
+-- preview and apply. payrollRevision is a plain monotonic counter, bumped on
+-- EVERY payroll-affecting write regardless of which fields it touches, and
+-- takes over as the value the rate-import signature is keyed on.
+-- ---------------------------------------------------------------------------
+ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payrollRevision" INTEGER NOT NULL DEFAULT 0;
