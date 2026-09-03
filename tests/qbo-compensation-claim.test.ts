@@ -287,3 +287,56 @@ test("round 51: every field the rail now freezes is one the predicate checks", a
         assert.equal(verdict.ok, false, `${label} must be refused`);
     }
 });
+
+test("round 53: the fence lets every NON-claimed marker through, including null", async () => {
+    // The bug this encodes: the fence was first expressed in SQL as
+    // `NOT (qbSyncError LIKE 'compensating:%')`. Three-valued logic makes that
+    // NULL — not TRUE — when qbSyncError IS NULL, so the predicate excluded
+    // every CLEAN row and ordinary settlement stopped dead. Two e2e deposit
+    // specs and a progress-billing settle went red on their FIRST apply, on
+    // fresh fixtures carrying no marker at all.
+    //
+    // The check now reads the marker and decides in JS. These are the values a
+    // real row carries; only the two claim prefixes may be refused.
+    const { isIrreversibleClaimHeld, compensationClaimMarker, deletionClaimMarker } =
+        await import("../src/lib/qbo-create-markers");
+
+    for (const marker of [
+        null,
+        undefined,
+        "",
+        "paylink-pending",
+        "paylink-pending:2",
+        "paylink-missing",
+        "pending-deletion",
+        "pending-deletion:settled",
+        "voided",
+        "notFound",
+        "create-in-flight:@1|INV-1-2|note",
+        "ambiguous-create:@1|INV-1-2|note",
+    ]) {
+        assert.equal(
+            isIrreversibleClaimHeld(marker as any),
+            false,
+            `${String(marker)} carries no irreversible claim and must still settle`,
+        );
+    }
+
+    // ...and exactly the two that do.
+    assert.equal(isIrreversibleClaimHeld(compensationClaimMarker("abc123")), true);
+    assert.equal(isIrreversibleClaimHeld(deletionClaimMarker("abc123")), true);
+});
+
+test("round 53: the QuickBooks settle rail expresses the fence in JS, not in SQL", async () => {
+    // Belt and braces on the above: the same predicate written back into the
+    // WHERE clause would reintroduce the NULL hole without failing the pure
+    // unit test, because that test never goes near a database.
+    const src = await import("node:fs").then((fs) => fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
+    const body = functionBody(src, "settleMilestonePaidInTx");
+    assert.match(body, /isIrreversibleClaimHeld\(current\?\.qbSyncError\)/, "the fence is a JS check on the read marker");
+    assert.doesNotMatch(
+        body,
+        /NOT: \[/,
+        "a NOT ... LIKE in the WHERE is NULL for a null marker and silently excludes clean rows",
+    );
+});

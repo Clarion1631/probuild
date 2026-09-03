@@ -70,6 +70,7 @@ import {
     PENDING_DELETION_SETTLED_MARKER,
     deletionClaimMarker,
     COMPENSATION_CLAIMED_PREFIX,
+    isIrreversibleClaimHeld,
     compensationClaimMarker,
     PENDING_DELETION_CLAIMED_PREFIX,
 } from "./qbo-create-markers";
@@ -2430,14 +2431,28 @@ async function settleMilestonePaidInTx(
     // This does NOT pin a marker the way the INVARIANT below forbids — it
     // refuses ONLY the two short-lived claims that fence a network call, and
     // the caller retries. A settle is never dropped, only deferred.
+    // Read the marker and decide in JS, NOT with a `NOT ... LIKE` in the WHERE.
+    //
+    // SQL three-valued logic: `NOT (qbSyncError LIKE 'compensating:%')` is NULL,
+    // not TRUE, when qbSyncError IS NULL — so expressing the fence that way
+    // excluded every CLEAN row and stopped ordinary settlement dead. This
+    // transaction is caller-locked (see the doc comment), so a read followed by
+    // the pinned CAS below is atomic with respect to any other settle.
+    const current = await t.paymentSchedule.findUnique({
+        where: { id: paymentScheduleId },
+        select: { qbSyncError: true },
+    });
+    if (isIrreversibleClaimHeld(current?.qbSyncError)) {
+        // A compensation or a deletion is between its claim and an irreversible
+        // QuickBooks call for this row. Settling behind it destroyed the invoice
+        // of a milestone that had just been paid. The claim is short-lived and
+        // released on every path, so the caller retries and nothing is lost.
+        return false;
+    }
     const claim = await t.paymentSchedule.updateMany({
         where: {
             id: paymentScheduleId,
             status: { not: "Paid" },
-            NOT: [
-                { qbSyncError: { startsWith: COMPENSATION_CLAIMED_PREFIX } },
-                { qbSyncError: { startsWith: PENDING_DELETION_CLAIMED_PREFIX } },
-            ],
         },
         data: {
             status: "Paid",

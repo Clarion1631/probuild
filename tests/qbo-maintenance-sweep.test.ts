@@ -1869,8 +1869,11 @@ test("round 51: a settle cannot land at all while the deletion claim is held", a
     const qbo = await import("node:fs").then((fs) => fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
     const settleAt = qbo.indexOf("function settleMilestonePaidInTx(");
     const settleBody = qbo.slice(settleAt, settleAt + 12000);
-    assert.match(settleBody, /COMPENSATION_CLAIMED_PREFIX/);
-    assert.match(settleBody, /PENDING_DELETION_CLAIMED_PREFIX/);
+    // The fence is a JS check on the marker it read, NOT a `NOT ... LIKE` in
+    // the WHERE: three-valued logic makes that NULL for a null marker, which
+    // excluded every clean row and stopped ordinary settlement (round 53).
+    assert.match(settleBody, /isIrreversibleClaimHeld\(current\?\.qbSyncError\)/);
+    assert.doesNotMatch(settleBody, /NOT: \[/);
 });
 test("round 49: an UNCONTESTED row still deletes (the control)", async () => {
     // Without this, the three tests above would pass just as happily against a
