@@ -17,6 +17,7 @@ import {
     BANK_REGISTER_ACCOUNT,
     type PullWindowState,
     BANK_REGISTER_PULL_DAYS,
+    isYmd,
     REGISTER_WINDOW_DAYS,
     registerWindowStart,
     runBankRegisterPull,
@@ -78,6 +79,7 @@ async function readWindowState(): Promise<PullWindowState> {
         if (!row?.value) return { highWater: null, lastFullSweep: null, continueAfter: null };
         const parsed = JSON.parse(row.value) as Partial<PullWindowState>;
         const resume = parsed.continueAfter;
+        const retry = parsed.retryPending;
         return {
             highWater: typeof parsed.highWater === "string" ? parsed.highWater : null,
             lastFullSweep: typeof parsed.lastFullSweep === "string" ? parsed.lastFullSweep : null,
@@ -85,6 +87,16 @@ async function readWindowState(): Promise<PullWindowState> {
                 ? { postedDate: resume.postedDate, qbTxnId: resume.qbTxnId }
                 : null,
             mintRemainingCursor: typeof parsed.mintRemainingCursor === "string" ? parsed.mintRemainingCursor : null,
+            // VALIDATED FIELD BY FIELD, and dropped whole if any part is
+            // unusable. A half-read marker would re-plan the pull over bounds
+            // that are not a window, and an unreadable `attempts` would make the
+            // retry unbounded — both worse than having no marker at all.
+            retryPending: retry
+                && isYmd(retry.startDate) && isYmd(retry.endDate)
+                && typeof retry.reason === "string"
+                && Number.isInteger(retry.attempts) && retry.attempts > 0
+                ? { startDate: retry.startDate, endDate: retry.endDate, reason: retry.reason, attempts: retry.attempts }
+                : null,
         };
     } catch {
         // A corrupt or unreadable state is "we know nothing", which plans the
@@ -106,13 +118,23 @@ async function saveWindowState(next: PullWindowState): Promise<void> {
  * Is there parked work a continuation pass should pick up?
  *
  * `continueAfter` is the intra-window resume point a budget-truncated ingest
- * writes; `mintRemainingCursor` is where a truncated mint stopped. Either one
- * means the last run left the register in a state it already reported as
- * incomplete, so a continuation has real work. Both null means the last run
- * finished, and a resume pass must cost nothing.
+ * writes; `mintRemainingCursor` is where a truncated mint stopped;
+ * `retryPending` is a window that ingested cleanly but could not be CERTIFIED —
+ * today, one whose clearance probe failed. Any one of them means the last run
+ * left the register in a state it already reported as incomplete, so a
+ * continuation has real work. All null means the last run finished, and a resume
+ * pass must cost nothing.
+ *
+ * The third was the gap (Codex PR #443 gate round 34, finding 2): a failed probe
+ * is not a TRUNCATION, so it wrote neither of the first two — the window was
+ * cleared as finished and every 15-minute resume slot answered
+ * `nothing-in-progress` while the register stayed uncertified until the next
+ * night, long after the 13:00 chaser had given up on it.
  */
 export function pullContinuationPending(state: PullWindowState): boolean {
-    return (state.continueAfter ?? null) !== null || (state.mintRemainingCursor ?? null) !== null;
+    return (state.continueAfter ?? null) !== null
+        || (state.mintRemainingCursor ?? null) !== null
+        || (state.retryPending ?? null) !== null;
 }
 
 export async function GET(request: Request) {
@@ -454,7 +476,14 @@ async function runPull() {
     // `chaser-blocked:<reason>` does for the sweep. Written on EVERY run so a
     // recovered probe clears the alarm rather than leaving it latched.
     try {
-        const value = summary.clearedProbeOk === false ? "cleared-probe-failed" : "";
+        // EXHAUSTION IS ITS OWN REASON. `cleared-probe-failed` says a retry is
+        // scheduled; `probe-retries-exhausted` says the retries are over and
+        // nobody is coming back for this window — a human has to look at the
+        // QuickBooks report endpoint. Reading them as the same string would hide
+        // the moment the system stopped trying.
+        const value = summary.clearedProbeOk === false
+            ? (summary.reason === "probe-retries-exhausted" ? "probe-retries-exhausted" : "cleared-probe-failed")
+            : "";
         await prisma.automationSetting.upsert({
             where: { key: BANK_PULL_BLOCKED_REASON_KEY },
             update: { value },

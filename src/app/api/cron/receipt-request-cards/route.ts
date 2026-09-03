@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { decodeReasonCodes, type ReasonCode } from "@/lib/review-alert-reasons";
-import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasResolution } from "@/lib/receipt-requests";
+import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasResolution, isComponentDeadlineExceeded } from "@/lib/receipt-requests";
 import {
     CARD_OWNERS_ASKED,
     CARD_RATE_CEILING,
@@ -165,14 +165,31 @@ function toCandidate(issue: {
  *
  * So the scan pages oldest-first and stops as soon as every asked owner has a
  * full card's worth (or the queue is exhausted). Bounded either way.
+ *
+ * BOUNDED IN TIME AS WELL AS IN PAGES (Codex PR #443 gate round 34, finding 3).
+ * `SCAN_MAX_PAGES` caps how many queries the scan may run; it says nothing about
+ * how long they take, and this runs before the revalidation and the webhook
+ * posts that still have to fit inside `maxDuration`. Stopping on the clock is
+ * the same answer stopping on the page cap already gives — `exhausted: false`,
+ * so `overflowExact` is false and the card prints no "and N more" it cannot
+ * stand behind — rather than a killed invocation that claims nothing at all.
+ *
+ * EXPORTED for the same reason `loadCardItemTruth` is: the run's own clock is a
+ * 45-second budget with no injection seam at the route boundary, so the only way
+ * to prove the scan STOPS on it — rather than to assert that the source contains
+ * a check — is to call it with a deadline of the test's own.
  */
-async function scanCandidates(): Promise<{ candidates: CardCandidateIssue[]; pages: number; exhausted: boolean }> {
+export async function scanCandidates(
+    deadlineExceeded: () => boolean = () => false,
+): Promise<{ candidates: CardCandidateIssue[]; pages: number; exhausted: boolean; deadlineHit: boolean }> {
     const candidates: CardCandidateIssue[] = [];
     let cursor: string | undefined;
     let pages = 0;
     let exhausted = false;
+    let deadlineHit = false;
 
     while (pages < SCAN_MAX_PAGES) {
+        if (deadlineExceeded()) { deadlineHit = true; break; }
         const page = await prisma.reviewIssue.findMany({
             where: {
                 targetType: RECEIPT_REQUEST_TARGET_TYPE,
@@ -205,7 +222,7 @@ async function scanCandidates(): Promise<{ candidates: CardCandidateIssue[]; pag
         // number rather than printing a guess.
     }
 
-    return { candidates, pages, exhausted };
+    return { candidates, pages, exhausted, deadlineHit };
 }
 
 /**
@@ -225,7 +242,11 @@ export async function loadCardItemTruth(
     issueIds: string[],
     deps: {
         cache?: Map<string, ReasonCode[]>;
-        recompute?: (targetKey: string, cache?: Map<string, ReasonCode[]>) => Promise<ReasonCode[]>;
+        recompute?: (
+            targetKey: string,
+            cache?: Map<string, ReasonCode[]>,
+            deadlineExceeded?: () => boolean,
+        ) => Promise<ReasonCode[]>;
         deadlineExceeded?: () => boolean;
     } = {},
 ): Promise<Map<string, CardItemTruth>> {
@@ -268,7 +289,26 @@ export async function loadCardItemTruth(
                 // mode this whole re-check exists to prevent.
                 revalidationSkipped = true;
             } else {
-                evidenceSatisfied = (await recompute(row.targetKey, cache)).length === 0;
+                /**
+                 * THE DEADLINE GOES IN, NOT JUST ROUND THE OUTSIDE (Codex PR
+                 * #443 gate round 34, finding 3).
+                 *
+                 * The check above only decides whether to START a recompute.
+                 * One recompute is a multi-pass component walk plus a 60-day
+                 * evidence load, each a real round trip — so a single slow
+                 * component begun with a second of budget left could run the
+                 * whole invocation past `maxDuration` and be KILLED, losing
+                 * the claim bookkeeping along with the answer. Handing the
+                 * same clock down lets it stop between queries instead, and
+                 * the abort lands in exactly the state the pre-call check
+                 * produces: not verified, therefore not sent this run.
+                 */
+                try {
+                    evidenceSatisfied = (await recompute(row.targetKey, cache, deadlineExceeded)).length === 0;
+                } catch (error) {
+                    if (!isComponentDeadlineExceeded(error)) throw error;
+                    revalidationSkipped = true;
+                }
             }
         }
         truth.set(row.id, {
@@ -377,8 +417,8 @@ export async function GET(request: Request) {
     // different hat. A retry that may not select still needs no scan: it only
     // re-posts what an earlier run claimed.
     const scan = selectionAllowed
-        ? await scanCandidates()
-        : { candidates: [] as CardCandidateIssue[], pages: 0, exhausted: true };
+        ? await scanCandidates(() => remainingRevalidationBudgetMs(runStartedAt) <= 0)
+        : { candidates: [] as CardCandidateIssue[], pages: 0, exhausted: true, deadlineHit: false };
     const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
     // Sent, but we never confirmed it. Reported, never reposted.
     const uncertain: string[] = [];
@@ -738,6 +778,10 @@ export async function GET(request: Request) {
         scanned: scan.candidates.length,
         scanPages: scan.pages,
         scanExhausted: scan.exhausted,
+        // WHY the scan was not exhausted, when it was the clock rather than the
+        // page cap. Both produce the same honest `overflowExact: false`, and
+        // they need different fixes — one is a backlog, the other is a slow run.
+        scanDeadlineHit: scan.deadlineHit,
         claimed: toPost.length,
         // Rows whose whole snapshot was answered between selection and the
         // send. Not a failure — the opposite — but worth seeing.

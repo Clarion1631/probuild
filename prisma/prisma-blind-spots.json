@@ -254,6 +254,10 @@
       "forced": false
     },
     {
+      "name": "ReceiptMemoArtifact",
+      "forced": false
+    },
+    {
       "name": "ReceiptRequestCard",
       "forced": false
     },

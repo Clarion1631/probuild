@@ -1048,6 +1048,33 @@ export class ComponentTooLargeError extends Error {
 }
 
 /**
+ * Raised when the caller's absolute deadline ran out mid-walk (Codex PR #443
+ * gate round 34, finding 3).
+ *
+ * A DIFFERENT ANSWER FROM "too large", deliberately. Too-large is a property of
+ * the DATA and is the same on every run — the chase stays open and a human is
+ * the escalation. This one is a property of THIS INVOCATION: nothing is wrong
+ * with the component, we simply stopped asking. The caller must therefore treat
+ * it as "not decided this run" rather than as a verdict, which is exactly the
+ * card cron's existing `revalidation-deadline` drop reason.
+ */
+export class ComponentDeadlineExceededError extends Error {
+    constructor(readonly passes: number) {
+        super(`competing component walk hit the run deadline after ${passes} pass(es)`);
+        this.name = "ComponentDeadlineExceededError";
+    }
+}
+
+/**
+ * Name-based, so a second copy of this module (tsx's require chain, a test
+ * double) cannot make the guard silently fail open the way `instanceof` would.
+ */
+export function isComponentDeadlineExceeded(error: unknown): boolean {
+    return typeof error === "object" && error !== null
+        && (error as { name?: unknown }).name === "ComponentDeadlineExceededError";
+}
+
+/**
  * Widen a same-amount window by the link rule until nothing new joins.
  *
  * A FIXED WINDOW IS THE WRONG SHAPE, in both directions at once. `±8 days`
@@ -1064,13 +1091,23 @@ export class ComponentTooLargeError extends Error {
  * one's clothes.
  *
  * PURE: the caller supplies `load`, so the walk is testable without a database.
+ *
+ * `deadlineExceeded` is the run's absolute clock, checked BETWEEN passes. The
+ * node cap bounds how MANY queries a pathological component can cost; it says
+ * nothing about how LONG they take, and each pass is a real database round trip
+ * — so a slow multi-pass component could chain past a cron's `maxDuration` and
+ * be killed mid-run, which loses the checkpoint as well as the answer (Codex PR
+ * #443 gate round 34, finding 3). Aborting is honest where truncating would not
+ * be: a partial component allocates evidence differently from the whole, so
+ * there is no useful answer to return, only a decision not to decide.
  */
 export async function loadComponentToClosure<T extends { id: string; postedDate: string }>(
     seedDate: string,
     load: (fromYmd: string, toYmd: string) => Promise<T[]>,
-    options: { maxNodes: number; linkDays?: number } = { maxNodes: 200 },
+    options: { maxNodes: number; linkDays?: number; deadlineExceeded?: () => boolean } = { maxNodes: 200 },
 ): Promise<T[]> {
     const linkDays = options.linkDays ?? COMPETING_LINE_ADJACENCY_DAYS;
+    const deadlineExceeded = options.deadlineExceeded ?? (() => false);
     const seed = dayNumber(seedDate);
     if (seed === null) return [];
 
@@ -1081,6 +1118,10 @@ export async function loadComponentToClosure<T extends { id: string; postedDate:
     // Each pass either grows the extent or stops, and `maxNodes` bounds it a
     // second way, so this cannot spin.
     for (let pass = 0; pass <= options.maxNodes; pass++) {
+        // CHECKED BEFORE EACH QUERY, including the first: a caller that is
+        // already out of budget must not spend one more round trip, and the
+        // walk is only ever entered by an item that would otherwise be SENT.
+        if (deadlineExceeded()) throw new ComponentDeadlineExceededError(pass);
         const rows = await load(ymdOf(from - linkDays), ymdOf(to + linkDays));
         if (rows.length > options.maxNodes) throw new ComponentTooLargeError(rows.length, options.maxNodes);
         if (rows.length === loaded.length) return rows;

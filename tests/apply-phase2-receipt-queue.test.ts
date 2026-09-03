@@ -63,7 +63,14 @@ test("both are additive and idempotent — a re-run must change nothing", () => 
             || /^DO \$\$\s+DECLARE current_def text;\s+BEGIN\s+SELECT pg_get_constraintdef/i.test(s)
             // ENABLE ROW LEVEL SECURITY is idempotent by definition: enabling
             // it twice is the same as enabling it once, and it touches no row.
-            || /^ALTER TABLE .* ENABLE ROW LEVEL SECURITY$/i.test(s);
+            || /^ALTER TABLE .* ENABLE ROW LEVEL SECURITY$/i.test(s)
+            // A BACKFILL is idempotent when its primary key is DERIVED from the
+            // data it reads and the insert is ON CONFLICT DO NOTHING: a re-run
+            // computes the same ids and writes nothing. A backfill keyed on a
+            // fresh cuid would insert a duplicate on every run while reporting
+            // "ok", which is the same silent-drift failure the constraint
+            // convergence above exists to avoid.
+            || (/^INSERT INTO /i.test(s) && /ON CONFLICT DO NOTHING$/i.test(s) && /md5\(/i.test(s));
         assert.ok(guarded, `not idempotent:\n  ${s.slice(0, 120)}`);
         // NOTHING HERE MAY DESTROY OR REWRITE DATA. A constraint is not data:
         // dropping one to re-add it with the right definition changes no row,
@@ -220,4 +227,61 @@ test("the verifier checks overflowExact's type, nullability AND default", () => 
     for (const name of created) {
         assert.ok(card.some(c => c.name === name), `${name} is created but never verified`);
     }
+});
+
+// ── The memo-artifact table (Codex PR #443 gate round 34, finding 1) ─────────
+
+test("the memo binding's two invariants are UNIQUE indexes, in both paths", () => {
+    // Neither is an optimisation. `pdfId` unique means one signed affidavit
+    // answers ONE charge; (targetType, targetKey) unique means a charge is bound
+    // to ONE memo, immutably. A non-unique index for either would leave the
+    // route's own in-transaction checks as the only thing between a replayed
+    // memo and a second silently-closed chase — which is exactly the state that
+    // shipped, because the record it checked was a rewritable TEXT blob.
+    for (const ddl of [
+        `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptMemoArtifact_pdfId_key" ON "ReceiptMemoArtifact"("pdfId")`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptMemoArtifact_targetType_targetKey_key" ON "ReceiptMemoArtifact"("targetType", "targetKey")`,
+    ]) {
+        const wanted = normalize(ddl);
+        assert.ok(statements.some(s => normalize(s) === wanted), `the apply script is missing ${wanted.slice(0, 60)}`);
+        assert.ok(normalizedMigration.includes(wanted), `the committed migration is missing ${wanted.slice(0, 60)}`);
+    }
+    // And Prisma declares the same two, so a fresh client cannot query a shape
+    // the database does not enforce.
+    const model = schemaPrisma.slice(schemaPrisma.indexOf("model ReceiptMemoArtifact"));
+    const body = model.slice(0, model.indexOf("\n}"));
+    assert.match(body, /pdfId\s+String\s+@unique/);
+    assert.match(body, /@@unique\(\[targetType, targetKey\]\)/);
+});
+
+test("the backfill records bindings that predate the table, and re-runs to nothing", () => {
+    // Without it, every memo signed before this table existed reads as UNBOUND:
+    // the first replay of one would find an empty table and close a second
+    // charge — the exact bug, reintroduced by the fix for it.
+    const backfill = (statements as string[]).find(s => /INSERT INTO "ReceiptMemoArtifact"/.test(s));
+    assert.ok(backfill, "the migration must carry the evidence that already exists forward");
+    assert.match(backfill, /ON CONFLICT DO NOTHING/, "a re-run must write nothing");
+    assert.match(backfill, /'rma_' \|\| md5\(parsed\."pdfId"\)/, "the id is DERIVED, so the re-run computes the same row");
+    // Read by REGEX, not by a jsonb cast: displayDetails is TEXT and one
+    // malformed row would abort the whole script.
+    assert.match(backfill, /substring\(i\."displayDetails" from/);
+    assert.doesNotMatch(backfill, /::jsonb/, "a jsonb cast would take the rollout down on a single bad row");
+    assert.match(backfill, /parsed\."resolution" = 'memo-signed'/, "only a memo resolution is a memo binding");
+    assert.match(backfill, /ORDER BY/, "deterministic residue where the pre-fix bug already duplicated a pdfId");
+    assert.ok(normalizedMigration.includes(normalize(backfill)), "and the committed migration does the same");
+});
+
+test("the artifact table is verified by shape and carries RLS, like every other sensitive table here", () => {
+    const columns = (expectedColumns as Record<string, Array<{ name: string; nullable: boolean }>>).ReceiptMemoArtifact;
+    assert.ok(columns, "a table the script creates and never verifies is a table nobody checked");
+    for (const column of columns) {
+        assert.equal(column.nullable, false, `${column.name} must be NOT NULL — a half-written binding enforces nothing`);
+    }
+    assert.deepEqual(
+        columns.map(c => c.name).sort(),
+        ["createdAt", "id", "issueId", "pdfId", "targetKey", "targetType"],
+    );
+    const rls = `ALTER TABLE "ReceiptMemoArtifact" ENABLE ROW LEVEL SECURITY`;
+    assert.ok(statements.some(s => normalize(s) === normalize(rls)));
+    assert.ok(normalizedMigration.includes(normalize(rls)));
 });

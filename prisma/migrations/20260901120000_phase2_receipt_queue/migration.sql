@@ -129,3 +129,71 @@ BEGIN
     ALTER TABLE "ReceiptRequestCard" ADD CONSTRAINT "ReceiptRequestCard_status_check" CHECK ("status" IN ('PENDING', 'POSTING', 'POSTED', 'UNCERTAIN'));
   END IF;
 END $$;
+
+
+-- 5. The DURABLE identity of a signed missing-receipt memo (Codex PR #443 gate
+-- round 34, finding 1).
+--
+-- Two invariants, two unique constraints, in the one place a concurrent writer
+-- cannot argue with:
+--   * "pdfId" UNIQUE            — one signed memo answers ONE charge.
+--   * (targetType, targetKey)   — one charge is bound to ONE memo, immutably.
+--
+-- The answers route checked reuse by scanning every OTHER issue's displayDetails
+-- and then REPLACED its own issue's pdfId in place, so a memo could be unbound
+-- by a later one and then replayed against a second charge with nothing on
+-- record to catch it. A check is a statement about the moment it ran; these are
+-- statements about the row.
+CREATE TABLE IF NOT EXISTS "ReceiptMemoArtifact" (
+    "id" TEXT NOT NULL,
+    "pdfId" TEXT NOT NULL,
+    "targetType" TEXT NOT NULL,
+    "targetKey" TEXT NOT NULL,
+    "issueId" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "ReceiptMemoArtifact_pkey" PRIMARY KEY ("id")
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptMemoArtifact_pdfId_key"
+  ON "ReceiptMemoArtifact"("pdfId");
+
+CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptMemoArtifact_targetType_targetKey_key"
+  ON "ReceiptMemoArtifact"("targetType", "targetKey");
+
+CREATE INDEX IF NOT EXISTS "ReceiptMemoArtifact_issueId_idx"
+  ON "ReceiptMemoArtifact"("issueId");
+
+-- BACKFILL FROM THE EVIDENCE THAT ALREADY EXISTS. Every issue already carrying
+-- a `memo-signed` resolution with a pdfId is a binding that was made before this
+-- table existed; without this the first replay of one of those memos would find
+-- an empty table and read as unbound.
+--
+-- Read with `substring(... from ...)`, NOT a jsonb cast: displayDetails is TEXT
+-- and a single malformed row would abort the whole migration. A regex that does
+-- not match yields NULL, which the WHERE drops.
+--
+-- The id is DERIVED from the pdfId (md5), so a re-run inserts the same row and
+-- ON CONFLICT makes it a no-op rather than a duplicate under a new cuid.
+--
+-- ORDER BY makes the residue deterministic: where the pre-fix bug already let
+-- two issues record the SAME pdfId, the oldest binding wins and the other issue
+-- keeps its recorded resolution but gains no artifact row — which is right, it
+-- is the one whose memo was spent elsewhere.
+INSERT INTO "ReceiptMemoArtifact" ("id", "pdfId", "targetType", "targetKey", "issueId", "createdAt")
+SELECT 'rma_' || md5(parsed."pdfId"), parsed."pdfId", i."targetType", i."targetKey", i."id",
+       COALESCE(i."updatedAt", CURRENT_TIMESTAMP)
+  FROM "ReviewIssue" i
+  CROSS JOIN LATERAL (
+      SELECT substring(i."displayDetails" from '"pdfId"[[:space:]]*:[[:space:]]*"([^"]+)"') AS "pdfId",
+             substring(i."displayDetails" from '"resolution"[[:space:]]*:[[:space:]]*"([^"]+)"') AS "resolution"
+  ) parsed
+ WHERE i."displayDetails" LIKE '%memo-signed%'
+   AND parsed."resolution" = 'memo-signed'
+   AND parsed."pdfId" IS NOT NULL
+ ORDER BY i."firstObservedAt", i."id"
+ ON CONFLICT DO NOTHING;
+
+-- RLS, matching ReceiptRequestCard: ENABLE without FORCE, so the owner/service
+-- role the app connects as is unaffected while anon and authenticated get
+-- nothing.
+ALTER TABLE "ReceiptMemoArtifact" ENABLE ROW LEVEL SECURITY;

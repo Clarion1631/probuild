@@ -154,7 +154,7 @@ test("the retry pass selects when the chase finished after the morning run", () 
     assert.doesNotMatch(cardsSource, /if \(retryOnly\) continue; \/\/ nothing claimed today/);
     // It also has to SCAN, or selection finds an empty list — the same lost day
     // wearing a different hat.
-    assert.match(cardsSource, /const scan = selectionAllowed\s*\n\s*\? await scanCandidates\(\)/);
+    assert.match(cardsSource, /const scan = selectionAllowed\s*\n\s*\? await scanCandidates\(\(\) =>/);
     // A retry that may not select still re-posts what an earlier run claimed.
     assert.match(cardsSource, /if \(!retryOnly\) \{\s*\n\s*if \(!selectionAllowed\) \{/);
 });

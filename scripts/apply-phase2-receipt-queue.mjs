@@ -213,6 +213,69 @@ export const statements = [
     // take the cron down. This table holds owner names and the item snapshot
     // for real charges, so it is in the same class.
     `ALTER TABLE "ReceiptRequestCard" ENABLE ROW LEVEL SECURITY`,
+
+    // 5. The DURABLE identity of a signed missing-receipt memo (Codex PR #443
+    // gate round 34, finding 1). Two invariants, two unique indexes:
+    //   * "pdfId" UNIQUE          — one signed memo answers ONE charge.
+    //   * (targetType, targetKey) — one charge is bound to ONE memo, immutably.
+    // The answers route checked reuse by scanning every OTHER issue's
+    // displayDetails and then REPLACED its own issue's pdfId in place, so a memo
+    // could be unbound by a later one and replayed against a second charge with
+    // nothing on record to catch it. A check is a statement about the moment it
+    // ran; these are statements about the row.
+    `CREATE TABLE IF NOT EXISTS "ReceiptMemoArtifact" (
+       "id"         TEXT NOT NULL,
+       "pdfId"      TEXT NOT NULL,
+       "targetType" TEXT NOT NULL,
+       "targetKey"  TEXT NOT NULL,
+       "issueId"    TEXT NOT NULL,
+       "createdAt"  TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       CONSTRAINT "ReceiptMemoArtifact_pkey" PRIMARY KEY ("id")
+     )`,
+
+    `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptMemoArtifact_pdfId_key"
+       ON "ReceiptMemoArtifact"("pdfId")`,
+
+    `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptMemoArtifact_targetType_targetKey_key"
+       ON "ReceiptMemoArtifact"("targetType", "targetKey")`,
+
+    `CREATE INDEX IF NOT EXISTS "ReceiptMemoArtifact_issueId_idx"
+       ON "ReceiptMemoArtifact"("issueId")`,
+
+    // BACKFILL FROM THE EVIDENCE THAT ALREADY EXISTS. Every issue already
+    // carrying a `memo-signed` resolution with a pdfId is a binding made before
+    // this table existed; without this, the first replay of one of those memos
+    // would find an empty table and read as unbound.
+    //
+    // Read with `substring(... from ...)`, NOT a jsonb cast: displayDetails is
+    // TEXT and one malformed row would abort the whole script. A regex that does
+    // not match yields NULL, which the WHERE drops.
+    //
+    // IDEMPOTENT BY DERIVED ID: the primary key is md5 of the pdfId, so a re-run
+    // computes the same row and ON CONFLICT DO NOTHING makes it a no-op rather
+    // than a duplicate under a fresh cuid. It writes no existing row.
+    //
+    // ORDER BY makes the residue deterministic: where the pre-fix bug already
+    // let two issues record the SAME pdfId, the oldest binding wins and the
+    // other issue keeps its recorded resolution but gains no artifact row —
+    // which is right, it is the one whose memo was spent elsewhere.
+    `INSERT INTO "ReceiptMemoArtifact" ("id", "pdfId", "targetType", "targetKey", "issueId", "createdAt")
+     SELECT 'rma_' || md5(parsed."pdfId"), parsed."pdfId", i."targetType", i."targetKey", i."id",
+            COALESCE(i."updatedAt", CURRENT_TIMESTAMP)
+       FROM "ReviewIssue" i
+       CROSS JOIN LATERAL (
+           SELECT substring(i."displayDetails" from '"pdfId"[[:space:]]*:[[:space:]]*"([^"]+)"') AS "pdfId",
+                  substring(i."displayDetails" from '"resolution"[[:space:]]*:[[:space:]]*"([^"]+)"') AS "resolution"
+       ) parsed
+      WHERE i."displayDetails" LIKE '%memo-signed%'
+        AND parsed."resolution" = 'memo-signed'
+        AND parsed."pdfId" IS NOT NULL
+      ORDER BY i."firstObservedAt", i."id"
+      ON CONFLICT DO NOTHING`,
+
+    // Same RLS class as ReceiptRequestCard: this row names a real charge and the
+    // Drive file that answers it.
+    `ALTER TABLE "ReceiptMemoArtifact" ENABLE ROW LEVEL SECURITY`,
 ];
 
 /**
@@ -259,9 +322,21 @@ export const expectedColumns = {
     ReceiptIntake: [
         { name: "postVoidQbPurchaseId", type: "text", nullable: true, default: null },
     ],
+    // Every column NOT NULL: a memo binding with a missing half is not a
+    // weaker binding, it is a row the unique indexes cannot enforce anything
+    // about. `createdAt` carries the DEFAULT so the backfill's COALESCE and a
+    // live insert agree.
+    ReceiptMemoArtifact: [
+        { name: "id", type: "text", nullable: false, default: null },
+        { name: "pdfId", type: "text", nullable: false, default: null },
+        { name: "targetType", type: "text", nullable: false, default: null },
+        { name: "targetKey", type: "text", nullable: false, default: null },
+        { name: "issueId", type: "text", nullable: false, default: null },
+        { name: "createdAt", type: "timestamp without time zone", nullable: false, default: "CURRENT_TIMESTAMP" },
+    ],
 };
 
-const expectedRlsTables = ["ReceiptRequestCard"];
+const expectedRlsTables = ["ReceiptRequestCard", "ReceiptMemoArtifact"];
 
 const expectedConstraints = [
     { name: "BankLine_sourceOfRecord_check", table: "BankLine" },
@@ -272,9 +347,20 @@ const expectedConstraints = [
 // and it is not an optimisation: it IS the per-day claim. Verified on both
 // properties that matter — it must EXIST and be UNIQUE (a non-unique index
 // claims nothing, so every concurrent run would sail through and double-post).
+//
+// The memo-artifact pair is the same kind of object and the same kind of claim:
+// each one IS an invariant (one memo answers one charge; one charge is bound to
+// one memo), so a non-unique index would leave the route's own checks as the
+// only thing standing between a replayed affidavit and a second closed chase.
 const expectedUniqueIndexes = [{
     name: "ReceiptRequestCard_owner_pacificDate_key",
     mustMatch: [/CREATE UNIQUE INDEX/, /\("owner", "pacificDate"\)/],
+}, {
+    name: "ReceiptMemoArtifact_pdfId_key",
+    mustMatch: [/CREATE UNIQUE INDEX/, /\("pdfId"\)/],
+}, {
+    name: "ReceiptMemoArtifact_targetType_targetKey_key",
+    mustMatch: [/CREATE UNIQUE INDEX/, /\("targetType", "targetKey"\)/],
 }];
 
 async function main() {

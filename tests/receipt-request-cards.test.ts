@@ -438,7 +438,13 @@ test("the cron re-verifies against CURRENT receipt evidence, not just the issue'
     // component-shared cache and a test double can both stand in for it.
     assert.match(source, /import \{ recomputeCodesFor \} from "@\/app\/api\/cron\/receipt-requests\/route";/);
     assert.match(source, /const recompute = deps\.recompute \?\? recomputeCodesFor;/);
-    assert.match(source, /await recompute\(row\.targetKey, cache\)/);
+    // The run clock goes IN with it (round-34 finding 3): checking the budget
+    // only before the call bounded the DECISION to recompute, never the
+    // multi-pass component walk and 60-day evidence load the call itself runs.
+    assert.match(source, /await recompute\(row\.targetKey, cache, deadlineExceeded\)/);
+    // And an abort is read as "not verified", never as a verdict — a `[]` from
+    // a recompute means evidence was FOUND, which would close the chase.
+    assert.match(source, /if \(!isComponentDeadlineExceeded\(error\)\) throw error;\s*\n\s*revalidationSkipped = true;/);
     // Only spent on an item that would otherwise be sent — already dead for a
     // cheaper reason skips the real evidence query.
     assert.match(source, /clearedAt === null && !resolved && !acknowledged/);

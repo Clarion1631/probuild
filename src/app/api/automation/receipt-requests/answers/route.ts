@@ -176,6 +176,60 @@ async function pdfIdReusedElsewhere(
     });
 }
 
+/**
+ * The pdfId this issue is ALREADY bound to, or null.
+ *
+ * Only a `memo-signed` resolution binds: an issue closed by a found receipt or
+ * any other resolution has no memo of its own, and a `memo-signed` row written
+ * before `pdfId` was recorded (the legacy shape) has nothing to be bound to
+ * either — both are free to take a first binding.
+ */
+function boundMemoPdfId(details: Record<string, unknown>): string | null {
+    if (details.resolution !== "memo-signed") return null;
+    return typeof details.pdfId === "string" && details.pdfId ? details.pdfId : null;
+}
+
+/**
+ * Prisma's unique-constraint violation (P2002), duck-typed by CODE rather than
+ * by `instanceof Prisma.PrismaClientKnownRequestError` — the same convention
+ * review-alert-lifecycle.ts uses, so a test's fake client can throw a plain
+ * `{code:"P2002"}` and a mismatched module identity cannot make the guard
+ * silently fail open.
+ */
+function isUniqueConstraintError(error: unknown): boolean {
+    return typeof error === "object" && error !== null && (error as { code?: unknown }).code === "P2002";
+}
+
+/** What one locked read-check-write attempt concluded. */
+type AttemptOutcome =
+    | { kind: "missing" }
+    | { kind: "reused" }
+    | { kind: "already-bound"; detail: string }
+    | { kind: "never-requested" }
+    | { kind: "wrong-thread"; detail: string }
+    | { kind: "mismatch" }
+    | { kind: "recorded"; alreadyCleared: boolean; alreadyResolved: boolean }
+    | { kind: "lost-race" };
+
+/**
+ * A P2002 escaping one attempt is the DURABLE backstop firing — a concurrent
+ * writer committed a `ReceiptMemoArtifact` row this attempt's insert would have
+ * violated. The whole transaction rolled back, so nothing of it happened: that
+ * is precisely a lost race, and the retry re-reads under a fresh lock and
+ * returns the typed answer (`reused` or `already-bound`) the now-committed row
+ * proves. Mapping it here rather than at the insert is deliberate — a caught
+ * error inside a Postgres transaction leaves that transaction aborted, so there
+ * is no continuing from it.
+ */
+async function withBindingBackstop(run: () => Promise<AttemptOutcome>): Promise<AttemptOutcome> {
+    try {
+        return await run();
+    } catch (error) {
+        if (isUniqueConstraintError(error)) return { kind: "lost-race" };
+        throw error;
+    }
+}
+
 export async function POST(request: Request) {
     // RECEIPT_BRIDGE_SECRET, not the intake key — see the threads route.
     const auth = authenticateBridge(request);
@@ -326,20 +380,13 @@ export async function POST(request: Request) {
     let wrongThread: string | null = null;
     let mismatch = false;
     let reused = false;
-
-    type AttemptOutcome =
-        | { kind: "missing" }
-        | { kind: "reused" }
-        | { kind: "never-requested" }
-        | { kind: "wrong-thread"; detail: string }
-        | { kind: "mismatch" }
-        | { kind: "recorded"; alreadyCleared: boolean; alreadyResolved: boolean }
-        | { kind: "lost-race" };
+    /** The pdfId this issue is already bound to, when a DIFFERENT one arrived. */
+    let alreadyBound: string | null = null;
 
     const association = associationFromBody(body);
 
-    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !wrongThread && !mismatch && !reused; attempt++) {
-        const outcome: AttemptOutcome = await prisma.$transaction(async tx => {
+    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !wrongThread && !mismatch && !reused && !alreadyBound; attempt++) {
+        const outcome: AttemptOutcome = await withBindingBackstop(() => prisma.$transaction(async tx => {
             /**
              * THE PDF-ID LOCK — taken BEFORE the reuse check, and held through
              * the write, on EVERY attempt (not just the first).
@@ -372,9 +419,53 @@ export async function POST(request: Request) {
             // answering a different one (Codex PR #443 gate, finding 3).
             if (await pdfIdReusedElsewhere(tx, pdfId, bankLineId)) return { kind: "reused" };
 
+            /**
+             * THE DURABLE BINDING, read under the same lock.
+             *
+             * `pdfIdReusedElsewhere` above scans `displayDetails`, which the
+             * write below REWRITES in place — so a memo could be un-recorded by
+             * a later one and the scan would then find nothing. These two rows
+             * are the record that survives that: `pdfId` is unique, so a memo
+             * that answered any charge is on file forever, and
+             * (targetType, targetKey) is unique, so a charge's binding is on
+             * file forever too.
+             */
+            const [artifactByPdf, artifactByIssue] = await Promise.all([
+                tx.receiptMemoArtifact.findUnique({ where: { pdfId }, select: { targetKey: true } }),
+                tx.receiptMemoArtifact.findUnique({
+                    where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: bankLineId } },
+                    select: { pdfId: true },
+                }),
+            ]);
+            if (artifactByPdf && artifactByPdf.targetKey !== bankLineId) return { kind: "reused" };
+            if (artifactByIssue && artifactByIssue.pdfId !== pdfId) {
+                return { kind: "already-bound", detail: artifactByIssue.pdfId };
+            }
+
             // Merged from THIS read, not from anything older: a card record or
             // a corrected amount written since must survive.
             const details = parseMissingReceiptDetails(issue.displayDetails);
+
+            /**
+             * A MEMO BINDING IS IMMUTABLE ONCE RECORDED (Codex PR #443 gate
+             * round 34, finding 1).
+             *
+             * This used to overwrite `details.pdfId` with whatever the latest
+             * answer carried, and the reuse check above deliberately EXCLUDES
+             * this issue — so the sequence that mattered was: PDF-A recorded on
+             * issue 1; PDF-B arrives for issue 1 and replaces it, leaving A
+             * recorded nowhere; PDF-A replayed against issue 2 finds no trace of
+             * itself, passes the reuse check, and closes a SECOND charge with a
+             * memo that was already spent. One signed affidavit answers one
+             * charge, and the identity that says so must not be mutable.
+             *
+             * So a second, DIFFERENT pdfId is terminal (422) — re-sending it
+             * cannot make it belong here, and the issue keeps the memo it has.
+             * The SAME pdfId falls through to the idempotent path below, which
+             * is what lets the forwarder retry and get the same answer.
+             */
+            const bound = boundMemoPdfId(details);
+            if (bound !== null && bound !== pdfId) return { kind: "already-bound", detail: bound };
 
             /**
              * THE ORIGINATING ASSOCIATION. A memo is evidence for the charge
@@ -435,6 +526,22 @@ export async function POST(request: Request) {
                 data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
             });
             if (written.count === 1) {
+                // THE BINDING, IN THE SAME TRANSACTION AS THE RESOLUTION.
+                // Either both land or neither does — a resolution without its
+                // artifact row is exactly the un-recorded memo this fix exists
+                // to make impossible. Skipped when the row is already ours
+                // (the idempotent re-submit), because the reads above proved
+                // that is the only way it can exist.
+                if (!artifactByPdf) {
+                    await tx.receiptMemoArtifact.create({
+                        data: {
+                            pdfId,
+                            targetType: RECEIPT_REQUEST_TARGET_TYPE,
+                            targetKey: bankLineId,
+                            issueId: issue.id,
+                        },
+                    });
+                }
                 return {
                     kind: "recorded",
                     alreadyCleared: issue.clearedAt !== null,
@@ -442,11 +549,12 @@ export async function POST(request: Request) {
                 };
             }
             return { kind: "lost-race" };
-        });
+        }));
 
         switch (outcome.kind) {
             case "missing": missing = true; break;
             case "reused": reused = true; break;
+            case "already-bound": alreadyBound = outcome.detail; break;
             case "never-requested": neverRequested = true; break;
             case "wrong-thread": wrongThread = outcome.detail; break;
             case "mismatch": mismatch = true; break;
@@ -473,6 +581,22 @@ export async function POST(request: Request) {
                 targetKey: bankLineId,
             },
             { status: 409 },
+        );
+    }
+    // THIS CHARGE ALREADY HAS A MEMO, AND IT IS NOT THIS ONE. Terminal (422),
+    // like every other binding failure: re-sending cannot make a second
+    // affidavit the one that answered this charge, and the recorded memo is not
+    // overwritten. The detail names the memo that IS bound, so a human can open
+    // it rather than guess which of the two is on file.
+    if (alreadyBound) {
+        return NextResponse.json(
+            {
+                ok: false,
+                reason: "memo-already-bound",
+                detail: `this charge is already answered by a different signed memo (${alreadyBound})`,
+                targetKey: bankLineId,
+            },
+            { status: 422 },
         );
     }
     if (neverRequested) {

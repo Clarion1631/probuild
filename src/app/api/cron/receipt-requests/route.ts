@@ -17,6 +17,7 @@ import {
     RECEIPT_MATCH_DATE_SLOP_DAYS,
     RECEIPT_REQUEST_TARGET_TYPE,
     decimalStringToCents,
+    ComponentDeadlineExceededError,
     ComponentTooLargeError,
     competingLineFilter,
     componentTouchesBoundary,
@@ -514,7 +515,7 @@ async function loadCompetingComponent(seed: {
     id: string;
     postedDate: Date;
     amountCents: number;
-}) {
+}, deadlineExceeded?: () => boolean) {
     return loadComponentToClosure(
         seed.postedDate.toISOString().slice(0, 10),
         (fromYmd, toYmd) => prisma.bankLine.findMany({
@@ -532,15 +533,32 @@ async function loadCompetingComponent(seed: {
             // `updatedAt` rides along for the component fingerprint — see BatchLine.
             select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
         }).then(rows => rows.map(row => ({ ...row, postedDate: row.postedDate.toISOString().slice(0, 10) }))),
-        { maxNodes: MAX_COMPONENT_LINES },
+        { maxNodes: MAX_COMPONENT_LINES, deadlineExceeded },
     );
 }
 
+/**
+ * `deadlineExceeded`, when supplied, is the CALLER'S ABSOLUTE CLOCK, threaded
+ * all the way into the closure walk (Codex PR #443 gate round 34, finding 3).
+ *
+ * One recompute is not one query: it is a multi-pass component walk plus an
+ * evidence load plus a sibling-issue read, each a real round trip. The card
+ * cron used to check its budget only BEFORE calling this, so a single slow
+ * component could run the whole invocation past `maxDuration` from inside — and
+ * being killed there costs the checkpoint as well as the answer. Checked
+ * between queries, it aborts with `ComponentDeadlineExceededError`, which the
+ * caller reads as "not decided this run", never as a verdict. Absent (the
+ * nightly sweep, which owns its own outer budget) nothing changes.
+ */
 export async function recomputeCodesFor(
     targetKey: string,
     cache?: Map<string, ReasonCode[]>,
+    deadlineExceeded?: () => boolean,
 ): Promise<ReasonCode[]> {
     if (cache?.has(targetKey)) return cache.get(targetKey)!;
+    // The cache miss is the expensive path; the hit above costs nothing and is
+    // still worth serving after the deadline.
+    if (deadlineExceeded?.()) throw new ComponentDeadlineExceededError(0);
 
     const [line, issue] = await Promise.all([
         prisma.bankLine.findUnique({
@@ -567,7 +585,7 @@ export async function recomputeCodesFor(
     // had already been given to its twin.
     let loadedLines: Array<{ id: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber: string | null }>;
     try {
-        loadedLines = await loadCompetingComponent(line);
+        loadedLines = await loadCompetingComponent(line, deadlineExceeded);
     } catch (error) {
         if (error instanceof ComponentTooLargeError) {
             // NO VERDICT. Returning [] would CLEAR the issue, which is the one
@@ -591,6 +609,11 @@ export async function recomputeCodesFor(
     const componentDays = lines.map(row => Date.parse(`${row.postedDate}T00:00:00Z`));
     const fromYmd = new Date(Math.min(...componentDays) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
     const toYmd = new Date(Math.max(...componentDays) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+    // CHECKED AGAIN BEFORE THE EVIDENCE LOAD. The walk above may have been
+    // cheap and still have consumed the last of the budget; the two queries
+    // below scan a 60-day-wide window of Expense and ReceiptIntake and are the
+    // most expensive thing left in this function.
+    if (deadlineExceeded?.()) throw new ComponentDeadlineExceededError(0);
     // ONE resolved zone for the window AND for every day key derived below —
     // see the day-key note in processBatch.
     const zone = await resolveCompanyTimeZone();

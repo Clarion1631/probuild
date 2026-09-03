@@ -283,7 +283,51 @@ export interface PullWindowState {
      * without it that looks exactly like a quiet week.
      */
     mintRemainingCursor?: string | null;
+    /**
+     * A window that INGESTED cleanly but could not be certified, and that a
+     * continuation should re-run (Codex PR #443 gate round 34, finding 2).
+     *
+     * The case this exists for is the failed clearance probe. QuickBooks serves
+     * the register and errors on the clearance report, so every row reads
+     * "Unknown": the rows land, `ok` stays true, and `complete` goes false —
+     * which correctly withholds the freshness stamp and holds minting back. But
+     * nothing was PARKED. `continueAfter` is only written by a budget-truncated
+     * ingest, and this run was not truncated, so it was CLEARED as a finished
+     * window — and `pullContinuationPending` (the only thing the 15-minute
+     * resume pass looks at) answered "nothing in progress" every time. The
+     * 02:00 failure sat until 02:00 the next night while the 13:00 chaser found
+     * an uncertified register and held every owner's cards.
+     *
+     * Carries the window's own BOUNDS because the high-water mark legitimately
+     * advances over a fully-ingested window: re-planning from the mark would ask
+     * QuickBooks about a NARROWER span than the one whose clearance is unknown.
+     * `attempts` is what stops a dead report endpoint spinning through all 44
+     * continuation slots — see PROBE_RETRY_LIMIT.
+     */
+    retryPending?: PullRetryPending | null;
 }
+
+export interface PullRetryPending {
+    startDate: string;
+    endDate: string;
+    /** Why the window needs re-running. Today only `cleared-probe-failed`. */
+    reason: string;
+    /** How many runs have now failed on this same window. */
+    attempts: number;
+}
+
+/**
+ * How many times one window may be re-run for a failed clearance probe before
+ * the retry is abandoned.
+ *
+ * The continuation cron fires every 15 minutes from 02:00, so six attempts is
+ * about ninety minutes of trying — long enough to ride out a QuickBooks report
+ * outage, short enough that a permanently dead endpoint stops re-asking and
+ * lets `bank-pull-stale` be the signal instead. Abandoning does NOT stamp the
+ * freshness clock: the window is still uncertified, it is simply no longer
+ * being retried.
+ */
+export const PROBE_RETRY_LIMIT = 6;
 
 export interface PullWindow {
     startDate: string;
@@ -608,6 +652,13 @@ export interface BankRegisterPullSummary {
     highWater?: string | null;
     /** Why minting was held back this run, when it was. */
     mintSkipped?: "stale-fetch" | "conflicts" | "ingest-failed" | "incomplete-window" | "cleared-probe-failed";
+    /**
+     * The window this run parked for a continuation to re-run, or null when it
+     * parked none (and cleared any it inherited). Reported so a failed probe is
+     * visible as SCHEDULED work rather than as a run that merely said `complete:
+     * false` and left nothing behind.
+     */
+    retryPending?: PullRetryPending | null;
     minted?: {
         minted: number;
         skipped: Record<string, number>;
@@ -631,11 +682,28 @@ export async function runBankRegisterPull(
     const account = dependencies.account ?? BANK_REGISTER_ACCOUNT;
     const nowMs = dependencies.now ? dependencies.now() : Date.now();
     const days = dependencies.days ?? BANK_REGISTER_PULL_DAYS;
+    /**
+     * A PARKED RETRY WINDOW OUTRANKS THE PLANNER.
+     *
+     * Its bounds are the ones whose clearance is still unknown, and the
+     * high-water mark has already moved past them (the ingest DID finish), so
+     * `planPullWindow` would ask QuickBooks about a narrower span and leave the
+     * uncertified part uncertified forever. Re-running the same bounds re-runs
+     * the probe and the clearance-dependent mint over exactly the rows that
+     * needed them.
+     *
+     * A due deep sweep is deferred, not lost: `lastFullSweep` is untouched while
+     * a retry is outstanding, so the sweep plans on the first run after the
+     * retry clears — at most PROBE_RETRY_LIMIT invocations later.
+     */
+    const retryWindow = dependencies.windowState?.retryPending ?? null;
     // The window is PLANNED from the persisted high-water mark when the caller
     // keeps one; the fixed-days form is the fallback for tests and one-offs.
-    const planned = dependencies.windowState
-        ? planPullWindow(dependencies.windowState, new Date(nowMs))
-        : { startDate: ymdDaysAgo(days - 1, nowMs), endDate: new Date(nowMs).toISOString().slice(0, 10), fullSweep: false, continues: false };
+    const planned = retryWindow
+        ? { startDate: retryWindow.startDate, endDate: retryWindow.endDate, fullSweep: false, continues: false }
+        : dependencies.windowState
+            ? planPullWindow(dependencies.windowState, new Date(nowMs))
+            : { startDate: ymdDaysAgo(days - 1, nowMs), endDate: new Date(nowMs).toISOString().slice(0, 10), fullSweep: false, continues: false };
     const { startDate, endDate } = planned;
     const elapsed = dependencies.elapsedMs ?? (() => 0);
     const budgetMs = dependencies.budgetMs ?? Number.POSITIVE_INFINITY;
@@ -918,6 +986,36 @@ export async function runBankRegisterPull(
         summary.continueAfter = { postedDate: lastPosted.postedDate, qbTxnId: lastPosted.qbTxnId };
     }
 
+    /**
+     * PARK THE WINDOW WHEN IT INGESTED BUT COULD NOT BE CERTIFIED.
+     *
+     * `clearedProbeOk === false` is the retryable incompleteness: the rows are
+     * stored and idempotent, and the only thing missing is an answer QuickBooks
+     * may well give in fifteen minutes. Parking it is what makes
+     * `pullContinuationPending` true, which is the only thing the resume pass
+     * looks at — without it a probe failure at 02:00 was invisible to every one
+     * of the day's continuation slots.
+     *
+     * `attempts` only carries forward for the SAME bounds; a different window
+     * failing is a new problem and starts its own count. Past the limit the
+     * marker is dropped rather than re-parked: the window stays uncertified (the
+     * stamp is withheld either way) and `bank-pull-stale` becomes the signal,
+     * instead of a dead report endpoint burning all 44 slots every day.
+     */
+    let retryPending: PullRetryPending | null = null;
+    if (!clearedProbeOk) {
+        const sameWindow = retryWindow !== null
+            && retryWindow.startDate === startDate
+            && retryWindow.endDate === endDate;
+        const attempts = (sameWindow ? retryWindow.attempts : 0) + 1;
+        if (attempts > PROBE_RETRY_LIMIT) {
+            summary.reason = "probe-retries-exhausted";
+        } else {
+            retryPending = { startDate, endDate, reason: "cleared-probe-failed", attempts };
+        }
+    }
+    summary.retryPending = retryPending;
+
     if (dependencies.saveWindowState && dependencies.windowState && summary.ok) {
         // NOT `summary.complete`. This asks the narrower question "did this run
         // ingest every batch of the window it fetched?", and a CAPPED window
@@ -943,6 +1041,11 @@ export async function runBankRegisterPull(
                     : dependencies.windowState.lastFullSweep,
                 // Cleared on a finished window; set when we stopped part way.
                 continueAfter: windowFullyIngested ? null : summary.continueAfter ?? dependencies.windowState.continueAfter ?? null,
+                // Written on EVERY save, so a recovered probe clears the marker
+                // rather than leaving the resume pass re-running a window that
+                // is now certified — the same "latches nothing" rule the blocked
+                // reason follows.
+                retryPending,
             });
         } catch (error) {
             // Same reasoning as the sweep's cursor: work committed, the

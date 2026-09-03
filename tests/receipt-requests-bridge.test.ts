@@ -197,10 +197,12 @@ test("the sweep recomputes source truth on an OCC retry instead of reapplying a 
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     assert.match(source, /recomputeCodes: \(\) => recomputeCodesFor\(targetKey\)/);
     // The recompute reads the line and the evidence again, and honours a
-    // resolution that landed since. `cache` is an OPTIONAL second param (Codex
-    // PR #443 gate finding 3 in receipt-request-cards) — this call site still
-    // passes only `targetKey`, so its per-call behaviour is unchanged.
-    assert.match(source, /async function recomputeCodesFor\(\s*targetKey: string,\s*cache\?: Map<string, ReasonCode\[\]>,\s*\): Promise<ReasonCode\[\]> \{/);
+    // resolution that landed since. `cache` and `deadlineExceeded` are both
+    // OPTIONAL trailing params (Codex PR #443 gate finding 3 in
+    // receipt-request-cards, then round 34) — this call site still passes only
+    // `targetKey`, so the sweep's per-call behaviour is unchanged and it keeps
+    // its own outer budget rather than inheriting the card cron's.
+    assert.match(source, /async function recomputeCodesFor\(\s*targetKey: string,\s*cache\?: Map<string, ReasonCode\[\]>,\s*deadlineExceeded\?: \(\) => boolean,\s*\): Promise<ReasonCode\[\]> \{/);
     assert.match(source, /if \(hasResolution\(parseMissingReceiptDetails\(issue\?\.displayDetails \?\? null\)\)\) \{ cache\?\.set\(targetKey, \[\]\); return \[\]; \}/);
 });
 
@@ -336,8 +338,10 @@ test("the retry pass re-posts unposted rows, and selects only when it may", () =
     assert.match(source, /if \(!selectionAllowed\) continue;/);
     assert.match(source, /const selectionAllowed = chaserCompletedFor\(marker, date\);/);
     // The scan follows the same verdict: needed when it may select, skipped
-    // when it may not (then it posts purely from the claimed snapshot).
-    assert.match(source, /const scan = selectionAllowed\s*\n\s*\? await scanCandidates\(\)\s*\n\s*: \{ candidates: \[\] as CardCandidateIssue\[\]/);
+    // when it may not (then it posts purely from the claimed snapshot). It is
+    // handed the run's own clock (round-34 finding 3), so the skipped branch has
+    // to supply the same shape — including `deadlineHit`.
+    assert.match(source, /const scan = selectionAllowed\s*\n\s*\? await scanCandidates\(\(\) => remainingRevalidationBudgetMs\(runStartedAt\) <= 0\)\s*\n\s*: \{ candidates: \[\] as CardCandidateIssue\[\]/);
 });
 
 test("the retry pass is scheduled two hours after the morning card", () => {

@@ -2783,6 +2783,43 @@ model ReceiptRequestCard {
   @@index([pacificDate])
 }
 
+/// The DURABLE identity of a signed missing-receipt memo (Codex PR #443 gate
+/// round 34, finding 1).
+///
+/// WHY A TABLE AND NOT JUST `displayDetails`. A signed affidavit IS the
+/// evidence when no merchant receipt exists, so exactly two things must be true
+/// of it forever: one memo answers one charge, and one charge is answered by
+/// one memo. Both used to live only in a TEXT blob the answers route rewrote in
+/// place, which made the second one false: PDF-A recorded on issue 1, PDF-B
+/// then REPLACING it on issue 1, and PDF-A was suddenly nowhere on record — so
+/// replaying it against issue 2 passed the "already used elsewhere" scan and
+/// closed a second charge with a memo that had already been spent.
+///
+/// The two unique constraints are the two invariants, in the one place a
+/// concurrent writer cannot argue with:
+///   - `pdfId` UNIQUE           — a memo answers ONE charge.
+///   - (targetType, targetKey)  — a charge is bound to ONE memo, immutably.
+/// The route checks both first and returns typed answers; these exist because a
+/// check is a statement about the moment it ran and a constraint is a statement
+/// about the row.
+model ReceiptMemoArtifact {
+  id String @id @default(cuid())
+  /// The affidavit app's Drive file id — the memo's durable identity.
+  pdfId String @unique
+  /// The ReviewIssue this memo answers, by its natural key (always "bank-line"
+  /// today). Stored as the key rather than only the row id so the binding
+  /// survives an issue being deleted and recreated for the same bank line.
+  targetType String
+  targetKey  String
+  /// The ReviewIssue row that carried the resolution when this was written.
+  /// Diagnostic — the natural key above is the binding.
+  issueId   String
+  createdAt DateTime @default(now())
+
+  @@unique([targetType, targetKey])
+  @@index([issueId])
+}
+
 // ── Bank ledger (Receipt Automation Phase 1) ────────────────────────────────
 // docs/RECEIPT-AUTOMATION-PHASES.md, "Persistence decision" (2026-08-14) +
 // Codex peer-review round-1 amendments (2026-08-14): BankLine is the

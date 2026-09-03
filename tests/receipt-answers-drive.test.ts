@@ -76,12 +76,38 @@ interface FakeIssueRow {
     clearedAt: Date | null;
 }
 
+/** A `ReceiptMemoArtifact` row — the DURABLE memo binding (round-34 finding 1). */
+interface FakeArtifactRow {
+    pdfId: string;
+    targetType: string;
+    targetKey: string;
+    issueId: string;
+}
+
+/**
+ * The artifact table, keyed by pdfId. Both of its unique indexes are enforced
+ * on write below, because they are the invariants — a fake that merely records
+ * inserts would let every reuse test pass for the wrong reason.
+ */
+let artifacts: Map<string, FakeArtifactRow>;
+
+/** Prisma's own unique-violation shape, duck-typed exactly as the route's guard reads it. */
+function uniqueViolation(target: string): Error & { code: string } {
+    return Object.assign(new Error(`Unique constraint failed on ${target}`), { code: "P2002" });
+}
+
 /** The one shape the answers route needs from `prisma` — and from `tx`, since it's the same object. */
 interface FakePrisma {
     reviewIssue: {
         findUnique: (args: { where: { targetType_targetKey?: { targetKey: string }; id?: string } }) => Promise<FakeIssueRow | null>;
         findMany: (args: { where: { targetKey?: { not?: string } } }) => Promise<Array<{ displayDetails: string | null }>>;
         updateMany: (args: { where: { id: string; version: number }; data: Record<string, unknown> }) => Promise<{ count: number }>;
+    };
+    receiptMemoArtifact: {
+        findUnique: (args: {
+            where: { pdfId?: string; targetType_targetKey?: { targetType: string; targetKey: string } };
+        }) => Promise<FakeArtifactRow | null>;
+        create: (args: { data: FakeArtifactRow }) => Promise<FakeArtifactRow>;
     };
     $executeRaw: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<undefined>;
     $transaction: <T>(fn: (tx: FakePrisma) => Promise<T>) => Promise<T>;
@@ -117,20 +143,114 @@ const fakePrisma: FakePrisma = {
             return { count: 1 };
         },
     },
-    // The pdfId advisory lock (Codex round-2 gate, finding 1): a tagged
-    // template call, same shape `tx.$executeRaw` gets in the real route.
-    // Recorded so a test can assert it runs BEFORE the reuse check, on every
-    // attempt — the fake takes no real lock, but the call itself is the point.
+    // The DURABLE memo binding (round-34 finding 1). Both unique indexes are
+    // real here: `pdfId`, and (targetType, targetKey).
+    receiptMemoArtifact: {
+        findUnique: async ({ where }) => {
+            if (where.pdfId !== undefined) return artifacts.get(where.pdfId) ?? null;
+            const key = where.targetType_targetKey;
+            if (!key) return null;
+            return [...artifacts.values()].find(
+                row => row.targetType === key.targetType && row.targetKey === key.targetKey,
+            ) ?? null;
+        },
+        create: async ({ data }) => {
+            if (artifacts.has(data.pdfId)) throw uniqueViolation("ReceiptMemoArtifact_pdfId_key");
+            const boundAlready = [...artifacts.values()].some(
+                row => row.targetType === data.targetType && row.targetKey === data.targetKey,
+            );
+            if (boundAlready) throw uniqueViolation("ReceiptMemoArtifact_targetType_targetKey_key");
+            artifacts.set(data.pdfId, { ...data });
+            return { ...data };
+        },
+    },
+    /**
+     * The pdfId advisory lock (Codex round-2 gate, finding 1): a tagged
+     * template call, same shape `tx.$executeRaw` gets in the real route.
+     * Recorded so a test can assert it runs BEFORE the reuse check, on every
+     * attempt.
+     *
+     * AND IT REALLY SERIALIZES. `pg_advisory_xact_lock` blocks a second
+     * transaction until the first commits, and the whole reuse invariant rests
+     * on that — a fake that only recorded the call would let a concurrency test
+     * pass on a system with no mutual exclusion at all. The lock is held for the
+     * life of the transaction, exactly as `_xact_` means, and released in the
+     * `finally` below.
+     */
     $executeRaw: async (strings, ...values) => {
         lockCalls.push(String(values[0]));
         callOrder.push(`lock:${String(values[0])}`);
         return undefined;
     },
-    // The route runs everything for one attempt inside ONE transaction; the
-    // fake just hands the same object back as `tx` — the reviewIssue and
-    // $executeRaw methods above already do the recording tests need.
-    $transaction: async fn => fn(fakePrisma),
+    /**
+     * ONE transaction per attempt, with real all-or-nothing semantics.
+     *
+     * The route now writes TWO rows (the resolution and the artifact binding)
+     * and depends on neither surviving alone — a fake that let a half-write
+     * stand would hide exactly the state the artifact table exists to prevent.
+     *
+     * Rollback is an UNDO LOG of this transaction's own writes, not a snapshot
+     * of the whole store: two overlapping requests are the case these tests are
+     * for, and restoring a store captured before the other one committed would
+     * silently erase its work — a fake that manufactures the very bug it is
+     * meant to detect.
+     */
+    $transaction: async fn => {
+        const undo: Array<() => void> = [];
+        // A BOX, not a bare `let`: the assignment happens inside the `$executeRaw`
+        // closure below, so TypeScript narrows a plain binding to `null` by the
+        // time the `finally` reads it and the release becomes uncallable.
+        const lock: { release: (() => void) | null } = { release: null };
+        const tx: FakePrisma = {
+            ...fakePrisma,
+            reviewIssue: {
+                ...fakePrisma.reviewIssue,
+                updateMany: async args => {
+                    const before = [...issues.values()].find(row => row.id === args.where.id);
+                    const restored = before ? { ...before } : null;
+                    const result = await fakePrisma.reviewIssue.updateMany(args);
+                    if (result.count === 1 && before && restored) {
+                        undo.push(() => Object.assign(before, restored));
+                    }
+                    return result;
+                },
+            },
+            receiptMemoArtifact: {
+                ...fakePrisma.receiptMemoArtifact,
+                create: async args => {
+                    const created = await fakePrisma.receiptMemoArtifact.create(args);
+                    undo.push(() => artifacts.delete(args.data.pdfId));
+                    return created;
+                },
+            },
+            $executeRaw: async (strings, ...values) => {
+                const key = String(values[0]);
+                await fakePrisma.$executeRaw(strings, ...values);
+                // `pg_advisory_xact_lock` BLOCKS until the holder's transaction
+                // ends. Queue behind whoever holds this key and hand the baton
+                // on in the `finally` below.
+                const previous = lockHolders.get(key) ?? Promise.resolve();
+                let signal!: () => void;
+                const held = new Promise<void>(resolve => { signal = resolve; });
+                lockHolders.set(key, previous.then(() => held));
+                await previous;
+                lock.release = signal;
+                return undefined;
+            },
+        };
+        try {
+            return await fn(tx);
+        } catch (error) {
+            for (const step of undo.reverse()) step();
+            throw error;
+        } finally {
+            lock.release?.();
+        }
+    },
 };
+
+/** Per-key lock queues, so the advisory lock above is mutual exclusion, not a log line. */
+const lockHolders = new Map<string, Promise<void>>();
 
 let POST: (request: Request) => Promise<Response>;
 
@@ -181,6 +301,8 @@ function reset() {
     lockCalls = [];
     callOrder = [];
     updateManyCounts = [];
+    artifacts = new Map();
+    lockHolders.clear();
     issues = new Map([["bl-1", { id: "ri-1", version: 3, displayDetails: CARDED_DETAILS, clearedAt: null }]]);
 }
 
@@ -769,4 +891,130 @@ test("the LEGACY single `card` slot is still a valid association", async () => {
     const res = await post({ fingerprint: "pb-bl-legacy", signed: true, pdf_id: FILE_ID });
     assert.equal(res.status, 200);
     assert.equal(JSON.parse(writes[0].displayDetails as string).resolution, "memo-signed");
+});
+
+// ── A memo binding is IMMUTABLE once recorded (Codex PR #443 gate round 34, finding 1) ──
+
+/** A second Drive file, minted for a charge of the SAME amount as the fixture's. */
+const OTHER_FILE_ID = "1zzQWERTYuiopASDFG";
+/** The other charge's own Chat thread — a memo must come from the card that asked. */
+const SECOND_THREAD = "spaces/x/threads/second";
+
+/** A second carded issue for the SAME amount, so one affidavit name fits both. */
+function addTwinCharge(): void {
+    issues.set("bl-2", {
+        id: "ri-2",
+        version: 1,
+        displayDetails: JSON.stringify({
+            amountCents: -12_345,
+            cards: [{ n: 1, date: "2026-08-16", threadName: SECOND_THREAD, messageName: "spaces/x/messages/z2", requestId: "receipt-req-CJ-2026-08-16" }],
+        }),
+        clearedAt: null,
+    });
+}
+
+function foundMemo(id: string): void {
+    probeResult = { kind: "found", id, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+}
+
+test("PDF-A → issue 1, PDF-B → issue 1 REJECTED, PDF-A → issue 2 REJECTED", async () => {
+    /**
+     * THE WHOLE STORY, in three requests.
+     *
+     * The reuse check deliberately excludes the issue being answered, and the
+     * write REPLACED that issue's recorded pdfId in place. So a second memo on
+     * the same charge did not merely add a record — it ERASED the first one.
+     * PDF-A was then on file nowhere, and replaying it against a second charge
+     * of the same amount (whose affidavit filename is interchangeable) sailed
+     * through the reuse check and closed a chase nobody had answered. Two
+     * charges, one signed affidavit.
+     */
+    reset();
+    addTwinCharge();
+
+    // 1. PDF-A answers issue 1. The ordinary happy path.
+    foundMemo(FILE_ID);
+    const first = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(first.status, 200);
+    assert.equal(JSON.parse(issues.get("bl-1")!.displayDetails!).pdfId, FILE_ID);
+    assert.deepEqual([...artifacts.keys()], [FILE_ID], "and the durable binding is on file");
+
+    // 2. PDF-B tries to REPLACE it on the same issue. This is the write that
+    //    used to succeed and unbind PDF-A.
+    foundMemo(OTHER_FILE_ID);
+    const second = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: OTHER_FILE_ID });
+    assert.equal(second.status, 422, "a charge already answered by a memo cannot be re-bound to another");
+    const secondBody = await second.json() as { ok: boolean; reason: string; detail: string };
+    assert.equal(secondBody.ok, false);
+    assert.equal(secondBody.reason, "memo-already-bound");
+    assert.match(secondBody.detail, new RegExp(FILE_ID), "and it names the memo that IS bound");
+    assert.equal(JSON.parse(issues.get("bl-1")!.displayDetails!).pdfId, FILE_ID, "PDF-A is untouched — never overwritten");
+    assert.equal(artifacts.has(OTHER_FILE_ID), false, "and PDF-B recorded nothing");
+
+    // 3. PDF-A, replayed against the twin charge. The step the first two exist
+    //    to protect: it is still on record as spent, so it is still refused.
+    foundMemo(FILE_ID);
+    const third = await post({ fingerprint: "pb-bl-2", signed: true, pdf_id: FILE_ID, thread: SECOND_THREAD });
+    assert.equal(third.status, 409);
+    assert.equal((await third.json() as { reason: string }).reason, "artifact-reused");
+    assert.equal(issues.get("bl-2")!.displayDetails!.includes("memo-signed"), false, "the second charge is still open");
+    assert.deepEqual(cleared, ["bl-1"], "only the charge the memo actually answered was ever cleared");
+});
+
+test("the artifact row refuses the replay even when the details were rewritten out from under it", async () => {
+    // The DURABLE half, isolated. `pdfIdReusedElsewhere` reads displayDetails,
+    // which is exactly the field a future writer could change; the artifact row
+    // is the record that cannot be edited away. Here issue 1's details are
+    // wiped after the memo was recorded, so the TEXT scan finds nothing — and
+    // the replay is still refused, by the unique index alone.
+    reset();
+    addTwinCharge();
+    foundMemo(FILE_ID);
+    assert.equal((await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID })).status, 200);
+
+    issues.get("bl-1")!.displayDetails = CARDED_DETAILS; // resolution gone; artifact remains
+
+    foundMemo(FILE_ID);
+    const replay = await post({ fingerprint: "pb-bl-2", signed: true, pdf_id: FILE_ID, thread: SECOND_THREAD });
+    assert.equal(replay.status, 409);
+    assert.equal((await replay.json() as { reason: string }).reason, "artifact-reused");
+});
+
+test("the SAME memo re-sent for the SAME charge is still the idempotent 200", async () => {
+    // Immutability must not break the forwarder's retry: one memo, one charge,
+    // any number of deliveries.
+    reset();
+    foundMemo(FILE_ID);
+    assert.equal((await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID })).status, 200);
+
+    foundMemo(FILE_ID);
+    const again = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(again.status, 200, "same memo, same charge — never memo-already-bound");
+    assert.equal((await again.json() as { memoRecorded?: boolean }).memoRecorded, true);
+    assert.deepEqual([...artifacts.keys()], [FILE_ID], "and it did not insert a second binding");
+});
+
+test("CONCURRENT PDF-A → issue 1 and PDF-A → issue 2: exactly one wins", async () => {
+    /**
+     * Both requests in flight at once, against the same fake state, with the
+     * `memo-pdf:<pdfId>` advisory lock genuinely serializing them (see the
+     * $transaction fake). Sequentially the loser reads the winner's committed
+     * row; the point here is that it does so under CONTENTION, which is the
+     * only condition the lock exists for.
+     */
+    reset();
+    addTwinCharge();
+    foundMemo(FILE_ID);
+
+    const [a, b] = await Promise.all([
+        post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID }),
+        post({ fingerprint: "pb-bl-2", signed: true, pdf_id: FILE_ID, thread: SECOND_THREAD }),
+    ]);
+    const statuses = [a.status, b.status].sort();
+    assert.deepEqual(statuses, [200, 409], "one charge is answered, the other is told the memo is spent");
+
+    const reasons = await Promise.all([a, b].map(async res => (res.status === 409 ? (await res.json() as { reason: string }).reason : "ok")));
+    assert.ok(reasons.includes("artifact-reused"));
+    assert.deepEqual([...artifacts.keys()], [FILE_ID], "one memo, one binding");
+    assert.equal(cleared.length, 1, "and one chase closed, not two");
 });
