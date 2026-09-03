@@ -27,6 +27,8 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
     BANK_APPLY_MIN_AGE_DAYS,
@@ -3049,3 +3051,62 @@ test("G1: a deterministic payment guard AFTER the invoice was staged keeps the h
 // 7. Gate round 2 (PR #458): mutual exclusion, and honest handoff notes
 // ═════════════════════════════════════════════════════════════════════════════
 
+test("P1: the reservation-index rebuild must not erase a STAGED hold", async t => {
+    // scripts/apply-deposit-ingest-schema.mjs is documented as idempotent and
+    // safe to re-run, and its preflight clears `failed` reservations that carry
+    // no settleStartedAt. Invoice staging deliberately leaves settleStartedAt
+    // NULL (it marks itself inside `extracted`), so without an explicit guard
+    // that supported rerun would release a milestone a QuickBooks invoice may
+    // already point at — and the next sweep would re-match and create a second
+    // invoice for the same money.
+    //
+    // Read as TEXT, never imported: importing an apply script executes it
+    // (CLAUDE.md, 2026-09-02).
+    const scriptPath = fileURLToPath(new URL("../scripts/apply-deposit-ingest-schema.mjs", import.meta.url));
+    const script = readFileSync(scriptPath, "utf8");
+
+    await t.test("the cleanup predicate carries the staged guard", () => {
+        const cleanup = script.slice(
+            script.indexOf('UPDATE "DepositIngest" SET "paymentScheduleId" = NULL'),
+            script.indexOf('DROP INDEX IF EXISTS "DepositIngest_paymentScheduleId_reservation_key"'),
+        );
+        assert.ok(cleanup, "the preflight UPDATE must still be there");
+        assert.match(cleanup, /"status" = 'failed'/);
+        assert.match(cleanup, /"settleStartedAt" IS NULL/);
+        assert.match(
+            cleanup, /"extracted" NOT LIKE '%"stagedScheduleId"%'/,
+            "a failed row that staged a QuickBooks invoice must keep its reservation",
+        );
+    });
+
+    await t.test("no other apply script or migration carries an unguarded copy", () => {
+        // The predicate lives in exactly one place; the baseline migration
+        // carries the index DDL, not this data preflight. If a second copy ever
+        // appears it must be guarded too, or CI's migration-parity job and this
+        // fix would disagree.
+        for (const rel of ["../scripts/apply-deposit-sweep-schema.mjs",
+                           "../prisma/migrations/20260814000000_baseline_production/migration.sql"]) {
+            const other = readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+            assert.equal(
+                other.includes('SET "paymentScheduleId" = NULL'), false,
+                `${rel} must not hold a second, unguarded copy of the reservation cleanup`,
+            );
+        }
+    });
+
+    await t.test("and a failed+staged row still resumes instead of re-matching", async () => {
+        // The end the guard protects: reservation intact — so the sweep goes
+        // through reserved recovery and never runs the candidate query again.
+        const { milestone, amount } = seedChristensen({ ref: "REF-REBUILD", amount: 25000 });
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId = "qb-inv-survived";
+        seedStagedRow("REF-REBUILD", milestone, amount, {
+            status: "failed", attempts: 2, lastError: "socket hang up", settleStartedAt: null,
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-REBUILD", amount }]));
+        assert.equal(creditResult(body, "REF-REBUILD").status, "applied");
+        assert.equal(queries.paymentSchedule.length, 0, "a staged row resumes; it must never re-match");
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "and never creates a second invoice");
+        assert.equal(calls.buildQBPaymentRequest[0].qbInvoiceId, "qb-inv-survived");
+    });
+});
