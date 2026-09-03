@@ -14,6 +14,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
+import { BANK_DEPOSIT_SOURCE, MONEY_IN_FLIGHT_STATUSES } from "./deposit-sweep";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
 import {
@@ -458,6 +459,22 @@ export async function settleProgressBillingPaidCore(
  * cron's poll of the payment it just created) and this is a success, not a
  * conflict; a different or absent `qbPaymentId` is a genuine conflict the
  * caller must route to manual reconciliation.
+ *
+ * Receipt suppression is DERIVED here, not just taken from the caller. The
+ * deposit sweep persists `qbo_created` before it settles; if it dies in that
+ * gap, the hourly QuickBooks sync finds the very payment the sweep created and
+ * settles the milestone itself — with no opts at all — and the client gets a
+ * "Payment Confirmed" email for money no human has looked at. So this function
+ * asks the database whether a bank-sourced deposit owns this milestone. Either
+ * signal suppresses; neither one can be lost by which caller happened to win.
+ *
+ * The question is asked about THIS payment, not about the schedule's history.
+ * A finished (`applied`) deposit row only suppresses when its own qbPaymentId
+ * is the payment being settled — otherwise an undo-and-repay months later
+ * would inherit the old sweep's silence and swallow the client's receipt. A
+ * row that is still mid-flight (including one parked in `reconcile`, which is
+ * very much still the sweep's money) suppresses on status alone, because its
+ * QuickBooks payment id may not be known yet.
  */
 export async function settleMilestoneFromQBPayment(input: {
     paymentScheduleId: string;
@@ -465,8 +482,11 @@ export async function settleMilestoneFromQBPayment(input: {
     qbPaymentId: string | null;
     paidAt: Date;
     referenceNumber: string | null;
+    /** Deposit sweep only: skip the CLIENT receipt for this settlement (team
+     *  email + activity log still fire). See payment-outbox.enqueueMilestonePaid. */
+    suppressClientReceipt?: boolean;
 }): Promise<boolean> {
-    const { paymentScheduleId, invoiceId, ...payment } = input;
+    const { paymentScheduleId, invoiceId, suppressClientReceipt, ...payment } = input;
     return withTxRetry(() => prisma.$transaction(async (t) => {
         // Canonical lock order: Estimate → Invoice → schedules. This settle mirrors onto the
         // estimate copy, so read the estimate link (non-locking) and lock Estimate before Invoice,
@@ -477,8 +497,29 @@ export async function settleMilestoneFromQBPayment(input: {
         const claimed = await settleMilestonePaidInTx(t, paymentScheduleId, invoiceId, payment);
         if (!claimed) return false;
 
+        // Read INSIDE the settle transaction, so the answer is the same one the
+        // settle itself committed against.
+        const sweptByBankDeposit = await t.depositIngest.findFirst({
+            where: {
+                source: BANK_DEPOSIT_SOURCE,
+                paymentScheduleId,
+                OR: [
+                    // (a) this exact payment came from the sweep, whatever state
+                    //     the row has since reached;
+                    ...(payment.qbPaymentId ? [{ qbPaymentId: payment.qbPaymentId }] : []),
+                    // (b) a sweep is mid-flight on this milestone right now.
+                    { status: { in: [...MONEY_IN_FLIGHT_STATUSES] } },
+                ],
+            },
+            select: { id: true },
+        });
+
         // Durable notification, enqueued in-tx (delivered by the drainer after commit).
-        await enqueueMilestonePaid(t, { scheduleId: paymentScheduleId, scheduleType: "invoice" });
+        await enqueueMilestonePaid(t, {
+            scheduleId: paymentScheduleId,
+            scheduleType: "invoice",
+            suppressClientReceipt: suppressClientReceipt === true || sweptByBankDeposit !== null,
+        });
         return true;
     }));
 }

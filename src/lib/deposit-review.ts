@@ -9,6 +9,12 @@ export type DepositReviewItem = {
     checkDate: string | null;
     checkNumber: string | null;
     paymentScheduleId: string | null;
+    /** The milestone this deposit matched or would apply to, named for a human:
+     *  `"Rough In complete" (Hoppe Hall Bath, INV-00173)`. Null when nothing was
+     *  matched, or when the caller did not join the schedule. */
+    candidate: string | null;
+    /** null = the deposit-photo path, "bank" = the daily sweep. */
+    source: string | null;
     qbPaymentId: string | null;
     officeTaskId: string | null;
     attempts: number;
@@ -27,6 +33,14 @@ type DepositReviewSource = {
     lastError: string | null;
     createdAt: Date;
     updatedAt: Date;
+    // Both optional so existing callers (and their fixtures) keep compiling; a
+    // caller that joins the schedule gets a named candidate, one that doesn't
+    // gets null rather than a wrong answer.
+    source?: string | null;
+    paymentSchedule?: {
+        name: string | null;
+        invoice: { code: string | null; project: { name: string | null } | null } | null;
+    } | null;
 };
 
 type ExtractedDeposit = {
@@ -49,6 +63,14 @@ function toCents(value: unknown): number | null {
     if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
     const cents = Math.round(value * 100);
     return Math.abs(value * 100 - cents) <= 1e-6 && Number.isSafeInteger(cents) ? cents : null;
+}
+
+/** The milestone a deposit matched, in the words a human uses for it. */
+function describeCandidateMilestone(schedule: DepositReviewSource["paymentSchedule"]): string | null {
+    if (!schedule) return null;
+    const where = [schedule.invoice?.project?.name, schedule.invoice?.code].filter(Boolean).join(", ");
+    const name = schedule.name?.trim() || "milestone";
+    return where ? `"${name}" (${where})` : `"${name}"`;
 }
 
 /**
@@ -79,6 +101,8 @@ export function toDepositReviewItem(row: DepositReviewSource): DepositReviewItem
         checkDate: boundedText(extracted.checkDate, 10),
         checkNumber: boundedText(extracted.checkNumber, 100),
         paymentScheduleId: row.paymentScheduleId,
+        candidate: describeCandidateMilestone(row.paymentSchedule),
+        source: row.source ?? null,
         qbPaymentId: row.qbPaymentId,
         officeTaskId: row.officeTaskId,
         attempts: row.attempts,

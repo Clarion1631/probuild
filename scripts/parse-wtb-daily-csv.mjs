@@ -59,9 +59,31 @@
 // are therefore sorted into a total order (sortLines) before the payload is
 // built, so the hash is addressed by CONTENT, not by transport order.
 //
+// DEPOSIT SWEEP (--sweep): this script is also the production TRIGGER for the
+// daily bank-credit auto-apply (docs/plans/DEPOSIT-SWEEP-PLAN.md). After a
+// day's STATEMENT post succeeds (a replay no-op counts), --sweep POSTs that
+// same day's CREDIT rows to /api/payments/deposit-ingest as ONE batch:
+// source "bank", the postDate, the credits, and the control totals — where
+// creditSum is the bank's OWN per-day TOTAL CREDITS figure (BAI 100). The
+// endpoint refuses the whole batch if it does not tie to the rows posted.
+// Rules that matter for an unattended cron:
+//   - only COMPLETE days are swept, and a day skipped for any reason
+//     (REPOST_FLOOR, a missing ledger row, a quiet day) is never swept
+//     either — a partial day is exactly the state that makes an amount look
+//     unique when it is not;
+//   - a failed sweep POST is a non-zero exit, so the Hermes watchdog fires;
+//   - the bearer secret is read from DEPOSIT_INGEST_SECRET in the
+//     environment, never from argv, and its absence fails BEFORE any network
+//     call rather than half way through the day;
+//   - --sweep-dry-run posts the same batch with dryRun true (the Phase A
+//     shadow week): the endpoint runs the whole match and stops before any
+//     money boundary.
+//
 // Usage:
 //   node scripts/parse-wtb-daily-csv.mjs <daily.csv> [--dry-run]
 //   node scripts/parse-wtb-daily-csv.mjs <daily.csv> --post <base-url>
+//   node scripts/parse-wtb-daily-csv.mjs <daily.csv> --post <base-url> --sweep
+//   node scripts/parse-wtb-daily-csv.mjs <daily.csv> --post <base-url> --sweep-dry-run
 //   node scripts/parse-wtb-daily-csv.mjs <daily.csv> --account WTB-0723
 //
 // --post takes the SITE BASE URL (e.g. https://probuild.goldentouchremodeling.com);
@@ -71,6 +93,7 @@ import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 const INGEST_PATH = "/api/integrations/bank-ledger/ingest";
+const DEPOSIT_SWEEP_PATH = "/api/payments/deposit-ingest";
 const DEFAULT_ACCOUNT = "WTB-0723";
 // First calendar date the daily-CSV path owns (the first day ingested from a
 // daily export in prod, 2026-08-18). The monthly PDF parser must only cover
@@ -113,6 +136,11 @@ const BAI_TOTAL_CREDITS = "100";
 const BAI_TOTAL_DEBITS = "400";
 const BAI_CHECK_PAID = "475";
 const POST_TIMEOUT_MS = 30_000;
+// The sweep endpoint processes a whole day sequentially, each credit worth up
+// to two QuickBooks round trips, inside a 60-second function. Abandoning that
+// request early would leave a batch mid-money-write with nobody reading the
+// answer, so the client waits LONGER than the server can possibly take.
+const SWEEP_POST_TIMEOUT_MS = 90_000;
 
 /** Collapse internal whitespace runs to one space and trim. Hash stability. */
 function collapseWs(value) { return value.trim().replace(/\s+/g, " "); }
@@ -125,6 +153,14 @@ function collapseWs(value) { return value.trim().replace(/\s+/g, " "); }
  * the 7-day window re-posts each completed day up to ~5 times, an unsorted
  * payload turns a cosmetic re-order into a 409 that stalls every later day.
  */
+/** Deterministic order for the sweep batch. No hash depends on it; a stable
+ *  order just makes the log and any diff readable. */
+function sortCredits(credits) {
+    return [...credits].sort((a, b) =>
+        a.bankReference.localeCompare(b.bankReference)
+        || a.amountCents - b.amountCents);
+}
+
 function sortLines(lines) {
     return [...lines].sort((a, b) =>
         a.postedDate.localeCompare(b.postedDate)
@@ -133,11 +169,15 @@ function sortLines(lines) {
         || String(a.checkNumber ?? "").localeCompare(String(b.checkNumber ?? "")));
 }
 
-function parseArgs(argv) {
-    const args = { csvPath: null, dryRun: false, post: null, account: DEFAULT_ACCOUNT };
+export function parseArgs(argv) {
+    const args = { csvPath: null, dryRun: false, post: null, account: DEFAULT_ACCOUNT, sweep: false, sweepDryRun: false };
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
         if (arg === "--dry-run") args.dryRun = true;
+        // --sweep-dry-run implies --sweep: it is the SAME batch, posted with
+        // dryRun true so the endpoint stops before any money boundary.
+        else if (arg === "--sweep") args.sweep = true;
+        else if (arg === "--sweep-dry-run") { args.sweep = true; args.sweepDryRun = true; }
         else if (arg === "--post") {
             const value = argv[++i];
             if (value === undefined || value.startsWith("--")) throw new Error("--post requires a base URL argument");
@@ -154,6 +194,13 @@ function parseArgs(argv) {
             args.account = value;
         }
         else if (!arg.startsWith("--") && !args.csvPath) args.csvPath = arg;
+        // Anything else is refused rather than ignored. A typo in an unattended
+        // cron used to be silent and catastrophic in the quiet direction:
+        // `--sweep-dryrun` (no second hyphen) parsed as "not --sweep-dry-run",
+        // was dropped on the floor, and the job POSTed a LIVE batch believing
+        // it was shadowing. Nothing is posted unless the flags are understood.
+        else if (arg.startsWith("--")) throw new Error(`unknown flag ${arg} — see the usage block at the top of this file`);
+        else throw new Error(`unexpected argument ${arg} (the CSV path is already ${args.csvPath})`);
     }
     return args;
 }
@@ -227,6 +274,12 @@ export function buildDayStatements(csvText, account) {
     const iDate = col("Post Date"), iAcct = col("Account Number"), iDesc = col("Description"),
         iBai = col("BAI Code"), iAmt = col("Amount"), iStatus = col("Status"),
         iCustRef = col("Customer Reference"), iDetail = col("Transaction Detail");
+    // Bank Reference is the stable per-deposit id the sweep keys on
+    // (docs/WTB-CHECK-IMAGES.md). Looked up OPTIONALLY so a historical export
+    // without the column still parses for the ledger: a credit then carries an
+    // empty reference, and the sweep endpoint refuses that batch rather than
+    // inventing an identity for it.
+    const iBankRef = header.indexOf("Bank Reference");
 
     /** day → { openingCents, closingCents, lines: [], pending: n } */
     const days = new Map();
@@ -247,7 +300,7 @@ export function buildDayStatements(csvText, account) {
         const acctNum = (rec[iAcct] ?? "").trim();
         if (acctNum !== EXPECTED_ACCOUNT_NUMBER) { problems.push(`row ${r + 1}: unexpected account "${acctNum}"`); continue; }
 
-        if (!days.has(isoDate)) days.set(isoDate, { openingCents: null, closingCents: null, lines: [], pending: 0, totalCreditsCents: null, totalDebitsCents: null });
+        if (!days.has(isoDate)) days.set(isoDate, { openingCents: null, closingCents: null, lines: [], credits: [], pending: 0, totalCreditsCents: null, totalDebitsCents: null });
         const day = days.get(isoDate);
 
         const desc = (rec[iDesc] ?? "").trim();
@@ -309,6 +362,25 @@ export function buildDayStatements(csvText, account) {
             : null;
 
         day.lines.push({ postedDate: isoDate, amountCents: cents, rawDescriptor, checkNumber });
+        // Money IN, for the deposit sweep. Kept in a SEPARATE list and never on
+        // the ledger line, because the statement route content-addresses those
+        // line objects: an extra field there would re-hash every stored day.
+        if (cents > 0) {
+            day.credits.push({
+                bankReference: iBankRef === -1 ? "" : (rec[iBankRef] ?? "").trim(),
+                amount: cents / 100,
+                amountCents: cents,
+                // The three fields the endpoint classifies on, kept SEPARATE and
+                // unmerged: only an actual customer deposit may be booked as a
+                // customer payment, and that decision reads the BAI code, the
+                // description and the detail independently. (The ledger's
+                // combined rawDescriptor is no use for it.)
+                baiCode: bai || null,
+                description: desc || null,
+                transactionDetail: collapseWs(detail) || null,
+                customerReference: custRef || null,
+            });
+        }
     }
 
     if (problems.length > 0) throw new Error(`CSV problems:\n  ${problems.join("\n  ")}`);
@@ -364,6 +436,9 @@ export function buildDayStatements(csvText, account) {
             closingCents: day.closingCents,
             lines: sortLines(day.lines), // B-2: content-addressed, not transport-order-addressed
             pending: day.pending,
+            // Sweep-only, stripped before the ledger POST (see postStatement).
+            credits: sortCredits(day.credits),
+            totalCreditsCents: day.totalCreditsCents,
         });
     }
 
@@ -378,17 +453,274 @@ export function buildDayStatements(csvText, account) {
 }
 
 async function postStatement(baseUrl, secret, statement) {
-    const { pending, ...payload } = statement;
+    const { account, periodStart, periodEnd, openingCents, closingCents, lines } = statement;
+    // Built by WHITELIST, in this exact key order: the route content-addresses
+    // a statement, so a stray field (pending, credits, totalCreditsCents) would
+    // change the hash and 409 every day already stored.
+    const payload = { source: "STATEMENT", account, periodStart, periodEnd, openingCents, closingCents, lines };
     // NIT (round 2): a hung fetch would stall the nightly cron indefinitely.
     const res = await fetch(new URL(INGEST_PATH, baseUrl), {
         method: "POST",
         headers: { "content-type": "application/json", "x-ingest-key": secret },
-        body: JSON.stringify({ source: "STATEMENT", ...payload }),
+        body: JSON.stringify(payload),
         signal: AbortSignal.timeout(POST_TIMEOUT_MS),
     });
     let body = null;
     try { body = await res.json(); } catch { /* non-JSON error body */ }
     return { status: res.status, body };
+}
+
+/**
+ * Can this day be swept at all?
+ *
+ * The control total is only evidence if it comes from somewhere OTHER than the
+ * rows it checks. Deriving creditSum from the credits themselves made the
+ * endpoint's check a tautology: a day whose export dropped a deposit row would
+ * have posted a sum that matched the rows perfectly and sailed through, which
+ * is precisely the "browser automation quietly saw half a day" failure the
+ * control totals exist to catch. So a credit-bearing day with no independent
+ * TOTAL CREDITS row (BAI 100) is NOT swept.
+ *
+ * A day with no credits at all is fine either way — there is nothing to sweep,
+ * and no money can be missed by not sweeping it.
+ */
+export function canSweepDay(day) {
+    if (day.credits.length === 0) return { ok: false, reason: "no credits", failure: false };
+    if (day.totalCreditsCents === null || day.totalCreditsCents === undefined) {
+        return {
+            ok: false,
+            reason: "no TOTAL CREDITS control row, sweep skipped",
+            failure: true,
+        };
+    }
+    return { ok: true };
+}
+
+/**
+ * The deposit-sweep batch for ONE complete day. Pure, so the payload shape is
+ * unit-testable without a network.
+ *
+ * creditSum is the BANK's own TOTAL CREDITS figure, and ONLY that — there is
+ * deliberately no fallback to the summed rows (see canSweepDay).
+ * buildDayStatements has already refused the whole file if the cleared credits
+ * disagree with that figure, and the endpoint re-checks it against the rows
+ * posted, so a day that cannot be vouched for is never written.
+ */
+export function buildSweepPayload(day, opts = {}) {
+    const credits = day.credits.map(c => ({
+        bankReference: c.bankReference,
+        amount: c.amount,
+        baiCode: c.baiCode,
+        description: c.description,
+        transactionDetail: c.transactionDetail,
+        customerReference: c.customerReference,
+    }));
+    if (day.totalCreditsCents === null || day.totalCreditsCents === undefined) {
+        // Unreachable via sweepDay (canSweepDay gates it); a hard error rather
+        // than a quiet fallback so no future caller can reintroduce the
+        // tautology.
+        throw new Error(`day ${day.periodStart} has no TOTAL CREDITS control row — it must not be swept`);
+    }
+    const creditSumCents = day.totalCreditsCents;
+    return {
+        source: "bank",
+        postDate: day.periodStart,
+        credits,
+        creditCount: credits.length,
+        creditSum: creditSumCents / 100,
+        ...(opts.dryRun ? { dryRun: true } : {}),
+    };
+}
+
+/**
+ * The sweep bearer secret. Resolved from the environment ONLY — a secret on
+ * the command line lands in argv, shell history and any agent transcript — and
+ * resolved BEFORE the first POST of the run, so an unconfigured cron fails
+ * loudly and immediately instead of half way through a day.
+ */
+export function resolveSweepSecret(env = process.env) {
+    const secret = env.DEPOSIT_INGEST_SECRET;
+    if (!secret) {
+        throw new Error("--sweep requires DEPOSIT_INGEST_SECRET in the environment (never on the command line)");
+    }
+    return secret;
+}
+
+export async function postSweep(baseUrl, secret, day, opts = {}) {
+    const res = await fetch(new URL(DEPOSIT_SWEEP_PATH, baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+        body: JSON.stringify(buildSweepPayload(day, opts)),
+        signal: AbortSignal.timeout(SWEEP_POST_TIMEOUT_MS),
+    });
+    let body = null;
+    try { body = await res.json(); } catch { /* non-JSON error body */ }
+    return { status: res.status, body };
+}
+
+/** One log line for a credit a human has to look at: reference, money, why. */
+export function sweepCreditLine(credit, amount) {
+    const money = typeof amount === "number" ? `$${amount.toFixed(2)}` : "unknown amount";
+    return `${credit?.bankReference} ${money}: ${credit?.status} — ${credit?.reason ?? ""}`;
+}
+
+/**
+ * True when this credit needs to appear in the job log.
+ *
+ * Everything that is not finished with, PLUS the two CLEAN outcomes a human
+ * still has to act on:
+ *   - `unmatched` — the sweep could not place the money and asked for help;
+ *   - `proposed`  — suggest-only mode (or the 2-day wait) matched it but did
+ *     not book it. Until the /automation panel grows a confirm button, this log
+ *     line IS the operator's worklist, so it must carry the candidate.
+ * Neither is a job failure; both are things somebody must look at.
+ */
+export function sweepCreditNeedsAttention(credit) {
+    return credit?.status === "unmatched"
+        || credit?.status === "proposed"
+        || !CLEAN_SWEEP_STATUSES.includes(credit?.status);
+}
+
+/** The statuses that mean a credit is finished with. Mirrors
+ *  CLEAN_SWEEP_STATUSES in src/lib/deposit-sweep.ts — this runner is plain
+ *  .mjs and cannot import the TypeScript module. */
+const CLEAN_SWEEP_STATUSES = ["applied", "proposed", "unmatched"];
+const SWEEP_BUCKETS = ["applied", "proposed", "unmatched", "reconcile", "failed", "qboUnknown", "unresolved"];
+
+const bucket = (counts, key) => {
+    const value = counts?.[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+};
+
+/** The one line the Hermes job copies into its Bot Health report. Reports every
+ *  bucket: a day whose credits all failed on a QuickBooks outage must not read
+ *  the same as a quiet day. */
+export function sweepSummaryLine(postDate, counts) {
+    const needHuman = bucket(counts, "unmatched") + bucket(counts, "reconcile");
+    const line = `sweep ${postDate}: ${counts.credits} credits, ${counts.applied} applied, ` +
+        `${needHuman} need-human, ${counts.proposed} proposed, ${counts.replay} replay`;
+    const failed = bucket(counts, "failed");
+    const qboUnknown = bucket(counts, "qboUnknown");
+    const unresolved = bucket(counts, "unresolved");
+    if (failed + qboUnknown + unresolved === 0) return line;
+    return `${line}, ${failed} failed, ${qboUnknown} qbo-unknown` +
+        (unresolved > 0 ? `, ${unresolved} unresolved` : "");
+}
+
+/**
+ * Did this day's sweep finish cleanly? The endpoint already answers that in
+ * `ok`, and that is the authority; everything below is a second, independent
+ * reading, because the whole point of this check is that the run must never
+ * report success on a batch nobody fully accounted for. `unmatched` is NOT a
+ * failure — asking a human is the sweep working as designed.
+ *
+ * Three ways to fail, in the order they can go wrong:
+ *   1. the endpoint said so;
+ *   2. the buckets do not add up to the credit count, so some outcome went
+ *      uncounted (an older deployment, or a status added since);
+ *   3. any per-credit status outside the clean set — the raw result, not a
+ *      bucket, so a status nobody has a bucket for still fails the run;
+ *   4. an answer that does not account for the credits that were submitted.
+ *
+ * @param {unknown} body
+ * @param {Set<string>|null} [submittedReferences]
+ * @returns {boolean}
+ */
+export function sweepBatchFailed(body, submittedReferences = null) {
+    if (!body || typeof body !== "object") return true;
+    // POSITIVE confirmation only. A missing `ok` is not a pass: it means the
+    // response is not the one this runner knows how to read, and an unattended
+    // job must never treat "I could not tell" as success.
+    if (body.ok !== true) return true;
+
+    const counts = body.counts;
+    if (!counts || typeof counts !== "object") return true;
+    // Every figure must be a whole, non-negative number BEFORE any of them is
+    // added up: `bucket()` coerces junk to 0, and a negative bucket can make the
+    // sum tie perfectly while describing something that cannot have happened.
+    for (const key of [...SWEEP_BUCKETS, "credits", "replay"]) {
+        const value = counts[key];
+        if (!Number.isSafeInteger(value) || value < 0) return true;
+    }
+    const sum = SWEEP_BUCKETS.reduce((total, key) => total + bucket(counts, key), 0);
+    if (sum !== bucket(counts, "credits")) return true;
+    if (bucket(counts, "reconcile") + bucket(counts, "failed") + bucket(counts, "qboUnknown") + bucket(counts, "unresolved") > 0) return true;
+
+    // The response must actually account for the credits, one by one. An empty
+    // or short array with healthy-looking counts would otherwise pass: the
+    // runner would report a clean day for credits nobody can prove were seen.
+    if (!Array.isArray(body.credits)) return true;
+    if (body.credits.length !== bucket(counts, "credits")) return true;
+    for (const credit of body.credits) {
+        if (!CLEAN_SWEEP_STATUSES.includes(credit?.status)) return true;
+    }
+
+    // …and they must be the SAME credits that were submitted, not some other
+    // day's. Set equality, so a duplicate or a substitution both fail.
+    if (submittedReferences) {
+        const answered = new Set(body.credits.map(c => c?.bankReference));
+        if (answered.size !== submittedReferences.size) return true;
+        for (const ref of submittedReferences) if (!answered.has(ref)) return true;
+    }
+    return false;
+}
+
+/**
+ * POST one complete day's credits and report the outcome. Returns false when
+ * the caller must stop and exit non-zero — which, under the Hermes cron, is
+ * what makes the daily-job watchdog fire.
+ */
+async function sweepDay(args, sweepSecret, statement, stalled) {
+    const postDate = statement.periodStart;
+    if (statement.credits.length === 0) {
+        console.log(`  sweep ${postDate}: 0 credits — nothing to apply`);
+        return true;
+    }
+    const sweepable = canSweepDay(statement);
+    if (!sweepable.ok && sweepable.failure) {
+        // The day HAS credits but the bank published no independent total for
+        // them, so nothing about this batch can be vouched for.
+        console.error(`  sweep ${postDate}: ${sweepable.reason}`);
+        stalled();
+        return false;
+    }
+    const missingRef = statement.credits.filter(c => !c.bankReference);
+    if (missingRef.length > 0) {
+        // Refused here rather than posted: without the bank reference there is
+        // no idempotency key, and the endpoint would (correctly) 400 the batch.
+        console.error(`  sweep ${postDate}: ${missingRef.length} credit(s) carry no Bank Reference — refusing to post a batch with no idempotency key`);
+        stalled();
+        return false;
+    }
+    const { status, body } = await postSweep(args.post, sweepSecret, statement, { dryRun: args.sweepDryRun });
+    if (status !== 200 || !body?.counts) {
+        console.error(`  sweep ${postDate}: HTTP ${status} ${JSON.stringify(body)}`);
+        stalled();
+        return false;
+    }
+
+    // Always report the whole day, whichever way it went.
+    const submitted = new Set(statement.credits.map(c => c.bankReference));
+    const summary = `  ${sweepSummaryLine(postDate, body.counts)}${args.sweepDryRun ? " (dry run)" : ""}`;
+    const failed = sweepBatchFailed(body, submitted);
+    (failed ? console.error : console.log)(summary);
+    // Every credit a human has to look at gets its own line, with the money on
+    // it. `unmatched` is a CLEAN batch outcome, so it would otherwise never be
+    // printed — and then the only trace of "the sweep could not place $13,447"
+    // would be a count in a summary nobody reads twice.
+    const amountByReference = new Map(statement.credits.map(c => [c.bankReference, c.amount]));
+    for (const credit of body.credits ?? []) {
+        if (!sweepCreditNeedsAttention(credit)) continue;
+        console.log(`    ${sweepCreditLine(credit, amountByReference.get(credit?.bankReference))}`);
+    }
+    if (!failed) return true;
+
+    // A credit left failed / qbo_unknown / reconcile is unresolved money: exit
+    // non-zero so the Hermes daily-job watchdog fires instead of the run
+    // logging a healthy day through a QuickBooks outage.
+    console.error(`  sweep ${postDate}: unresolved credits — a human (or the next run) must resolve them`);
+    stalled();
+    return false;
 }
 
 async function main() {
@@ -418,6 +750,10 @@ async function main() {
 
     if (args.dryRun || !args.post) {
         if (!args.post) console.log("(no --post; dry run only)");
+        // --sweep is an action taken against a live site; without --post there
+        // is nowhere to take it, and silently ignoring the flag would let a
+        // mis-wired cron look healthy while sweeping nothing.
+        if (args.sweep) fail("--sweep requires --post <base-url>");
         return;
     }
 
@@ -425,6 +761,17 @@ async function main() {
     if (!secret) {
         fail("--post requires BANK_LEDGER_INGEST_SECRET or INGEST_KEY in the environment");
         return;
+    }
+    // Resolved up front, before ANY network call: an unconfigured sweep must
+    // not post half the day's statements and then discover it has no secret.
+    let sweepSecret = null;
+    if (args.sweep) {
+        try {
+            sweepSecret = resolveSweepSecret();
+        } catch (error) {
+            fail(error.message);
+            return;
+        }
     }
 
     let hadError = false;
@@ -450,6 +797,13 @@ async function main() {
         if (status === 200 && body?.ok) {
             const tag = body.replay ? "replay (no-op)" : `inserted ${body.inserted}`;
             console.log(`  POST ${statement.periodStart}: OK — ${tag}`);
+            // The sweep runs ONLY after this day's statement is safely stored
+            // (a replay no-op counts): the ledger is the record, the sweep is
+            // the action taken on it.
+            if (args.sweep && !(await sweepDay(args, sweepSecret, statement, stalled))) {
+                hadError = true;
+                break;
+            }
         } else if (status === 409) {
             hadError = true;
             console.error(`  POST ${statement.periodStart}: 409 CONFLICT — the stored day differs from this file. Bank-side restatement? A HUMAN SHOULD LOOK. ${JSON.stringify(body)}`);

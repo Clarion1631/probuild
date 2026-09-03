@@ -179,10 +179,30 @@ export default async function AutomationPage(props: {
                 select: {
                     id: true, status: true, extracted: true, paymentScheduleId: true,
                     qbPaymentId: true, officeTaskId: true, attempts: true, lastError: true,
-                    createdAt: true, updatedAt: true,
+                    createdAt: true, updatedAt: true, source: true,
                 },
             });
-            depositReviews = deposits.map(toDepositReviewItem);
+
+            // Name the matched milestone for the reviewer. A bank credit carries
+            // no project of its own, so for a `proposed` row this is the only
+            // human-readable thing about it. Resolved in a second query rather
+            // than a join: DepositIngest.paymentScheduleId is deliberately a
+            // bare column, not a relation (a deposit may outlive its milestone).
+            const scheduleIds = [...new Set(deposits.map(d => d.paymentScheduleId).filter((id): id is string => !!id))];
+            const schedules = scheduleIds.length > 0
+                ? await prisma.paymentSchedule.findMany({
+                    where: { id: { in: scheduleIds } },
+                    select: {
+                        id: true, name: true,
+                        invoice: { select: { code: true, project: { select: { name: true } } } },
+                    },
+                })
+                : [];
+            const scheduleById = new Map(schedules.map(s => [s.id, s]));
+            depositReviews = deposits.map(row => toDepositReviewItem({
+                ...row,
+                paymentSchedule: row.paymentScheduleId ? scheduleById.get(row.paymentScheduleId) ?? null : null,
+            }));
         } catch (error) {
             depositReviewUnavailable = true;
             console.error("deposit review fetch failed", error instanceof Error ? error.name : "UnknownError");
