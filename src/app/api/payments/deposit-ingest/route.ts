@@ -339,7 +339,7 @@ export async function POST(req: Request) {
         // through the exact reserved-row path (matchAndApply's reserved branch /
         // resumeFromQboUnknown) — never a heuristic re-match against a settle that
         // may already have committed.
-        const boundaryMarked = !!(row.qbPaymentId || row.qbRequestPayload || row.settleStartedAt);
+        const boundaryMarked = crossedAnyBoundary(row);
         const claim = await prisma.depositIngest.updateMany({
             where: {
                 id: row.id, status: row.status,
@@ -376,11 +376,10 @@ export async function POST(req: Request) {
     // crash mid-attempt-MAX) reconciles. The post-failure check in the catch below uses
     // `>=` because it runs AFTER the attempt completed. Together: at most MAX real runs.
     if (row.attempts > MAX_ATTEMPTS) {
-        const crossedAnyBoundary = !!row.qbPaymentId || !!row.qbRequestPayload || !!row.settleStartedAt;
         return await finalizeReconcile(
             row,
             `exceeded ${MAX_ATTEMPTS} retry attempts (last error: ${row.lastError ?? "none"})`,
-            { nullReservation: !crossedAnyBoundary },
+            { nullReservation: !crossedAnyBoundary(row) },
         );
     }
 
@@ -407,11 +406,13 @@ async function recordAttemptFailure(row: DepositIngest, e: unknown): Promise<Nex
     const message = e instanceof Error ? e.message : String(e);
     const fresh = (await prisma.depositIngest.findUnique({ where: { id: row.id } })) ?? row;
     const crossedQboBoundary = !!fresh.qbPaymentId || !!fresh.qbRequestPayload;
-    const crossedAnyBoundary = crossedQboBoundary || !!fresh.settleStartedAt;
     if (fresh.attempts >= MAX_ATTEMPTS) {
         // Reservation survives exhaustion whenever ANY money boundary was crossed —
         // the reconcile human must see which milestone this deposit may have paid.
-        return await finalizeReconcile(fresh, message, { nullReservation: !crossedAnyBoundary });
+        // "Any" INCLUDES a staged invoice push: attempt eight can be the one that
+        // stages and then throws, and releasing the milestone there would strand a
+        // QuickBooks invoice that may exist (Codex round 2, F3).
+        return await finalizeReconcile(fresh, message, { nullReservation: !crossedAnyBoundary(fresh) });
     }
     const retryStatus = !crossedQboBoundary ? "failed" : fresh.qbPaymentId ? "qbo_created" : "qbo_unknown";
     await prisma.depositIngest.updateMany({
@@ -1085,20 +1086,35 @@ async function persistCollisionVerdict(
     // Only a row PAST the boundary is left alone, because cancelling it would
     // strand a QuickBooks payment that already exists. That one needs a human,
     // and so does the credit that collided with it.
-    const boundaryMarked = !!(existing.qbPaymentId || existing.qbRequestPayload || existing.settleStartedAt);
-    const pastBoundary = boundaryMarked || ["qbo_unknown", "qbo_created"].includes(existing.status);
+    const pastBoundary = crossedAnyBoundary(existing) || ["qbo_unknown", "qbo_created"].includes(existing.status);
     if (pastBoundary) return "past-boundary";
 
     const status = "unmatched";
     const claimed = await prisma.depositIngest.updateMany({
-        where: { id: existing.id, status: existing.status },
+        // `extracted` is pinned to the exact value just read, which is what makes
+        // this an ATOMIC arbitration with stageInvoicePush rather than a
+        // check-then-act (Codex round 2, F1). Staging leaves the status at
+        // `processing` — deliberately, so the reservation stays inside the partial
+        // unique index's predicate — and its ONLY visible change is a rewrite of
+        // `extracted`. So the two CASes are the same lock from opposite ends:
+        //   cancel first → staging's `status: "processing"` CAS misses, and no
+        //                  QuickBooks invoice is ever created;
+        //   staging first → this CAS misses, because `extracted` moved.
+        // Whichever lands first, the other stops.
+        where: { id: existing.id, status: existing.status, extracted: existing.extracted },
         data: {
             // Pre-boundary by construction (past-boundary rows returned above),
             // so releasing the reservation here is safe and correct.
             status, lastError: reason.slice(0, 1000), paymentScheduleId: null,
         },
     });
-    if (claimed.count === 0) return "recorded"; // another worker moved it; its own path decides
+    if (claimed.count === 0) {
+        // Lost the arbitration. If what moved was a staging write, this credit is
+        // NOT merely "someone else's to decide": a QuickBooks invoice may now
+        // exist for it, which the batch must report as unresolved.
+        const moved = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
+        return moved && crossedAnyBoundary(moved) ? "past-boundary" : "recorded";
+    }
     const fresh = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
     if (fresh && !fresh.officeTaskId) {
         const taskId = await ensureReviewTask(fresh, reason, "unmatched");
@@ -1136,16 +1152,23 @@ async function processBankCredit(
 
     // Belt and braces: the verdict was already persisted by
     // persistCollisionVerdict, so this only fires if that CAS lost a race.
+    // It obeys the same boundary rule the preflight does (Codex round 2, F1):
+    // a credit that has already staged an invoice — or reached QuickBooks any
+    // other way — cannot simply be set aside as `unmatched`, because that
+    // releases the index hold on a milestone a real QBO document may point at.
     if (opts.collidesWith.length > 0) {
-        return await bankResult(credit.bankReference, opts.replay,
-            await finalizeUnmatched(row, collisionNote(credit, postDate, opts.collidesWith)));
+        const note = collisionNote(credit, postDate, opts.collidesWith);
+        return await bankResult(credit.bankReference, opts.replay, crossedAnyBoundary(row)
+            ? await finalizeReconcile(row,
+                `${note}; this credit has already crossed a money boundary ` +
+                `(${describeBoundaryMarkers(row).join(", ")}), so it cannot just be set aside`, {})
+            : await finalizeUnmatched(row, note));
     }
     if (row.attempts > MAX_ATTEMPTS) {
-        const crossedAnyBoundary = !!row.qbPaymentId || !!row.qbRequestPayload || !!row.settleStartedAt;
         return await bankResult(credit.bankReference, opts.replay, await finalizeReconcile(
             row,
             `exceeded ${MAX_ATTEMPTS} retry attempts (last error: ${row.lastError ?? "none"})`,
-            { nullReservation: !crossedAnyBoundary },
+            { nullReservation: !crossedAnyBoundary(row) },
         ));
     }
     try {
@@ -1183,6 +1206,60 @@ async function bankResult(bankReference: string, replay: boolean, response: Next
 }
 
 /**
+ * C1: an `unmatched` row that already crossed a money boundary must NEVER be
+ * re-run — the reserved branch could submit a second QuickBooks write for money
+ * that may already have moved. Promote it to `reconcile` instead, KEEPING the
+ * reservation so the human can see which milestone is in play.
+ *
+ * Two things can go wrong, and both are answered rather than papered over
+ * (Codex round 2, F5):
+ *
+ *  - the CAS finds nothing, because another actor moved the row first. The
+ *    old code still answered "reconcile", which could be a plain lie about a
+ *    row that had just been APPLIED. Re-read and dispatch on what is actually
+ *    there.
+ *  - the CAS throws P2002. An `unmatched` row sits OUTSIDE the partial
+ *    reservation index, so another deposit may have taken its milestone in the
+ *    meantime; promoting back INTO an indexed status then collides. The
+ *    reservation has to go, but the milestone identity must not — it goes into
+ *    the reason, which is what the human actually reads.
+ */
+async function promoteBoundaryUnmatched(row: DepositIngest): Promise<BankClaim> {
+    const base = `this deposit was recorded unmatched AFTER it had already crossed a money boundary ` +
+        `(${describeBoundaryMarkers(row).join(", ")}) — re-running it could create a second QuickBooks write, ` +
+        `so a human must reconcile it against QuickBooks`;
+
+    let reason = base;
+    let promoted: { count: number };
+    try {
+        promoted = await prisma.depositIngest.updateMany({
+            where: { id: row.id, status: "unmatched" },
+            data: { status: "reconcile", lastError: reason.slice(0, 1000) },
+        });
+    } catch (e: any) {
+        if (e?.code !== "P2002") throw e;
+        reason = `${base}; another deposit has since reserved milestone ${row.paymentScheduleId ?? "(unrecorded)"}, ` +
+            `so this row could not keep its hold on it — that milestone is still the one this deposit was applying to`;
+        promoted = await prisma.depositIngest.updateMany({
+            where: { id: row.id, status: "unmatched" },
+            data: { status: "reconcile", lastError: reason.slice(0, 1000), paymentScheduleId: null },
+        });
+    }
+
+    const fresh = (await prisma.depositIngest.findUnique({ where: { id: row.id } })) ?? row;
+    if (promoted.count === 0) {
+        // Somebody else got there first. Answer for the row that EXISTS.
+        if (fresh.status === "applied") return await bankAppliedClaim(fresh);
+        return {
+            kind: "settled",
+            response: NextResponse.json({ ok: true, status: fresh.status, reason: fresh.lastError, officeTaskId: fresh.officeTaskId }),
+        };
+    }
+    const officeTaskId = fresh.officeTaskId ?? await ensureReviewTask(fresh, reason, "reconcile");
+    return { kind: "settled", response: NextResponse.json({ ok: true, status: "reconcile", reason, officeTaskId }) };
+}
+
+/**
  * The invoice-staging marker, read back out of the row's `extracted` JSON.
  *
  * Creating a QuickBooks invoice for an unrequested milestone is an EXTERNAL
@@ -1201,6 +1278,20 @@ function stagedScheduleIdOf(extracted: string | null | undefined): string | null
     } catch {
         return null;
     }
+}
+
+/**
+ * Has this row already reached OUTSIDE the database?
+ *
+ * THE single definition, because four places used to spell it out by hand and
+ * the invoice-staging marker went missing from three of them (Codex round 2,
+ * F3): retry exhaustion then cleared the reservation of a row that may have a
+ * QuickBooks invoice against it. Every boundary/exhaustion test in this file
+ * calls this, both sources — staging is bank-only today, and a hand-rolled
+ * copy is exactly how it would stop being.
+ */
+function crossedAnyBoundary(row: DepositIngest): boolean {
+    return !!(row.qbPaymentId || row.qbRequestPayload || row.settleStartedAt || stagedScheduleIdOf(row.extracted));
 }
 
 /** Which boundaries a row actually carries, for the human who has to unpick it. */
@@ -1250,6 +1341,35 @@ async function reviewTaskIsUntouched(officeTaskId: string | null): Promise<boole
 }
 
 type BankClaim = { kind: "claimed"; row: DepositIngest } | { kind: "settled"; response: NextResponse };
+
+/**
+ * The terminal `applied` answer for a bank row, plus its crash healing: the
+ * apply may have committed before the review task this row had already filed
+ * was closed, and nothing else would ever close it. Extracted because the
+ * promotion CAS below can LOSE to a concurrent apply and must give the same
+ * answer rather than a fabricated one (Codex round 2, F5).
+ */
+async function bankAppliedClaim(row: DepositIngest): Promise<BankClaim> {
+    let invoiceCode: string | undefined;
+    if (row.paymentScheduleId) {
+        const s = await prisma.paymentSchedule.findUnique({
+            where: { id: row.paymentScheduleId },
+            select: { invoice: { select: { code: true } } },
+        });
+        invoiceCode = s?.invoice.code;
+    }
+    if (row.officeTaskId) {
+        await closeReviewTask(row.officeTaskId,
+            `Closed by the deposit sweep: this credit is applied to milestone ${row.paymentScheduleId ?? "(unrecorded)"}.`);
+    }
+    return {
+        kind: "settled",
+        response: NextResponse.json({
+            ok: true, status: "applied", alreadyApplied: true,
+            scheduleId: row.paymentScheduleId, qbPaymentId: row.qbPaymentId, invoiceCode,
+        }),
+    };
+}
 
 /**
  * Claim ONE bank credit's row. Mirrors the photo path's claim above, minus
@@ -1319,36 +1439,13 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
     }
     if (!row) return { kind: "settled", response: NextResponse.json({ ok: false, status: "claim-race" }) };
 
-    if (row.status === "applied") {
-        let invoiceCode: string | undefined;
-        if (row.paymentScheduleId) {
-            const s = await prisma.paymentSchedule.findUnique({
-                where: { id: row.paymentScheduleId },
-                select: { invoice: { select: { code: true } } },
-            });
-            invoiceCode = s?.invoice.code;
-        }
-        // Crash healing: the apply committed but the process died before the
-        // review task this row had already filed was closed. Nothing else would
-        // ever close it, so the replay does it (a no-op once archived).
-        if (row.officeTaskId) {
-            await closeReviewTask(row.officeTaskId,
-                `Closed by the deposit sweep: this credit is applied to milestone ${row.paymentScheduleId ?? "(unrecorded)"}.`);
-        }
-        return {
-            kind: "settled",
-            response: NextResponse.json({
-                ok: true, status: "applied", alreadyApplied: true,
-                scheduleId: row.paymentScheduleId, qbPaymentId: row.qbPaymentId, invoiceCode,
-            }),
-        };
-    }
+    if (row.status === "applied") return await bankAppliedClaim(row);
 
     // Every marker that says this row has already reached OUTSIDE the database.
     // `stagedScheduleId` is the invoice-staging one (see stageInvoicePush): a
     // QuickBooks invoice create was started for that milestone, and whether it
     // landed cannot be known from here.
-    const boundaryMarked = !!(row.qbPaymentId || row.qbRequestPayload || row.settleStartedAt || stagedScheduleIdOf(row.extracted));
+    const boundaryMarked = crossedAnyBoundary(row);
 
     // C1 (Codex round 1): an `unmatched` row that already crossed a money
     // boundary must NEVER be re-run. Re-running it would resume the reserved
@@ -1356,16 +1453,7 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
     // already have moved. The reservation is deliberately RETAINED so the
     // human reconciling it can see which milestone is in play.
     if (row.status === "unmatched" && row.source === BANK_DEPOSIT_SOURCE && boundaryMarked) {
-        const reason = `this deposit was recorded unmatched AFTER it had already crossed a money boundary ` +
-            `(${describeBoundaryMarkers(row).join(", ")}) — re-running it could create a second QuickBooks write, ` +
-            `so a human must reconcile it against QuickBooks`;
-        await prisma.depositIngest.updateMany({
-            where: { id: row.id, status: "unmatched" },
-            data: { status: "reconcile", lastError: reason.slice(0, 1000) },
-        });
-        const fresh = (await prisma.depositIngest.findUnique({ where: { id: row.id } })) ?? row;
-        const officeTaskId = fresh.officeTaskId ?? await ensureReviewTask(fresh, reason, "reconcile");
-        return { kind: "settled", response: NextResponse.json({ ok: true, status: "reconcile", reason, officeTaskId }) };
+        return await promoteBoundaryUnmatched(row);
     }
 
     // An `unmatched` BANK credit is a QUESTION, not a verdict: "nothing here
@@ -1688,12 +1776,15 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
         const linked = await loadMatchedSchedule(picked.id);
         qbInvoiceId = linked?.qbInvoiceId ?? null;
         if (!qbInvoiceId) {
-            // The push RETURNED without throwing, so QuickBooks accepted it and
-            // the link write either committed or compensated — a deterministic
-            // business outcome, not an unknown one. `unmatched` is right here.
-            return await finalizeUnmatched(row,
-                `could not create the QuickBooks invoice for ${describeCandidates([describeOne(picked)])}: ` +
-                `the milestone still has no QuickBooks invoice link after the push`);
+            // The push returned but left no link. `unmatched` was wrong here
+            // (Codex round 2, F4): it sits OUTSIDE the reservation index, so
+            // another deposit could take this milestone during the window
+            // before the next POST promoted the row — and the staging marker
+            // means a QuickBooks invoice may well exist. Reconcile, holding
+            // the reservation, and say so.
+            return await finalizeReconcile(row,
+                `a QuickBooks invoice may have been created for ${describeCandidates([describeOne(picked)])} but no link ` +
+                `was saved against the milestone — check QuickBooks before recording this payment`, {});
         }
     }
 
@@ -1712,9 +1803,19 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
  * is the only writer, and stagedScheduleIdOf is the only reader.
  *
  * CONDITIONAL on the row still being ours AND still holding this exact
- * reservation — the batch preflight can cancel a row mid-flight. Zero rows
- * updated means we no longer own this deposit, and the correct answer is to
- * stop BEFORE QuickBooks is touched at all.
+ * reservation — the batch preflight can cancel a row mid-flight, or another
+ * worker can re-reserve it. Zero rows updated means we no longer own this
+ * deposit, and the correct answer is to stop BEFORE QuickBooks is touched.
+ *
+ * The status deliberately STAYS `processing`. A dedicated `invoice_staging`
+ * status would read better, but the reservation's uniqueness is a Postgres
+ * PARTIAL UNIQUE INDEX whose predicate hard-codes six status literals
+ * (scripts/apply-deposit-ingest-schema.mjs) — a seventh value would put the
+ * row OUTSIDE the index and leave the milestone unprotected for the whole
+ * invoice-create window, which is the opposite of what staging is for.
+ * Arbitration is therefore done on `extracted` instead: this write is the only
+ * thing that changes it mid-flight, and persistCollisionVerdict's cancel CAS
+ * pins the value it read, so the two contend on the same row state.
  *
  * Returns a response to send when the claim was lost, or null to proceed.
  */
@@ -2066,10 +2167,16 @@ async function closeReviewTask(officeTaskId: string, note: string): Promise<void
             select: { notes: true, archivedAt: true },
         });
         if (!task || task.archivedAt) return;
-        await prisma.officeTask.update({
-            where: { id: officeTaskId },
+        // Read-then-CONDITIONAL-write (Codex round 2, F6). Prisma cannot append
+        // to a text column in one statement, so the notes we are about to
+        // rewrite are pinned in the WHERE alongside `archivedAt: null`: a human
+        // who archived or edited the task in the gap wins, and this write
+        // simply finds nothing rather than clobbering their words.
+        const closed = await prisma.officeTask.updateMany({
+            where: { id: officeTaskId, archivedAt: null, notes: task.notes },
             data: { archivedAt: new Date(), notes: [task.notes, note].filter(Boolean).join("\n") },
         });
+        if (closed.count === 0) return;
         revalidatePath("/tasks");
     } catch (e) {
         console.error("[deposit-ingest] could not close the review task after a re-evaluation applied:", e);
