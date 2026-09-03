@@ -646,12 +646,15 @@ model Expense {
   invoicedAt    DateTime?
   status        String        @default("Pending") // Pending, Reviewed
 
-  // ── Phase 3 attribution (docs/plans/PHASE-3-ATTRIBUTION-SPEC.md §2) ────────
-  // Born-with-a-job. `estimateId` stays the REQUIRED parent (and still
-  // Cascade-deletes this row); `projectId` is the denormalized truth every
-  // money-path reader resolves through src/lib/expense-attribution.ts.
-  // Nullable because it was backfilled onto 562 existing rows — a NULL here
-  // still resolves via the estimate, which is why the resolver exists.
+  /// ── Phase 3 attribution (docs/plans/PHASE-3-ATTRIBUTION-SPEC.md §2) ───────
+  /// Born-with-a-job. `projectId` is the denormalized truth every money-path
+  /// reader resolves through src/lib/expense-attribution.ts. Nullable because
+  /// it was backfilled onto 562 existing rows — a NULL here still resolves via
+  /// the estimate, which is why the resolver exists. `estimateId` (above) is
+  /// NOT the required parent this comment once described: round 42, item 4b
+  /// made it nullable with `onDelete: SetNull`, precisely so deleting an
+  /// estimate can no longer delete the spend `projectId` has already anchored
+  /// to a job — see the doc comment on `estimateId` itself.
   projectId           String?
   project             Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
   /// Sales tax read off the receipt. `Expense.amount` stays the GROSS total
@@ -698,12 +701,18 @@ model Expense {
   attributionAnchoredAt DateTime?
   /// A re-sync changed the gross out from under a tax classification a human
   /// had made, so the tax fields were cleared and this row needs a person to
-  /// look at it again. Additive and default-false; the tax report ignores it
-  /// (a cleared row has no tax and drops out on its own), but the correction
-  /// UI surfaces it.
+  /// look at it again. Additive and default-false; `queryTaxAtSourceRows`
+  /// (src/lib/tax-at-source-report.ts) filters it OUT with `needsTaxReview:
+  /// false` — a row flagged here is excluded from the excise deduction even
+  /// when its remaining figures would otherwise qualify, not merely a row
+  /// that "drops out on its own" for having no tax left — and the correction
+  /// UI surfaces it for a bookkeeper to clear.
   needsTaxReview      Boolean   @default(false)
-  /// capture | ai | manual | backfill. Precedence: capture = manual >
-  /// ai = backfill > null. Nothing but a human edit rewrites capture/manual.
+  /// capture | ai | manual | manual-none | backfill. Precedence: capture =
+  /// manual = manual-none > ai = backfill > null. "manual-none" is a human
+  /// DECISION — a bookkeeper deliberately clearing the phase — not an
+  /// absence, and is never rewritten by an automated pass: see
+  /// HUMAN_COST_CODE_SOURCES in src/lib/expense-attribution.ts.
   costCodeSource      String?
   costCodeConfidence  Decimal?
 

@@ -403,9 +403,20 @@ export const SPLIT_JOB_GUARD_SQL = [
             AND OLD."projectId" IS NOT NULL
             AND NEW."estimateId" IS NOT NULL
          THEN
+             -- LOCKED, NOT A PLAIN READ (Codex round 15, item 3). A bare
+             -- SELECT is ordinary MVCC: it can read the estimate's project as
+             -- it stood before an in-flight estimate move commits, stamp that
+             -- stale value onto this row, and let the move commit right after
+             -- -- landing a split attribution the guard exists to prevent.
+             -- FOR KEY SHARE blocks behind a mover holding FOR UPDATE /
+             -- NO KEY UPDATE on the same estimate row (the real
+             -- estimate-move path already locks Estimate before touching any
+             -- expense, so this is parent before child) while leaving every
+             -- other reader free.
              SELECT est."projectId" INTO est_project
                FROM "Estimate" est
-              WHERE est.id = NEW."estimateId";
+              WHERE est.id = NEW."estimateId"
+                FOR KEY SHARE;
              IF est_project IS NOT NULL THEN
                  NEW."projectId" := est_project;
              END IF;
@@ -685,6 +696,44 @@ export const COMPATIBILITY_TRIGGERS = [
  * the same two reasons — the estimate must hold still between the read and the
  * write, and the acquisition order must match `lockMoneyParentsMany`.
  */
+
+/**
+ * THE PROJECTS, LOCKED FIRST (Codex round 15, item 2 — the same fix round 41
+ * item 1 gave PROJECT_ID_BACKFILL, missed here). Locking the Estimate rows and
+ * then UPDATE-ing `Expense.projectId` is not an Estimate-only statement: the
+ * foreign key this script adds makes Postgres take `FOR KEY SHARE` on every
+ * referenced Project row to enforce it, so SPLIT_JOB_REPAIR's real acquisition
+ * order is Estimate -> Project — the exact inversion the rest of this script
+ * exists to remove. A job editor holding its Project row FOR UPDATE while
+ * reaching for an estimate closes the cycle.
+ *
+ * A separate STATEMENT, not another CTE, for the same reason
+ * PROJECT_ID_BACKFILL_LOCK_PROJECTS is: CTE evaluation order is not
+ * guaranteed. `ORDER BY id`, ascending, matches `lockMoneyParentsMany` and
+ * every other locking statement in this file.
+ *
+ * Scoped to the SAME candidate set SPLIT_JOB_REPAIR reads from — the target
+ * projects of the QBO-synced rows whose pair disagrees — so it locks no more
+ * than the repair itself will touch.
+ */
+export const SPLIT_JOB_REPAIR_LOCK_PROJECTS =
+    `SELECT p.id
+       FROM "Project" p
+      WHERE p.id IN (
+            SELECT DISTINCT est."projectId"
+              FROM "Estimate" est
+             WHERE est."projectId" IS NOT NULL
+               AND EXISTS (
+                     SELECT 1 FROM "Expense" e
+                      WHERE e."estimateId" = est.id
+                        AND e."qbPurchaseId" IS NOT NULL
+                        AND e."projectId" IS NOT NULL
+                        AND e."projectId" <> est."projectId"
+                   )
+          )
+      ORDER BY p.id
+        FOR SHARE`;
+
 export const SPLIT_JOB_REPAIR =
     `WITH locked AS (
        SELECT est.id, est."projectId"
@@ -711,28 +760,74 @@ export const SPLIT_JOB_REPAIR =
 
 
 /**
- * PHASE A: SHAPE ONLY. NOTHING HERE TOUCHES `Project` OR `Estimate`
- * (Codex round 44, item 1).
+ * PHASE A IS A SEQUENCE OF SHORT TRANSACTIONS, NOT ONE (Codex round 15, item
+ * 1 — replacing round 44's "every DDL statement in one transaction, no
+ * Project/Estimate lock at all").
  *
- * The first `ALTER TABLE "Expense"` takes ACCESS EXCLUSIVE on the whole table
- * and holds it until COMMIT. Running the backfill in that same transaction
- * therefore meant: hold the Expense table, then reach for Project and Estimate
- * ROW locks. A concurrent estimate move holding its Estimate row and needing to
- * read Expense closes the cycle, and Postgres breaks it with 40P01 -- killing
- * either the migration mid-run or the bookkeeper's save.
+ * Round 44's claim was false. `ALTER TABLE "Expense" ADD CONSTRAINT ...
+ * FOREIGN KEY ... REFERENCES "Project"` takes SHARE ROW EXCLUSIVE on the
+ * REFERENCED table too — Postgres needs it to install the FK's enforcement
+ * trigger, and it takes it even when the constraint is `NOT VALID`. Bundled
+ * into round 44's single phase-A transaction, that meant: hold ACCESS
+ * EXCLUSIVE on Expense (from the very first `ALTER TABLE`, held to COMMIT),
+ * and only near the end of the SAME transaction reach for Project's and
+ * Estimate's table lock. A concurrent parent-first writer — anything holding
+ * a Project or Estimate row and then writing Expense, which is every writer
+ * `lockAttributionParents` protects — is the other half of a cycle, and
+ * Postgres breaks a cycle with 40P01: the victim is chosen by the server, so
+ * half the time it is a person's save rather than this script.
  *
- * So the run is TWO transactions now, and this is the first: every DDL
- * statement, plus the three Expense-only normalisations that a CHECK or a
- * `SET NOT NULL` in this same phase depends on. It takes no row lock outside
- * `Expense`, so nothing it holds can participate in a cross-table cycle, and it
- * commits -- releasing the table -- before phase B asks for a parent.
+ * There is also a SECOND, subtler bug in the naive fix of "just add an
+ * explicit `LOCK TABLE`": `ALTER TABLE "Expense" ADD CONSTRAINT ...` opens
+ * and locks the table NAMED IN THE ALTER TABLE CLAUSE (Expense, ACCESS
+ * EXCLUSIVE) BEFORE it opens the REFERENCED table (Project/Estimate, SHARE
+ * ROW EXCLUSIVE) to install the FK trigger — the wrong order, Expense before
+ * its parent, baked into a single ALTER TABLE statement no matter how it is
+ * phrased. `LOCK TABLE "Project" IN SHARE ROW EXCLUSIVE MODE` as its OWN,
+ * PRECEDING statement fixes that: Postgres locks are cumulative within a
+ * transaction and never downgraded, so once the LOCK TABLE statement holds
+ * Project, the ADD CONSTRAINT statement's own (redundant) request for the
+ * same lock is a no-op — the OBSERVABLE acquisition order, the one every
+ * other waiter sees, becomes Project-then-Expense. That is `lockAttributionParents`'s
+ * own order, said in DDL.
  *
- * Every statement is additive and idempotent (`IF NOT EXISTS`, `DROP`-then-`ADD`
- * by name, guarded `DO` blocks), so a crash between the two phases is safe to
- * re-run from the top. The verification pass checks the END state, not that a
- * particular transaction committed.
+ * So the fix is not "wrap it all in fewer transactions" but the opposite:
+ * split phase A into short transactions, each doing ONE kind of thing, so
+ * that by the time any transaction reaches for a Project or Estimate lock it
+ * is not ALSO holding a lock on Expense from an earlier, unrelated statement.
+ * Every step below is additive and idempotent, so a crash between any two of
+ * them is safe to re-run from the top — the verification pass at the end
+ * checks the END STATE, never that a particular transaction committed:
+ *
+ *   (a) each foreign key is added `NOT VALID` in its own short transaction
+ *       that FIRST takes the explicit parent lock and only then alters
+ *       Expense (PROJECT_FK_LOCK_STATEMENTS / ESTIMATE_FK_LOCK_STATEMENTS),
+ *       and is VALIDATED in a separate, later transaction
+ *       (PROJECT_FK_VALIDATE_STATEMENTS / ESTIMATE_FK_VALIDATE_STATEMENTS) —
+ *       `VALIDATE CONSTRAINT` takes only `SHARE UPDATE EXCLUSIVE` on Expense
+ *       and nothing table-level on the parent, so splitting it out of the
+ *       lock-holding transaction shrinks the window the parent lock is held
+ *       for to "however long the NOT VALID add itself takes", which is
+ *       metadata-only;
+ *   (b) the three indexes run as standalone `CREATE INDEX CONCURRENTLY IF NOT
+ *       EXISTS` statements, OUTSIDE any transaction (`prisma.$executeRawUnsafe`
+ *       directly, never inside `prisma.$transaction`) — CONCURRENTLY refuses
+ *       to run inside a transaction block at all, and buys the extra benefit
+ *       that an index build no longer blocks writers on Expense either
+ *       (INDEX_STATEMENTS, rendered through `toConcurrentIndexSql`);
+ *   (c) the three normalising UPDATEs run in their own short transaction,
+ *       after the columns they read exist (NORMALIZE_STATEMENTS);
+ *   (d) every `ADD COLUMN` / `ALTER COLUMN` runs in its own short transaction,
+ *       touching only Expense (COLUMN_STATEMENTS).
+ *
+ * `PHASE_A_STEPS` is the one list that says what actually runs and how — main()
+ * and the two-connection DB test in tests/attribution-lock-order-db.test.ts
+ * both execute it directly, so the two can never describe different runs.
+ * `DDL_STATEMENTS` (kept for every existing consumer: the migration-parity
+ * tests, expectedColumns, the source tripwires) is its flat concatenation —
+ * one definition, so the flat and the structured view cannot drift.
  */
-export const DDL_STATEMENTS = [
+export const COLUMN_STATEMENTS = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "projectId" TEXT`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAmount" DECIMAL(65,30)`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DEFAULT false`,
@@ -774,11 +869,6 @@ export const DDL_STATEMENTS = [
     // pass being able to claim it. Rows with an OCR or absent `taxSource` stay
     // NULL: nobody wrote a base on them, and inventing a provenance is how a
     // guess becomes a fact. Idempotent by the IS NULL predicate.
-    `UPDATE "Expense"
-   SET "taxDeductibleBaseSource" = 'manual'
- WHERE "taxDeductibleBaseSource" IS NULL
-   AND "taxDeductibleBase" IS NOT NULL
-   AND "taxSource" IN ('manual', 'manual-none')`,
     // The re-anchor marker (see reanchorSql): a predicate on the time-of-day
     // cannot tell an already-re-anchored row from one legitimately written at
     // local midnight, so the fact is recorded on the row.
@@ -798,63 +888,62 @@ export const DDL_STATEMENTS = [
     // aborts. Adding the column WITH the default means no insert can ever
     // produce a NULL, so the last step cannot lose that race.
     //
-    // The three statements after it are REPAIR for a database left in the old
-    // half-applied shape (column present, no default, NULLs from that window),
-    // and no-ops on a clean run. The whole array runs in one transaction, so a
-    // failure anywhere leaves the table exactly as it was.
+    // The repair for a database left in the old half-applied shape (column
+    // present, no default, NULLs from that window) is NORMALIZE_STATEMENTS
+    // below — it has to run in a LATER transaction than this one, because it
+    // depends on the column this statement adds.
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) DEFAULT now()`,
     `ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET DEFAULT now()`,
-    `UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", now()) WHERE "updatedAt" IS NULL`,
-    `ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL`,
-
-    `CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId")`,
-    `CREATE INDEX IF NOT EXISTS "Expense_sourceFileId_idx" ON "Expense"("sourceFileId")`,
-
-    // THE DURABLE BACKSTOP FOR THE INGEST LOCK. The advisory lock in the
-    // ingest route serialises two concurrent deliveries of one Drive file, but
-    // an advisory lock is not a constraint — a writer that does not take it
-    // cannot be stopped by it. This index makes the duplicate unrepresentable
-    // for every row the new ingest writes, which stamps both columns.
-    //
-    // PARTIAL and NULLS-DISTINCT, both deliberately: `sourceFileId IS NOT
-    // NULL` keeps manual and QBO-imported expenses out of it entirely, and the
-    // rows backfilled above have a NULL `sourceGroupIndex` (nothing can say
-    // which group they were), which a btree unique index treats as distinct —
-    // so the backfill cannot collide with itself. Those legacy rows are NOT
-    // protected by this index; the file-level dedupe covers them.
-    //
-    // Prisma cannot express a partial index, so it is SQL-only and recorded in
-    // prisma/prisma-blind-spots.json, exactly like BankImage_driveFileId_key.
-    `CREATE UNIQUE INDEX IF NOT EXISTS "Expense_sourceFileId_sourceGroupIndex_key"
-  ON "Expense"("sourceFileId", "sourceGroupIndex")
-  WHERE "sourceFileId" IS NOT NULL`,
 
     // SET NULL, not Cascade: `estimateId` already owns this row's lifecycle. A
     // project delete must not silently destroy spend history that the estimate
-    // still holds.
-    //
-    // Guarded on the DEFINITION, not just the name: a name-only IF NOT EXISTS
-    // silently accepts a same-named constraint that points elsewhere or carries
-    // ON DELETE CASCADE. Existing-and-wrong raises rather than being skipped.
-    `DO $$
-DECLARE existing_def TEXT;
-BEGIN
-  SELECT pg_get_constraintdef(oid) INTO existing_def
-    FROM pg_constraint
-   WHERE conname = 'Expense_projectId_fkey'
-     AND conrelid = '"Expense"'::regclass;
-  IF existing_def IS NULL THEN
-    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_projectId_fkey"
-      FOREIGN KEY ("projectId") REFERENCES "Project"("id")
-      ON DELETE SET NULL ON UPDATE CASCADE;
-  ELSIF existing_def NOT LIKE '%FOREIGN KEY ("projectId")%'
-     OR existing_def NOT LIKE '%REFERENCES "Project"(id)%'
-     OR existing_def NOT LIKE '%ON DELETE SET NULL%'
-     OR existing_def NOT LIKE '%ON UPDATE CASCADE%' THEN
-    RAISE EXCEPTION 'Expense_projectId_fkey already exists with an unexpected definition: %', existing_def;
-  END IF;
-END $$`,
+    // still holds. AN ESTIMATE MAY NOT DELETE SPEND (round 42, item 4b): this
+    // column has to become nullable before the FK below can be SET NULL, or
+    // the constraint is unenforceable and Postgres refuses it. `DROP NOT
+    // NULL` is idempotent and Expense-only, so it belongs with the rest of
+    // the column shape rather than with the FK step that reaches for Estimate.
+    `ALTER TABLE "Expense" ALTER COLUMN "estimateId" DROP NOT NULL`,
+];
 
+/**
+ * (c) THE NORMALISING UPDATEs, IN THEIR OWN SHORT TRANSACTION, AFTER THE
+ * COLUMNS THEY READ (Codex round 15, item 1(c)).
+ *
+ * All three are Expense-only — no table outside Expense is named — and each
+ * is idempotent by predicate, so this transaction can run any number of times
+ * with the second run touching 0 rows.
+ */
+export const NORMALIZE_STATEMENTS = [
+    // THE CONSERVATIVE READING OF THE ROWS THAT PREDATE taxDeductibleBaseSource.
+    // Before the split, a human-entered base could only exist on a row a human
+    // had also spoken to about tax, so a non-NULL base beside a human
+    // `taxSource` was necessarily a human base — and saying so is what stops
+    // the next booking pass being able to claim it. Rows with an OCR or absent
+    // `taxSource` stay NULL: nobody wrote a base on them, and inventing a
+    // provenance is how a guess becomes a fact.
+    `UPDATE "Expense"
+   SET "taxDeductibleBaseSource" = 'manual'
+ WHERE "taxDeductibleBaseSource" IS NULL
+   AND "taxDeductibleBase" IS NOT NULL
+   AND "taxSource" IN ('manual', 'manual-none')`,
+    // REPAIR for a database left in the OLD half-applied `updatedAt` shape
+    // (column present, no default, NULLs from that window); a no-op on a
+    // clean run. Must precede SET NOT NULL below, in this same transaction.
+    `UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", now()) WHERE "updatedAt" IS NULL`,
+    `ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL`,
+    // `taxAtSource` IS DERIVED, AND THE DATABASE SAYS SO (round 20, item 1).
+    // Normalised here, BEFORE CHECK_STATEMENTS adds the CHECK that depends on
+    // it — a CHECK cannot be added to a table that already violates it.
+    `UPDATE "Expense"
+   SET "taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0)
+ WHERE "taxAtSource" <> ("taxAmount" IS NOT NULL AND "taxAmount" <> 0)`,
+];
+
+/**
+ * The three CHECK constraints, Expense-only, in their own short transaction
+ * after NORMALIZE_STATEMENTS has committed the data they depend on.
+ */
+export const CHECK_STATEMENTS = [
     // TAX POINTS THE SAME WAY AS THE MONEY, AND IS NEVER BIGGER THAN IT
     // (round 6 item 2; signed amounts, round 16 item 3). The deduction base is
     // `amount - taxAmount`, so a tax above the gross makes it NEGATIVE and the
@@ -873,24 +962,15 @@ END $$`,
          OR "taxAmount" = 0
          OR (sign("taxAmount") = sign("amount") AND abs("taxAmount") <= abs("amount")))`,
 
+    `ALTER TABLE "Expense" DROP CONSTRAINT IF EXISTS "Expense_taxAtSource_check"`,
+    `ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAtSource_check"
+  CHECK ("taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0))`,
+
     // THE DEDUCTION INVARIANT, IN THE DATABASE (Codex round 5, item 4).
     // Enforced only by the API handler before this: read the amount, validate,
     // then UPDATE. A QBO re-sync changing `amount` between those two statements
     // leaves a row the tax report TRUSTS verbatim. Prisma cannot express a
     // CHECK, so it is hand-written here and in prisma-blind-spots.json.
-    // `taxAtSource` IS DERIVED, AND THE DATABASE SAYS SO (round 20, item 1).
-    // It was a second writable column saying what `taxAmount` already says, so
-    // the two could disagree: `true` with no amount is a claim about nothing,
-    // `false` with a figure is a deduction dropped from the filing. Normalised
-    // first — a CHECK cannot be added to a table that already violates it —
-    // then constrained. Both statements are re-runnable.
-    `UPDATE "Expense"
-   SET "taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0)
- WHERE "taxAtSource" <> ("taxAmount" IS NOT NULL AND "taxAmount" <> 0)`,
-    `ALTER TABLE "Expense" DROP CONSTRAINT IF EXISTS "Expense_taxAtSource_check"`,
-    `ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAtSource_check"
-  CHECK ("taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0))`,
-
     // SIGNED, for the same reason the tax check is: the resold portion of a
     // return is negative. `base >= 0` made every credit unallocatable.
     // Dropped and re-added by name so an old definition is corrected.
@@ -900,81 +980,84 @@ END $$`,
          OR "taxDeductibleBase" = 0
          OR (sign("taxDeductibleBase") = sign("amount")
              AND abs("taxDeductibleBase") <= abs("amount" - COALESCE("taxAmount", 0))))`,
+];
 
-    // RE-ANCHOR THE LEGACY UTC-MIDNIGHT ROWS (Codex round 6, item 1).
+/**
+ * (b) THE THREE INDEXES (Codex round 15, item 1(b)).
+ *
+ * Kept here in their PLAIN, non-concurrent form — this is what stays
+ * byte-equivalent to migration.sql, and what the shape/drift checks in this
+ * file and tests/apply-expense-attribution.test.ts compare against the live
+ * catalog. Production never runs this exact text: `toConcurrentIndexSql`
+ * renders each one through `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT
+ * EXISTS` at the point PHASE_A_STEPS actually executes it, standalone and
+ * outside any transaction — CONCURRENTLY is not just friendlier (it does not
+ * block writers on Expense for the build), it is REQUIRED here: Postgres
+ * refuses to run it inside a transaction block at all, and index creation is
+ * Expense-only regardless, so pulling it out of a transaction cannot create a
+ * new lock-ordering hazard. The committed migration keeps the plain form
+ * verbatim, in one transaction with everything else — Prisma has no
+ * supported way to run CONCURRENTLY inside a migration, and it costs nothing
+ * there: a migration only ever runs against a fresh CI/dev database with
+ * nothing else writing.
+ */
+export const INDEX_STATEMENTS = [
+    `CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId")`,
+    `CREATE INDEX IF NOT EXISTS "Expense_sourceFileId_idx" ON "Expense"("sourceFileId")`,
+    // THE DURABLE BACKSTOP FOR THE INGEST LOCK. The advisory lock in the
+    // ingest route serialises two concurrent deliveries of one Drive file, but
+    // an advisory lock is not a constraint — a writer that does not take it
+    // cannot be stopped by it. This index makes the duplicate unrepresentable
+    // for every row the new ingest writes, which stamps both columns.
     //
-    // Every writer now stores `Expense.date` as a company calendar day, but the
-    // rows already in the table were written at UTC midnight — which the tax
-    // report reads as the PREVIOUS day in Pacific, moving a 1 July receipt out
-    // of Q3.
+    // PARTIAL and NULLS-DISTINCT, both deliberately: `sourceFileId IS NOT
+    // NULL` keeps manual and QBO-imported expenses out of it entirely, and the
+    // rows backfilled above have a NULL `sourceGroupIndex` (nothing can say
+    // which group they were), which a btree unique index treats as distinct —
+    // so the backfill cannot collide with itself. Those legacy rows are NOT
+    // protected by this index; the file-level dedupe covers them.
     //
-    // IDEMPOTENT BY PREDICATE, which is stronger than a marker: re-anchoring
-    // moves the time-of-day off 00:00 UTC, so a second run matches nothing and
-    // there is no flag that can be lost, copied to another database, or get out
-    // of step with the data. (A marker was specified; this is the same
-    // once-only guarantee derived from the rows themselves, which is why it is
-    // used instead — noted in the PR.)
-    //
-    // For a company configured as UTC the update is a no-op by arithmetic:
-    // local midnight IS 00:00 UTC, so the value is rewritten to itself.
-    //
-    // It deliberately does NOT touch rows already at a non-midnight time —
-    // those were written by time-expense-core, which has always used the shared
-    // parser.
-    // The backfill. Idempotent by predicate, and a no-op on an empty database.
-    // THE COMPATIBILITY GUARDS GO IN BEFORE THE FILL, not after: from the
-    // moment the columns carry values, an old instance moving `estimateId`
-    // can split the row across two jobs, and one moving `amount` can leave a
-    // stale tax classification reportable — or fail the CHECK constraints
-    // added above. See SPLIT_JOB_GUARD_SQL and AMOUNT_TAX_GUARD_SQL.
-    ...SPLIT_JOB_GUARD_SQL,
-    ...AMOUNT_TAX_GUARD_SQL,
-    // (The projectId backfill is PHASE B: it is the statement that takes
-    // Project and Estimate row locks, and it must not run while this phase
-    // holds ACCESS EXCLUSIVE on Expense. See DDL_STATEMENTS.)
+    // Prisma cannot express a partial index, so it is SQL-only and recorded in
+    // prisma/prisma-blind-spots.json, exactly like BankImage_driveFileId_key.
+    `CREATE UNIQUE INDEX IF NOT EXISTS "Expense_sourceFileId_sourceGroupIndex_key"
+  ON "Expense"("sourceFileId", "sourceGroupIndex")
+  WHERE "sourceFileId" IS NOT NULL`,
+];
 
-    // ReceiptIntake is Phase 1's table. The guard keeps this runnable in EITHER
-    // merge order: if Phase 1 has not landed in the target database yet, these
-    // two columns are skipped, and re-running this script after Phase 1 lands
-    // adds them.
-    // AN ESTIMATE MAY NOT DELETE SPEND (round 42, item 4b).
-    //
-    // `Expense_estimateId_fkey` was NOT NULL + ON DELETE CASCADE, so deleting
-    // an estimate DELETED every expense booked through it. Phase 3 makes that
-    // strictly worse: a re-attributed row is reported under a DIFFERENT job
-    // (its own `projectId`) while still hanging off the estimate it left, so
-    // tidying up a superseded estimate silently destroys another job's cost --
-    // money with a QuickBooks Purchase behind it.
-    //
-    // SET NULL, not RESTRICT. The row keeps `projectId`, which is the primary
-    // attribution every reader already prefers, so the spend simply stays on
-    // its job with no estimate behind it -- a shape `resolveExpenseProjectId`
-    // has always handled. RESTRICT would preserve the cost too, but it would
-    // also block deleting a PROJECT, because Project cascades to its Estimates
-    // and those deletes would then be refused; and `Invoice.estimateId` and
-    // `Takeoff.estimateId` already take the SET NULL stance in this schema.
-    //
-    // The column has to become nullable first, or the SET NULL is unenforceable
-    // and Postgres refuses the constraint. `DROP NOT NULL` is idempotent.
-    `ALTER TABLE "Expense" ALTER COLUMN "estimateId" DROP NOT NULL`,
-    `DO $$
-DECLARE existing_def TEXT;
-BEGIN
-  SELECT pg_get_constraintdef(oid) INTO existing_def
-    FROM pg_constraint
-   WHERE conname = 'Expense_estimateId_fkey'
-     AND conrelid = '"Expense"'::regclass;
-  IF existing_def IS NULL THEN
-    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
-      FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
-      ON DELETE SET NULL ON UPDATE CASCADE;
-  ELSIF existing_def NOT LIKE '%ON DELETE SET NULL%' THEN
-    ALTER TABLE "Expense" DROP CONSTRAINT "Expense_estimateId_fkey";
-    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
-      FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
-      ON DELETE SET NULL ON UPDATE CASCADE;
-  END IF;
-END $$`,
+/**
+ * Renders a plain `CREATE [UNIQUE] INDEX IF NOT EXISTS` statement as its
+ * CONCURRENTLY form. Pulled out and tested on its own (rather than inlined at
+ * the call site) so a typo here fails a unit test instead of a production run.
+ */
+export function toConcurrentIndexSql(sql) {
+    const rendered = sql.replace(
+        /^(\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+)(IF NOT EXISTS)/i,
+        "$1CONCURRENTLY $2",
+    );
+    if (rendered === sql) {
+        throw new Error(`toConcurrentIndexSql could not find "CREATE [UNIQUE] INDEX IF NOT EXISTS" in: ${sql.slice(0, 80)}`);
+    }
+    return rendered;
+}
+
+/**
+ * The compatibility triggers, Expense-only (they read "Estimate" only inside
+ * a function BODY, which is compiled, not executed, at CREATE time — the
+ * table is touched only later, when the trigger fires on somebody else's
+ * transaction). Their own short transaction, run before PHASE_A_STEPS reaches
+ * for either FK, and well before phase B's backfill — see the comment at
+ * SPLIT_JOB_GUARD_SQL for why they must exist before the columns carry values.
+ */
+export const TRIGGER_STATEMENTS = [...SPLIT_JOB_GUARD_SQL, ...AMOUNT_TAX_GUARD_SQL];
+
+/**
+ * ReceiptIntake is Phase 1's table, not Project, Estimate, or even Expense —
+ * its own short transaction, touching neither of the tables the FK steps
+ * below reach for. The guard keeps this runnable in EITHER merge order: if
+ * Phase 1 has not landed in the target database yet, these two columns are
+ * skipped, and re-running this script after Phase 1 lands adds them.
+ */
+export const RECEIPT_INTAKE_STATEMENTS = [
     `DO $$ BEGIN
        IF to_regclass('"ReceiptIntake"') IS NOT NULL THEN
          ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DEFAULT false;
@@ -985,11 +1068,167 @@ END $$`,
 ];
 
 /**
+ * (a) THE TWO FOREIGN KEYS, EACH `NOT VALID` AND EACH PRECEDED BY AN EXPLICIT
+ * PARENT LOCK, IN ITS OWN SHORT TRANSACTION (Codex round 15, item 1(a)).
+ *
+ * `LOCK TABLE "Project" IN SHARE ROW EXCLUSIVE MODE` runs FIRST, as its own
+ * statement — not because `ADD CONSTRAINT` would fail to take that lock on
+ * its own, but because it takes it in the WRONG ORDER on its own: an `ALTER
+ * TABLE "Expense" ADD CONSTRAINT ... REFERENCES "Project"` statement opens
+ * and locks the table NAMED IN THE ALTER TABLE CLAUSE (Expense, ACCESS
+ * EXCLUSIVE) before it opens the REFERENCED table (Project, SHARE ROW
+ * EXCLUSIVE) to install the FK's enforcement trigger — Expense before its own
+ * parent, exactly backwards from `lockAttributionParents`. Postgres locks are
+ * cumulative and never downgraded within one transaction, so taking the
+ * Project lock as its own PRECEDING statement makes the ADD CONSTRAINT
+ * statement's own request for the same lock a no-op, and the acquisition
+ * order every other waiter observes becomes Project-then-Expense.
+ *
+ * `NOT VALID` keeps this transaction short: it adds the constraint and the
+ * enforcement trigger (for every write from this moment on) without scanning
+ * existing rows, so the ACCESS EXCLUSIVE it takes on Expense — and the SHARE
+ * ROW EXCLUSIVE it takes on Project — are both held only for a metadata
+ * change. Existing data is checked afterward, by PROJECT_FK_VALIDATE_STATEMENTS,
+ * in a separate transaction that needs no parent lock at all. At the moment
+ * this runs `projectId` is a column this same script just added, so every row
+ * is NULL and validation later finds nothing to disagree with — but the split
+ * is the correct shape regardless of when it runs, not a fact about this being
+ * the column's first migration.
+ */
+export const PROJECT_FK_LOCK_STATEMENTS = [
+    `LOCK TABLE "Project" IN SHARE ROW EXCLUSIVE MODE`,
+    // Guarded on the DEFINITION, not just the name: a name-only IF NOT EXISTS
+    // silently accepts a same-named constraint that points elsewhere or
+    // carries ON DELETE CASCADE. Existing-and-wrong raises rather than being
+    // skipped.
+    `DO $$
+DECLARE existing_def TEXT;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO existing_def
+    FROM pg_constraint
+   WHERE conname = 'Expense_projectId_fkey'
+     AND conrelid = '"Expense"'::regclass;
+  IF existing_def IS NULL THEN
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_projectId_fkey"
+      FOREIGN KEY ("projectId") REFERENCES "Project"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE NOT VALID;
+  ELSIF existing_def NOT LIKE '%FOREIGN KEY ("projectId")%'
+     OR existing_def NOT LIKE '%REFERENCES "Project"(id)%'
+     OR existing_def NOT LIKE '%ON DELETE SET NULL%'
+     OR existing_def NOT LIKE '%ON UPDATE CASCADE%' THEN
+    RAISE EXCEPTION 'Expense_projectId_fkey already exists with an unexpected definition: %', existing_def;
+  END IF;
+END $$`,
+];
+
+/**
+ * `VALIDATE CONSTRAINT` takes only `SHARE UPDATE EXCLUSIVE` on Expense (reads
+ * and writes proceed; only other DDL is blocked) and no table-level lock on
+ * Project at all, so it cannot take part in a Project/Expense cycle. A
+ * separate, later transaction from the lock+add above, so the SHARE ROW
+ * EXCLUSIVE lock on Project is not held one moment longer than the
+ * metadata-only add needs. Idempotent: Postgres treats VALIDATE CONSTRAINT as
+ * a no-op once a constraint is already marked valid.
+ */
+export const PROJECT_FK_VALIDATE_STATEMENTS = [
+    `ALTER TABLE "Expense" VALIDATE CONSTRAINT "Expense_projectId_fkey"`,
+];
+
+/**
+ * The estimateId FK, same treatment as the project FK above. AN ESTIMATE MAY
+ * NOT DELETE SPEND (round 42, item 4b): `Expense_estimateId_fkey` was NOT
+ * NULL + ON DELETE CASCADE, so deleting an estimate deleted every expense
+ * booked through it — worse after Phase 3, since a re-attributed row is
+ * reported under a DIFFERENT job while still hanging off the estimate it
+ * left. SET NULL, not RESTRICT: the row keeps `projectId`, the attribution
+ * every reader already prefers, so the spend stays on its job with no
+ * estimate behind it; RESTRICT would also block deleting a PROJECT, since
+ * Project cascades to its Estimates. `Invoice.estimateId` and
+ * `Takeoff.estimateId` already take the SET NULL stance in this schema.
+ */
+export const ESTIMATE_FK_LOCK_STATEMENTS = [
+    `LOCK TABLE "Estimate" IN SHARE ROW EXCLUSIVE MODE`,
+    `DO $$
+DECLARE existing_def TEXT;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO existing_def
+    FROM pg_constraint
+   WHERE conname = 'Expense_estimateId_fkey'
+     AND conrelid = '"Expense"'::regclass;
+  IF existing_def IS NULL THEN
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
+      FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE NOT VALID;
+  ELSIF existing_def NOT LIKE '%ON DELETE SET NULL%' THEN
+    ALTER TABLE "Expense" DROP CONSTRAINT "Expense_estimateId_fkey";
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
+      FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE NOT VALID;
+  END IF;
+END $$`,
+];
+
+export const ESTIMATE_FK_VALIDATE_STATEMENTS = [
+    `ALTER TABLE "Expense" VALIDATE CONSTRAINT "Expense_estimateId_fkey"`,
+];
+
+/**
+ * THE ORDERED SEQUENCE OF SHORT TRANSACTIONS PHASE A ACTUALLY RUNS AS.
+ *
+ * main() and tests/attribution-lock-order-db.test.ts both drive this list
+ * directly, so "what the script runs" and "what the deadlock test measures"
+ * are the same data, not two hand-written copies that can drift. Each entry
+ * commits (or, for the `concurrent` entry, completes its standalone
+ * statements) before the next one begins — that is the entire fix: no step
+ * here is EVER holding a lock on Expense while ALSO requesting one on Project
+ * or Estimate, because the only steps that touch a parent table (the two FK
+ * steps) do so as the very FIRST thing in a fresh transaction, immediately
+ * after taking the explicit parent lock.
+ */
+export const PHASE_A_STEPS = [
+    { label: "phase A: columns (Expense-only, no parent lock)", statements: COLUMN_STATEMENTS },
+    { label: "phase A: normalize (Expense-only, no parent lock)", statements: NORMALIZE_STATEMENTS },
+    { label: "phase A: checks (Expense-only, no parent lock)", statements: CHECK_STATEMENTS },
+    { label: "phase A: indexes (CONCURRENTLY, standalone -- refuses to run inside a transaction)", statements: INDEX_STATEMENTS, concurrent: true },
+    { label: "phase A: triggers (Expense-only, no parent lock)", statements: TRIGGER_STATEMENTS },
+    { label: "phase A: ReceiptIntake (Phase 1's table -- not Project, Estimate, or Expense)", statements: RECEIPT_INTAKE_STATEMENTS },
+    { label: "phase A: project FK (locks Project FIRST, parent before child)", statements: PROJECT_FK_LOCK_STATEMENTS },
+    { label: "phase A: validate project FK", statements: PROJECT_FK_VALIDATE_STATEMENTS },
+    { label: "phase A: estimate FK (locks Estimate FIRST, parent before child)", statements: ESTIMATE_FK_LOCK_STATEMENTS },
+    { label: "phase A: validate estimate FK", statements: ESTIMATE_FK_VALIDATE_STATEMENTS },
+];
+
+/**
+ * The flat concatenation of every PHASE_A_STEPS statement, in run order. Kept
+ * for every consumer that predates the split — the migration-parity tests,
+ * expectedColumns, the source tripwires — none of which care how many
+ * transactions the run is broken into, only which statements run and in what
+ * order. Built by SPREADING the same step arrays `PHASE_A_STEPS` holds
+ * (rather than `PHASE_A_STEPS.flatMap(...)`, a module-scope method call
+ * tests/apply-scripts-inert-on-import.test.ts's AST guard refuses to treat as
+ * inert), so the flat view and the structured view still cannot drift apart —
+ * there is exactly one array of statements per step, referenced from both
+ * places.
+ */
+export const DDL_STATEMENTS = [
+    ...COLUMN_STATEMENTS,
+    ...NORMALIZE_STATEMENTS,
+    ...CHECK_STATEMENTS,
+    ...INDEX_STATEMENTS,
+    ...TRIGGER_STATEMENTS,
+    ...RECEIPT_INTAKE_STATEMENTS,
+    ...PROJECT_FK_LOCK_STATEMENTS,
+    ...PROJECT_FK_VALIDATE_STATEMENTS,
+    ...ESTIMATE_FK_LOCK_STATEMENTS,
+    ...ESTIMATE_FK_VALIDATE_STATEMENTS,
+];
+
+/**
  * PHASE B: THE DATA, IN THE CANONICAL LOCK ORDER (round 44, item 1).
  *
  * Projects first, then Estimates, then the Expense rows the UPDATE touches —
- * and in its OWN transaction, so the Expense table lock phase A took is long
- * released by the time any parent is asked for.
+ * and in its OWN transaction, so every phase-A lock is long released by the
+ * time any parent is asked for here.
  *
  * It is exactly `postDeployStatements`, which is not a coincidence and is the
  * point: the post-deploy pass exists to re-run the backfills against rows the
@@ -1009,8 +1248,8 @@ export function backfillStatements(timeZone) {
  * migration file is replayed by Prisma inside a SINGLE transaction and there is
  * no supported way to split one, which costs nothing: it only ever runs against
  * a fresh CI or dev database where nothing else is writing. Production gets the
- * two-transaction treatment through this script, which is the only place the
- * concurrency exists.
+ * short-transaction treatment described at PHASE_A_STEPS, which is the only
+ * place the concurrency exists.
  *
  * `reanchorSql` needs the company time zone, so this list holds the three
  * zone-free backfills and `main()` splices the re-anchor in beside them.
@@ -1057,10 +1296,14 @@ export function postDeployStatements(timeZone) {
  * leaves `estimateId` alone, so the guard never sees it; but if a future
  * version ever touched `estimateId`, doing it while the guard still stands is
  * the safe order, not the other way round.
+ *
+ * The lock travels WITH the repair (round 15, item 2), immediately before it,
+ * for the same reason PROJECT_ID_BACKFILL_LOCK_PROJECTS precedes
+ * PROJECT_ID_BACKFILL.
  */
 export function postDeployTeardownStatements({ repairSplitJobs = false } = {}) {
     return [
-        ...(repairSplitJobs ? [SPLIT_JOB_REPAIR] : []),
+        ...(repairSplitJobs ? [SPLIT_JOB_REPAIR_LOCK_PROJECTS, SPLIT_JOB_REPAIR] : []),
         ...SPLIT_JOB_GUARD_DROP_SQL,
         // The amount/tax guard comes out in the same pass and for the same
         // reason (see AMOUNT_TAX_GUARD_DROP_SQL). AFTER the repair, which
@@ -1290,38 +1533,25 @@ async function main() {
         const { timeZone: companyTimeZone, from: zoneFrom } = pickCompanyTimeZone(settingsRows);
         console.log(`company time zone for the date re-anchor: ${companyTimeZone} (from ${zoneFrom})`);
 
-        // TWO TRANSACTIONS: SHAPE, THEN DATA (round 44, item 1 — this replaces
-        // the "one transaction for the whole thing" rule of round 13, item 6).
+        // A SEQUENCE OF SHORT TRANSACTIONS, SHAPE THEN DATA (round 15, item 1
+        // — replacing round 44's "two transactions", which was still wrong:
+        // see the comment at PHASE_A_STEPS for why bundling every DDL
+        // statement into ONE phase-A transaction still deadlocks a
+        // parent-first writer, even though nothing in that transaction's own
+        // text says "Project" or "Estimate" outside a `pg_constraint` lookup.
         //
-        // Round 13 made the whole run atomic so a network blip could not leave
-        // production half-migrated, and that reasoning still holds WITHIN each
-        // phase. What it missed is the lock it was holding while it did so: the
-        // first `ALTER TABLE "Expense"` takes ACCESS EXCLUSIVE on the table and
-        // keeps it until COMMIT, so running the backfill in the same
-        // transaction meant holding the Expense table and THEN reaching for
-        // Project and Estimate row locks. A concurrent estimate move holding
-        // its Estimate row and needing to read Expense is the other half of a
-        // cycle, and Postgres breaks a cycle by killing somebody — here, the
-        // migration mid-run or the bookkeeper's save.
-        //
-        // Phase A is every DDL statement and the Expense-only normalisations a
-        // CHECK depends on: no row lock outside `Expense`, so nothing it holds
-        // can take part in a cross-table cycle. It commits, releasing the
-        // table. Phase B then takes Projects, Estimates and Expense rows in the
-        // canonical order with the table free.
-        //
-        // ATOMICITY IS NOT LOST, it is re-argued: every statement in both
-        // phases is additive and idempotent, so a crash between them is safe to
-        // re-run from the top, and the verification pass below checks the END
-        // STATE rather than that any particular transaction committed. That is
-        // a stronger guarantee than "all or nothing" for a script whose whole
-        // design is to be re-runnable.
+        // ATOMICITY IS NOT LOST, it is re-argued: every statement in every
+        // step is additive and idempotent, so a crash between any two of them
+        // is safe to re-run from the top, and the verification pass below
+        // checks the END STATE rather than that any particular transaction
+        // committed. That is a stronger guarantee than "all or nothing" for a
+        // script whose whole design is to be re-runnable.
         //
         // The timeout is generous because a backfill over the Expense table on
         // a cold connection is not a five-second operation, and the default
         // would roll the whole thing back for being slow.
         // --post-deploy runs ONLY the two backfills, for the live-write gap
-        // documented above PROJECT_ID_BACKFILL. The DDL is skipped because it
+        // documented above PROJECT_ID_BACKFILL. Phase A is skipped because it
         // has already run; re-running it would be harmless but the point of
         // this mode is to be an obviously-narrow second pass.
         const postDeployOnly = process.argv.includes("--post-deploy");
@@ -1334,10 +1564,6 @@ async function main() {
             console.error("--repair-split-jobs is only valid together with --post-deploy.");
             process.exit(1);
         }
-        // Phase A is skipped entirely on --post-deploy: the shape has already
-        // landed, and the point of that mode is to be an obviously-narrow
-        // second pass over the rows the old build wrote while it drained.
-        const phaseA = postDeployOnly ? [] : DDL_STATEMENTS;
         const phaseB = postDeployOnly
             ? [...postDeployStatements(companyTimeZone), ...postDeployTeardownStatements({ repairSplitJobs })]
             : backfillStatements(companyTimeZone);
@@ -1349,14 +1575,20 @@ async function main() {
                     : "split-job repair NOT running (pass --repair-split-jobs to enable it; the verifier below reports the count either way).",
             );
         }
-        const runPhase = async (label, sqlList) => {
+        const runPhase = async (label, sqlList, { concurrent = false } = {}) => {
             if (!sqlList.length) return;
             console.log(`\n-- ${label} --`);
-            await prisma.$transaction(async tx => {
+            const execute = async client => {
                 for (const sql of sqlList) {
-                    const head = sql.replace(/\s+/g, " ").slice(0, 84);
+                    // CREATE INDEX CONCURRENTLY refuses to run inside a
+                    // transaction block, so the concurrent step renders each
+                    // statement here rather than storing the CONCURRENTLY
+                    // text in the exported constant (which stays plain, for
+                    // byte-equivalence with migration.sql).
+                    const rendered = concurrent ? toConcurrentIndexSql(sql) : sql;
+                    const head = rendered.replace(/\s+/g, " ").slice(0, 84);
                     process.stdout.write(`  ${head} ... `);
-                    const affected = await tx.$executeRawUnsafe(sql);
+                    const affected = await client.$executeRawUnsafe(rendered);
                     // Print the row count for the backfill: a SECOND run
                     // reporting 0 is the whole idempotency proof, and a silent
                     // "ok" hides it. `WITH` as well as `UPDATE`:
@@ -1366,11 +1598,30 @@ async function main() {
                     // idempotency argument rests on.
                     console.log(/^(UPDATE|WITH)\b/i.test(sql.trimStart()) ? `ok (${affected} rows)` : "ok");
                 }
-            }, { timeout: 300_000, maxWait: 60_000 });
+            };
+            if (concurrent) {
+                // Each statement here is its own implicit transaction — that
+                // is the whole point, and it is Expense-only regardless, so
+                // running it outside any transaction cannot introduce a new
+                // lock-ordering hazard.
+                await execute(prisma);
+            } else {
+                await prisma.$transaction(tx => execute(tx), { timeout: 300_000, maxWait: 60_000 });
+            }
         };
-        // ORDER IS THE POINT: A commits and releases the Expense table before B
-        // asks for its first Project row.
-        await runPhase("phase A: shape (no Project/Estimate locks)", phaseA);
+        // Phase A is skipped entirely on --post-deploy: the shape has already
+        // landed, and the point of that mode is to be an obviously-narrow
+        // second pass over the rows the old build wrote while it drained.
+        //
+        // ORDER IS THE POINT: every phase-A step commits (or, for the
+        // concurrent index step, completes) before the next one starts, and
+        // phase B — the only other step reaching for Project or Estimate —
+        // runs only after every phase-A step has.
+        if (!postDeployOnly) {
+            for (const step of PHASE_A_STEPS) {
+                await runPhase(step.label, step.statements, { concurrent: !!step.concurrent });
+            }
+        }
         await runPhase("phase B: data (Projects, then Estimates, then rows)", phaseB);
 
         // Verify shape rather than trusting the run.

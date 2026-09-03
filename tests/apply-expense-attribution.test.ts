@@ -25,6 +25,9 @@ import {
     expectedReceiptIntakeColumns,
     backfillStatements,
     DDL_STATEMENTS,
+    INDEX_STATEMENTS,
+    PHASE_A_STEPS,
+    toConcurrentIndexSql,
     AMOUNT_TAX_GUARD_DROP_SQL,
     AMOUNT_TAX_GUARD_SQL,
     COMPATIBILITY_TRIGGERS,
@@ -41,6 +44,7 @@ import {
     SPLIT_JOB_GUARD_DROP_SQL,
     SPLIT_JOB_GUARD_SQL,
     SPLIT_JOB_REPAIR,
+    SPLIT_JOB_REPAIR_LOCK_PROJECTS,
     statements,
     targetMatches,
 } from "../scripts/apply-expense-attribution.mjs";
@@ -382,18 +386,17 @@ test("every updatedAt statement is re-runnable, and matches the migration", () =
     }
 });
 
-test("the run is TWO transactions: shape, then data", () => {
-    // ROUND 44, ITEM 1, replacing "the DDL runs inside ONE transaction".
+test("the run is a SEQUENCE OF SHORT TRANSACTIONS: PHASE_A_STEPS, then data", () => {
+    // ROUND 15, ITEM 1, replacing round 44's "the run is TWO transactions".
+    // That was still wrong: bundling every DDL statement (including the two
+    // FK adds) into ONE phase-A transaction still deadlocks a parent-first
+    // writer, because `ADD CONSTRAINT ... REFERENCES "Project"` takes SHARE
+    // ROW EXCLUSIVE on Project regardless of NOT VALID, and round 44's single
+    // transaction held ACCESS EXCLUSIVE on Expense the whole time it did so.
     //
-    // A blip between the backfill and SET NOT NULL used to leave production
-    // half-migrated, which is why round 13 made the whole run atomic. What that
-    // missed is the LOCK it held while being atomic: the first
-    // `ALTER TABLE "Expense"` takes ACCESS EXCLUSIVE until COMMIT, so the
-    // backfill's Project and Estimate row locks were taken while the whole
-    // Expense table was held — the other half of a cycle with any concurrent
-    // estimate move. Atomicity is re-argued through idempotency instead: every
-    // statement in both phases is re-runnable and the verifier checks the END
-    // state.
+    // The fix is MORE transactions, not fewer: PHASE_A_STEPS is the ordered,
+    // exported list of what actually runs, and main() drives it directly
+    // rather than hand-rolling a second copy of the sequence.
     const script = readFileSync(
         path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
         "utf8",
@@ -401,22 +404,102 @@ test("the run is TWO transactions: shape, then data", () => {
     const loopAt = script.indexOf("for (const sql of sqlList)");
     assert.ok(loopAt > 0, "the run loop is still there");
     const run = script.slice(loopAt);
-    assert.match(script, /await prisma\.\$transaction\(async tx =>/);
-    assert.match(run, /await tx\.\$executeRawUnsafe\(sql\)/, "inside the transaction, not outside it");
-    assert.ok(
-        script.indexOf("$transaction(async tx =>") < loopAt,
-        "the loop is INSIDE the transaction",
-    );
-    // ONE loop, called twice — not two loops that could drift.
+    assert.match(run, /await client\.\$executeRawUnsafe\(rendered\)/, "the loop runs on whichever client it is given");
+    // ONE loop, reused — not two loops that could drift.
     assert.equal(
         script.split("for (const sql of sqlList)").length - 1, 1,
         "one loop, whichever set it is given",
     );
-    // ...and it IS called twice, phase A before phase B.
-    const aAt = script.indexOf('runPhase("phase A');
+    // Each step commits (transactional) or completes (concurrent) on its own,
+    // rather than every step sharing one enclosing transaction — that is the
+    // whole fix, so both branches have to exist and disagree about whether
+    // $transaction wraps the loop.
+    const runPhaseAt = script.indexOf("const runPhase = async");
+    assert.ok(runPhaseAt > -1 && runPhaseAt < loopAt, "runPhase is defined before its loop");
+    const runPhaseBody = script.slice(runPhaseAt, script.indexOf("await runPhase("));
+    assert.match(runPhaseBody, /if \(concurrent\) \{/);
+    assert.match(runPhaseBody, /await execute\(prisma\)/, "the concurrent branch runs OUTSIDE any transaction");
+    assert.match(runPhaseBody, /await prisma\.\$transaction\(tx => execute\(tx\)/, "the default branch wraps the loop in its OWN transaction");
+
+    // PHASE_A_STEPS is iterated directly — no hand-rolled second copy of the
+    // sequence that could drift from the exported, tested list.
+    const stepsLoopAt = script.indexOf("for (const step of PHASE_A_STEPS)");
+    assert.ok(stepsLoopAt > -1, "main() must drive PHASE_A_STEPS, not a private copy");
+    assert.match(
+        script.slice(stepsLoopAt),
+        /await runPhase\(step\.label, step\.statements, \{ concurrent: !!step\.concurrent \}\)/,
+    );
+    // ...and it runs BEFORE phase B, which is the only other step that
+    // reaches for a Project or Estimate lock.
     const bAt = script.indexOf('runPhase("phase B');
-    assert.ok(aAt > 0 && bAt > 0, "both phases are run");
-    assert.ok(aAt < bAt, "shape commits before data asks for a parent row");
+    assert.ok(bAt > -1, "phase B still runs");
+    assert.ok(stepsLoopAt < bAt, "every phase-A step runs before phase B asks for a parent row");
+});
+
+test("PHASE_A_STEPS is the ordered, structured view PHASE_A actually runs as", () => {
+    // The property round 15 exists to buy: no step ever holds a lock on
+    // Expense from an EARLIER statement while requesting one on Project or
+    // Estimate. The only steps that reach a parent table are the two FK
+    // steps, and each does so as the FIRST thing in a FRESH transaction —
+    // immediately after the explicit LOCK TABLE that makes the acquisition
+    // order Project/Estimate-then-Expense, never the other way round.
+    const labels = (PHASE_A_STEPS as { label: string }[]).map(s => s.label);
+    assert.deepEqual(labels, [
+        "phase A: columns (Expense-only, no parent lock)",
+        "phase A: normalize (Expense-only, no parent lock)",
+        "phase A: checks (Expense-only, no parent lock)",
+        "phase A: indexes (CONCURRENTLY, standalone -- refuses to run inside a transaction)",
+        "phase A: triggers (Expense-only, no parent lock)",
+        "phase A: ReceiptIntake (Phase 1's table -- not Project, Estimate, or Expense)",
+        "phase A: project FK (locks Project FIRST, parent before child)",
+        "phase A: validate project FK",
+        "phase A: estimate FK (locks Estimate FIRST, parent before child)",
+        "phase A: validate estimate FK",
+    ]);
+    // Exactly one step is concurrent (the indexes) — everything else is a
+    // normal short transaction.
+    const concurrentSteps = (PHASE_A_STEPS as { label: string; concurrent?: boolean }[]).filter(s => s.concurrent);
+    assert.equal(concurrentSteps.length, 1);
+    assert.equal(concurrentSteps[0].label, "phase A: indexes (CONCURRENTLY, standalone -- refuses to run inside a transaction)");
+
+    // Each FK step's FIRST statement is the explicit parent lock, and its
+    // LAST is the ADD CONSTRAINT DO-block — nothing else shares the
+    // transaction with it.
+    const project = (PHASE_A_STEPS as { label: string; statements: string[] }[])
+        .find(s => s.label.includes("project FK ("))!;
+    assert.equal(project.statements.length, 2);
+    assert.equal(project.statements[0], `LOCK TABLE "Project" IN SHARE ROW EXCLUSIVE MODE`);
+    assert.match(project.statements[1], /Expense_projectId_fkey/);
+    assert.match(project.statements[1], /NOT VALID/);
+
+    const estimate = (PHASE_A_STEPS as { label: string; statements: string[] }[])
+        .find(s => s.label.includes("estimate FK ("))!;
+    assert.equal(estimate.statements.length, 2);
+    assert.equal(estimate.statements[0], `LOCK TABLE "Estimate" IN SHARE ROW EXCLUSIVE MODE`);
+    assert.match(estimate.statements[1], /Expense_estimateId_fkey/);
+    assert.match(estimate.statements[1], /NOT VALID/);
+
+    // Each VALIDATE step is a SEPARATE step from its LOCK+ADD, so the parent
+    // lock is not held one moment longer than the metadata-only add needs.
+    const projectValidate = (PHASE_A_STEPS as { label: string; statements: string[] }[])
+        .find(s => s.label === "phase A: validate project FK")!;
+    assert.deepEqual(projectValidate.statements, [`ALTER TABLE "Expense" VALIDATE CONSTRAINT "Expense_projectId_fkey"`]);
+    const estimateValidate = (PHASE_A_STEPS as { label: string; statements: string[] }[])
+        .find(s => s.label === "phase A: validate estimate FK")!;
+    assert.deepEqual(estimateValidate.statements, [`ALTER TABLE "Expense" VALIDATE CONSTRAINT "Expense_estimateId_fkey"`]);
+
+    // DDL_STATEMENTS is derived, not a second hand-maintained list.
+    assert.deepEqual(DDL_STATEMENTS, (PHASE_A_STEPS as { statements: string[] }[]).flatMap(s => s.statements));
+});
+
+test("toConcurrentIndexSql renders each plain index statement, and only that", () => {
+    for (const sql of INDEX_STATEMENTS as string[]) {
+        const rendered = toConcurrentIndexSql(sql);
+        assert.match(rendered, /CREATE (UNIQUE )?INDEX CONCURRENTLY IF NOT EXISTS/);
+        // Nothing else about the statement changes.
+        assert.equal(rendered.replace("CONCURRENTLY ", ""), sql);
+    }
+    assert.throws(() => toConcurrentIndexSql(`SELECT 1`), /could not find/);
 });
 
 test("phase A takes no Project or Estimate lock, and phase B is the backfills", () => {
@@ -468,6 +551,29 @@ test("taxSource is declared everywhere the other tax columns are", () => {
     assert.ok(expectedColumns.Expense.includes("taxSource"), "and it is verified after the run");
     const schema = readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
     assert.match(schema, /taxSource\s+String\?/);
+});
+
+test("schema.prisma's Expense comments describe the CURRENT shape, not a stale one (round 15, item 5)", () => {
+    // Three comments had drifted from what the schema actually declares:
+    //   - the Phase 3 banner above `projectId` used to call `estimateId` the
+    //     "REQUIRED parent" that "still Cascade-deletes this row", which round
+    //     42 item 4b made false (nullable, onDelete: SetNull);
+    //   - `needsTaxReview`'s comment said the tax report "ignores" it, when
+    //     queryTaxAtSourceRows actually filters `needsTaxReview: false`,
+    //     EXCLUDING a flagged row even when its remaining figures would
+    //     otherwise qualify;
+    //   - `costCodeSource`'s comment listed capture | ai | manual | backfill
+    //     and omitted "manual-none" entirely, though it is a
+    //     HUMAN_COST_CODE_SOURCES member and a real, deliberate decision (a
+    //     bookkeeper clearing the phase), not an oversight.
+    const schema = readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
+    assert.ok(!/REQUIRED parent/.test(schema), "estimateId is no longer claimed to be required");
+    assert.ok(!/still\s+\/{2,3}\s*Cascade-deletes this row/.test(schema), "estimateId is no longer claimed to cascade-delete");
+    assert.match(schema, /estimateId[\s\S]{0,200}NOT the required parent this comment once described/);
+    assert.match(schema, /queryTaxAtSourceRows/, "needsTaxReview must name the reader that filters on it");
+    assert.match(schema, /filters it OUT with `needsTaxReview:\s*\n?\s*\/\/\/ false`/);
+    assert.match(schema, /capture \| ai \| manual \| manual-none \| backfill/, "manual-none must be in the precedence list");
+    assert.match(schema, /HUMAN_COST_CODE_SOURCES in src\/lib\/expense-attribution\.ts/);
 });
 
 test("taxDeductibleBaseSource is declared in BOTH DDL paths, the verifier and the schema", () => {
@@ -1146,7 +1252,20 @@ test("the split-job repair is OPT-IN and never runs by default", () => {
 
 test("the repair runs BEFORE the guard is dropped, and only on QBO-synced rows", () => {
     const withRepair = postDeployTeardownStatements({ repairSplitJobs: true });
-    assert.equal(withRepair[0], SPLIT_JOB_REPAIR, "repair first, teardown second");
+    // ROUND 15, ITEM 2: the project lock travels WITH the repair, immediately
+    // before it — the same shape PROJECT_ID_BACKFILL_LOCK_PROJECTS has beside
+    // PROJECT_ID_BACKFILL, and for the same reason: the repair's UPDATE takes
+    // FOR KEY SHARE on every referenced Project through the FK this script
+    // adds, so on its own it is Estimate -> Project.
+    assert.equal(withRepair[0], SPLIT_JOB_REPAIR_LOCK_PROJECTS, "the project lock runs first");
+    assert.equal(withRepair[1], SPLIT_JOB_REPAIR, "repair second, teardown third");
+    assert.ok(
+        !/WITH\s/i.test(SPLIT_JOB_REPAIR_LOCK_PROJECTS),
+        "the project lock must not be folded into a CTE",
+    );
+    assert.match(SPLIT_JOB_REPAIR_LOCK_PROJECTS, /FROM "Project" p/);
+    assert.match(SPLIT_JOB_REPAIR_LOCK_PROJECTS, /ORDER BY p\.id\s+FOR SHARE/);
+    assert.ok(!/\b(UPDATE|INSERT|DELETE)\b/i.test(SPLIT_JOB_REPAIR_LOCK_PROJECTS), "it locks, it does not write");
 
     // The old QBO sync is the only writer that rewrites estimateId without
     // projectId, so a row that never came from QuickBooks cannot have been

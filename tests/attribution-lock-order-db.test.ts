@@ -50,8 +50,14 @@ import { runBackfill } from "../scripts/backfill-expense-attribution";
 import {
     backfillStatements,
     DDL_STATEMENTS,
+    PHASE_A_STEPS,
     PROJECT_ID_BACKFILL,
     PROJECT_ID_BACKFILL_LOCK_PROJECTS,
+    SPLIT_JOB_GUARD_DROP_SQL,
+    SPLIT_JOB_GUARD_SQL,
+    SPLIT_JOB_REPAIR,
+    SPLIT_JOB_REPAIR_LOCK_PROJECTS,
+    toConcurrentIndexSql,
 } from "../scripts/apply-expense-attribution.mjs";
 
 const url =
@@ -1238,6 +1244,443 @@ test("...and a source that stays put still moves", { skip }, async () => {
         );
         assert.deepEqual(outcome, { moved: true, projectId: TARGET_PROJECT, estimateId: TARGET_ESTIMATE });
     } finally {
+        await cleanupTwoJobs();
+    }
+});
+
+// ── PHASE A ITSELF CAN DEADLOCK PRODUCTION (Codex round 15, item 1) ─────────
+//
+// The tests above prove the two-phase SPLIT (round 44) is not enough on its
+// own. `ALTER TABLE "Expense" ADD CONSTRAINT ... REFERENCES "Project"` takes
+// SHARE ROW EXCLUSIVE on the REFERENCED table too -- Postgres needs it to
+// install the FK's enforcement trigger, and it takes it even for a `NOT
+// VALID` constraint. Bundled into ONE phase-A transaction (round 44's shape),
+// that statement runs while the SAME transaction still holds ACCESS
+// EXCLUSIVE on Expense from the very first `ALTER TABLE` -- so a writer that
+// takes an actual write lock on Project (an `UPDATE`/`DELETE`, not merely a
+// `SELECT ... FOR UPDATE` row lock -- a plain row lock's table-level ROW
+// SHARE intent does not conflict with SHARE ROW EXCLUSIVE, which is why the
+// existing `projectFirstEditor` control above cannot reproduce THIS defect)
+// and then reads Expense is the other half of a cycle.
+//
+// A real Prisma `.update()`/`.delete()` on Project or Estimate is exactly
+// this: `reattributeExpense`'s target-estimate write, an ordinary project
+// edit, or the Project cascade-delete path all take ROW EXCLUSIVE at the
+// table level, not merely ROW SHARE.
+//
+// PHASE_A_STEPS is executed exactly as main() executes it -- imported as
+// data, not reconstructed -- so what these tests measure is the sequence that
+// will actually run against production.
+function projectRowUpdater(held: ReturnType<typeof gate>) {
+    let error: unknown = null;
+    const done = (async () => {
+        try {
+            await editorDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+                // A REAL write -- ROW EXCLUSIVE at the table level -- not the
+                // FOR UPDATE row lock every other control in this file uses.
+                await tx.$executeRawUnsafe(`UPDATE "Project" SET name = name WHERE id = $1`, PROJECT);
+                held.open();
+                await new Promise(resolve => setTimeout(resolve, 900));
+                // Reading Expense needs the table, which a monolithic phase A
+                // holds ACCESS EXCLUSIVE on for the whole transaction.
+                await tx.$executeRawUnsafe(`SELECT count(*)::int FROM "Expense" WHERE "projectId" = $1`, PROJECT);
+            });
+        } catch (caught) {
+            error = caught;
+        }
+    })();
+    return { done, get error() { return error; } };
+}
+
+function estimateRowUpdater(held: ReturnType<typeof gate>) {
+    let error: unknown = null;
+    const done = (async () => {
+        try {
+            await editorDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+                await tx.$executeRawUnsafe(`UPDATE "Estimate" SET title = title WHERE id = $1`, ESTIMATE);
+                held.open();
+                await new Promise(resolve => setTimeout(resolve, 900));
+                await tx.$executeRawUnsafe(`SELECT count(*)::int FROM "Expense" WHERE "estimateId" = $1`, ESTIMATE);
+            });
+        } catch (caught) {
+            error = caught;
+        }
+    })();
+    return { done, get error() { return error; } };
+}
+
+test("CONTROL: bundling PHASE_A_STEPS into ONE transaction deadlocks a Project writer", { skip }, async () => {
+    // The pre-round-15 shape: every phase-A statement -- including the
+    // Project FK's explicit LOCK TABLE and its NOT VALID add -- run together
+    // in one transaction, exactly as round 44 shipped it. NOT VALID and the
+    // explicit lock alone do not fix anything if they are not ALSO split into
+    // their own transaction.
+    await seed();
+    try {
+        const held = gate();
+        const editor = projectRowUpdater(held);
+        await held.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+            for (const step of PHASE_A_STEPS as { statements: string[] }[]) {
+                for (const sql of step.statements) await tx.$executeRawUnsafe(sql);
+            }
+        }, { timeout: 60_000 }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(editor.error),
+            `expected 40P01 from holding Expense across the Project FK step; migration=${writerError} editor=${editor.error}`,
+        );
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the SHIPPED per-step transactions wait instead, against a Project writer", { skip }, async () => {
+    // Each PHASE_A_STEPS entry commits (or, for the concurrent index step,
+    // completes) before the next one starts -- exactly what main() does. By
+    // the time the project-FK step asks for Project, the columns/normalize/
+    // checks/indexes/triggers/receiptIntake steps have already committed and
+    // released Expense, so there is nothing left for a cycle to close over.
+    await seed();
+    try {
+        const held = gate();
+        const editor = projectRowUpdater(held);
+        await held.reached;
+
+        let writerError: unknown = null;
+        try {
+            for (const step of PHASE_A_STEPS as { statements: string[]; concurrent?: boolean }[]) {
+                if (!step.statements.length) continue;
+                if (step.concurrent) {
+                    for (const sql of step.statements) {
+                        await writerDb!.$executeRawUnsafe(toConcurrentIndexSql(sql));
+                    }
+                } else {
+                    await writerDb!.$transaction(async tx => {
+                        await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+                        for (const sql of step.statements) await tx.$executeRawUnsafe(sql);
+                    }, { timeout: 60_000 });
+                }
+            }
+        } catch (caught) {
+            writerError = caught;
+        }
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `phase A was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the project writer was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `phase A failed: ${writerError}`);
+        assert.equal(editor.error, null, `the project writer failed: ${editor.error}`);
+
+        // Correct end state, not just "no error": the FK exists and is VALID
+        // (VALIDATE CONSTRAINT ran, in its own later step).
+        const [row] = await editorDb!.$queryRawUnsafe<{ def: string }[]>(
+            `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'Expense_projectId_fkey' AND conrelid = '"Expense"'::regclass`,
+        );
+        assert.match(row.def, /FOREIGN KEY \("projectId"\)/);
+        assert.match(row.def, /ON DELETE SET NULL/);
+        assert.ok(!/NOT VALID/.test(row.def), "the FK must be VALID after its own validate step ran");
+    } finally {
+        await cleanup();
+    }
+});
+
+test("CONTROL: bundling PHASE_A_STEPS into ONE transaction deadlocks an Estimate writer", { skip }, async () => {
+    await seed();
+    try {
+        const held = gate();
+        const editor = estimateRowUpdater(held);
+        await held.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+            for (const step of PHASE_A_STEPS as { statements: string[] }[]) {
+                for (const sql of step.statements) await tx.$executeRawUnsafe(sql);
+            }
+        }, { timeout: 60_000 }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(editor.error),
+            `expected 40P01 from holding Expense across the Estimate FK step; migration=${writerError} editor=${editor.error}`,
+        );
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the SHIPPED per-step transactions wait instead, against an Estimate writer", { skip }, async () => {
+    await seed();
+    try {
+        const held = gate();
+        const editor = estimateRowUpdater(held);
+        await held.reached;
+
+        let writerError: unknown = null;
+        try {
+            for (const step of PHASE_A_STEPS as { statements: string[]; concurrent?: boolean }[]) {
+                if (!step.statements.length) continue;
+                if (step.concurrent) {
+                    for (const sql of step.statements) {
+                        await writerDb!.$executeRawUnsafe(toConcurrentIndexSql(sql));
+                    }
+                } else {
+                    await writerDb!.$transaction(async tx => {
+                        await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+                        for (const sql of step.statements) await tx.$executeRawUnsafe(sql);
+                    }, { timeout: 60_000 });
+                }
+            }
+        } catch (caught) {
+            writerError = caught;
+        }
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `phase A was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the estimate writer was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `phase A failed: ${writerError}`);
+        assert.equal(editor.error, null, `the estimate writer failed: ${editor.error}`);
+
+        const [row] = await editorDb!.$queryRawUnsafe<{ def: string }[]>(
+            `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'Expense_estimateId_fkey' AND conrelid = '"Expense"'::regclass`,
+        );
+        assert.match(row.def, /FOREIGN KEY \("estimateId"\)/);
+        assert.match(row.def, /ON DELETE SET NULL/);
+        assert.ok(!/NOT VALID/.test(row.def), "the FK must be VALID after its own validate step ran");
+    } finally {
+        await cleanup();
+    }
+});
+
+// ── THE SPLIT-JOB REPAIR HAD THE SAME DEFECT (Codex round 15, item 2) ───────
+//
+// SPLIT_JOB_REPAIR locks Estimate rows and then UPDATEs Expense.projectId --
+// which takes FOR KEY SHARE on every referenced Project through the FK this
+// script adds, so on its own it is Estimate -> Project. SPLIT_JOB_REPAIR_LOCK_PROJECTS
+// closes it exactly like PROJECT_ID_BACKFILL_LOCK_PROJECTS does for the
+// ordinary backfill.
+test("CONTROL: the split-job repair without its project lock deadlocks a Project-first editor", { skip }, async () => {
+    await seedTwoJobs();
+    // Give the expense a split pair so SPLIT_JOB_REPAIR has a candidate row:
+    // qbPurchaseId set, projectId disagreeing with its estimate's (est.
+    // projectId is PROJECT; the row currently claims TARGET_PROJECT, which
+    // seedTwoJobs already created). The repair re-derives PROJECT from the
+    // estimate, so PROJECT is the job SPLIT_JOB_REPAIR_LOCK_PROJECTS locks.
+    await writerDb!.expense.update({
+        where: { id: EXPENSE },
+        data: { projectId: TARGET_PROJECT, qbPurchaseId: PURCHASE },
+    });
+    try {
+        const projectHeld = gate();
+        const editor = projectFirstEditor(projectHeld);
+        await projectHeld.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            // The pre-fix shape: the repair alone, no preceding project lock.
+            await tx.$executeRawUnsafe(SPLIT_JOB_REPAIR);
+        }, { timeout: 30_000 }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(editor.error),
+            `expected 40P01 from the repair's implicit FOR KEY SHARE; writer=${writerError} editor=${editor.error}`,
+        );
+    } finally {
+        await cleanupTwoJobs();
+    }
+});
+
+test("the SHIPPED repair locks its projects first, and waits instead", { skip }, async () => {
+    await seedTwoJobs();
+    await writerDb!.expense.update({
+        where: { id: EXPENSE },
+        data: { projectId: TARGET_PROJECT, qbPurchaseId: PURCHASE },
+    });
+    try {
+        const projectHeld = gate();
+        const editor = projectFirstEditor(projectHeld);
+        await projectHeld.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            await tx.$executeRawUnsafe(SPLIT_JOB_REPAIR_LOCK_PROJECTS);
+            await tx.$executeRawUnsafe(SPLIT_JOB_REPAIR);
+        }, { timeout: 30_000 }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `the repair was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `the repair failed: ${writerError}`);
+        assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+
+        const repaired = await editorDb!.expense.findUnique({ where: { id: EXPENSE }, select: { projectId: true } });
+        assert.deepEqual(repaired, { projectId: PROJECT }, "the repair actually ran and re-derived the project");
+    } finally {
+        await cleanupTwoJobs();
+    }
+});
+
+// ── THE ROLLOUT PAIR GUARD CAN PERSIST A SPLIT ATTRIBUTION (round 15, item 3) ─
+//
+// The compatibility trigger's estimate lookup used to be a plain MVCC SELECT:
+// it can read the previous committed Estimate.projectId, stamp it onto the
+// row, and let the estimate move commit right after -- landing a split
+// attribution the guard exists to prevent. `FOR KEY SHARE` makes the trigger
+// block behind an in-flight estimate move that holds FOR UPDATE / NO KEY
+// UPDATE on the same estimate row.
+// The pre-round-15 trigger body, verbatim except for the plain (unlocked)
+// SELECT -- used only as the CONTROL below, to prove the race is real before
+// measuring the fix against it.
+const UNLOCKED_PAIR_GUARD_SQL = [
+    `CREATE OR REPLACE FUNCTION probuild_expense_estimate_pair_guard()
+     RETURNS trigger
+     LANGUAGE plpgsql
+     AS $guard$
+     DECLARE
+         est_project TEXT;
+     BEGIN
+         IF NEW."estimateId" IS DISTINCT FROM OLD."estimateId"
+            AND NEW."projectId" IS NOT DISTINCT FROM OLD."projectId"
+            AND OLD."projectId" IS NOT NULL
+            AND NEW."estimateId" IS NOT NULL
+         THEN
+             SELECT est."projectId" INTO est_project
+               FROM "Estimate" est
+              WHERE est.id = NEW."estimateId";
+             IF est_project IS NOT NULL THEN
+                 NEW."projectId" := est_project;
+             END IF;
+         END IF;
+         RETURN NEW;
+     END;
+     $guard$`,
+    `DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard ON "Expense"`,
+    `CREATE TRIGGER probuild_expense_estimate_pair_guard
+     BEFORE UPDATE OF "estimateId" ON "Expense"
+     FOR EACH ROW
+     EXECUTE FUNCTION probuild_expense_estimate_pair_guard()`,
+];
+
+/**
+ * Both the CONTROL and the fix test share this choreography: job B's
+ * estimate (`TARGET_ESTIMATE`) is mid-move to a THIRD project while an
+ * old-build-shaped write re-points `EXPENSE` at that same estimate without
+ * touching `projectId`. The third project makes a stale read observable --
+ * PROJECT (pre-test), TARGET_PROJECT (pre-move) and the third project
+ * (post-move) are all different values, so whichever one lands says exactly
+ * which snapshot the guard's SELECT used.
+ */
+async function raceEstimateMoveAgainstPairGuard() {
+    const THIRD_PROJECT = `${PFX}-project-3`;
+    await writerDb!.project.create({
+        data: { id: THIRD_PROJECT, name: "Attribution Lock Order 3", clientId: CLIENT, status: "In Progress" },
+    });
+    try {
+        const held = gate();
+        // The mover: holds the estimate FOR UPDATE (as a real estimate move
+        // would, e.g. reattributeExpense), then commits its project change
+        // slowly, so the guard's SELECT has time to arrive while it is still
+        // in flight.
+        let moverError: unknown = null;
+        const moverDone = (async () => {
+            try {
+                await editorDb!.$transaction(async tx => {
+                    await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+                    await tx.$executeRawUnsafe(`SELECT id FROM "Estimate" WHERE id = $1 FOR UPDATE`, TARGET_ESTIMATE);
+                    held.open();
+                    await new Promise(resolve => setTimeout(resolve, 700));
+                    await tx.$executeRawUnsafe(
+                        `UPDATE "Estimate" SET "projectId" = $1 WHERE id = $2`,
+                        THIRD_PROJECT, TARGET_ESTIMATE,
+                    );
+                });
+            } catch (caught) {
+                moverError = caught;
+            }
+        })();
+        await held.reached;
+
+        // The old-build write: moves estimateId while leaving projectId
+        // untouched (still PROJECT) -- exactly what fires the guard.
+        let guardError: unknown = null;
+        try {
+            await writerDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+                await tx.$executeRawUnsafe(
+                    `UPDATE "Expense" SET "estimateId" = $1 WHERE id = $2`,
+                    TARGET_ESTIMATE, EXPENSE,
+                );
+            }, { timeout: 30_000 });
+        } catch (caught) {
+            guardError = caught;
+        }
+
+        await moverDone;
+        assert.equal(guardError, null, `the guard write failed: ${guardError}`);
+        assert.equal(moverError, null, `the estimate move failed: ${moverError}`);
+
+        const row = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true, estimateId: true },
+        });
+        return { row, THIRD_PROJECT };
+    } finally {
+        await writerDb!.project.deleteMany({ where: { id: THIRD_PROJECT } });
+    }
+}
+
+test("CONTROL: an unlocked pair-guard read lands a split attribution", { skip }, async () => {
+    await seedTwoJobs();
+    try {
+        for (const sql of UNLOCKED_PAIR_GUARD_SQL) await writerDb!.$executeRawUnsafe(sql);
+        const { row, THIRD_PROJECT } = await raceEstimateMoveAgainstPairGuard();
+
+        assert.equal(row?.estimateId, TARGET_ESTIMATE);
+        // The bug: the guard's unlocked SELECT read the PRE-move project
+        // (TARGET_PROJECT) because it never waited for the mover to commit,
+        // so the expense now claims a job (TARGET_PROJECT) that the estimate
+        // it points at has already LEFT (the estimate itself ends up on
+        // THIRD_PROJECT) -- a split pair, exactly what MISMATCHED_PAIRS_QUERY
+        // exists to catch.
+        assert.equal(row?.projectId, TARGET_PROJECT, "the unlocked guard read the STALE pre-move project");
+        assert.notEqual(row?.projectId, THIRD_PROJECT, "and disagrees with where the estimate actually ended up");
+    } finally {
+        for (const sql of SPLIT_JOB_GUARD_DROP_SQL) await writerDb!.$executeRawUnsafe(sql);
+        await cleanupTwoJobs();
+    }
+});
+
+test("the SHIPPED pair guard's estimate read blocks behind an in-flight estimate move", { skip }, async () => {
+    await seedTwoJobs();
+    try {
+        // Install the guard trigger (it is dropped again by --post-deploy;
+        // here we only need it standing to exercise its SELECT).
+        for (const sql of SPLIT_JOB_GUARD_SQL) await writerDb!.$executeRawUnsafe(sql);
+        const { row, THIRD_PROJECT } = await raceEstimateMoveAgainstPairGuard();
+
+        assert.equal(row?.estimateId, TARGET_ESTIMATE);
+        // The fix: FOR KEY SHARE blocked the guard's SELECT behind the
+        // mover's FOR UPDATE, so it only ran AFTER the move committed and
+        // read the estimate's FINAL project -- the pair stays consistent.
+        assert.equal(row?.projectId, THIRD_PROJECT, "the guard read the estimate's project AFTER the move committed, not before");
+    } finally {
+        for (const sql of SPLIT_JOB_GUARD_DROP_SQL) await writerDb!.$executeRawUnsafe(sql);
         await cleanupTwoJobs();
     }
 });

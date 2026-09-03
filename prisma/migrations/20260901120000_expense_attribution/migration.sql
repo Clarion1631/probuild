@@ -121,6 +121,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS "Expense_sourceFileId_sourceGroupIndex_key"
 -- same name that points somewhere else or carries ON DELETE CASCADE — which is
 -- precisely the failure this constraint exists to prevent. Existing-and-wrong
 -- raises instead of being skipped: an operator has to look at it.
+--
+-- LOCK THE PARENT FIRST, AS ITS OWN STATEMENT, AND ADD NOT VALID (Codex round
+-- 15, item 1). `ALTER TABLE "Expense" ADD CONSTRAINT ... REFERENCES
+-- "Project"` locks the table NAMED in the ALTER TABLE clause (Expense, ACCESS
+-- EXCLUSIVE) before it locks the REFERENCED table (Project, SHARE ROW
+-- EXCLUSIVE, needed even for NOT VALID to install the FK's enforcement
+-- trigger) — Expense before its own parent, backwards from every writer's
+-- lockAttributionParents order. Locks are cumulative within a transaction and
+-- never downgraded, so taking the Project lock first, as its own preceding
+-- statement, makes the ADD CONSTRAINT statement's own request for the same
+-- lock a no-op and the OBSERVED order becomes Project-then-Expense. See
+-- scripts/apply-expense-attribution.mjs (PROJECT_FK_LOCK_STATEMENTS /
+-- PROJECT_FK_VALIDATE_STATEMENTS) for the two-transaction split production
+-- gets; this file stays one transaction (a Prisma requirement) but keeps the
+-- SAME order — lock, then alter, then validate.
+LOCK TABLE "Project" IN SHARE ROW EXCLUSIVE MODE;
 DO $$
 DECLARE existing_def TEXT;
 BEGIN
@@ -131,7 +147,7 @@ BEGIN
   IF existing_def IS NULL THEN
     ALTER TABLE "Expense" ADD CONSTRAINT "Expense_projectId_fkey"
       FOREIGN KEY ("projectId") REFERENCES "Project"("id")
-      ON DELETE SET NULL ON UPDATE CASCADE;
+      ON DELETE SET NULL ON UPDATE CASCADE NOT VALID;
   ELSIF existing_def NOT LIKE '%FOREIGN KEY ("projectId")%'
      OR existing_def NOT LIKE '%REFERENCES "Project"(id)%'
      OR existing_def NOT LIKE '%ON DELETE SET NULL%'
@@ -139,6 +155,7 @@ BEGIN
     RAISE EXCEPTION 'Expense_projectId_fkey already exists with an unexpected definition: %', existing_def;
   END IF;
 END $$;
+ALTER TABLE "Expense" VALIDATE CONSTRAINT "Expense_projectId_fkey";
 
 -- TAX POINTS THE SAME WAY AS THE MONEY, AND IS NEVER BIGGER THAN IT
 -- (Codex round 6 item 2; signed amounts, round 16 item 3).
@@ -247,9 +264,12 @@ BEGIN
        AND OLD."projectId" IS NOT NULL
        AND NEW."estimateId" IS NOT NULL
     THEN
+        -- LOCKED, NOT A PLAIN READ (Codex round 15, item 3). See the same
+        -- comment in scripts/apply-expense-attribution.mjs.
         SELECT est."projectId" INTO est_project
           FROM "Estimate" est
-         WHERE est.id = NEW."estimateId";
+         WHERE est.id = NEW."estimateId"
+           FOR KEY SHARE;
         IF est_project IS NOT NULL THEN
             NEW."projectId" := est_project;
         END IF;
@@ -441,6 +461,9 @@ EXECUTE FUNCTION probuild_expense_amount_tax_guard();
 -- The column has to become nullable first, or SET NULL is unenforceable.
 ALTER TABLE "Expense" ALTER COLUMN "estimateId" DROP NOT NULL;
 
+-- LOCK THE PARENT FIRST, AS ITS OWN STATEMENT, AND ADD NOT VALID (Codex round
+-- 15, item 1) — same reasoning as the Project FK above, pointed at Estimate.
+LOCK TABLE "Estimate" IN SHARE ROW EXCLUSIVE MODE;
 DO $$
 DECLARE existing_def TEXT;
 BEGIN
@@ -451,14 +474,15 @@ BEGIN
   IF existing_def IS NULL THEN
     ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
       FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
-      ON DELETE SET NULL ON UPDATE CASCADE;
+      ON DELETE SET NULL ON UPDATE CASCADE NOT VALID;
   ELSIF existing_def NOT LIKE '%ON DELETE SET NULL%' THEN
     ALTER TABLE "Expense" DROP CONSTRAINT "Expense_estimateId_fkey";
     ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
       FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
-      ON DELETE SET NULL ON UPDATE CASCADE;
+      ON DELETE SET NULL ON UPDATE CASCADE NOT VALID;
   END IF;
 END $$;
+ALTER TABLE "Expense" VALIDATE CONSTRAINT "Expense_estimateId_fkey";
 
 DO $$ BEGIN
   IF to_regclass('"ReceiptIntake"') IS NOT NULL THEN
