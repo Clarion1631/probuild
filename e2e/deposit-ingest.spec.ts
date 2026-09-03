@@ -513,12 +513,7 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
     const unmatched = [a, b].filter((r) => r.body.status === "unmatched");
     expect(applied, "exactly one of the two deposits applies").toHaveLength(1);
     expect(unmatched, "exactly one is refused by the reservation").toHaveLength(1);
-    // Two outcomes are both correct here, and which one fires depends on the
-    // interleaving: the reservation index (P2002) when both reach the reserve
-    // together, or the cross-source claim check when one row is already
-    // visible as in-flight at this same amount and date (both paths run it
-    // inside the reservation transaction — DEPOSIT-SWEEP-PLAN.md, R1).
-    expect(unmatched[0].body.reason).toMatch(/already being applied by another deposit|is already working \(processing\) this same amount/);
+    expect(unmatched[0].body.reason).toContain("already being applied by another deposit");
     expect(unmatched[0].body.officeTaskId).toBeTruthy();
 
     const schedule = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: F.reserve.schedule } });

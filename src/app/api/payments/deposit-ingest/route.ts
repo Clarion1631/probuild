@@ -496,7 +496,9 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
         // Reserve — the partial unique index (scripts/apply-deposit-ingest-schema.mjs)
         // stops a second deposit file from claiming the same milestone concurrently,
         // and the cross-source claim check inside the same transaction stops the OTHER
-        // path from reserving a DIFFERENT milestone for this same money.
+        // SOURCE (the sweep) from reserving a DIFFERENT milestone for this same money.
+        // Another PHOTO at the same amount is not blocked: it carries its own project
+        // name, so it was never ambiguous.
         const reserved = await reserveMilestone(row, picked.id, {
             amountCents: Math.round(payload.amount * 100),
             postDate: isValidCheckDate(payload.checkDate) ? payload.checkDate : null,
@@ -1170,18 +1172,31 @@ class CrossSourceClaimError extends Error {}
  *
  * Used by BOTH paths, which is why photo rows now persist amountCents/postDate:
  * the query has to work in both directions.
+ *
+ * Scoped to the OTHER source, deliberately. Two rows of the SAME source at the
+ * same amount are not this hazard and must not be blocked: two deposit photos
+ * each carry a project name, which is what disambiguates them (the photo path's
+ * matching rules are untouched by this feature), and two bank credits are
+ * already covered by the batch collision rule, the 14-day Paid union and the
+ * applied-row lookup. The match is written as a POSITIVE source equality rather
+ * than `not: row.source` because Prisma's `not` also matches NULL rows — with a
+ * null source meaning "photo", `not` would make photo-vs-photo collide, which
+ * is exactly the case being excluded here.
  */
 async function reserveMilestone(
     row: DepositIngest,
     scheduleId: string,
     claim: { amountCents: number | null; postDate: string | null },
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    // null source = the photo path, the same normalisation findAppliedTwin uses.
+    const otherSource = row.source === BANK_DEPOSIT_SOURCE ? null : BANK_DEPOSIT_SOURCE;
     try {
         await prisma.$transaction(async (tx) => {
             if (claim.amountCents != null && claim.postDate) {
                 const other = await tx.depositIngest.findFirst({
                     where: {
                         id: { not: row.id },
+                        source: otherSource,
                         amountCents: claim.amountCents,
                         postDate: {
                             gte: isoDateToUtc(isoDaysBefore(claim.postDate, CROSS_SOURCE_CLAIM_WINDOW_DAYS)),

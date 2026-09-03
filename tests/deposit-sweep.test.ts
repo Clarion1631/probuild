@@ -301,6 +301,7 @@ function seedMilestone(opts: {
     status?: string;
     requested?: boolean;
     qbInvoiceId?: string | null;
+    projectId?: string;
     projectName?: string;
     clientName?: string;
     invoiceCode?: string;
@@ -321,10 +322,10 @@ function seedMilestone(opts: {
         paymentDate: opts.paymentDate ?? null,
         invoice: {
             id: `inv-${scheduleSeq}`,
-            projectId: "project-1",
+            projectId: opts.projectId ?? "project-1",
             code: opts.invoiceCode ?? `INV-${scheduleSeq}`,
             status: opts.invoiceStatus ?? "Issued",
-            project: { id: "project-1", name: opts.projectName ?? "Hoppe Hall Bath" },
+            project: { id: opts.projectId ?? "project-1", name: opts.projectName ?? "Hoppe Hall Bath" },
             client: { name: opts.clientName ?? "Hoppe" },
         },
     });
@@ -712,6 +713,54 @@ test("cross-source claim check, the other direction: a bank row in flight stands
     assert.equal(body.status, "unmatched");
     assert.match(String(body.reason), /deposit sweep \(bank ref REF-INFLIGHT\)/);
     assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+});
+
+test("the claim check is CROSS-source only: two photos at the same amount both apply", async () => {
+    // Two deposit photos at identical cents inside the window are NOT the
+    // hazard the claim check exists for: each carries a project name, which is
+    // what tells them apart, and the photo path's matching rules are untouched
+    // by the sweep. Blocking the second one here would be a regression in a
+    // path that was never ambiguous. (Prisma's `not` matches NULL rows, so a
+    // `not: row.source` spelling of this filter would do exactly that — hence
+    // the positive other-source equality in reserveMilestone.)
+    tables.project.rows.push(
+        { id: "project-1", name: "Hoppe Hall Bath", client: { name: "Hoppe" } },
+        { id: "project-2", name: "Mesplay Kitchen", client: { name: "Mesplay" } },
+    );
+    const hoppeMilestone = seedMilestone({ amount: 5150.42, projectId: "project-1", projectName: "Hoppe Hall Bath", clientName: "Hoppe", requested: false });
+    const mesplayMilestone = seedMilestone({ amount: 5150.42, projectId: "project-2", projectName: "Mesplay Kitchen", clientName: "Mesplay", requested: false });
+
+    const first = await post({
+        fileId: "drive-photo-hoppe", projectName: "Hoppe Hall Bath", amount: 5150.42,
+        checkDate: SETTLED_DAY, checkNumber: "5001", payerName: "Hoppe",
+    });
+    assert.equal(first.body.status, "applied", `first photo: ${first.body.reason}`);
+    assert.equal(first.body.scheduleId, hoppeMilestone);
+
+    const second = await post({
+        fileId: "drive-photo-mesplay", projectName: "Mesplay Kitchen", amount: 5150.42,
+        checkDate: SETTLED_DAY, checkNumber: "5002", payerName: "Mesplay",
+    });
+    assert.equal(second.body.status, "applied", `second photo must not be claim-blocked: ${second.body.reason}`);
+    assert.equal(second.body.scheduleId, mesplayMilestone);
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === mesplayMilestone)!.status, "Paid");
+});
+
+test("the claim check is CROSS-source only: two bank credits days apart still resolve on their own rules", async () => {
+    // Bank-vs-bank at one amount is covered by the batch collision rule (same
+    // day) and by the union rule plus the applied-row lookup (different days),
+    // so the claim check must not fire between two bank rows either.
+    const requested = seedMilestone({ amount: 5250.43 });
+    tables.depositIngest.rows.push({
+        id: "bank-earlier", fileId: bankFileId("REF-BANK-EARLIER"), status: "applied", source: BANK_DEPOSIT_SOURCE,
+        bankReference: "REF-BANK-EARLIER", extracted: "{}", attempts: 1, amountCents: 525_043,
+        postDate: utc(isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS + 6)), paymentScheduleId: "sched-unrelated", updatedAt: new Date(),
+    });
+
+    const { body } = await post(bankBatch([{ ref: "REF-BANK-LATER", amount: 5250.43 }]));
+    const result = creditResult(body, "REF-BANK-LATER");
+    assert.equal(result.status, "applied", `a second bank credit is judged on the match rules, not the claim check: ${result.reason}`);
+    assert.equal(result.scheduleId, requested);
 });
 
 test("dedup messaging, photo first: the sweep's task says the photo already applied it", async () => {
