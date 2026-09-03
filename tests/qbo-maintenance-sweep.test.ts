@@ -68,11 +68,30 @@ function makePrisma(
             id: `${prefix}-${String(i).padStart(4, "0")}`,
             qbInvoiceId,
             code: `${prefix.toUpperCase()}-${i}`,
+            // The marker the sweep selects on. Present because the sweep now
+            // reads it back to decide the NEXT state (attempt count, or the
+            // durable paylink-missing), and pins it in the CAS.
+            qbSyncError: "paylink-pending",
             invoice: { code: `${prefix.toUpperCase()}-${i}` },
         }));
     const pendingPage = (list: any[], args: any) => {
         const where = args?.where ?? {};
         const matched = list.filter((r) => {
+            // The sweep selects `{ OR: payLinkPendingWhere() }`; every fixture
+            // row carries the bare marker, so the OR is satisfied by the first
+            // clause. Honoured explicitly rather than ignored, so a where this
+            // fake does not understand cannot silently match everything.
+            if (Array.isArray(where.OR)) {
+                const ok = where.OR.some((c: any) => {
+                    const cond = c.qbSyncError;
+                    if (typeof cond === "string") return r.qbSyncError === cond;
+                    if (cond && typeof cond.startsWith === "string") {
+                        return typeof r.qbSyncError === "string" && r.qbSyncError.startsWith(cond.startsWith);
+                    }
+                    return false;
+                });
+                if (!ok) return false;
+            }
             if (where.id?.gt !== undefined && !(r.id > where.id.gt)) return false;
             if (where.id?.lt !== undefined && !(r.id < where.id.lt)) return false;
             return true;
@@ -148,7 +167,7 @@ function makePrisma(
                 async findMany(args: any) {
                     opts.onPage?.();
                     // The pay-link sweep's page, not the payment-options one.
-                    if (args.select?.qbInvoiceId && args.where?.qbSyncError) {
+                    if (args.select?.qbInvoiceId && (args.where?.qbSyncError !== undefined || Array.isArray(args.where?.OR))) {
                         return pendingPage(pending("milestone", "pl"), args).map((r) => ({ ...r }));
                     }
                     let list = all;
@@ -167,7 +186,7 @@ function makePrisma(
                     // the marker filter identifies the second one, and
                     // answering it with `all.length` would report every unpaid
                     // milestone as an unresolved pay link.
-                    if (args?.where?.qbSyncError !== undefined) {
+                    if (args?.where?.qbSyncError !== undefined || Array.isArray(args?.where?.OR)) {
                         return pendingPage(pending("milestone", "pl"), { where: args.where }).length;
                     }
                     const gt = args?.where?.id?.gt;

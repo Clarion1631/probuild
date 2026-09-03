@@ -24,7 +24,7 @@
 import { createHash } from "node:crypto";
 import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents, lockClientRow, clientCustomerStillMatches } from "./tx-retry";
-import { logAutomationEvent } from "./automation-events";
+import { logAutomationEventInTx, type AutomationEventInput } from "./automation-events";
 import { canResolveAmbiguousCreate, canAccessProject, type ProjectScopedUser } from "./access-rules";
 import {
     createRouteDeadline,
@@ -45,7 +45,7 @@ import {
     parseCreateMarker,
     getFreshQBTokens,
 } from "./quickbooks-payments";
-import type { CreateIdentity } from "./qbo-create-markers";
+import { RESOLVE_REASON_MAX_LEN, type CreateIdentity } from "./qbo-create-markers";
 import { milestoneIssuanceHash, progressBillingIssuanceHash, milestoneTaxSplit } from "./qbo-issuance";
 import { toNum } from "./prisma-helpers";
 
@@ -148,6 +148,12 @@ export interface AmbiguousCreateTx {
     progressBilling: { updateMany(args: any): Promise<{ count: number }> };
     invoice: { findUnique(args: any): Promise<any> };
     client: { findUnique(args: any): Promise<any> };
+    /**
+     * The audit row is written HERE, in the same transaction as the
+     * decision it records — see logAutomationEventInTx. Declared on the seam
+     * so a fake database cannot quietly skip it.
+     */
+    automationEvent: { create(args: { data: unknown }): Promise<unknown> };
     $queryRaw(...args: any[]): Promise<unknown>;
 }
 
@@ -166,7 +172,6 @@ export interface ResolveAmbiguousCreateDeps {
     };
     getTokens?: (deadline: RouteDeadline) => Promise<QBTokens>;
     findInvoices?: (tokens: QBTokens, docNumber: string, deadline: RouteDeadline) => Promise<QBInvoiceMatch[]>;
-    logEvent?: typeof logAutomationEvent;
     deadline?: RouteDeadline;
 }
 
@@ -268,7 +273,6 @@ export async function resolveAmbiguousInvoiceCreateCore(
     // overloaded (array form, callback form, options form) and the narrow
     // callback shape this module needs does not assign cleanly from it.
     const db = deps?.db ?? (prisma as unknown as NonNullable<ResolveAmbiguousCreateDeps["db"]>);
-    const logEvent = deps?.logEvent ?? logAutomationEvent;
     const findInvoices = deps?.findInvoices ?? findQBInvoicesByDocNumber;
     const getTokens = deps?.getTokens ?? getFreshQBTokens;
 
@@ -601,7 +605,7 @@ export async function resolveAmbiguousInvoiceCreateCore(
         // asserted. Adopt it. PAYLINK_PENDING_MARKER rather than null, because
         // we have the id but not the pay link — the maintenance sweep fetches it.
         const qbInvoiceId = matches[0].id;
-        const linked = await writeUnderParentLocks(db, input.kind, parked, (delegate) => delegate.updateMany({
+        const linked = await writeUnderParentLocks(db, input.kind, parked, auditEvent(input, parked, "linked", reason, { qbInvoiceId }), (delegate) => delegate.updateMany({
             // The issuance columns are pinned here as well as hashed above: the
             // hash check is a read taken before this write, so without them a
             // settle or a reprice landing in between would still be linked. The
@@ -616,7 +620,6 @@ export async function resolveAmbiguousInvoiceCreateCore(
             },
         }));
         if (!linked.ok) return linked.refused;
-        await audit(logEvent, input, parked, "linked", reason, { qbInvoiceId });
         return {
             ok: true,
             outcome: "linked",
@@ -645,12 +648,11 @@ export async function resolveAmbiguousInvoiceCreateCore(
     // again. A client re-pointed at another QuickBooks customer while this ran
     // makes that answer meaningless, so the guard refuses rather than freeing
     // a row whose real invoice may be sitting in the other customer's ledger.
-    const cleared = await writeUnderParentLocks(db, input.kind, parked, (delegate) => delegate.updateMany({
+    const cleared = await writeUnderParentLocks(db, input.kind, parked, auditEvent(input, parked, "cleared", reason, {}), (delegate) => delegate.updateMany({
         where: { id: parked.id, qbInvoiceId: null, qbSyncError: parked.marker },
         data: { qbSyncError: null },
     }));
     if (!cleared.ok) return cleared.refused;
-    await audit(logEvent, input, parked, "cleared", reason, {});
     return { ok: true, outcome: "cleared", message: "Cleared — QuickBooks has nothing for this, so it can be sent again." };
 }
 
@@ -695,6 +697,12 @@ async function writeUnderParentLocks(
     db: NonNullable<ResolveAmbiguousCreateDeps["db"]>,
     kind: AmbiguousCreateKind,
     parked: ParkedRow,
+    /**
+     * The audit row, committed with the write or not at all. A human override
+     * that lands with no record of who made it, or why, is not reviewable
+     * afterwards — and the row it changed is a money row.
+     */
+    auditInput: AutomationEventInput,
     write: (delegate: { updateMany(args: any): Promise<{ count: number }> }) => Promise<{ count: number }>,
 ): Promise<{ ok: true } | { ok: false; refused: ResolveAmbiguousCreateResult }> {
     const changed: ResolveAmbiguousCreateResult = {
@@ -782,6 +790,12 @@ async function writeUnderParentLocks(
         const delegate = kind === "milestone" ? tx.paymentSchedule : tx.progressBilling;
         const written = await write(delegate);
         if (written.count !== 1) return { ok: false as const, refused: changed };
+        // Same transaction, and it THROWS. The write above is a human decision
+        // about money made against evidence only that human saw; committing it
+        // with a best-effort log means a failed insert leaves a row that changed
+        // state with no author and no reason. Rolling both back is the honest
+        // outcome — the operator sees an error and can decide again.
+        await logAutomationEventInTx(tx, auditInput);
         return { ok: true as const };
     }));
 }
@@ -961,10 +975,12 @@ function parkedIdentity(row: { qbSyncError: string | null; qbInvoiceId: string |
 }
 
 /**
- * How long an operator note may be. Long enough for a real explanation, short
- * enough that it can never be the reason an audit row loses its other fields.
+ * Re-exported from the client-safe marker module, where the UI that has to
+ * enforce the same bound can import it without pulling a server module into
+ * the browser bundle. Two copies of this number is how a note the form
+ * accepts gets rejected by the action that receives it.
  */
-export const RESOLVE_REASON_MAX_LEN = 500;
+export { RESOLVE_REASON_MAX_LEN } from "./qbo-create-markers";
 
 /** Enough marker to recognise, not enough to crowd out the rest of the row. */
 export const MARKER_PREVIEW_LEN = 200;
@@ -980,15 +996,21 @@ export function markerDigest(marker: string): string {
     return createHash("sha256").update(marker).digest("hex").slice(0, 16);
 }
 
-async function audit(
-    logEvent: typeof logAutomationEvent,
+/**
+ * The audit row for one human override, as data.
+ *
+ * Pure, and built BEFORE the transaction opens, so the write inside the
+ * transaction is one insert and nothing that could throw for a reason other
+ * than the insert failing.
+ */
+function auditEvent(
     input: ResolveAmbiguousCreateInput,
     parked: ParkedRow,
     outcome: "linked" | "cleared",
     reason: string,
     extra: Record<string, unknown>,
-) {
-    await logEvent({
+): AutomationEventInput {
+    return {
         kind: "qbo-payments-sync",
         status: "ok",
         reason: `ambiguous-create-${outcome}`,
@@ -1013,5 +1035,5 @@ async function audit(
             actorRole: input.actor.role,
             ...extra,
         },
-    });
+    };
 }

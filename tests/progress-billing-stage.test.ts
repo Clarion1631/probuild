@@ -88,6 +88,12 @@ interface QboCalls {
 
 function makeQbo(behaviour?: {
     createThrows?: unknown;
+    /**
+     * What QuickBooks says the invoice totals, when that is not what we asked
+     * for. Automated Sales Tax recomputing the tax line is the real-world
+     * shape; the default keeps every other test on the matching path.
+     */
+    createdTotal?: number;
     payLinkThrows?: unknown;
     payLink?: string | null;
     deleteResult?: boolean;
@@ -105,12 +111,14 @@ function makeQbo(behaviour?: {
         async createInvoice(_t, input) {
             calls.created.push(input);
             if (behaviour?.createThrows) throw behaviour.createThrows;
-            return { qbId: "qb-1", total: input.amount };
+            return { qbId: "qb-1", total: behaviour?.createdTotal ?? input.amount };
         },
         async getPaymentLink(_t, qbId) {
             calls.payLinks.push(qbId);
             if (behaviour?.payLinkThrows) throw behaviour.payLinkThrows;
-            return behaviour?.payLink ?? "https://pay.example/qb-1";
+            // Presence, not truthiness: `payLink: null` is a real QuickBooks
+            // answer ("this invoice has no payable URL"), not an absent override.
+            return behaviour && "payLink" in behaviour ? behaviour.payLink ?? null : "https://pay.example/qb-1";
         },
         async deleteInvoice(_t, qbId) {
             calls.deleted.push(qbId);
@@ -521,4 +529,106 @@ test("a link write that genuinely failed still compensates", async () => {
     );
     assert.deepEqual(calls.deleted, ["qb-1"], "an unreferenced invoice is still cleaned up");
     assert.equal(row.qbInvoiceId, null);
+});
+
+// --- QuickBooks decides the total, so the total gets checked (round 45, item 2) ---
+
+/**
+ * The create returned `total` all along and nothing read it. QuickBooks is the
+ * system of record for what a client is charged: Automated Sales Tax
+ * recomputes the tax from the customer address and the item tax code, so the
+ * invoice it books can differ from the one we proposed. Staging that as-is
+ * leaves a collectible invoice for one number and a ProBuild row that bills,
+ * reports and reconciles against another — forever, because nothing on this
+ * rail ever looks at the QuickBooks total again.
+ */
+test("a QuickBooks total that differs from the billing is deleted, never staged", async () => {
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo({ createdTotal: 1200 });
+    events.length = 0;
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /QuickBooks created this invoice for \$1200\.00/,
+    );
+
+    assert.deepEqual(calls.deleted, ["qb-1"], "the wrong invoice is removed from QuickBooks");
+    assert.equal(row.qbInvoiceId, null, "nothing was linked");
+    assert.equal(row.status, "Draft", "the billing can be staged again once the tax setup is fixed");
+    assert.equal(row.qbSyncError, null, "the in-flight claim was released");
+    assert.equal(
+        events.filter((e) => e.reason === "create-total-mismatch").length,
+        1,
+        "the drift is on the record even though the invoice is gone",
+    );
+});
+
+test("a total inside the tolerance still stages (control)", async () => {
+    // Without this, the test above would also pass against a rail that refused
+    // EVERY create — which would be a different, worse bug.
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo({ createdTotal: 1089.04 });
+
+    const res = await stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent });
+
+    assert.equal(res.success, true);
+    assert.equal(row.qbInvoiceId, "qb-1");
+    assert.deepEqual(calls.deleted, [], "a rounding-sized difference is not drift");
+});
+
+test("an unreadable total is a mismatch, not a pass", async () => {
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo({ createdTotal: Number.NaN });
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /an unreadable total/,
+    );
+    assert.deepEqual(calls.deleted, ["qb-1"]);
+    assert.equal(row.qbInvoiceId, null);
+});
+
+/**
+ * The delete is a remote call and can fail. Then the invoice is real,
+ * collectible and wrong, and no automated path can fix it: the resolver will
+ * refuse to link it (the marker records the total it should have had) and must
+ * not release the row either, because the document genuinely exists. All that
+ * is left is to stop the next stage from billing on top of it and to tell the
+ * human WHICH document to void.
+ */
+test("when the compensating delete fails the row parks on a marker carrying the QuickBooks id", async () => {
+    const { row, db } = makeDb(draftRow());
+    const { qbo } = makeQbo({ createdTotal: 1200, deleteThrows: new QBTimeoutError("QuickBooks request timed out") });
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /could not be deleted/,
+    );
+
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER);
+    const identity = parseCreateMarker(row.qbSyncError)?.identity;
+    assert.equal(identity?.qbId, "qb-1", "the abandoned document is findable without a DocNumber search");
+    assert.equal(identity?.expectedTotal, 1089, "and what it SHOULD have been is on the record");
+    assert.equal(row.qbInvoiceId, null, "a wrong invoice is never linked");
+});
+
+// --- A null pay link keeps the row in the repair queue (round 45, item 1) ---
+
+/**
+ * `getPaymentLink` can answer null without throwing. This path used to write
+ * `qbSyncError: null` on that answer, which took an invoice with no payable URL
+ * out of the sweep's queue and out of every health count in one write — the
+ * same bug the sweep had, on the other end of the same rail. Both now go
+ * through `nextPayLinkState`.
+ */
+test("a null pay link on the direct path keeps the row queued for repair", async () => {
+    const { row, db } = makeDb(draftRow());
+    const { qbo } = makeQbo({ payLink: null });
+
+    const res = await stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent });
+
+    assert.equal(res.success, true, "the invoice is real and linked; only the convenience link is missing");
+    assert.equal(res.qbInvoiceLink, null);
+    assert.equal(row.qbInvoiceId, "qb-1");
+    assert.equal(row.qbSyncError, "paylink-pending:1", "still in the sweep's queue, with the attempt recorded");
 });

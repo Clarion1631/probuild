@@ -910,6 +910,7 @@ test("round 44: each parked money-path queue alone turns health non-green", () =
     assert.equal(evaluatePipelineHealth(green).ok, true, "the control really is green");
 
     const queues: Array<[string, string]> = [
+        ["payLinksMissing", "pay-links-missing:1"],
         ["parkedCreates", "parked-creates:1"],
         ["parkedDocumentSyncs", "parked-document-syncs:1"],
         ["pendingDeletions", "pending-deletions:1"],
@@ -973,4 +974,39 @@ test("round 44: the limiter never exceeds its cap when a slot is handed over", a
     assert.ok(a, "and it is the caller that was already waiting, not the one that jumped in");
 
     for (const release of granted) release!();
+});
+
+// --- Round 45: a missing pay link is its own standing queue ---
+
+/**
+ * `paylink-pending` clears itself, one way or another, once QuickBooks
+ * answers. `paylink-missing` does not: the retries are spent and the invoice
+ * still has no payable URL, so somebody has to open it in QuickBooks. Counting
+ * it with the pending rows would hide it behind a number that drains on its
+ * own; not counting it at all is what let the row vanish from health entirely.
+ */
+test("round 45: a missing pay link is counted and named separately from a pending one", () => {
+    const missing = evaluatePipelineHealth(snapshot({ payLinksMissing: { status: "ok", count: 2 } } as any));
+    assert.equal(missing.ok, false);
+    assert.ok(missing.reasons.includes("pay-links-missing:2"), missing.reasons.join(","));
+    assert.ok(
+        !missing.reasons.some((r) => r.startsWith("pay-links-pending")),
+        "the two queues are not the same queue",
+    );
+});
+
+test("round 45: a pay-link-missing probe that FAILED is reported, not read as zero", () => {
+    const v = evaluatePipelineHealth(snapshot({ payLinksMissing: { status: "error", reason: "timeout", count: 0 } } as any));
+    assert.equal(v.ok, false);
+    assert.ok(v.reasons.includes("probe-failed:pay-links-missing"), v.reasons.join(","));
+});
+
+test("round 45: the digest tells the operator what to DO about a missing pay link", () => {
+    const digest = formatPipelineDigest(sampleHealth({
+        ok: false,
+        reasons: ["pay-links-missing:1"],
+        payLinksMissing: { status: "ok", count: 1 },
+    } as any));
+    assert.match(digest.text, /NO payable link/);
+    assert.match(digest.text, /QuickBooks/);
 });

@@ -55,6 +55,9 @@ import {
     AMBIGUOUS_CREATE_MARKER,
     CREATE_IN_FLIGHT_MARKER,
     PAYLINK_PENDING_MARKER,
+    isPayLinkPending,
+    nextPayLinkState,
+    payLinkPendingWhere,
     composeCreateMarker,
     isBlockedByAmbiguousCreate,
 } from "./qbo-create-markers";
@@ -339,6 +342,8 @@ export {
     CREATE_IN_FLIGHT_MARKER,
     CREATE_IN_FLIGHT_STALE_MS,
     PAYLINK_PENDING_MARKER,
+    PAYLINK_MISSING_MARKER,
+    PAYLINK_MAX_ATTEMPTS,
     PENDING_CREATE_MARKERS,
     PENDING_DELETION_MARKER,
     PENDING_DELETION_SETTLED_MARKER,
@@ -547,6 +552,8 @@ export interface PayLinkPendingRow {
     id: string;
     qbInvoiceId: string;
     code: string;
+    /** The marker as READ, so the attempt count survives into the write. */
+    qbSyncError: string | null;
 }
 
 export interface PayLinkSweepDelegate {
@@ -579,6 +586,8 @@ export interface PayLinkSweepResult {
     repaired: number;
     /** QuickBooks answered, but this invoice has no payment link to offer. */
     noLink: number;
+    /** Rows that ran out of retries and are now durably `paylink-missing`. */
+    payLinkMissing: number;
     /** Left for the next run — the sweep stopped, or the CAS lost. */
     skipped: number;
     /**
@@ -867,11 +876,14 @@ export async function sweepPendingPayLinks(
     const cursorStore = deps?.cursorStore ?? automationSettingCursorStore;
     const zero = (): PayLinkRailCounts => ({ milestone: 0, progressBilling: 0, total: 0 });
     const result: PayLinkSweepResult = {
-        checked: 0, repaired: 0, noLink: 0, skipped: 0,
+        checked: 0, repaired: 0, noLink: 0, payLinkMissing: 0, skipped: 0,
         unvisited: zero(), unresolved: zero(), railFirst: "milestone",
     };
 
-    const where = { qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceId: { not: null } };
+    // Attempt-suffixed markers too: a row that has already come back empty once
+    // carries `paylink-pending:1`, and pinning the bare value would drop every
+    // retry out of the queue after its first miss.
+    const where = { OR: payLinkPendingWhere(), qbInvoiceId: { not: null } };
 
     /**
      * One rail's rows for this run: the tail after its cursor, and — only when
@@ -933,12 +945,12 @@ export async function sweepPendingPayLinks(
     const [milestonePage, billingPage, milestonesEligible, billingsEligible] = await Promise.all([
         fetchRail(
             db.paymentSchedule,
-            { id: true, qbInvoiceId: true, invoice: { select: { code: true } } },
+            { id: true, qbInvoiceId: true, qbSyncError: true, invoice: { select: { code: true } } },
             PAYLINK_CURSOR_KEYS.milestones,
         ),
         fetchRail(
             db.progressBilling,
-            { id: true, qbInvoiceId: true, code: true },
+            { id: true, qbInvoiceId: true, qbSyncError: true, code: true },
             PAYLINK_CURSOR_KEYS.billings,
         ),
         // Eligible-at-start, per rail. `unvisited` is measured against this, so
@@ -998,11 +1010,17 @@ export async function sweepPendingPayLinks(
 
     const milestoneEntries = milestones.map((m: any) => ({
         kind: "milestone" as const,
-        row: { id: m.id, qbInvoiceId: m.qbInvoiceId as string, code: m.invoice?.code ?? m.id },
+        row: {
+            id: m.id, qbInvoiceId: m.qbInvoiceId as string, code: m.invoice?.code ?? m.id,
+            qbSyncError: (m.qbSyncError ?? null) as string | null,
+        },
     }));
     const billingEntries = billings.map((b: any) => ({
         kind: "progressBilling" as const,
-        row: { id: b.id, qbInvoiceId: b.qbInvoiceId as string, code: b.code },
+        row: {
+            id: b.id, qbInvoiceId: b.qbInvoiceId as string, code: b.code,
+            qbSyncError: (b.qbSyncError ?? null) as string | null,
+        },
     }));
     const rows: { kind: "milestone" | "progressBilling"; row: PayLinkPendingRow }[] =
         railFirst === "milestone"
@@ -1062,9 +1080,22 @@ export async function sweepPendingPayLinks(
         const delegate = entry.kind === "milestone" ? db.paymentSchedule : db.progressBilling;
         // CAS: only clear a marker we still own, on a row still pointing at the
         // invoice we just read. A concurrent unlink/re-stage must win.
+        // A NULL LINK IS NOT A REPAIR. Clearing the marker either way wrote
+        // `qbSyncError: null` on an invoice with no payable URL, counted it as
+        // "noLink", and dropped it out of this queue — so health went green while
+        // a client held a bill they could not pay. `nextPayLinkState` is the one
+        // decision: clear only on a real link, otherwise keep waiting (bounded)
+        // and finally park as `paylink-missing`, which health counts.
+        const next = nextPayLinkState(entry.row.qbSyncError, payLink);
         const cleared = await delegate.updateMany({
-            where: { id: entry.row.id, qbInvoiceId: entry.row.qbInvoiceId, qbSyncError: PAYLINK_PENDING_MARKER },
-            data: { qbSyncError: null, ...(payLink ? { qbInvoiceLink: payLink } : {}) },
+            where: {
+                id: entry.row.id,
+                qbInvoiceId: entry.row.qbInvoiceId,
+                // Pinned to the marker THIS row was read with, so a concurrent
+                // retry cannot double-count an attempt.
+                qbSyncError: entry.row.qbSyncError,
+            },
+            data: { qbSyncError: next.marker, ...(next.link ? { qbInvoiceLink: next.link } : {}) },
         });
         // Decided either way: a lost CAS means someone else moved this row on,
         // so it is no longer this sweep's work.
@@ -1073,8 +1104,13 @@ export async function sweepPendingPayLinks(
             result.skipped++;
             continue;
         }
-        if (payLink) result.repaired++;
-        else result.noLink++;
+        if (next.link) result.repaired++;
+        else {
+            // Still outstanding either way; `exhausted` only says whether a
+            // human now has to look at it.
+            result.noLink++;
+            if (next.exhausted) result.payLinkMissing++;
+        }
     }
 
     // Every exit above falls through to here, so the resume point is recorded
@@ -1462,6 +1498,12 @@ export async function finalizeMilestoneLinkUnderLock(
         // poller only watches Pending) and the content snapshot
         // (amount/name/dueDate) pinned to what the QBO invoice was actually
         // created from, so a mid-push edit can't leave QBO silently out of sync.
+        // One decision for every pay-link outcome on every rail — the sweep,
+        // the progress-billing stage and this finalizer all call it, so a null
+        // link cannot mean "repaired" in one place and "still queued" in
+        // another. Attempts start at zero here: this create's own read is the
+        // first one.
+        const payLinkState = nextPayLinkState(null, payLink);
         const claimed = claimedNow ? { count: 0 } : await tx.paymentSchedule.updateMany({
             where: {
                 id: schedule.id,
@@ -1483,8 +1525,19 @@ export async function finalizeMilestoneLinkUnderLock(
                 name: schedule.name,
                 dueDate: schedule.dueDate,
             },
-            // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
-            data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
+            // The marker a fresh invoice ends on. Any prior voided/notFound flag
+            // is overwritten either way (self-heal); what decides between `null`
+            // and a retry marker is whether a payable URL was actually
+            // persisted. `payLink` reaches here as null from two places — the
+            // create path's `.catch(() => null)` and a QuickBooks answer of
+            // "no link" — and writing `qbSyncError: null` on either took an
+            // invoice the client cannot pay straight out of the repair queue.
+            data: {
+                qbInvoiceId: qbId,
+                qbInvoiceLink: payLinkState.link ?? null,
+                qbSyncedAt: new Date(),
+                qbSyncError: payLinkState.marker,
+            },
         });
         if (claimed.count === 1) return { outcome: "linked", payLink };
         // The claim lost. Before treating this invoice as abandoned, ask what
@@ -1632,6 +1685,8 @@ export async function pushMilestoneToQuickBooks(
         // surfaces.
         let payLink = schedule.qbInvoiceLink;
         let linkReadFailed = false;
+        /** Did the pay-link read actually ANSWER on this call (a link, or a definite none)? */
+        let payLinkAnswered = false;
         /** What `qbSyncError` holds after the claim — what the final CAS pins. */
         let markerNow = schedule.qbSyncError;
         /** Did THIS call write a `paylink-pending` claim it now owes a retraction for? */
@@ -1653,6 +1708,7 @@ export async function pushMilestoneToQuickBooks(
             claimedPending = claimMarker === PAYLINK_PENDING_MARKER;
             try {
                 payLink = await getQBInvoicePaymentLink(tokens, linkedQbInvoiceId, pushDeadline);
+                payLinkAnswered = true;
             } catch (error) {
                 if (!isAmbiguousCreateFailure(error)) throw error;
                 linkReadFailed = true;
@@ -1674,9 +1730,21 @@ export async function pushMilestoneToQuickBooks(
         //     asked for it to be deleted and the delete has not been confirmed,
         //     so "we could read it" is evidence the intent is UNFINISHED, not
         //     evidence to forget it.
-        const clearFlag = !linkReadFailed && !isPendingDeletion(markerNow)
+        // A pay-link marker is not cleared by "QuickBooks answered" — only by a
+        // payable URL actually landing on the row. This branch used to clear it
+        // on a definite "no link", which is the same false repair the sweep and
+        // the progress-billing stage had: the invoice stays uncollectable and
+        // leaves the queue. Routed through the one helper, a null answer keeps
+        // the row queued with its attempt recorded, and eventually parks it on
+        // `paylink-missing` for a human.
+        const payLinkDecision = payLinkAnswered && isPayLinkPending(markerNow)
+            ? nextPayLinkState(markerNow, payLink)
+            : null;
+        // Unchanged for every OTHER marker: a `voided`/`notFound` flag is still
+        // cleared by the original evidence, a reachable invoice.
+        const clearFlag = !linkReadFailed && !isPendingDeletion(markerNow) && !payLinkDecision
             && (claimedPending || (!!markerNow && !!status));
-        if (linkChanged || clearFlag) {
+        if (linkChanged || clearFlag || payLinkDecision) {
             const written = await prisma.paymentSchedule.updateMany({
                 // Pinned to the link we read AND to the marker the claim left,
                 // so an unlink or a new create claim during the remote calls
@@ -1685,6 +1753,7 @@ export async function pushMilestoneToQuickBooks(
                 data: {
                     ...(linkChanged ? { qbInvoiceLink: payLink } : {}),
                     ...(clearFlag ? { qbSyncError: null } : {}),
+                    ...(payLinkDecision ? { qbSyncError: payLinkDecision.marker } : {}),
                 },
             });
             if (written.count !== 1) {

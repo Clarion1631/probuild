@@ -174,6 +174,11 @@ function makeDb(
          * before the child write can catch this one.
          */
         onClientRead?: () => void;
+        /**
+         * Fires when the AUDIT row is inserted, inside the same transaction as
+         * the decision. Throw from it to model a failing audit insert.
+         */
+        onAuditWrite?: () => void;
     } = {},
     clientRow: any = { qbCustomerId: CUSTOMER_ID },
 ) {
@@ -196,6 +201,19 @@ function makeDb(
     const tx = {
         paymentSchedule,
         progressBilling,
+        automationEvent: {
+            async create(args: any) {
+                seams.onAuditWrite?.();
+                // `detail` reaches Prisma as a JSON string; decoded here so the
+                // assertions read the fields rather than the encoding.
+                const data = args.data;
+                events.push({
+                    ...data,
+                    detail: typeof data.detail === "string" ? JSON.parse(data.detail) : data.detail,
+                });
+                return { id: `ev-${events.length}` };
+            },
+        },
         invoice: {
             async findUnique() {
                 if (!held.estimate || !held.invoice) {
@@ -247,8 +265,27 @@ function makeDb(
         locks,
         parent: parentInvoice,
         client: clientRow,
+        /**
+         * A REAL rollback, not just a call-through. The row fakes mutate in
+         * place, so without restoring them a test asserting "the audit failed,
+         * therefore nothing changed" would pass against code that committed
+         * the change and merely threw afterwards — i.e. against the bug.
+         */
         async $transaction<T>(fn: (t: any) => Promise<T>): Promise<T> {
-            return fn(tx);
+            const before = [milestone, billing].map((r) => (r ? { ...r } : null));
+            const eventsBefore = events.length;
+            try {
+                return await fn(tx);
+            } catch (err) {
+                for (const [i, row] of [milestone, billing].entries()) {
+                    const snap = before[i];
+                    if (!row || !snap) continue;
+                    for (const k of Object.keys(row)) delete row[k];
+                    Object.assign(row, snap);
+                }
+                events.length = eventsBefore;
+                throw err;
+            }
         },
     };
 }
@@ -294,7 +331,6 @@ const invoice = (
 function deps(found: QBInvoiceMatch[] | (() => Promise<QBInvoiceMatch[]>), db: any) {
     return {
         db,
-        logEvent,
         getTokens: async () => TOKENS,
         findInvoices: async () => (typeof found === "function" ? found() : found),
     };
@@ -573,7 +609,7 @@ test("round 31 gate: a young create-in-flight marker with an EXACT match is refu
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, decision: "link-existing", expectedState: ambiguousCreateFingerprint(row) },
         {
-            db, logEvent,
+            db,
             getTokens: async () => TOKENS,
             findInvoices: async () => { asked++; return [invoice("qb-9", MILESTONE_NOTE)]; },
         },
@@ -674,7 +710,7 @@ test("round 31 gate: a FINANCE user restricted to a different project is refused
             actor: { id: "u4", email: "f2@x", role: "FINANCE", projectAccess: [{ projectId: "proj-other" }] },
         },
         {
-            db, logEvent,
+            db,
             getTokens: async () => TOKENS,
             findInvoices: async () => { asked++; return [invoice("qb-9", MILESTONE_NOTE)]; },
         },
@@ -844,7 +880,6 @@ test("the queried identity does not move when a sibling is deleted or the projec
         { ...base, expectedState: ambiguousCreateFingerprint(row) },
         {
             db,
-            logEvent,
             getTokens: async () => TOKENS,
             findInvoices: async (_t, docNumber) => {
                 asked.push(docNumber);
@@ -870,7 +905,7 @@ test("a marker with no identity refuses, and confirmed-none cannot clear it", as
             const res = await resolveAmbiguousInvoiceCreateCore(
                 { ...base, decision, expectedState: ambiguousCreateFingerprint(row) },
                 {
-                    db, logEvent,
+                    db,
                     getTokens: async () => TOKENS,
                     findInvoices: async () => { asked++; return []; },
                 },
@@ -899,7 +934,7 @@ test("round 35 gate: a marker from another QuickBooks realm is refused, never qu
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
         {
-            db, logEvent,
+            db,
             getTokens: async () => ({ ...TOKENS, realmId: "realm-OTHER" }),
             findInvoices: async () => { asked++; return []; },
         },
@@ -923,7 +958,7 @@ test("round 35 gate: a row re-pointed at a different QuickBooks customer is refu
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, expectedState: ambiguousCreateFingerprint(row) },
         {
-            db, logEvent,
+            db,
             getTokens: async () => TOKENS,
             findInvoices: async () => { asked++; return [invoice("qb-9", MILESTONE_NOTE)]; },
         },
@@ -961,7 +996,7 @@ test("round 35 gate: a marker predating the realm field is refused outright and 
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
         {
-            db, logEvent,
+            db,
             getTokens: async () => TOKENS,
             findInvoices: async () => { asked++; return []; },
         },
@@ -1288,4 +1323,91 @@ test("round 36 gate: the under-lock CUSTOMER check stands alone when the marker 
     assert.equal(res.ok, false);
     assert.equal(!res.ok && res.refusal, "mismatch");
     assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked — not released");
+});
+
+// --- Round 45: the audit row commits with the decision, or not at all ---
+
+/**
+ * Every other automation event in this codebase is fire-and-forget, and that
+ * is right: a QuickBooks push that succeeded must not be undone because a log
+ * insert failed. A HUMAN OVERRIDE is the opposite case. Linking a parked row to
+ * an invoice, or asserting QuickBooks holds nothing and releasing the row to
+ * bill again, is a decision a person made against evidence only they saw. The
+ * record of who decided it and why is the only thing that makes the write
+ * reviewable afterwards — committed without it, a money row silently changes
+ * state with no author.
+ */
+test("round 45: an audit row that cannot be written rolls the LINK back", async () => {
+    const row = milestoneRow();
+    const marker = row.qbSyncError;
+    const db = makeDb(row, null, parentFixture(), {
+        onAuditWrite: () => { throw new Error("automation event insert failed"); },
+    });
+
+    await assert.rejects(
+        () => resolveAmbiguousInvoiceCreateCore(
+            { ...base, expectedState: ambiguousCreateFingerprint(row) },
+            deps([invoice("qb-9", MILESTONE_NOTE)], db),
+        ),
+        /automation event insert failed/,
+    );
+
+    assert.equal(row.qbInvoiceId, null, "the link did not commit without its audit row");
+    assert.equal(row.qbSyncError, marker, "the row is still parked, exactly as it was");
+});
+
+test("round 45: the same failure rolls the CLEAR back too", async () => {
+    const row = milestoneRow();
+    const marker = row.qbSyncError;
+    const db = makeDb(row, null, parentFixture(), {
+        onAuditWrite: () => { throw new Error("automation event insert failed"); },
+    });
+
+    await assert.rejects(
+        () => resolveAmbiguousInvoiceCreateCore(
+            { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+            deps([], db),
+        ),
+        /automation event insert failed/,
+    );
+
+    assert.equal(row.qbSyncError, marker, "a row released with no record of who released it is not released");
+});
+
+test("round 45: the control — a working audit insert commits BOTH rows", async () => {
+    const row = milestoneRow();
+    const db = makeDb(row, null, parentFixture());
+    events.length = 0;
+
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE)], db),
+    );
+
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(row.qbInvoiceId, "qb-9");
+    assert.equal(events.length, 1, "one audit row, written inside the same transaction");
+    assert.equal(events[0].reason, "ambiguous-create-linked");
+    assert.equal(events[0].detail.operatorReason, base.reason);
+    assert.equal(events[0].detail.actorRole, ADMIN.role, "who decided it");
+});
+
+/**
+ * The identity a failed compensation leaves behind (progress-billing rail,
+ * round 45 item 2) has to survive the marker's own encoding: composed into a
+ * string, parsed back out, still the same document id.
+ */
+test("round 45: a left-behind QuickBooks id rides through compose/parse", () => {
+    const withId = { ...MILESTONE_IDENTITY, qbId: "1042" };
+    const marker = composeCreateMarker(AMBIGUOUS_CREATE_MARKER, withId, AMBIGUOUS_MARKER_AT);
+    const parsed = parseCreateMarker(marker);
+    assert.equal(parsed?.kind, AMBIGUOUS_CREATE_MARKER);
+    assert.deepEqual(parsed?.identity, withId);
+
+    // And a marker that carries none still parses to an identity with no such
+    // key at all, so a deep-equality check against an older shape still holds.
+    const without = parseCreateMarker(
+        composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY, AMBIGUOUS_MARKER_AT),
+    );
+    assert.equal("qbId" in (without?.identity ?? {}), false);
 });

@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import type { Prisma } from "@prisma/client";
 
 /**
  * Append-only event log behind the Automation Command Center.
@@ -126,7 +127,15 @@ export function serializeDetail(detail: Record<string, unknown> | undefined): st
         : JSON.stringify({ truncated: true, droppedKeys: dropped.slice(0, 20) });
 }
 
-export async function logAutomationEvent(input: AutomationEventInput): Promise<void> {
+/**
+ * The row an event becomes, with every column already clipped to its budget.
+ *
+ * Split out from the writer so the FIRE-AND-FORGET path and the
+ * TRANSACTIONAL one below cannot disagree about what gets recorded: two
+ * copies of this shaping is how an audit row ends up with a field one caller
+ * writes and the other silently drops.
+ */
+export function automationEventData(input: AutomationEventInput): Prisma.AutomationEventCreateInput {
     const safeCents = (v: number | undefined) => {
         if (typeof v !== "number" || !Number.isFinite(v)) return undefined;
         const rounded = Math.round(v);
@@ -145,32 +154,56 @@ export async function logAutomationEvent(input: AutomationEventInput): Promise<v
         typeof input.detail?.qbPurchaseId === "string" && input.detail.qbPurchaseId
             ? input.detail.qbPurchaseId
             : undefined;
+    return {
+        kind: input.kind,
+        stage: clip(input.stage),
+        status: clip(input.status) ?? "unknown",
+        reason: clip(input.reason),
+        source: clip(input.source),
+        vendor: clip(input.vendor),
+        projectName: clip(input.projectName),
+        docNumber: clip(input.docNumber),
+        fileName: clip(input.fileName),
+        amountCents: safeCents(input.amountCents),
+        taxCents: safeCents(input.taxCents),
+        qbPurchaseId: clip(qbPurchaseId),
+        driveFileId: clip(driveFileId),
+        detail: serializeDetail(input.detail),
+    };
+}
 
+export async function logAutomationEvent(input: AutomationEventInput): Promise<void> {
     try {
-        await prisma.automationEvent.create({
-            data: {
-                kind: input.kind,
-                stage: clip(input.stage),
-                status: clip(input.status) ?? "unknown",
-                reason: clip(input.reason),
-                source: clip(input.source),
-                vendor: clip(input.vendor),
-                projectName: clip(input.projectName),
-                docNumber: clip(input.docNumber),
-                fileName: clip(input.fileName),
-                amountCents: safeCents(input.amountCents),
-                taxCents: safeCents(input.taxCents),
-                qbPurchaseId: clip(qbPurchaseId),
-                driveFileId: clip(driveFileId),
-                detail: serializeDetail(input.detail),
-            },
-        });
+        await prisma.automationEvent.create({ data: automationEventData(input) });
     } catch (error) {
         console.error(
             "automation event log failed",
             error instanceof Error ? error.name : "UnknownError",
         );
     }
+}
+
+/**
+ * The one place an automation event is NOT fire-and-forget.
+ *
+ * The comment above says the books write outranks the audit row, and for
+ * every automated path it does — a QuickBooks push that succeeded must not be
+ * undone because a log insert failed. A HUMAN OVERRIDE is the opposite case.
+ * Linking a parked row to an invoice, or asserting that QuickBooks holds
+ * nothing and releasing the row to bill again, is a decision a person made
+ * against evidence only they saw. The record of who decided it, and why, is
+ * not commentary on the write — it is the only thing that makes the write
+ * reviewable afterwards. Committed without it, the row silently changes state
+ * with no author.
+ *
+ * So this one THROWS, and runs inside the caller's transaction: either the
+ * decision and its audit row both commit, or neither does.
+ */
+export async function logAutomationEventInTx(
+    tx: { automationEvent: { create(args: { data: unknown }): Promise<unknown> } },
+    input: AutomationEventInput,
+): Promise<void> {
+    await tx.automationEvent.create({ data: automationEventData(input) });
 }
 
 // ── Dashboard reads ─────────────────────────────────────────────────────────

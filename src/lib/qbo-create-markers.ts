@@ -50,6 +50,86 @@ export const CREATE_IN_FLIGHT_STALE_MS = 5 * 60_000;
 export const PAYLINK_PENDING_MARKER = "paylink-pending";
 
 /**
+ * The pay-link fetch has now failed enough times that nobody should keep
+ * waiting for it.
+ *
+ * `paylink-pending` used to be cleared whether or not a link came back: a null
+ * answer wrote `qbSyncError: null` and counted the row as "noLink", so an
+ * invoice with NO payable URL left the repair queue and health went green. The
+ * client had a bill they could not pay and nothing said so anywhere.
+ *
+ * The marker is now only cleared when a non-empty link was actually persisted.
+ * A null answer keeps it and increments an attempt counter; past
+ * PAYLINK_MAX_ATTEMPTS it becomes THIS, which is durable, counted by
+ * pipeline-health as a standing queue and named in the digest. It is a real
+ * state, not the absence of one.
+ */
+export const PAYLINK_MISSING_MARKER = "paylink-missing";
+
+/**
+ * How many times the sweep asks QuickBooks for a link before calling it missing.
+ *
+ * The sweep runs hourly, so this is roughly five hours of a transient failure
+ * before a human is told — long enough to ride out an Intuit blip, short enough
+ * that a client is not sitting on an unpayable invoice for a day.
+ */
+export const PAYLINK_MAX_ATTEMPTS = 5;
+
+/**
+ * How long an operator note may be. Long enough for a real explanation, short
+ * enough that it can never be the reason an audit row loses its other fields.
+ *
+ * Lives in this module because BOTH ends need it: the server action that
+ * refuses an over-long note, and the client form that collects it. This is the
+ * one module the invoice editor can import.
+ */
+export const RESOLVE_REASON_MAX_LEN = 500;
+
+/** Bare `paylink-pending`, or `paylink-pending:<attempts>`. */
+export function isPayLinkPending(marker: string | null | undefined): boolean {
+    if (!marker) return false;
+    return marker === PAYLINK_PENDING_MARKER
+        || marker.startsWith(PAYLINK_PENDING_MARKER + MARKER_KIND_SEP);
+}
+
+/** How many fetches have already come back empty. A bare marker means none. */
+export function payLinkAttempts(marker: string | null | undefined): number {
+    if (!isPayLinkPending(marker)) return 0;
+    const at = (marker as string).indexOf(MARKER_KIND_SEP);
+    if (at === -1) return 0;
+    const n = Number.parseInt((marker as string).slice(at + 1), 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** Every shape a still-waiting row can carry, for a Prisma `OR`. */
+export function payLinkPendingWhere(): Array<{ qbSyncError: string | { startsWith: string } }> {
+    return [
+        { qbSyncError: PAYLINK_PENDING_MARKER },
+        { qbSyncError: { startsWith: PAYLINK_PENDING_MARKER + MARKER_KIND_SEP } },
+    ];
+}
+
+/**
+ * THE decision both pay-link writers make. One helper, so the sweep and the
+ * progress-billing stage path cannot disagree about what a null link means.
+ *
+ * `link` is only present when there is something worth persisting; the caller
+ * must never write an empty string over a real URL.
+ */
+export function nextPayLinkState(
+    currentMarker: string | null | undefined,
+    payLink: string | null | undefined,
+): { marker: string | null; link?: string; exhausted: boolean } {
+    const link = (payLink ?? "").trim();
+    if (link) return { marker: null, link, exhausted: false };
+    const attempts = payLinkAttempts(currentMarker) + 1;
+    if (attempts >= PAYLINK_MAX_ATTEMPTS) {
+        return { marker: PAYLINK_MISSING_MARKER, exhausted: true };
+    }
+    return { marker: `${PAYLINK_PENDING_MARKER}${MARKER_KIND_SEP}${attempts}`, exhausted: false };
+}
+
+/**
  * The two markers that mean "an invoice may exist in QuickBooks for this row
  * even though qbInvoiceId is null". Both appear as a bare marker (legacy rows)
  * or with a recovery identity appended (see composeCreateMarker), so a Prisma
@@ -193,6 +273,22 @@ export interface CreateIdentity {
      * refused.
      */
     customerId?: string;
+    /**
+     * The QuickBooks id of a document this create DID produce and then could
+     * not clean up.
+     *
+     * Every other field here describes what we went looking for. This one
+     * records what we already found and failed to undo: a create whose
+     * returned total did not match the row it was issued against, whose
+     * compensating delete then failed. The invoice is real, collectible and
+     * WRONG, and the row must never re-stage on top of it. The resolver
+     * cannot fix that — a human has to void it in QuickBooks — so the id is
+     * carried here to make it findable instead of leaving an operator to
+     * search a company file by DocNumber.
+     *
+     * `undefined` is the normal case: nothing was left behind.
+     */
+    qbId?: string;
 }
 
 /** Separates the marker kind from its identity payload. */
@@ -256,6 +352,14 @@ const MARKER_REALM_PREFIX = "~";
  * Last of the optional fields, immediately before the docNumber.
  */
 const MARKER_CUSTOMER_PREFIX = "%";
+/**
+ * Prefixes the QuickBooks id of a document left behind by a failed
+ * compensation, e.g. `ambiguous-create:%58|!1042|INV-00171-2|ProBuild ...`.
+ *
+ * Last of the optional fields, immediately before the docNumber, for the
+ * same positional-safety reason as the prefixes above.
+ */
+const MARKER_QBID_PREFIX = "!";
 
 /** Every optional field prefix, in the order composeCreateMarker emits them. */
 const MARKER_OPTIONAL_PREFIXES = [
@@ -264,6 +368,7 @@ const MARKER_OPTIONAL_PREFIXES = [
     MARKER_TOTAL_PREFIX,
     MARKER_REALM_PREFIX,
     MARKER_CUSTOMER_PREFIX,
+    MARKER_QBID_PREFIX,
 ] as const;
 
 /**
@@ -308,7 +413,7 @@ export function composeCreateMarker(
     // separator in the DocNumber would, and an EMPTY one would compose a field
     // that parses back as absent -- i.e. silently downgrade to "unknown realm".
     // Both are invariants of the ids QuickBooks issues, not input validation.
-    for (const [label, value] of [["realmId", identity.realmId], ["customerId", identity.customerId]] as const) {
+    for (const [label, value] of [["realmId", identity.realmId], ["customerId", identity.customerId], ["qbId", identity.qbId]] as const) {
         if (value == null) continue;
         if (value === "" || value.includes(MARKER_FIELD_SEP)) {
             throw new Error(`${label} must be non-empty and must not contain "${MARKER_FIELD_SEP}": ${value}`);
@@ -336,7 +441,10 @@ export function composeCreateMarker(
     const customerPart = identity.customerId
         ? `${MARKER_CUSTOMER_PREFIX}${identity.customerId}${MARKER_FIELD_SEP}`
         : "";
-    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${totalPart}${realmPart}${customerPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
+    const qbIdPart = identity.qbId
+        ? `${MARKER_QBID_PREFIX}${identity.qbId}${MARKER_FIELD_SEP}`
+        : "";
+    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${totalPart}${realmPart}${customerPart}${qbIdPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
 }
 
 /** Which pending-create marker is this, identity or not? `null` when it is neither. */
@@ -425,6 +533,16 @@ export function parseCreateMarker(
         }
         // Same fall-through as `~...` above.
     }
+    let qbId: string | undefined;
+    if (payload.startsWith(MARKER_QBID_PREFIX)) {
+        const end = payload.indexOf(MARKER_FIELD_SEP);
+        const raw = end > 0 ? payload.slice(MARKER_QBID_PREFIX.length, end) : "";
+        if (raw) {
+            qbId = raw;
+            payload = payload.slice(end + MARKER_FIELD_SEP.length);
+        }
+        // Same fall-through as `%...` above.
+    }
     const sep = payload.indexOf(MARKER_FIELD_SEP);
     // A payload with no separator, an empty docNumber or an empty note is a
     // corrupt marker. Same handling as the legacy shape: refuse, don't guess.
@@ -444,6 +562,7 @@ export function parseCreateMarker(
             ...(expectedTotal != null ? { expectedTotal } : {}),
             ...(realmId ? { realmId } : {}),
             ...(customerId ? { customerId } : {}),
+            ...(qbId ? { qbId } : {}),
         },
         atMs,
     };

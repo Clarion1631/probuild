@@ -108,10 +108,21 @@ function makePrisma(state: Row, onRead?: () => void) {
     };
 }
 
-function fakeQuickBooks(opts: { payLinkStatus?: number; statusStatus?: number } = {}): typeof fetch {
+function fakeQuickBooks(
+    opts: {
+        payLinkStatus?: number;
+        statusStatus?: number;
+        /**
+         * A 200 with NO InvoiceLink: QuickBooks answering "this invoice has no
+         * payable URL". Not a failure, and not a repair either — the read
+         * succeeded and the client still cannot pay.
+         */
+        noPayLink?: boolean;
+    } = {},
+): typeof fetch {
     return (async (url: string) => {
         const body = url.includes("include=invoiceLink")
-            ? { Invoice: { Id: "qb-9", InvoiceLink: PAY_LINK } }
+            ? { Invoice: { Id: "qb-9", ...(opts.noPayLink ? {} : { InvoiceLink: PAY_LINK }) } }
             : { Invoice: { Id: "qb-9", Balance: 1089, TotalAmt: 1089, LinkedTxn: [] } };
         const status = url.includes("include=invoiceLink")
             ? (opts.payLinkStatus ?? 200)
@@ -219,4 +230,47 @@ test("a reachable invoice still clears a stale voided flag", async () => {
 
     assert.equal(state.qbSyncError, null);
     assert.equal(state.qbInvoiceLink, PAY_LINK);
+});
+
+// --- Round 45: a definite "no link" is not a repair ---
+
+/**
+ * The third place the same bug lived. A transient failure already left the
+ * marker (above), but a SUCCESSFUL read that answered "no payable URL"
+ * retracted the claim and cleared the marker: the row left the repair queue
+ * and every health count with an invoice the client cannot pay. The rail's
+ * three pay-link writers — this repair, the create finalizer, and the sweep —
+ * now share one decision, so none of them can call that a repair.
+ */
+test("a successful read that finds NO pay link keeps the row queued", async () => {
+    const state = row();
+    const db = makePrisma(state);
+    const result = await withFakes(db.client, fakeQuickBooks({ noPayLink: true }), push);
+
+    assert.equal(result.payLink, null);
+    assert.equal(state.qbInvoiceLink, null);
+    assert.equal(state.qbSyncError, "paylink-pending:1", "still queued, with this attempt recorded");
+    assert.equal(state.qbInvoiceId, "qb-9", "the invoice itself is untouched");
+});
+
+test("a row already at its last attempt parks on paylink-missing", async () => {
+    const { PAYLINK_MAX_ATTEMPTS, PAYLINK_MISSING_MARKER } = await import("../src/lib/quickbooks-payments");
+    const state = row({ qbSyncError: `paylink-pending:${PAYLINK_MAX_ATTEMPTS - 1}` });
+    const db = makePrisma(state);
+    await withFakes(db.client, fakeQuickBooks({ noPayLink: true }), push);
+
+    assert.equal(state.qbSyncError, PAYLINK_MISSING_MARKER);
+});
+
+test("a real link still clears the marker (control)", async () => {
+    // Without this the tests above would also pass against a rail that never
+    // cleared the marker at all, which would queue every healthy invoice
+    // forever.
+    const state = row({ qbSyncError: "paylink-pending:2" });
+    const db = makePrisma(state);
+    const result = await withFakes(db.client, fakeQuickBooks(), push);
+
+    assert.equal(result.payLink, PAY_LINK);
+    assert.equal(state.qbInvoiceLink, PAY_LINK);
+    assert.equal(state.qbSyncError, null);
 });

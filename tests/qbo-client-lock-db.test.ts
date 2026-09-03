@@ -240,7 +240,6 @@ function resolve(db: PrismaClient, marker: string) {
             db: db as any,
             getTokens: async () => TOKENS,
             findInvoices: async () => [],
-            logEvent: (async () => {}) as any,
         },
     );
 }

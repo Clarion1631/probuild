@@ -49,10 +49,22 @@ import {
     AMBIGUOUS_CREATE_MARKER,
     CREATE_IN_FLIGHT_MARKER,
     PAYLINK_PENDING_MARKER,
+    nextPayLinkState,
     QBResolveRequiredError,
 } from "./qbo-create-markers";
 import { progressBillingIssuanceHash } from "./qbo-issuance";
 import { logAutomationEvent } from "./automation-events";
+
+/**
+ * How far QuickBooks' own invoice total may sit from the total we asked for
+ * before the create is treated as drift rather than rounding.
+ *
+ * The same 0.05 the milestone rail's Drift Guard uses (billing-core.ts), on
+ * purpose: two different answers to "is this the same amount of money?" on
+ * two rails of the same integration is how one of them ends up quietly
+ * billing a number the other would have refused.
+ */
+const QB_CREATE_TOTAL_TOLERANCE = 0.05;
 
 // Cent-round helper shared by every money computation below. EPSILON nudges
 // values like 1.005 (which float as 1.00499999999...) up to the cent they were
@@ -1189,6 +1201,58 @@ export async function stageProgressBillingToQuickBooksCore(
             ? ` The abandoned QuickBooks invoice ${billing.code} was deleted, but the link in ProBuild could not be cleared — clear it before re-staging.`
             : "";
 
+    // QuickBooks decides what an invoice totals; we only propose a number.
+    // Automated Sales Tax recomputes the tax from the customer address and the
+    // item tax code, and a changed item, a rounding rule or a tax-exempt
+    // customer all move the answer. The create returns what QuickBooks
+    // actually booked, and this rail used to throw that number away: a billing
+    // for $10,890.00 could stage as a collectible invoice for some other
+    // amount, and ProBuild would report Staged and go on to bill against its
+    // OWN total forever. The milestone rail catches the same drift at SEND
+    // time (the Drift Guard in billing-core.ts) — same tolerance, applied here
+    // at CREATE time, because a progress billing has no equivalent review gate.
+    //
+    // Checked while the row is still UNLINKED, so the guarded compensation path
+    // above is still usable. A non-finite total is a mismatch too: the real
+    // client already refuses to return one (createQBMilestoneInvoice), so
+    // reaching here with one means the total is unverifiable, and an
+    // unverifiable total must not become a staged invoice.
+    const createdTotal = created.total;
+    if (!Number.isFinite(createdTotal) || Math.abs(createdTotal - total) > QB_CREATE_TOTAL_TOLERANCE) {
+        const shown = Number.isFinite(createdTotal) ? `$${createdTotal.toFixed(2)}` : "an unreadable total";
+        const detail = `QuickBooks created this invoice for ${shown}, but billing ${billing.code} is $${total.toFixed(2)}`;
+        await logEvent({
+            kind: "qbo-payments-sync",
+            status: "error",
+            reason: "create-total-mismatch",
+            source: "progress-billing-stage",
+            docNumber: billing.code,
+            detail: {
+                progressBillingId: billing.id,
+                qbInvoiceId: qbId,
+                expectedTotal: total,
+                createdTotal: Number.isFinite(createdTotal) ? createdTotal : null,
+            },
+        }).catch(() => {});
+        if (await compensate()) {
+            throw new Error(
+                `${detail} — the QuickBooks invoice was deleted. Fix the tax setup in QuickBooks, then re-stage.${compensationNote()}`,
+            );
+        }
+        // The delete did not land. That invoice is real, collectible and wrong,
+        // and nothing automatic can fix it — the resolver will refuse to link it
+        // (the marker's expectedTotal says what it should have been) and must
+        // not clear the row either, because the document genuinely exists. Park
+        // on the durable marker carrying the id, so the next stage refuses
+        // instead of double-billing and a human can find the document without
+        // searching the company file by DocNumber.
+        await db.updateMany({
+            where: { id: billing.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
+            data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, { ...identity, qbId }, claimedAt) },
+        }).catch(() => {});
+        throw orphanError(detail);
+    }
+
     // Persist the link FIRST, before the pay-link fetch. That read is another
     // remote call, and a timeout there used to abandon a real, created invoice.
     // Guards pin id, Draft status, no existing qbInvoiceId, and the exact content
@@ -1275,12 +1339,16 @@ export async function stageProgressBillingToQuickBooksCore(
         return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: null };
     }
 
-    // Pinned to the id we just wrote, so a concurrent unlink/re-stage can't have
-    // its link overwritten by ours.
+    // Pinned to the id we just wrote, so a concurrent unlink/re-stage cannot
+    // have its link overwritten by ours — and routed through the SAME decision
+    // the sweep uses, because `getPaymentLink` can answer null without
+    // throwing. Writing `qbSyncError: null` on that answer is what used to
+    // drop an invoice with no payable URL straight out of the repair queue.
+    const next = nextPayLinkState(PAYLINK_PENDING_MARKER, payLink);
     await db.updateMany({
         where: { id: billing.id, qbInvoiceId: qbId },
-        data: { qbInvoiceLink: payLink, qbSyncError: null },
+        data: { qbSyncError: next.marker, ...(next.link ? { qbInvoiceLink: next.link } : {}) },
     });
 
-    return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: payLink };
+    return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: next.link ?? null };
 }

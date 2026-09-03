@@ -2,7 +2,9 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import {
     PAID_DELETION_UNRESOLVABLE,
+    PAYLINK_MISSING_MARKER,
     PAYLINK_PENDING_MARKER,
+    payLinkPendingWhere,
     PENDING_DELETION_MARKER,
     PENDING_DELETION_SETTLED_MARKER,
     SETTLED_WITHOUT_QB_PAYMENT,
@@ -134,6 +136,8 @@ export interface PipelineHealth {
      * fixture) still typechecks; the verdict treats an absent probe as
      * unmeasured rather than as zero, which is the honest reading.
      */
+    /** Pay-link retries exhausted: a collectible invoice with no payable URL. */
+    payLinksMissing?: CountProbe;
     parkedCreates?: CountProbe;
     parkedDocumentSyncs?: CountProbe;
     pendingDeletions?: CountProbe;
@@ -331,6 +335,8 @@ export function evaluatePipelineHealth(input: {
      * fixture) still typechecks; the verdict treats an absent probe as
      * unmeasured rather than as zero, which is the honest reading.
      */
+    /** Pay-link retries exhausted: a collectible invoice with no payable URL. */
+    payLinksMissing?: CountProbe;
     parkedCreates?: CountProbe;
     parkedDocumentSyncs?: CountProbe;
     pendingDeletions?: CountProbe;
@@ -384,6 +390,7 @@ export function evaluatePipelineHealth(input: {
     // one number would tell an operator that something is parked without
     // saying which thing, and they need different actions.
     const queues: Array<[string, CountProbe | undefined]> = [
+        ["pay-links-missing", input.payLinksMissing],
         ["parked-creates", input.parkedCreates],
         ["parked-document-syncs", input.parkedDocumentSyncs],
         ["pending-deletions", input.pendingDeletions],
@@ -699,7 +706,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     const [
         intuit, lastPurchase, purchaseSyncRun, lastPush, lastPaymentsSync, receiptRows,
         lastBankLine, stuck, qboAuth, payLinksPending,
-        parkedCreates, parkedDocumentSyncs, pendingDeletions, unreconciledMoney, maintenanceRun,
+        payLinksMissing, parkedCreates, parkedDocumentSyncs, pendingDeletions, unreconciledMoney, maintenanceRun,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -847,7 +854,9 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         probe<number>(
             "payLinksPending",
             async (db) => {
-                const where = { qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceId: { not: null } };
+                // Attempt-suffixed markers count too: a row on its third retry is
+                // every bit as unpayable as one on its first.
+                const where = { OR: payLinkPendingWhere(), qbInvoiceId: { not: null } };
                 const [milestones, billings] = await Promise.all([
                     db.paymentSchedule.count({ where }),
                     db.progressBilling.count({ where }),
@@ -863,6 +872,22 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // outside QuickBooks with its invoice still open. Each is money-path
         // work that only a human can finish, so each is its own count and each
         // one alone turns the check non-green.
+        // Retries exhausted: QuickBooks has an invoice with no payable URL and
+        // nothing automatic will fix it. Its own queue, because the action is
+        // different from every other one — somebody has to look at that invoice
+        // in QuickBooks.
+        probe<number>(
+            "payLinksMissing",
+            async (db) => {
+                const where = { qbSyncError: PAYLINK_MISSING_MARKER, qbInvoiceId: { not: null } };
+                const [milestones, billings] = await Promise.all([
+                    db.paymentSchedule.count({ where }),
+                    db.progressBilling.count({ where }),
+                ]);
+                return milestones + billings;
+            },
+            0,
+        ),
         probe<number>(
             "parkedCreates",
             async (db) => {
@@ -959,6 +984,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         stuck: { status: stuck.status, reason: stuck.reason, count: stuck.value },
         qboAuth: { status: qboAuth.status, reason: qboAuth.reason, count: qboAuth.value },
         payLinksPending: { status: payLinksPending.status, reason: payLinksPending.reason, count: payLinksPending.value },
+        payLinksMissing: { status: payLinksMissing.status, reason: payLinksMissing.reason, count: payLinksMissing.value },
         parkedCreates: { status: parkedCreates.status, reason: parkedCreates.reason, count: parkedCreates.value },
         parkedDocumentSyncs: { status: parkedDocumentSyncs.status, reason: parkedDocumentSyncs.reason, count: parkedDocumentSyncs.value },
         pendingDeletions: { status: pendingDeletions.status, reason: pendingDeletions.reason, count: pendingDeletions.value },
@@ -983,6 +1009,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         stuck: snapshot.stuck,
         qboAuth: snapshot.qboAuth,
         payLinksPending: snapshot.payLinksPending,
+        payLinksMissing: snapshot.payLinksMissing,
         parkedCreates: snapshot.parkedCreates,
         parkedDocumentSyncs: snapshot.parkedDocumentSyncs,
         pendingDeletions: snapshot.pendingDeletions,
@@ -1049,6 +1076,9 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         }`,
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
     ];
+    if (health.payLinksMissing?.status === "ok" && health.payLinksMissing.count > 0) {
+        lines.push(`${health.payLinksMissing.count} QuickBooks invoice(s) have NO payable link after repeated retries — open them in QuickBooks and enable payments by hand.`);
+    }
     if (health.payLinksPending?.status === "ok" && health.payLinksPending.count > 0) {
         lines.push(`${health.payLinksPending.count} QuickBooks invoice(s) are linked but still have no pay link — run QBO maintenance (sync-payment-options).`);
     }

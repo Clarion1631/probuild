@@ -1637,9 +1637,30 @@ test("a linked-but-paylink-pending row is a success, not a failure", async () =>
  * collection shipped green.
  */
 function makeSweepDb(milestones: any[], billings: any[]) {
+    // One marker predicate, matching Prisma's semantics for the two shapes
+    // the sweep actually sends: an exact value and a `startsWith`. The sweep
+    // now selects `{ OR: payLinkPendingWhere() }` so it also picks up the
+    // attempt-suffixed markers; a fake that ignored the OR would hand back
+    // every row and these tests would pass against a sweep that selected
+    // nothing at all.
+    const markerMatches = (value: any, cond: any): boolean => {
+        if (cond === undefined) return true;
+        if (cond !== null && typeof cond === "object") {
+            if (typeof cond.startsWith === "string") {
+                return typeof value === "string" && value.startsWith(cond.startsWith);
+            }
+            if ("in" in cond) return Array.isArray(cond.in) && cond.in.includes(value);
+            throw new Error(`unsupported qbSyncError condition: ${JSON.stringify(cond)}`);
+        }
+        return value === cond;
+    };
     const eligible = (rows: any[], where: any) =>
         rows.filter((r) => {
-            if (where.qbSyncError !== undefined && r.qbSyncError !== where.qbSyncError) return false;
+            if (Array.isArray(where.OR)
+                && !where.OR.some((clause: any) => markerMatches(r.qbSyncError, clause.qbSyncError))) {
+                return false;
+            }
+            if (where.qbSyncError !== undefined && !markerMatches(r.qbSyncError, where.qbSyncError)) return false;
             if (where.qbInvoiceId?.not === null && r.qbInvoiceId === null) return false;
             if (where.id?.gt !== undefined && !(r.id > where.id.gt)) return false;
             if (where.id?.lt !== undefined && !(r.id < where.id.lt)) return false;
@@ -1732,7 +1753,19 @@ test("the sweep STOPS on a connection failure and leaves the rest pending", asyn
     assert.equal(milestones[1].qbSyncError, PAYLINK_PENDING_MARKER);
 });
 
-test("an invoice with no pay link clears the marker without inventing one", async () => {
+// --- A missing pay link is a STATE, not a cleared queue (round 45, item 1) ---
+
+/**
+ * The old assertion here was that a null pay link CLEARED the marker: the
+ * read had succeeded, so there was supposedly nothing left to retry. That is
+ * what the finding is about. QuickBooks answering "no link" for an invoice
+ * the client is expected to PAY is not a resolved row — it is an invoice with
+ * no payable URL, and clearing the marker took it out of the repair queue and
+ * out of every health count in one write. The row is now retried a bounded
+ * number of times and then parked on a durable state that health counts and
+ * the digest names.
+ */
+test("an invoice with no pay link KEEPS a marker instead of leaving the queue", async () => {
     const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
     const milestones = [{ id: "ps-1", qbInvoiceId: "qb-1", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null, invoice: { code: "INV-1" } }];
     const db = makeSweepDb(milestones, []);
@@ -1740,9 +1773,47 @@ test("an invoice with no pay link clears the marker without inventing one", asyn
     const result = await sweepPendingPayLinks(TOKENS, undefined, { db, readPayLink: async () => null });
 
     assert.equal(result.noLink, 1);
-    assert.equal(result.repaired, 0);
-    assert.equal(milestones[0].qbSyncError, null, "QuickBooks answered; there is nothing left to retry");
+    assert.equal(result.repaired, 0, "nothing was repaired — there is no link");
+    assert.equal(result.payLinkMissing, 0, "one attempt is not exhaustion");
+    assert.equal(milestones[0].qbSyncError, "paylink-pending:1", "still queued, with the attempt recorded");
     assert.equal(milestones[0].qbInvoiceLink, null);
+});
+
+test("the sweep still SELECTS a row whose marker carries an attempt count", async () => {
+    // Without payLinkPendingWhere() in the select, a row that failed once is
+    // invisible to every later run: it keeps a marker no query looks for.
+    const { sweepPendingPayLinks } = await import("../src/lib/quickbooks-payments");
+    const milestones = [{ id: "ps-1", qbInvoiceId: "qb-1", qbSyncError: "paylink-pending:2", qbInvoiceLink: null, invoice: { code: "INV-1" } }];
+    const db = makeSweepDb(milestones, []);
+
+    const result = await sweepPendingPayLinks(TOKENS, undefined, {
+        db,
+        readPayLink: async () => "https://pay.example/qb-1",
+    });
+
+    assert.equal(result.checked, 1, "the retry row is picked up");
+    assert.equal(result.repaired, 1);
+    assert.equal(milestones[0].qbSyncError, null, "a real link ends the retries");
+    assert.equal(milestones[0].qbInvoiceLink, "https://pay.example/qb-1");
+});
+
+test("the last attempt parks the row on paylink-missing and stops re-selecting it", async () => {
+    const { sweepPendingPayLinks, PAYLINK_MISSING_MARKER, PAYLINK_MAX_ATTEMPTS } =
+        await import("../src/lib/quickbooks-payments");
+    const marker = `paylink-pending:${PAYLINK_MAX_ATTEMPTS - 1}`;
+    const milestones = [{ id: "ps-1", qbInvoiceId: "qb-1", qbSyncError: marker, qbInvoiceLink: null, invoice: { code: "INV-1" } }];
+    const db = makeSweepDb(milestones, []);
+
+    const first = await sweepPendingPayLinks(TOKENS, undefined, { db, readPayLink: async () => null });
+
+    assert.equal(first.payLinkMissing, 1);
+    assert.equal(milestones[0].qbSyncError, PAYLINK_MISSING_MARKER);
+
+    // Durable, not a retry: the next run does not pick it up again, so the
+    // count comes from the health probe rather than from an endless sweep.
+    const second = await sweepPendingPayLinks(TOKENS, undefined, { db, readPayLink: async () => null });
+    assert.equal(second.checked, 0, "parked rows are out of the sweep's hands");
+    assert.equal(milestones[0].qbSyncError, PAYLINK_MISSING_MARKER);
 });
 
 test("a row that changed under the sweep is skipped, not overwritten", async () => {
@@ -2635,14 +2706,24 @@ const ISSUED_HASH = milestoneIssuanceHash({
     customerId: ISSUED_CUSTOMER,
 });
 
-async function runFinalize(fake: { prisma: unknown }, preLinked = true, issuanceHash = ISSUED_HASH) {
+async function runFinalize(
+    fake: { prisma: unknown },
+    preLinked = true,
+    issuanceHash = ISSUED_HASH,
+    /**
+     * What the pay-link read produced. `null` is a real outcome on this path:
+     * the create's own read answered "no payable URL", or the retry branch's
+     * `.catch(() => null)` swallowed a failure.
+     */
+    payLink: string | null = "https://pay/77",
+) {
     const { finalizeMilestoneLinkUnderLock } = await import("../src/lib/quickbooks-payments");
     const previous = (globalThis as any).prisma;
     (globalThis as any).prisma = fake.prisma;
     try {
         return await finalizeMilestoneLinkUnderLock(SCHEDULE, {
             qbId: "inv-77",
-            payLink: "https://pay/77",
+            payLink,
             preLinked,
             inFlightMarker: "create-in-flight:@1|INV-1-2|note",
             clientId: "client-1",
@@ -2901,4 +2982,36 @@ test("round 35 gate: checked counts progress-billing probes as well as milestone
             else (process.env as Record<string, string>)[key] = value;
         }
     }
+});
+
+// --- Round 45: the create finalizer is a pay-link writer too ---
+
+/**
+ * This write said `qbSyncError: null` unconditionally, with a comment about
+ * self-healing a stale voided/notFound flag. It does still do that — but when
+ * `payLink` arrives null (QuickBooks answered "no payable URL", or the retry
+ * branch's `.catch(() => null)` swallowed a failure) it also cleared the ONLY
+ * record that this invoice still needs one. A brand-new invoice went straight
+ * to linked-and-finished with nothing for the client to pay against, and
+ * nothing anywhere counting it.
+ */
+test("round 45: a create whose pay link came back null stays queued, not finished", async () => {
+    const fake = fakeFinalizeDb({ claimCount: 1, current: currentRow() });
+    const result = await runFinalize(fake, true, ISSUED_HASH, null);
+
+    assert.equal(result.outcome, "linked", "the invoice is real and the row points at it");
+    const data = fake.seen.claims[0].data;
+    assert.equal(data.qbInvoiceId, "inv-77");
+    assert.equal(data.qbInvoiceLink, null);
+    assert.equal(data.qbSyncError, "paylink-pending:1", "the repair queue still knows about it");
+});
+
+test("round 45: a create WITH a pay link still clears the marker (control)", async () => {
+    const fake = fakeFinalizeDb({ claimCount: 1, current: currentRow() });
+    const result = await runFinalize(fake);
+
+    assert.equal(result.outcome, "linked");
+    const data = fake.seen.claims[0].data;
+    assert.equal(data.qbInvoiceLink, "https://pay/77");
+    assert.equal(data.qbSyncError, null, "nothing left to repair");
 });
