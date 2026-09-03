@@ -84,6 +84,9 @@ function createDeps(overrides: {
             overrides.authOk === false
                 ? { ok: false, status: 401, error: "Unauthorized" }
                 : { ok: true, user: { id: "u1", role: overrides.role ?? "FIELD_CREW", email: "u1@example.com", payType: "HOURLY", hourlyRate: 20, burdenRate: 5 } },
+        // ONE resolution per request; every day key in the close path comes
+        // from it (round 7, finding 1).
+        resolveTimeZone: async () => "America/Los_Angeles",
         findTimeEntry: async () => (overrides.entry !== undefined ? overrides.entry : baseEntry()),
         findProjectIsLogistics: async (projectId) =>
             overrides.logisticsProjects

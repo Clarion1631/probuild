@@ -148,6 +148,18 @@ export class CsvParseError extends Error {
  *    file means somebody's NAME lands in the rate column, or one person's rate
  *    lands on another person's row.
  *
+ *  - a BARE CARRIAGE RETURN was dropped, wherever it appeared. Outside a
+ *    quoted field every `\r` was skipped on the assumption it was the first
+ *    half of a CRLF, so `2\r8` — a mangled export, a half-converted line
+ *    ending, a value pasted out of a terminal — silently became the rate
+ *    28.00. This is the same class of bug as the `$`/space scrubbing below:
+ *    the parser repaired malformed money into a plausible number instead of
+ *    refusing it. A `\r` is now accepted ONLY as the first half of `\r\n`;
+ *    anywhere else it is a parse error. Inside QUOTES it stays verbatim, like
+ *    every other character there — the quotes say where the field ends, so
+ *    there is nothing to guess, and a stray CR in the rate column is refused
+ *    by parseRateValue anyway;
+ *
  *  - characters AFTER a closing quote were appended to the value as if the
  *    quotes had never been there: `"Alex Smith"x` read as `Alex Smithx`, and
  *    `"28.50"0` as a rate of 28.500. Neither is what the file says, and both
@@ -196,10 +208,8 @@ export function parseCsvGrid(text: string): string[][] {
             continue;
         }
         // Between the closing quote and the end of the field, NOTHING is
-        // allowed through. `\r` is let past because it is the first half of a
-        // CRLF line ending, which the `\n` branch below then terminates the
-        // field on; a `\r` followed by anything else lands back here on the
-        // next character and is refused there.
+        // allowed through. `\r` is let past ONLY so the CRLF branch below can
+        // judge it: a `\r` that is not followed by `\n` throws there.
         if (closedQuote && char !== "," && char !== "\r" && char !== "\n") {
             throw new CsvParseError(
                 `Line ${line}, column ${row.length + 1}: "${char}" appears after a closing quote. ` +
@@ -223,7 +233,20 @@ export function parseCsvGrid(text: string): string[][] {
             sawAnyChar = true;
             continue;
         }
-        if (char === "\r") continue;
+        if (char === "\r") {
+            // ONLY as the first half of CRLF. This used to be an unconditional
+            // `continue`, which DELETED the character: `2\r8` came out as the
+            // rate 28.00. A pay-rate file that cannot be read exactly is not a
+            // file to guess at, and a lone CR is exactly the half-converted
+            // export this parser exists to refuse.
+            if (text[i + 1] !== "\n") {
+                throw new CsvParseError(
+                    `Line ${line}, column ${row.length + 1}: a stray carriage return that is not part of a line ending. ` +
+                        `Save the file with normal line endings — a carriage return inside a value would silently change it.`
+                );
+            }
+            continue;
+        }
         if (char === "\n") {
             pushField();
             rows.push(row);

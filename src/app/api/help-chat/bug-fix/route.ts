@@ -177,7 +177,12 @@ export async function POST(req: NextRequest) {
         // only ADMIN/MANAGER can trigger that (bug-widget-auth.ts).
         labels: bugFixIssueLabels(auth.user),
         metadata: [
-          steps ? `**Steps to Reproduce:**\n${steps}` : "",
+          // NO STEPS HERE. They are already inside `filing.response` —
+          // buildBugFixDetails folds them into the stored description, which is
+          // what `description` above is — so adding them again printed the same
+          // text twice in every issue body. Worse on a RESUME: `steps` is the
+          // INCOMING body while `filing` is the STORED report, so the duplicate
+          // could disagree with the copy above it (round 7, finding 5).
           `**Conversation ID:** \`${filing.conversationId}\``,
           // The idempotency marker, in the body, so a resumed attempt can find
           // this issue instead of opening a second one.
@@ -186,14 +191,31 @@ export async function POST(req: NextRequest) {
       }));
 
     if (!ghIssue) {
-      // The report is already saved; only the Phantom hand-off failed. Leaving
+      // The report is already SAVED; only the Phantom hand-off failed. Leaving
       // providerState 'pending' is what lets a later retry resume it. Fenced,
       // so a superseded attempt cannot mark a filed report pending again.
-      await completeUnderLease(requestId, leaseToken, { filed: false, status: "submitted_no_issue" });
-      return NextResponse.json(
-        { error: "Failed to create GitHub issue for Phantom" },
-        { status: 502 }
-      );
+      const held = await completeUnderLease(requestId, leaseToken, {
+        filed: false,
+        status: "submitted_no_issue",
+      });
+      const saved = await prisma.helpRequest.findUnique({ where: { id: requestId } });
+      // 202, NOT 502 — the shared durable-submission contract
+      // (helpChatResponse, and the same branch in /api/help-chat/request).
+      // A 5xx tells the crew app the request failed, so it retries; the report
+      // is already durable, so every retry was a second attempt at a hand-off
+      // that had already been recorded as pending. 202 + status "pending" says
+      // what actually happened: we have it, GitHub does not have it yet.
+      return helpChatResponse({
+        body: {
+          request: saved,
+          githubIssue: null,
+          ...(held ? {} : { superseded: true }),
+        },
+        // The STORED state decides, not "we got no issue back": a superseded
+        // attempt may have lost the race to one that DID file.
+        filed: saved?.providerState === "created",
+        submissionId,
+      });
     }
 
     // Attach the issue to the row that already exists — a retry updates it

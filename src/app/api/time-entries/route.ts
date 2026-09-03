@@ -4,7 +4,8 @@ import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
-import { toCompanyDayKey } from "@/lib/company-day";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -78,6 +79,13 @@ export async function POST(req: Request) {
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
 
+    // ONE resolution per request. Every company-local day key below is derived
+    // from it — the stale-DEFERRED check, the day settlement triggers, and the
+    // punch-to-task binding. They all used to call toCompanyDayKey, hardcoded
+    // to America/Los_Angeles, so the whole path ignored CompanySettings.timeZone
+    // (round 7, finding 1).
+    const companyTimeZone = await resolveCompanyTimeZone();
+
     const body = await req.json();
     const {
         projectId, costCodeId, estimateItemId, startTime, latitude, longitude,
@@ -109,8 +117,8 @@ export async function POST(req: Request) {
         const stale = staleDeferredReview({
             latest,
             now: new Date(),
-            latestDayKey: latest ? toCompanyDayKey(latest.startTime) : undefined,
-            todayKey: toCompanyDayKey(new Date()),
+            latestDayKey: latest ? dayKeyInTimeZone(latest.startTime, companyTimeZone) : undefined,
+            todayKey: dayKeyInTimeZone(new Date(), companyTimeZone),
         });
         if (stale && latest) {
             // Optimistic: only if nobody composed a reason onto the row meanwhile.
@@ -124,7 +132,7 @@ export async function POST(req: Request) {
             );
             // And settle that day for real — the deferred close WAS the day's end.
             // Day keyed by START time, like every other reader of a row's day.
-            await settleDay(user.id, toCompanyDayKey(latest.startTime), null);
+            await settleDay(user.id, dayKeyInTimeZone(latest.startTime, companyTimeZone), null, companyTimeZone);
         }
     } catch (error) {
         console.error("[time-entries] stale DEFERRED review check failed", error);
@@ -268,7 +276,7 @@ export async function POST(req: Request) {
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
         userId: user.id,
         projectId,
-        dayKey: toCompanyDayKey(entryStartTime),
+        dayKey: dayKeyInTimeZone(entryStartTime, companyTimeZone),
         estimateItemId: resolvedEstimateItemId,
     });
 
@@ -386,6 +394,14 @@ const LOGISTICS_NOTES_REQUIRED_MESSAGE = "Notes are required to clock out of a l
 
 export interface ClockOutDependencies {
     authenticate(req: Request): Promise<ClockOutAuthResult>;
+    /**
+     * The company time zone, resolved ONCE per request. Every company-local day
+     * key in the close path comes from it: the day this punch belongs to, the
+     * day lock taken on it, the settlement window filter, and the guard
+     * settlement takes for itself. A dependency rather than a direct call so the
+     * close path stays testable without a database, exactly like the rest.
+     */
+    resolveTimeZone(): Promise<string>;
     findTimeEntry(id: string): Promise<ClockOutTimeEntryRow | null>;
     findProjectIsLogistics(projectId: string): Promise<boolean>;
     /**
@@ -405,14 +421,19 @@ export interface ClockOutDependencies {
      * splits a shift into several entries), so the closing entry alone can
      * never decide it. See src/lib/wa-breaks.ts computeMealDeduction.
      */
-    findDayEntries(userId: string, dayKey: string, excludeEntryId: string): Promise<DayEntry[]>;
+    findDayEntries(userId: string, dayKey: string, excludeEntryId: string, timeZone: string): Promise<DayEntry[]>;
     /**
      * Re-settle the worker's whole company-local day AFTER the close commits
      * (src/lib/wa-breaks-db.ts settleDay): moves the deduction to the day's
      * last entry, refunds an earlier one a later punched meal covers, and
      * serializes concurrent closes. Best-effort; never fails the response.
      */
-    settleDay(userId: string, dayKey: string, closing: { id: string; mealSkipped: unknown }): Promise<number>;
+    settleDay(
+        userId: string,
+        dayKey: string,
+        closing: { id: string; mealSkipped: unknown },
+        timeZone: string
+    ): Promise<number>;
     /** Flag the row when settleDay reports failure (-1) — visible, never silent. */
     flagSettlementFailed(entryId: string): Promise<void>;
     /**
@@ -459,6 +480,8 @@ export interface ClockOutDependencies {
             entryId: string;
             /** Day key the caller EXPECTS this entry to be on — locked before the row is read. */
             expectedDayKey: string;
+            /** The zone `expectedDayKey` was derived in. The transaction re-derives the stored row's day in it. */
+            timeZone: string;
             settle: { closing: { id: string; mealSkipped: unknown } } | null;
         }
     ): Promise<
@@ -475,6 +498,9 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             const auth = await dependencies.authenticate(req);
             if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
             const { user } = auth;
+
+            // ONE resolution per request — see resolveTimeZone on the interface.
+            const companyTimeZone = await dependencies.resolveTimeZone();
 
             const body = await req.json();
             const { id, endTime, latitude, longitude, notes, deferMeal } = body;
@@ -707,8 +733,9 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 // (what payroll/export/summary read); shiftHours keeps the raw span.
                 const dayEntries = await dependencies.findDayEntries(
                     stored.userId,
-                    toCompanyDayKey(storedStart),
-                    stored.id
+                    dayKeyInTimeZone(storedStart, companyTimeZone),
+                    stored.id,
+                    companyTimeZone
                 );
                 const meal = computeMealDeduction({
                     dayEntries,
@@ -794,7 +821,10 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     // row is read; if the stored row turns out to be on another
                     // day, a concurrent edit moved it and we bail rather than
                     // settle the wrong day.
-                    expectedDayKey: toCompanyDayKey(existing.startTime),
+                    expectedDayKey: dayKeyInTimeZone(existing.startTime, companyTimeZone),
+                    // The zone that key was derived in, carried into the
+                    // transaction so the re-derivation there matches.
+                    timeZone: companyTimeZone,
                     // Settlement rides along in the same transaction (deferMeal
                     // closes settle nothing — the day settles on the final punch).
                     settle: deferMeal !== true ? { closing: settleClosing } : null,
@@ -895,6 +925,7 @@ const clockOutHandler = createClockOutHandler({
     // does read the stored zone) considers perfectly writable — stranding an
     // open punch on the phone with no way to close it.
     loadLockedPeriods,
+    resolveTimeZone: resolveCompanyTimeZone,
     findDayEntries: loadDayEntries,
     settleDay,
     flagSettlementFailed,
@@ -953,7 +984,7 @@ const clockOutHandler = createClockOutHandler({
                 // If it moved to a different day we hold the WRONG day lock, so
                 // settling would re-plan a day we never serialised. Bail and let
                 // the client retry against the row's real state.
-                if (toCompanyDayKey(stored.startTime) !== guard.expectedDayKey) {
+                if (dayKeyInTimeZone(stored.startTime, guard.timeZone) !== guard.expectedDayKey) {
                     return { ok: false as const, moved: true as const };
                 }
 
@@ -1001,7 +1032,8 @@ const clockOutHandler = createClockOutHandler({
                         t,
                         userId,
                         guard.expectedDayKey,
-                        guard.settle.closing
+                        guard.settle.closing,
+                        guard.timeZone
                     );
                     if (settled < 0) await t.timeEntry.update({ where: { id }, data: { needsReview: true } });
                 }

@@ -4,7 +4,8 @@ import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
-import { toCompanyDayKey } from "@/lib/company-day";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx, settlementCandidateIds } from "@/lib/wa-breaks-db";
@@ -61,6 +62,15 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
+
+    // ONE resolution per request, and every company-local day key below comes
+    // from it — the day this punch belongs to, the day lock, the settlement
+    // window filter, and the guard settlement takes for itself. These all used
+    // to call toCompanyDayKey, hardcoded to America/Los_Angeles, so the whole
+    // path was Pacific regardless of CompanySettings.timeZone (round 7,
+    // finding 1). settleDay and friends now REQUIRE the zone, so it cannot be
+    // dropped on the way through.
+    const companyTimeZone = await resolveCompanyTimeZone();
 
     const { id } = await params;
     if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
@@ -311,7 +321,12 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     const mealSkippedForEdit: boolean | undefined =
         isOwner && typeof body.mealSkipped === "boolean" ? body.mealSkipped : storedAnswer;
     if (newEnd) {
-        const dayEntries = await loadDayEntries(existing.userId, toCompanyDayKey(newStart), existing.id);
+        const dayEntries = await loadDayEntries(
+            existing.userId,
+            dayKeyInTimeZone(newStart, companyTimeZone),
+            existing.id,
+            companyTimeZone
+        );
         const meal = computeMealDeduction({
             dayEntries,
             closing: { startTime: newStart, endTime: newEnd },
@@ -409,11 +424,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // different local day — the board may have changed mid-shift, so we must not
     // repick the day on every edit. Binding follows the entry's OWNER, not the
     // editing manager (costs already follow the owner).
-    if (toCompanyDayKey(newStart) !== toCompanyDayKey(existing.startTime)) {
+    if (dayKeyInTimeZone(newStart, companyTimeZone) !== dayKeyInTimeZone(existing.startTime, companyTimeZone)) {
         data.scheduleTaskId = await resolveScheduleTaskIdForPunch({
             userId: existing.userId,
             projectId: existing.projectId,
-            dayKey: toCompanyDayKey(newStart),
+            dayKey: dayKeyInTimeZone(newStart, companyTimeZone),
             estimateItemId: existing.estimateItemId,
         });
     }
@@ -437,8 +452,8 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         // locking only `id` up front, then letting settlement lock each day's
         // wider 72-hour window afterward, is what let two adjacent-day edits
         // deadlock on each other's rows (see settlementCandidateIds).
-        const oldDayKey = toCompanyDayKey(existing.startTime);
-        const newDayKey = toCompanyDayKey(newStart);
+        const oldDayKey = dayKeyInTimeZone(existing.startTime, companyTimeZone);
+        const newDayKey = dayKeyInTimeZone(newStart, companyTimeZone);
         const settlementCandidates = new Set<string>();
         for (const dayKey of new Set([oldDayKey, newDayKey])) {
             for (const cid of await settlementCandidateIds(prisma, existing.userId, dayKey)) {
@@ -579,7 +594,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             // Re-plan every day this edit touched (the row may have moved days),
             // in THIS transaction — settling afterwards left a window in which
             // the period could be locked in between.
-            const days = new Set<string>([toCompanyDayKey(existing.startTime), toCompanyDayKey(newStart)]);
+            const days = new Set<string>([dayKeyInTimeZone(existing.startTime, companyTimeZone), dayKeyInTimeZone(newStart, companyTimeZone)]);
             for (const dayKey of days) {
                 const result = await settleDayWithinTx(
                     tx as never,
@@ -587,7 +602,8 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                     // day belonging to whoever used to hold this punch.
                     stored.userId,
                     dayKey,
-                    newEnd ? { id: existing.id, mealSkipped: mealSkippedForEdit } : null
+                    newEnd ? { id: existing.id, mealSkipped: mealSkippedForEdit } : null,
+                    companyTimeZone
                 );
                 if (result < 0) await client.timeEntry.update({ where: { id }, data: { needsReview: true } });
             }
@@ -627,6 +643,9 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
         return NextResponse.json({ error: "Only managers can delete time entries" }, { status: 403 });
     }
 
+    // ONE resolution per request — see the note in PATCH above.
+    const companyTimeZone = await resolveCompanyTimeZone();
+
     const { id } = await params;
     if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
 
@@ -665,12 +684,12 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
         // Recomputed on every attempt from `fresh`, so the retry locks the
         // CURRENT owner's day rather than the one that already moved.
         const dayKeys = [...new Set([
-            dayLockKey(existing.userId, toCompanyDayKey(existing.startTime)),
-            dayLockKey(fresh.userId, toCompanyDayKey(fresh.startTime)),
+            dayLockKey(existing.userId, dayKeyInTimeZone(existing.startTime, companyTimeZone)),
+            dayLockKey(fresh.userId, dayKeyInTimeZone(fresh.startTime, companyTimeZone)),
         ])].sort();
 
         try {
-            await deleteEntryAndSettle(id, toCompanyDayKey(fresh.startTime), fresh.userId, {
+            await deleteEntryAndSettle(id, dayKeyInTimeZone(fresh.startTime, companyTimeZone), fresh.userId, companyTimeZone, {
                 // Re-reads the row FOR UPDATE inside the delete transaction and
                 // validates its STORED startTime — the values read above are
                 // stale the moment another writer moves the row.
@@ -684,10 +703,10 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
                     // let two adjacent-day deletes deadlock on each other's
                     // rows. See settlementCandidateIds.
                     const settlementCandidates = new Set<string>();
-                    for (const cid of await settlementCandidateIds(tx, existing.userId, toCompanyDayKey(existing.startTime))) {
+                    for (const cid of await settlementCandidateIds(tx, existing.userId, dayKeyInTimeZone(existing.startTime, companyTimeZone))) {
                         settlementCandidates.add(cid);
                     }
-                    for (const cid of await settlementCandidateIds(tx, fresh.userId, toCompanyDayKey(fresh.startTime))) {
+                    for (const cid of await settlementCandidateIds(tx, fresh.userId, dayKeyInTimeZone(fresh.startTime, companyTimeZone))) {
                         settlementCandidates.add(cid);
                     }
                     await assertEntriesUnlockedInTx(tx, [id, ...settlementCandidates], { dayKeys });
@@ -705,7 +724,7 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
                     // owner's day-lock set.
                     if (
                         now.userId !== fresh.userId ||
-                        toCompanyDayKey(now.startTime) !== toCompanyDayKey(fresh.startTime)
+                        dayKeyInTimeZone(now.startTime, companyTimeZone) !== dayKeyInTimeZone(fresh.startTime, companyTimeZone)
                     ) {
                         throw new EntryMovedError();
                     }

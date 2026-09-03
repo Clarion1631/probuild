@@ -207,6 +207,9 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[], startTime: Date = INSIDE
         authenticate: async () => ({ ok: true, user: { id: "u1", role: "FIELD_CREW", email: "u1@example.com", payType: "HOURLY", hourlyRate: 20, burdenRate: 5 } }),
         findTimeEntry: async () => entry,
         findProjectIsLogistics: async () => false,
+        // The close path resolves the company zone ONCE and derives every day
+        // key from it (round 7, finding 1).
+        resolveTimeZone: async () => "America/Los_Angeles",
         findOwnerRates: async () => ({ hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" }),
         findDayEntries: async () => [],
         settleDay: async () => 0,
@@ -551,12 +554,14 @@ test("settlement is blocked for a west-of-LA locked period even though LA midnig
 });
 
 test("a day key means the zone it was DERIVED in — a wrong zone reads the WRONG 24h window even when it still refuses", async () => {
-    // Every dayKey that reaches settlement comes out of toCompanyDayKey, which
-    // is hardcoded to COMPANY_TIME_ZONE, and settlement selects the rows it
-    // rewrites with that same helper. This test is what makes the coupling
-    // load-bearing rather than incidental.
+    // Every dayKey reaching settlement is derived in the zone the caller
+    // resolved, and settlement selects the rows it rewrites in THAT SAME zone —
+    // both sides now take it as a required parameter (round 7, finding 1). They
+    // used to agree by both hardcoding America/Los_Angeles, which is one way to
+    // make two things agree and the wrong one. This test is what makes the
+    // coupling load-bearing rather than incidental, either way.
     const { assertDayUnlockedInTx, isPeriodLockedError } = await import("../src/lib/payroll-period");
-    const { COMPANY_TIME_ZONE } = await import("../src/lib/company-day");
+    const COMPANY_TIME_ZONE = "America/Los_Angeles";
     // A real locked period carries the zone it was locked in, so ITS envelope
     // does not move when the company zone changes — only the caller's reading
     // of the day key does.
@@ -573,8 +578,8 @@ test("a day key means the zone it was DERIVED in — a wrong zone reads the WRON
     );
     // The same key read as New York midnight opens a window three hours
     // EARLIER (04:00Z, not 07:00Z) — the WRONG 24h window for the rows
-    // settlement will actually select and rewrite (those come out of
-    // toCompanyDayKey, hardcoded to COMPANY_TIME_ZONE). Since the
+    // settlement will actually select and rewrite (those are derived in the
+    // zone the caller passes down, not this one). Since the
     // whole-settlement-day overlap check (assertDayUnlockedInTx / see the
     // Honolulu regression below) widened the comparison from a single
     // instant to the full [dayStart, dayEnd), this particular wrong window
@@ -582,8 +587,9 @@ test("a day key means the zone it was DERIVED in — a wrong zone reads the WRON
     // safe accident of window width, not proof the zone argument is
     // optional. It is still the WRONG day: for a zone offset wide enough to
     // clear the 24h window (not realistic between US zones, but the reason
-    // wa-breaks-db.ts hardcodes COMPANY_TIME_ZONE rather than trusting a
-    // caller-supplied one), the same call would silently miss.
+    // wa-breaks-db.ts threads ONE resolved zone through the key derivation,
+    // the guard and the row filter instead of letting any of them pick their
+    // own), the same call would silently miss.
     await assert.rejects(
         () => assertDayUnlockedInTx(tx, "2026-08-17", "America/New_York"),
         (error: Error) => isPeriodLockedError(error)
@@ -607,7 +613,12 @@ test("settlement stays locked out of an LA-day after the company zone is switche
             payrollPeriod: { findMany: async () => [period({ timeZone: "America/Los_Angeles" })] },
         };
         await assert.rejects(
-            () => settleDayWithinTx(tx as never, "u1", "2026-08-17"),
+            // The day key is in the zone passed alongside it: the guard and
+            // the write must read "2026-08-17" as the same instant. The locked
+            // period below carries America/Los_Angeles, and COMPANY_TIMEZONE is
+            // New York for this test, so passing the Pacific zone here is what
+            // makes the two agree — the point of round 7, finding 1.
+            () => settleDayWithinTx(tx as never, "u1", "2026-08-17", null, "America/Los_Angeles"),
             (error: Error) => isPeriodLockedError(error)
         );
     } finally {
@@ -1018,8 +1029,8 @@ test("DELETE locks every candidate day before the row, and retries once if it mo
     // deleteEntryAndSettle re-plans BOTH the day it was told about and the day
     // it actually finds, so both have to be locked up front — in sorted order,
     // like every other path.
-    assert.match(deleteHalf, /dayLockKey\(existing\.userId, toCompanyDayKey\(existing\.startTime\)\)/);
-    assert.match(deleteHalf, /dayLockKey\(fresh\.userId, toCompanyDayKey\(fresh\.startTime\)\)/);
+    assert.match(deleteHalf, /dayLockKey\(existing\.userId, dayKeyInTimeZone\(existing\.startTime, companyTimeZone\)\)/);
+    assert.match(deleteHalf, /dayLockKey\(fresh\.userId, dayKeyInTimeZone\(fresh\.startTime, companyTimeZone\)\)/);
     assert.match(deleteHalf, /\]\)\]\.sort\(\)/);
     // One retry from a FRESH read, then give up: looping would hold locks while
     // whatever is rewriting the row keeps rewriting it.
@@ -1030,7 +1041,10 @@ test("DELETE locks every candidate day before the row, and retries once if it mo
     // the locks held and the settlement about to run still belonged to A.
     assert.match(deleteHalf, /SELECT "userId", "startTime" FROM "TimeEntry" WHERE "id" = \$1/);
     assert.match(deleteHalf, /now\.userId !== fresh\.userId \|\|/);
-    assert.match(deleteHalf, /toCompanyDayKey\(now\.startTime\) !== toCompanyDayKey\(fresh\.startTime\)/);
+    assert.match(
+        deleteHalf,
+        /dayKeyInTimeZone\(now\.startTime, companyTimeZone\) !== dayKeyInTimeZone\(fresh\.startTime, companyTimeZone\)/
+    );
 });
 
 test("deleteEntryAndSettle locks the COMPLETE owner+day set, not just a second day", () => {
@@ -1285,6 +1299,12 @@ test("the DELETE guard folds both owner/day settlement candidates into entryIds 
     );
     const guard = source.slice(source.indexOf("guard: async (tx) => {"));
     const body = guard.slice(0, guard.indexOf("assertEntriesUnlockedInTx(tx, [id, ...settlementCandidates]"));
-    assert.match(body, /settlementCandidateIds\(tx, existing\.userId, toCompanyDayKey\(existing\.startTime\)\)/);
-    assert.match(body, /settlementCandidateIds\(tx, fresh\.userId, toCompanyDayKey\(fresh\.startTime\)\)/);
+    assert.match(
+        body,
+        /settlementCandidateIds\(tx, existing\.userId, dayKeyInTimeZone\(existing\.startTime, companyTimeZone\)\)/
+    );
+    assert.match(
+        body,
+        /settlementCandidateIds\(tx, fresh\.userId, dayKeyInTimeZone\(fresh\.startTime, companyTimeZone\)\)/
+    );
 });

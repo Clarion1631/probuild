@@ -210,20 +210,29 @@ export type HelpRequestPayload = {
  * than a joined string: a separator that can appear inside a field is a
  * separator a caller can forge a collision with.
  */
-export function helpPayloadFingerprint(payload: HelpRequestPayload): string {
+/**
+ * THE canonical form of what a submission says. Everything that decides
+ * "is this the same report?" is derived from this one function.
+ *
+ * That is the whole point of it existing. The payload fingerprint used to
+ * canonicalise here while the derived idempotency key canonicalised somewhere
+ * else, over a SMALLER set of fields and with different rules — so the two
+ * could disagree, and when they did the disagreement was a dropped report.
+ * See mobileSubmissionContentKey.
+ */
+export function helpPayloadCanonical(payload: HelpRequestPayload): string {
     const norm = (value: string | null | undefined) => (typeof value === "string" ? value.trim() : "");
-    return createHash("sha256")
-        .update(
-            JSON.stringify([
-                norm(payload.type),
-                norm(payload.question),
-                norm(payload.response),
-                norm(payload.currentPage),
-                norm(payload.conversationId),
-            ]),
-            "utf8"
-        )
-        .digest("hex");
+    return JSON.stringify([
+        norm(payload.type),
+        norm(payload.question),
+        norm(payload.response),
+        norm(payload.currentPage),
+        norm(payload.conversationId),
+    ]);
+}
+
+export function helpPayloadFingerprint(payload: HelpRequestPayload): string {
+    return createHash("sha256").update(helpPayloadCanonical(payload), "utf8").digest("hex");
 }
 
 export type ReserveResult =
@@ -426,11 +435,36 @@ export const HELP_DERIVED_KEY_WINDOW_MS = 24 * 60 * 60 * 1000;
  */
 export const HELP_DERIVED_KEY_HASH_CHARS = 48;
 
-/** The content half of a derived key — same user, same words, same value, forever. */
-export function mobileSubmissionContentKey(userId: string, title: string, description: string): string {
-    const normalizedText = `${title}\n${description}`.trim().toLowerCase().replace(/\s+/g, " ");
+/**
+ * The content half of a derived key — same user, same submission, same value,
+ * forever.
+ *
+ * OVER THE SAME CANONICAL PAYLOAD THE FINGERPRINT USES, and that is not a
+ * tidiness choice. reserveHelpRequest refuses a key whose stored fingerprint
+ * does not match the incoming one, on the reasoning that a reused key with
+ * different content is a client lying about "this is the same report". A
+ * DERIVED key is not chosen by a client at all — this function is the only
+ * thing that can produce one — so the two must agree by construction or the
+ * refusal fires on reports nobody reused anything for.
+ *
+ * They did not agree. This hashed a lowercased, whitespace-collapsed
+ * title + description and nothing else; the fingerprint hashed trimmed
+ * type / question / response / currentPage / conversationId. So:
+ *
+ *  - the same words reported from a DIFFERENT PAGE derived the SAME key and
+ *    produced a different fingerprint -> 409 submission-key-conflict, and a
+ *    legitimate second report was dropped;
+ *  - a retry that differed only in case or spacing did the same thing.
+ *
+ * Deriving from the identical canonical string closes both: same key implies
+ * same fingerprint, so a derived key can never be the thing that conflicts.
+ * The cost is that the key is now case- and whitespace-SENSITIVE, which is
+ * correct — the client retries with the identical body, and two reports whose
+ * text genuinely differs are two reports.
+ */
+export function mobileSubmissionContentKey(userId: string, payload: HelpRequestPayload): string {
     return createHash("sha256")
-        .update(`${userId}:${normalizedText}`)
+        .update(`${userId}:${helpPayloadCanonical(payload)}`, "utf8")
         .digest("hex")
         .slice(0, HELP_DERIVED_KEY_HASH_CHARS);
 }
@@ -472,14 +506,18 @@ export function nextDerivedSubmissionId(
  */
 export async function deriveMobileSubmissionId(
     userId: string,
-    title: string,
-    description: string,
+    /**
+     * THE SAME payload object the reservation is about to be made with — not
+     * the title and description alone. See mobileSubmissionContentKey for why
+     * anything less lets a derived key conflict with its own fingerprint.
+     */
+    payload: HelpRequestPayload,
     now: Date = new Date(),
     client: {
         $queryRaw: <T>(strings: TemplateStringsArray, ...values: unknown[]) => Promise<T>;
     } = prisma as never
 ): Promise<string> {
-    const contentKey = mobileSubmissionContentKey(userId, title, description);
+    const contentKey = mobileSubmissionContentKey(userId, payload);
     const rows = await client.$queryRaw<Array<{ submissionId: string; createdAt: Date }>>`
         SELECT "submissionId", "createdAt" FROM "HelpRequest"
         WHERE "userId" = ${userId} AND "submissionId" LIKE ${derivedKeyLikePattern(contentKey)}

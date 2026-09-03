@@ -19,6 +19,7 @@ import {
     isMobileSubmission,
     deriveMobileSubmissionId,
     derivedKeyLikePattern,
+    helpPayloadFingerprint,
     mobileSubmissionContentKey,
     nextDerivedSubmissionId,
     HELP_DERIVED_KEY_WINDOW_MS,
@@ -317,13 +318,33 @@ test("a mobile caller with no submissionId gets a DERIVED key, never a 400 for m
     // Still derived from HOW THEY AUTHENTICATED, never from the posted body.
     assert.match(source, /const fromMobileClient = isMobileClient\(auth\)/);
     assert.match(source, /fromMobileClient && !submissionId/);
-    assert.match(source, /deriveMobileSubmissionId\(userId, title, description\)/);
+    // From the WHOLE payload, not title+description: a subset let the same
+    // words from a different page derive the same key with a different
+    // fingerprint, and the guard refused that as a reused key.
+    assert.match(source, /deriveMobileSubmissionId\(userId, payload\)/);
+    assert.match(source, /const payload = \{/);
+    assert.match(source, /\.\.\.payload,/, "the reservation is made with the SAME object");
     assert.doesNotMatch(
         source,
         /MOBILE_SUBMISSION_ID_REQUIRED/,
         "the request route must no longer refuse a mobile caller for omitting submissionId"
     );
 });
+
+/**
+ * The payload shape a mobile bug report reserves under. The derived key is
+ * hashed from THIS, exactly as the route does it — see mobileSubmissionContentKey.
+ */
+function bugPayload(overrides: Partial<Record<string, string | null>> = {}) {
+    return {
+        type: "bug",
+        question: "Bug",
+        response: "It broke",
+        currentPage: "mobile",
+        conversationId: null,
+        ...overrides,
+    } as { type: string; question: string; response: string; currentPage: string | null; conversationId: string | null };
+}
 
 // ---- deriveMobileSubmissionId ---------------------------------------------
 // The replacement for the hard 400: a deterministic idempotency key derived
@@ -337,40 +358,105 @@ test("the content key carries NO clock — the same report hashes the same at an
     // whatever the network took, so two retries of ONE report that straddle a
     // minute boundary hashed differently and opened two GitHub issues. Bucket
     // size never fixed it; every bucket has a boundary.
-    const a = mobileSubmissionContentKey("u1", "Bug", "It broke");
-    const b = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    const a = mobileSubmissionContentKey("u1", bugPayload());
+    const b = mobileSubmissionContentKey("u1", bugPayload());
     assert.equal(a, b);
 
     // The function takes no `now` at all — this is the structural half of the
     // claim, and it is why no instant can change the answer.
-    assert.equal(mobileSubmissionContentKey.length, 3, "the content key must not accept a clock");
+    assert.equal(mobileSubmissionContentKey.length, 2, "the content key must not accept a clock");
 
     // A different user, same content — must not collide.
-    assert.notEqual(a, mobileSubmissionContentKey("u2", "Bug", "It broke"));
+    assert.notEqual(a, mobileSubmissionContentKey("u2", bugPayload()));
     // Different content, same user — must not collide.
-    assert.notEqual(a, mobileSubmissionContentKey("u1", "Bug", "Something else broke"));
+    assert.notEqual(a, mobileSubmissionContentKey("u1", bugPayload({ response: "Something else broke" })));
 
-    // Whitespace/case are cosmetic: a retyped retry still collapses.
-    assert.equal(a, mobileSubmissionContentKey("u1", "  BUG  ", "  it   broke  "));
+    // Surrounding whitespace is cosmetic and still collapses — the canonical
+    // form trims every field.
+    assert.equal(a, mobileSubmissionContentKey("u1", bugPayload({ question: "  Bug  ", response: "  It broke  " })));
+
+    // CASE and INNER SPACING are not cosmetic any more, and that is the fix.
+    // The key used to lowercase and collapse runs of whitespace while the
+    // fingerprint did neither, so a retyped report hashed to the SAME key with
+    // a DIFFERENT fingerprint — which reserveHelpRequest refuses as a reused
+    // key. Same rule on both sides means a derived key can never conflict.
+    assert.notEqual(a, mobileSubmissionContentKey("u1", bugPayload({ question: "BUG" })));
+    assert.notEqual(a, mobileSubmissionContentKey("u1", bugPayload({ response: "It   broke" })));
+});
+
+test("a derived key AGREES with the fingerprint of the payload it was derived from", () => {
+    // The invariant the whole fix rests on: same derived key implies same
+    // fingerprint. reserveHelpRequest refuses a key whose stored fingerprint
+    // differs from the incoming one — sound for a client-chosen key, and a
+    // guaranteed false positive for a derived one unless the two agree.
+    const cases: Array<[string, ReturnType<typeof bugPayload>]> = [
+        ["same page", bugPayload()],
+        ["another page", bugPayload({ currentPage: "/projects/42" })],
+        ["a conversation", bugPayload({ conversationId: "conv-1" })],
+        ["a feature request", bugPayload({ type: "feature_request" })],
+        ["different words", bugPayload({ response: "Something else broke" })],
+    ];
+    const seen = new Map<string, string>();
+    for (const [label, payload] of cases) {
+        const key = mobileSubmissionContentKey("u1", payload);
+        const fingerprint = helpPayloadFingerprint(payload);
+        const priorFingerprint = seen.get(key);
+        if (priorFingerprint !== undefined) {
+            assert.equal(priorFingerprint, fingerprint, `${label}: same key, so it MUST be the same fingerprint`);
+        }
+        seen.set(key, fingerprint);
+    }
+    // The control: these really are five distinct submissions, so the loop above
+    // was not vacuously comparing one key to itself.
+    assert.equal(seen.size, cases.length, "every one of these is a different report and gets its own key");
+});
+
+test("the same words from a DIFFERENT PAGE are a different report, not a 409", () => {
+    // THE REGRESSION. A crew member hits the same bug on two screens and files
+    // it twice. Both reports carry the same title and description, so the old
+    // key — hashed from title + description alone — was identical; the
+    // fingerprint included currentPage, so it was not. reserveHelpRequest saw a
+    // reused key with different content and answered 409
+    // submission-key-conflict, and the second report was never filed.
+    const first = bugPayload({ currentPage: "/time-clock" });
+    const second = bugPayload({ currentPage: "/projects/42" });
+
+    assert.notEqual(
+        mobileSubmissionContentKey("u1", first),
+        mobileSubmissionContentKey("u1", second),
+        "two reports the guard would treat as different content must get different keys"
+    );
+    assert.notEqual(helpPayloadFingerprint(first), helpPayloadFingerprint(second));
+
+    // The pre-fix derivation, spelled out: title + description, lowercased and
+    // whitespace-collapsed. It cannot tell these two apart — which is exactly
+    // how it collided with a fingerprint that can.
+    const preFix = (payload: ReturnType<typeof bugPayload>) =>
+        `${payload.question}\n${payload.response}`.trim().toLowerCase().replace(/\s+/g, " ");
+    assert.equal(preFix(first), preFix(second), "the old content key saw one report where there are two");
+
+    // And an identical payload twice is still ONE report — the retry case the
+    // derived key exists for.
+    assert.equal(mobileSubmissionContentKey("u1", first), mobileSubmissionContentKey("u1", bugPayload({ currentPage: "/time-clock" })));
 });
 
 test("a derived key fits the submissionId contract the route validates against", () => {
-    const key = `${mobileSubmissionContentKey("u1", "Bug", "It broke")}-g1`;
+    const key = `${mobileSubmissionContentKey("u1", bugPayload())}-g1`;
     assert.ok(key.length <= HELP_SUBMISSION_ID_MAX, `${key.length} > ${HELP_SUBMISSION_ID_MAX}`);
     assert.match(key, /^[a-f0-9]{48}-g1$/);
     assert.equal(checkHelpSubmission({ title: "t", description: "d", submissionId: key }).ok, true);
     // And every generation of it is still under the cap.
-    const far = `${mobileSubmissionContentKey("u1", "Bug", "It broke")}-g999999`;
+    const far = `${mobileSubmissionContentKey("u1", bugPayload())}-g999999`;
     assert.ok(far.length <= HELP_SUBMISSION_ID_MAX);
 });
 
 test("nextDerivedSubmissionId: no prior report starts generation 1", () => {
-    const key = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    const key = mobileSubmissionContentKey("u1", bugPayload());
     assert.equal(nextDerivedSubmissionId(key, null), `${key}-g1`);
 });
 
 test("nextDerivedSubmissionId: a retry ANY time inside the window reuses the original key", () => {
-    const key = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    const key = mobileSubmissionContentKey("u1", bugPayload());
     const filedAt = new Date("2026-09-02T12:00:59.500Z");
     const prior = { submissionId: `${key}-g1`, createdAt: filedAt };
 
@@ -386,7 +472,7 @@ test("nextDerivedSubmissionId: a retry ANY time inside the window reuses the ori
 });
 
 test("nextDerivedSubmissionId: past the window the same content is a NEW report, one generation on", () => {
-    const key = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    const key = mobileSubmissionContentKey("u1", bugPayload());
     const filedAt = new Date("2026-09-02T12:00:00.000Z");
     const justPast = new Date(filedAt.getTime() + HELP_DERIVED_KEY_WINDOW_MS + 1);
     assert.equal(nextDerivedSubmissionId(key, { submissionId: `${key}-g1`, createdAt: filedAt }, justPast), `${key}-g2`);
@@ -397,7 +483,7 @@ test("nextDerivedSubmissionId: past the window the same content is a NEW report,
 });
 
 test("deriveMobileSubmissionId asks the database for the current generation of this content", async () => {
-    const key = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    const key = mobileSubmissionContentKey("u1", bugPayload());
     const seen: unknown[][] = [];
     const client = {
         $queryRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
@@ -407,8 +493,7 @@ test("deriveMobileSubmissionId asks the database for the current generation of t
     };
     const inWindow = await deriveMobileSubmissionId(
         "u1",
-        "Bug",
-        "It broke",
+        bugPayload(),
         new Date("2026-09-03T11:00:00.000Z"),
         client
     );
@@ -419,8 +504,7 @@ test("deriveMobileSubmissionId asks the database for the current generation of t
 
     const outOfWindow = await deriveMobileSubmissionId(
         "u1",
-        "Bug",
-        "It broke",
+        bugPayload(),
         new Date("2026-09-03T13:00:01.000Z"),
         client
     );
@@ -480,7 +564,7 @@ test("a crash between provider and DB leaves a row a retry can finish", () => {
         path.join(__dirname, "..", "src", "app", "api", "help-chat", "bug-fix", "route.ts"),
         "utf8"
     );
-    assert.match(bugFix, /completeUnderLease\(requestId, leaseToken, \{ filed: false, status: "submitted_no_issue" \}\)/);
+    assert.match(bugFix, /completeUnderLease\(requestId, leaseToken, \{\s*filed: false,\s*status: "submitted_no_issue",?\s*\}\)/);
     assert.match(bugFix, /filed: true/);
     // 'pending' vs 'created' now lives in ONE place, so the two routes cannot
     // drift on what a half-finished submission looks like.
@@ -844,4 +928,64 @@ test("both routes answer 409 submission-key-conflict, and file from reserved.pay
             `${route}: refuse before filing, not after`
         );
     }
+});
+
+// ── The durable-submission RESPONSE contract (round 7, findings 4 and 5) ──
+
+test("a GitHub failure AFTER the report is saved answers 202, never 5xx", () => {
+    // The report is durable before GitHub is called at all — that is the whole
+    // point of reserving the row first. So a filing failure is not a failed
+    // request: it is a saved report with no issue yet, which the shared
+    // contract spells 202 + status "pending" (helpChatResponse). Answering 502
+    // told the crew app the submission had failed, and the app retries 5xx —
+    // so every retry re-attempted a hand-off that was already recorded as
+    // pending, against a row that already existed.
+    const bugFix = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "help-chat", "bug-fix", "route.ts"),
+        "utf8"
+    );
+    const branch = bugFix.slice(bugFix.indexOf("if (!ghIssue) {"));
+    const body = branch.slice(0, branch.indexOf("\n    }"));
+
+    assert.match(body, /helpChatResponse\(\{/, "the shared contract, not a hand-rolled response");
+    assert.match(body, /filed: saved\?\.providerState === "created"/, "the STORED state decides");
+    assert.ok(!/status: 502/.test(body), "502 tells a retrying client the report was lost, and it was not");
+    assert.ok(!/NextResponse\.json/.test(body), "every exit from this branch goes through helpChatResponse");
+
+    // The sibling route answers the identical shape for the identical case —
+    // this is what the contract being SHARED means.
+    const request = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "help-chat", "request", "route.ts"),
+        "utf8"
+    );
+    assert.match(request, /completeUnderLease\(requestId, leaseToken, \{ filed: false, status: "submitted_no_issue" \}\)/);
+    assert.match(request, /filed: request\?\.providerState === "created"/);
+
+    // And 202 really is what that helper emits for an unfiled report — the
+    // control, so the assertions above are about a status the client will see.
+    assert.match(readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8"), /\{ status: 202 \}/);
+});
+
+test("reproduction steps reach the GitHub issue exactly once", () => {
+    // buildBugFixDetails folds the steps into the stored description, and the
+    // issue body is built FROM that stored description. Adding them again as
+    // metadata printed the same block twice — and on a resume the metadata
+    // copy came from the INCOMING body while the description came from the
+    // STORED row, so the two could disagree.
+    const bugFix = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "help-chat", "bug-fix", "route.ts"),
+        "utf8"
+    );
+    // Once, in the stored description.
+    assert.match(bugFix, /details\.push\(`Steps to reproduce:/);
+    assert.equal((bugFix.match(/Steps to reproduce:/gi) || []).length, 1, "exactly one place puts steps in the issue");
+    // ...and never again as metadata.
+    const metadata = bugFix.slice(bugFix.indexOf("metadata: ["));
+    // Comments stripped: the prose in there explains the very thing it must no
+    // longer DO, so a bare text search would fail on the explanation.
+    const metadataCode = metadata.slice(0, metadata.indexOf("],")).replace(/^\s*\/\/.*$/gm, "");
+    assert.ok(!/steps/i.test(metadataCode), "the metadata block must not add steps a second time");
+
+    // The description the issue is built from is the STORED one.
+    assert.match(bugFix, /description: filing\.response/);
 });

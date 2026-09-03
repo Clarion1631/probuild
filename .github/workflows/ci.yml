@@ -190,6 +190,20 @@ jobs:
           # singleton — same pgbouncer reasoning as the rate-lock step above.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # WA meal settlement is a per-DAY rule, and every day key on that path used
+      # to come from a helper hardcoded to America/Los_Angeles while the payroll
+      # window around it used the CONFIGURED zone. For a non-Pacific company a
+      # 00:30 Monday punch settled as a Pacific Sunday and the rule was computed
+      # over two local days at once, which changes what comes off a paycheque.
+      # Two zones, both boundaries, real rows, each with a pre-fix control.
+      - name: Prove settlement uses the company time zone, not Pacific
+        run: npx tsx --test tests/payroll-settlement-zone-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # settleDay reaches the app's prisma singleton — same pgbouncer
+          # reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

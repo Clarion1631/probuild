@@ -68,9 +68,23 @@ export async function POST(req: NextRequest) {
     // (submission-guard.ts explains why a time bucket is not an idempotency
     // key). The web widget is a human clicking once, so an explicit key there
     // is passed through unchanged.
+    // ONE payload object: the derived key is hashed from it, the reservation
+    // is made with it, and reserveHelpRequest fingerprints it. Deriving the key
+    // from a SUBSET (title + description) let the same words from a different
+    // page hash to the same key and a different fingerprint, which the guard
+    // then refused as a reused key — dropping a legitimate report with a 409
+    // (round 7, finding 3).
+    const payload = {
+      type: fromMobile ? "bug" : "feature_request",
+      question: title,
+      response: description,
+      currentPage,
+      conversationId,
+    };
+
     const effectiveSubmissionId =
       fromMobileClient && !submissionId
-        ? await deriveMobileSubmissionId(userId, title, description)
+        ? await deriveMobileSubmissionId(userId, payload)
         : submissionId;
 
     if (conversationId) {
@@ -93,11 +107,7 @@ export async function POST(req: NextRequest) {
     // read-then-write that five concurrent requests all pass.
     const reserved = await reserveHelpRequest({
       userId,
-      type: fromMobile ? "bug" : "feature_request",
-      question: title,
-      response: description,
-      currentPage,
-      conversationId,
+      ...payload,
       submissionId: effectiveSubmissionId,
     });
     if (!reserved.ok) {

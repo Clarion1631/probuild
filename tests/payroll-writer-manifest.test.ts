@@ -83,31 +83,31 @@ function findWriters(): string[] {
  */
 const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     // ---- the payroll write paths -------------------------------------------
-    "app/api/time-entries/route.ts:290::create": {
+    "app/api/time-entries/route.ts:298::create": {
         kind: "guarded",
         why: "clock-in create, wrapped in withPayrollWriteTx (startTime is client-supplied, so it can aim at a locked period)",
     },
-    "app/api/time-entries/route.ts:120::updateMany": {
+    "app/api/time-entries/route.ts:128::updateMany": {
         kind: "guarded",
         why: "the stale-DEFERRED review flag, wrapped in withPayrollWrite — it sets needsReview, which gates the export",
     },
-    "app/api/time-entries/route.ts:982::updateMany": {
+    "app/api/time-entries/route.ts:1013::updateMany": {
         kind: "guarded",
         why: "the clock-out claim, inside closeTimeEntry's locked transaction with a compare-and-set on startTime AND on updatedAt, so any concurrent write to the row the close was decided from fails it closed",
     },
-    "app/api/time-entries/route.ts:1006::update": {
+    "app/api/time-entries/route.ts:1038::update": {
         kind: "guarded",
         why: "settlement-failure flag, written inside the same locked transaction as the close it belongs to",
     },
-    "app/api/time-entries/[id]/route.ts:155::updateMany": {
+    "app/api/time-entries/[id]/route.ts:165::updateMany": {
         kind: "guarded",
         why: "the geofence telemetry branch — offsiteMs/isOffsite/lastLocationCheck touch no hours, cost or readiness flag, but it is still routed through withPayrollWriteTx (entryIds: [id]) so it cannot become a hole later without someone deliberately removing the wrapper",
     },
-    "app/api/time-entries/[id]/route.ts:573::updateMany": {
+    "app/api/time-entries/[id]/route.ts:588::updateMany": {
         kind: "guarded",
         why: "the PATCH edit claim, inside withPayrollWriteTx with a compare-and-set on updatedAt",
     },
-    "app/api/time-entries/[id]/route.ts:592::update": {
+    "app/api/time-entries/[id]/route.ts:608::update": {
         kind: "guarded",
         why: "the settlement-failure flag, written inside the same locked edit transaction",
     },
@@ -184,19 +184,19 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     // longer runs.
 
     // ---- the settlement protocol -------------------------------------------
-    "lib/wa-breaks-db.ts:296::update": {
+    "lib/wa-breaks-db.ts:320::update": {
         kind: "guarded",
         why: "settleDayInTx's re-plan of one entry's shift/meal/cost fields, run inside the caller's already-locked payroll transaction (every caller takes the payroll lock before the day lock)",
     },
-    "lib/wa-breaks-db.ts:367::delete": {
+    "lib/wa-breaks-db.ts:393::delete": {
         kind: "guarded",
         why: "deleteEntryAndSettle, whose guard hook runs the payroll assertion before anything is removed",
     },
-    "lib/wa-breaks-db.ts:395::update": {
+    "lib/wa-breaks-db.ts:426::update": {
         kind: "exempt",
         why: "flagSettlementFailed's already-flagged branch: only ADDS needsReview, which blocks the export rather than letting bad numbers through. Deliberately outside the payroll lock — it must still run when the surrounding settlement transaction has rolled back, which is precisely the failure it exists to flag",
     },
-    "lib/wa-breaks-db.ts:398::update": {
+    "lib/wa-breaks-db.ts:429::update": {
         kind: "exempt",
         why: "flagSettlementFailed's first-flag branch — same reasoning as the already-flagged branch above: best-effort, ADDS-only, and must survive the surrounding transaction rolling back",
     },

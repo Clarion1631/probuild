@@ -138,6 +138,9 @@ function deps(options: {
         reviewReason: null,
     };
     const dependencies: ClockOutDependencies = {
+        // ONE resolution per request; every day key in the close path comes
+        // from it (round 7, finding 1).
+        resolveTimeZone: async () => "America/Los_Angeles",
         authenticate: async () => ({
             ok: true,
             user: {

@@ -166,7 +166,9 @@ test("deleteEntryAndSettle takes the NEW owner's day lock after a same-date reas
         await new Promise((r) => setTimeout(r, 300));
 
         // knownDayKey / userId are the STALE ones the caller read.
-        const deleting = deleteEntryAndSettle(ids.entryId, DAY, ids.a);
+        // DAY is a company-local key, and the zone it was derived in is now
+        // passed explicitly rather than assumed (round 7, finding 1).
+        const deleting = deleteEntryAndSettle(ids.entryId, DAY, ids.a, "America/Los_Angeles");
 
         const blocked = await Promise.race([
             deleting.then(() => false),

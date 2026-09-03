@@ -2,7 +2,7 @@
 // paths (PUT /api/time-entries and PATCH /api/time-entries/[id]) must see the
 // SAME "rest of the day", so they share this rather than each hand-rolling it.
 import { prisma } from "@/lib/prisma";
-import { COMPANY_TIME_ZONE, toCompanyDayKey } from "@/lib/company-day";
+import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { toNum } from "@/lib/prisma-helpers";
 import { SETTLEMENT_FAILED_NOTE, settleDayPlan, type DayEntry } from "@/lib/wa-breaks";
 import { dayLockKey, isPeriodLockedError } from "@/lib/payroll-period";
@@ -45,18 +45,33 @@ export async function settlementCandidateIds(
 }
 
 /**
- * The worker's OTHER closed entries on the given company-local day. A UTC
- * day either side is a superset of any local day; the toCompanyDayKey filter
- * is what makes it exact (same helper the rule and the clock-in binding use).
+ * The worker's OTHER closed entries on the given company-local day. A UTC day
+ * either side is a superset of any local day; the zone filter is what makes it
+ * exact.
+ *
+ * `timeZone` IS REQUIRED, and it must be the zone `dayKey` was derived in.
+ *
+ * It used to be implicit: every filter in this module called toCompanyDayKey,
+ * which is hardcoded to America/Los_Angeles. That is right for this company and
+ * wrong as a rule — and it made settleDeferredDaysForPeriod, which builds its
+ * window from the CONFIGURED zone, the one caller that mixed the two. For a New
+ * York company an entry at 00:30 Monday is a Pacific SUNDAY, so it settled under
+ * the wrong key and dragged in that Sunday's other rows, which can sit outside
+ * the period the operator asked for (round 7, finding 1).
  */
-export async function loadDayEntries(userId: string, dayKey: string, excludeEntryId: string): Promise<DayEntry[]> {
+export async function loadDayEntries(
+    userId: string,
+    dayKey: string,
+    excludeEntryId: string,
+    timeZone: string
+): Promise<DayEntry[]> {
     const rows = await prisma.timeEntry.findMany({
         where: { userId, id: { not: excludeEntryId }, endTime: { not: null }, startTime: dayWindow(dayKey) },
         select: { startTime: true, endTime: true, mealDeductionHours: true },
     });
     return rows
         .filter((row): row is typeof row & { endTime: Date } => row.endTime != null)
-        .filter((row) => toCompanyDayKey(row.startTime) === dayKey)
+        .filter((row) => dayKeyInTimeZone(row.startTime, timeZone) === dayKey)
         .map((row) => ({ startTime: row.startTime, endTime: row.endTime, mealDeductionHours: row.mealDeductionHours }));
 }
 
@@ -77,7 +92,9 @@ export async function loadDayEntries(userId: string, dayKey: string, excludeEntr
 export async function settleDay(
     userId: string,
     dayKey: string,
-    closing?: { id: string; mealSkipped: unknown } | null
+    closing: { id: string; mealSkipped: unknown } | null,
+    /** The zone `dayKey` was derived in. REQUIRED — see loadDayEntries. */
+    timeZone: string
 ): Promise<number> {
     try {
         return await prisma.$transaction(async (tx) => {
@@ -86,13 +103,13 @@ export async function settleDay(
             // Taking the day lock first would let a settlement hold it while
             // waiting on payroll, against a locker holding payroll and waiting
             // on this day.
-            await assertSettlementDayUnlocked(tx, userId, dayKey);
+            await assertSettlementDayUnlocked(tx, dayKey, timeZone);
             await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayLockKey(userId, dayKey));
-            return settleDayInTx(tx, userId, dayKey, closing, { alreadyGuarded: true });
+            return settleDayInTx(tx, userId, dayKey, closing, timeZone, { alreadyGuarded: true });
         });
     } catch (error) {
         if (isPeriodLockedError(error)) throw error;
-        console.error("[wa-breaks] settleDay failed", { userId, dayKey }, error);
+        console.error("[wa-breaks] settleDay failed", { userId, dayKey, timeZone }, error);
         return -1;
     }
 }
@@ -158,35 +175,40 @@ export async function settleDayWithinTx(
     tx: Tx,
     userId: string,
     dayKey: string,
-    closing?: { id: string; mealSkipped: unknown } | null
+    closing: { id: string; mealSkipped: unknown } | null,
+    /** The zone `dayKey` was derived in. REQUIRED — see loadDayEntries. */
+    timeZone: string
 ): Promise<number> {
     // Payroll lock first, then the day lock (see LOCK ORDER in payroll-period.ts).
-    await assertSettlementDayUnlocked(tx, userId, dayKey);
+    await assertSettlementDayUnlocked(tx, dayKey, timeZone);
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayLockKey(userId, dayKey));
-    return settleDayInTx(tx, userId, dayKey, closing, { alreadyGuarded: true });
+    return settleDayInTx(tx, userId, dayKey, closing, timeZone, { alreadyGuarded: true });
 }
 
 /**
  * Payroll guard for a settlement: takes the shared payroll advisory lock and
  * refuses a locked day.
  *
- * THE ZONE IS THE ONE THE DAY KEY WAS DERIVED IN, not the configured company
- * zone. Every `dayKey` reaching settlement comes out of toCompanyDayKey, which
- * is hardcoded to COMPANY_TIME_ZONE, and settlement then selects the rows it
- * rewrites with that same helper (see settleDayInTx). Interpreting the key
- * here through resolveCompanyTimeZone() made the guard and the write disagree
- * the moment CompanySettings.timeZone moved off the default: "2026-08-17"
- * would be read as New York midnight, three hours BEFORE the Los Angeles
- * midnight the rows actually sit at, which falls outside a locked period's
- * envelope — so the guard passed and settlement rewrote paid hours inside an
- * already-exported period. A locked period carries the zone it was locked in
- * and evaluates its own envelope in it (lockedPeriodFor), so nothing else here
- * depends on the caller's zone.
+ * THE ZONE IS THE ONE THE DAY KEY WAS DERIVED IN, and it is now PASSED IN
+ * rather than assumed. The guard and the write have to agree about what
+ * "2026-08-17" means: read as New York midnight it is three hours before the
+ * Los Angeles midnight the rows would sit at, which can fall outside a locked
+ * period's envelope — the guard passes and settlement rewrites paid hours
+ * inside an already-exported period.
+ *
+ * They used to agree by both hardcoding America/Los_Angeles (toCompanyDayKey /
+ * COMPANY_TIME_ZONE). That is one way to make two things agree, and it is the
+ * wrong one: it is correct only for a Pacific company, and it left
+ * settleDeferredDaysForPeriod — whose window comes from the CONFIGURED zone —
+ * mixing two zones in a single operation. Both sides now take the caller's
+ * resolved zone, so they agree in EVERY zone rather than in one.
+ *
+ * A locked period carries the zone it was locked in and evaluates its own
+ * envelope in it (lockedPeriodFor), so nothing else here depends on this value.
  */
-async function assertSettlementDayUnlocked(tx: Tx, userId: string, dayKey: string): Promise<void> {
-    void userId;
+async function assertSettlementDayUnlocked(tx: Tx, dayKey: string, timeZone: string): Promise<void> {
     const { assertDayUnlockedInTx } = await import("./payroll-period");
-    await assertDayUnlockedInTx(tx as never, dayKey, COMPANY_TIME_ZONE);
+    await assertDayUnlockedInTx(tx as never, dayKey, timeZone);
 }
 
 type Tx = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
@@ -196,7 +218,9 @@ async function settleDayInTx(
     tx: Tx,
     userId: string,
     dayKey: string,
-    closing?: { id: string; mealSkipped: unknown } | null,
+    closing: { id: string; mealSkipped: unknown } | null,
+    /** The zone `dayKey` was derived in. REQUIRED — see loadDayEntries. */
+    timeZone: string,
     options: { alreadyGuarded?: boolean } = {}
 ): Promise<number> {
     {
@@ -208,7 +232,7 @@ async function settleDayInTx(
             // Same helper as the guarded callers, so there is exactly ONE
             // answer to "which zone is this day key in" on both sides.
             if (!options.alreadyGuarded) {
-                await assertSettlementDayUnlocked(tx, userId, dayKey);
+                await assertSettlementDayUnlocked(tx, dayKey, timeZone);
             }
 
             // TimeEntry BEFORE User, in sorted id order — the same order every
@@ -264,7 +288,7 @@ async function settleDayInTx(
             });
             const day = rows
                 .filter((row): row is typeof row & { endTime: Date } => row.endTime != null)
-                .filter((row) => toCompanyDayKey(row.startTime) === dayKey);
+                .filter((row) => dayKeyInTimeZone(row.startTime, timeZone) === dayKey);
             const plan = settleDayPlan({
                 entries: day.map((row) => ({
                     id: row.id, startTime: row.startTime, endTime: row.endTime,
@@ -327,6 +351,8 @@ export async function deleteEntryAndSettle(
     entryId: string,
     knownDayKey: string,
     userId: string,
+    /** The zone `knownDayKey` was derived in. REQUIRED — see loadDayEntries. */
+    timeZone: string,
     options: {
         /**
          * Runs FIRST, inside this transaction, before anything is deleted. The
@@ -342,7 +368,7 @@ export async function deleteEntryAndSettle(
         await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayLockKey(userId, knownDayKey));
         const victim = await tx.timeEntry.findUnique({ where: { id: entryId }, select: { userId: true, startTime: true } });
         if (!victim) return; // already gone
-        const actualDay = toCompanyDayKey(victim.startTime);
+        const actualDay = dayKeyInTimeZone(victim.startTime, timeZone);
 
         // THE COMPLETE SET, keyed on OWNER AND DAY.
         //
@@ -368,18 +394,23 @@ export async function deleteEntryAndSettle(
         // Re-plan the day the hours actually left. The caller's day is settled
         // too when it differs, because the row may have moved off it.
         for (const dayKey of new Set([knownDayKey, actualDay])) {
-            await settleDayInTx(tx, victim.userId, dayKey, null);
+            await settleDayInTx(tx, victim.userId, dayKey, null, timeZone);
         }
     });
 }
 
 /** Id of the worker's latest CLOSED entry on a company-local day (null when none) — the row that carries the day's outcome. */
-export async function latestClosedEntryIdOnDay(userId: string, dayKey: string): Promise<string | null> {
+export async function latestClosedEntryIdOnDay(
+    userId: string,
+    dayKey: string,
+    /** The zone `dayKey` was derived in. REQUIRED — see loadDayEntries. */
+    timeZone: string
+): Promise<string | null> {
     const rows = await prisma.timeEntry.findMany({
         where: { userId, endTime: { not: null }, startTime: dayWindow(dayKey) },
         select: { id: true, startTime: true, endTime: true },
     });
-    const day = rows.filter((row) => row.endTime != null && toCompanyDayKey(row.startTime) === dayKey);
+    const day = rows.filter((row) => row.endTime != null && dayKeyInTimeZone(row.startTime, timeZone) === dayKey);
     if (day.length === 0) return null;
     day.sort((a, b) => (b.endTime as Date).getTime() - (a.endTime as Date).getTime() || b.startTime.getTime() - a.startTime.getTime());
     return day[0].id;

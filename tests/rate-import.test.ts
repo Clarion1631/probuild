@@ -849,3 +849,80 @@ test("the identity-less row blocks the APPLY, so nothing is half-imported", () =
     assert.ok(write > 0, "and it does have a write to refuse");
     assert.ok(refusal < write, "the refusal must come BEFORE anything is written");
 });
+
+// ── A bare CARRIAGE RETURN is never dropped (round 7, finding 2) ─────────
+//
+// Outside a quoted field every CR used to be skipped unconditionally, on the
+// assumption it was the first half of a CRLF. So a CR sitting inside a value
+// was DELETED and the two halves closed up: "2\r8" parsed as the rate 28.00.
+// That is the same failure as the dollar-sign and space scrubbing this file
+// already refuses — malformed money quietly repaired into a plausible number,
+// on somebody's paycheque, with no error to look at.
+//
+// The rule now: a CR is accepted ONLY as the first half of CRLF. Anywhere
+// else outside quotes it is a parse error. Inside quotes it is content, like
+// every other character there.
+
+const CR = String.fromCharCode(13);
+
+test("a bare CR inside a value is an ERROR — it is never deleted to close the gap", () => {
+    // THE REGRESSION, exactly: the digits either side of the CR must not be
+    // joined into a rate nobody typed.
+    const csv = ["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,2" + CR + "8"].join(LF);
+    assert.throws(() => parseCsvGrid(csv), /stray carriage return/);
+
+    // ...and the whole import refuses, rather than importing a repaired row.
+    const parsed = parseGustoRateCsv(csv);
+    assert.deepEqual(parsed.rows, [], "nothing parses out of a file that cannot be read");
+    assert.equal(parsed.errors.length, 1);
+    assert.match(parsed.errors[0], /stray carriage return/);
+
+    // The control: the same file WITHOUT the stray CR is a perfectly good
+    // 28.00 — so the refusal above is about the CR, not about the row.
+    const clean = parseGustoRateCsv(
+        ["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,28"].join(LF)
+    );
+    assert.deepEqual(clean.errors, []);
+    assert.equal(clean.rows[0].hourlyRate, "28.00", "which is exactly the value the dropped CR used to fabricate");
+});
+
+test("a CRLF file parses identically to the same file with LF", () => {
+    const lines = [
+        "Employee name,Email,Compensation rate,Compensation type",
+        "Tim Brennan,tim@example.com,31.00,Hourly",
+        "Garrett Lane,garrett@example.com,28.50,Hourly",
+    ];
+    const lf = parseGustoRateCsv(lines.join(LF) + LF);
+    const crlf = parseGustoRateCsv(lines.join(CRLF) + CRLF);
+    assert.deepEqual(crlf, lf, "the CRLF half of a CRLF is still a line ending, not a stray CR");
+    assert.deepEqual(lf.errors, []);
+    assert.equal(lf.rows.length, 2);
+    // And at the grid level, byte for byte.
+    assert.deepEqual(parseCsvGrid(lines.join(CRLF) + CRLF), parseCsvGrid(lines.join(LF) + LF));
+});
+
+test("a CR used as a LINE ending on its own is refused, not silently swallowed", () => {
+    // Classic-Mac line endings are not accepted: guessing which convention a
+    // file uses is how one row silently becomes one field. Refusing says so.
+    const csv = ["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,31.00"].join(CR);
+    assert.throws(() => parseCsvGrid(csv), /stray carriage return/);
+});
+
+test("inside QUOTES a CR is content — the quotes say where the field ends", () => {
+    // Nothing to guess at inside quotes, so the character is kept verbatim,
+    // exactly like a comma or a newline there.
+    assert.deepEqual(parseCsvGrid(Q + "a" + CR + "b" + Q + LF), [["a" + CR + "b"]]);
+
+    // And a quoted CR in the RATE column is still refused, by the money parser
+    // rather than the grid reader — the value never becomes 28.00 either way.
+    assert.equal(parseRateValue("2" + CR + "8"), null);
+    const parsed = parseGustoRateCsv(
+        [
+            "Employee name,Email,Compensation rate",
+            "Tim Brennan,tim@example.com," + Q + "2" + CR + "8" + Q,
+        ].join(LF)
+    );
+    assert.deepEqual(parsed.rows, []);
+    assert.equal(parsed.errors.length, 1);
+    assert.match(parsed.errors[0], /could not read the rate/);
+});
