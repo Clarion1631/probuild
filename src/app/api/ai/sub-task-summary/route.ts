@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "@/lib/prisma";
 import { displayEndDate, toDateKey, isTaskOverdue } from "@/lib/schedule-dates";
+import { toCompanyDayKey } from "@/lib/company-day";
 
 export async function POST(req: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) {
@@ -57,7 +58,7 @@ export async function POST(req: NextRequest) {
     });
 
     const tasks = assignments.map((a) => a.task);
-    const today = new Date().toISOString().split("T")[0];
+    const today = toCompanyDayKey(new Date()); // business-day "today" (Pacific), not UTC
 
     const taskDetails = tasks.map((t) => {
         const start = new Date(t.startDate).toISOString().split("T")[0];

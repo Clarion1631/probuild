@@ -62,20 +62,28 @@ export const EXTEND_ROW = `
       AND "type" <> 'milestone'
       AND "endDate" = ($2::date + interval '1 day')`;
 
-// Review list, printed in dry run: multi-day tasks that are current or upcoming.
-// A task whose dates were last typed into the old Calendar view (inclusive)
-// now displays one day shorter; nothing in the row says which surface wrote
-// it, so these are listed per project for a human to eyeball rather than
-// guessed at by the script.
+// Review list, printed in dry run: every current or upcoming task with a real
+// span (a two-day inclusive entry has a one-day stored difference, so the
+// predicate is end > start, not end > start + 1). A task whose dates were
+// last typed into the old Calendar view (inclusive) now displays one day
+// shorter; nothing in the row says which surface wrote it, so these are
+// listed per project for a human to eyeball rather than guessed at.
 export const SELECT_REVIEW_ROWS = `
     SELECT t."id", t."name", p."name" AS "projectName", t."startDate", t."endDate"
     FROM "ScheduleTask" t
     JOIN "Project" p ON p."id" = t."projectId"
     WHERE t."projectId" IS NOT NULL
       AND t."type" <> 'milestone'
-      AND t."endDate" > t."startDate" + interval '1 day'
+      AND t."endDate" > t."startDate"
       AND t."endDate" >= now() - interval '7 days'
     ORDER BY p."name" ASC, t."startDate" ASC`;
+
+export const SELECT_TASK_END = `SELECT "endDate" FROM "ScheduleTask" WHERE "id" = $1`;
+
+function addDaysKey(key, days) {
+    const [y, m, d] = key.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+}
 
 const APPLY = process.argv.includes("--yes");
 
@@ -133,10 +141,16 @@ async function main() {
             let extended = 0;
             for (const { id, shownEnd } of extendPairs) {
                 const n = await tx.$executeRawUnsafe(EXTEND_ROW, id, shownEnd);
-                if (n !== 1) {
-                    throw new Error(`Refusing: task ${id} no longer shows End ${shownEnd} (already extended or edited since review). Nothing was applied.`);
+                if (n === 1) { extended += 1; continue; }
+                // Zero rows: either this token was already applied (a rerun, fine)
+                // or the row was edited since the review (refuse the whole batch).
+                const current = await tx.$queryRawUnsafe(SELECT_TASK_END, id);
+                const storedEnd = current[0]?.endDate?.toISOString().slice(0, 10);
+                const alreadyExtended = storedEnd === addDaysKey(shownEnd, 2);
+                if (!alreadyExtended) {
+                    throw new Error(`Refusing: task ${id} no longer shows End ${shownEnd} (edited since review; stored end ${storedEnd ?? "missing"}). Nothing was applied.`);
                 }
-                extended += n;
+                console.log(`  ${id} already extended past ${shownEnd}; skipping`);
             }
             return { applied, milestonesFixed, extended };
         });

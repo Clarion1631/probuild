@@ -122,3 +122,23 @@ test("linking an estimate item enforces project ownership and rejects sections",
     assert.equal(labor.updates.length, 1);
     assert.equal(labor.updates[0].data.estimatedHours, 8);
 });
+
+test("a type change is a date mutation: blocked on closed projects and audited", async () => {
+    const closed = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+    closed.tx.scheduleTask.findUnique = async () => ({
+        id: TASK_ID, name: "Framing", projectId: PROJECT_ID, type: "task", status: "Not Started", blockedReason: null,
+        startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z"), project: { status: "Closed Complete" },
+    });
+    await assert.rejects(
+        () => updateScheduleTaskInTransaction(closed.tx, TASK_ID, { type: "milestone" }, actor, PROJECT_ID),
+        (err: unknown) => err instanceof ScheduleTaskValidationError && /closed project/.test((err as Error).message),
+    );
+    assert.equal(closed.updates.length, 0);
+
+    const open = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+    const audits: any[] = [];
+    open.tx.activityLog = { create: async (args: any) => { audits.push(args); return {}; } };
+    await updateScheduleTaskInTransaction(open.tx, TASK_ID, { type: "milestone" }, actor, PROJECT_ID);
+    assert.equal(audits.length, 1);
+    assert.equal(audits[0].data.action, "updated_company_schedule_task_dates");
+});

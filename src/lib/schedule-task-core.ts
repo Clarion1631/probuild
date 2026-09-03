@@ -370,12 +370,17 @@ export async function updateScheduleTaskInTransaction(
     }
 
     const hasDatePatch = data.startDate !== undefined || data.endDate !== undefined;
-    if (hasDatePatch) {
+    const typeChanges = data.type !== undefined && data.type !== persisted.type;
+    // A type change normalizes endDate (milestone: end == start; task: end > start),
+    // which is a date mutation too: same closed-project guard, same audit row.
+    if (hasDatePatch || typeChanges) {
         if (!persisted.project) throw new ScheduleTaskValidationError("Task is not attached to a project");
         if (CLOSED_PROJECT_STATUSES.includes(persisted.project.status)) {
             throw new ScheduleTaskValidationError(`Cannot update a task on a closed project (${persisted.project.status})`);
         }
-        if (data.type !== undefined && data.type !== persisted.type) {
+    }
+    if (hasDatePatch) {
+        if (typeChanges) {
             throw new ScheduleTaskValidationError("Change task type separately before editing its dates");
         }
         const startDate = data.startDate === undefined ? persisted.startDate : parseStartDateInput(data.startDate);
@@ -386,7 +391,7 @@ export async function updateScheduleTaskInTransaction(
         }
         updateData.startDate = startDate;
         updateData.endDate = endDate;
-    } else if (data.type !== undefined && data.type !== persisted.type) {
+    } else if (typeChanges) {
         // A type change without a date patch must keep the stored dates valid:
         // milestones store end == start, everything else stores end > start
         // (exclusive end, see schedule-dates.ts).
@@ -401,7 +406,7 @@ export async function updateScheduleTaskInTransaction(
         where: { id: taskId },
         data: updateData,
     });
-    if (hasDatePatch) {
+    if (hasDatePatch || typeChanges) {
         await tx.activityLog.create({
             data: {
                 projectId: locked.projectId,
@@ -414,8 +419,8 @@ export async function updateScheduleTaskInTransaction(
                 metadata: JSON.stringify({
                     previousStartDate: persisted.startDate.toISOString().slice(0, 10),
                     previousEndDate: persisted.endDate.toISOString().slice(0, 10),
-                    startDate: saved.startDate.toISOString().slice(0, 10),
-                    endDate: saved.endDate.toISOString().slice(0, 10),
+                    startDate: (saved.startDate ?? persisted.startDate).toISOString().slice(0, 10),
+                    endDate: (saved.endDate ?? persisted.endDate).toISOString().slice(0, 10),
                     type: persisted.type,
                 }),
             },

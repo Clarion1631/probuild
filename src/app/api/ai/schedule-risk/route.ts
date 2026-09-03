@@ -3,6 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { getAnthropicText } from "@/lib/anthropic";
 import { prisma } from "@/lib/prisma";
 import { displayEndDate, toDateKey, durationDays, isTaskOverdue, isTaskOnDay } from "@/lib/schedule-dates";
+import { toCompanyDayKey } from "@/lib/company-day";
 
 interface ScheduleTask {
     id: string;
@@ -28,7 +29,7 @@ export async function POST(req: NextRequest) {
         select: { name: true, type: true, status: true },
     });
 
-    const today = new Date().toISOString().split("T")[0];
+    const today = toCompanyDayKey(new Date()); // business-day "today" (Pacific), not UTC
 
     const taskSummary = tasks.map(t => {
         const taskDurationDays = durationDays(toDateKey(t.startDate), toDateKey(t.endDate), t.type);

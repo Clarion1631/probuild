@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "@/lib/prisma";
 import { displayEndDate, toDateKey, durationDays, isTaskOverdue } from "@/lib/schedule-dates";
+import { toCompanyDayKey } from "@/lib/company-day";
 
 export async function POST(req: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
@@ -32,7 +33,7 @@ export async function POST(req: NextRequest) {
 
     if (!sub) return NextResponse.json({ error: "Subcontractor not found" }, { status: 404 });
 
-    const today = new Date().toISOString().split("T")[0];
+    const today = toCompanyDayKey(new Date()); // business-day "today" (Pacific), not UTC
 
     const taskSummary = sub.taskAssignments.map(ta => {
         const t = ta.task;

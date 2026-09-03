@@ -5,6 +5,7 @@ import Link from "next/link";
 import ProjectViewTracker from "@/components/ProjectViewTracker";
 import SubTaskSummaryCard from "./SubTaskSummaryCard";
 import { displayEndDate, isTaskOverdue, toDateKey } from "@/lib/schedule-dates";
+import { toCompanyDayKey } from "@/lib/company-day";
 
 export default async function SubPortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const sub = await getSubPortalSession();
@@ -165,7 +166,7 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
                 {tasks.map((task, idx) => {
                     const start = new Date(task.startDate);
                     const end = new Date(displayEndDate(toDateKey(task.startDate), toDateKey(task.endDate), task.type));
-                    const isOverdue = isTaskOverdue(task.startDate, task.endDate, new Date(), task.type) && task.status !== "Complete";
+                    const isOverdue = isTaskOverdue(task.startDate, task.endDate, toCompanyDayKey(new Date()), task.type) && task.status !== "Complete";
 
                     return (
                         <div
