@@ -2837,9 +2837,15 @@ model ReceiptRequestCard {
 
   @@unique([owner, pacificDate])
   /// ONE DELIVERY PER OWNER PER DAY, enforced rather than remembered
-  /// (round-42 gate, finding 4). Partial in the database — a row that has never
-  /// been delivered holds no claim — so the constraint only binds real
-  /// deliveries.
+  /// (round-42 gate, finding 4).
+  ///
+  /// NULLS ARE ALREADY DISTINCT, so this needs no WHERE clause. Postgres treats
+  /// two NULLs as unequal in a unique index (the default, not NULLS NOT
+  /// DISTINCT), so every never-delivered card coexists freely under one owner
+  /// and only real delivery days collide. A partial index would say exactly the
+  /// same thing while being invisible to Prisma's diff engine, which reports it
+  /// as missing forever and needs a blind-spot entry to stay quiet — a permanent
+  /// phantom bought for no semantics at all.
   @@unique([owner, deliveredOn])
   @@index([pacificDate])
   /// The drain's own lookup: queued rows, oldest first, whatever date they are

@@ -499,8 +499,10 @@ test("the claim is a database constraint, not a check somebody has to remember",
     const migration = readFileSync(
         join(repoRoot, "prisma/migrations/20260901120000_phase2_receipt_queue/migration.sql"), "utf8");
     assert.match(migration, /CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCard_owner_deliveredOn_key"/);
-    assert.match(migration, /WHERE "deliveredOn" IS NOT NULL/,
-        "PARTIAL: a card that was never delivered holds no claim");
+    // NOT partial: Postgres already treats NULLs as distinct, so an undelivered
+    // card holds no claim without one — and a partial index is invisible to
+    // Prisma's diff engine, which is a permanent phantom for no semantics.
+    assert.doesNotMatch(migration, /WHERE "deliveredOn" IS NOT NULL/);
 
     // The apply script has to say the same thing, or prod and CI drift.
     const apply = readFileSync(join(repoRoot, "scripts/apply-phase2-receipt-queue.mjs"), "utf8");

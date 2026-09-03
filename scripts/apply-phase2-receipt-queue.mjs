@@ -181,10 +181,15 @@ export const statements = [
     // a check somebody has to remember to write.
     `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "deliveredOn" TEXT`,
 
-    // PARTIAL, so a card that has never been delivered holds no claim at all.
+    // NULLS ARE ALREADY DISTINCT, so this needs no WHERE clause. Postgres treats
+    // two NULLs as unequal in a unique index (the default, not NULLS NOT
+    // DISTINCT), so every never-delivered card coexists freely under one owner
+    // and only real delivery days collide. A partial index would say exactly the
+    // same thing while being invisible to Prisma's diff engine, which reports it
+    // as missing forever and needs a blind-spot entry to stay quiet — a permanent
+    // phantom bought for no semantics at all.
     `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCard_owner_deliveredOn_key"
-  ON "ReceiptRequestCard"("owner", "deliveredOn")
-  WHERE "deliveredOn" IS NOT NULL`,
+  ON "ReceiptRequestCard"("owner", "deliveredOn")`,
 
     `CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_pacificDate_idx"
        ON "ReceiptRequestCard"("pacificDate")`,
