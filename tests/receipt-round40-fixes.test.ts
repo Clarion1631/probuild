@@ -208,9 +208,9 @@ test("the cron drains queued resends by their own date, oldest first and bounded
     // today — the rows today's (owner, pacificDate) lookup can never reach.
     assert.match(
         cron,
-        /const queued = await prisma\.receiptRequestCard\.findMany\(\{[\s\S]{0,400}status: "PENDING",[\s\S]{0,200}lastError: CARD_RESEND_QUEUED_REASON,[\s\S]{0,200}pacificDate: \{ lt: date \}/,
+        /const queued = await prisma\.receiptRequestCard\.findMany\(\{[\s\S]{0,400}status: "PENDING",[\s\S]{0,300}resendQueuedAt: \{ not: null \},[\s\S]{0,200}pacificDate: \{ lt: date \}/,
     );
-    assert.match(cron, /orderBy: \[\{ pacificDate: "asc" \}, \{ owner: "asc" \}\],[\s\S]{0,80}take: QUEUED_RESEND_DRAIN_LIMIT/,
+    assert.match(cron, /orderBy: \[\{ resendQueuedAt: "asc" \}, \{ pacificDate: "asc" \}, \{ owner: "asc" \}\],[\s\S]{0,80}take: QUEUED_RESEND_DRAIN_LIMIT/,
         "oldest first, and bounded so a backlog cannot crowd out today");
     // Posted under ITS OWN date, so the request id — and the Chat thread —
     // stay the ones the operator was looking at.
@@ -277,7 +277,9 @@ test("a stale queued card is reported, a fresh one is not", () => {
     assert.equal(evaluatePipelineHealth(input).reasons.includes("probe-failed:queuedCards"), false);
 
     const health = readFileSync(join(repoRoot, "src/lib/pipeline-health.ts"), "utf8");
-    assert.match(health, /lastError: CARD_RESEND_QUEUED_REASON,[\s\S]{0,200}updatedAt: \{ lt: new Date\(now - CARD_RESEND_STALE_HOURS \* HOUR_MS\) \}/,
+    assert.match(
+        health,
+        /resendQueuedAt: \{ not: null, lt: new Date\(now - CARD_RESEND_STALE_HOURS \* HOUR_MS\) \}/,
         "the probe counts only the ones that have waited too long");
     assert.equal(CARD_RESEND_STALE_HOURS, 6);
 });

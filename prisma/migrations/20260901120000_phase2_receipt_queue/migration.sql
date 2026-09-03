@@ -72,6 +72,23 @@ CREATE TABLE IF NOT EXISTS "ReceiptRequestCard" (
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCard_owner_pacificDate_key"
   ON "ReceiptRequestCard"("owner", "pacificDate");
 
+-- THE DURABLE QUEUE STATE FOR A RESEND (Codex PR #443 gate round 41, finding 3).
+--
+-- An operator answering "resend" on an uncertain card puts it back to PENDING.
+-- That decision used to live in `lastError` as the text `resend-requested` —
+-- and `lastError` is DIAGNOSTIC: the next failure overwrites it. A queued card
+-- that Chat then rejected became `rejected:*`, so the cards cron stopped
+-- draining it and the health probe stopped counting it. The operator's decision
+-- disappeared with no trace, and the crew was never asked.
+--
+-- Its own nullable column, so no write that records an ERROR can erase a
+-- DECISION. Set by the resend action, cleared only by a successful post (or by
+-- the row being deleted because every item was answered).
+ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "resendQueuedAt" TIMESTAMP(3);
+
+CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_resendQueuedAt_idx"
+  ON "ReceiptRequestCard"("resendQueuedAt");
+
 CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_pacificDate_idx"
   ON "ReceiptRequestCard"("pacificDate");
 

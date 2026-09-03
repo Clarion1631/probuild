@@ -75,6 +75,15 @@ jobs:
         env:
           RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # The missing-receipt sweep's component transaction, at the isolation it
+      # actually runs at. Postgres SSI is the whole fence for evidence writers
+      # this PR does not own (a ReceiptIntake insert, an Expense receipt
+      # update), so it can only be asserted against a real database.
+      - name: Sweep component transaction is serializable against real Postgres
+        run: npx tsx --test tests/receipt-sweep-serializable-db.test.ts
+        env:
+          RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

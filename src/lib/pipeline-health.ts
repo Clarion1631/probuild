@@ -153,6 +153,8 @@ export interface PipelineHealth {
      * existed still type-checks; the health route always populates it.
      */
     queuedCards?: CountProbe;
+    /** Queued resends Chat rejected — never auto-retried, so a human owns them. */
+    rejectedQueuedCards?: CountProbe;
     /** The missing-receipt sweep's marker, including why it is holding back. */
     chaser?: {
         status: ProbeStatus;
@@ -353,6 +355,8 @@ export function evaluatePipelineHealth(input: {
      * the operator already decided, and the crew is still waiting.
      */
     queuedCards?: CountProbe;
+    /** Queued resends Chat rejected — reported, never auto-retried. */
+    rejectedQueuedCards?: CountProbe;
     /** Can we authenticate to Drive at all? Gates the signed-memo path. */
     driveCredentials: { status: ProbeStatus; reason?: string; configured: boolean; source: string };
     /**
@@ -387,6 +391,7 @@ export function evaluatePipelineHealth(input: {
         ["intakeUnassigned", input.intakeUnassigned],
         ["uncertainCards", input.uncertainCards],
         ...(input.queuedCards ? [["queuedCards", input.queuedCards] as [string, { status: ProbeStatus }]] : []),
+        ...(input.rejectedQueuedCards ? [["rejectedQueuedCards", input.rejectedQueuedCards] as [string, { status: ProbeStatus }]] : []),
         ["bankPull", input.bankPull],
         ["driveCredentials", input.driveCredentials],
         ["chaser", input.chaser],
@@ -555,6 +560,12 @@ export function evaluatePipelineHealth(input: {
     // the next cron slot, which is the system working.
     if (input.queuedCards?.status === "ok" && input.queuedCards.count > 0) {
         reasons.push(`cards-queued-stale:${input.queuedCards.count}`);
+    }
+
+    // A queued resend Chat REJECTED. Never auto-retried, so it is a human's to
+    // pick up — and silently dropping it is what round-41 finding 3 was about.
+    if (input.rejectedQueuedCards?.status === "ok" && input.rejectedQueuedCards.count > 0) {
+        reasons.push(`cards-queued-rejected:${input.rejectedQueuedCards.count}`);
     }
 
     return { ok: reasons.length === 0, reasons };
@@ -830,7 +841,8 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
 
     const [
         intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck,
-        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards, queuedCards, bankPull, chaser, driveCredentials,
+        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards, queuedCards, rejectedQueuedCards,
+        bankPull, chaser, driveCredentials,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -1006,8 +1018,30 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                 where: {
                     status: "PENDING",
                     postedAt: null,
-                    lastError: CARD_RESEND_QUEUED_REASON,
-                    updatedAt: { lt: new Date(now - CARD_RESEND_STALE_HOURS * HOUR_MS) },
+                    // THE COLUMN (round-41 gate, finding 3): `lastError` is
+                    // overwritten by the next failure, so counting on it lost
+                    // every row that had been rejected once.
+                    resendQueuedAt: { not: null, lt: new Date(now - CARD_RESEND_STALE_HOURS * HOUR_MS) },
+                },
+            }),
+            0,
+        ),
+        /**
+         * Queued resends Chat REJECTED (round-41 gate, finding 3).
+         *
+         * A definitive rejection is not retried automatically — Chat declined,
+         * and re-posting the same card into the same space is how a chase list
+         * becomes noise — so these rows would sit for ever with nobody told.
+         * They keep their `resendQueuedAt`, so they are still the operator's
+         * outstanding decision, and this is what says so out loud.
+         */
+        probe<number>(
+            "rejectedQueuedCards",
+            () => prisma.receiptRequestCard.count({
+                where: {
+                    postedAt: null,
+                    resendQueuedAt: { not: null },
+                    lastError: { startsWith: "rejected:" },
                 },
             }),
             0,
@@ -1104,6 +1138,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             status: queuedCards.status,
             reason: queuedCards.reason,
             count: queuedCards.value,
+        },
+        rejectedQueuedCards: {
+            status: rejectedQueuedCards.status,
+            reason: rejectedQueuedCards.reason,
+            count: rejectedQueuedCards.value,
         },
         chaser: {
             status: chaser.status,
@@ -1211,6 +1250,8 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         }`,
         `Cards queued for resend >${CARD_RESEND_STALE_HOURS}h: ${
             health.queuedCards?.status === "error" ? "unavailable (probe failed)" : health.queuedCards?.count ?? "unavailable"
+        }${
+            (health.rejectedQueuedCards?.count ?? 0) > 0 ? ` (${health.rejectedQueuedCards?.count} rejected by Chat)` : ""
         }`,
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
         // Optional-chained on purpose: a digest that THROWS means no morning

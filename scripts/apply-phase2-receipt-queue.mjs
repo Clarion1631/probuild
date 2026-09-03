@@ -149,6 +149,23 @@ export const statements = [
        ON "ReceiptRequestCard"("owner", "pacificDate")`,
 
     // The 14-day retention scan and the threads endpoint both read by date.
+    // THE DURABLE QUEUE STATE FOR A RESEND (Codex PR #443 gate round 41, finding 3).
+    //
+    // An operator answering "resend" on an uncertain card puts it back to PENDING.
+    // That decision used to live in `lastError` as the text `resend-requested` —
+    // and `lastError` is DIAGNOSTIC: the next failure overwrites it. A queued card
+    // that Chat then rejected became `rejected:*`, so the cards cron stopped
+    // draining it and the health probe stopped counting it. The operator's decision
+    // disappeared with no trace, and the crew was never asked.
+    //
+    // Its own nullable column, so no write that records an ERROR can erase a
+    // DECISION. Set by the resend action, cleared only by a successful post (or by
+    // the row being deleted because every item was answered).
+    `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "resendQueuedAt" TIMESTAMP(3)`,
+
+    `CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_resendQueuedAt_idx"
+  ON "ReceiptRequestCard"("resendQueuedAt")`,
+
     `CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_pacificDate_idx"
        ON "ReceiptRequestCard"("pacificDate")`,
 
@@ -336,6 +353,9 @@ export const expectedColumns = {
         { name: "clearedStatus", type: "text", nullable: true, default: null },
     ],
     ReceiptRequestCard: [
+        // NULLABLE and DEFAULTLESS: "no resend was asked for" is the absence of
+        // a decision, not a decision with a date (round-41 gate, finding 3).
+        { name: "resendQueuedAt", type: "timestamp without time zone", nullable: true, default: null },
         { name: "id", type: "text", nullable: false, default: null },
         { name: "owner", type: "text", nullable: false, default: null },
         { name: "pacificDate", type: "text", nullable: false, default: null },

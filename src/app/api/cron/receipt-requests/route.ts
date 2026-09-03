@@ -37,6 +37,7 @@ import {
 } from "@/lib/receipt-requests";
 import { REGISTER_WINDOW_DAYS, registerWindowStartYmd } from "@/lib/bank-register-pull";
 import { lockBankLedgerEpoch, readBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
+import { withTxRetry } from "@/lib/tx-retry";
 import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_CHASER_WINDOW_HOURS } from "@/lib/pipeline-health";
 import {
     SWEEP_MARKER_KEY,
@@ -1289,7 +1290,29 @@ async function processBatch(
         });
 
         try {
-            await prisma.$transaction(async tx => {
+            /**
+             * SERIALIZABLE, AND RETRIED (Codex PR #443 gate round 41, finding 4).
+             *
+             * The advisory lock below serializes this sweep against ITSELF, and
+             * the row locks cover rows that already exist. Neither covers the
+             * evidence this transaction actually decides on: a ReceiptIntake
+             * INSERTED after the fingerprint reads, or an Expense whose
+             * `receiptUrl` is filled in by the QBO sync a moment later. Those
+             * writers are not ours to fence — they span Phase 3's files, and the
+             * ledger epoch only tracks BankLine writers — so the fence has to
+             * come from the database: under SERIALIZABLE, Postgres's SSI takes
+             * predicate locks on what this transaction READ, and a concurrent
+             * insert or update inside those predicates aborts one of the two
+             * with 40001 rather than letting a stale plan commit.
+             *
+             * The cost is a retry, not a failure: a 40001 rolls the whole
+             * component back — nothing of it happened — and `withTxRetry` runs
+             * it again against fresh state, bounded, with jittered backoff. A
+             * component that keeps losing ends up counted as an error and its
+             * cursor does not advance, which is the same safe end state every
+             * other failure here has.
+             */
+            await withTxRetry(() => prisma.$transaction(async tx => {
                 /**
                  * 0. THE COMPONENT LOCK.
                  *
@@ -1454,7 +1477,7 @@ async function processBatch(
                 summary.skipped += applied.skipped;
                 summary.errors += applied.errors;
                 summary.failedTargets.push(...applied.failedTargets);
-            }, { timeout: COMPONENT_TX_TIMEOUT_MS });
+            }, { timeout: COMPONENT_TX_TIMEOUT_MS, isolationLevel: "Serializable" }));
         } catch (error) {
             if (error instanceof ComponentMovedError) {
                 // NOTHING COMMITTED for this component. The caller replans the

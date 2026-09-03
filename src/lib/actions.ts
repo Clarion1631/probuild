@@ -15892,10 +15892,13 @@ export async function resolveUncertainCard(
                 }
                 : {
                     status: "PENDING",
-                    // THE QUEUE MARKER, not a note (round-40 gate, finding 2).
-                    // The cards cron drains rows carrying it regardless of their
-                    // Pacific date — without that, a resend requested after the
-                    // day's last retry slot was never claimed again.
+                    // THE QUEUE STATE, in its own column (round-41 gate, finding
+                    // 3). `lastError` is diagnostic text and every later write
+                    // replaces it — a rejection wrote `rejected:*` straight over
+                    // the marker, and the drain and the health probe both lost
+                    // the row. `resendQueuedAt` is what they query now; the text
+                    // stays for a human reading the queue.
+                    resendQueuedAt: new Date(),
                     lastError: CARD_RESEND_QUEUED_REASON,
                     // Ownership released, so the retry pass can claim it.
                     claimedAt: null,

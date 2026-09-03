@@ -2807,11 +2807,25 @@ model ReceiptRequestCard {
   messageName String?
   attempts    Int       @default(0)
   lastError   String?
+  /// When an operator asked for this card to be RESENT (Codex PR #443 gate
+  /// round 41, finding 3).
+  ///
+  /// Its own column because `lastError` is DIAGNOSTIC text that every later
+  /// write replaces: a queued card that Chat then rejected had its marker
+  /// overwritten with `rejected:*`, so the drain stopped selecting it and the
+  /// health probe stopped counting it — the operator's decision vanished, for
+  /// ever, without a trace. Cleared only when the card is actually posted (or
+  /// cancelled); a rejection leaves it set, which is what keeps the row
+  /// visible as `cards-queued-rejected`.
+  resendQueuedAt DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
   @@unique([owner, pacificDate])
   @@index([pacificDate])
+  /// The drain's own lookup: queued rows, oldest first, whatever date they are
+  /// for. Partial so it stays small — a card that was never resent is not in it.
+  @@index([resendQueuedAt])
 }
 
 /// The DURABLE identity of a signed missing-receipt memo (Codex PR #443 gate

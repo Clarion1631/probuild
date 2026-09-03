@@ -488,7 +488,10 @@ test("an uncertain card is surfaced, and resolving it is a CAS", () => {
     // The marker is a named constant since round 40 (finding 2): the cards
     // cron drains rows carrying it whatever date they are for, so the two
     // sides must read the same string.
-    assert.match(actions, /status: "PENDING",\s*\n[\s\S]{0,400}lastError: CARD_RESEND_QUEUED_REASON,/);
+    // The DECISION is its own column since round 41 (finding 3) — `lastError`
+    // is diagnostic text a later failure overwrites — and the human-readable
+    // note rides along with it.
+    assert.match(actions, /status: "PENDING",[\s\S]{0,900}resendQueuedAt: new Date\(\),[\s\S]{0,200}lastError: CARD_RESEND_QUEUED_REASON,/);
 
     // The queue loads them and the tab renders a group with both actions.
     const data = readFileSync(join(root, "src/app/automation/receipts-data.ts"), "utf8");
@@ -628,7 +631,7 @@ test("the cron commits delivery+history together and repairs old gaps", () => {
         "utf8",
     );
     // ONE transaction: the POSTED write and the history write.
-    assert.match(source, /const completed = await prisma\.\$transaction\(async tx => \{[\s\S]{0,900}await recordCardOnIssues\(card, result\.threadName, result\.messageName, now, tx\);/);
+    assert.match(source, /const completed = await prisma\.\$transaction\(async tx => \{[\s\S]{0,1400}await recordCardOnIssues\(card, result\.threadName, result\.messageName, now, tx\);/);
     // And no second, un-transacted call after it.
     assert.doesNotMatch(source, /await recordCardOnIssues\(card, result\.threadName, result\.messageName, now\);/);
     // THE REPAIR PASS: bounded, idempotent, and it never fails the run.

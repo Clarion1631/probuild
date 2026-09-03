@@ -641,14 +641,35 @@ export async function GET(request: Request) {
      * a backlog cannot crowd out today's cards or the send budget.
      */
     const queuedDrained: string[] = [];
+    /**
+     * A DRAINED RESEND CONSUMES THAT OWNER'S SEND FOR THE DAY (Codex PR #443
+     * gate round 41, finding 1).
+     *
+     * The queued row and today's selection are drawn from the SAME open issues
+     * — a chase does not leave `scan.candidates` because a card for it is
+     * waiting to go out — so posting both asks the same person for the same
+     * receipts twice in one morning, which is exactly the noise the whole
+     * per-owner-per-day claim exists to prevent.
+     *
+     * Skipping the owner (rather than subtracting the resend's items from the
+     * scan) is the choice, because the resend IS that owner's card: it carries
+     * the operator's decision, its items are the ones they were looking at, and
+     * anything genuinely new is on tomorrow's card — one day late, in exchange
+     * for never double-asking. Recorded so the run says which owners were
+     * consumed this way.
+     */
+    const drainedOwners = new Set<string>();
     const queued = await prisma.receiptRequestCard.findMany({
         where: {
             status: "PENDING",
             postedAt: null,
-            lastError: CARD_RESEND_QUEUED_REASON,
+            // THE COLUMN, not the diagnostic text (round-41 gate, finding 3):
+            // a rejection overwrites `lastError` and used to make the row
+            // invisible to this query for ever.
+            resendQueuedAt: { not: null },
             pacificDate: { lt: date },
         },
-        orderBy: [{ pacificDate: "asc" }, { owner: "asc" }],
+        orderBy: [{ resendQueuedAt: "asc" }, { pacificDate: "asc" }, { owner: "asc" }],
         take: QUEUED_RESEND_DRAIN_LIMIT,
         select: { id: true, owner: true, pacificDate: true, itemsJson: true, overflow: true, overflowExact: true },
     });
@@ -681,9 +702,14 @@ export async function GET(request: Request) {
             resumed: true,
         });
         queuedDrained.push(`${row.owner}:${row.pacificDate}`);
+        drainedOwners.add(row.owner);
     }
 
     for (const owner of CARD_OWNERS_ASKED) {
+        // Their card is already going out today — the queued one. Selecting a
+        // second from the same open issues would ask twice (round-41 gate,
+        // finding 1).
+        if (drainedOwners.has(owner)) continue;
         const existing = await prisma.receiptRequestCard.findUnique({
             where: { owner_pacificDate: { owner, pacificDate: date } },
             select: { id: true, itemsJson: true, overflow: true, overflowExact: true, postedAt: true, status: true, claimedAt: true },
@@ -880,6 +906,9 @@ export async function GET(request: Request) {
             // empty card or parking a status: a row that survives holds this
             // owner's (owner, pacificDate) slot, so a genuinely new item found
             // later today would have no card to go on.
+            // Deleting the row takes its queue marker with it — the resend
+            // was answered by the items closing, which is the outcome the
+            // operator wanted (round-41 gate, finding 3).
             await prisma.receiptRequestCard.deleteMany({
                 where: { id: rowId, claimToken: token, postedAt: null },
             });
@@ -887,9 +916,23 @@ export async function GET(request: Request) {
             continue;
         }
 
+        /**
+         * REBUILT UNDER ITS OWN DATE (Codex PR #443 gate round 41, finding 2).
+         *
+         * `date` is this INVOCATION's Pacific day. For a drained resend the
+         * card belongs to an earlier one, and every identity downstream is
+         * derived from the date on the card: the request id, therefore the
+         * thread key the webhook posts into, therefore the `request_id` the
+         * threads endpoint exports and the association a signed memo has to
+         * echo back. Rebuilding with today's date sent the card into a thread
+         * whose id nothing else agreed with — the row kept its old
+         * `pacificDate`, the bridge echoed an association
+         * `matchCardAssociation` rejects, and it could collide with today's
+         * own thread for that owner.
+         */
         const card = rebuilt.dropped.length === 0
             ? claimedCard
-            : buildCardFromItems(claimedCard.owner, date, rebuilt.items, claimedCard.overflow, claimedCard.overflowExact);
+            : buildCardFromItems(claimedCard.owner, claimedCard.date, rebuilt.items, claimedCard.overflow, claimedCard.overflowExact);
 
         // HISTORY IS WRITTEN AFTER A VALIDATED POST, and only then.
         //
@@ -998,6 +1041,12 @@ export async function GET(request: Request) {
                     messageName: result.messageName,
                     attempts: { increment: 1 },
                     lastError: null,
+                    // THE QUEUE OBLIGATION, DISCHARGED (round-41 gate, finding
+                    // 3). Cleared here and nowhere else: a rejection or an
+                    // uncertain delivery leaves it set, which is what keeps the
+                    // row in the drain and in `cards-queued-rejected` instead of
+                    // vanishing when `lastError` is overwritten.
+                    resendQueuedAt: null,
                 },
             });
             if (written.count === 1) {
@@ -1096,6 +1145,9 @@ export async function GET(request: Request) {
         // only place an operator can see that a decision made after the day's
         // last slot was honoured (round-40 gate, finding 2).
         queuedDrained,
+        // Owners whose today-selection was skipped because their queued resend
+        // is the card going out instead (round-41 gate, finding 1).
+        queuedConsumedOwners: [...drainedOwners],
         date,
         retryOnly,
         scanned: scan.candidates.length,
