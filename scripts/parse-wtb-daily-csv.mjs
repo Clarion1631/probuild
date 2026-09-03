@@ -515,13 +515,32 @@ export function canSweepDay(day) {
  * disagree with that figure, and the endpoint re-checks it against the rows
  * posted, so a day that cannot be vouched for is never written.
  */
+/**
+ * The credits this day will actually POST. A credit with no Bank Reference has
+ * no idempotency key and cannot be swept; it is declared in `excluded` instead
+ * (see buildSweepPayload).
+ *
+ * Exported and shared because the payload and the response check MUST agree on
+ * what was submitted. They did not: sweepDay built its expected-reference set
+ * from every credit on the day, including the unreferenced one, so on
+ * 2026-08-28 the endpoint answered for the one credit it was given, the sets
+ * did not tie, and a clean day (one credit correctly sent to a human) was
+ * reported as a job failure that stopped every later day.
+ */
+export function sweepableCredits(day) {
+    return day.credits.filter(c => c.bankReference);
+}
+
+/** The bank references this day posts — what the response must account for. */
+export function sweepableReferences(day) {
+    return new Set(sweepableCredits(day).map(c => c.bankReference));
+}
+
 export function buildSweepPayload(day, opts = {}) {
-    // A credit with no Bank Reference has no idempotency key, so it cannot be
-    // swept — but the bank publishes ONE total for the day, so dropping it
-    // silently would break the control totals and refusing the day would stall
-    // every later day. It is DECLARED instead: excluded from the work, included
-    // in the arithmetic.
-    const sweepable = day.credits.filter(c => c.bankReference);
+    // The unreferenced rows are DECLARED, not dropped: the bank publishes ONE
+    // total for the day, so they stay in the arithmetic while staying out of
+    // the work.
+    const sweepable = sweepableCredits(day);
     const credits = sweepable.map(c => ({
         bankReference: c.bankReference,
         amount: c.amount,
@@ -723,7 +742,7 @@ export function sweepBatchFailed(body, submittedReferences = null) {
  * the caller must stop and exit non-zero — which, under the Hermes cron, is
  * what makes the daily-job watchdog fire.
  */
-async function sweepDay(args, sweepSecret, statement, stalled) {
+export async function sweepDay(args, sweepSecret, statement, stalled) {
     const postDate = statement.periodStart;
     if (statement.credits.length === 0) {
         console.log(`  sweep ${postDate}: 0 credits — nothing to apply`);
@@ -756,7 +775,9 @@ async function sweepDay(args, sweepSecret, statement, stalled) {
     }
 
     // Always report the whole day, whichever way it went.
-    const submitted = new Set(statement.credits.map(c => c.bankReference));
+    // The references actually POSTED — not every credit on the day. An excluded
+    // credit was never sent, so the endpoint cannot answer for it.
+    const submitted = sweepableReferences(statement);
     const summary = `  ${sweepSummaryLine(postDate, body.counts, body.excludedCount ?? 0)}${args.sweepDryRun ? " (dry run)" : ""}`;
     const failed = sweepBatchFailed(body, submitted);
     (failed ? console.error : console.log)(summary);
