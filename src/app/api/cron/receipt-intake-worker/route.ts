@@ -13,6 +13,7 @@ import {
     retryPendingCleanups,
     sealObject,
     settleQueuedCleanup,
+    withReceiptPublishLock,
 } from "@/lib/receipt-intake/storage-cleanup";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
@@ -469,10 +470,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // that path stays writable by whoever holds the signed URL,
                     // so a swept row's "verified" bytes would remain replaceable
                     // afterwards.
-                    const outcome = await sealAndPublish(row.storagePath, row.id, check, {
+                    const outcome = await sealAndPublish(row.storagePath, row.id, row.uploadLeaseVersion, check, {
+                        withObjectLock: withReceiptPublishLock,
                         seal: sealObject,
-                        commit: async (canonicalPath, values) => {
-                            const { count } = await prisma.receiptIntake.updateMany({
+                        commit: async (tx, canonicalPath, values) => {
+                            const { count } = await tx.receiptIntake.updateMany({
                                 where: {
                                     id: row.id,
                                     state: "STAGING",
@@ -491,8 +493,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         },
                         dropUpload: uploadPath =>
                             deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
-                        currentStoragePath: async rowId => {
-                            const r = await prisma.receiptIntake.findUnique({
+                        currentStoragePath: async (tx, rowId) => {
+                            const r = await tx.receiptIntake.findUnique({
                                 where: { id: rowId },
                                 select: { storagePath: true },
                             });
@@ -909,6 +911,35 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 data: { nextRetryAt, ...RELEASE_CLAIM },
             });
             return count > 0;
+        },
+
+        // Every row the soft deadline cut off, in one token-fenced write per
+        // claim token. `nextRetryAt: null` puts them back at the front of the
+        // queue: they were never worked on, so there is nothing to back off
+        // from, and the ten-minute claim lease they are carrying was written
+        // for a pass that has ended.
+        releaseUnprocessed: async rows => {
+            const byToken = new Map<string, string[]>();
+            for (const row of rows) {
+                // A row with no token was never really claimed; there is
+                // nothing to fence a release on and nothing to release.
+                if (!row.claimToken) continue;
+                const ids = byToken.get(row.claimToken);
+                if (ids) ids.push(row.id);
+                else byToken.set(row.claimToken, [row.id]);
+            }
+            let released = 0;
+            for (const [claimToken, ids] of byToken) {
+                const { count } = await prisma.receiptIntake.updateMany({
+                    // FENCED ON THE TOKEN THIS PASS CLAIMED WITH. A row whose
+                    // token changed belongs to a successor, and clearing its
+                    // claim here would hand a live pass's row to a third one.
+                    where: { id: { in: ids }, claimToken },
+                    data: { nextRetryAt: null, ...RELEASE_CLAIM },
+                });
+                released += count;
+            }
+            return released;
         },
 
         retryRow: async (rowId, attempts, nextRetryAt, reason, ownership) => {

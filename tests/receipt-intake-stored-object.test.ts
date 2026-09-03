@@ -156,11 +156,27 @@ test("the canonical path is content-addressed and per-row", () => {
     // content — so a later comparison is against a value that cannot have been
     // rewritten in place.
     const sha = createHash("sha256").update(PNG).digest("hex");
-    assert.equal(canonicalStoragePath("row-1", sha, "image/png"), `receipts/row-1/${sha}.png`);
-    assert.equal(canonicalStoragePath("row-1", sha, "application/pdf"), `receipts/row-1/${sha}.pdf`);
+    assert.equal(canonicalStoragePath("row-1", 1, sha, "image/png"), `receipts/row-1/v1/${sha}.png`);
+    assert.equal(canonicalStoragePath("row-1", 1, sha, "application/pdf"), `receipts/row-1/v1/${sha}.pdf`);
     // Two rows with identical bytes still get separate objects — deleting one
     // receipt must never remove another's evidence.
-    assert.notEqual(canonicalStoragePath("row-1", sha, "image/png"), canonicalStoragePath("row-2", sha, "image/png"));
+    assert.notEqual(
+        canonicalStoragePath("row-1", 1, sha, "image/png"),
+        canonicalStoragePath("row-2", 1, sha, "image/png"),
+    );
+});
+
+test("the canonical path carries the UPLOAD LEASE, so a re-seal never reuses a queued-for-deletion path", () => {
+    // A path that is a function of the row and the bytes alone is reused by
+    // every later attempt on the same row — including one that follows a
+    // rejection, and a rejection is what QUEUES A DELETION of that exact path.
+    // A re-armed /start bumps the lease, so the next publish targets a path no
+    // outstanding cleanup event can be naming.
+    const sha = createHash("sha256").update(PNG).digest("hex");
+    assert.notEqual(
+        canonicalStoragePath("row-1", 1, sha, "image/png"),
+        canonicalStoragePath("row-1", 2, sha, "image/png"),
+    );
 });
 
 test("a download whose bytes do not match the recorded sha is REFUSED", async () => {
@@ -308,8 +324,14 @@ const CHECK = {
     bytes: PNG,
 };
 
-/** The path sealAndPublish("...", "row-1", CHECK, ...) will compute. */
-const CANONICAL_ROW1 = `receipts/row-1/${CHECK.fileSha256}.png`;
+/**
+ * A pass-through object lock, for the tests whose subject is the fenced CAS
+ * rather than the mutual exclusion. The real one is exercised above.
+ */
+const noLock = (_p: string, body: (tx: never) => Promise<unknown>) => body(null as never);
+
+/** The path sealAndPublish("...", "row-1", 1, CHECK, ...) will compute. */
+const CANONICAL_ROW1 = `receipts/row-1/v1/${CHECK.fileSha256}.png`;
 
 /**
  * `sealOk`/`committed` drive the outcome; the call log is always recorded.
@@ -319,10 +341,29 @@ const CANONICAL_ROW1 = `receipts/row-1/${CHECK.fileSha256}.png`;
  * the orphan-cleanup branch never accidentally exercises it.
  */
 function publishHarness(
-    opts: { sealOk?: boolean; committed?: number; currentPath?: string | null; currentPathThrows?: boolean } = {},
+    opts: {
+        sealOk?: boolean;
+        committed?: number;
+        currentPath?: string | null;
+        currentPathThrows?: boolean;
+        lockThrows?: boolean;
+    } = {},
 ) {
     const calls: string[] = [];
     const deps = {
+        // `lock`/`unlock` bracket the critical section in the call log, so
+        // every ordering assertion below also states which steps are INSIDE
+        // it. The seal, the commit, the winner lookup and the orphan drop must
+        // be; the upload drop must not.
+        withObjectLock: async (_p: string, body: (tx: never) => Promise<unknown>) => {
+            calls.push("lock");
+            if (opts.lockThrows) throw new Error("could not take the lock");
+            try {
+                return await body(null as never);
+            } finally {
+                calls.push("unlock");
+            }
+        },
         seal: async (_u: string, canonical: string) => {
             calls.push("seal");
             return opts.sealOk === false ? null : canonical;
@@ -344,10 +385,12 @@ test("the upload object is deleted only AFTER the row pointer is committed", asy
     // points at a path whose object we just removed, and the receipt is gone
     // with nothing left to retry from.
     const h = publishHarness();
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
-    assert.deepEqual(h.calls, ["seal", "commit", "drop"]);
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    // And the seal and the commit are INSIDE one critical section: the gap
+    // between them is exactly where the cleanup sweep used to fit.
+    assert.deepEqual(h.calls, ["lock", "seal", "commit", "unlock", "drop"]);
     assert.equal(outcome?.published, true);
-    assert.equal(outcome?.canonicalPath, `receipts/row-1/${CHECK.fileSha256}.png`);
+    assert.equal(outcome?.canonicalPath, `receipts/row-1/v1/${CHECK.fileSha256}.png`);
 });
 
 test("a FAILED commit leaves the upload object alone, so the retry can recover", async () => {
@@ -355,8 +398,8 @@ test("a FAILED commit leaves the upload object alone, so the retry can recover",
     // EXACT canonical path — a double-publish racing on identical content —
     // so nothing is deleted, upload OR canonical.
     const h = publishHarness({ committed: 0 });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
-    assert.deepEqual(h.calls, ["seal", "commit", "current-path"], "nothing was deleted");
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    assert.deepEqual(h.calls, ["lock", "seal", "commit", "current-path", "unlock"], "nothing was deleted");
     assert.equal(outcome?.published, false);
 });
 
@@ -368,8 +411,11 @@ test("a lost CAS whose winner points elsewhere cleans up the orphaned canonical 
     // storagePath any more, and the STAGING sweep will never look at it
     // again — it must be cleaned up here or it sits in the bucket forever.
     const h = publishHarness({ committed: 0, currentPath: "receipts/row-1/some-other-sha.png" });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
-    assert.deepEqual(h.calls, ["seal", "commit", "current-path", "drop-orphan"]);
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    // The winner lookup AND the drop it decides are inside the lock: asking
+    // outside it and deleting afterwards is the same two-step race one level
+    // down — the winner can commit this path in the gap.
+    assert.deepEqual(h.calls, ["lock", "seal", "commit", "current-path", "drop-orphan", "unlock"]);
     assert.equal(outcome?.published, false);
     assert.equal(outcome?.canonicalPath, CANONICAL_ROW1);
 });
@@ -379,21 +425,35 @@ test("a lost CAS never deletes the object the winner is actually using", async (
     // /finalize (or /finalize racing the sweep) on the SAME content. That
     // object is the winner's now.
     const h = publishHarness({ committed: 0, currentPath: CANONICAL_ROW1 });
-    await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
-    assert.deepEqual(h.calls, ["seal", "commit", "current-path"], "no drop-orphan call");
+    await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    assert.deepEqual(h.calls, ["lock", "seal", "commit", "current-path", "unlock"], "no drop-orphan call");
 });
 
 test("a failed currentStoragePath lookup never deletes on uncertainty", async () => {
     const h = publishHarness({ committed: 0, currentPathThrows: true });
-    await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
-    assert.deepEqual(h.calls, ["seal", "commit", "current-path"], "the failure default is 'do not delete'");
+    await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    assert.deepEqual(
+        h.calls,
+        ["lock", "seal", "commit", "current-path", "unlock"],
+        "the failure default is 'do not delete'",
+    );
 });
 
 test("a failed SEAL never touches the row or the upload object", async () => {
     const h = publishHarness({ sealOk: false });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
     assert.equal(outcome, null);
-    assert.deepEqual(h.calls, ["seal"]);
+    assert.deepEqual(h.calls, ["lock", "seal", "unlock"]);
+});
+
+test("a lock that cannot be taken is a RETRYABLE null, never a verdict", async () => {
+    // Nothing was sealed and nothing was committed, so the honest answer is
+    // the same "come back" a failed seal gives — not a published row, and not
+    // a park.
+    const h = publishHarness({ lockThrows: true });
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    assert.equal(outcome, null);
+    assert.deepEqual(h.calls, ["lock"], "the seal never ran");
 });
 
 test("a retry that finds the canonical object already there still commits", async () => {
@@ -401,10 +461,100 @@ test("a retry that finds the canonical object already there still commits", asyn
     // content-addressed path, so re-sealing the same bytes is a no-op and the
     // retry simply commits.
     const h = publishHarness();
-    const first = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
-    const second = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    const first = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    const second = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
     assert.equal(first?.canonicalPath, second?.canonicalPath, "same content, same path");
     assert.equal(second?.published, true);
+});
+
+// ── Cleanup vs publication: the seal/commit gap (round-35 P0) ───────────────
+
+/**
+ * A stand-in for `pg_advisory_xact_lock`: one holder per path, everybody else
+ * queues. Deliberately not a mock of the transaction — the ONLY property under
+ * test is mutual exclusion between two concurrent holders of the same path.
+ */
+function pathLocks() {
+    const held = new Map<string, Promise<void>>();
+    return async function withLock<T>(path: string, body: () => Promise<T>): Promise<T> {
+        while (held.has(path)) await held.get(path);
+        let release!: () => void;
+        held.set(path, new Promise<void>(resolve => { release = resolve; }));
+        try {
+            return await body();
+        } finally {
+            held.delete(path);
+            release();
+        }
+    };
+}
+
+/**
+ * The whole failure, run: a publish that has sealed its bytes but not yet
+ * committed its row pointer, and a cleanup sweep that starts in that window.
+ *
+ * `lockPaths: false` is the CONTROL, and it is the point of the pair — a
+ * concurrency test whose "fixed" case passes proves nothing unless the
+ * unlocked case actually reproduces the loss.
+ */
+async function raceSweepAgainstPublish(lockPaths: boolean) {
+    const withLock = pathLocks();
+    const UPLOAD = "receipts/intake/a.png";
+    const objects = new Set<string>([UPLOAD]);
+    let rowStoragePath = UPLOAD;
+    let sealDone!: () => void;
+    const sealed = new Promise<void>(resolve => { sealDone = resolve; });
+
+    const publishing = sealAndPublish(UPLOAD, "row-1", 1, CHECK, {
+        withObjectLock: (path: string, body: (tx: never) => Promise<unknown>) =>
+            lockPaths ? withLock(path, () => body(null as never)) : body(null as never),
+        seal: async (_u: string, canonical: string) => {
+            objects.add(canonical);
+            sealDone();
+            return canonical;
+        },
+        commit: async (_tx: never, canonical: string) => {
+            // THE GAP. Wide here so the sweep is guaranteed to arrive inside
+            // it; in production it is a Supabase round trip.
+            await new Promise(resolve => setTimeout(resolve, 20));
+            rowStoragePath = canonical;
+            return 1;
+        },
+        dropUpload: async (uploadPath: string) => { objects.delete(uploadPath); },
+        currentStoragePath: async () => rowStoragePath,
+        dropOrphanedCanonical: async () => {},
+    } as never);
+
+    // The sweep: exactly what retryPendingCleanups does for a pending event
+    // naming this path — look for a live row pointing at it, then delete.
+    await sealed;
+    const sweep = async () => {
+        if (rowStoragePath === CANONICAL_ROW1) return "referenced";
+        objects.delete(CANONICAL_ROW1);
+        return "deleted";
+    };
+    const swept = lockPaths ? await withLock(CANONICAL_ROW1, sweep) : await sweep();
+
+    const outcome = await publishing;
+    return { outcome, swept, objects, rowStoragePath };
+}
+
+test("a cleanup that starts between the seal and the commit WAITS, and the published bytes survive", async () => {
+    const race = await raceSweepAgainstPublish(true);
+    assert.equal(race.outcome?.published, true);
+    assert.equal(race.swept, "referenced", "the sweep blocked on the lock, then saw the reference");
+    assert.equal(race.rowStoragePath, CANONICAL_ROW1);
+    assert.ok(race.objects.has(CANONICAL_ROW1), "the row the sweep let through still has its bytes");
+});
+
+test("CONTROL: without the lock the same interleaving publishes a row pointing at nothing", async () => {
+    // If this ever stops failing the way it does, the test above has stopped
+    // proving anything.
+    const race = await raceSweepAgainstPublish(false);
+    assert.equal(race.outcome?.published, true, "the intake reports success either way");
+    assert.equal(race.swept, "deleted", "the sweep saw an unreferenced path, because the commit had not landed");
+    assert.equal(race.rowStoragePath, CANONICAL_ROW1);
+    assert.ok(!race.objects.has(CANONICAL_ROW1), "...and the successful intake now points at missing bytes");
 });
 
 test("text/plain is no longer accepted at all", async () => {
@@ -518,14 +668,15 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
 
     let dropped = false;
     let droppedOrphan = false;
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, {
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, {
+        withObjectLock: noLock,
         seal: async (_u: string, canonical: string) => {
             // THE RACE, in the exact window it happens: the worker re-parks the
             // row while we are copying the bytes.
             store.set({ stateReason: "vendor-mismatch" });
             return canonical;
         },
-        commit: async (canonicalPath: string) =>
+        commit: async (_tx: never, canonicalPath: string) =>
             store.updateMany(
                 { id: "row-1", ...fence },
                 { state: "RECEIVED", stateReason: null, storagePath: canonicalPath },
@@ -550,7 +701,8 @@ test("RACE: a worker claim taken during sealing also loses the publish", async (
         id: "row-1", state: "STAGING", stateReason: null, claimToken: null, uploadLeaseVersion: 1,
     });
     const fence = publishFence({ state: "STAGING", stateReason: null, uploadLeaseVersion: 1 });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, {
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, {
+        withObjectLock: noLock,
         seal: async (_u: string, canonical: string) => {
             store.set({ claimToken: "sweeper-1" });
             return canonical;
@@ -569,7 +721,8 @@ test("an unchanged row still publishes — the control", async () => {
         id: "row-1", state: "NEEDS_REVIEW", stateReason: "sha-mismatch", claimToken: null, uploadLeaseVersion: 1,
     });
     const fence = publishFence({ state: "NEEDS_REVIEW", stateReason: "sha-mismatch", uploadLeaseVersion: 1 });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, {
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, {
+        withObjectLock: noLock,
         seal: async (_u: string, canonical: string) => canonical,
         commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED", stateReason: null, uploadLeaseVersion: 1 }),
         dropUpload: async () => {},

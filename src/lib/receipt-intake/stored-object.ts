@@ -13,6 +13,7 @@
  * straight to Supabase, so nothing it declared about the file is evidence.
  */
 import { createHash } from "node:crypto";
+import type { Prisma } from "@prisma/client";
 import type { DocBytesResult } from "@/lib/secure-storage";
 import { downloadReceiptObject, receiptObjectSize, type SizeResult } from "./bucket";
 import { EXT_BY_MIME, sniffMime } from "./file-type";
@@ -28,10 +29,19 @@ import { MAX_STORED_BYTES } from "./intake-core";
  * URL for, and names it after the sha — so the path itself asserts the content,
  * and re-verifying on download is a comparison against a value that cannot have
  * been rewritten in place.
+ *
+ * THE UPLOAD LEASE VERSION IS IN THE PATH, and it is not decoration. A path
+ * that is a function of the row and the bytes alone is reused by every later
+ * attempt on the same row — including one that follows a rejection, and a
+ * rejection is what QUEUES A DELETION of that exact path. A re-armed /start
+ * bumps the lease, so this makes a re-seal target a path no outstanding cleanup
+ * event can be naming. (Belt and braces: withReceiptPublishLock also cancels
+ * any pending cleanup for the path it is about to fill. Either alone closes the
+ * reuse; both is cheap.)
  */
-export function canonicalStoragePath(id: string, sha256: string, mimeType: string): string {
+export function canonicalStoragePath(id: string, leaseVersion: number, sha256: string, mimeType: string): string {
     const ext = EXT_BY_MIME[mimeType] ?? "bin";
-    return `receipts/${id}/${sha256}.${ext}`;
+    return `receipts/${id}/v${leaseVersion}/${sha256}.${ext}`;
 }
 
 /**
@@ -61,24 +71,54 @@ export type VerifiedBytes =
  * finds the canonical copy already there, re-uploads it as a no-op, and
  * commits. A failure at 3 is an orphan on the cleanup queue, not a lost
  * receipt.
+ *
+ * AND STEPS 1 AND 2 ARE ONE CRITICAL SECTION. The gap between them is a window
+ * in which the bytes exist and nothing in the database references them — which
+ * is exactly the shape the storage-cleanup sweep tests for before it deletes.
+ * A sweep landing in that window deleted the object this call had just sealed,
+ * and the commit then published a row pointing at nothing. `withObjectLock`
+ * holds the canonical path's advisory lock across both, so the sweep either
+ * runs entirely before the seal (and the seal writes the bytes again) or
+ * entirely after the commit (and sees the reference). See
+ * withReceiptPublishLock in storage-cleanup.ts.
+ *
+ * Nothing slow goes inside that lock: no read, no QBO call, no attachment —
+ * one storage copy and one fenced UPDATE.
  */
 export interface PublishOutcome {
     published: boolean;
     canonicalPath: string;
 }
 
+/**
+ * The database handle the object lock hands to the critical section. Only the
+ * row pointer (and the loser's orphan bookkeeping) may be written with it —
+ * every other writer of this path is blocked for as long as it is open.
+ */
+export type PublishTx = Prisma.TransactionClient;
+
 export interface SealPublishDeps {
+    /**
+     * Runs the seal-and-commit critical section inside ONE transaction holding
+     * the canonical path's advisory lock. See withReceiptPublishLock.
+     */
+    withObjectLock: <T>(canonicalPath: string, body: (tx: PublishTx) => Promise<T>) => Promise<T>;
     seal: (uploadPath: string, canonicalPath: string, bytes: Buffer, contentType: string) => Promise<string | null>;
-    /** Fenced CAS. Returns the number of rows actually moved. */
-    commit: (canonicalPath: string, check: { mimeType: string; fileSize: number; fileSha256: string }) => Promise<number>;
-    /** Best-effort, AFTER the commit. Records a cleanup event on failure. */
+    /** Fenced CAS, INSIDE the lock. Returns the number of rows actually moved. */
+    commit: (
+        tx: PublishTx,
+        canonicalPath: string,
+        check: { mimeType: string; fileSize: number; fileSha256: string },
+    ) => Promise<number>;
+    /** Best-effort, AFTER the commit and OUTSIDE the lock. Records a cleanup event on failure. */
     dropUpload: (uploadPath: string) => Promise<void>;
     /**
      * Consulted ONLY when the commit CAS is lost, to tell apart the two
      * reasons that can happen. Returns wherever the row's storagePath points
-     * RIGHT NOW.
+     * RIGHT NOW. Read through the lock's transaction, so the answer and the
+     * orphan drop it decides cannot be separated by another publish.
      */
-    currentStoragePath: (rowId: string) => Promise<string | null>;
+    currentStoragePath: (tx: PublishTx, rowId: string) => Promise<string | null>;
     /**
      * Best-effort, AFTER a lost commit CAS, and ONLY when the winner is
      * proven to be pointing somewhere else (see below). Same shape as
@@ -92,45 +132,72 @@ export interface SealPublishDeps {
 export async function sealAndPublish(
     uploadPath: string,
     rowId: string,
+    /** The lease the bytes arrived on. It is part of the canonical path. */
+    leaseVersion: number,
     check: { mimeType: string; fileSize: number; fileSha256: string; bytes: Buffer },
     deps: SealPublishDeps,
 ): Promise<PublishOutcome | null> {
-    const canonicalPath = canonicalStoragePath(rowId, check.fileSha256, check.mimeType);
-    const sealed = await deps.seal(uploadPath, canonicalPath, check.bytes, check.mimeType);
-    if (!sealed) return null;
+    const canonicalPath = canonicalStoragePath(rowId, leaseVersion, check.fileSha256, check.mimeType);
 
-    const moved = await deps.commit(canonicalPath, check);
+    // EVERYTHING THAT TOUCHES THIS PATH HAPPENS UNDER ITS LOCK: the seal, the
+    // fenced commit, and — when the commit is lost — the question of what the
+    // winner is pointing at and the drop that answer decides. Asking that
+    // question outside the lock and deleting afterwards is the same two-step
+    // race one level down: the winner can commit THIS path in the gap, and the
+    // drop then deletes the object the winner just published.
+    const moved = await deps.withObjectLock(canonicalPath, async tx => {
+        const sealed = await deps.seal(uploadPath, canonicalPath, check.bytes, check.mimeType);
+        if (!sealed) return null;
+
+        const count = await deps.commit(tx, canonicalPath, check);
+        if (count > 0) return count;
+
+        // LOST THE CAS. Some other publish already moved the row — but "moved
+        // it where" is the whole question, and it splits into two very
+        // different cases:
+        //
+        //   - the row's storagePath is THIS exact canonicalPath: another
+        //     publisher raced this one on the SAME content (same rowId, same
+        //     lease, same bytes -> the identical content-addressed path — a
+        //     double /finalize, or /finalize racing the sweep on one row). The
+        //     object this call just sealed IS the object the winner committed;
+        //     deleting it would destroy what the winner is now pointing at.
+        //   - anything else: the winner published a DIFFERENT object — a
+        //     re-armed upload landed different bytes in the gap between this
+        //     call's read and its commit — and the copy THIS call sealed is an
+        //     orphan nothing will ever find on its own. It is not a STAGING row
+        //     any more (the winner moved it), so the stale-STAGING sweep will
+        //     never look at it again, and it would sit in the bucket forever.
+        //
+        // A failed lookup answers "don't know" as the first case: never delete
+        // on uncertainty about what the winner is using.
+        const winnerPath = await deps.currentStoragePath(tx, rowId).catch(() => canonicalPath);
+        if (winnerPath !== canonicalPath) {
+            await deps.dropOrphanedCanonical(canonicalPath).catch(() => undefined);
+        }
+        return count;
+    }).catch(error => {
+        // A lock we could not take, or a transaction that could not commit.
+        // NOTHING was published, and the same `null` the seal failure returns
+        // is the honest answer: a retryable "come back", never a verdict.
+        console.error(
+            "[receipts/intake] publish critical section failed",
+            rowId,
+            error instanceof Error ? error.name : "error",
+        );
+        return null;
+    });
+    if (moved === null) return null;
+
     if (moved > 0) {
         // Only once the row points at the sealed copy is the upload object
         // safe to remove — and only if we are the one who moved the row. A
         // publisher that lost the CAS must not delete an object the winner
-        // may still be using.
+        // may still be using. Outside the lock deliberately: it is a
+        // best-effort delete of a DIFFERENT path, and it must not hold a lock
+        // every other publisher of this row is waiting on.
         if (uploadPath !== canonicalPath) await deps.dropUpload(uploadPath);
         return { published: true, canonicalPath };
-    }
-
-    // LOST THE CAS. Some other publish already moved the row — but "moved it
-    // where" is the whole question, and it splits into two very different
-    // cases:
-    //
-    //   - the row's storagePath is THIS exact canonicalPath: another
-    //     publisher raced this one on the SAME content (same rowId, same
-    //     bytes, same sha256 -> the identical content-addressed path — a
-    //     double /finalize, or /finalize racing the sweep on one row). The
-    //     object this call just sealed IS the object the winner committed;
-    //     deleting it would destroy what the winner is now pointing at.
-    //   - anything else: the winner published a DIFFERENT object — a
-    //     re-armed upload landed different bytes in the gap between this
-    //     call's read and its commit — and the copy THIS call sealed is an
-    //     orphan nothing will ever find on its own. It is not a STAGING row
-    //     any more (the winner moved it), so the stale-STAGING sweep will
-    //     never look at it again, and it would sit in the bucket forever.
-    //
-    // A failed lookup answers "don't know" as the first case: never delete
-    // on uncertainty about what the winner is using.
-    const winnerPath = await deps.currentStoragePath(rowId).catch(() => canonicalPath);
-    if (winnerPath !== canonicalPath) {
-        await deps.dropOrphanedCanonical(canonicalPath).catch(() => undefined);
     }
     return { published: false, canonicalPath };
 }

@@ -12,11 +12,107 @@
  * already the audit surface the Command Center reads, and a table for it would
  * be schema churn for a queue that should normally be empty.
  */
+import type { Prisma } from "@prisma/client";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { prisma } from "@/lib/prisma";
 import { removeReceiptObject, uploadReceiptObject } from "./bucket";
 
 export const STORAGE_CLEANUP_KIND = "storage-cleanup-pending";
+
+/**
+ * ONE OBJECT PATH, ONE WRITER — publication or cleanup, never both at once.
+ *
+ * The two used to be free-running, and each was individually careful in a way
+ * that only worked if the other was not there:
+ *
+ *   - the sweep checks "does a live row point at this path" and then deletes
+ *     the object, in two separate operations;
+ *   - a publish seals the bytes at the canonical path and only THEN commits the
+ *     row pointer at it, in two separate operations — deliberately, because
+ *     committing a pointer to bytes that were never written is unrecoverable.
+ *
+ * Interleave them and the guards cancel out. The sweep looks while the row
+ * still points at the UPLOAD path, sees nothing referencing the canonical one,
+ * and deletes the object the publish just sealed; the publish then commits, and
+ * deletes the upload copy because the pointer moved. The row is RECEIVED, its
+ * sha is recorded, every later reader verifies against it — and the bytes are
+ * gone. A successful intake, pointing at nothing.
+ *
+ * A transaction-scoped advisory lock on the path is what makes the pairs
+ * atomic with respect to each other. Transaction scoped, not session scoped,
+ * because the app talks to Postgres through pgbouncer in transaction pooling
+ * mode: a session lock would be taken on a connection that is handed to
+ * somebody else the moment the statement ends, and released never.
+ *
+ * `hashtext` collisions are harmless here — two unrelated paths sharing a hash
+ * serialize against each other for a few milliseconds and nothing more.
+ */
+export async function withReceiptObjectLock<T>(
+    storagePath: string,
+    body: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+    return prisma.$transaction(
+        async tx => {
+            // $executeRaw, NOT $queryRaw: pg_advisory_xact_lock returns void.
+            // The blocking form, not `try_`: the critical sections here are a
+            // storage round trip long, and a publish that gave up because a
+            // sweep held the lock would be a spurious 503.
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('receipt-object:' || ${storagePath}))`;
+            return body(tx);
+        },
+        // Generous: the section holds one Supabase round trip on an object
+        // capped at MAX_STORED_BYTES (8 MB), and the default 5s interactive
+        // timeout would abort a slow-but-healthy seal.
+        { maxWait: 10_000, timeout: 30_000 },
+    );
+}
+
+/**
+ * A queued deletion for a path a publish is, right now, putting bytes at.
+ *
+ * Resolved rather than left pending: the event says "nothing references these
+ * bytes, remove them", and the publish holding this lock is in the middle of
+ * making that false. Leaving it pending would let the next sweep delete the
+ * object the moment this lock is released — the sweep's own reference check
+ * cannot save it, because a publish that has sealed but not yet committed is
+ * exactly the window in which no row references the path.
+ *
+ * Run BEFORE the seal, not after it. The canonical path is a deterministic
+ * function of the row, its upload lease and the bytes' own hash, so a publish
+ * that fails and is retried targets the SAME path again — the queued deletion
+ * is wrong about that object whether or not this particular attempt gets there.
+ *
+ * Matched on the JSON-quoted path so a prefix cannot widen it: the detail is
+ * `{"storagePath":"<path>",...}`, and the quotes bound both ends.
+ */
+async function reclaimQueuedCleanups(tx: Prisma.TransactionClient, storagePath: string): Promise<void> {
+    await tx.automationEvent.updateMany({
+        where: {
+            kind: STORAGE_CLEANUP_KIND,
+            status: "pending",
+            detail: { contains: JSON.stringify(storagePath) },
+        },
+        data: { status: "resolved", reason: `reclaimed by the publish of ${storagePath}`.slice(0, 500) },
+    });
+}
+
+/**
+ * The publish half of the mutual exclusion: hold the path's lock, cancel any
+ * queued deletion of it, and run the seal-and-commit inside.
+ *
+ * Only the seal and the row pointer belong in here. No Gemini read, no QBO
+ * round trip, nothing that can take seconds — this transaction blocks every
+ * other writer of the same path for as long as it is open.
+ */
+export async function withReceiptPublishLock<T>(
+    canonicalPath: string,
+    body: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+    return withReceiptObjectLock(canonicalPath, async tx => {
+        await reclaimQueuedCleanups(tx, canonicalPath);
+        return body(tx);
+    });
+}
 
 /**
  * Copy verified bytes to their canonical path and drop the upload path.
@@ -274,38 +370,57 @@ export async function retryPendingCleanups(limit: number, shouldStop: () => bool
             continue;
         }
 
-        // NEVER delete a path a LIVE row still points at.
+        // NEVER delete a path a LIVE row still points at — and never answer
+        // that question while a publish is mid-flight at the same path.
         //
-        // The recovery sequence makes this reachable: an ambiguous upload
+        // The recovery sequence makes the first reachable: an ambiguous upload
         // records a cleanup, the row is deleted, the caller retries, and the
         // retry's row can end up pointing at the same path — or a seal can
         // publish a canonical path that an older pending event names. Deleting
         // then destroys a receipt that is in active use. The event is resolved
         // rather than retried forever: the object is accounted for, just not by
         // us.
-        const referenced = await prisma.receiptIntake.findFirst({
-            where: { storagePath },
-            select: { id: true },
-        });
-        if (referenced) {
-            await prisma.automationEvent.update({
-                where: { id: event.id },
-                data: { status: "resolved", reason: `still referenced by ${referenced.id}` },
+        //
+        // The LOCK is what makes the check mean anything. Looking and then
+        // deleting, as two free-running operations, answers "was it referenced
+        // a moment ago" — and a publish that has sealed its bytes but not yet
+        // committed its row pointer is precisely the state that answers "no"
+        // while being seconds away from answering "yes". See
+        // withReceiptObjectLock. The whole check-and-delete now runs inside one
+        // transaction holding the path's lock, so a publish either finished
+        // before it (the row is visible, and this skips) or starts after it
+        // (the object is already gone, and the seal simply writes it again).
+        const verdict = await withReceiptObjectLock(storagePath, async tx => {
+            const referenced = await tx.receiptIntake.findFirst({
+                where: { storagePath },
+                select: { id: true },
             });
-            continue;
-        }
-
-        try {
+            if (referenced) {
+                await tx.automationEvent.update({
+                    where: { id: event.id },
+                    data: { status: "resolved", reason: `still referenced by ${referenced.id}` },
+                });
+                return "referenced" as const;
+            }
+            // A throw here rolls the whole transaction back, so the event stays
+            // pending for the next pass — the same outcome the old separate
+            // delete had, without the resolve ever landing on its own.
             await removeReceiptObject(storagePath);
-        } catch {
-            // Still failing. Leave it pending for the next pass.
-            continue;
-        }
-        // Resolved ONLY after a delete that did not throw — removeReceiptObject
-        // surfaces a missing storage client as an error rather than a success,
-        // so a misconfigured deployment cannot quietly mark the queue clean.
-        await prisma.automationEvent.update({ where: { id: event.id }, data: { status: "resolved" } });
-        cleared++;
+            // Resolved ONLY after a delete that did not throw —
+            // removeReceiptObject surfaces a missing storage client as an error
+            // rather than a success, so a misconfigured deployment cannot
+            // quietly mark the queue clean.
+            await tx.automationEvent.update({ where: { id: event.id }, data: { status: "resolved" } });
+            return "deleted" as const;
+        }).catch(error => {
+            console.error(
+                "[receipts/intake] queued cleanup left pending",
+                storagePath,
+                error instanceof Error ? error.name : "error",
+            );
+            return "failed" as const;
+        });
+        if (verdict === "deleted") cleared++;
     }
     return cleared;
 }

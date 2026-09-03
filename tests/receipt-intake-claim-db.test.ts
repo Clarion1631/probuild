@@ -269,3 +269,44 @@ test("SHADOW_QUARANTINE is writable — the CHECK allows it", { skip }, async ()
     assert.equal(row?.state, "SHADOW_QUARANTINE");
     await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
 });
+
+test("the PER-OBJECT lock really is mutually exclusive, and really is per path", { skip }, async () => {
+    // The lock that stops the storage-cleanup sweep deleting an object a
+    // publish has sealed but not yet committed. The unit suites drive it
+    // through a fake, so this is the only place the SQL itself is exercised:
+    // that `hashtext('receipt-object:' || $1)` is a legal argument to
+    // pg_advisory_xact_lock (hashtext returns int4, which has to widen to the
+    // bigint overload), that $executeRaw is the right verb for a void return,
+    // and that two concurrent transactions on the same path actually serialize.
+    // A DIFFERENT path does not block: the try-variant succeeds while the
+    // first transaction still holds its own lock.
+    const other = await db!.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('receipt-object:' || ${"receipts/a/v1/aa.png"}))`;
+        const [row] = await tx.$queryRaw<{ locked: boolean }[]>(
+            Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtext('receipt-object:' || ${"receipts/b/v1/bb.png"})) AS locked`,
+        );
+        return row.locked;
+    });
+    assert.equal(other, true, "two different object paths never wait on each other");
+
+    // The SAME path does: the second attempt is refused while the first
+    // transaction holds it, and granted once that transaction has ended.
+    const same = await db!.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('receipt-object:' || ${"receipts/a/v1/aa.png"}))`;
+        // A SEPARATE connection, so this is a real contender rather than the
+        // same transaction re-entering its own lock (which always succeeds).
+        const [row] = await db!.$queryRaw<{ locked: boolean }[]>(
+            Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtext('receipt-object:' || ${"receipts/a/v1/aa.png"})) AS locked`,
+        );
+        return row.locked;
+    });
+    assert.equal(same, false, "a second holder of the SAME path is made to wait");
+
+    // ...and the lock is transaction scoped, so it is gone now. pgbouncer's
+    // transaction pooling is why it has to be: a session lock would be taken on
+    // a connection handed straight to somebody else, and released never.
+    const [after] = await db!.$queryRaw<{ locked: boolean }[]>(
+        Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtext('receipt-object:' || ${"receipts/a/v1/aa.png"})) AS locked`,
+    );
+    assert.equal(after.locked, true, "the lock was released when its transaction ended");
+});

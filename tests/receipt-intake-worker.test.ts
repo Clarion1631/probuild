@@ -47,6 +47,8 @@ import { Prisma } from "@prisma/client";
 
 const PrismaKnownError = Prisma.PrismaClientKnownRequestError;
 const NOW = new Date("2026-09-01T12:00:00.000Z");
+/** The token this pass claims with. A row carrying anything else is a successor's. */
+const LIVE_TOKEN = "claim-1";
 
 function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
     return {
@@ -77,7 +79,7 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         lastError: null,
         suggestedConfidence: null,
         sendAttempted: false,
-        claimToken: "claim-1",
+        claimToken: LIVE_TOKEN,
         fileSha256: "s".repeat(64),
         stateReason: null,
         ...overrides,
@@ -115,6 +117,7 @@ interface Harness {
     deferred: { id: string; busyPasses: number }[];
     retried: { id: string; attempts: number; reason: string }[];
     releasedClaims: { id: string; nextRetryAt: Date }[];
+    releasedUnprocessed: { id: string; claimToken: string | null }[];
     leaseAcquires: number;
     leaseReleases: number;
     claimOpts: CutoverRequest[];
@@ -130,7 +133,7 @@ interface Harness {
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
     const h: Harness = {
         reads: 0, books: 0, applied: [], states: [], promoted: [], finished: [], deferred: [],
-        retried: [], releasedClaims: [], leaseAcquires: 0, leaseReleases: 0,
+        retried: [], releasedClaims: [], releasedUnprocessed: [], leaseAcquires: 0, leaseReleases: 0,
         claimOpts: [], sweepCalls: 0, cleanupCalls: 0, bookBudgets: [], clock: 0,
         sendReads: [],
         boundary: new Date("2026-08-25T00:00:00.000Z"),
@@ -181,6 +184,12 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         applyBookResult: async () => {},
         deferRead: async (id, busyPasses) => { h.deferred.push({ id, busyPasses }); return true; },
         releaseClaim: async (id, nextRetryAt) => { h.releasedClaims.push({ id, nextRetryAt }); return true; },
+        // Token-fenced in the real implementation; here it just records what
+        // was handed back, and reports the rows whose token still matches.
+        releaseUnprocessed: async released => {
+            h.releasedUnprocessed.push(...released);
+            return released.filter(r => r.claimToken === LIVE_TOKEN).length;
+        },
         retryRow: async (id, attempts, _next, reason) => { h.retried.push({ id, attempts, reason }); return true; },
         now: () => NOW,
         monotonicMs: () => h.clock,
@@ -466,6 +475,65 @@ test("the worker stops TAKING rows at 40s and leaves the rest for the next run",
     assert.equal(summary.processed, 3, "three rows fit inside the soft deadline");
     assert.equal(summary.deferredToNextRun, 2);
     assert.equal(h.reads, 3, "the deferred rows are never read");
+
+    // ...AND THE TWO IT NEVER REACHED ARE HANDED BACK.
+    //
+    // The claim stamps all ten rows with a ten-minute lease. A row the loop
+    // never touched that keeps that lease AND its claim token is invisible to
+    // the next cron five minutes later — `eligibleClaimWhere` skips a future
+    // `nextRetryAt`, and every fenced write misses a token no live pass holds.
+    // A batch that spent its budget on row 3 sat on seven untouched receipts
+    // for the rest of the ten minutes.
+    assert.deepEqual(
+        h.releasedUnprocessed.map(r => r.id),
+        ["row-4", "row-5"],
+        "exactly the rows nothing was attempted against — the processed ones release themselves",
+    );
+    assert.equal(summary.releasedUnprocessed, 2);
+});
+
+test("the release is FENCED: a row whose token changed is handed to the release and refused by it", async () => {
+    // The fence lives in the UPDATE's where clause, so what this proves at the
+    // worker level is that the token the pass claimed with travels with the
+    // row — a release keyed on the id alone would clear a claim a successor
+    // now holds.
+    const rows = [
+        workerRow({ id: "row-1" }),
+        workerRow({ id: "row-2" }),
+        // Taken over between the claim and the deadline.
+        workerRow({ id: "row-3", claimToken: "claim-2" }),
+    ];
+    const h = harness(rows, {
+        read: async () => { h.clock += 45_000; h.reads++; return goodRead; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.processed, 1);
+    assert.deepEqual(
+        h.releasedUnprocessed,
+        [{ id: "row-2", claimToken: LIVE_TOKEN }, { id: "row-3", claimToken: "claim-2" }],
+        "the release is told each row's own token, not just its id",
+    );
+    assert.equal(summary.releasedUnprocessed, 1, "only the row this pass still owns was released");
+});
+
+test("no deadline, no release call: a batch that finishes hands nothing back", async () => {
+    const h = harness([workerRow(), workerRow({ id: "row-2" })]);
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.processed, 2);
+    assert.equal(summary.deferredToNextRun, undefined);
+    assert.deepEqual(h.releasedUnprocessed, [], "every row completed under its own transition");
+    assert.equal(summary.releasedUnprocessed, undefined);
+});
+
+test("a failing release never takes the pass down with it", async () => {
+    const rows = [1, 2, 3].map(n => workerRow({ id: `row-${n}` }));
+    const h = harness(rows, {
+        read: async () => { h.clock += 45_000; h.reads++; return goodRead; },
+        releaseUnprocessed: async () => { throw new Error("db blip"); },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.deferredToNextRun, 2, "the rows are still reported as deferred");
+    assert.equal(summary.releasedUnprocessed, undefined, "and honestly reported as NOT released");
 });
 
 // ── Weak-dedup race at the READ -> BOOKING transition (Codex blocker 5) ───────
@@ -962,7 +1030,12 @@ test("the deadline starts at invocation entry, so a slow sweep cannot overrun it
     const summary = await runIntakeWorker(h.deps);
     assert.equal(h.reads, 0, "no Gemini call after the budget is gone");
     assert.equal(summary.processed, 0);
-    assert.equal(summary.deferredToNextRun, 2, "both rows keep their lease for the next run");
+    assert.equal(summary.deferredToNextRun, 2, "neither row was reached");
+    // A deadline BEFORE the first row releases the whole batch: not one of
+    // them was looked at, so all ten minutes of their lease would otherwise be
+    // spent on rows nothing ever considered.
+    assert.deepEqual(h.releasedUnprocessed.map(r => r.id), ["row-1", "row-2"]);
+    assert.equal(summary.releasedUnprocessed, 2);
 });
 
 // ── A missing boundary halts the WHOLE pass (round-7 item 3) ───────────────

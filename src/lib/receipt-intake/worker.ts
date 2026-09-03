@@ -361,6 +361,27 @@ export interface WorkerDependencies {
      * slot that a new receipt needs.
      */
     releaseClaim: (rowId: string, nextRetryAt: Date, ownership: Ownership) => Promise<boolean>;
+    /**
+     * HAND BACK EVERY ROW THIS PASS CLAIMED AND NEVER LOOKED AT.
+     *
+     * The claim takes BATCH_SIZE rows in one transaction and stamps them all
+     * with a lease (`nextRetryAt = now + LEASE_MS`, ten minutes). The loop then
+     * stops at the soft deadline — and the rows it never reached kept that
+     * lease AND their claim token, so the next cron five minutes later could
+     * not see them at all: `eligibleClaimWhere` skips a row whose `nextRetryAt`
+     * is in the future, and every fenced write misses a token no live pass
+     * holds. A batch that deadlocked on its first row sat idle for the rest of
+     * the ten minutes with nine untouched receipts behind it.
+     *
+     * Token-fenced, like every other write here: a row whose token changed is
+     * owned by somebody else now and must not be handed back by this pass.
+     * `nextRetryAt` is cleared rather than set, so the next pass sees them as
+     * due immediately — they were never worked on, so there is nothing to
+     * back off from.
+     *
+     * Returns how many rows were actually released.
+     */
+    releaseUnprocessed: (rows: { id: string; claimToken: string | null }[]) => Promise<number>;
     /** A transient fault anywhere else: spend an attempt and back off. */
     retryRow: (
         rowId: string,
@@ -436,8 +457,15 @@ export interface WorkerRunSummary {
      * reachable when a lease has expired under a still-running pass.
      */
     skipped?: "already-running" | "lease-held";
-    /** Rows left unprocessed because the soft deadline hit. They keep their lease. */
+    /** Rows left unprocessed because the soft deadline hit. */
     deferredToNextRun?: number;
+    /**
+     * How many of those `deferredToNextRun` rows were successfully handed back.
+     * A shortfall means some rows stayed claimed — either a successor had
+     * already taken them, or the release write failed — and those wait out
+     * their lease.
+     */
+    releasedUnprocessed?: number;
     /** Rows v1 already booked, retired as SHADOW_DONE by the first live pass. */
     shadowRetired?: number;
     /** Rows received AFTER v1 stopped: nobody booked these, so they are handed to v2. */
@@ -659,8 +687,10 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
     for (const row of rows) {
         // A row started at 41s can still be reading at 66s, past the function
         // ceiling — the invocation dies mid-book and the row's state is
-        // whatever it happened to be. Stop TAKING rows instead; the claim
-        // lease already keeps them ours, and the next run picks them up.
+        // whatever it happened to be. Stop TAKING rows instead, and RELEASE the
+        // ones we never reached (below): keeping them would leave rows this
+        // pass never looked at holding a ten-minute lease under a token nobody
+        // owns, invisible to the next cron five minutes later.
         if (outOfTime()) {
             deferredToNextRun = rows.length - processed;
             break;
@@ -716,10 +746,26 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
         }
     }
 
+    // THE ROWS THE DEADLINE CUT OFF ARE HANDED BACK, not left leased.
+    //
+    // `processed` is incremented BEFORE a row is worked on, so `rows.slice`
+    // from it is exactly the set nothing was ever attempted against — a row
+    // that threw is `processed` and was already routed through handleRowError,
+    // which releases it. Best-effort: a release that fails leaves the row
+    // exactly as the old code did, waiting out its lease, which is strictly no
+    // worse than not trying.
+    let releasedUnprocessed = 0;
+    if (deferredToNextRun > 0) {
+        releasedUnprocessed = await deps
+            .releaseUnprocessed(rows.slice(processed).map(r => ({ id: r.id, claimToken: r.claimToken })))
+            .catch(() => 0);
+    }
+
     return {
         processed,
         byState,
         ...(deferredToNextRun ? { deferredToNextRun } : {}),
+        ...(releasedUnprocessed ? { releasedUnprocessed } : {}),
         ...(shadowRetired ? { shadowRetired } : {}),
         ...(requeued ? { requeued } : {}),
         ...(shadowQuarantined ? { shadowQuarantined } : {}),

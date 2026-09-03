@@ -26,6 +26,7 @@ import {
     rejectRowAndQueueCleanup,
     sealObject,
     settleQueuedCleanup,
+    withReceiptPublishLock,
 } from "@/lib/receipt-intake/storage-cleanup";
 
 export const dynamic = "force-dynamic";
@@ -468,10 +469,11 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     // ONE shared seal-and-publish, also used by the worker's stale-STAGING
     // sweep, so the two publishers cannot diverge on ordering or fencing.
-    const outcome = await sealAndPublish(row.storagePath, id, check, {
+    const outcome = await sealAndPublish(row.storagePath, id, row.uploadLeaseVersion, check, {
+        withObjectLock: withReceiptPublishLock,
         seal: sealObject,
-        commit: async (canonicalPath, values) => {
-            const { count } = await prisma.receiptIntake.updateMany({
+        commit: async (tx, canonicalPath, values) => {
+            const { count } = await tx.receiptIntake.updateMany({
                 // Fenced on the EXACT state and reason observed, on the row
                 // being unclaimed, and on every captured value this publish was
                 // validated against. Anything that moved between the read and
@@ -495,8 +497,8 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             return count;
         },
         dropUpload: uploadPath => deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
-        currentStoragePath: async rowId => {
-            const r = await prisma.receiptIntake.findUnique({ where: { id: rowId }, select: { storagePath: true } });
+        currentStoragePath: async (tx, rowId) => {
+            const r = await tx.receiptIntake.findUnique({ where: { id: rowId }, select: { storagePath: true } });
             return r?.storagePath ?? null;
         },
         // A lost CAS here means another /finalize (or the worker's

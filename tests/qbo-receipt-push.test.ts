@@ -84,6 +84,7 @@ const MATCHED = {
         txnDate: "2026-07-15",
         vendor: "Home Depot",
         projectNames: ["Mueller Remodel"],
+        lines: [{ tax: false, customerId: "cust-1", customerName: "Mueller Remodel", readable: true }],
         taxAmount: 0,
     },
 };
@@ -1645,20 +1646,171 @@ test("an UNREADABLE total or date is a review — never a silent pass", () => {
     }
 });
 
-test("a ref with no display name is not comparable, and is not a mismatch", () => {
+test("a VENDOR ref with no display name is not comparable, and is not a mismatch", () => {
     // QBO documents `name` on a ReferenceType as optional, so its absence is a
-    // fact about the response shape rather than about the books. Parking on it
-    // would break every honest lost-response retry.
+    // fact about the response shape rather than about the books. The vendor is
+    // a DERIVE field — QuickBooks wins it outright — so nothing is lost by
+    // skipping a comparison that cannot be made.
     const check = compareExistingPurchase(
-        readBooked({
-            EntityRef: { value: "vendor-1" },
-            Line: [{ Amount: 150, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { value: "cust-1" } } }],
-        }),
+        readBooked({ EntityRef: { value: "vendor-1" } }),
         baseInput(),
     );
     assert.equal(check.verdict, "match");
     assert.equal(check.booked.vendor, null);
+});
+
+test("a CUSTOMER ref with no display name is a REVIEW: the job was never confirmed", () => {
+    // The job is not a derive field, and this is the half of the old rule that
+    // was wrong. An id with no name says the lines agree with EACH OTHER; it
+    // says nothing about whether they agree with this receipt, and the expected
+    // customer's id is not known on the replay branch (resolving it there would
+    // CREATE a QBO customer). "I could not check" must not read the same as "I
+    // checked and it agrees" — the same rule the total and the date already
+    // follow.
+    const check = compareExistingPurchase(
+        readBooked({
+            Line: [{ Amount: 150, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { value: "cust-1" } } }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
     assert.deepEqual(check.booked.projectNames, []);
+});
+
+// -- Attribution is PER LINE, not "one line agreed" (round-35 P1) ------------
+
+/**
+ * The finding: the project check ran only `if (projectNames.length > 0)` and
+ * built that list from the lines that HAD a readable customer name. A Purchase
+ * that was only partly coded therefore passed on the strength of its coded
+ * half, and one that was not coded at all skipped the check entirely — and
+ * book.ts then wrote a real Expense for the WHOLE amount against a job
+ * QuickBooks does not carry it under.
+ */
+function linesOf(...lines: Record<string, unknown>[]) {
+    return readBooked({ Line: lines });
+}
+
+const CODED = {
+    Amount: 100,
+    AccountBasedExpenseLineDetail: {
+        AccountRef: { value: EXPENSE_ACCOUNT_ID },
+        CustomerRef: { value: "cust-1", name: "Mueller Remodel" },
+    },
+};
+/** The line with no CustomerRef at all: real money on this Purchase, on no job. */
+const UNCODED = {
+    Amount: 50,
+    AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID } },
+};
+
+test("ALL lines coded to this job books clean", () => {
+    const check = compareExistingPurchase(linesOf(CODED, { ...CODED, Amount: 50 }), baseInput());
+    assert.equal(check.verdict, "match");
+    assert.deepEqual(check.differences, []);
+});
+
+test("ONE coded line plus an UNCODED one is a review — the old rule called this a match", () => {
+    // $100 on the job, $50 on nothing, and the Expense would have been written
+    // for the full $150 against the job.
+    const check = compareExistingPurchase(linesOf(CODED, UNCODED), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(
+        check.booked.lines.map(l => l.customerId),
+        ["cust-1", null],
+        "the uncoded line is RECORDED, not dropped — that is what the name set could not do",
+    );
+});
+
+test("ZERO coded lines is a review — the old rule skipped the check entirely", () => {
+    const check = compareExistingPurchase(linesOf(UNCODED, { ...UNCODED, Amount: 100 }), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(check.booked.projectNames, [], "nothing to build the old rule's list from");
+});
+
+test("all coded, one to a DIFFERENT customer, is a review", () => {
+    const other = {
+        Amount: 50,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { value: "cust-9", name: "Mesplay Kitchen" },
+        },
+    };
+    const check = compareExistingPurchase(linesOf(CODED, other), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+});
+
+test("identity is compared on CustomerRef.value, so two customers sharing a NAME is still a review", () => {
+    // Two QBO customers can carry the same display name — a sub-customer under
+    // a different parent, a duplicate nobody merged. The name comparison alone
+    // cannot see it.
+    const twin = {
+        Amount: 50,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { value: "cust-2", name: "Mueller Remodel" },
+        },
+    };
+    const check = compareExistingPurchase(linesOf(CODED, twin), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+});
+
+test("an UNCODED TAX line is fine: the reclaimable account is its attribution", () => {
+    // The reseller-permit tax posts to its own account and is not job money in
+    // the same sense, so requiring a customer on it would park every honest
+    // split. A tax line naming a DIFFERENT job is still a review.
+    const taxLine = { Amount: 12.5, AccountBasedExpenseLineDetail: { AccountRef: { value: TAX_ACCOUNT_ID } } };
+    const ok = compareExistingPurchase(
+        readBooked({
+            Line: [{ ...CODED, Amount: 137.5 }, taxLine],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(ok.verdict, "match");
+
+    const wrongJob = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { ...CODED, Amount: 137.5 },
+                {
+                    Amount: 12.5,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: TAX_ACCOUNT_ID },
+                        CustomerRef: { value: "cust-9", name: "Mesplay Kitchen" },
+                    },
+                },
+            ],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(wrongJob.verdict, "review");
+    assert.ok(wrongJob.differences.includes("project"));
+});
+
+test("a line shape this code cannot read is a review, never a silent skip", () => {
+    // An item-based expense line, a v1-cutover Purchase, anything without an
+    // AccountBasedExpenseLineDetail: there is no CustomerRef to find, and the
+    // money on it is real.
+    const itemBased = {
+        Amount: 50,
+        DetailType: "ItemBasedExpenseLineDetail",
+        ItemBasedExpenseLineDetail: { ItemRef: { value: "item-1" } },
+    };
+    const check = compareExistingPurchase(linesOf(CODED, itemBased), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.equal(check.booked.lines[1].readable, false);
+});
+
+test("a Purchase with NO lines at all is a review", () => {
+    const check = compareExistingPurchase(readBooked({ Line: [] }), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
 });
 
 test("a REVIEW outranks a DERIVE when both kinds of difference are present", () => {

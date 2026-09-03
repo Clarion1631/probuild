@@ -197,8 +197,9 @@ export type ReceiptAttachmentStatus = "attached" | "already-attached" | "skipped
  * the entity rather than assumed from the payload we would have sent.
  *
  * `projectNames` is a list because the job rides on each LINE's CustomerRef and
- * a Purchase can carry several: one name is an answer, two is an ambiguity that
- * nobody may resolve automatically.
+ * a Purchase can carry several. It is a SUMMARY, kept for the review snapshot —
+ * the verdict is decided from `lines`, because a set of names cannot represent
+ * the line that carried no name at all.
  */
 export interface BookedPurchaseValues {
     /** QBO's `TotalAmt`. Null only when the entity did not carry a usable one. */
@@ -209,8 +210,36 @@ export interface BookedPurchaseValues {
     vendor: string | null;
     /** Distinct `CustomerRef.name`s across the expense lines. */
     projectNames: string[];
+    /**
+     * EVERY entry of `Line`, in order, with what could be read of its job
+     * attribution — including the ones that carry none. The distinct-name set
+     * above cannot answer "is all of this money on this job", because a line
+     * with no customer, or one this code cannot parse at all, leaves no trace
+     * in it: see attributionAgrees.
+     */
+    lines: BookedExpenseLine[];
     /** Dollars posted to the reimbursable-sales-tax account. */
     taxAmount: number;
+}
+
+/**
+ * One `Purchase.Line` entry's job attribution, read off the entity.
+ *
+ * `readable: false` means the entry is not an account-based expense line, so
+ * there is no `AccountBasedExpenseLineDetail` to find a `CustomerRef` on at
+ * all. That is NOT the same as an account-based line that simply carries no
+ * customer — both fail the check, but only one of them is a shape this code
+ * understands, and conflating them would hide the difference from the review.
+ */
+export interface BookedExpenseLine {
+    /** Posted to the reimbursable-sales-tax account rather than an expense one. */
+    tax: boolean;
+    /** `CustomerRef.value` — the identity. Null when the ref is absent or unusable. */
+    customerId: string | null;
+    /** `CustomerRef.name` — a display string, and optional per QBO's own docs. */
+    customerName: string | null;
+    /** False when the entry is not an account-based expense line. */
+    readable: boolean;
 }
 
 /**
@@ -221,8 +250,9 @@ export interface BookedPurchaseValues {
  *   the booked truth for those (real money posted against them, and the
  *   difference is OCR noise on our side), so the Expense is written from the
  *   QBO values and the difference is recorded.
- * - `review` — they disagree about the PROJECT or the TAX SPLIT, or QBO did not
- *   give a usable total or date at all. Those are attribution decisions, not
+ * - `review` — they disagree about the PROJECT or the TAX SPLIT, the Purchase
+ *   is not FULLY attributed to that project (see attributionAgrees), or QBO did
+ *   not give a usable total or date at all. Those are attribution decisions, not
  *   noise: which job carries the cost, and whether the sales tax is sitting on
  *   the reclaimable account. Neither side may be preferred automatically, so no
  *   Expense is written and a human looks.
@@ -346,6 +376,18 @@ function refName(ref: unknown): string | null {
     return typeof name === "string" && name.trim() ? name.trim() : null;
 }
 
+/**
+ * A QBO ReferenceType's id. The `name` beside it is a display string two
+ * different customers can share; THIS is the identity.
+ */
+function refValue(ref: unknown): string | null {
+    if (!ref || typeof ref !== "object") return null;
+    const value = (ref as { value?: unknown }).value;
+    if (typeof value === "string") return value.trim() || null;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    return null;
+}
+
 function expenseLineDetail(line: unknown): Record<string, unknown> | null {
     if (!line || typeof line !== "object") return null;
     const detail = (line as { AccountBasedExpenseLineDetail?: unknown }).AccountBasedExpenseLineDetail;
@@ -364,16 +406,30 @@ export function readBookedPurchase(purchase: Record<string, unknown>, taxAccount
 
     let taxCents = 0;
     const projectNames = new Set<string>();
+    const expenseLines: BookedExpenseLine[] = [];
     for (const line of lines) {
         const detail = expenseLineDetail(line);
-        if (!detail) continue;
+        // RECORDED, not skipped. A line this code cannot parse still carries
+        // money on this Purchase, and dropping it here is what let a partly
+        // attributed document read as a fully attributed one.
+        if (!detail) {
+            expenseLines.push({ tax: false, customerId: null, customerName: null, readable: false });
+            continue;
+        }
         const customer = refName(detail.CustomerRef);
         if (customer) projectNames.add(customer);
         const account = (detail.AccountRef as { value?: unknown } | undefined)?.value;
-        if (account !== undefined && String(account) === taxAccountId) {
+        const tax = account !== undefined && String(account) === taxAccountId;
+        if (tax) {
             const amount = Number((line as { Amount?: unknown }).Amount);
             if (Number.isFinite(amount)) taxCents += Math.round(amount * 100);
         }
+        expenseLines.push({
+            tax,
+            customerId: refValue(detail.CustomerRef),
+            customerName: customer,
+            readable: true,
+        });
     }
 
     return {
@@ -381,8 +437,60 @@ export function readBookedPurchase(purchase: Record<string, unknown>, taxAccount
         txnDate: isValidCalendarDate(rawDate) ? rawDate : null,
         vendor: refName(purchase.EntityRef),
         projectNames: Array.from(projectNames),
+        lines: expenseLines,
         taxAmount: taxCents / 100,
     };
+}
+
+/**
+ * IS EVERY DOLLAR ON THIS PURCHASE ON THE JOB THIS RECEIPT SAYS IT IS?
+ *
+ * The rule this replaces read the DISTINCT customer names off the lines and
+ * passed when exactly one of them matched. That answered "does some line agree"
+ * rather than "do they all", and the difference is money: a Purchase carrying a
+ * $50 line coded to this job plus a $100 line coded to nothing at all read as a
+ * clean match, and the Expense was then written for the whole $150 against a
+ * job QuickBooks only holds a third of. A Purchase with NO coded lines missed
+ * the check entirely — the guard was inside `projectNames.length > 0` — and
+ * passed unconditionally.
+ *
+ * So it is per line now, and the burden of proof runs the other way: the
+ * default is `review`, and a `match` has to be earned by every line.
+ *
+ *   - Nothing readable to attribute is not a pass. "I could not check" must not
+ *     read the same as "I checked and it agrees", exactly as for the total and
+ *     the date above.
+ *   - Every NON-TAX line must be coded. A tax line need not be: it posts to the
+ *     reclaimable-sales-tax account, which is its own attribution, and an
+ *     uncoded one misfiles nothing.
+ *   - A customer NAME that disagrees is fatal wherever it sits, tax line
+ *     included — that is the old two-jobs ambiguity, kept.
+ *   - Identity between lines is compared on `CustomerRef.value`, never the
+ *     display name: two QBO customers can share one. More than one id on a
+ *     document is the same split-across-jobs ambiguity by a route the name
+ *     comparison cannot see.
+ *   - And at least one line has to be confirmed BY NAME. Ids agreeing with each
+ *     other says the lines agree with each other, not that they agree with this
+ *     receipt: the expected customer's id is not known on this branch (it is
+ *     resolved after the idempotency query, and resolving it here would CREATE
+ *     a QBO customer on a replay path), so the name is the only form of the
+ *     expected identity available to compare against.
+ */
+function attributionAgrees(lines: BookedExpenseLine[], expectedProjectName: string): boolean {
+    if (lines.length === 0) return false;
+    const expected = normalizeProjectName(expectedProjectName);
+    const ids = new Set<string>();
+    let confirmedByName = false;
+    for (const line of lines) {
+        if (!line.readable) return false;
+        if (line.customerName) {
+            if (normalizeProjectName(line.customerName) !== expected) return false;
+            confirmedByName = true;
+        }
+        if (!line.tax && !line.customerId && !line.customerName) return false;
+        if (line.customerId) ids.add(line.customerId);
+    }
+    return ids.size <= 1 && confirmedByName;
 }
 
 function normalizeVendorName(name: string): string {
@@ -429,14 +537,10 @@ export function compareExistingPurchase(
         derive.push("vendor");
     }
 
-    // One name that matches is the only pass. Two names is an ambiguity a human
-    // resolves — QBO let the lines be split across jobs and nothing here can
-    // decide which one this receipt belongs to.
-    if (booked.projectNames.length > 0) {
-        const agrees = booked.projectNames.length === 1
-            && normalizeProjectName(booked.projectNames[0]) === normalizeProjectName(input.projectName);
-        if (!agrees) review.push("project");
-    }
+    // EVERY line, not "one name that matched". See attributionAgrees: a
+    // partly-coded Purchase used to pass on the strength of its coded half, and
+    // an entirely uncoded one skipped the check altogether.
+    if (!attributionAgrees(booked.lines, input.projectName)) review.push("project");
 
     const plannedTaxCents = input.groups
         .filter(g => g.tax === true)
