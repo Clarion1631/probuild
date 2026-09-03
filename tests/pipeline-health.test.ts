@@ -221,7 +221,7 @@ test("digest is plain text: one line per item, no markdown tables, no emoji", ()
     assert.doesNotMatch(text, /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u);
     assert.match(text, /Intuit status: none \(All Systems Operational\)/);
     assert.match(text, /Receipts \(24h\): created 4, fallback 1/);
-    assert.match(text, /Bank ledger through: 2026-08-29/);
+    assert.match(text, /Statement ledger through: 2026-08-29/);
     assert.match(text, /Automation errors \(24h, all kinds\): 0/);
 });
 
@@ -251,7 +251,7 @@ test("a failed probe reads as unavailable in the digest, never as a real value",
         }),
     );
     assert.match(text, /Receipts \(24h\): unavailable \(probe failed\)/);
-    assert.match(text, /Bank ledger through: unavailable \(probe failed\)/);
+    assert.match(text, /Statement ledger through: unavailable \(probe failed\)/);
     // The 0 fallback must NOT be printed as a real "0 errors" all-clear.
     assert.match(text, /Automation errors \(24h, all kinds\): unavailable \(probe failed\)/);
     assert.doesNotMatch(text, /Automation errors \(24h, all kinds\): 0/);

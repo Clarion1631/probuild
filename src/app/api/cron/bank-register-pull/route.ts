@@ -27,6 +27,7 @@ import {
     type BankRegisterIngestResult,
 } from "@/lib/bank-register-pull";
 import { BANK_LINE_IDENTITY_LOCK, bankLineIdentityPayee, planQboMint } from "@/lib/bank-line-mint";
+import { bumpBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 import { bankLedgerIngestHandlers } from "@/app/api/integrations/bank-ledger/ingest/route";
 import { ambiguousGroupKey, bankLedgerReconcileHandlers } from "@/app/api/integrations/bank-ledger/reconcile/route";
 
@@ -34,14 +35,23 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 /**
- * Nightly QBO bank register pull (Phase 2 prerequisite / risk 1).
+ * Nightly QBO POSTED-register pull (Phase 2 prerequisite / risk 1).
  *
  * Until this existed, `BankLine` only ever filled from a monthly statement
  * import and QBO register rows only arrived when a human ran
  * `scripts/post-qbo-register.mjs` from a laptop. The missing-receipt matcher's
- * whole input is bank truth, so a chase request could be weeks late. This runs
- * at 02:00 UTC — BEFORE `/api/cron/receipt-requests` (13:00 UTC) — so the
- * matcher always sees last night's register.
+ * whole input is the bank ledger, so a chase request could be weeks late. This
+ * runs at 02:00 UTC — BEFORE `/api/cron/receipt-requests` (13:00 UTC) — so the
+ * matcher always sees last night's posted register.
+ *
+ * WHAT IT DOES NOT SEE (Codex PR #443 gate round 37, finding 1). The source is
+ * the QuickBooks General Ledger report: transactions QuickBooks has POSTED to
+ * the account. A charge sitting in the bank feed unposted — pending, excluded,
+ * or never matched — is absent from that report, so this pull cannot ingest it
+ * and the mint cannot create a line for it. The monthly statement import
+ * remains the source of record for those, and its freshness is reported
+ * separately (`newestStatementPostedDate`) so a healthy run of THIS cron can
+ * never read as a current statement import.
  *
  * It goes through the SAME ingest and reconcile code the script used
  * (`bankLedgerIngestHandlers.handleQboRegister` /
@@ -193,24 +203,64 @@ async function saveWindowState(next: PullWindowState): Promise<void> {
  * Never throws: the run's own answer is already decided by the time this is
  * called, and failing to record the obligation must not turn a 503 into a crash.
  */
-async function persistStampPending(pending: boolean): Promise<void> {
+async function mergeWindowState(fields: Record<string, unknown>): Promise<void> {
     try {
         const row = await prisma.automationSetting.findUnique({ where: { key: WINDOW_STATE_KEY } });
         const parsed = row?.value ? JSON.parse(row.value) as Record<string, unknown> : {};
         // Unchanged is the common case, and a KV write nobody needs is a write
         // that can fail for nothing.
-        if ((parsed.stampPending === true) === pending) return;
-        if (pending) parsed.stampPending = true;
-        else delete parsed.stampPending;
-        const value = JSON.stringify(parsed);
+        if (Object.entries(fields).every(([key, value]) => parsed[key] === value)) return;
+        const value = JSON.stringify({ ...parsed, ...fields });
         await prisma.automationSetting.upsert({
             where: { key: WINDOW_STATE_KEY },
             update: { value },
             create: { key: WINDOW_STATE_KEY, value },
         });
     } catch (error) {
-        console.error("[cron/bank-register-pull] stamp-pending write failed", error instanceof Error ? error.message : "UnknownError");
+        console.error("[cron/bank-register-pull] window-state merge failed", error instanceof Error ? error.message : "UnknownError");
     }
+}
+
+/**
+ * STAMP THE CLOCK AND RELEASE THE OBLIGATION IN ONE TRANSACTION (Codex PR #443
+ * gate round 37, finding 2).
+ *
+ * `stampPending` used to be cleared by any run that did not owe a stamp, which
+ * read reasonably and was wrong: a continuation that failed for an unrelated
+ * reason — a QuickBooks timeout, an ingest conflict — is not evidence that the
+ * stamp landed, and clearing it there DELETED the only marker that would have
+ * brought a later slot back. The obligation survives everything except the one
+ * write that discharges it, so the release happens here, in the same
+ * transaction as the marker itself, and nowhere else.
+ *
+ * A window state that will not parse does NOT roll the stamp back. The clock is
+ * what matters and it is now correct; the flag is only a reminder to come back
+ * for a write that has just succeeded. Losing the reminder costs a continuation
+ * that finds nothing to do; losing the stamp costs the day's cards.
+ */
+async function commitFreshnessStamp(at: string): Promise<void> {
+    await prisma.$transaction(async tx => {
+        await tx.automationSetting.upsert({
+            where: { key: BANK_PULL_LAST_SUCCESS_KEY },
+            update: { value: at },
+            create: { key: BANK_PULL_LAST_SUCCESS_KEY, value: at },
+        });
+        const row = await tx.automationSetting.findUnique({ where: { key: WINDOW_STATE_KEY } });
+        if (!row?.value) return;
+        let parsed: Record<string, unknown>;
+        try {
+            parsed = JSON.parse(row.value) as Record<string, unknown>;
+        } catch {
+            console.error("[cron/bank-register-pull] window state unparseable; stamp committed, obligation left parked");
+            return;
+        }
+        if (parsed.stampPending !== true) return;
+        delete parsed.stampPending;
+        await tx.automationSetting.update({
+            where: { key: WINDOW_STATE_KEY },
+            data: { value: JSON.stringify(parsed) },
+        });
+    });
 }
 
 /**
@@ -360,6 +410,13 @@ async function mintFromQbo(
         }
         const result = await prisma.$transaction(async tx => {
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
+            // AND THE LEDGER EPOCH, BEFORE ANY BankLine WRITE (round-37 gate,
+            // finding 3). The chaser fences its completion stamp on this
+            // counter; bumping it first is what makes that fence real —
+            // this transaction holds the row until it commits, so a chaser
+            // validating at the same moment waits and then sees movement
+            // instead of certifying a list these rows are missing from.
+            await bumpBankLedgerEpoch(tx);
 
             const [observations, existingLines] = await Promise.all([
                 tx.bankLineObservation.findMany({
@@ -508,9 +565,11 @@ async function runPull() {
             };
         },
 
-        // Justin, decision 3: the QBO bank feed is bank truth. OFF by default —
-        // the dependency is simply absent unless the flag is on, so there is no
-        // "enabled" branch inside the pull to get wrong.
+        // Justin, decision 3: a QuickBooks POSTED register row is good enough to
+        // mint a canonical line from — NOT "the bank feed is bank truth", which
+        // this pull has no way to read (round-37 gate, finding 1). OFF by
+        // default — the dependency is simply absent unless the flag is on, so
+        // there is no "enabled" branch inside the pull to get wrong.
         ...(process.env.BANK_LINE_MINT_FROM_QBO === "true" ? { mintFromQbo } : {}),
     });
 
@@ -680,11 +739,7 @@ async function runPull() {
     let stampFailed = false;
     if (stampWarranted) {
         try {
-            await prisma.automationSetting.upsert({
-                where: { key: BANK_PULL_LAST_SUCCESS_KEY },
-                update: { value: new Date().toISOString() },
-                create: { key: BANK_PULL_LAST_SUCCESS_KEY, value: new Date().toISOString() },
-            });
+            await commitFreshnessStamp(new Date().toISOString());
         } catch (error) {
             stampFailed = true;
             summary.ok = false;
@@ -692,13 +747,26 @@ async function runPull() {
             console.error("[cron/bank-register-pull] last-success write failed", error instanceof Error ? error.message : "UnknownError");
         }
     }
-    // AND A CONTINUATION HAS TO COME BACK FOR IT. Every other marker this run
-    // could have left was cleared by a run that was, in every other respect, a
-    // complete success — so without this the resume pass answers
-    // `nothing-in-progress` and the stamp waits for tomorrow night. Released on
-    // any run that stamps, or that finds the stamp no longer warranted: the
-    // obligation is to the CLOCK, and a run that must not stamp does not owe it.
-    await persistStampPending(stampFailed);
+    /**
+     * WHAT A RUN THAT DID NOT DISCHARGE ITS OBLIGATIONS LEAVES BEHIND.
+     *
+     * Both flags are only ever SET here; neither is ever cleared on this path
+     * (round-37 gate, finding 2). `stampPending` is released by the stamp
+     * transaction, and `continuationPending` by the state save of a run that
+     * completed the picture — the two writes that are actually evidence the
+     * work is done.
+     *
+     * The second flag closes the other half of that finding: a failed run skips
+     * the state save entirely — deliberately, since its high-water mark must not
+     * advance over rows it never stored — so nothing recorded that the register
+     * still needs reading, and every later slot answered `nothing-in-progress`.
+     * A failure IS unfinished work. The 500 this run returns is what surfaces
+     * the cause; this is what brings a slot back for it.
+     */
+    const statePatch: Record<string, unknown> = {};
+    if (stampFailed) statePatch.stampPending = true;
+    if (!summary.ok) statePatch.continuationPending = true;
+    if (Object.keys(statePatch).length > 0) await mergeWindowState(statePatch);
 
     const status = stampFailed ? 503 : summary.ok ? 200 : 500;
     return NextResponse.json(summary, { status });

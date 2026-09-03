@@ -80,7 +80,17 @@ export interface PipelineHealth {
     };
     /** receipt-push events in the last 24h, by status ("created", "fallback", ...). */
     receipts24h: CountsProbe;
-    /** Newest posted date in the bank ledger — how current the statement feed is. */
+    /**
+     * Newest posted date of a STATEMENT-sourced bank line — how current the
+     * statement import is (Codex PR #443 gate round 37, finding 1).
+     *
+     * Scoped to `sourceOfRecord: "STATEMENT"` on purpose. The nightly QBO pull
+     * mints canonical lines from the POSTED register, and counting those here
+     * meant a healthy pull could carry this date forward while the statement
+     * import — the only source that sees a bank-feed charge QuickBooks has not
+     * posted — had been stale for a week. The two sources answer different
+     * questions and only one of them can go stale unnoticed.
+     */
     bank: TimestampProbe;
     /** Automation events (ANY kind) that errored in the last 24h. */
     stuck: CountProbe;
@@ -738,6 +748,28 @@ export interface ProbeResult<T> {
  *
  * Exported for tests: a never-settling fake is the only way to prove this.
  */
+/**
+ * The STATEMENT import's own high-water mark (round-37 gate, finding 1).
+ *
+ * The nightly QBO pull reads the POSTED general-ledger register. A charge the
+ * bank has cleared but QuickBooks has not posted — a pending or unmatched
+ * bank-feed line — is not in that source at all and can never be minted from
+ * it, so the monthly statement import stays the only thing that sees it. That
+ * makes "how current is the statement import" a question the pull must not be
+ * able to answer, and an unfiltered `max(postedDate)` let it: one night of
+ * QBO-minted lines carried the date forward over a statement import nobody had
+ * run since July.
+ *
+ * Exported so the scoping is testable without standing up every other probe.
+ */
+export async function newestStatementPostedDate(client: Pick<typeof prisma, "bankLine">): Promise<Date | null> {
+    const newest = await client.bankLine.aggregate({
+        where: { sourceOfRecord: "STATEMENT" },
+        _max: { postedDate: true },
+    });
+    return newest._max.postedDate ?? null;
+}
+
 export async function runProbe<T>(
     name: string,
     run: () => Promise<T>,
@@ -848,7 +880,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         ),
         probe<Date | null>(
             "bank",
-            async () => (await prisma.bankLine.aggregate({ _max: { postedDate: true } }))._max.postedDate ?? null,
+            () => newestStatementPostedDate(prisma),
             null,
         ),
         // ANY kind: a qbo-sync failure is exactly the thing this digest exists
@@ -1123,7 +1155,11 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
                     : ""
         }`,
         `Receipts (24h): ${receiptsLine}`,
-        `Bank ledger through: ${
+        // NAMED FOR WHAT IT MEASURES (round-37 gate, finding 1). "Bank ledger"
+        // read as every line in the ledger, QBO-minted ones included, which is
+        // exactly the reading that let a fresh pull disguise a stale statement
+        // import. The pull has its own line below.
+        `Statement ledger through: ${
             health.bank.status === "error"
                 ? "unavailable (probe failed)"
                 : health.bank.at

@@ -351,6 +351,24 @@ on the same `txn_type` cell the GL does), so the join is an identity join and no
 heuristic. And a manually entered Journal Entry — the reviewer's exact fake-bank-truth
 case — is classified by NEITHER filter, so it comes back `Unknown` and can never mint.
 
+### 4b-i. What the pull CANNOT see — unposted bank-feed lines (round-37 gate, finding 1)
+
+The source is the QuickBooks **General Ledger report**: transactions QuickBooks has
+POSTED to the account. It is not the bank feed, and it cannot be — QBO exposes no API
+for the "For Review" queue, so pending, excluded and never-matched feed items are absent
+from every call this pull makes. A charge the bank has cleared but QuickBooks has not
+posted therefore produces no register row, no observation, and no mint: nothing in this
+phase can chase it.
+
+**So the claim is narrowed, not dropped.** The nightly pull takes the chase gap from
+"every charge waits for the monthly statement import" down to "unposted feed lines wait
+for the monthly statement import". For those lines the **statement import remains the
+source of record**, and its own freshness is reported separately —
+`newestStatementPostedDate` scopes the health probe to `sourceOfRecord: "STATEMENT"`,
+so a healthy pull can never carry the "statement ledger through" date forward over an
+import nobody has run. Anything that reads as "the pull closes the freshness gap" is
+wrong and should be corrected on sight.
+
 **The rule.** `BankLineObservation.clearedStatus` carries the answer; `isClearedForMint`
 is POSITIVE, so only `Reconciled` and `Cleared` mint. Uncleared, Unknown, and NULL
 (never asked) all stay observations: visible on the Bank page and in
@@ -542,12 +560,15 @@ reason to suppress every owner's cards.
 
 ## 8. Risks / open questions (max 5)
 
-1. **Data freshness**: matcher truth is `BankLine`, which today fills only from monthly
-   statement imports; QBO register rows are observations without canonical lines. The
-   3-day chase is therefore late until Phase 6's nightly pull (or until unlinked
-   QBO_REGISTER observations also feed the matcher — deliberately NOT done here, to avoid
-   dual-identity issues when a statement later mints the canonical line). Confirm Phase 6
-   ordering is acceptable, or ask for the observation-feed variant as a follow-up.
+1. **Data freshness**: matcher truth is `BankLine`, which before the nightly pull filled
+   only from monthly statement imports; QBO register rows were observations without
+   canonical lines, so a 3-day chase was in practice a 30-day one. The nightly pull
+   narrows that to the charges QuickBooks has POSTED. It does **not** close the gap:
+   a cleared-but-unposted bank-feed line is invisible to the QBO API (see §4b-i), so the
+   statement import stays the source of record for those and its staleness is reported on
+   its own. OPEN: whether unlinked QBO_REGISTER observations should also feed the matcher
+   (deliberately NOT done here, to avoid dual-identity issues when a statement later mints
+   the canonical line).
 1b. **Reply routing must outlive the answer** (round-32 gate, CLOSED). `itemsJson` is
    the immutable record of what a card said, and "sign N" resolves against THAT — so the
    thread export now covers the full 14-day retention window regardless of whether an

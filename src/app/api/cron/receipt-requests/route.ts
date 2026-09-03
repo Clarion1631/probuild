@@ -34,6 +34,7 @@ import {
     type ReceiptRequestPlan,
 } from "@/lib/receipt-requests";
 import { REGISTER_WINDOW_DAYS, registerWindowStartYmd } from "@/lib/bank-register-pull";
+import { lockBankLedgerEpoch, readBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_CHASER_WINDOW_HOURS } from "@/lib/pipeline-health";
 import {
     SWEEP_MARKER_KEY,
@@ -156,32 +157,83 @@ export const BANK_PULL_STALE_REASON = "bank-pull-stale";
 export const PULL_MOVED_REASON = "pull-moved";
 
 /**
- * Did canonical lines land in the window AFTER the line pass loaded its
- * snapshot? (round-36 gate, finding 2.)
- *
- * The line pass reads `windowLines` once and then works from that list for the
- * rest of the run, while the freshness marker is read at the END. A pull that
- * mints lines in between satisfies both: the marker is fresh, the snapshot is
- * stale, and the cycle stamps "complete" over charges it never looked at — the
- * cards then go out saying the list is finished.
- *
- * COUNTED FROM THE LEDGER, not from the pull's own marker. A mint is not the
- * only way a line appears (a statement import and the receipt-intake worker
- * both write them), and a pull that minted lines and then failed its own stamp
- * would move the ledger without moving the marker at all.
- *
- * A COUNT THAT CANNOT BE TAKEN IS TREATED AS MOVED. "We could not check" is not
- * evidence that nothing arrived, and the safe direction is the one that
- * withholds the stamp for fifteen minutes rather than certifying a list that
- * may be short.
+ * The `blockedReason` for a cycle that could not FENCE its own certification
+ * (round-37 gate, finding 3). Distinct from both of the above: the ledger may
+ * not have moved at all — what failed is the proof that it did not.
  */
-export async function ledgerMovedDuringPass(countNewLines: () => Promise<number>): Promise<boolean> {
-    try {
-        return (await countNewLines()) > 0;
-    } catch (error) {
-        console.error("[cron/receipt-requests] ledger watermark read failed", error instanceof Error ? error.message : "UnknownError");
-        return true;
-    }
+export const LEDGER_FENCE_FAILED_REASON = "ledger-fence-failed";
+
+/** How long the fence transaction may wait for the ledger epoch's row lock. */
+const FENCE_TX_TIMEOUT_MS = 15_000;
+
+/**
+ * The three things the fence does, all inside ONE transaction.
+ *
+ * Named as an interface so the real implementation (Prisma) and a test double
+ * satisfy the same contract — the ordering guarantee is the whole point of this
+ * finding, and a test that cannot express an interleaving cannot prove it.
+ */
+export interface LedgerFenceOps {
+    /** Take the ledger epoch row's lock and read it. */
+    lockEpoch(): Promise<string>;
+    /** Canonical lines that appeared in the window since the snapshot instant. */
+    countNewLines(): Promise<number>;
+    /** Write the phase marker — in the SAME transaction as the two above. */
+    writePhase(phase: SweepPhase, completedAt: string | undefined, blockedReason: string | null): Promise<void>;
+}
+
+/**
+ * VALIDATE AND COMMIT UNDER ONE FENCE (round-37 gate, finding 3).
+ *
+ * The old shape counted rows created since the snapshot, and then wrote the
+ * phase marker in a separate statement. Two holes, and the second is the one
+ * that mattered:
+ *
+ *   1. TIME OF CHECK, TIME OF USE. A BankLine committed between the count and
+ *      the marker write was certified as chased by a cycle that never saw it,
+ *      and the 14:30 cards went out on that list.
+ *   2. `createdAt` SEES ONLY INSERTS. A line whose `rawDescriptor` changed —
+ *      the field that decides the owner, and therefore who gets asked — is the
+ *      same charge with a different answer, and no count of new rows can see it.
+ *
+ * So the check and the write are one transaction, ordered around the ledger
+ * epoch's row lock: every BankLine writer bumps that counter first (see
+ * `bumpBankLedgerEpoch`), which covers updates as well as inserts. A writer
+ * mid-flight holds the row, so this waits and then sees movement; a writer
+ * arriving after this takes the lock waits for the marker to commit, and its
+ * rows are not in the database the cycle certified.
+ *
+ * The row count stays as a SECOND net, run only when the epoch says nothing
+ * moved: it catches a future writer that inserts without bumping — the failure
+ * mode a counter everyone must remember to touch actually has.
+ */
+export async function fenceAndWritePhase(
+    input: {
+        snapshotEpoch: string;
+        computedPhase: SweepPhase;
+        bankPullStale: boolean;
+        /** The completion instant, injected so a test does not race a clock. */
+        now: Date;
+    },
+    transaction: <T>(fn: (ops: LedgerFenceOps) => Promise<T>) => Promise<T>,
+): Promise<{ phase: SweepPhase; complete: boolean; blockedReason: string | null; ledgerMoved: boolean }> {
+    return transaction(async ops => {
+        const epoch = await ops.lockEpoch();
+        const epochMoved = epoch !== input.snapshotEpoch;
+        const appeared = epochMoved ? 0 : await ops.countNewLines();
+        const ledgerMoved = epochMoved || appeared > 0;
+        const decision = sweepCompletionDecision({
+            computedPhase: input.computedPhase,
+            bankPullStale: input.bankPullStale,
+            ledgerMoved,
+        });
+        await ops.writePhase(
+            decision.phase,
+            decision.complete ? input.now.toISOString() : undefined,
+            decision.blockedReason,
+        );
+        return { ...decision, ledgerMoved };
+    });
 }
 
 /**
@@ -325,9 +377,16 @@ export function shouldResumeSweep(
     return phase !== "done" || !!lineCursor || !!openCursor;
 }
 
-async function readMarker(): Promise<SweepMarker> {
+/**
+ * The client the marker is read and written through: the pool by default, or an
+ * interactive transaction when the write has to be fenced (round-37 gate,
+ * finding 3). Narrowed to the one model it touches so a test double is small.
+ */
+type MarkerClient = Pick<typeof prisma, "automationSetting">;
+
+async function readMarker(client: MarkerClient = prisma): Promise<SweepMarker> {
     try {
-        const row = await prisma.automationSetting.findUnique({ where: { key: PHASE_KEY } });
+        const row = await client.automationSetting.findUnique({ where: { key: PHASE_KEY } });
         return parseSweepMarker(row?.value);
     } catch {
         return { phase: "done", chaserCompletedAt: null };
@@ -348,9 +407,14 @@ async function readPhase(): Promise<SweepPhase> {
  * FORWARD on every other write — losing it would block tomorrow's cards on a
  * technicality.
  */
-async function writePhase(phase: SweepPhase, completedAt?: string, blockedReason: string | null = null): Promise<void> {
+async function writePhase(
+    phase: SweepPhase,
+    completedAt?: string,
+    blockedReason: string | null = null,
+    client: MarkerClient = prisma,
+): Promise<void> {
     try {
-        const previous = await readMarker();
+        const previous = await readMarker(client);
         const value = formatSweepMarker({
             phase,
             chaserCompletedAt: completedAt ?? previous.chaserCompletedAt,
@@ -361,7 +425,7 @@ async function writePhase(phase: SweepPhase, completedAt?: string, blockedReason
             // `chaser-blocked` firing after the pull recovered.
             blockedReason,
         });
-        await prisma.automationSetting.upsert({
+        await client.automationSetting.upsert({
             where: { key: PHASE_KEY },
             update: { value },
             create: { key: PHASE_KEY, value },
@@ -1634,6 +1698,11 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     // below judges this one list; a line that arrives after this point is one
     // this cycle cannot have chased, and the completion stamp has to know.
     const linePassFrom = new Date();
+    // AND THE LEDGER EPOCH AT THAT SAME INSTANT (round-37 gate, finding 3).
+    // `createdAt` sees inserts only; the epoch is bumped by every BankLine
+    // writer, so a descriptor rewritten under this pass — which changes who owns
+    // the charge, and therefore who is asked — moves it too.
+    const snapshotEpoch = await readBankLedgerEpoch(prisma);
     const windowLines = await prisma.bankLine.findMany({
         where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
         orderBy: [{ postedDate: "asc" }, { id: "asc" }],
@@ -1795,21 +1864,12 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
      * ledger. The closes and opens this run made all stand — they were right
      * about the lines it did see.
      */
-    // ASKED ONLY WHERE IT CAN CHANGE THE ANSWER. A cycle that did not reach
-    // "done", or one already held by a stale pull, is held open by that — so an
-    // extra count on every 15-minute slot buys nothing, and a count that could
-    // not be taken would attach a second, misleading reason to it.
-    const ledgerMoved = computedPhase === "done" && !bankPullStale
-        ? await ledgerMovedDuringPass(() => prisma.bankLine.count({
-            where: {
-                postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) },
-                amountCents: { lt: 0 },
-                createdAt: { gte: linePassFrom },
-            },
-        }))
-        : false;
-    const decision = sweepCompletionDecision({ computedPhase, bankPullStale, ledgerMoved });
-    const phase = decision.phase;
+    // FENCED ONLY WHERE IT CAN CHANGE THE ANSWER. A cycle that did not reach
+    // "done", or one already held by a stale pull, is held open by that — and
+    // taking the ledger's row lock to write a marker that cannot carry a
+    // completion stamp would queue this run behind an unrelated import for
+    // nothing.
+    //
     // A CLEAN, COMPLETE cycle stamps the clock the cards cron reads. Anything
     // else leaves the previous stamp alone: yesterday's completion is still a
     // true statement about yesterday, and the cards cron compares it to TODAY.
@@ -1817,11 +1877,47 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     // "Anything else" INCLUDES a run that left contended work behind. The stamp
     // is a claim that tonight's issue set is reconciled, and a component nobody
     // could reconcile makes that claim false.
-    await writePhase(
-        phase,
-        decision.complete ? new Date().toISOString() : undefined,
-        decision.blockedReason,
-    );
+    const certifiable = computedPhase === "done" && !bankPullStale;
+    let decision: { phase: SweepPhase; complete: boolean; blockedReason: string | null; ledgerMoved: boolean };
+    if (certifiable) {
+        try {
+            decision = await fenceAndWritePhase(
+                { snapshotEpoch, computedPhase, bankPullStale, now: new Date() },
+                fn => prisma.$transaction(async tx => fn({
+                    lockEpoch: () => lockBankLedgerEpoch(tx),
+                    countNewLines: () => tx.bankLine.count({
+                        where: {
+                            postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) },
+                            amountCents: { lt: 0 },
+                            createdAt: { gte: linePassFrom },
+                        },
+                    }),
+                    writePhase: (phase, completedAt, blockedReason) =>
+                        writePhase(phase, completedAt, blockedReason, tx),
+                }), { timeout: FENCE_TX_TIMEOUT_MS }),
+            );
+        } catch (error) {
+            /**
+             * THE FENCE ITSELF FAILED — a lock wait that ran out, or the marker
+             * write inside it. The ledger may not have moved at all; what is
+             * missing is the PROOF that it did not, and a completion stamp is
+             * exactly a claim of proof. So the cycle is held open under its own
+             * reason and the next continuation tries again, 15 minutes later,
+             * with hours to spare before the cards.
+             */
+            console.error("[cron/receipt-requests] ledger fence failed", error instanceof Error ? error.message : "UnknownError");
+            decision = { phase: "lines", complete: false, blockedReason: LEDGER_FENCE_FAILED_REASON, ledgerMoved: false };
+            await writePhase(decision.phase, undefined, decision.blockedReason);
+        }
+    } else {
+        // Not certifiable, so nothing to fence: this write can only ever carry
+        // the previous stamp forward.
+        decision = { ...sweepCompletionDecision({ computedPhase, bankPullStale }), ledgerMoved: false };
+        await writePhase(decision.phase, undefined, decision.blockedReason);
+    }
+    const ledgerMoved = decision.ledgerMoved;
+    const fenceFailed = decision.blockedReason === LEDGER_FENCE_FAILED_REASON;
+    const phase = decision.phase;
 
     const result = {
         ok: totals.errors === 0,
@@ -1831,7 +1927,8 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // question without a database read.
         ...(bankPullStale
             ? { reason: BANK_PULL_STALE_REASON }
-            : ledgerMoved ? { reason: PULL_MOVED_REASON } : {}),
+            : ledgerMoved ? { reason: PULL_MOVED_REASON }
+                : fenceFailed ? { reason: LEDGER_FENCE_FAILED_REASON } : {}),
         bankPull: { fresh: bankPull.fresh, lastSuccessAt: bankPull.lastSuccessAt },
         window: { start: windowStart, end: windowEnd },
         batches,
@@ -1851,7 +1948,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // exhausted its pages but left a component unreconciled, and including a
         // cycle held open because the register it read was not current.
         moreToProcess: !exhausted || !openExhausted || openContended > 0 || lineContended > 0
-            || bankPullStale || ledgerMoved,
+            || bankPullStale || ledgerMoved || fenceFailed,
         cursor,
         elapsedMs: Date.now() - startedAt,
         ...totals,

@@ -378,7 +378,10 @@ test("a resume already past the open pass does not redo it", () => {
     assert.match(source, /const computedPhase = sweepPhaseAfter\(\{/);
     // It also stamps the completion the morning cards cron waits for — and
     // ONLY when the register pull that fed this cycle was current.
-    assert.match(source, /await writePhase\(\s*phase,\s*decision\.complete \? new Date\(\)\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
+    // WRITTEN INSIDE THE FENCE (round-37 gate, finding 3): the completion stamp
+    // and the ledger check are one transaction, so no BankLine can commit
+    // between "the ledger has not moved" and "this cycle is done".
+    assert.match(source, /await ops\.writePhase\(\s*decision\.phase,\s*decision\.complete \? input\.now\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
     // A scheduled (non-resume) run always starts a fresh cycle.
     assert.match(source, /runSweep\(now, continueOnly \? resumePhase : "open-issues"\)/);
 });

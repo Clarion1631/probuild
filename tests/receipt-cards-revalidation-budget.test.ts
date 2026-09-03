@@ -108,26 +108,42 @@ test("ten items sharing ONE competing component share ONE recompute call", async
     for (const t of truth.values()) assert.equal(t.evidenceSatisfied, true, "the cached [] verdict still reads as evidence found");
 });
 
-test("a cache shared across TWO SEPARATE loadCardItemTruth calls (two owners' cards) still recomputes the shared component once", async () => {
-    // Mirrors the real caller: one `revalidationCache` created before the
-    // owner loop, reused across every owner's `loadCardItemTruth` call.
-    const cache = new Map<string, ReasonCode[]>();
+test("a SECOND owner's card re-resolves the shared component — evidence can arrive while the first card posts", async () => {
+    /**
+     * This used to assert the opposite (Codex PR #443 gate round 37, finding
+     * 4). One `revalidationCache` spanned the whole run, so owner B's card was
+     * built from a verdict computed before owner A's card was even posted — and
+     * a receipt booked, or a memo signed, during that post reached nobody. B was
+     * chased for a charge that had just been answered.
+     *
+     * The cache is now created per card, so the second card pays for one more
+     * component walk and gets a verdict that is true at ITS send.
+     */
+    let receiptArrived = false;
     let calls = 0;
     const recompute = async (targetKey: string, sharedCache?: Map<string, ReasonCode[]>): Promise<ReasonCode[]> => {
         if (sharedCache?.has(targetKey)) return sharedCache.get(targetKey)!;
         calls++;
-        sharedCache?.set("bl-shared-a", []);
-        sharedCache?.set("bl-shared-b", []);
+        sharedCache?.set("bl-shared-a", ["MISSING_RECEIPT"]);
+        sharedCache?.set("bl-shared-b", receiptArrived ? [] : ["MISSING_RECEIPT"]);
         return sharedCache?.get(targetKey) ?? [];
     };
 
     issues = [row("ri-a", "bl-shared-a")];
-    await loadCardItemTruth(["ri-a"], { cache, recompute });
+    const first = await loadCardItemTruth(["ri-a"], { cache: new Map(), recompute });
+    assert.equal(first.get("ri-a")?.evidenceSatisfied, false, "owner A is genuinely still missing its receipt");
+
+    // ...A's card posts, and B's receipt is booked while it does.
+    receiptArrived = true;
 
     issues = [row("ri-b", "bl-shared-b")];
-    await loadCardItemTruth(["ri-b"], { cache, recompute });
+    const second = await loadCardItemTruth(["ri-b"], { cache: new Map(), recompute });
 
-    assert.equal(calls, 1, "the second owner's card reused the first owner's traversal of the same component");
+    assert.equal(calls, 2, "one component walk per card — the cost of a verdict that is true at this send");
+    assert.equal(
+        second.get("ri-b")?.evidenceSatisfied, true,
+        "owner B must not be chased from a verdict computed before the first card went out",
+    );
 });
 
 test("items that do not need revalidation (cleared/resolved/acknowledged) never touch the cache", async () => {

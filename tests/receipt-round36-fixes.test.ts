@@ -12,9 +12,35 @@ import {
 import {
     BANK_PULL_STALE_REASON,
     PULL_MOVED_REASON,
-    ledgerMovedDuringPass,
+    fenceAndWritePhase,
     sweepCompletionDecision,
 } from "../src/app/api/cron/receipt-requests/route";
+
+/**
+ * A fence over an in-memory ledger: the epoch the chaser will read, the count
+ * of lines that appeared since its snapshot, and what the phase write recorded.
+ *
+ * The round-37 gate turned the round-36 watermark into a real transaction, so
+ * these two stories are told through it — the failure they describe is the same
+ * one, and a test that still called the deleted helper would be pinning nothing.
+ */
+function fence(input: { epochNow: string; appeared: number }) {
+    const written: Array<{ phase: string; completedAt: string | undefined; blockedReason: string | null }> = [];
+    return {
+        written,
+        run: (snapshotEpoch: string, computedPhase: "done" | "lines" | "open-issues", bankPullStale = false) =>
+            fenceAndWritePhase(
+                { snapshotEpoch, computedPhase, bankPullStale, now: new Date("2026-09-03T14:00:00Z") },
+                fn => fn({
+                    lockEpoch: async () => input.epochNow,
+                    countNewLines: async () => input.appeared,
+                    writePhase: async (phase, completedAt, blockedReason) => {
+                        written.push({ phase, completedAt, blockedReason });
+                    },
+                }),
+            ),
+    };
+}
 
 /**
  * Codex PR #443, adversarial gate round 36.
@@ -74,8 +100,17 @@ const pullPrisma = {
             settings.set(where.key, settings.has(where.key) ? update.value : create.value);
             return { key: where.key };
         },
+        update: async ({ where, data }: { where: { key: string }; data: { value: string } }) => {
+            if (!settings.has(where.key)) throw new Error("record not found");
+            settings.set(where.key, data.value);
+            return { key: where.key };
+        },
     },
     bankLineObservation: { count: async () => 0 },
+    // The stamp and the release of its obligation are ONE transaction
+    // (round-37 gate, finding 2), so the fake has to be able to run one.
+    // Flattened onto itself: every write inside is against this same store.
+    $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(pullPrisma),
 };
 
 let pullGET: (request: Request) => Promise<Response>;
@@ -329,43 +364,47 @@ test("a corrupt uncertifiedSince is dropped without taking the outstanding DAYS 
 
 // ── 2. The chaser may not certify a list the ledger changed under ───────────
 
-test("ledgerMovedDuringPass: lines that arrived mid-pass are movement, and an unanswerable count is too", async () => {
-    assert.equal(await ledgerMovedDuringPass(async () => 0), false, "an empty count is the only proof nothing arrived");
-    assert.equal(await ledgerMovedDuringPass(async () => 1), true);
-    assert.equal(
-        await ledgerMovedDuringPass(async () => { throw new Error("db down"); }), true,
-        "'we could not check' is not evidence that nothing arrived",
-    );
+test("lines that arrived mid-pass are movement; a quiet ledger is the only thing that certifies", async () => {
+    const quiet = fence({ epochNow: "7", appeared: 0 });
+    const settled = await quiet.run("7", "done");
+    assert.equal(settled.ledgerMoved, false);
+    assert.equal(settled.complete, true, "an unchanged ledger and an empty count is the only proof nothing arrived");
+
+    const counted = fence({ epochNow: "7", appeared: 1 });
+    const held = await counted.run("7", "done");
+    assert.equal(held.ledgerMoved, true, "a line that appeared since the snapshot is movement even if nobody bumped the epoch");
+    assert.equal(held.complete, false);
 });
 
 test("a pull landing mid-pass holds the cycle open; the same pull landing before it does not", async () => {
     /**
-     * The interleave, in the two units the route composes: the snapshot instant
-     * is taken when the line pass loads its window, and the count afterwards
-     * asks whether the ledger moved since. A fresh freshness marker cannot
-     * answer that question — it says the pull succeeded, not WHEN.
+     * The interleave the fence exists for. A fresh freshness marker says the
+     * pull succeeded, not WHEN — so the question "did the ledger move under
+     * this pass" is asked of the ledger itself.
      */
-    const ledger: Array<{ createdAt: number }> = [{ createdAt: Date.parse("2026-09-03T12:00:00Z") }];
-    const countSince = (since: number) => async () => ledger.filter(row => row.createdAt >= since).length;
-
-    // (a) The pull lands BEFORE the pass loads its snapshot: the line is in the
-    // list this cycle judged, so the cycle is finished and stamps.
-    const before = Date.parse("2026-09-03T13:00:00Z");
-    const quiet = await ledgerMovedDuringPass(countSince(before));
-    const settled = sweepCompletionDecision({ computedPhase: "done", bankPullStale: false, ledgerMoved: quiet });
+    // (a) The pull lands BEFORE the pass takes its snapshot: its rows are in the
+    // list this cycle judged, the epoch it bumped is the one the snapshot read,
+    // and the cycle stamps.
+    const quiet = fence({ epochNow: "12", appeared: 0 });
+    const settled = await quiet.run("12", "done");
     assert.equal(settled.phase, "done");
     assert.equal(settled.complete, true);
     assert.equal(settled.blockedReason, null);
+    assert.deepEqual(
+        quiet.written.map(w => w.phase), ["done"],
+        "and the marker is written by the fence, not somewhere else afterwards",
+    );
+    assert.ok(quiet.written[0].completedAt, "a finished cycle carries its completion stamp");
 
-    // (b) The same pull lands WHILE the pass is working: the marker is fresh and
-    // the snapshot is short by exactly that line.
-    const during = Date.parse("2026-09-03T11:00:00Z");
-    const moved = await ledgerMovedDuringPass(countSince(during));
-    assert.equal(moved, true);
-    const held = sweepCompletionDecision({ computedPhase: "done", bankPullStale: false, ledgerMoved: moved });
+    // (b) The same pull lands WHILE the pass is working: the epoch it bumped is
+    // not the one the snapshot read.
+    const moved = fence({ epochNow: "13", appeared: 4 });
+    const held = await moved.run("12", "done");
+    assert.equal(held.ledgerMoved, true);
     assert.equal(held.phase, "lines", "held open so the next 15-minute continuation re-reads the fuller ledger");
     assert.equal(held.complete, false, "and the cards cron never sees a completion stamp for a short list");
     assert.equal(held.blockedReason, PULL_MOVED_REASON);
+    assert.equal(held.ledgerMoved && moved.written[0].completedAt, undefined, "no stamp lands on a moved ledger");
 });
 
 test("sweepCompletionDecision: a register that never arrived outranks one that arrived late", () => {

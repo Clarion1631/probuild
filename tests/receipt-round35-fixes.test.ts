@@ -133,11 +133,19 @@ const settingStore = {
         settings.set(where.key, settings.has(where.key) ? update.value : create.value);
         return { key: where.key };
     },
+    update: async ({ where, data }: { where: { key: string }; data: { value: string } }) => {
+        if (!settings.has(where.key)) throw new Error("record not found");
+        settings.set(where.key, data.value);
+        return { key: where.key };
+    },
 };
 
 const pullPrisma = {
     automationSetting: settingStore,
     bankLineObservation: { count: async () => 0 },
+    // The freshness stamp and the release of its obligation are ONE
+    // transaction (round-37 gate, finding 2), so the fake runs one.
+    $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(pullPrisma),
 };
 
 let pullGET: (request: Request) => Promise<Response>;

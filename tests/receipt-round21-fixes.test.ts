@@ -213,7 +213,10 @@ test("contended work keeps the cycle unfinished and resumable", () => {
 test("only a done phase carries the stamp, and contention cannot reach done", () => {
     // The stamp is written ONLY on "done" (that expression is asserted in
     // receipt-sweep-marker.test.ts), so blocking "done" is what blocks the card.
-    assert.match(sweepSource, /await writePhase\(\s*phase,\s*decision\.complete \? new Date\(\)\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
+    // WRITTEN INSIDE THE FENCE (round-37 gate, finding 3): the completion stamp
+    // and the ledger check are one transaction, so no BankLine can commit
+    // between "the ledger has not moved" and "this cycle is done".
+    assert.match(sweepSource, /await ops\.writePhase\(\s*decision\.phase,\s*decision\.complete \? input\.now\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
     // And the contention counts actually reach the decision.
     assert.match(sweepSource, /const computedPhase = sweepPhaseAfter\(\{[\s\S]{0,240}openContended,[\s\S]{0,240}lineContended,/);
     // A run that left contended work says so, and says there is more to do —

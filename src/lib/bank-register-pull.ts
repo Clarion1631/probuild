@@ -1302,6 +1302,13 @@ export async function runBankRegisterPull(
                 // every save, so the flag can never outlive the state it
                 // describes; false the moment a run completes the picture.
                 continuationPending: !summary.complete && clearedProbeOk,
+                // CARRIED, NEVER CLEARED HERE (round-37 gate, finding 2). An
+                // owed freshness stamp is discharged by the write that commits
+                // the marker, in that write's own transaction; a save that
+                // omitted this field would silently drop the obligation on any
+                // run that did not happen to stamp — which is every run held
+                // back by ambiguity, and every continuation of one.
+                stampPending: dependencies.windowState.stampPending === true,
                 highWater,
                 // Same rule: a sweep nobody could certify is not a sweep that
                 // happened, and recording it would push the next one a week out.

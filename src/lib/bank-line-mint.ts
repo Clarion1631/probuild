@@ -2,11 +2,24 @@
  * Minting canonical BankLines from QBO register observations, and adopting
  * those lines when the statement finally arrives.
  *
- * THE DECISION THIS IMPLEMENTS (Justin, decision 3): the QBO bank feed is bank
- * truth. Before this, a canonical `BankLine` was minted ONLY from a STATEMENT
- * observation, so nothing existed to chase until the monthly statement import
- * ran — a 3-day receipt chase was in practice a 30-day one. QBO register rows
- * now mint their own canonical line.
+ * THE DECISION THIS IMPLEMENTS (Justin, decision 3): a QuickBooks POSTED
+ * register row is good enough to chase against. Before this, a canonical
+ * `BankLine` was minted ONLY from a STATEMENT observation, so nothing existed
+ * to chase until the monthly statement import ran — a 3-day receipt chase was
+ * in practice a 30-day one. QBO register rows now mint their own canonical line.
+ *
+ * AND WHAT THAT IS NOT (Codex PR #443 gate round 37, finding 1). The source is
+ * the QuickBooks GENERAL LEDGER report — what QuickBooks has posted to the
+ * account — NOT the WTB bank feed. A charge the bank has cleared that
+ * QuickBooks has not posted (still pending in the feed, excluded, or never
+ * matched) produces no register row, therefore no observation, therefore
+ * nothing here can mint it. Those lines reach the ledger only when the
+ * statement import runs, and that import is still the source of record for
+ * them: this narrows the gap from "everything waits for the statement" to
+ * "unposted feed lines wait for the statement", and it does not close it.
+ * `newestStatementPostedDate` in pipeline-health is scoped to STATEMENT lines
+ * for exactly this reason — a healthy pull must not be able to make a stale
+ * statement import look current.
  *
  * WHAT THAT COSTS, AND HOW IT IS PAID. The old rule bought one thing: exactly
  * one canonical line per real transaction. Mint from two sources and you can

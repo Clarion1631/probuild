@@ -441,7 +441,10 @@ test("the bank pull fails on a stale fetch and on chunk errors; truncation is no
     // register is current. Behaviour lives in tests/bank-pull-window.test.ts.
     const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
     assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified;/);
-    assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,600}BANK_PULL_LAST_SUCCESS_KEY/);
+    // The write itself, and the release of an owed stamp, are ONE transaction
+    // (round-37 gate, finding 2) — the ONLY place stampPending is ever cleared.
+    assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,300}await commitFreshnessStamp\(/);
+    assert.match(route, /prisma\.\$transaction\([\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY[\s\S]{0,900}delete parsed\.stampPending;/);
 });
 
 test("health enablement is the cron's existence, not an undocumented env var", () => {
@@ -854,7 +857,10 @@ test("mintFromQbo reports truncation, and a truncated run stamps nothing", () =>
     assert.match(route, /remainingCursor = result\.nextId;/);
     // The freshness clock needs a run that was BOTH clean and whole.
     assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified;/);
-    assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,600}BANK_PULL_LAST_SUCCESS_KEY/);
+    // The write itself, and the release of an owed stamp, are ONE transaction
+    // (round-37 gate, finding 2) — the ONLY place stampPending is ever cleared.
+    assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,300}await commitFreshnessStamp\(/);
+    assert.match(route, /prisma\.\$transaction\([\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY[\s\S]{0,900}delete parsed\.stampPending;/);
     // And the cursor is persisted, so a backlog that is not draining is visible.
     assert.match(route, /mintRemainingCursor: typeof parsed\.mintRemainingCursor === "string"/);
 

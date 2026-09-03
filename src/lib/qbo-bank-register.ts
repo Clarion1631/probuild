@@ -17,6 +17,15 @@ import { isPurchaseType, isMoneyInType, type ClearedStatus } from "@/lib/registe
  * are pending, excluded, unmatched, or absent from QuickBooks. The UI must say
  * so — no "true north" claims.
  *
+ * AND NEITHER CAN ANYTHING BUILT ON IT (Codex PR #443 gate round 37, finding
+ * 1). There is no QBO endpoint that returns bank-feed items — the "For Review"
+ * queue is not exposed by the API at all — so this module cannot be extended
+ * to cover them, and the nightly pull, the mint and the missing-receipt chaser
+ * all inherit the limit: a cleared-but-unposted feed charge is invisible to
+ * every one of them and is chased only after the statement import brings it in.
+ * Say "narrows the statement-import gap to unposted feed lines", never "closes
+ * the freshness gap".
+ *
  * BANK CLEARANCE, AND HOW IT IS ACTUALLY OBTAINED (Codex PR #443, raised three
  * rounds running). The GL report does not prove clearance, and QuickBooks will
  * not put clearance on it: `cleared` is a FILTER, never a returnable column,

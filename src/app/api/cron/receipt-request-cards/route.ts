@@ -374,10 +374,15 @@ export async function scanCandidates(
  * itself stays pure and testable.
  *
  * `deps.cache` and `deps.recompute` are DI seams (Codex PR #443 gate, finding
- * 3): the caller passes ONE cache spanning the whole run so a competing
- * component that straddles two owners' cards is still walked only once, and
- * tests can substitute a counting fake for `recomputeCodesFor` without a
- * database. `deps.deadlineExceeded` is checked before each real recompute —
+ * 3): a component walk populates every member of the competing set at once, so
+ * the cache turns the rest of ONE card's items into map reads, and tests can
+ * substitute a counting fake for `recomputeCodesFor` without a database.
+ *
+ * SCOPED TO A SINGLE CARD'S PRE-SEND VALIDATION, not to the run (round-37 gate,
+ * finding 4). A cache spanning owners hands owner B a verdict computed before
+ * owner A's card was posted, and evidence that arrives in between — a receipt
+ * booked, a memo signed — then reaches nobody: B is chased for a charge that is
+ * already answered. `deps.deadlineExceeded` is checked before each real recompute —
  * once the run's revalidation budget is gone, remaining items are marked
  * `revalidationSkipped` rather than spending a query that might not finish.
  */
@@ -722,13 +727,26 @@ export async function GET(request: Request) {
     // send them safely. NOT a failure and NOT uncertain: nothing was sent, the
     // claim is released, and the next invocation picks the row up unchanged.
     const sendDeferred: string[] = [];
-    // ONE cache for the whole run, not one per owner: two owners' cards can
-    // each carry a line from the SAME competing component (same amount,
-    // adjacent dates, different assignees), and a cache scoped to a single
-    // `loadCardItemTruth` call would still repeat that component's walk a
-    // second time for the other owner.
-    const revalidationCache = new Map<string, ReasonCode[]>();
     for (const { card: claimedCard, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
+        /**
+         * ONE CACHE PER CARD, NOT PER RUN (Codex PR #443 gate round 37,
+         * finding 4).
+         *
+         * It used to span the whole run, so a competing component that straddles
+         * two owners' cards was walked once and the verdict reused. That saved a
+         * traversal and broke the guarantee the revalidation exists for: the
+         * verdict was computed BEFORE owner A's card was posted, and the posting
+         * takes seconds — a receipt booked, a memo signed, or the sweep closing
+         * the sibling in that window left owner B chased for a charge that was
+         * already answered. "Immediately before the send" has to mean this send.
+         *
+         * The cost is bounded and known: at most one extra component walk per
+         * owner who shares a component, inside a loop already capped by
+         * CARD_RATE_CEILING and guarded by the revalidation budget below. A
+         * repeated query is cheap; asking a human for a receipt they already
+         * sent is what makes the list noise.
+         */
+        const revalidationCache = new Map<string, ReasonCode[]>();
         /**
          * ENOUGH WALL CLOCK TO FINISH WHAT WE START (round-35 gate, finding 3).
          *

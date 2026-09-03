@@ -12,6 +12,7 @@ import {
     isSafeCents,
 } from "@/lib/bank-ledger";
 import { BANK_LINE_IDENTITY_LOCK, bankLineIdentityPayee, planStatementAdoption } from "@/lib/bank-line-mint";
+import { bumpBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 import { isClearedStatusValue, type ClearedStatus } from "@/lib/register-types";
 
 export const dynamic = "force-dynamic";
@@ -551,6 +552,13 @@ const handlers = createBankLedgerIngestHandlers({
                 // committing between this read and these inserts would leave a
                 // QBO line the statement never adopted, plus the twin.
                 await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
+                // AND THE LEDGER EPOCH, BEFORE ANY BankLine WRITE (round-37 gate,
+                // finding 3). The chaser fences its completion stamp on this
+                // counter; bumping it first is what makes that fence real —
+                // this transaction holds the row until it commits, so a chaser
+                // validating at the same moment waits and then sees movement
+                // instead of certifying a list these rows are missing from.
+                await bumpBankLedgerEpoch(tx);
 
                 // ADOPTION (Justin, decision 3). The nightly QBO pull may have
                 // already minted a canonical line for some of these
@@ -775,6 +783,13 @@ const handlers = createBankLedgerIngestHandlers({
                  * void, and the query form trips the raw-SQL guard.
                  */
                 await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
+                // AND THE LEDGER EPOCH, BEFORE ANY BankLine WRITE (round-37 gate,
+                // finding 3). The chaser fences its completion stamp on this
+                // counter; bumping it first is what makes that fence real —
+                // this transaction holds the row until it commits, so a chaser
+                // validating at the same moment waits and then sees movement
+                // instead of certifying a list these rows are missing from.
+                await bumpBankLedgerEpoch(tx);
                 const result = await tx.bankLineObservation.updateMany({
                     where: {
                         source: "QBO_REGISTER",

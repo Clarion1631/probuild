@@ -75,16 +75,23 @@ test("the marker row still reads correctly when an older build wrote it", () => 
 test("the sweep stamps only a clean cycle, and the cards cron refuses without one", () => {
     const sweep = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     // "done" stamps; anything else carries the previous stamp forward.
-    assert.match(sweep, /await writePhase\(\s*phase,\s*decision\.complete \? new Date\(\)\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
+    // WRITTEN INSIDE THE FENCE (round-37 gate, finding 3): the completion stamp
+    // and the ledger check are one transaction, so no BankLine can commit
+    // between "the ledger has not moved" and "this cycle is done".
+    assert.match(sweep, /await ops\.writePhase\(\s*decision\.phase,\s*decision\.complete \? input\.now\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
     assert.match(sweep, /chaserCompletedAt: completedAt \?\? previous\.chaserCompletedAt,/);
     // A STALE BANK PULL CANNOT REACH "done". The phase is forced back to
     // "lines" so `shouldResumeSweep` keeps saying yes and the every-15-minutes
     // resume stamps as soon as the pull recovers — leaving it "done" would make
     // the resume exit with "nothing-in-progress" and lose the day's cards to an
     // outage that had already been fixed (Codex PR #443 gate, finding 3).
-    // The same holds for a pull that landed mid-pass (round-36 gate, finding 2):
-    // both inputs reach the one decision, and both can only hold a cycle open.
-    assert.match(sweep, /const decision = sweepCompletionDecision\(\{ computedPhase, bankPullStale, ledgerMoved \}\);/);
+    // The same holds for a pull that landed mid-pass (round-36 gate, finding 2)
+    // and for a ledger that moved under it (round-37, finding 3): every input
+    // reaches the one decision, and each can only ever hold a cycle open. The
+    // decision is now taken INSIDE the fence transaction, which is what stops a
+    // BankLine committing between the check and the marker.
+    assert.match(sweep, /const decision = sweepCompletionDecision\(\{\s*computedPhase: input\.computedPhase,\s*bankPullStale: input\.bankPullStale,\s*ledgerMoved,\s*\}\);/);
+    assert.match(sweep, /return transaction\(async ops => \{[\s\S]{0,400}await ops\.lockEpoch\(\)/);
     // The block reason is RESTATED on every write, never carried forward, or
     // `chaser-blocked` would keep firing after the pull recovered.
     assert.match(sweep, /blockedReason,/);
