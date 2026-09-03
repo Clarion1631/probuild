@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import {
     createContractFromTemplate, createContractBlank, sendContractToClient,
     deleteContract, getContractSigningHistory, updateContract, signContractAsContractor,
-    getResolvedMergePreview, getContractSendDefaults, countersignContractAsCompany,
+    getResolvedMergePreview, getContractPrintMergeData, getContractSendDefaults, countersignContractAsCompany,
     createContractFromPdf,
 } from "@/lib/actions";
 import { toast } from "sonner";
@@ -34,6 +34,8 @@ interface SigningRecord {
     signatureUrl?: string | null; notes?: string | null;
 }
 interface Entity { type: "lead" | "project"; id: string; name: string; clientName: string; }
+// Unsigned statuses that can be printed / proofed; signed ones use the executed PDF.
+const PRINTABLE_STATUSES = new Set(["Draft", "Sent", "Viewed"]);
 interface LinkedEntity { type: "lead" | "project"; id: string; name: string; }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -561,13 +563,9 @@ export default function EntityContractsClient({
         setPrinting(true);
         try {
             const escapeHtml = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-            // Resolve against the contract's own job, not the surrounding page — this
-            // list also shows contracts owned by the linked lead/project.
-            const ownProjectId: string | null = editingContract.projectId ?? null;
-            const ownLeadId: string | null = editingContract.leadId ?? null;
-            const mergeData = (ownProjectId || ownLeadId)
-                ? await getResolvedMergePreview(ownProjectId, ownLeadId)
-                : await getResolvedMergePreview(entity.type === "project" ? entity.id : null, entity.type === "lead" ? entity.id : null);
+            // Resolved server-side from the contract's own job (this list also shows
+            // contracts owned by the linked lead/project) under the `contracts` permission.
+            const mergeData = await getContractPrintMergeData(editingContract.id);
             // payment_schedule is a formatted <table> and is inserted raw (DOMPurify
             // sanitizes the whole document below); every other value is plain text.
             const RAW_HTML_FIELDS = new Set(["payment_schedule"]);
@@ -579,14 +577,15 @@ export default function EntityContractsClient({
             const line = (label: string, width: number) =>
                 `<span style="display:inline-block;vertical-align:bottom;margin:6px 8px 0 0;"><span style="display:block;min-width:${width}px;border-bottom:1px solid #334155;height:28px;"></span><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">${label}</span></span>`;
             const contractorDate = editingContract.contractorSignedAt ? fmtDate(editingContract.contractorSignedAt) : "";
+            // Stamp the stored contractor signature/date only onto the exact text it signed:
+            // updateContract clears the signature when either title or body changes.
+            const signedSnapshotIntact = editTitle === (editingContract.title || "") && editBody === (editingContract.body || "");
             const SIGN_LINES: Record<string, string> = {
                 SIGNATURE_BLOCK: line("Client signature", 240),
                 INITIAL_BLOCK: line("Initials", 70),
                 DATE_BLOCK: line("Date", 120),
-                CONTRACTOR_DATE_BLOCK: contractorDate && editBody === (editingContract.body || "") ? `<strong>${contractorDate}</strong>` : line("Date", 120),
-                // Only stamp the stored contractor signature onto the text it actually
-                // signed — unsaved edits print with a blank line (saving clears it anyway).
-                CONTRACTOR_SIGNATURE_BLOCK: editingContract.contractorSignatureUrl && editBody === (editingContract.body || "")
+                CONTRACTOR_DATE_BLOCK: contractorDate && signedSnapshotIntact ? `<strong>${contractorDate}</strong>` : line("Date", 120),
+                CONTRACTOR_SIGNATURE_BLOCK: editingContract.contractorSignatureUrl && signedSnapshotIntact
                     ? `<span style="display:inline-block;margin:4px 0;"><img src="${escapeHtml(editingContract.contractorSignatureUrl)}" alt="Contractor Signature" style="height:48px;object-fit:contain;" /><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">Contractor — ${escapeHtml(editingContract.contractorSignedBy || "")}</span></span>`
                     : line("Contractor signature", 240),
             };
@@ -618,7 +617,7 @@ export default function EntityContractsClient({
   @media print { .toolbar { display: none; } .page { padding: 0; max-width: none; } }
 </style></head><body>
 <div class="toolbar"><button onclick="window.print()">Print / Save as PDF</button><span>Choose “Save as PDF” as the printer to get a PDF you can email.</span></div>
-<div class="page"><h1 class="doc-title">${title}</h1><p class="doc-sub">${escapeHtml(entity.name)} · ${escapeHtml(entity.clientName || "")}</p>${html}</div>
+<div class="page"><h1 class="doc-title">${title}</h1><p class="doc-sub">${escapeHtml([mergeData.project_name, mergeData.client_name].filter(Boolean).join(" · "))}</p>${html}</div>
 <script>window.addEventListener("load", function () { setTimeout(function () { window.print(); }, 300); });</script>
 </body></html>`;
             win.document.open();
@@ -842,7 +841,7 @@ export default function EntityContractsClient({
                                 {loadingPreview ? "Loading..." : isPreview ? "Back to Editor" : "Preview"}
                             </button>
                         )}
-                        {!isReadOnly && !editingContract.originalPdfPath && (
+                        {PRINTABLE_STATUSES.has(editingContract.status) && !editingContract.originalPdfPath && (
                             <button onClick={handlePrint} disabled={printing} title="Open a print-ready copy of this contract. Use “Save as PDF” in the print dialog to get a PDF you can email." className="px-3 py-1.5 text-sm font-medium rounded-lg transition border text-slate-600 border-slate-200 hover:bg-slate-50 disabled:opacity-50">
                                 {printing ? "Preparing..." : "🖨 Print / PDF"}
                             </button>

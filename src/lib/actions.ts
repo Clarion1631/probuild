@@ -5971,6 +5971,16 @@ export async function getResolvedMergePreview(
     return buildContractMergeData(projectId, leadId);
 }
 
+/**
+ * Merge data for printing one contract, scoped by the contract itself: any staff
+ * user with the `contracts` permission who can see the contract gets the values
+ * for ITS owning project/lead (never caller-supplied ids).
+ */
+export async function getContractPrintMergeData(contractId: string): Promise<Record<string, string>> {
+    const { projectId, leadId } = await assertContractAccess(contractId);
+    return buildContractMergeData(projectId, leadId);
+}
+
 // `getContracts` was deleted here. It had no callers anywhere — the live staff
 // screens (projects/[id]/contracts, leads/[id]/contracts) query prisma.contract
 // directly with contractScopeWhere(viewer). Having no callers did NOT make it
