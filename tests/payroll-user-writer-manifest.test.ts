@@ -84,7 +84,7 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "wrapped",
         why: "the Team Members editor writes name/role/status in one payload; status is half the roster predicate and name is printed in both CSVs",
     },
-    "app/api/users/route.ts:257::update": {
+    "app/api/users/route.ts:256::update": {
         kind: "wrapped",
         why: "PATCH /api/users writes name/role/status — the same payload, for the same reason",
     },

@@ -9,23 +9,22 @@
 //
 // The hash is never returned to ANYONE. "Only admins can see it" is not a
 // reason to ship a credential to a browser, a log, or a proxy cache.
+//
+// ONE IMPLEMENTATION. This branch and main (#459) closed the same hole at the
+// same time, under two filenames. `src/lib/user-safe.ts` is the survivor and
+// this module RE-EXPORTS it rather than keeping a second stripper: two helpers
+// that both claim to be "the one place" is how they come to disagree about a
+// field, and a divergence here ships a credential.
 
-/** A row that may carry the PIN hash. Structural, so it fits every select shape. */
-type MaybeWithPin = { pinCode?: string | null } & Record<string, unknown>;
+export { toSafeUser } from "./user-safe";
+import { toSafeUser } from "./user-safe";
 
 /**
- * Drop `pinCode`, report only WHETHER one is set.
+ * Null-tolerant, for the `findUnique` shapes that can miss.
  *
- * `hasPin` is the fact the Team Members UI actually renders ("PIN set" /
- * "no PIN"), and it is derivable from the hash without carrying it.
+ * The only thing this module still adds. `toSafeUser` itself is main's.
  */
-export function toSafeUser<T extends MaybeWithPin>(user: T): Omit<T, "pinCode"> & { hasPin: boolean } {
-    const { pinCode, ...rest } = user;
-    return { ...(rest as Omit<T, "pinCode">), hasPin: !!pinCode };
-}
-
-/** Null-tolerant, for the `findUnique` shapes that can miss. */
-export function toSafeUserOrNull<T extends MaybeWithPin>(
+export function toSafeUserOrNull<T extends { pinCode?: string | null }>(
     user: T | null | undefined
 ): (Omit<T, "pinCode"> & { hasPin: boolean }) | null {
     return user ? toSafeUser(user) : null;

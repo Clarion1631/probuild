@@ -12,7 +12,7 @@ import {
     touchesPayrollRateState,
     withPayrollUserWrite,
 } from "@/lib/payroll-period";
-import { toSafeUser } from "@/lib/user-serialization";
+import { toSafeUser } from "@/lib/user-safe";
 import {
     ASSIGNABLE_PERMISSIONS,
     isUserMutationActorInvalidError,

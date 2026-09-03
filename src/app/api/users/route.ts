@@ -5,7 +5,6 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { withPayrollUserWrite } from "@/lib/payroll-period";
-import { toSafeUser } from "@/lib/user-serialization";
 import {
     isUserMutationActorInvalidError,
     isUserMutationRefusedError,
@@ -15,6 +14,7 @@ import {
 } from "@/lib/user-mutation-guard";
 import { Resend } from "resend";
 import bcrypt from "bcryptjs";
+import { toSafeUser } from "@/lib/user-safe";
 
 const resend = new Resend(process.env.RESEND_API_KEY || "re_dummy");
 
@@ -229,7 +229,6 @@ export async function PATCH(req: Request) {
         // target under FOR UPDATE and re-runs checkUserMutation against THAT
         // row before the write below is allowed to run.
         let user;
-        let _pin;
         try {
             const updated = await prisma.$transaction(async (tx) => {
                 return withGuardedUserMutation(
@@ -263,7 +262,10 @@ export async function PATCH(req: Request) {
                     }
                 );
             });
-            ({ pinCode: _pin, ...user } = updated as Record<string, unknown>);
+            // The RAW row. toSafeUser below is the one place the hash is
+            // dropped (#459) — stripping it here as well would leave that
+            // helper reporting hasPin:false for a user who has one.
+            user = updated as Record<string, unknown>;
         } catch (error) {
             if (error instanceof RateChangeError) {
                 return NextResponse.json({ error: error.message }, { status: error.status });
@@ -285,7 +287,7 @@ export async function PATCH(req: Request) {
         const { autoAssignProjectsOnUserChange } = await import("@/lib/crew-auto-assign-sync");
         after(() => autoAssignProjectsOnUserChange(id, { role, status }));
 
-        return NextResponse.json({ ...user, hasPin: !!_pin });
+        return NextResponse.json(toSafeUser(user));
     } catch (error: any) {
         console.error("PATCH /api/users error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });
