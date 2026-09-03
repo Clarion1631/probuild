@@ -12,11 +12,13 @@
  * already the audit surface the Command Center reads, and a table for it would
  * be schema churn for a queue that should normally be empty.
  */
+import { randomUUID } from "node:crypto";
 import type { Prisma } from "@prisma/client";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { prisma } from "@/lib/prisma";
 import { removeReceiptObject, uploadReceiptObject } from "./bucket";
 import { leaseFence } from "./stored-object";
+import type { RouteDeadline } from "@/lib/quickbooks";
 
 export const STORAGE_CLEANUP_KIND = "storage-cleanup-pending";
 
@@ -93,7 +95,9 @@ export interface CleanupIo {
 }
 
 const liveIo: CleanupIo = {
-    remove: removeReceiptObject,
+    // The sweep runs inside the worker's invocation; its own deadline is
+    // threaded in by the caller through `retryPendingCleanups`.
+    remove: (storagePath: string) => removeReceiptObject(storagePath, undefined),
     record: recordPendingCleanup,
     resolve: async eventId => {
         await prisma.automationEvent
@@ -206,14 +210,39 @@ export async function claimObjectPath(
     /** When the object may be deleted once the lease lapses. */
     notBefore: Date | null = null,
     now: Date = new Date(),
+    /**
+     * The transaction runner. Injected ONLY by tests: what this function
+     * writes is the whole subject, and a verdict that persists nothing is
+     * exactly the bug this claim exists to close.
+     */
+    run: <T>(body: (tx: Prisma.TransactionClient) => Promise<T>) => Promise<T> = inShortTx,
 ): Promise<string> {
-    await inShortTx(tx => reclaimQueuedCleanups(tx, canonicalPath));
-    return recordPendingCleanup(
-        canonicalPath,
-        "canonical-seal-intent",
-        objectClaimDueAt(notBefore, now),
-        "provisional",
-    );
+    const until = objectClaimDueAt(notBefore, now);
+    // ONE TRANSACTION: read what holds the path, cancel any stale queued
+    // deletion of it, and write this publish's claim. Split across two, a
+    // deleter could take the path between the read and the write — which is
+    // the very interleaving this claim exists to stop.
+    return run(async tx => {
+        const existing = await tx.automationEvent.findMany({
+            where: {
+                kind: STORAGE_CLEANUP_KIND,
+                status: { in: CLEANUP_SWEEPABLE_STATUSES },
+                detail: { contains: JSON.stringify(canonicalPath) },
+            },
+            select: { detail: true },
+        });
+        const blocked = claimsConflict(existing, "publishing", now);
+        if (blocked) throw new ObjectPathBusyError(canonicalPath, blocked);
+        await reclaimQueuedCleanups(tx, canonicalPath);
+        return queueObjectCleanup(
+            tx,
+            canonicalPath,
+            "canonical-seal-intent",
+            until,
+            "provisional",
+            { token: randomUUID(), kind: "publishing", until },
+        );
+    });
 }
 
 /**
@@ -263,10 +292,16 @@ export async function sealObject(
     canonicalPath: string,
     bytes: Buffer,
     contentType: string,
+    /**
+     * REQUIRED. The seal is one of three storage calls a /finalize makes, and
+     * with an optional deadline each took a fresh fifteen seconds — 45s inside
+     * a handler the platform kills at 30.
+     */
+    deadline: RouteDeadline | undefined,
 ): Promise<string | null> {
     // upsert: the canonical path is content-addressed, so a re-seal of the
     // SAME bytes is a no-op by construction and must not fail.
-    const copied = await uploadReceiptObject(canonicalPath, bytes, contentType, { upsert: true });
+    const copied = await uploadReceiptObject(canonicalPath, bytes, contentType, { upsert: true, deadline });
     if (!copied) return null;
 
     // NOTE: the upload object is deliberately NOT deleted here.
@@ -298,27 +333,22 @@ export async function recordPendingCleanup(
      * path's lock. The sweeper picks up both statuses.
      */
     status: CleanupStatus = "pending",
+    /** The writer. Injected only by tests — see queueObjectCleanup. */
+    client: CleanupQueueTx = prisma,
 ): Promise<string> {
-    // THROWS on failure, unlike an audit write. This record is not an audit
-    // trail — it is the ONLY thing that will remember the object once the row
-    // pointing at it is gone. Swallowing the failure loses the orphan silently
-    // and forever, so the caller must know and keep the row instead.
-    await logAutomationEvent({
-        kind: STORAGE_CLEANUP_KIND,
-        status,
-        reason,
-        source: "receipt-intake",
-        detail: notBefore ? { storagePath, notBefore: notBefore.toISOString() } : { storagePath },
-    });
-    const recorded = await prisma.automationEvent.findFirst({
-        where: { kind: STORAGE_CLEANUP_KIND, status, detail: { contains: storagePath } },
-        orderBy: { createdAt: "desc" },
-        select: { id: true },
-    });
-    // logAutomationEvent is fire-and-forget by contract, so "it did not throw"
-    // is not proof it wrote. Read it back.
-    if (!recorded) throw new Error(`could not record a cleanup for ${storagePath}`);
-    return recorded.id;
+    // A DIRECT, THROWING `create` — never logAutomationEvent + a search.
+    //
+    // logAutomationEvent is fire-and-forget by contract: it swallows its insert
+    // failure. The read-back that compensated for that searched for ANY event
+    // whose detail CONTAINED this path, newest first — so on a retry, where an
+    // older provisional event for the same canonical path already exists, a
+    // FAILED insert returned that old event's id and its stale deadline as if
+    // the write had just succeeded. The publish then sealed its object under a
+    // claim it did not hold, against a lease that might already have lapsed.
+    //
+    // `create` returns the id of the row it actually wrote, or throws. There is
+    // nothing to search for and nothing to mistake it for.
+    return queueObjectCleanup(client, storagePath, reason, notBefore, status);
 }
 
 /**
@@ -384,20 +414,96 @@ export async function queueObjectCleanup(
     storagePath: string,
     reason: string,
     notBefore: Date | null = null,
+    status: CleanupStatus = "pending",
+    /** The per-path claim this entry carries, when it IS one. See claimObjectPath. */
+    claim: { token: string; kind: ObjectClaimKind; until: Date } | null = null,
 ): Promise<string> {
     const event = await tx.automationEvent.create({
         data: {
             kind: STORAGE_CLEANUP_KIND,
-            status: "pending",
+            status,
             reason: reason.slice(0, 500),
             source: "receipt-intake",
-            detail: JSON.stringify(
-                notBefore ? { storagePath, notBefore: notBefore.toISOString() } : { storagePath },
-            ),
+            detail: JSON.stringify({
+                storagePath,
+                ...(notBefore ? { notBefore: notBefore.toISOString() } : {}),
+                ...(claim
+                    ? { claimToken: claim.token, claimKind: claim.kind, claimUntil: claim.until.toISOString() }
+                    : {}),
+            }),
         },
         select: { id: true },
     });
     return event.id;
+}
+
+/**
+ * The path is held by the other kind of operation right now. Retryable: the
+ * holder's lease is short and the caller comes back on its own schedule.
+ */
+export class ObjectPathBusyError extends Error {
+    name = "ObjectPathBusyError";
+    constructor(storagePath: string, heldBy: string) {
+        super(`${storagePath} is held by a ${heldBy} claim`);
+    }
+}
+
+/** Which operation holds a path. Exactly one may hold it at a time. */
+export type ObjectClaimKind = "publishing" | "deleting";
+
+interface ObjectClaim {
+    token: string;
+    kind: ObjectClaimKind;
+    until: Date;
+}
+
+/** The claim an event carries, if it is still live. */
+export function liveClaim(detail: string | null | undefined, now: Date): ObjectClaim | null {
+    if (!detail) return null;
+    let parsed: { claimToken?: unknown; claimKind?: unknown; claimUntil?: unknown };
+    try {
+        parsed = JSON.parse(detail) as typeof parsed;
+    } catch {
+        return null;
+    }
+    if (typeof parsed.claimToken !== "string" || typeof parsed.claimUntil !== "string") return null;
+    if (parsed.claimKind !== "publishing" && parsed.claimKind !== "deleting") return null;
+    const until = new Date(parsed.claimUntil);
+    if (Number.isNaN(until.getTime()) || until.getTime() <= now.getTime()) return null;
+    return { token: parsed.claimToken, kind: parsed.claimKind, until };
+}
+
+/**
+ * THE PATH IS HELD BY EXACTLY ONE OPERATION AT A TIME.
+ *
+ * A publish and a cleanup both act on one object path, and the cleanup's
+ * decision to delete is taken BEFORE it deletes. Without a durable claim those
+ * two facts can interleave fatally: the sweep reads "unreferenced, due", its
+ * transaction commits having persisted nothing, a publisher then claims the
+ * path and seals a NEW object at it, and the sweep — still holding a verdict
+ * it reached before any of that — deletes the object the publisher is about to
+ * point at. Neither party is wrong; nothing recorded that the other had
+ * started.
+ *
+ * So a claim is written, and it is what the other side collides with:
+ *   - a publisher refuses while a live `deleting` claim exists;
+ *   - a sweep refuses while a live `publishing` claim exists;
+ *   - and the sweep RE-READS its own claim immediately before the delete, so a
+ *     verdict that went stale between the two transactions cannot act.
+ */
+export function claimsConflict(
+    events: { detail: string | null }[],
+    want: ObjectClaimKind,
+    now: Date,
+): ObjectClaimKind | null {
+    for (const event of events) {
+        const held = liveClaim(event.detail, now);
+        if (held && held.kind !== want) return held.kind;
+        // Two publishers may share a path (content-addressed, identical bytes);
+        // two deleters may not, and neither may cross.
+        if (held && held.kind === "deleting" && want === "deleting") return held.kind;
+    }
+    return null;
 }
 
 /**
@@ -664,7 +770,9 @@ const liveSweepDeps: CleanupSweepDeps = {
         await prisma.automationEvent.update({ where: { id: eventId }, data: { status: "abandoned" } });
     },
     inShortTx,
-    remove: removeReceiptObject,
+    // The sweep runs inside the worker's invocation; `retryPendingCleanups`
+    // threads that deadline in, so this default is only for a bare call.
+    remove: (storagePath: string) => removeReceiptObject(storagePath, undefined),
     now: () => new Date(),
 };
 
@@ -757,14 +865,14 @@ export async function retryPendingCleanups(
                     where: { id: event.id },
                     data: { status: "resolved", reason: `still referenced by ${referenced.id}` },
                 });
-                return { verdict: "referenced" as const, siblingIds: [] as string[] };
+                return { verdict: "referenced" as const, siblingIds: [] as string[], token: "" };
             }
             const siblings = await tx.automationEvent.findMany({
                 where: {
                     kind: STORAGE_CLEANUP_KIND,
                     // Provisional intents included: they name the same object,
                     // so they carry a schedule this delete must respect — a
-                    // publish's live lease among them — and they must be
+                    // publish's live claim among them — and they must be
                     // resolved with it rather than left retrying forever
                     // against bytes that are already gone.
                     status: { in: CLEANUP_SWEEPABLE_STATUSES },
@@ -772,24 +880,65 @@ export async function retryPendingCleanups(
                 },
                 select: { id: true, detail: true },
             });
+            // A PUBLISH HOLDS THIS PATH. Its object may not exist yet, and the
+            // pointer that will reference it has not committed — so "nothing
+            // references this" is true and irrelevant. Leave it entirely.
+            const blocked = claimsConflict(siblings, "deleting", now);
+            if (blocked) return { verdict: "not-due" as const, siblingIds: [], token: "" };
             const newest = siblings
                 .map(sibling => cleanupDueAt(sibling.detail))
                 .reduce<Date | null>(
                     (latest, at) => (at && (!latest || at > latest) ? at : latest),
                     null,
                 );
-            if (pending(newest, now)) return { verdict: "not-due" as const, siblingIds: [] };
-            return { verdict: "claimed" as const, siblingIds: siblings.map(sibling => sibling.id) };
+            if (pending(newest, now)) return { verdict: "not-due" as const, siblingIds: [], token: "" };
+
+            // THE CLAIM IS WRITTEN, not merely decided. A verdict that
+            // persisted nothing let a publisher take the path immediately
+            // afterwards and seal a new object into it, which this sweep then
+            // deleted on the strength of a reading taken before any of that.
+            const token = randomUUID();
+            const until = new Date(now.getTime() + OBJECT_CLAIM_LEASE_MS);
+            await tx.automationEvent.update({
+                where: { id: event.id },
+                data: {
+                    detail: JSON.stringify({
+                        storagePath,
+                        notBefore: (cleanupDueAt(event.detail) ?? now).toISOString(),
+                        claimToken: token,
+                        claimKind: "deleting",
+                        claimUntil: until.toISOString(),
+                    }),
+                },
+            });
+            return { verdict: "claimed" as const, siblingIds: siblings.map(s => s.id), token };
         }).catch(error => {
             console.error(
                 "[receipts/intake] cleanup claim failed, left pending",
                 storagePath,
                 error instanceof Error ? error.name : "error",
             );
-            return { verdict: "failed" as const, siblingIds: [] as string[] };
+            return { verdict: "failed" as const, siblingIds: [] as string[], token: "" };
         });
 
         if (claim.verdict !== "claimed") continue;
+
+        // RE-READ THE CLAIM IMMEDIATELY BEFORE THE DELETE.
+        //
+        // The verdict above was reached in a transaction that has since
+        // committed and closed. This confirms, in its own short transaction,
+        // that the claim written there is still ours and still live — so a
+        // delete can only proceed on a path nothing else has taken since.
+        const stillOurs = await deps.inShortTx(async tx => {
+            const fresh = await tx.automationEvent.findUnique({
+                where: { id: event.id },
+                select: { detail: true, status: true },
+            });
+            if (!fresh || !CLEANUP_SWEEPABLE_STATUSES.includes(fresh.status as CleanupStatus)) return false;
+            const held = liveClaim(fresh.detail, deps.now());
+            return !!held && held.kind === "deleting" && held.token === claim.token;
+        }).catch(() => false);
+        if (!stillOurs) continue;
 
         // PHASE 2: the external delete, with NO transaction open.
         //
@@ -808,11 +957,6 @@ export async function retryPendingCleanups(
             continue;
         }
 
-        // PHASE 3 (short tx): the object is gone, so every event naming it is
-        // settled. Resolved only AFTER a delete that did not throw —
-        // removeReceiptObject surfaces a missing storage client as an error
-        // rather than a success, so a misconfigured deployment cannot quietly
-        // mark the queue clean.
         const settled = await deps.inShortTx(async tx => {
             for (const id of claim.siblingIds.length ? claim.siblingIds : [event.id]) {
                 await tx.automationEvent.update({ where: { id }, data: { status: "resolved" } });

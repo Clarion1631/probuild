@@ -50,10 +50,21 @@ test("recording a cleanup is durable, not fire-and-forget", () => {
     // logAutomationEvent never throws by contract, so "it did not throw" is not
     // proof it wrote. The record is read back, and the function throws if it is
     // not there — the caller has to know.
+    // It no longer goes through logAutomationEvent at all. That helper swallows
+    // its insert failure by contract, and the read-back that compensated
+    // searched for ANY event whose detail CONTAINED this path — so on a retry,
+    // with an older provisional event for the same canonical path already
+    // there, a FAILED insert returned that old id and its stale deadline as if
+    // the write had just landed.
     const body = bodyOf(cleanup, "export async function recordPendingCleanup");
     assert.ok(!/\.catch\(\(\)\s*=>\s*\{/.test(body), "the write is not swallowed");
-    assert.match(body, /findFirst/, "it is read back");
-    assert.match(body, /throw new Error/, "and a missing record throws");
+    // A CALL, not a mention: the doc comment names the helper it stopped using.
+    assert.ok(!/await logAutomationEvent\(/.test(body), "no fire-and-forget writer");
+    assert.ok(!/await prisma\.automationEvent\.findFirst\(/.test(body), "nothing is searched for after");
+    assert.match(body, /queueObjectCleanup\(client,/, "a throwing create returns the id it wrote");
+    // ...and `client` DEFAULTS to prisma, so the injection is a test seam
+    // and not a way for a caller to write somewhere else.
+    assert.match(cleanup, /client: CleanupQueueTx = prisma,/);
 });
 
 test("an unrecordable cleanup KEEPS the row as the last pointer", () => {
@@ -78,11 +89,16 @@ test("the cleanup worker refuses to delete a path a LIVE row still points at", (
     const fn = bodyOf(cleanup, "export async function retryPendingCleanups");
     assert.match(fn, /receiptIntake\.findFirst\(\{\s*\n?\s*where: \{ storagePath \}/, "it checks for a referencing row");
     assert.match(fn, /still referenced by/, "and resolves rather than retrying forever");
-    // The reference check must come BEFORE the delete.
-    assert.ok(
-        fn.indexOf("still referenced by") < fn.indexOf("removeReceiptObject"),
-        "the check precedes the deletion",
-    );
+    // The reference check must come BEFORE the delete — and so must the
+    // written claim and its re-read, which are what stop a publisher taking
+    // the path in between.
+    const refAt = fn.indexOf("still referenced by");
+    const claimAt = fn.indexOf('claimKind: "deleting"');
+    const recheckAt = fn.indexOf("const stillOurs = await deps.inShortTx(");
+    const removeAt = fn.indexOf("await deps.remove(storagePath)");
+    assert.ok(refAt > 0 && refAt < claimAt, "the reference check precedes the claim");
+    assert.ok(claimAt < recheckAt, "the claim is written, then re-read");
+    assert.ok(recheckAt < removeAt, "and only then is anything deleted");
 });
 
 test("an event is resolved only AFTER a confirmed deletion", () => {
@@ -217,13 +233,23 @@ import {
     settleQueuedCleanup,
     CLEANUP_SCAN_FACTOR,
     CLEANUP_SWEEPABLE_STATUSES,
+    claimsConflict,
+    claimObjectPath,
+    recordPendingCleanup,
     objectClaimDueAt,
     OBJECT_CLAIM_LEASE_MS,
     type CleanupIo,
     type CleanupSweepDeps,
 } from "../src/lib/receipt-intake/storage-cleanup";
+import type { Prisma } from "@prisma/client";
 import { CLEANUP_GRACE_MS, cleanupNotBefore } from "../src/lib/receipt-intake/worker";
-import { STORAGE_CALL_MAX_MS } from "../src/lib/receipt-intake/bucket";
+import {
+    STORAGE_CALL_MAX_MS,
+    isStorageTimeout,
+    removeReceiptObject,
+    storageBudgetMs,
+} from "../src/lib/receipt-intake/bucket";
+import { createRouteDeadline } from "../src/lib/quickbooks";
 import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
 
 /** The verified bytes a publish carries. Only the shape matters here. */
@@ -247,6 +273,7 @@ function world(now: Date = T0) {
     const objects = new Set<string>();
     const events: { id: string; status: string; detail: string }[] = [];
     let rows: { id: string; storagePath: string }[] = [];
+    let afterClaim: (() => void) | null = null;
     let txOpen = 0;
     let txOpenMs = 0;
     let maxConcurrentTx = 0;
@@ -304,16 +331,37 @@ function world(now: Date = T0) {
                 // can never authorise a delete a newer one is still deferring.
                 findMany: async ({ where }: { where: { detail: { contains: string } } }) =>
                     events.filter(e => e.status === "pending" && e.detail.includes(where.detail.contains)),
-                update: async ({ where, data }: { where: { id: string }; data: { status: string } }) => {
+                findUnique: async ({ where }: { where: { id: string } }) =>
+                    events.find(e => e.id === where.id) ?? null,
+                update: async (
+                    { where, data }: { where: { id: string }; data: { status?: string; detail?: string } },
+                ) => {
                     const event = events.find(e => e.id === where.id);
-                    if (event) event.status = data.status;
+                    if (event) {
+                        if (data.status !== undefined) event.status = data.status;
+                        // The delete CLAIM is written into `detail`, so the
+                        // fake has to carry it or the pre-delete re-read can
+                        // never confirm the claim it just took.
+                        if (data.detail !== undefined) event.detail = data.detail;
+                    }
                     return event;
                 },
+                create: async ({ data }: { data: Record<string, string> }) => {
+                    const created = {
+                        id: `ev-${events.length + 1}`,
+                        status: data.status,
+                        detail: data.detail,
+                    };
+                    events.push(created);
+                    return created;
+                },
+                updateMany: async () => ({ count: 0 }),
             },
                 } as never);
             } finally {
                 txOpen--;
                 txOpenMs += Date.now() - openedAt;
+                if (afterClaim) { const fn = afterClaim; afterClaim = null; fn(); }
             }
         },
         remove,
@@ -322,6 +370,8 @@ function world(now: Date = T0) {
     return {
         objects, events, io, sweep,
         setRows: (next: typeof rows) => { rows = next; },
+        /** Runs once, after the sweep's claim tx and before its re-read. */
+        onAfterClaim: (fn: () => void) => { afterClaim = fn; },
         advance: (ms: number) => { clock += ms; },
         pending: () => events.filter(e => (CLEANUP_SWEEPABLE_STATUSES as string[]).includes(e.status)),
         /** Total time any transaction was open, across the whole sweep. */
@@ -885,4 +935,395 @@ test("a claimed path is NOT swept while its lease is live — the whole point", 
     w.advance(OBJECT_CLAIM_LEASE_MS + 1_000);
     assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1);
     assert.equal(w.objects.has(CANON), false);
+});
+
+// ── A cleanup may not delete an object a publish is writing (round-18 #1) ──
+//
+// The sweep's verdict is reached in one transaction and acted on after it
+// commits. When that transaction persisted NOTHING, the two operations could
+// interleave fatally:
+//
+//   1. sweep reads: unreferenced, due  -> decides "delete"      (tx commits)
+//   2. publisher claims the path and seals a NEW object into it
+//   3. sweep removes -> the object the publisher is about to point at is gone
+//
+// Neither party is wrong; nothing recorded that the other had started. The fix
+// is a durable, mutually exclusive per-path claim.
+
+const claimDetail = (kind: string, until: number, token = "t") => JSON.stringify({
+    storagePath: "p",
+    claimToken: token,
+    claimKind: kind,
+    claimUntil: new Date(until).toISOString(),
+});
+
+test("CLAIMS ARE EXCLUSIVE: publishing and deleting cannot both hold a path", () => {
+    const now = new Date("2026-09-03T12:00:00.000Z");
+    const live = (kind: string) => ({ detail: claimDetail(kind, now.getTime() + 60_000) });
+
+    // A publisher is refused while a delete holds the path, and vice versa.
+    assert.equal(claimsConflict([live("deleting")], "publishing", now), "deleting");
+    assert.equal(claimsConflict([live("publishing")], "deleting", now), "publishing");
+    // Two deleters may not share it either.
+    assert.equal(claimsConflict([live("deleting")], "deleting", now), "deleting");
+    // TWO PUBLISHERS MAY. The canonical path is content-addressed, so they are
+    // writing identical bytes and the seal is an upsert; only the pointer needs
+    // serializing, and the phase-C CAS does that.
+    assert.equal(claimsConflict([live("publishing")], "publishing", now), null);
+    // A LAPSED claim holds nothing — that is what makes a dead process
+    // recoverable rather than a permanent block.
+    const lapsed = { detail: claimDetail("deleting", now.getTime() - 1) };
+    assert.equal(claimsConflict([lapsed], "publishing", now), null);
+    // And an entry carrying no claim at all blocks nobody.
+    assert.equal(claimsConflict([{ detail: JSON.stringify({ storagePath: "p" }) }], "deleting", now), null);
+});
+
+test("ORDERING: sweep decides, publisher claims, sweep is REFUSED", async () => {
+    // The exact interleaving, driven through the shipped sweep. The publisher
+    // lands in the gap between the sweep's claim transaction and its re-read.
+    const w = world();
+    const CANON = "receipts/row-1/v1/contested.png";
+    w.objects.add(CANON);
+    w.events.push({ id: "ev-old", status: "pending", detail: JSON.stringify({ storagePath: CANON }) });
+
+    w.onAfterClaim(() => {
+        // A publisher takes the path and seals a NEW object into it.
+        const ev = w.events.find(e => e.id === "ev-old");
+        if (ev) {
+            ev.detail = JSON.stringify({
+                storagePath: CANON,
+                claimToken: "publisher-token",
+                claimKind: "publishing",
+                claimUntil: new Date(Date.now() + 60_000).toISOString(),
+            });
+        }
+        w.objects.add(CANON);
+    });
+
+    const cleared = await retryPendingCleanups(10, () => false, w.sweep);
+
+    assert.equal(cleared, 0, "the sweep deleted nothing");
+    assert.ok(w.objects.has(CANON), "the object the publisher sealed survives");
+});
+
+test("CONTROL: with no claim recorded, the same interleaving DELETES it", async () => {
+    // The pre-fix world: the sweep's verdict persists nothing, so nothing
+    // stands between the decision and the delete.
+    const w = world();
+    const CANON = "receipts/row-1/v1/contested.png";
+    w.objects.add(CANON);
+    w.events.push({ id: "ev-old", status: "pending", detail: JSON.stringify({ storagePath: CANON }) });
+
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1);
+    assert.equal(w.objects.has(CANON), false, "an unclaimed path IS deleted — that was the bug");
+});
+
+test("a publisher REFUSES a path a delete is holding", async () => {
+    // The other direction of the same exclusion.
+    const now = new Date();
+    const deleting = [{ detail: claimDetail("deleting", now.getTime() + 30_000, "sweep-token") }];
+    assert.equal(claimsConflict(deleting, "publishing", now), "deleting");
+
+    // ...and the publish path turns that into a retryable refusal rather than
+    // sealing anyway.
+    const src = readFileSync(path.join(ROOT, "src/lib/receipt-intake/storage-cleanup.ts"), "utf8");
+    const claim = bodyOf(src, "export async function claimObjectPath");
+    assert.match(claim, /claimsConflict\(existing, "publishing", now\)/);
+    assert.match(claim, /throw new ObjectPathBusyError/);
+    // One transaction: the read, the reclaim and the claim write cannot be
+    // split, or a deleter takes the path between them.
+    assert.match(claim, /return run\(async tx => \{/);
+    // ...and `run` DEFAULTS to inShortTx, so the seam that makes the write
+    // observable cannot become a way to run it outside a transaction.
+    assert.match(claim, /=> Promise<T> = inShortTx,/);
+});
+
+// ── ONE deadline per invocation, shared by every storage call (round-18 #3) ──
+//
+// `deadline` used to be optional on every helper in bucket.ts, and the callers
+// under /finalize never passed one. So a single publish made three storage
+// calls — the size probe, the download and the seal upload — and each one
+// computed its own budget from `undefined`, taking a fresh fifteen seconds.
+// Forty-five seconds of allowance inside a handler the platform kills at
+// thirty: the invocation dies mid-seal, having spent its life on calls whose
+// answers it could no longer use. Making the parameter NON-OPTIONAL is the
+// fix, because it makes the compiler enumerate every caller rather than
+// leaving the omission invisible.
+
+/** A deadline that started `elapsed` ms ago. Real clock, no fake timers. */
+const started = (elapsed: number, budgetMs = ROUTE_BUDGET_FOR_TEST) =>
+    createRouteDeadline(budgetMs, Date.now() - elapsed);
+const ROUTE_BUDGET_FOR_TEST = 20_000;
+
+test("SEQUENTIAL calls draw down ONE budget, and it shrinks", () => {
+    // At the top of the request the cap still applies: a single call may never
+    // take more than STORAGE_CALL_MAX_MS even when the route has more left.
+    assert.equal(storageBudgetMs(started(0)), STORAGE_CALL_MAX_MS);
+
+    // Eight seconds in — say the size probe was slow — the NEXT call gets what
+    // is actually left, not another full allowance.
+    const afterFirst = storageBudgetMs(started(8_000));
+    assert.ok(afterFirst <= 12_000 && afterFirst > 11_000, `saw ${afterFirst}`);
+    assert.ok(afterFirst < STORAGE_CALL_MAX_MS, "strictly less than a fresh allowance");
+
+    // Eighteen seconds in, the third call gets two seconds. It still runs —
+    // a short call may well finish — but it cannot straddle the ceiling.
+    const afterSecond = storageBudgetMs(started(18_000));
+    assert.ok(afterSecond <= 2_000 && afterSecond > 1_000, `saw ${afterSecond}`);
+    assert.ok(afterSecond < afterFirst, "monotonically shrinking");
+
+    // Past the end there is nothing, and a negative remainder is clamped.
+    assert.equal(storageBudgetMs(started(25_000)), 0);
+});
+
+test("the LAST call REFUSES to start when there is no runway", async () => {
+    // Through the real exported helper, so this is the shipped gate and not a
+    // restatement of it. The budget check precedes the client, so this needs no
+    // Supabase configuration and makes no network call.
+    await assert.rejects(
+        () => removeReceiptObject("receipts/intake/row-1/x.png", started(19_900)),
+        (error: unknown) => {
+            assert.ok(isStorageTimeout(error), `saw ${(error as Error)?.name}`);
+            assert.match((error as Error).message, /storage-timeout:remove/);
+            return true;
+        },
+        "starting a call it cannot finish is how a pass spends its last milliseconds",
+    );
+
+    // ...and with runway it gets past the gate. It fails later, for a different
+    // reason, which is the point: the refusal above was the DEADLINE, not the
+    // environment.
+    await assert.rejects(
+        () => removeReceiptObject("receipts/intake/row-1/x.png", started(0)),
+        (error: unknown) => {
+            assert.equal(isStorageTimeout(error), false, "not a budget refusal");
+            return true;
+        },
+    );
+});
+
+test("PRE-FIX CONTROL: an omitted deadline hands every call a fresh 15s", () => {
+    // This is exactly what the callers did before this round: pass nothing.
+    assert.equal(storageBudgetMs(undefined), STORAGE_CALL_MAX_MS);
+    // Three calls, three full allowances, no draw-down between them.
+    const independent = [undefined, undefined, undefined].map(d => storageBudgetMs(d));
+    assert.deepEqual(independent, [STORAGE_CALL_MAX_MS, STORAGE_CALL_MAX_MS, STORAGE_CALL_MAX_MS]);
+    assert.ok(
+        independent.reduce((a, b) => a + b, 0) > 30_000,
+        "45s of allowance inside a 30s invocation — the bug, stated arithmetically",
+    );
+    // And the gate would have let the third one start with the route already
+    // over. Compare with the shared-budget case above, which refuses.
+    assert.ok(storageBudgetMs(undefined) >= 500, "no runway check is possible without a deadline");
+});
+
+test("every storage helper REQUIRES the deadline, so the compiler finds the callers", () => {
+    // The structural half of the fix. An optional parameter is silently
+    // omittable at every call site; a required one is a compile error, which is
+    // how the missing callers were found in the first place.
+    const src = readFileSync(path.join(ROOT, "src/lib/receipt-intake/bucket.ts"), "utf8");
+    for (const fn of [
+        "receiptObjectSize",
+        "downloadReceiptObject",
+        "uploadReceiptObject",
+        "removeReceiptObject",
+        "createReceiptUploadUrl",
+        "signReceiptDownloadUrl",
+    ]) {
+        const at = src.indexOf(`export async function ${fn}(`);
+        assert.ok(at > 0, `${fn} is exported`);
+        const sig = src.slice(at, src.indexOf("): Promise", at));
+        assert.match(sig, /deadline: RouteDeadline \| undefined/, `${fn} takes the deadline`);
+        assert.ok(!/deadline\?: /.test(sig), `${fn}'s deadline is NOT optional`);
+    }
+
+    // And each intake route creates exactly ONE, at the top.
+    for (const route of [
+        "src/app/api/receipts/intake/route.ts",
+        "src/app/api/receipts/intake/start/route.ts",
+    ]) {
+        const body = readFileSync(path.join(ROOT, route), "utf8");
+        const made = body.match(/createRouteDeadline\(/g) ?? [];
+        assert.equal(made.length, 1, `${route} creates one deadline, not one per call`);
+        assert.match(body, /const ROUTE_BUDGET_MS = 2[0-9]_000;/, `${route} budgets under the platform ceiling`);
+    }
+});
+
+// ── The claim a publisher takes is WRITTEN, not merely decided ─────────────
+//
+// B1-c survived the first mutation battery: setting `claimObjectPath`'s claim
+// argument to null — so the verdict persisted nothing — broke no test. Every
+// exclusion test above drove `claimsConflict` or the sweep directly, and the
+// publisher's own write was covered by a source pin, which a null argument
+// walks straight past. These drive the shipped function.
+
+/** A tx fake that honours `contains` for real, because path identity is the point. */
+function claimWorld(seed: { id: string; status: string; detail: string }[] = []) {
+    const events = seed.map(e => ({ ...e }));
+    const tx = {
+        automationEvent: {
+            findMany: async ({ where }: { where: { status: { in: string[] }; detail: { contains: string } } }) =>
+                events.filter(e => where.status.in.includes(e.status) && e.detail.includes(where.detail.contains)),
+            updateMany: async (
+                { where, data }: { where: { detail: { contains: string } }; data: { status: string } },
+            ) => {
+                let count = 0;
+                for (const e of events) {
+                    if (!e.detail.includes(where.detail.contains)) continue;
+                    e.status = data.status;
+                    count += 1;
+                }
+                return { count };
+            },
+            create: async ({ data }: { data: { status: string; detail: string } }) => {
+                const created = { id: `ev-${events.length + 1}`, status: data.status, detail: data.detail };
+                events.push(created);
+                return created;
+            },
+        },
+    } as unknown as Prisma.TransactionClient;
+    return { events, run: async <T>(body: (t: Prisma.TransactionClient) => Promise<T>) => body(tx) };
+}
+
+test("claimObjectPath WRITES the publishing claim, and a deleter is then refused", async () => {
+    const w = claimWorld();
+    const CANON = "receipts/intake/row-9/v2/abc.png";
+    const now = new Date("2026-09-03T12:00:00.000Z");
+
+    const id = await claimObjectPath(CANON, null, now, w.run);
+
+    const written = w.events.find(e => e.id === id);
+    assert.ok(written, "the id names a row that exists — not one it went looking for");
+    assert.equal(written.status, "provisional", "invisible to reclaim, visible to the sweeper");
+    const detail = JSON.parse(written.detail) as Record<string, string>;
+    assert.equal(detail.storagePath, CANON);
+    assert.equal(detail.claimKind, "publishing");
+    assert.ok(detail.claimToken && detail.claimToken.length > 8, "a real token, not a placeholder");
+    assert.equal(detail.claimUntil, objectClaimDueAt(null, now).toISOString(), "the lease covers the seal");
+
+    // THE POINT: feed the row that was actually persisted back through the
+    // exclusion rule. A sweeper reading the queue now finds the path held.
+    assert.equal(claimsConflict(w.events, "deleting", now), "publishing");
+    // ...and a second publisher is not blocked, because the path is content
+    // addressed and the seal is an upsert.
+    assert.equal(claimsConflict(w.events, "publishing", now), null);
+});
+
+test("a publisher is REFUSED, and writes nothing, when a delete holds the path", async () => {
+    const CANON = "receipts/intake/row-9/v2/abc.png";
+    const now = new Date("2026-09-03T12:00:00.000Z");
+    const w = claimWorld([{
+        id: "sweep-claim",
+        status: "pending",
+        detail: JSON.stringify({
+            storagePath: CANON,
+            claimToken: "sweep-token",
+            claimKind: "deleting",
+            claimUntil: new Date(now.getTime() + 30_000).toISOString(),
+        }),
+    }]);
+
+    await assert.rejects(
+        () => claimObjectPath(CANON, null, now, w.run),
+        (error: unknown) => (error as Error).name === "ObjectPathBusyError",
+    );
+    assert.equal(w.events.length, 1, "no claim written, and the deleter's is untouched");
+    assert.equal(w.events[0].status, "pending", "and NOT reclaimed out from under it");
+});
+
+test("path identity is EXACT: a longer path that starts with this one is untouched", async () => {
+    // `contains` on the bare path matches any path this one prefixes. The
+    // detail is `{"storagePath":"<path>",...}`, so the match is made on the
+    // JSON-QUOTED path and the closing quote bounds it.
+    const CANON = "receipts/intake/row-9/v2/abc.png";
+    const SIBLING = `${CANON}.orig.png`;
+    const now = new Date("2026-09-03T12:00:00.000Z");
+    const w = claimWorld([
+        { id: "other", status: "pending", detail: JSON.stringify({ storagePath: SIBLING }) },
+    ]);
+
+    await claimObjectPath(CANON, null, now, w.run);
+
+    const other = w.events.find(e => e.id === "other");
+    assert.equal(other?.status, "pending", "a DIFFERENT object's cleanup was not cancelled");
+    assert.equal(w.events.length, 2, "and exactly one claim was added");
+});
+
+test("CONTROL: the sibling's OWN claim does reach it", async () => {
+    // Without this, a matcher that matched nothing at all would pass the test
+    // above while making every reclaim a no-op.
+    const SIBLING = "receipts/intake/row-9/v2/abc.png.orig.png";
+    const now = new Date("2026-09-03T12:00:00.000Z");
+    const w = claimWorld([
+        { id: "other", status: "pending", detail: JSON.stringify({ storagePath: SIBLING }) },
+    ]);
+
+    await claimObjectPath(SIBLING, null, now, w.run);
+
+    assert.equal(w.events.find(e => e.id === "other")?.status, "resolved", "its own path DOES match");
+});
+
+// ── A cleanup intent is DURABLY recorded, or the caller hears about it ─────
+//
+// B2-a survived too: making `recordPendingCleanup` swallow its failure and
+// return a fabricated id broke nothing, because every throw test drove
+// `deleteObjectOrRecord`'s injected `record`. This drives the real one.
+
+test("recordPendingCleanup PROPAGATES a failed insert instead of inventing an id", async () => {
+    const exploding = {
+        automationEvent: { create: async () => { throw new Error("db is down"); } },
+    } as unknown as Prisma.TransactionClient;
+
+    await assert.rejects(
+        () => recordPendingCleanup("receipts/intake/row-9/v2/abc.png", "orphan", null, "pending", exploding),
+        /db is down/,
+        "a swallowed insert returns SOME id — an older event's, with its stale deadline",
+    );
+});
+
+test("CONTROL: recordPendingCleanup returns the id of the row it actually wrote", async () => {
+    const writes: { status: string; detail: string }[] = [];
+    const ok = {
+        automationEvent: {
+            create: async ({ data }: { data: { status: string; detail: string } }) => {
+                writes.push(data);
+                return { id: "the-row-it-wrote" };
+            },
+        },
+    } as unknown as Prisma.TransactionClient;
+
+    const id = await recordPendingCleanup("receipts/intake/row-9/v2/abc.png", "orphan", null, "pending", ok);
+
+    assert.equal(id, "the-row-it-wrote", "the create's own id, never a search result");
+    assert.equal(writes.length, 1);
+    assert.equal(JSON.parse(writes[0].detail).storagePath, "receipts/intake/row-9/v2/abc.png");
+});
+
+test("a DIFFERENT object's live claim does not block this path either", async () => {
+    // The conflict read is bounded the same way the reclaim is. Matched on the
+    // bare path, a delete holding `<path>.orig.png` would refuse every publish
+    // of `<path>` for the length of its lease — a live object held hostage by
+    // an unrelated one whose name happens to start the same way.
+    const CANON = "receipts/intake/row-9/v2/abc.png";
+    const now = new Date("2026-09-03T12:00:00.000Z");
+    const w = claimWorld([{
+        id: "other-delete",
+        status: "pending",
+        detail: JSON.stringify({
+            storagePath: `${CANON}.orig.png`,
+            claimToken: "sweep-token",
+            claimKind: "deleting",
+            claimUntil: new Date(now.getTime() + 30_000).toISOString(),
+        }),
+    }]);
+
+    const id = await claimObjectPath(CANON, null, now, w.run);
+    assert.ok(w.events.find(e => e.id === id), "the publish claimed its own path");
+
+    // CONTROL: the same claim DOES block a publish of the path it names.
+    const same = claimWorld(w.events.filter(e => e.id === "other-delete"));
+    await assert.rejects(
+        () => claimObjectPath(`${CANON}.orig.png`, null, now, same.run),
+        (error: unknown) => (error as Error).name === "ObjectPathBusyError",
+    );
 });

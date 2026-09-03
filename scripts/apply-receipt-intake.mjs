@@ -178,6 +178,17 @@ export const statements = [
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT`,
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3)`,
 
+    // THE STATE DEFAULT IS REPAIRED, not just declared on a fresh table.
+    //
+    // `CREATE TABLE IF NOT EXISTS` above carries DEFAULT 'STAGING', and a table
+    // this script created in an EARLIER Phase-1 revision carries the old
+    // DEFAULT 'RECEIVED'. Adding columns cannot fix that, so an upgraded
+    // deployment kept minting rows that skip STAGING entirely: they are
+    // claimable by the worker the instant they are inserted, before their
+    // object exists, which is the state the two-step upload exists to prevent.
+    // Idempotent — setting a default that already matches is a no-op.
+    `ALTER TABLE "ReceiptIntake" ALTER COLUMN "state" SET DEFAULT 'STAGING'`,
+
     // Intake idempotency: one row per caller-supplied sourceRef. A forwarder
     // replaying the same Drive file / Gmail message is a no-op.
     `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_sourceRef_key"
@@ -438,6 +449,53 @@ export function foreignKeyDrift(expected, def) {
  * returns — zero rows meaning "not on THIS table", which is a failure, never a
  * pass.
  */
+/**
+ * The column defaults the shape depends on, and which the upgrade path can
+ * silently leave wrong.
+ *
+ * A verify that reads column NAMES cannot see this: the column is present
+ * either way. `ReceiptIntake.state` created by an earlier Phase-1 revision
+ * defaults to 'RECEIVED', so every row inserted without an explicit state
+ * skipped STAGING and became claimable by the worker before its object
+ * existed. Pure, so the comparison is a unit test rather than a live DB.
+ */
+export const expectedColumnDefaults = {
+    ReceiptIntake: { state: "'STAGING'::text" },
+};
+
+/** Does a `column_default` read from Postgres match what we require? */
+export function columnDefaultMatches(actual, expected) {
+    if (typeof actual !== "string") return false;
+    // Postgres renders a text literal default as `'STAGING'::text`; accept the
+    // bare literal too so the check does not depend on how it echoes casts.
+    const normalise = (v) => v.replace(/::[a-z ]+$/i, "").trim();
+    return normalise(actual) === normalise(expected);
+}
+
+export async function verifyColumnDefaults(query) {
+    const problems = [];
+    const notes = [];
+    for (const [table, columns] of Object.entries(expectedColumnDefaults)) {
+        for (const [column, expected] of Object.entries(columns)) {
+            const rows = await query(
+                `SELECT column_default FROM information_schema.columns
+                  WHERE table_schema='public' AND table_name=$1 AND column_name=$2`,
+                table,
+                column,
+            );
+            const actual = rows?.[0]?.column_default ?? null;
+            if (!columnDefaultMatches(actual, expected)) {
+                problems.push(
+                    `${table}.${column} default is ${actual === null ? "(none)" : actual}, expected ${expected}`,
+                );
+            } else {
+                notes.push(`verified default ${table}.${column} = ${expected}`);
+            }
+        }
+    }
+    return { problems, notes };
+}
+
 export async function verifyConstraints(query) {
     const problems = [];
     const notes = [];
@@ -665,6 +723,17 @@ async function main() {
             }
             console.log(`verified ${table}: ${columns.length} columns`);
         }
+        // DEFAULTS, not just names: an upgraded table has every column and the
+        // wrong `state` default, which a name check reports as clean.
+        const defaults = await verifyColumnDefaults(
+            (sql, ...args) => prisma.$queryRawUnsafe(sql, ...args),
+        );
+        for (const note of defaults.notes) console.log(note);
+        if (defaults.problems.length) {
+            for (const problem of defaults.problems) console.error(`VERIFY FAILED: ${problem}`);
+            process.exit(1);
+        }
+
         const constraints = await verifyConstraints(
             (sql, name) => prisma.$queryRawUnsafe(sql, name),
         );

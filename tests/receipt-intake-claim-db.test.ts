@@ -16,6 +16,7 @@ import { PrismaClient, Prisma } from "@prisma/client";
 import { CLAIM_LOCK_KEY, eligibleClaimWhere } from "../src/lib/receipt-intake/worker";
 import { lockQboExpense } from "../src/lib/qbo-expense-sync";
 import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
+import { verifyColumnDefaults } from "../scripts/apply-receipt-intake.mjs";
 import { reconcileExistingExpense } from "../src/lib/receipt-intake/book";
 
 const url = process.env.RECEIPT_INTAKE_DB_TEST_URL ?? process.env.MIGRATION_HISTORY_TEST_URL;
@@ -580,4 +581,90 @@ test("CONCURRENT publishes do not queue behind each other on the pool", { skip }
     const results = await Promise.all([1, 2, 3, 4, 5, 6].map(publishOne));
     assert.ok(results.every(r => r?.published), "all six published");
     assert.ok(peak <= baseline, `six concurrent seals held no transactions (baseline ${baseline}, peak ${peak})`);
+});
+
+// ── The old state default is REPAIRED, against real Postgres (round-18 #4) ──
+//
+// A ReceiptIntake created by an earlier Phase-1 revision carries
+// DEFAULT 'RECEIVED'. `CREATE TABLE IF NOT EXISTS` is a no-op on it and adding
+// columns cannot change a default, so every row inserted without an explicit
+// state skipped STAGING and was claimable by the worker before its object
+// existed. The verify reported clean because it read column NAMES.
+
+const DEFAULT_PROBE = "ReceiptIntakeDefaultProbe";
+
+async function probeDefault(): Promise<string | null> {
+    const rows = await db!.$queryRawUnsafe<{ column_default: string | null }[]>(
+        `SELECT column_default FROM information_schema.columns
+          WHERE table_schema='public' AND table_name=$1 AND column_name='state'`,
+        DEFAULT_PROBE,
+    );
+    return rows[0]?.column_default ?? null;
+}
+
+test("apply REPAIRS a table created with the old default", { skip }, async () => {
+    // A stand-in table in the shape the earlier revision left behind. Using a
+    // probe table rather than the real one keeps this test from depending on
+    // (or damaging) whatever state the migrations job built.
+    await db!.$executeRawUnsafe(`DROP TABLE IF EXISTS "${DEFAULT_PROBE}"`);
+    try {
+        await db!.$executeRawUnsafe(
+            `CREATE TABLE "${DEFAULT_PROBE}" ("id" TEXT PRIMARY KEY, "state" TEXT NOT NULL DEFAULT 'RECEIVED')`,
+        );
+        assert.match(String(await probeDefault()), /RECEIVED/, "the drifted shape, as an earlier run left it");
+
+        // PRE-FIX CONTROL: a verify that reads column NAMES reports clean while
+        // the default is wrong — which is exactly how this survived.
+        const names = await db!.$queryRawUnsafe<{ column_name: string }[]>(
+            `SELECT column_name FROM information_schema.columns
+              WHERE table_schema='public' AND table_name=$1`,
+            DEFAULT_PROBE,
+        );
+        assert.ok(names.some(r => r.column_name === "state"), "the column is present in both shapes");
+
+        // ...and the default check catches it.
+        const before = await verifyColumnDefaults(
+            (sql: string, ...args: unknown[]) => db!.$queryRawUnsafe(sql.replace("ReceiptIntake", DEFAULT_PROBE), ...args),
+        );
+        assert.equal(before.problems.length, 1, JSON.stringify(before));
+
+        // THE REPAIR — the same statement the apply script and the migration
+        // both carry, run here against the drifted table.
+        await db!.$executeRawUnsafe(
+            `ALTER TABLE "${DEFAULT_PROBE}" ALTER COLUMN "state" SET DEFAULT 'STAGING'`,
+        );
+        assert.match(String(await probeDefault()), /STAGING/, "repaired");
+
+        const after = await verifyColumnDefaults(
+            (sql: string, ...args: unknown[]) => db!.$queryRawUnsafe(sql.replace("ReceiptIntake", DEFAULT_PROBE), ...args),
+        );
+        assert.deepEqual(after.problems, [], "and the verify is clean");
+
+        // Idempotent: running it again changes nothing.
+        await db!.$executeRawUnsafe(
+            `ALTER TABLE "${DEFAULT_PROBE}" ALTER COLUMN "state" SET DEFAULT 'STAGING'`,
+        );
+        assert.match(String(await probeDefault()), /STAGING/);
+
+        // And a row inserted without a state now lands in STAGING — invisible
+        // to the worker's claim until its object is published.
+        await db!.$executeRawUnsafe(`INSERT INTO "${DEFAULT_PROBE}" ("id") VALUES ('probe-1')`);
+        const inserted = await db!.$queryRawUnsafe<{ state: string }[]>(
+            `SELECT state FROM "${DEFAULT_PROBE}" WHERE id='probe-1'`,
+        );
+        assert.equal(inserted[0].state, "STAGING");
+    } finally {
+        await db!.$executeRawUnsafe(`DROP TABLE IF EXISTS "${DEFAULT_PROBE}"`);
+    }
+});
+
+test("the REAL ReceiptIntake ends up with the STAGING default", { skip }, async () => {
+    // The migrations job builds this table from prisma/migrations, so this is
+    // the end-to-end assertion that the upgrade path carries the repair.
+    const rows = await db!.$queryRawUnsafe<{ column_default: string | null }[]>(
+        `SELECT column_default FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='ReceiptIntake' AND column_name='state'`,
+    );
+    assert.equal(rows.length, 1, "the table exists");
+    assert.match(String(rows[0].column_default), /STAGING/, `saw ${rows[0].column_default}`);
 });

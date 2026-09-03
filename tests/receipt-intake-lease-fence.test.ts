@@ -333,3 +333,62 @@ test("the cleanup sweep does its DELETE outside a transaction too", () => {
     assert.ok(claimAt < removeAt, "the claim comes first");
     assert.ok(removeAt < settleAt, "the delete runs between the two transactions, not inside either");
 });
+
+// ── Why the DB-gated proof may not use the app's prisma singleton ──────────
+//
+// CI's "Migrations reproduce production" job failed on the connection-hold
+// tests with `not ok 11` and `not ok 13`. The cause was not the concurrency
+// protocol they measure. Those tests called the shipped `inShortTx`, which
+// runs on the app's prisma singleton — and that singleton REFUSES a
+// DATABASE_URL without `pgbouncer=true`. The rule is correct (Supabase's
+// transaction pooler needs it, and without it prod falls over with 42P05), and
+// CI's migrations job points at a plain Postgres container, so the singleton
+// could never be built there. `sealAndPublish` caught the throw, returned its
+// retryable null, and the assertion saw `undefined` — a connection-string
+// failure wearing a concurrency failure's clothes.
+//
+// The tests now build their transaction helper over their own client. These
+// two guards keep that true and record why.
+
+test("the app's prisma singleton REFUSES a plain Postgres URL — the root cause", async () => {
+    const before = process.env.DATABASE_URL;
+    // CI's migrations job, verbatim from .github/workflows/ci.yml.
+    process.env.DATABASE_URL = "postgresql://probuild:probuild@localhost:5432/probuild_migrations";
+    try {
+        const { prisma } = await import("../src/lib/prisma");
+        assert.throws(
+            () => { void (prisma as unknown as Record<string, unknown>).receiptIntake; },
+            /pgbouncer=true/,
+            "any test touching the singleton dies on CI's plain Postgres, whatever it meant to measure",
+        );
+    } finally {
+        if (before === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = before;
+    }
+});
+
+test("the migrations job's URL really is the plain one, and e2e's is not", () => {
+    const ci = readFileSync(path.join(ROOT, ".github/workflows/ci.yml"), "utf8");
+    const urls = ci.match(/postgresql:\/\/probuild:probuild@localhost:5432\/\S+/g) ?? [];
+    assert.ok(urls.length >= 2, "both jobs name their database");
+    assert.ok(
+        urls.some(u => u.includes("probuild_migrations") && !u.includes("pgbouncer")),
+        "the migrations job is plain Postgres — the singleton cannot be built there",
+    );
+    assert.ok(
+        urls.some(u => u.includes("probuild_e2e") && u.includes("pgbouncer=true")),
+        "the e2e job carries the flag, which is why it never hit this",
+    );
+});
+
+test("the DB-gated proof builds its OWN client, never the singleton", () => {
+    const db = readFileSync(path.join(ROOT, "tests/receipt-intake-claim-db.test.ts"), "utf8");
+    assert.ok(
+        !/inShortTx.*from "\.\.\/src\/lib\/receipt-intake\/storage-cleanup"/.test(db),
+        "it must not import the singleton-backed transaction helper",
+    );
+    assert.ok(!/from "\.\.\/src\/lib\/prisma"/.test(db), "nor the singleton itself");
+    assert.match(db, /const shortTx = /, "it builds the short transaction over its own client");
+    assert.match(db, /db!\.\$transaction\(tx => body\(tx\), \{ maxWait: 5_000, timeout: 5_000 \}\)/,
+        "with the SAME options as the shipped helper, so the protocol is what is measured");
+});

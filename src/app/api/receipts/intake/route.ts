@@ -26,6 +26,7 @@ import {
     MAX_STORED_BYTES,
 } from "@/lib/receipt-intake/intake-core";
 import { finalizeDisposition, leaseFence, verifyStoredCopy } from "@/lib/receipt-intake/stored-object";
+import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 import {
     ARCHIVE_READABLE_STATES,
     listReceiptIntakes,
@@ -35,6 +36,16 @@ import {
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
+
+/**
+ * THE ROUTE'S ONE ABSOLUTE DEADLINE, created at entry.
+ *
+ * `maxDuration = 30` is the whole request's budget, and every storage call now
+ * takes this rather than a fresh fifteen seconds of its own — three sequential
+ * calls with independent allowances could spend 45 seconds inside a handler
+ * the platform kills at 30.
+ */
+const ROUTE_BUDGET_MS = 27_000;
 
 /**
  * Receipt Pipeline v2 intake — the ONE front door for every inbound receipt or
@@ -184,6 +195,9 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
 }
 
 export async function POST(req: Request) {
+    // ONE deadline for the whole request — see ROUTE_BUDGET_MS.
+    const deadline = createRouteDeadline(ROUTE_BUDGET_MS);
+
     const auth = await authenticateIntake(req, "ingest");
     if (!auth.ok) return auth.response;
 
@@ -290,7 +304,7 @@ export async function POST(req: Request) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
             return respondToSourceRefConflict(auth, source, sourceRef, fileSha256, {
                 bytes: parsed.bytes, mimeType, storagePath,
-            });
+            }, deadline);
         }
         // A projectId/costCodeId that doesn't exist is the CALLER's mistake, so
         // it must be a deterministic 400 — a 500 would make a forwarder retry a
@@ -312,7 +326,7 @@ export async function POST(req: Request) {
     // then a clean insert rather than a conflict against a half-written row.
     let uploadFailed: string | null = null;
     try {
-        const stored = await uploadReceiptObject(storagePath, parsed.bytes, mimeType);
+        const stored = await uploadReceiptObject(storagePath, parsed.bytes, mimeType, { deadline });
         if (!stored) uploadFailed = "upload-failed";
     } catch (error) {
         uploadFailed = error instanceof Error ? `${error.name}: ${error.message}` : "upload-threw";
@@ -407,8 +421,12 @@ export async function POST(req: Request) {
  * finishes the job.
  */
 /** Upload bytes to the receipts bucket. Returns false on any failure. */
-const storeObject = (storagePath: string, bytes: Buffer, mimeType: string) =>
-    uploadReceiptObject(storagePath, bytes, mimeType, { upsert: true });
+const storeObject = (
+    storagePath: string,
+    bytes: Buffer,
+    mimeType: string,
+    deadline: RouteDeadline | undefined,
+) => uploadReceiptObject(storagePath, bytes, mimeType, { upsert: true, deadline });
 
 async function publishStagedRow(id: string, expectStoragePath: string, expectState = "STAGING"): Promise<NextResponse> {
     try {
@@ -501,6 +519,8 @@ async function respondToSourceRefConflict(
     fileSha256: string,
     /** The bytes this replay carried — used to HEAL a row whose object is gone. */
     payload: { bytes: Buffer; mimeType: string; storagePath: string },
+    /** The REQUEST's deadline. A heal's upload draws on the same budget. */
+    deadline: RouteDeadline,
 ): Promise<NextResponse> {
     const existing = await prisma.receiptIntake.findUnique({
         where: { sourceRef },
@@ -634,7 +654,7 @@ async function respondToSourceRefConflict(
                     { status: 503 },
                 );
             }
-            const healed = await storeObject(payload.storagePath, payload.bytes, payload.mimeType);
+            const healed = await storeObject(payload.storagePath, payload.bytes, payload.mimeType, deadline);
             if (!healed) {
                 // AMBIGUOUS: storage may hold the bytes. The intent stands and
                 // the sweeper collects them once its lease lapses, rechecking

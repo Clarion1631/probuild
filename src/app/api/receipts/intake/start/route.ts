@@ -20,9 +20,20 @@ import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
 import { queueObjectCleanup } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
+
+/**
+ * THE ROUTE'S ONE ABSOLUTE DEADLINE, created at entry.
+ *
+ * `maxDuration = 30` is the whole request's budget, and every storage call now
+ * takes this rather than a fresh fifteen seconds of its own — three sequential
+ * calls with independent allowances could spend 45 seconds inside a handler
+ * the platform kills at 30.
+ */
+const ROUTE_BUDGET_MS = 27_000;
 
 /**
  * Step 1 of the two-step upload: reserve the row, hand back a signed URL.
@@ -42,6 +53,9 @@ export const maxDuration = 30;
  * /finalize is what publishes it.
  */
 export async function POST(req: Request) {
+    // ONE deadline for the whole request — see ROUTE_BUDGET_MS.
+    const deadline = createRouteDeadline(ROUTE_BUDGET_MS);
+
     const auth = await authenticateIntake(req, "ingest");
     if (!auth.ok) return auth.response;
 
@@ -282,7 +296,7 @@ export async function POST(req: Request) {
                 // The re-arm's identity writes still happen, because a recovery
                 // may legitimately arrive with a CORRECTED expected hash — they
                 // just land on the SAME path and the SAME lease version.
-                const keptRecovery = await reuseLiveLease(existing, ext, leaseDeps, {
+                const keptRecovery = await reuseLiveLease(existing, ext, leaseDepsFor(deadline), {
                     expectedSha256,
                     fileSha256: "",
                     mimeType,
@@ -368,7 +382,7 @@ export async function POST(req: Request) {
                 // deleteObjectOrRecord is exactly the guarded path for this —
                 // it deletes, and records a pending cleanup when the delete
                 // fails.
-                const rearmed = await signUpload(retryPath);
+                const rearmed = await signUpload(retryPath, { deadline });
                 if (!rearmed) {
                     // The row keeps the NEW path and a live expiry, so the
                     // caller's retry lands in reuseLiveLease and is handed a
@@ -482,7 +496,7 @@ export async function POST(req: Request) {
             }
             // A LIVE LEASE IS NOT INVALIDATED BY A RETRY. Same rule, same
             // helper, as the recoverable re-arm above.
-            const kept = await reuseLiveLease(existing, ext, leaseDeps);
+            const kept = await reuseLiveLease(existing, ext, leaseDepsFor(deadline));
             if (kept) {
                 if (kept.kind === "storage-unavailable") {
                     return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
@@ -542,7 +556,7 @@ export async function POST(req: Request) {
                 return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
             }
             if (resumedRepath === "conflict") return leaseConflict(existing.id);
-            const resumed = await signUpload(resumePath);
+            const resumed = await signUpload(resumePath, { deadline });
             // The row is on the new path with a live expiry, so a retry resumes
             // through reuseLiveLease over that same path.
             if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
@@ -557,7 +571,7 @@ export async function POST(req: Request) {
         throw error;
     }
 
-    const signed = await signUpload(storagePath);
+    const signed = await signUpload(storagePath, { deadline });
     if (!signed) {
         // THE ROW ONLY GOES IF NOBODY ELSE ADOPTED IT.
         //
@@ -689,11 +703,14 @@ function leaseConflict(existingId: string) {
 }
 
 /** The live wiring for the shared lease rule (src/lib/receipt-intake/upload-lease.ts). */
-const leaseDeps = {
+const leaseDepsFor = (leaseDeadline: RouteDeadline | undefined) => ({
     db: prisma.receiptIntake,
-    sign: (storagePath: string, opts: { upsert: boolean }) => signUpload(storagePath, opts),
+    sign: (storagePath: string, opts: { upsert: boolean }) =>
+        // The reuse rule runs inside a request, so it gets that request's
+        // remaining budget rather than a fresh allowance of its own.
+        signUpload(storagePath, { ...opts, deadline: leaseDeadline }),
     expiresAt: uploadLeaseExpiry,
-};
+});
 
 /**
  * CREATE-ONLY BY DEFAULT.
@@ -707,4 +724,5 @@ const leaseDeps = {
  * checks above are what stop even that token from overwriting a DIFFERENT
  * document.
  */
-const signUpload = createReceiptUploadUrl;
+const signUpload = (storagePath: string, opts: { upsert?: boolean; deadline: RouteDeadline | undefined }) =>
+    createReceiptUploadUrl(storagePath, opts);

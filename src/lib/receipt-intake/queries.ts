@@ -8,6 +8,7 @@
  */
 import { prisma } from "@/lib/prisma";
 import { signReceiptDownloadUrl } from "./bucket";
+import type { RouteDeadline } from "@/lib/quickbooks";
 
 export const RECEIPT_INTAKE_LIST_SELECT = {
     id: true,
@@ -138,7 +139,7 @@ export async function listReceiptIntakes(args: ListReceiptIntakesArgs) {
 export async function withArchiveDownloadUrls<T extends { storagePath: string; project?: { name: string } | null }>(
     rows: T[],
     /** Injectable so the contract is testable without Supabase. */
-    sign: (storagePath: string, ttlSeconds: number) => Promise<string | null> = signReceiptDownloadUrl,
+    sign: (storagePath: string, ttlSeconds: number, deadline?: RouteDeadline) => Promise<string | null> = signReceiptDownloadUrl,
 ): Promise<Array<Omit<T, "project"> & { projectName: string | null; downloadUrl: string | null }>> {
     return Promise.all(
         rows.map(async row => {

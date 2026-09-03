@@ -168,7 +168,7 @@ export async function receiptObjectSize(
     storagePath: string,
     /** Injected only by tests: the classification is the whole subject here. */
     lister: BucketLister | null = null,
-    deadline?: RouteDeadline,
+    deadline: RouteDeadline | undefined,
 ): Promise<SizeResult> {
     const path = safePath(storagePath);
     if (!path) return { ok: false, kind: "missing" };
@@ -206,7 +206,7 @@ export async function receiptObjectSize(
 /** Tagged download, so a confirmed 404 and a storage blip cannot book the same. */
 export async function downloadReceiptObject(
     storagePath: string,
-    deadline?: RouteDeadline,
+    deadline: RouteDeadline | undefined,
 ): Promise<DocBytesResult> {
     const path = safePath(storagePath);
     if (!path) return { ok: false, kind: "not-found" };
@@ -234,7 +234,7 @@ export async function uploadReceiptObject(
     storagePath: string,
     bytes: Buffer,
     contentType: string,
-    opts: { upsert?: boolean; deadline?: RouteDeadline } = {},
+    opts: { upsert?: boolean; deadline: RouteDeadline | undefined },
 ): Promise<boolean> {
     const path = safePath(storagePath);
     if (!path) return false;
@@ -257,7 +257,7 @@ export async function uploadReceiptObject(
 /** Delete, and THROW on anything short of a confirmed removal. */
 export async function removeReceiptObject(
     storagePath: string,
-    deadline?: RouteDeadline,
+    deadline: RouteDeadline | undefined,
 ): Promise<void> {
     const path = safePath(storagePath);
     if (!path) throw new Error(`not a receipt object path: ${String(storagePath).slice(0, 80)}`);
@@ -292,7 +292,7 @@ export async function removeReceiptObject(
  */
 export async function createReceiptUploadUrl(
     storagePath: string,
-    opts: { upsert?: boolean; deadline?: RouteDeadline } = {},
+    opts: { upsert?: boolean; deadline: RouteDeadline | undefined },
 ): Promise<{ uploadUrl: string; token: string; storagePath: string } | null> {
     const path = safePath(storagePath);
     if (!path) return null;
@@ -316,7 +316,7 @@ export async function createReceiptUploadUrl(
 export async function signReceiptDownloadUrl(
     storagePath: string,
     ttlSeconds: number,
-    deadline?: RouteDeadline,
+    deadline: RouteDeadline | undefined,
 ): Promise<string | null> {
     const path = safePath(storagePath);
     if (!path) return null;

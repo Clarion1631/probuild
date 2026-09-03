@@ -283,7 +283,7 @@ test("A LIVE LEASE SURVIVES A RECOVERABLE RETRY — same path, same version, no 
     // rule, in one module, and both callers reach it.
     const branch = start.slice(start.indexOf("if (recoverable) {"));
     const body = branch.slice(0, branch.indexOf("// IDENTITY MUST BE PROVEN"));
-    const reuse = body.indexOf("await reuseLiveLease(existing, ext, leaseDeps, {");
+    const reuse = body.indexOf("await reuseLiveLease(existing, ext, leaseDepsFor(deadline), {");
     assert.ok(reuse > 0, "the recovery asks the shared rule first");
     assert.ok(
         reuse < body.indexOf("const nextLease = existing.uploadLeaseVersion + 1"),
@@ -485,7 +485,7 @@ test("the sweeper and /start both fence on the lease version", () => {
     // the ordering property is unchanged: the row moves BEFORE anything is
     // signed, so a signer failure cannot leave a URL for a row somebody else
     // has moved on.
-    for (const branch of ["const rearmed = await signUpload(retryPath)", "const resumed = await signUpload(resumePath)"]) {
+    for (const branch of ["const rearmed = await signUpload(retryPath,", "const resumed = await signUpload(resumePath,"]) {
         const at = start.indexOf(branch);
         assert.ok(at > 0, branch);
         const move = start.lastIndexOf("await repathWithCleanup(", at);
@@ -547,7 +547,12 @@ test("/start's signer-failure cleanup is a CAS over the lease it wrote, not a de
         !/receiptIntake\.delete\(/.test(start),
         "no unconditional delete is left anywhere in the route",
     );
-    const branch = start.slice(start.indexOf("const signed = await signUpload(storagePath);"));
+    const signedAt = start.indexOf("const signed = await signUpload(storagePath,");
+    // A -1 here would slice the LAST CHARACTER of the file and every
+    // assertion below would then be made about one stray character. Fail
+    // on the anchor instead.
+    assert.ok(signedAt > 0, "the signer call is still where this pin thinks it is");
+    const branch = start.slice(signedAt);
     assert.match(branch, /await discardUnresumedLease\(/);
     // The SAME values that were written to the row. A second uploadLeaseExpiry()
     // call would compare a fresh instant against the stored one and never match,

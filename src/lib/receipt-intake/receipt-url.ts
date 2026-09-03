@@ -14,6 +14,7 @@
  */
 import { prisma } from "@/lib/prisma";
 import { RECEIPT_BUCKET, signReceiptDownloadUrl } from "./bucket";
+import type { RouteDeadline } from "@/lib/quickbooks";
 
 export const RECEIPT_URL_SCHEME = "receipt-intake://";
 
@@ -43,7 +44,7 @@ export function parseReceiptUrl(value: string | null | undefined): { bucket: str
 }
 
 export interface ReceiptUrlDeps {
-    sign: (storagePath: string, ttlSeconds: number) => Promise<string | null>;
+    sign: (storagePath: string, ttlSeconds: number, deadline?: RouteDeadline) => Promise<string | null>;
     /** Where the intake row that owns this object points NOW. */
     currentPath: (storagePath: string) => Promise<string | null>;
 }

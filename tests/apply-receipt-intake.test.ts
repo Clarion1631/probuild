@@ -21,7 +21,9 @@ import {
     RECEIPT_BUCKET_MIME_TYPES,
     RECEIPT_INTAKE_STATES,
     CONSTRAINT_LOOKUP_SQL,
+    columnDefaultMatches,
     ensureReceiptBucket,
+    verifyColumnDefaults,
     expectedConstraints,
     foreignKeyDrift,
     maskUrl,
@@ -156,6 +158,11 @@ test("every statement is idempotent — the script is safe to re-run", () => {
             /CREATE TABLE IF NOT EXISTS/.test(sql) ||
             /CREATE (?:UNIQUE )?INDEX IF NOT EXISTS/.test(sql) ||
             /ALTER TABLE .* ADD COLUMN IF NOT EXISTS/.test(sql) ||
+            // SET DEFAULT is idempotent by nature: setting a default that is
+            // already in place is a no-op, and there is no IF NOT EXISTS form
+            // of it to write. It repairs a table an earlier revision created
+            // with the wrong one.
+            /ALTER TABLE .* ALTER COLUMN .* SET DEFAULT/.test(sql) ||
             // Re-enabling RLS on a table that already has it is a no-op.
             /ENABLE ROW LEVEL SECURITY/.test(sql) ||
             /IF NOT EXISTS \(SELECT 1 FROM pg_constraint/.test(sql) ||
@@ -639,4 +646,66 @@ test("a url with no credentials is passed through readably", () => {
     assert.ok(masked.includes("db.example.com"), masked);
     assert.ok(masked.includes("sslmode=require"), masked);
     assert.ok(!masked.includes("***"), masked);
+});
+
+// ── The upgrade path repairs the state default (round-18 item 4) ──────────
+//
+// `CREATE TABLE IF NOT EXISTS` carries DEFAULT 'STAGING' and is a no-op on an
+// existing table, so a ReceiptIntake created by an earlier Phase-1 revision
+// keeps DEFAULT 'RECEIVED'. Adding columns cannot fix that. Every row inserted
+// without an explicit state then skipped STAGING and became claimable by the
+// worker before its object existed — precisely what the two-step upload exists
+// to prevent — and the verify reported clean, because it read column NAMES and
+// the column was present either way.
+
+test("the upgrade path SETS the default, in both the script and the migration", () => {
+    const repair = `ALTER TABLE "ReceiptIntake" ALTER COLUMN "state" SET DEFAULT 'STAGING'`;
+    assert.ok(
+        statements.some(s => s.includes(repair)),
+        "the apply script repairs it",
+    );
+    const migration = readFileSync(
+        path.join(__dirname, "..", "prisma/migrations/20260901000000_receipt_intake/migration.sql"),
+        "utf8",
+    );
+    assert.ok(migration.includes(`${repair};`), "and so does the migration's upgrade section");
+    // It must live in the UPGRADE section — after the CREATE TABLE, which is
+    // the statement that is a no-op on an existing table.
+    assert.ok(
+        migration.indexOf(repair) > migration.indexOf("CREATE TABLE IF NOT EXISTS \"ReceiptIntake\""),
+        "after the create, where the upgrade statements are",
+    );
+});
+
+test("the verify reads DEFAULTS, and reports drift", async () => {
+    // A name check cannot see this, which is why it reported clean while the
+    // default was wrong.
+    const wrong = await verifyColumnDefaults(async () => [{ column_default: "'RECEIVED'::text" }]);
+    assert.equal(wrong.problems.length, 1);
+    assert.match(wrong.problems[0], /ReceiptIntake\.state default is 'RECEIVED'::text, expected 'STAGING'/);
+
+    // PRE-FIX CONTROL: the old verify only asked for column NAMES, and
+    // `state` is present in both shapes — so it passed.
+    assert.ok(expectedColumns.ReceiptIntake.includes("state"), "the column is there either way");
+
+    const right = await verifyColumnDefaults(async () => [{ column_default: "'STAGING'::text" }]);
+    assert.deepEqual(right.problems, []);
+    assert.equal(right.notes.length, 1);
+
+    // A column with NO default at all is drift too, not an absence to shrug at.
+    const none = await verifyColumnDefaults(async () => [{ column_default: null }]);
+    assert.equal(none.problems.length, 1);
+    assert.match(none.problems[0], /default is \(none\)/);
+});
+
+test("the default comparison ignores how Postgres echoes the cast", () => {
+    // `information_schema` renders a text literal as `'STAGING'::text`; the
+    // bare literal is the same default. Comparing raw strings would make the
+    // check fail on a correct database, which is worse than not checking.
+    assert.equal(columnDefaultMatches("'STAGING'::text", "'STAGING'::text"), true);
+    assert.equal(columnDefaultMatches("'STAGING'", "'STAGING'::text"), true);
+    assert.equal(columnDefaultMatches("'STAGING'::character varying", "'STAGING'::text"), true);
+    assert.equal(columnDefaultMatches("'RECEIVED'::text", "'STAGING'::text"), false);
+    assert.equal(columnDefaultMatches(null, "'STAGING'::text"), false);
+    assert.equal(columnDefaultMatches(undefined, "'STAGING'::text"), false);
 });

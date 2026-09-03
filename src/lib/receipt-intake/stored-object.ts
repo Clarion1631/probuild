@@ -15,7 +15,7 @@
 import { createHash } from "node:crypto";
 import type { Prisma } from "@prisma/client";
 import type { DocBytesResult } from "@/lib/secure-storage";
-import { downloadReceiptObject, receiptObjectSize, type SizeResult } from "./bucket";
+import { downloadReceiptObject, receiptObjectSize, type BucketLister, type SizeResult } from "./bucket";
 import type { RouteDeadline } from "@/lib/quickbooks";
 import { EXT_BY_MIME, sniffMime } from "./file-type";
 import { MAX_STORED_BYTES } from "./intake-core";
@@ -129,7 +129,13 @@ export interface SealPublishDeps {
      */
     claimCanonicalPath: (canonicalPath: string) => Promise<string>;
     /** PHASE B. The external write. Called with no transaction open. */
-    seal: (uploadPath: string, canonicalPath: string, bytes: Buffer, contentType: string) => Promise<string | null>;
+    seal: (
+        uploadPath: string,
+        canonicalPath: string,
+        bytes: Buffer,
+        contentType: string,
+        deadline: RouteDeadline | undefined,
+    ) => Promise<string | null>;
     /** PHASE C. The fenced CAS. Returns the number of rows actually moved. */
     commit: (
         tx: PublishTx,
@@ -162,6 +168,11 @@ export async function sealAndPublish(
     leaseVersion: number,
     check: { mimeType: string; fileSize: number; fileSha256: string; bytes: Buffer },
     deps: SealPublishDeps,
+    /**
+     * The route's ONE deadline, handed to the seal. Every storage call this
+     * invocation makes draws on the same shrinking budget.
+     */
+    deadline?: RouteDeadline,
 ): Promise<PublishOutcome | null> {
     const canonicalPath = canonicalStoragePath(rowId, leaseVersion, check.fileSha256, check.mimeType);
 
@@ -204,7 +215,7 @@ export async function sealAndPublish(
     }
 
     // PHASE B: no transaction is open here. This is the whole point.
-    const sealed = await deps.seal(uploadPath, canonicalPath, check.bytes, check.mimeType);
+    const sealed = await deps.seal(uploadPath, canonicalPath, check.bytes, check.mimeType, deadline);
     if (!sealed) return null;
 
     const moved = await deps.inShortTx(async tx => {
@@ -346,8 +357,8 @@ export async function verifyStoredCopy(
     storagePath: string,
     /** What the row was published with. Empty means a legacy row — see downloadVerified. */
     fileSha256: string,
-    sizeOf: (storagePath: string) => Promise<SizeResult> = receiptObjectSize,
-    download: (storagePath: string) => Promise<DocBytesResult> = downloadReceiptObject,
+    sizeOf: (storagePath: string, lister?: BucketLister | null, deadline?: RouteDeadline) => Promise<SizeResult> = receiptObjectSize,
+    download: (storagePath: string, deadline?: RouteDeadline) => Promise<DocBytesResult> = downloadReceiptObject,
 ): Promise<StoredCopyCheck> {
     const present = await sizeOf(storagePath);
     if (!present.ok) {
@@ -386,9 +397,9 @@ export async function inspectStoredObject(
      * format that CAN be identified is identified from the bytes.
      */
     declaredMime: string,
-    download: (storagePath: string) => Promise<DocBytesResult> = downloadReceiptObject,
+    download: (storagePath: string, deadline?: RouteDeadline) => Promise<DocBytesResult> = downloadReceiptObject,
     /** Metadata-only size lookup; injected so the "no body read" test is provable. */
-    sizeOf: (storagePath: string) => Promise<SizeResult> = receiptObjectSize,
+    sizeOf: (storagePath: string, lister?: BucketLister | null, deadline?: RouteDeadline) => Promise<SizeResult> = receiptObjectSize,
 ): Promise<StoredObjectCheck> {
     // SIZE FIRST, FROM METADATA — before a single byte is read.
     //

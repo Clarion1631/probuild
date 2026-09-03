@@ -75,6 +75,14 @@ ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "archivedByV1" BOOLEAN NOT 
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3);
 
+-- THE STATE DEFAULT IS REPAIRED, not merely declared on a fresh table.
+-- CREATE TABLE above carries DEFAULT 'STAGING'; a table an earlier Phase-1
+-- revision created carries DEFAULT 'RECEIVED', and adding columns cannot fix
+-- that. An upgraded deployment kept minting rows that skip STAGING entirely —
+-- claimable by the worker before their object exists, which is exactly what
+-- the two-step upload exists to prevent. Idempotent.
+ALTER TABLE "ReceiptIntake" ALTER COLUMN "state" SET DEFAULT 'STAGING';
+
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_sourceRef_key" ON "ReceiptIntake"("sourceRef");
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_expenseId_key" ON "ReceiptIntake"("expenseId");
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_dedupStrongKey_active_key"

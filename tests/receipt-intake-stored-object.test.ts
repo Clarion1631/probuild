@@ -837,12 +837,13 @@ test("the size lookup separates a real absence from a storage fault", async () =
     // the row pointing at a second copy.
     const lister = (result: unknown) => ({ list: async () => result as never });
 
-    const missing = await receiptObjectSize("receipts/intake/a.png", lister({ data: [], error: null }));
+    const missing = await receiptObjectSize("receipts/intake/a.png", lister({ data: [], error: null }), undefined);
     assert.deepEqual(missing, { ok: false, kind: "missing" }, "an empty listing IS an answer");
 
     const notFound = await receiptObjectSize(
         "receipts/intake/a.png",
         lister({ data: null, error: { status: 404, message: "Object not found" } }),
+        undefined,
     );
     assert.equal((notFound as { kind: string }).kind, "missing");
 
@@ -852,13 +853,14 @@ test("the size lookup separates a real absence from a storage fault", async () =
         { status: 429, message: "slow down" },
         { message: "fetch failed" },
     ]) {
-        const fault = await receiptObjectSize("receipts/intake/a.png", lister({ data: null, error }));
+        const fault = await receiptObjectSize("receipts/intake/a.png", lister({ data: null, error }), undefined);
         assert.equal((fault as { kind: string }).kind, "transient", JSON.stringify(error));
     }
 
     const found = await receiptObjectSize(
         "receipts/intake/a.png",
         lister({ data: [{ name: "a.png", metadata: { size: 1234 } }], error: null }),
+        undefined,
     );
     assert.deepEqual(found, { ok: true, size: 1234 });
 
@@ -867,13 +869,14 @@ test("the size lookup separates a real absence from a storage fault", async () =
     const sizeless = await receiptObjectSize(
         "receipts/intake/a.png",
         lister({ data: [{ name: "a.png", metadata: {} }], error: null }),
+        undefined,
     );
     assert.equal((sizeless as { kind: string }).kind, "transient");
 
     // A throwing client is a transport fault, never evidence of absence.
     const threw = await receiptObjectSize("receipts/intake/a.png", {
         list: async () => { throw new TypeError("fetch failed"); },
-    });
+    }, undefined);
     assert.equal((threw as { kind: string }).kind, "transient");
 });
 
