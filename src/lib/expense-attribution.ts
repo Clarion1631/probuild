@@ -363,6 +363,112 @@ export function taxDeductibleBaseFits(
     return Math.abs(base) <= Math.abs(ceiling);
 }
 
+/** The columns a tax re-validation may clear, exactly as they are written. */
+export interface TaxRevalidationClears {
+    taxAmount?: null;
+    taxAtSource?: false;
+    installedAtCustomer?: null;
+    taxDeductibleBase?: null;
+    taxDeductibleBaseSource?: null;
+    taxSource?: null;
+}
+
+export interface TaxRevalidationPlan {
+    /** Columns to write alongside the new gross. Empty when nothing broke. */
+    clears: TaxRevalidationClears;
+    /** True when a person has to look at this row again. */
+    needsTaxReview: boolean;
+    /** WHICH rule fired. `null` means the classification survived intact. */
+    reason: "tax-cannot-fit" | "base-cannot-fit" | "gross-moved" | null;
+}
+
+/**
+ * A NEW GROSS, JUDGED AGAINST THE TAX FIGURES THE ROW ALREADY CARRIES
+ * (Codex round 41, item 2).
+ *
+ * Three writers move `Expense.amount` and all three have to answer the same
+ * question: do the tax figures still describe this receipt? The QBO sync
+ * answered it (`planQboExpenseUpdate`), the rollout trigger transcribes that
+ * answer, and the expense PUT — the ONE handler a person uses to correct a
+ * total by hand — only ever raised `needsTaxReview`. It never handled a tax
+ * that the new gross cannot carry, so editing a $207.74 receipt with $16.55 of
+ * tax down to 0, to -5, or to any positive amount under $16.55 produced a row
+ * that violates `Expense_taxAmount_check`; Postgres refused the UPDATE and the
+ * handler's generic catch turned it into a 500. The unit tests missed it
+ * because the fake `updateMany` enforces no CHECK constraints, and production
+ * missed it because the compatibility trigger was silently repairing the row —
+ * until `--post-deploy` drops it.
+ *
+ * The policy is the conservative one already agreed everywhere else: a figure
+ * that cannot be true is CLEARED, together with the provenance that described
+ * it, and the row is flagged. NOTHING IS EVER INVENTED — a guessed-down tax is
+ * still a guess on a tax return.
+ *
+ *   1. The recorded tax cannot fit the new gross (wrong direction, or larger):
+ *      every tax answer on the row goes, including `installedAtCustomer` and
+ *      both provenances, and the row is flagged.
+ *   2. The tax fits but the hand allocation no longer does: only the allocation
+ *      and its provenance go. Clearing it silently would leave a row that still
+ *      reads as a deduction of the WHOLE pre-tax total, which is MORE than the
+ *      person allocated, so the flag is what keeps the report honest.
+ *   3. Neither breaks, but the gross MOVED on a classified row: nothing is
+ *      cleared (the figures may well still be right) and the row is flagged.
+ *
+ * `taxAtSource` is re-derived rather than assumed: it is defined as
+ * `taxAmount IS NOT NULL AND taxAmount <> 0`, so clearing the tax must clear it
+ * in the same statement or `Expense_taxAtSource_check` refuses the write.
+ *
+ * `costCodeSource` is deliberately untouched: which PHASE the money is on is a
+ * separate question the gross does not bear on.
+ */
+export function planTaxRevalidation(
+    row: TaxClassificationFacts & { taxAmount: number | null; taxDeductibleBase: number | null },
+    nextAmount: number,
+    options: { grossMoved: boolean },
+): TaxRevalidationPlan {
+    const tax = row.taxAmount;
+    const base = row.taxDeductibleBase;
+
+    // 1. The tax itself, against `Expense_taxAmount_check`: same direction as
+    //    the money, never larger in magnitude.
+    const taxCannotFitGross =
+        tax !== null &&
+        tax !== 0 &&
+        (!Number.isFinite(nextAmount) ||
+            Math.sign(tax) !== Math.sign(nextAmount) ||
+            Math.abs(tax) > Math.abs(nextAmount));
+    if (taxCannotFitGross) {
+        return {
+            clears: {
+                taxAmount: null,
+                taxAtSource: false,
+                installedAtCustomer: null,
+                taxDeductibleBase: null,
+                taxDeductibleBaseSource: null,
+                taxSource: null,
+            },
+            needsTaxReview: true,
+            reason: "tax-cannot-fit",
+        };
+    }
+
+    // 2. The allocation, against `Expense_taxDeductibleBase_check` — the same
+    //    shared helper every other caller of that rule uses.
+    if (!taxDeductibleBaseFits(base, nextAmount, tax)) {
+        return {
+            clears: { taxDeductibleBase: null, taxDeductibleBaseSource: null },
+            needsTaxReview: true,
+            reason: "base-cannot-fit",
+        };
+    }
+
+    // 3. Nothing broke, but a classified row's gross moved.
+    if (options.grossMoved && hasTaxClassification(row)) {
+        return { clears: {}, needsTaxReview: true, reason: "gross-moved" };
+    }
+    return { clears: {}, needsTaxReview: false, reason: null };
+}
+
 /**
  * WHAT A REQUEST SAID ABOUT `costCodeId`, PARSED ONCE (Codex round 40, item 3).
  *

@@ -209,6 +209,52 @@ export function reanchorSql(timeZone) {
  * `lockMoneyParentsMany` uses in the app, so this script and a live transaction
  * cannot deadlock against each other on the Estimate table.
  */
+/**
+ * THE JOBS FIRST, AND IT IS NOT OPTIONAL (Codex round 41, item 1).
+ *
+ * The backfill below locks Estimate rows and then UPDATEs `Expense.projectId`.
+ * That UPDATE is not the estimate-only statement it looks like: the foreign key
+ * added by this same script makes Postgres take `FOR KEY SHARE` on every
+ * referenced `Project` row to enforce it. So the statement's real acquisition
+ * order is Estimate -> Project — the exact inversion rounds 37 to 40 removed
+ * from the application — and a job editor holding its `Project` row FOR UPDATE
+ * while reaching for an estimate closes the cycle. Postgres breaks it with
+ * 40P01, and because this whole script runs inside ONE transaction, the victim
+ * is not one row: it is the entire DDL run, rolled back mid-migration.
+ *
+ * A separate STATEMENT, not another CTE. CTE evaluation order is not
+ * guaranteed — an unreferenced or laterally-independent locking CTE may be
+ * evaluated in either order — so "lock the projects in an earlier CTE" would
+ * be a hope rather than a rule. Two statements in one transaction have a
+ * defined order, and the locks the first one takes are held for the second.
+ *
+ * `ORDER BY id` for the same reason the estimate scan has it: ascending ids
+ * within a table is the rule `lockMoneyParentsMany` and
+ * `lockAttributionParents` both follow, so two holders acquire the same rows
+ * the same way.
+ *
+ * NOT BATCHED, deliberately. Batching is the usual answer to "keep the lock set
+ * small", and here it would buy nothing: the script is one transaction by
+ * design (round 13, item 6 — either the whole shape lands or none of it does),
+ * so every lock is held until the final COMMIT whatever size the batches are.
+ * Splitting the statement would add a loop and change nothing about the lock
+ * set. Recorded here so the next reader does not re-derive it.
+ */
+export const PROJECT_ID_BACKFILL_LOCK_PROJECTS =
+    `SELECT p.id
+       FROM "Project" p
+      WHERE p.id IN (
+            SELECT DISTINCT est."projectId"
+              FROM "Estimate" est
+             WHERE est."projectId" IS NOT NULL
+               AND EXISTS (
+                     SELECT 1 FROM "Expense" e
+                      WHERE e."estimateId" = est.id AND e."projectId" IS NULL
+                   )
+          )
+      ORDER BY p.id
+        FOR SHARE`;
+
 export const PROJECT_ID_BACKFILL =
     `WITH locked AS (
        SELECT est.id, est."projectId"
@@ -443,6 +489,41 @@ export const SPLIT_JOB_GUARD_DROP_SQL = [
  * CREATE TRIGGER IF NOT EXISTS and a re-run must not fail on its own trigger.
  */
 export const AMOUNT_TAX_GUARD_SQL = [
+    // THE STATEMENT'S OWN VOICE (round 41, item 3).
+    //
+    // `BEFORE UPDATE OF "needsTaxReview"` fires ONLY when that column is in the
+    // UPDATE's SET list -- which the old build can never do, because its Prisma
+    // client predates the column. That is the signal the guard needs to tell a
+    // new build's deliberate decision (an acknowledged tax review) from the old
+    // build's silence, and there is no other way to ask it: once a BEFORE
+    // trigger has NEW in hand, a column that was set to its existing value is
+    // indistinguishable from one that was never mentioned.
+    //
+    // It records the row AND the statement, so the exemption cannot leak: a
+    // second statement in the same transaction has a different
+    // `statement_timestamp()` and is judged on its own. `set_config(..., true)`
+    // is transaction-local, so nothing survives the COMMIT either.
+    //
+    // Named to sort BEFORE the guard: Postgres fires BEFORE ROW triggers in
+    // name order, and this has to have run before the guard reads it.
+    `CREATE OR REPLACE FUNCTION probuild_expense_amount_tax_ack()
+     RETURNS trigger
+     LANGUAGE plpgsql
+     AS $ack$
+     BEGIN
+         PERFORM set_config(
+             'probuild.tax_flag_stated',
+             NEW."id" || '@' || statement_timestamp()::text,
+             true
+         );
+         RETURN NEW;
+     END;
+     $ack$`,
+    `DROP TRIGGER IF EXISTS probuild_expense_amount_tax_ack ON "Expense"`,
+    `CREATE TRIGGER probuild_expense_amount_tax_ack
+     BEFORE UPDATE OF "needsTaxReview" ON "Expense"
+     FOR EACH ROW
+     EXECUTE FUNCTION probuild_expense_amount_tax_ack()`,
     `CREATE OR REPLACE FUNCTION probuild_expense_amount_tax_guard()
      RETURNS trigger
      LANGUAGE plpgsql
@@ -507,7 +588,28 @@ export const AMOUNT_TAX_GUARD_SQL = [
          -- 3. ANY movement in the gross re-opens a classification that survived
          --    the two branches above. The numbers still satisfy every CHECK,
          --    which is exactly why nothing else would ever ask.
-         IF was_classified THEN
+         --
+         --    UNLESS THE STATEMENT SPOKE FOR ITSELF (round 41, item 3). This
+         --    used to be unconditional, and it defeated a valid
+         --    taxReviewAck: the PUT decided the row was certified, omitted
+         --    the flag, and this line put it straight back -- so for the whole
+         --    drain window an acknowledged edit was still excluded from the
+         --    filing and queued for a review that had already happened.
+         --
+         --    The exemption is "this UPDATE named needsTaxReview in its SET
+         --    list", which is EXACTLY what the old build can never do: its
+         --    Prisma client predates the column. The companion trigger
+         --    probuild_expense_amount_tax_ack is declared BEFORE UPDATE OF
+         --    "needsTaxReview", so it fires only for a statement that names it,
+         --    and it fires FIRST because BEFORE ROW triggers run in name order
+         --    and 'ack' sorts before 'guard'. The marker carries the row id AND
+         --    statement_timestamp(), so it can only ever exempt the row and the
+         --    statement that set it -- a later statement in the same
+         --    transaction has a different timestamp and is judged on its own.
+         IF was_classified
+            AND COALESCE(current_setting('probuild.tax_flag_stated', true), '')
+                IS DISTINCT FROM NEW."id" || '@' || statement_timestamp()::text
+         THEN
              NEW."needsTaxReview" := true;
          END IF;
 
@@ -533,6 +635,11 @@ export const AMOUNT_TAX_GUARD_SQL = [
 export const AMOUNT_TAX_GUARD_DROP_SQL = [
     `DROP TRIGGER IF EXISTS probuild_expense_amount_tax_guard ON "Expense"`,
     `DROP FUNCTION IF EXISTS probuild_expense_amount_tax_guard()`,
+    // ...and its companion. The ack trigger is inert on its own -- it only
+    // writes a transaction-local setting -- but leaving it behind would mean
+    // every UPDATE naming needsTaxReview paid for a set_config forever.
+    `DROP TRIGGER IF EXISTS probuild_expense_amount_tax_ack ON "Expense"`,
+    `DROP FUNCTION IF EXISTS probuild_expense_amount_tax_ack()`,
 ];
 
 /**
@@ -801,7 +908,11 @@ END $$`,
     // added above. See SPLIT_JOB_GUARD_SQL and AMOUNT_TAX_GUARD_SQL.
     ...SPLIT_JOB_GUARD_SQL,
     ...AMOUNT_TAX_GUARD_SQL,
-    // See PROJECT_ID_BACKFILL and the POST-DEPLOY note above it.
+    // See PROJECT_ID_BACKFILL and the POST-DEPLOY note above it. The jobs are
+    // share-locked FIRST, in their own statement, because the UPDATE below
+    // takes FOR KEY SHARE on them through the new foreign key (round 41,
+    // item 1) -- Estimate -> Project otherwise, which deadlocks the whole run.
+    PROJECT_ID_BACKFILL_LOCK_PROJECTS,
     PROJECT_ID_BACKFILL,
 
     // ReceiptIntake is Phase 1's table. The guard keeps this runnable in EITHER
@@ -825,7 +936,16 @@ END $$`,
  * tests/apply-expense-attribution.test.ts).
  */
 export function postDeployStatements(timeZone) {
-    return [PROJECT_ID_BACKFILL, reanchorSql(timeZone), SOURCE_FILE_ID_BACKFILL];
+    return [
+        // The project locks travel WITH the fill they protect: the post-deploy
+        // pass runs the same statement against a live database, where a job
+        // editor is far more likely to be holding a Project row than during
+        // the pre-deploy window.
+        PROJECT_ID_BACKFILL_LOCK_PROJECTS,
+        PROJECT_ID_BACKFILL,
+        reanchorSql(timeZone),
+        SOURCE_FILE_ID_BACKFILL,
+    ];
 }
 
 /**

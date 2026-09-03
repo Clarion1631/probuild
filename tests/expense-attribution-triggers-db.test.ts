@@ -36,6 +36,7 @@ import {
     AMOUNT_TAX_GUARD_DROP_SQL,
     AMOUNT_TAX_GUARD_SQL,
 } from "../scripts/apply-expense-attribution.mjs";
+import { planTaxRevalidation } from "../src/lib/expense-attribution";
 
 const url =
     process.env.PHASE_INVARIANT_DB_TEST_URL ??
@@ -303,6 +304,154 @@ test("a NEW-BUILD write that restates the tax with the amount is left coherent",
     assert.equal(row!.taxSource, "manual", "and the human provenance with it");
     assert.equal(row!.taxAtSource, true);
     assert.equal(row!.needsTaxReview, true);
+});
+
+// ── the handler's own write, against the real constraints (round 41) ───────
+//
+// `tests/expense-edit-authz.test.ts` drives the PUT end to end, but its fake
+// `updateMany` enforces no CHECK constraints — which is precisely why "editing
+// a classified expense's gross returns 500" survived every unit test. These
+// apply the payload the handler actually produces, computed by the SHIPPED
+// `planTaxRevalidation`, to a real row with the real constraints in place.
+
+/** The `data` the PUT builds for a gross-only edit, per the shipped plan. */
+function putPayloadFor(row: {
+    taxAmount: number | null;
+    taxDeductibleBase: number | null;
+    installedAtCustomer: boolean | null;
+    taxSource: string | null;
+    taxDeductibleBaseSource: string | null;
+}, nextAmount: number) {
+    const plan = planTaxRevalidation(row, nextAmount, { grossMoved: true });
+    return { amount: nextAmount, ...plan.clears, ...(plan.needsTaxReview ? { needsTaxReview: true } : {}) };
+}
+
+const CLASSIFIED = {
+    taxAmount: 16.55,
+    taxDeductibleBase: null,
+    installedAtCustomer: true,
+    taxSource: "manual",
+    taxDeductibleBaseSource: null,
+};
+
+test("THE TRIGGER IS GONE: a gross edit that breaks the tax still lands valid", { skip }, async () => {
+    // ROUND 41, ITEM 2, with the compatibility scaffolding REMOVED — which is
+    // the state production ends in after `--post-deploy`, and the state the
+    // handler has to be correct in on its own. Three shapes, all of which used
+    // to write $16.55 of tax beside a gross that cannot carry it:
+    //   * a sign flip (a purchase corrected into a refund),
+    //   * zero, and
+    //   * a positive gross smaller than the tax.
+    await removeGuard();
+    try {
+        for (const nextAmount of [-5, 0, 10]) {
+            await seedClassified({ ...CLASSIFIED, taxAtSource: true, needsTaxReview: false });
+            const data = putPayloadFor(CLASSIFIED, nextAmount);
+            await db!.expense.updateMany({ where: { id: EXPENSE }, data });
+            const row = await readRow();
+            assert.equal(num(row!.amount), nextAmount, `amount ${nextAmount}`);
+            assert.equal(row!.taxAmount, null, `tax cleared at ${nextAmount}`);
+            assert.equal(row!.taxAtSource, false, `derived flag cleared at ${nextAmount}`);
+            assert.equal(row!.taxSource, null, `provenance cleared at ${nextAmount}`);
+            assert.equal(row!.installedAtCustomer, null, `deduction answer cleared at ${nextAmount}`);
+            assert.equal(row!.needsTaxReview, true, `flagged at ${nextAmount}`);
+        }
+    } finally {
+        await installGuard();
+    }
+});
+
+test("...and WITHOUT the clears that same write is refused by the CHECK", { skip }, async () => {
+    // The control. The old handler wrote `{ amount }` alone; with the trigger
+    // gone, Postgres refuses it and the route's generic catch answers 500.
+    await removeGuard();
+    try {
+        for (const nextAmount of [-5, 0, 10]) {
+            await seedClassified({ ...CLASSIFIED, taxAtSource: true, needsTaxReview: false });
+            await assert.rejects(
+                () => db!.$executeRawUnsafe(
+                    `UPDATE "Expense" SET "amount" = $1 WHERE id = $2`, nextAmount, EXPENSE,
+                ),
+                (error: { message?: string }) =>
+                    /Expense_taxAmount_check|violates check constraint/i.test(String(error?.message ?? error)),
+                `amount ${nextAmount} must be refused without the clears`,
+            );
+        }
+    } finally {
+        await installGuard();
+    }
+});
+
+test("a gross that still carries the tax keeps every figure", { skip }, async () => {
+    // The control for the control: the plan clears nothing it does not have to.
+    await removeGuard();
+    try {
+        await seedClassified({ ...CLASSIFIED, taxAtSource: true, needsTaxReview: false });
+        await db!.expense.updateMany({ where: { id: EXPENSE }, data: putPayloadFor(CLASSIFIED, 150) });
+        const row = await readRow();
+        assert.equal(num(row!.amount), 150);
+        assert.equal(num(row!.taxAmount), 16.55, "nothing of the person's is thrown away");
+        assert.equal(row!.taxSource, "manual");
+        assert.equal(row!.installedAtCustomer, true);
+        assert.equal(row!.needsTaxReview, true, "but it is still a review");
+    } finally {
+        await installGuard();
+    }
+});
+
+// ── an acknowledged write survives the drain window (round 41, item 3) ─────
+
+test("THE TRIGGER IS INSTALLED: an ACKED write stays unflagged", { skip }, async () => {
+    // The handler decided the row was certified and says so by naming the flag
+    // column. The trigger's exemption is exactly that — a statement that names
+    // `needsTaxReview` is one the old build could not have written, because its
+    // Prisma client predates the column.
+    await seedClassified({ ...CLASSIFIED, taxAtSource: true, needsTaxReview: false });
+    await db!.expense.updateMany({
+        where: { id: EXPENSE },
+        data: { amount: 150, needsTaxReview: false },
+    });
+    const row = await readRow();
+    assert.equal(num(row!.amount), 150);
+    assert.equal(row!.needsTaxReview, false, "the certification survives the scaffolding");
+    assert.equal(num(row!.taxAmount), 16.55, "and so do the figures it certified");
+});
+
+test("...an UN-acked write by the same build IS flagged", { skip }, async () => {
+    // The control. The new build states `true` when it has not been given an
+    // ack, and the trigger agrees rather than arguing.
+    await seedClassified({ ...CLASSIFIED, taxAtSource: true, needsTaxReview: false });
+    await db!.expense.updateMany({
+        where: { id: EXPENSE },
+        data: { amount: 150, needsTaxReview: true },
+    });
+    assert.equal((await readRow())!.needsTaxReview, true);
+});
+
+test("...and an OLD-BUILD write, which cannot name the column, is flagged", { skip }, async () => {
+    // The whole reason the trigger exists. Raw SQL with no `needsTaxReview` in
+    // the SET list is exactly what the draining build emits.
+    await seedClassified({ ...CLASSIFIED, taxAtSource: true, needsTaxReview: false });
+    await oldBuildSetsAmount(150);
+    assert.equal((await readRow())!.needsTaxReview, true);
+});
+
+test("the exemption cannot leak to another row or another statement", { skip }, async () => {
+    // The marker carries the row id AND `statement_timestamp()`, so an
+    // acknowledged write cannot buy silence for a different row, or for a
+    // later statement in the same transaction.
+    await seedClassified({ ...CLASSIFIED, taxAtSource: true, needsTaxReview: false });
+    await db!.$transaction(async tx => {
+        await tx.expense.updateMany({
+            where: { id: EXPENSE },
+            data: { amount: 150, needsTaxReview: false },
+        });
+        // A SECOND statement, same row, same transaction, no flag named.
+        await tx.$executeRawUnsafe(`UPDATE "Expense" SET "amount" = $1 WHERE id = $2`, 160, EXPENSE);
+    });
+    const row = await readRow();
+    assert.equal(num(row!.amount), 160);
+    assert.equal(row!.needsTaxReview, true, "the second statement was judged on its own");
 });
 
 test("the guard is idempotent to re-create, and the teardown really removes it", { skip }, async () => {

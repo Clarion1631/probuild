@@ -46,6 +46,10 @@ import {
 } from "../src/lib/qbo-expense-sync";
 import { createParsedReceiptExpense } from "../src/lib/receipt-parse-expense";
 import { runBackfill } from "../scripts/backfill-expense-attribution";
+import {
+    PROJECT_ID_BACKFILL,
+    PROJECT_ID_BACKFILL_LOCK_PROJECTS,
+} from "../scripts/apply-expense-attribution.mjs";
 
 const url =
     process.env.PHASE_INVARIANT_DB_TEST_URL ??
@@ -680,6 +684,107 @@ test("the RECEIPT sequence, parents first, against an exclusive Estimate holder"
         assert.equal(writerError, null, `the upload failed: ${writerError}`);
         assert.equal(booker.error, null, `the other writer failed: ${booker.error}`);
         assert.equal(outcome, "won", "it waited and then wrote the receipt url");
+    } finally {
+        await cleanup();
+    }
+});
+
+// ── the MIGRATION's own backfill has the same order to obey (round 41, item 1)
+//
+// `PROJECT_ID_BACKFILL` locks Estimate rows and then UPDATEs
+// `Expense.projectId`. That UPDATE is not the estimate-only statement it looks
+// like: the foreign key the same script adds makes Postgres take FOR KEY SHARE
+// on every referenced Project row to enforce it, so the statement's real order
+// is Estimate -> Project. A job editor holding its Project row FOR UPDATE while
+// reaching for an estimate closes the cycle — and because the script runs
+// everything in ONE transaction, the 40P01 victim is the whole DDL run, not one
+// row.
+//
+// These execute the SHIPPED SQL strings, imported from the apply script (it is
+// inert on import, asserted by tests/apply-scripts-inert-on-import.test.ts), so
+// what is measured is what will run against production.
+
+test("CONTROL: the backfill UPDATE alone deadlocks through its foreign key", { skip }, async () => {
+    // The pre-fix shape: the locked-CTE fill with no Project lock in front of
+    // it. Nothing in that SQL names "Project"; the foreign key does.
+    await seed();
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: null } });
+    try {
+        const projectHeld = gate();
+        const editor = projectFirstEditor(projectHeld);
+        await projectHeld.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            await tx.$executeRawUnsafe(PROJECT_ID_BACKFILL as string);
+        }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(editor.error),
+            `expected 40P01 from the FK's implicit Project lock; writer=${writerError} editor=${editor.error}`,
+        );
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the shipped pair — lock the jobs, then fill — waits instead of deadlocking", { skip }, async () => {
+    // Both statements, in the order the script runs them, in one transaction.
+    await seed();
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: null } });
+    try {
+        const projectHeld = gate();
+        const editor = projectFirstEditor(projectHeld);
+        await projectHeld.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            await tx.$executeRawUnsafe(PROJECT_ID_BACKFILL_LOCK_PROJECTS as string);
+            await tx.$executeRawUnsafe(PROJECT_ID_BACKFILL as string);
+        }, { timeout: 30_000 }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `the backfill was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `the backfill failed: ${writerError}`);
+        assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+        // Waiting is only the right answer if the work still happened.
+        const filled = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true },
+        });
+        assert.deepEqual(filled, { projectId: PROJECT }, "it waited and then attributed the row");
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the project lock covers exactly the jobs the fill will touch", { skip }, async () => {
+    // A lock statement that selects nothing protects nothing. This proves the
+    // predicate finds the job of an unattributed expense — and stops finding it
+    // once the fill has run, which is the same idempotency the fill has.
+    await seed();
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: null } });
+    try {
+        const before = (await writerDb!.$queryRawUnsafe(
+            (PROJECT_ID_BACKFILL_LOCK_PROJECTS as string).replace(/\s+FOR SHARE$/, ""),
+        )) as { id: string }[];
+        assert.ok(before.some(row => row.id === PROJECT), "the job of an unattributed expense is locked");
+
+        await writerDb!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(PROJECT_ID_BACKFILL_LOCK_PROJECTS as string);
+            await tx.$executeRawUnsafe(PROJECT_ID_BACKFILL as string);
+        });
+
+        const after = (await writerDb!.$queryRawUnsafe(
+            (PROJECT_ID_BACKFILL_LOCK_PROJECTS as string).replace(/\s+FOR SHARE$/, ""),
+        )) as { id: string }[];
+        assert.ok(!after.some(row => row.id === PROJECT), "and stops locking it once there is nothing to fill");
     } finally {
         await cleanup();
     }

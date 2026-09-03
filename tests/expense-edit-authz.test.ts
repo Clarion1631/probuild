@@ -726,15 +726,34 @@ test("a junk amount is REFUSED, not silently truncated", async () => {
 
 // ── money here is SIGNED (Codex round 40, item 2) ──────────────────────────
 
+/** Everything a tax classification is made of, cleared in one statement. */
+function assertClassificationCleared(data: Record<string, unknown> | undefined) {
+    assert.equal(data?.taxAmount, null, "the figure the new gross cannot carry");
+    assert.equal(data?.taxAtSource, false, "and the flag DERIVED from it, or the CHECK refuses the row");
+    assert.equal(data?.taxDeductibleBase, null);
+    assert.equal(data?.taxDeductibleBaseSource, null);
+    assert.equal(data?.taxSource, null, "provenance goes with the figure it described");
+    assert.equal(data?.installedAtCustomer, null);
+    assert.equal(data?.needsTaxReview, true, "and a person is asked");
+}
+
 test("a NEGATIVE amount is a refund, not an error", async () => {
     // This route refused every negative gross, so the one handler that can
     // change a receipt's total could not correct a credit at all — the amount
     // was the very thing it would not accept. The QBO sync writes negative
     // grosses, both tax CHECK constraints are written for them, and the
     // PATCH's sign rules exist to serve them.
+    //
+    // ROUND 41, ITEM 2: the $16.55 of tax on the fixture points the other way
+    // from a -$5 gross, so it cannot survive. It used to be written unchanged
+    // beside the new amount — a row that violates `Expense_taxAmount_check`,
+    // which Postgres refuses and the generic catch reports as a 500. The fake
+    // `updateMany` enforces no CHECKs, which is exactly why this test passed
+    // while production would not have.
     const res = await call({ amount: -5 });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.amount, -5);
+    assertClassificationCleared(updateArgs?.data);
 });
 
 test("a NON-FINITE amount is still refused", async () => {
@@ -793,9 +812,33 @@ test("a base pointing the WRONG way is refused, whichever way round", async () =
 
 test("ZERO is a real amount, not an omission", async () => {
     // `body.amount ? ...` dropped it, so a receipt could never be zeroed.
+    // ROUND 41, ITEM 2: $16.55 of tax on a $0 receipt is larger than the gross,
+    // so the classification cannot survive the edit and is cleared with it.
     const res = await call({ amount: 0 });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.amount, 0);
+    assertClassificationCleared(updateArgs?.data);
+});
+
+test("a gross that SHRINKS below the recorded tax clears it too", async () => {
+    // The third shape of the same failure, and the least obvious: $16.55 of tax
+    // on a $10 receipt points the right way and is merely too big.
+    const res = await call({ amount: "10.00" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.amount, 10);
+    assertClassificationCleared(updateArgs?.data);
+});
+
+test("...and a gross that STILL carries the tax clears nothing", async () => {
+    // The control for all three. $16.55 on $150 is inside every rule, so the
+    // figures stay and only the review flag is raised — clearing here would
+    // throw away a person's answer for no reason.
+    const res = await call({ amount: "150.00" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.amount, 150);
+    assert.equal("taxAmount" in (updateArgs?.data ?? {}), false, "nothing of the person's is touched");
+    assert.equal("taxSource" in (updateArgs?.data ?? {}), false);
+    assert.equal(updateArgs?.data.needsTaxReview, true, "but it is still a review");
 });
 
 test("the value validated is the value persisted", async () => {
@@ -1648,7 +1691,12 @@ test("...and WITH a matching acknowledgement it is not flagged", async () => {
     const res = await call({ amount: "200.00", taxReviewAck: ackFor(200) });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.amount, 200);
-    assert.equal(updateArgs?.data.needsTaxReview, undefined, "the review already happened");
+    // EXPLICITLY false, not omitted (round 41, item 3). The compatibility
+    // trigger forces the flag on every classified gross change it sees, and
+    // its only exemption is "this statement named the flag column" -- which is
+    // exactly what the old build can never do. Staying silent here meant a
+    // certified edit came back flagged for the whole drain window.
+    assert.equal(updateArgs?.data.needsTaxReview, false, "the review already happened, and it says so");
 });
 
 test("an ack naming a DIFFERENT total is refused, not silently downgraded", async () => {

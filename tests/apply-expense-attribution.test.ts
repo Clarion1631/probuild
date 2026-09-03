@@ -33,6 +33,7 @@ import {
     postDeployStatements,
     postDeployTeardownStatements,
     PROJECT_ID_BACKFILL,
+    PROJECT_ID_BACKFILL_LOCK_PROJECTS,
     reanchorSql,
     SOURCE_FILE_ID_BACKFILL,
     SPLIT_JOB_GUARD_DROP_SQL,
@@ -261,7 +262,7 @@ test("every statement is additive — nothing drops, renames, or rewrites data",
         const isConstraintReplace =
             /DROP CONSTRAINT IF EXISTS "Expense_(taxAmount|taxDeductibleBase|taxAtSource)_check"/.test(statement);
         const isGuardTriggerReplace =
-            /^DROP TRIGGER IF EXISTS probuild_expense_(estimate_pair|amount_tax)_guard ON "Expense"$/.test(statement.trim());
+            /^DROP TRIGGER IF EXISTS probuild_expense_(estimate_pair|amount_tax)_(guard|ack) ON "Expense"$/.test(statement.trim());
         assert.ok(
             isConstraintReplace || isGuardTriggerReplace || !/\bDROP\b/i.test(statement),
             `destructive statement: ${statement}`,
@@ -651,8 +652,16 @@ test("every post-deploy statement is idempotent BY PREDICATE", () => {
     // whether that row has ever been anchored before or not (round 31, item 3:
     // it must NOT be gated on the marker, or an old client's rewrite of an
     // already-anchored row is invisible to this exact pass).
-    const [projectFill, reanchor, sourceFileFill] = postDeployStatements("America/Los_Angeles");
-    assert.equal(postDeployStatements("America/Los_Angeles").length, 3);
+    // The project LOCK travels with the fill it protects (round 41, item 1) and
+    // is trivially idempotent: it is a locking SELECT that writes nothing. It
+    // must come immediately before the fill, because that is the whole point.
+    const [lockProjects, projectFill, reanchor, sourceFileFill] =
+        postDeployStatements("America/Los_Angeles");
+    assert.equal(postDeployStatements("America/Los_Angeles").length, 4);
+    assert.equal(lockProjects, PROJECT_ID_BACKFILL_LOCK_PROJECTS, "the array holds the exported constant");
+    assert.match(lockProjects, /FROM "Project" p/);
+    assert.match(lockProjects, /ORDER BY p\.id\s+FOR SHARE/);
+    assert.ok(!/\b(UPDATE|INSERT|DELETE)\b/i.test(lockProjects), "it locks, it does not write");
     assert.match(projectFill, /"projectId" IS NULL/);
     assert.doesNotMatch(reanchor, /"attributionAnchoredAt" IS NULL/);
     assert.match(reanchor, /"date"::time = TIME '00:00:00'/);
@@ -662,6 +671,35 @@ test("every post-deploy statement is idempotent BY PREDICATE", () => {
     // a row left in that shape is invisible to the new equality dedupe.
     assert.match(sourceFileFill, /"sourceFileId" IS NULL/);
     assert.equal(sourceFileFill, SOURCE_FILE_ID_BACKFILL, "the array holds the exported constant");
+});
+
+test("the projects are locked in their own statement, immediately before the fill", () => {
+    // ROUND 41, ITEM 1. The fill's UPDATE takes FOR KEY SHARE on every
+    // referenced Project through the foreign key this same script adds, so on
+    // its own it is Estimate -> Project — the inversion rounds 37 to 40 removed
+    // from the application, reintroduced by the migration that creates the
+    // constraint. A 40P01 here rolls back the whole DDL run.
+    const main = statements as string[];
+    const lockAt = main.indexOf(PROJECT_ID_BACKFILL_LOCK_PROJECTS);
+    const fillAt = main.indexOf(PROJECT_ID_BACKFILL);
+    assert.ok(lockAt > -1, "the project lock is in the main run");
+    assert.equal(fillAt, lockAt + 1, "nothing may run between the lock and the fill it protects");
+    // A SEPARATE statement, not another CTE: CTE evaluation order is not
+    // guaranteed, so a locking CTE beside the fill would be a hope rather than
+    // a rule. Two statements in one transaction have a defined order.
+    assert.ok(
+        !/WITH\s/i.test(PROJECT_ID_BACKFILL_LOCK_PROJECTS),
+        "the project lock must not be folded into a CTE",
+    );
+    // ...and both halves are in the committed migration, in that order.
+    const lockInMigration = migrationSql.indexOf('FROM "Project" p');
+    const fillInMigration = migrationSql.indexOf('UPDATE "Expense" e SET "projectId" = locked."projectId"');
+    assert.ok(lockInMigration > -1 && fillInMigration > -1);
+    assert.ok(lockInMigration < fillInMigration, "the migration locks the jobs first too");
+    assert.ok(
+        normalizedMigration.includes(normalize(PROJECT_ID_BACKFILL_LOCK_PROJECTS).replace(/;$/, "")),
+        "migration.sql is missing the project lock",
+    );
 });
 
 test("the live-write gap is documented where the statement is, not only in a PR", () => {
@@ -931,7 +969,7 @@ test("the amount/tax guard is a transcription of planExpenseUpdate, not a new po
     // keeps the two from drifting into different answers about the same row;
     // the BEHAVIOUR is proved against a real Postgres in
     // tests/expense-attribution-triggers-db.test.ts.
-    const fn = AMOUNT_TAX_GUARD_SQL.find(s => s.includes("CREATE OR REPLACE FUNCTION"))!;
+    const fn = AMOUNT_TAX_GUARD_SQL.find(s => s.includes("FUNCTION probuild_expense_amount_tax_guard()"))!;
     // It fires only on a gross that actually moved.
     assert.match(fn, /NEW\."amount" IS NOT DISTINCT FROM OLD\."amount"[\s\S]{0,60}RETURN NEW/);
     // Branch 1: the tax cannot fit — the figure AND every provenance that
@@ -975,8 +1013,20 @@ test("the amount/tax guard is a transcription of planExpenseUpdate, not a new po
     // Nothing outside the shared list may appear in the test at all.
     const allNamed = [...clauseBody.matchAll(/OLD\."(\w+)"/g)].map(m => m[1]);
     assert.deepEqual(allNamed, [...TAX_CLASSIFICATION_COLUMNS]);
-    // ...and the review flag is the only thing branch 3 sets.
-    assert.match(fn, /IF was_classified THEN\s+NEW\."needsTaxReview" := true;\s+END IF;/);
+    // ...and the review flag is the only thing branch 3 sets — but ONLY when
+    // the statement did not state the flag itself (round 41, item 3). It used
+    // to be unconditional, which is what defeated a valid `taxReviewAck`.
+    assert.match(
+        fn,
+        /IF was_classified\s+AND COALESCE\(current_setting\('probuild\.tax_flag_stated', true\), ''\)\s+IS DISTINCT FROM NEW\."id" \|\| '@' \|\| statement_timestamp\(\)::text\s+THEN\s+NEW\."needsTaxReview" := true;\s+END IF;/,
+    );
+    // Branches 1 and 2 stay UNCONDITIONAL: a classification the new gross
+    // cannot carry needs review whatever the statement claims, and the old
+    // build cannot reach them while naming the flag anyway.
+    assert.ok(
+        !/tax_flag_stated/.test(fn.slice(0, fn.indexOf("IF was_classified"))),
+        "the exemption applies to branch 3 only",
+    );
     // The derived flag is re-derived last, so no path can leave the row in
     // violation of Expense_taxAtSource_check.
     assert.match(fn, /NEW\."taxAtSource" := \(NEW\."taxAmount" IS NOT NULL AND NEW\."taxAmount" <> 0\);\s+RETURN NEW/);
@@ -988,7 +1038,7 @@ test("the amount/tax guard is a transcription of planExpenseUpdate, not a new po
 });
 
 test("the amount/tax trigger fires BEFORE UPDATE OF amount, per row", () => {
-    const trigger = AMOUNT_TAX_GUARD_SQL.find(s => /^CREATE TRIGGER/.test(s.trim()))!;
+    const trigger = AMOUNT_TAX_GUARD_SQL.find(s => /^CREATE TRIGGER probuild_expense_amount_tax_guard/.test(s.trim()))!;
     assert.match(trigger, /BEFORE UPDATE OF "amount" ON "Expense"/);
     assert.match(trigger, /FOR EACH ROW/);
     // BEFORE, not AFTER: an AFTER trigger cannot change the row that is

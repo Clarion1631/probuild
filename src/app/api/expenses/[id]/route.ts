@@ -13,6 +13,7 @@ import {
     expenseStillOnProjectWhere,
     hasTaxClassification,
     parseCostCodeIdEdit,
+    planTaxRevalidation,
     taxDeductibleBaseFits,
     isPlausibleReceiptTax,
     itemBelongsToProjectTx,
@@ -518,12 +519,42 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             // see every shape Postgres refuses. Reaching it means something
             // moved under the request, and it is answered as a 400 naming the
             // remedy instead of as the 500 a CHECK violation surfaces as.
-            const ceiling = deductionCeiling(finalAmount, lockedTax);
-            // The SAME helper the fast fail above uses, so the pre-transaction
-            // answer and the under-lock answer can never disagree about one row
-            // (round 40, item 2 — they did, and the disagreement was the bug).
-            const baseFits = taxDeductibleBaseFits(lockedBase, finalAmount, lockedTax);
-            if (!baseFits) {
+            // THE NEW GROSS, JUDGED AGAINST THE FIGURES ALREADY ON THE ROW,
+            // THROUGH THE SHARED PLAN (round 41, item 2).
+            //
+            // This route could only ever RAISE `needsTaxReview`. It never
+            // handled a tax the new gross cannot carry, so editing a $207.74
+            // receipt with $16.55 of tax down to 0, to -5, or to any positive
+            // amount under $16.55 wrote a row that violates
+            // `Expense_taxAmount_check` — Postgres refused it and the generic
+            // catch turned that into a 500. The unit tests said 200 because the
+            // fake `updateMany` enforces no CHECK constraints, and production
+            // said nothing because the rollout trigger was quietly repairing
+            // the row until `--post-deploy` drops it.
+            //
+            // `planTaxRevalidation` is the same rule the QBO sync applies and
+            // the compatibility trigger transcribes, so all three now answer
+            // one question one way.
+            const revalidation = planTaxRevalidation(
+                {
+                    taxAmount: lockedTax,
+                    taxDeductibleBase: lockedBase,
+                    installedAtCustomer: current.installedAtCustomer,
+                    taxSource: lockedTaxSource,
+                    taxDeductibleBaseSource: lockedBaseSource,
+                },
+                finalAmount,
+                { grossMoved: grossChanges },
+            );
+            // A BASE THAT NO LONGER FITS IS STILL A 400 HERE, not a silent
+            // clear. The plan's branch 2 would throw the allocation away; this
+            // route deliberately refuses instead and names the remedy, which is
+            // strictly more conservative — nothing of the person's is destroyed
+            // and they are told why (round 35). The plan's branch 1 CANNOT be
+            // answered that way: refusing every gross edit on a row whose tax
+            // no longer fits would leave the receipt uncorrectable through the
+            // only handler that can correct it.
+            if (revalidation.reason === "base-cannot-fit") {
                 return { expense: null, phaseRejected: null, denied: "base" } as const;
             }
 
@@ -607,8 +638,32 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             }
             // ...and an ack cannot certify an IMPOSSIBLE classification: a tax
             // outside the 12% band is a figure no writer of that column would
-            // have accepted, whoever says otherwise.
-            const flagsReview = classified && grossChanges && !(ackCounts && stillPlausible);
+            // have accepted, whoever says otherwise — and neither can it
+            // certify one the plan just had to CLEAR.
+            const flagsReview =
+                revalidation.needsTaxReview &&
+                !(ackCounts && stillPlausible && revalidation.reason !== "tax-cannot-fit");
+            // AND THE ACKNOWLEDGED WRITE SAYS SO OUT LOUD (round 41, item 3).
+            //
+            // During the drain window the compatibility trigger forces
+            // `needsTaxReview` true on EVERY classified gross change, because
+            // the old build cannot speak for itself. It cannot see an ack, so a
+            // certified edit was flagged anyway and the row stayed out of the
+            // filing — the ack bought nothing for exactly as long as the
+            // scaffolding stood.
+            //
+            // The trigger's exemption is "this statement named the flag
+            // column", which is precisely what the old build can never do. So
+            // an acknowledged write states `needsTaxReview: false` EXPLICITLY
+            // rather than omitting it. Writing `false` onto a row that is
+            // already `false` changes no data; it is the signal.
+            //
+            // Only when the row was NOT already flagged. Clearing a flag that
+            // is already up needs the PATCH, which demands the figures
+            // themselves — this route may not write the tax columns at all, so
+            // it has no business retiring a review it cannot answer.
+            const acknowledgedWrite =
+                !flagsReview && classified && grossChanges && ackCounts && !current.needsTaxReview;
 
             const written = await tx.expense.updateMany({
             where: {
@@ -664,12 +719,24 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                         costCodeConfidence: null,
                     }
                     : {}),
+                // FIGURES THE NEW GROSS CANNOT CARRY GO IN THE SAME STATEMENT
+                // AS THE GROSS (round 41, item 2). Without this the write
+                // violates `Expense_taxAmount_check` and the handler answers
+                // 500; with it the row lands valid and flagged, which is the
+                // policy the QBO sync and the rollout trigger already apply.
+                ...revalidation.clears,
                 // Raised in the SAME statement as the gross that invalidated
                 // the classification. Two statements would leave a window in
                 // which the excise report sees the new amount under the old
                 // certification — which is the exact state the flag exists to
                 // keep out of a filing.
-                ...(flagsReview ? { needsTaxReview: true } : {}),
+                ...(flagsReview
+                    ? { needsTaxReview: true }
+                    // ...and an ACKNOWLEDGED write states the flag explicitly
+                    // rather than staying silent, so the compatibility trigger
+                    // can tell a certified edit from the old build's (round 41,
+                    // item 3). No-op as data; load-bearing as a signal.
+                    : acknowledgedWrite ? { needsTaxReview: false } : {}),
             },
             });
             if (written.count === 0) {

@@ -289,6 +289,27 @@ EXECUTE FUNCTION probuild_expense_estimate_pair_guard();
 -- Dropped again at the end of this file, like the guard above: in production
 -- the drop is the --post-deploy pass; here the two run back to back so a
 -- database built from these migrations ends in production's END state.
+CREATE OR REPLACE FUNCTION probuild_expense_amount_tax_ack()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $ack$
+BEGIN
+    PERFORM set_config(
+        'probuild.tax_flag_stated',
+        NEW."id" || '@' || statement_timestamp()::text,
+        true
+    );
+    RETURN NEW;
+END;
+$ack$;
+
+DROP TRIGGER IF EXISTS probuild_expense_amount_tax_ack ON "Expense";
+
+CREATE TRIGGER probuild_expense_amount_tax_ack
+BEFORE UPDATE OF "needsTaxReview" ON "Expense"
+FOR EACH ROW
+EXECUTE FUNCTION probuild_expense_amount_tax_ack();
+
 CREATE OR REPLACE FUNCTION probuild_expense_amount_tax_guard()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -353,7 +374,28 @@ BEGIN
     -- 3. ANY movement in the gross re-opens a classification that survived
     --    the two branches above. The numbers still satisfy every CHECK,
     --    which is exactly why nothing else would ever ask.
-    IF was_classified THEN
+    --
+    --    UNLESS THE STATEMENT SPOKE FOR ITSELF (round 41, item 3). This
+    --    used to be unconditional, and it defeated a valid
+    --    taxReviewAck: the PUT decided the row was certified, omitted
+    --    the flag, and this line put it straight back -- so for the whole
+    --    drain window an acknowledged edit was still excluded from the
+    --    filing and queued for a review that had already happened.
+    --
+    --    The exemption is "this UPDATE named needsTaxReview in its SET
+    --    list", which is EXACTLY what the old build can never do: its
+    --    Prisma client predates the column. The companion trigger
+    --    probuild_expense_amount_tax_ack is declared BEFORE UPDATE OF
+    --    "needsTaxReview", so it fires only for a statement that names it,
+    --    and it fires FIRST because BEFORE ROW triggers run in name order
+    --    and 'ack' sorts before 'guard'. The marker carries the row id AND
+    --    statement_timestamp(), so it can only ever exempt the row and the
+    --    statement that set it -- a later statement in the same
+    --    transaction has a different timestamp and is judged on its own.
+    IF was_classified
+       AND COALESCE(current_setting('probuild.tax_flag_stated', true), '')
+           IS DISTINCT FROM NEW."id" || '@' || statement_timestamp()::text
+    THEN
         NEW."needsTaxReview" := true;
     END IF;
 
@@ -382,6 +424,35 @@ EXECUTE FUNCTION probuild_expense_amount_tax_guard();
 -- transaction. Kept byte-identical in meaning to PROJECT_ID_BACKFILL in
 -- scripts/apply-expense-attribution.mjs (asserted by
 -- tests/apply-expense-attribution.test.ts).
+-- THE JOBS FIRST (round 41, item 1). The UPDATE below is not the
+-- estimate-only statement it looks like: the foreign key added by this same
+-- migration makes Postgres take FOR KEY SHARE on every referenced Project row
+-- to enforce it, so its real order is Estimate -> Project. A job editor
+-- holding its Project row FOR UPDATE while reaching for an estimate closes the
+-- cycle, and Postgres breaks it with 40P01 -- which here means the whole
+-- migration transaction, not one row.
+--
+-- A separate STATEMENT rather than another CTE, because CTE evaluation order
+-- is not guaranteed and "lock the projects in an earlier CTE" would be a hope
+-- rather than a rule. Two statements in one transaction have a defined order,
+-- and the first one's locks are held for the second. Kept byte-identical in
+-- meaning to PROJECT_ID_BACKFILL_LOCK_PROJECTS in
+-- scripts/apply-expense-attribution.mjs (asserted by
+-- tests/apply-expense-attribution.test.ts).
+SELECT p.id
+  FROM "Project" p
+ WHERE p.id IN (
+       SELECT DISTINCT est."projectId"
+         FROM "Estimate" est
+        WHERE est."projectId" IS NOT NULL
+          AND EXISTS (
+                SELECT 1 FROM "Expense" e
+                 WHERE e."estimateId" = est.id AND e."projectId" IS NULL
+              )
+     )
+ ORDER BY p.id
+   FOR SHARE;
+
 WITH locked AS (
   SELECT est.id, est."projectId"
     FROM "Estimate" est
@@ -421,3 +492,5 @@ DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard ON "Expense";
 DROP FUNCTION IF EXISTS probuild_expense_estimate_pair_guard();
 DROP TRIGGER IF EXISTS probuild_expense_amount_tax_guard ON "Expense";
 DROP FUNCTION IF EXISTS probuild_expense_amount_tax_guard();
+DROP TRIGGER IF EXISTS probuild_expense_amount_tax_ack ON "Expense";
+DROP FUNCTION IF EXISTS probuild_expense_amount_tax_ack();
