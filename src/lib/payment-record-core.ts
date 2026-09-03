@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum } from "./prisma-helpers";
+import { PENDING_DELETION_MARKER } from "./qbo-create-markers";
 
 /**
  * Manual (non-QuickBooks) milestone settlement core — the transaction body of
@@ -71,6 +72,21 @@ export async function recordPaymentCore(
             },
         });
         if (claim.count === 0) return { success: false as const, error: "Milestone already paid" };
+
+        // Money beats cleanup. A milestone whose QuickBooks invoice was queued
+        // for deletion has just been PAID, so the deletion intent is cancelled
+        // here, in the same transaction as the settle. Left standing it formed a
+        // state nothing could leave: the sweep kept selecting the row, but the
+        // final unlink requires `status != Paid`, so a confirmed remote deletion
+        // left a permanent link to a document that no longer exists.
+        //
+        // A separate write rather than a clause on the claim above: a settle must
+        // never be made conditional on a marker (see the INVARIANT on
+        // settleMilestonePaidInTx), and this is idempotent either way.
+        await t.paymentSchedule.updateMany({
+            where: { id: paymentId, qbSyncError: PENDING_DELETION_MARKER },
+            data: { qbSyncError: null },
+        });
 
         // Recalculate from scratch (matches Stripe webhook) to avoid drift.
         const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });

@@ -39,12 +39,21 @@ const state: {
     locksTaken: number;
     /** Fired inside the create, to model a concurrent edit mid-flight. */
     onCreate: (() => void) | null;
+    /**
+     * Fired once, right after the handler's FIRST read of the record ' — ' the only
+     * window in which an edit can make the pre-lock copy and the locked
+     * snapshot disagree.
+     */
+    onFirstRead: (() => void) | null;
     /** The PrivateNote each create actually sent. */
     sentNotes: Array<string | undefined>;
+    /** The line items and total each create actually sent. */
+    sentItems: any[][];
+    sentTotals: number[];
 } = {
     user: null, estimates: {}, invoices: {}, posts: [], createThrows: null,
     lookup: { estimates: [], invoices: [], throws: null, calls: [] },
-    clientQbCustomerId: "42", locksTaken: 0, onCreate: null, sentNotes: [],
+    clientQbCustomerId: "42", locksTaken: 0, onCreate: null, onFirstRead: null, sentNotes: [], sentItems: [], sentTotals: [],
 };
 
 function resetState() {
@@ -57,7 +66,10 @@ function resetState() {
     state.clientQbCustomerId = "42";
     state.locksTaken = 0;
     state.onCreate = null;
+    state.onFirstRead = null;
     state.sentNotes = [];
+    state.sentItems = [];
+    state.sentTotals = [];
 }
 
 const fakePermissions = {
@@ -74,8 +86,19 @@ function table(rows: Record<string, any>) {
         // route snapshot move with a concurrent edit, so a CAS pinned to that
         // snapshot could never fail - which would have made the interleaving
         // tests below pass against no guard at all.
-        findUnique: async (args: { where: { id: string } }) =>
-            rows[args.where.id] ? { ...rows[args.where.id] } : null,
+        findUnique: async (args: { where: { id: string } }) => {
+            const row = rows[args.where.id];
+            if (!row) return null;
+            const snapshot = { ...row };
+            // AFTER the copy is taken: the caller keeps the old state, the next
+            // read sees the new one. That is the interleaving.
+            const hook = state.onFirstRead;
+            if (hook) {
+                state.onFirstRead = null;
+                hook();
+            }
+            return snapshot;
+        },
         updateMany: async (args: { where: Record<string, any>; data: Record<string, any> }) => {
             const row = rows[args.where.id];
             if (!row) return { count: 0 };
@@ -131,6 +154,14 @@ const QUICKBOOKS_SPECIFIER = "@/lib/quickbooks";
  * cannot quietly stub the module for anything else in the graph.
  */
 const RELATIVE_QUICKBOOKS_SPECIFIER = "./quickbooks";
+/**
+ * Same trap, one module along: `decideUnderIdentity` now lives in
+ * qbo-document-sync.ts, which imports prisma RELATIVELY. Patching only the
+ * route alias left the identity decision talking to a real PrismaClient, so
+ * every request 500ed. Scoped by requiring FILENAME so this cannot stub the
+ * module for anything else in the graph.
+ */
+const RELATIVE_PRISMA_SPECIFIER = "./prisma";
 
 let POST: (req: Request) => Promise<Response>;
 
@@ -152,6 +183,9 @@ before(async () => {
         }
         if (id === QB_PAYMENTS_SPECIFIER) return fakeQbPayments;
         if (id === INTEGRATION_STORE_SPECIFIER) return fakeIntegrationStore;
+        if (id === RELATIVE_PRISMA_SPECIFIER && /qbo-document-sync/.test(this.filename ?? "")) {
+            return { prisma: fakePrisma };
+        }
         if (id === QUICKBOOKS_SPECIFIER
             || (id === RELATIVE_QUICKBOOKS_SPECIFIER && /qbo-document-sync/.test(this.filename ?? ""))) {
             // SPREAD the real module: the route also imports the deadline helper
@@ -165,6 +199,8 @@ before(async () => {
                 syncEstimateToQB: async (_t: unknown, e: any, _gl: unknown, _d: unknown, requestId?: string) => {
                     state.posts.push({ kind: "estimate", requestId });
                     state.sentNotes.push(e?.privateNote);
+                    state.sentItems.push(e?.items ?? []);
+                    state.sentTotals.push(e?.totalAmount);
                     state.onCreate?.();
                     if (state.createThrows) throw state.createThrows;
                     return { qbId: "qb-est-1", qbUrl: "https://qbo/est/1" };
@@ -772,4 +808,31 @@ test("round 41: a REPARENT (losing the billable client) between claim and finali
     const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
     assert.equal(res.status, 409);
     assert.equal(row.qbEstimateId, null);
+});
+
+// ─── Round 42 gate, finding 2: hash and payload come from ONE read ───
+
+test("round 42: an edit before the claim is SENT, not just fingerprinted", async () => {
+    // The claim reloaded state under the locks while the POST still used the
+    // copy read at the top of the handler. An edit committed in that window made
+    // the marker fingerprint the NEW state while QuickBooks received the OLD
+    // lines and totals — and finalize, comparing the new state against a marker
+    // that also described it, recorded the link as if nothing had happened.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    row.items = [{ id: "it-1", parentId: null, name: "Old", quantity: 1, unitCost: 100, total: 100, type: "Material" }];
+    row.totalAmount = 100;
+
+    // Lands between the handler's read and the locked read the claim takes.
+    state.onFirstRead = () => {
+        row.items = [{ id: "it-1", parentId: null, name: "New", quantity: 2, unitCost: 250, total: 500, type: "Material" }];
+        row.totalAmount = 500;
+    };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+    const sent = state.sentItems[0];
+    assert.equal(sent?.[0]?.name, "New", "QuickBooks must receive the state the claim fingerprinted");
+    assert.equal(state.sentTotals[0], 500);
+    assert.equal(row.qbEstimateId, "qb-est-1", "and the link is recorded");
 });

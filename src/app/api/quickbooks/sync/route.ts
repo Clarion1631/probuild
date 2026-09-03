@@ -11,8 +11,7 @@ import { getFreshQBTokens, resolveCustomerAndItem } from "@/lib/quickbooks-payme
 import { AMBIGUOUS_CREATE_MARKER, CREATE_IN_FLIGHT_MARKER, parseCreateMarker } from "@/lib/qbo-create-markers";
 import {
     composeSyncMarker,
-    identityMatchesMarker,
-    loadDocumentIdentity,
+    decideUnderIdentity,
     probeDocumentSync,
     syncMarkerIdentity,
     syncMarkerKind,
@@ -109,66 +108,6 @@ export const maxDuration = 60;
  * mid-decision, and the finalize CAS re-reads and re-computes it. Same shape as
  * the milestone rail, whose marker has carried an issuance hash since round 33.
  */
-
-/**
- * THE decision primitive. Every adopt, replay, finalize and fresh claim on
- * this rail goes through it, and none of them re-derives its own subset of
- * columns.
- *
- * Rounds 39, 40 and 41 each found the same bug in a different place: a
- * decision comparing SOME of the state and missing whichever field the next
- * reviewer thought of — the customer, then the line items, then the project
- * association and the code. So this takes the canonical money locks
- * (Estimate → Invoice → Client), recomputes the WHOLE payload identity from the
- * database inside them (`loadDocumentIdentity`), optionally compares it to what
- * the marker recorded (`identityMatchesMarker`), and only then runs the write.
- *
- * The Client lock is FOR SHARE: this reads the mapping, but must not straddle
- * the FOR UPDATE remap in `resolveCustomerAndItem`, which may have run moments
- * ago on this very request.
- */
-async function decideUnderIdentity<T>(args: {
-    kind: "estimate" | "invoice";
-    id: string;
-    clientId: string;
-    /** When set, the current identity must still equal what this claim recorded. */
-    expectMarker?: string;
-    /**
-     * When set, the customer read under the lock must be this one.
-     *
-     * A fresh claim passes what `resolveCustomerAndItem` just answered. If the
-     * locked read disagrees, the mapping moved between that call and this
-     * decision — and the payload is built from the resolved value, so proceeding
-     * would send an invoice to one customer while recording another. Fail
-     * closed; the retry resolves against the mapping that now stands.
-     */
-    expectCustomerId?: string;
-    decide: (tx: Prisma.TransactionClient, facts: DocumentIdentityFacts) => Promise<T>;
-}): Promise<{ ok: true; value: T; facts: DocumentIdentityFacts } | { ok: false; reason: string }> {
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
-        await lockMoneyParents(
-            tx,
-            {
-                estimateId: args.kind === "estimate" ? args.id : null,
-                invoiceId: args.kind === "invoice" ? args.id : null,
-                clientId: args.clientId,
-            },
-            { clientLock: "share" },
-        );
-        const facts = await loadDocumentIdentity(tx, args.kind, args.id);
-        if (!facts) {
-            return { ok: false as const, reason: "it no longer has a client and project to bill" };
-        }
-        if (args.expectCustomerId && facts.customerId !== args.expectCustomerId) {
-            return { ok: false as const, reason: "its QuickBooks customer changed while this was being prepared" };
-        }
-        if (args.expectMarker) {
-            const verdict = identityMatchesMarker(facts, args.expectMarker);
-            if (!verdict.ok) return { ok: false as const, reason: verdict.reason };
-        }
-        return { ok: true as const, value: await args.decide(tx, facts), facts };
-    }));
-}
 
 /** Compose the claim marker for a set of freshly computed facts. */
 function markerFor(facts: DocumentIdentityFacts, tokens: QBTokens, at: Date): string {
@@ -483,30 +422,29 @@ export async function POST(req: NextRequest) {
                 estimateFacts = claimed.facts;
             }
 
+            // EVERY field comes from the LOCKED snapshot the claim fingerprinted,
+            // never from the copy read at the top of this handler. An edit
+            // committed between that read and the claim used to make the marker
+            // describe the NEW state while QuickBooks received the OLD lines and
+            // totals — and finalize, comparing the new state against a marker that
+            // also described it, recorded the link as if nothing had happened.
+            if (estimateFacts.payload.kind !== "estimate") {
+                throw new Error("estimate branch loaded a non-estimate payload");
+            }
+            const estimateOut = estimateFacts.payload;
             const result = await syncEstimateToQB(tokens, {
-                id: estimate.id,
-                code: estimate.code,
-                title: estimate.title,
-                totalAmount: toNum(estimate.totalAmount),
+                id: estimateOut.id,
+                code: estimateOut.code,
+                title: estimateOut.title,
+                totalAmount: estimateOut.totalAmount,
                 // Passed through whole — `syncEstimateToQB` drops section headers itself, so the
                 // hierarchy fields have to survive this mapping.
-                items: estimate.items.map(i => ({
-                    id: i.id,
-                    parentId: i.parentId,
-                    name: i.name,
-                    quantity: i.quantity,
-                    unitCost: toNum(i.unitCost),
-                    total: toNum(i.total),
-                    type: i.type,
-                })),
-                // From the verified facts, so what is billed is what the claim
-                // recorded — the two cannot drift apart.
+                items: estimateOut.items,
                 customerId: estimateFacts.customerId,
                 itemId,
-                project: estimate.project ? { name: estimate.project.name } : null,
+                project: estimateOut.projectName ? { name: estimateOut.projectName } : null,
                 // The canonical marker note, not the bare title: this is what a
-                // recovery matches on to prove the document is ours. Taken from
-                // the VERIFIED facts, so what is sent is what the claim recorded.
+                // recovery matches on to prove the document is ours.
                 privateNote: estimateFacts.privateNote,
             }, qb.glMappings || {}, deadline, syncRequestId(estimate.id, estimateMarker))
                 .catch(async (error) => {
@@ -631,13 +569,18 @@ export async function POST(req: NextRequest) {
             invoiceFacts = claimed.facts;
         }
 
+        // Same rule as the estimate rail: the locked snapshot, not the pre-lock read.
+        if (invoiceFacts.payload.kind !== "invoice") {
+            throw new Error("invoice branch loaded a non-invoice payload");
+        }
+        const invoiceOut = invoiceFacts.payload;
         const result = await syncInvoiceToQB(tokens, {
-            code: invoice.code,
-            totalAmount: toNum(invoice.totalAmount),
-            balanceDue: toNum(invoice.balanceDue),
+            code: invoiceOut.code,
+            totalAmount: invoiceOut.totalAmount,
+            balanceDue: invoiceOut.balanceDue,
             customerId: invoiceFacts.customerId,
             itemId,
-            project: invoice.project ? { name: invoice.project.name } : null,
+            project: invoiceOut.projectName ? { name: invoiceOut.projectName } : null,
             privateNote: invoiceFacts.privateNote,
         }, deadline, syncRequestId(invoice.id, invoiceMarker))
             .catch(async (error) => {

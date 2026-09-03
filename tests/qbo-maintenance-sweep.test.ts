@@ -629,9 +629,9 @@ test("round 40: the document sweep pages by cursor, so an unresolvable head row 
     // Three estimates. The FIRST can never be resolved (QuickBooks will not
     // answer about it); the other two are sitting in QuickBooks.
     const rows = [
-        { id: "est-1", marker: "ambiguous-create:@1|EST-1|note", kind: "estimate" as const },
-        { id: "est-2", marker: "ambiguous-create:@1|EST-2|note", kind: "estimate" as const },
-        { id: "est-3", marker: "ambiguous-create:@1|EST-3|note", kind: "estimate" as const },
+        { id: "est-1", marker: "ambiguous-create:@1|EST-1|note", kind: "estimate" as const , clientId: "cli-1" },
+        { id: "est-2", marker: "ambiguous-create:@1|EST-2|note", kind: "estimate" as const , clientId: "cli-1" },
+        { id: "est-3", marker: "ambiguous-create:@1|EST-3|note", kind: "estimate" as const , clientId: "cli-1" },
     ];
     const live = new Map(rows.map((r) => [r.id, r]));
     const kv = new Map<string, string>();
@@ -699,7 +699,7 @@ test("round 40: the document sweep wraps back to the head once its tail drains",
                 if (after) return [];
                 return seen.length
                     ? []
-                    : [{ id: "est-1", marker: "ambiguous-create:@1|EST-1|note", kind: "estimate" as const }];
+                    : [{ id: "est-1", marker: "ambiguous-create:@1|EST-1|note", kind: "estimate" as const , clientId: "cli-1" }];
             },
             probe: (async () => ({ state: "absent" })) as any,
             adopt: async () => 1,
@@ -722,9 +722,12 @@ test("round 40: the sweep NEVER adopts on an unanswered question", async () => {
         undefined,
         {
             railFirst: "invoice",
+            // One row is the whole rail, so the run stops rather than wrapping
+            // back over the row it just probed.
+            pageSize: 1,
             listParked: async (rail, after) =>
                 rail === "invoice" && !after
-                    ? [{ id: "inv-1", marker: "create-in-flight:@1|INV-1|note", kind: "invoice" as const }]
+                    ? [{ id: "inv-1", marker: "create-in-flight:@1|INV-1|note", kind: "invoice" as const , clientId: "cli-1" }]
                     : [],
             probe: (async () => ({ state: "unknown", reason: "QuickBooks is unavailable" })) as any,
             adopt: async () => { adopts++; return 1; },
@@ -734,7 +737,12 @@ test("round 40: the sweep NEVER adopts on an unanswered question", async () => {
     assert.equal(adopts, 0);
     assert.equal(res.recovered, 0);
     assert.equal(res.stillParked, 1);
-    assert.match(String(res.reason), /unavailable/);
+    // Round 42: a per-row refusal is recorded against its OWN rail and does
+    // not become a run-wide stop — setting `reason` here made the outer loop
+    // skip the other rail entirely.
+    assert.equal(res.reason, null, "not a shared stop");
+    assert.match(String(res.rails.invoice.note), /unavailable/);
+    assert.equal(res.rails.invoice.unresolved, 1);
 });
 
 test("round 40: the deletion sweep pages by cursor too", async () => {
@@ -1078,9 +1086,9 @@ test("round 41: a page of unrecognised markers is stepped over, not read as exha
     // row behind it unvisited.
     const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
     const rows = [
-        { id: "est-1", marker: "gibberish", kind: "estimate" as const },
-        { id: "est-2", marker: "voided", kind: "estimate" as const },
-        { id: "est-3", marker: "ambiguous-create:@1|EST-3|note", kind: "estimate" as const },
+        { id: "est-1", marker: "gibberish", kind: "estimate" as const , clientId: "cli-1" },
+        { id: "est-2", marker: "voided", kind: "estimate" as const , clientId: "cli-1" },
+        { id: "est-3", marker: "ambiguous-create:@1|EST-3|note", kind: "estimate" as const , clientId: "cli-1" },
     ];
     const adopted: string[] = [];
     const res = await sweepPendingDocumentSyncs(
@@ -1124,4 +1132,180 @@ test("round 41: the maintenance query filters recognised markers itself", async 
         "the page query, and the parked COUNT, must use the same predicate");
     assert.doesNotMatch(src, /qbSyncMarker: \{ not: null \}/,
         "selecting every non-null marker is the bug this closes");
+});
+
+// ─── Round 42 gate ───
+
+test("round 42: maintenance does NOT adopt a document whose record has moved", async () => {
+    // The adoption callback was a bare marker CAS, and the probe only ever
+    // compares QuickBooks against the HISTORICAL marker — so nothing asked
+    // whether the record still described it. An edited record would have had
+    // the stale document linked to it by a background sweep, unattended.
+    const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
+    const adopts: string[] = [];
+    const res = await sweepPendingDocumentSyncs(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        undefined,
+        {
+            railFirst: "estimate",
+            pageSize: 1,
+            listParked: async (rail, after) =>
+                rail === "estimate" && !after
+                    ? [{ id: "est-1", marker: "ambiguous-create:@1|EST-1|note", kind: "estimate" as const, clientId: "cli-1" }]
+                    : [],
+            probe: (async () => ({ state: "found", qbId: "qb-9" })) as any,
+            // This is what `decideUnderIdentity` returns when the recomputed
+            // identity no longer matches the claim: zero rows written.
+            adopt: async (row) => { adopts.push(row.id); return 0; },
+            countParked: async () => 1,
+        },
+    );
+    assert.deepEqual(adopts, ["est-1"], "it did try");
+    assert.equal(res.recovered, 0, "and nothing was linked");
+    assert.equal(res.stillParked, 1, "the row stays parked for a human");
+    assert.equal(res.rails.estimate.unresolved, 1, "reported against its own rail");
+});
+
+test("round 42: the maintenance adoption really is routed through the identity decision", async () => {
+    // The behavioural test above drives the sweep with an injected `adopt`, so
+    // it cannot see WHICH adopt the route supplies. This can.
+    const src = await import("node:fs").then((fs) =>
+        fs.readFileSync("src/app/api/integrations/qbo-maintenance/route.ts", "utf8"));
+    const at = src.indexOf("adopt: async (row, qbId)");
+    assert.ok(at > -1, "the adoption callback moved — has it been renamed?");
+    const cb = src.slice(at, at + 1600);
+    assert.match(cb, /decideUnderIdentity\(\{/, "adoption must take the money locks and compare");
+    assert.match(cb, /expectMarker: row\.marker/, "against the claim the row carries");
+});
+
+test("round 42: one rail refusing a row does not skip the other rail", async () => {
+    // Any `unknown` probe used to set the run-wide `reason`, and the outer loop
+    // breaks on it — so a single permanently-unresolvable estimate meant the
+    // invoice rail was never examined, run after run.
+    const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
+    const seen: string[] = [];
+    const res = await sweepPendingDocumentSyncs(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        undefined,
+        {
+            railFirst: "estimate",
+            pageSize: 1,
+            listParked: async (rail, after) => {
+                if (after) return [];
+                return rail === "estimate"
+                    ? [{ id: "est-1", marker: "ambiguous-create:@1|EST-1|note", kind: "estimate" as const, clientId: "cli-1" }]
+                    : [{ id: "inv-1", marker: "ambiguous-create:@1|INV-1|note", kind: "invoice" as const, clientId: "cli-1" }];
+            },
+            probe: (async (_t: unknown, input: { kind: string }) => {
+                seen.push(input.kind);
+                return input.kind === "estimate"
+                    ? { state: "unknown", reason: "two documents match EST-1" }
+                    : { state: "found", qbId: "qb-inv-9" };
+            }) as any,
+            adopt: async () => 1,
+            countParked: async () => 1,
+        },
+    );
+    assert.deepEqual(seen, ["estimate", "invoice"], "the invoice rail is still examined");
+    assert.equal(res.recovered, 1, "and its recoverable row is recovered");
+    assert.equal(res.reason, null, "a per-row refusal is not a run-wide stop");
+    assert.equal(res.rails.estimate.unresolved, 1);
+    assert.match(String(res.rails.estimate.note), /two documents match/);
+    assert.equal(res.rails.invoice.recovered, 1);
+});
+
+test("round 42: a SHARED failure still stops both rails (the control)", async () => {
+    // If nothing crossed rails any more, a QuickBooks outage would burn a full
+    // deadline on the second rail proving what the first already knew.
+    const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
+    const seen: string[] = [];
+    const res = await sweepPendingDocumentSyncs(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        undefined,
+        {
+            railFirst: "estimate",
+            isExhausted: () => true,
+            listParked: async (rail) => { seen.push(rail); return []; },
+            probe: (async () => ({ state: "absent" })) as any,
+            adopt: async () => 1,
+            countParked: async () => 0,
+        },
+    );
+    assert.equal(res.reason, "budget-exhausted");
+    assert.deepEqual(seen, [], "out of budget stops before either rail is paged");
+});
+
+test("round 42: a Paid pending-deletion row reaches a terminal state, both ways", async () => {
+    // Settlement now cancels the deletion intent, so this only turns up on a
+    // legacy row or a settle that raced. It used to be unrecoverable: the sweep
+    // kept selecting it, but the final unlink requires status != Paid.
+    const { sweepPendingDeletions, PAID_PENDING_DELETION_FLAG } =
+        await import("../src/lib/quickbooks-payments");
+    const tokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
+
+    for (const [probeState, expectFlag, label] of [
+        ["ok", null, "the invoice is there, so the intent is simply wrong now"],
+        ["notFound", PAID_PENDING_DELETION_FLAG, "gone remotely and Paid locally: a human must settle it"],
+    ] as const) {
+        const writes: any[] = [];
+        const deleted: string[] = [];
+        const db = {
+            paymentSchedule: {
+                async findMany() { return [{ id: "ps-1", qbInvoiceId: "qb-1", status: "Paid" }]; },
+                async count() { return 1; },
+                async updateMany(args: any) { writes.push(args); return { count: 1 }; },
+            },
+        };
+        await sweepPendingDeletions(tokens, undefined, {
+            db: db as any,
+            cursorStore: { get: async () => null, set: async () => {} } as any,
+            probeInvoice: (async () => ({ state: probeState, balance: 0, total: 0, paymentTxnIds: [] })) as any,
+            deleteInvoice: async (_t, qbId) => { deleted.push(qbId); return true; },
+            unlink: async () => true,
+        });
+        assert.deepEqual(deleted, [], `${label}: a Paid invoice must never be deleted`);
+        assert.equal(writes.length, 1, label);
+        assert.equal(writes[0].data.qbSyncError, expectFlag, label);
+        assert.equal(writes[0].where.qbSyncError, "pending-deletion",
+            "the release is CAS-pinned to the intent it is clearing");
+    }
+});
+
+test("round 42: settling a pending-deletion row cancels the intent, both settle paths", async () => {
+    // A separate write rather than a clause on the settle claim: a settle must
+    // never be made conditional on a marker.
+    const fs = await import("node:fs");
+    for (const [file, fn] of [
+        ["src/lib/payment-record-core.ts", "recordPaymentCore"],
+        ["src/lib/quickbooks-payments.ts", "settleMilestonePaidInTx"],
+    ] as const) {
+        const src = fs.readFileSync(file, "utf8");
+        const at = src.indexOf(fn);
+        assert.ok(at > -1, `${fn} not found`);
+        const body = src.slice(at, at + 4000);
+        const claim = body.indexOf("claim.count === 0");
+        const cancel = body.indexOf("qbSyncError: PENDING_DELETION_MARKER");
+        assert.ok(cancel > -1, `${fn} must cancel a pending-deletion intent on settle`);
+        assert.ok(claim > -1 && cancel > claim,
+            `${fn}: the cancel must follow the settle claim, never gate it`);
+    }
+});
+
+test("round 42: the maintenance response explains both new sweeps", async () => {
+    // They affected ok/truncated and appeared in neither the reason chain nor
+    // the body, so a caller got {ok:false, truncated:true, retry:true} with
+    // nothing at all to act on.
+    const src = await import("node:fs").then((fs) =>
+        fs.readFileSync("src/app/api/integrations/qbo-maintenance/route.ts", "utf8"));
+    for (const key of [
+        "pendingDeletions:", "documentSyncs:", "remaining: deletions.stillPending",
+        "unrecognised: docSyncs.unrecognised", "rails: docSyncs.rails",
+    ]) {
+        assert.ok(src.includes(key), `the response must report ${key}`);
+    }
+    for (const reason of [
+        "document-sync-failed", "pending-deletions-outstanding", "document-sync-parked",
+    ]) {
+        assert.ok(src.includes(reason), `the reason chain must include ${reason}`);
+    }
 });

@@ -667,7 +667,15 @@ export const PENDING_DELETION_PAGE_SIZE = 50;
 
 /** The two calls this sweep needs; injectable so a test can drive the real loop. */
 export interface PendingDeletionSweepDeps {
-    db?: { paymentSchedule: { findMany(args: any): Promise<any[]>; count(args: any): Promise<number> } };
+    db?: {
+        paymentSchedule: {
+            findMany(args: any): Promise<any[]>;
+            count(args: any): Promise<number>;
+            updateMany(args: any): Promise<{ count: number }>;
+        };
+    };
+    /** Read-only remote state, for the Paid branch that must not delete. */
+    probeInvoice?: typeof probeQBInvoice;
     deleteInvoice?: (tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) => Promise<boolean>;
     unlink?: (scheduleId: string, qbInvoiceId: string) => Promise<boolean>;
     /** Where this sweep resumes; defaults to the shared AutomationSetting store. */
@@ -704,6 +712,14 @@ export async function sweepPendingDeletions(
             // These rows are, by definition, the ones carrying the marker: it is
             // what the sweep selected them by, so it is what the unlink pins.
             claimQBInvoiceUnlink(prisma, scheduleId, qbInvoiceId, PENDING_DELETION_MARKER));
+    const probeRemote = deps?.probeInvoice ?? probeQBInvoice;
+    /** CAS the deletion intent to a terminal value, pinned to the intent itself. */
+    const releaseIntent = async (id: string, flag: string | null) => {
+        await db.paymentSchedule.updateMany({
+            where: { id, qbSyncError: PENDING_DELETION_MARKER },
+            data: { qbSyncError: flag },
+        }).catch(() => ({ count: 0 }));
+    };
     const cursorStore = deps?.cursorStore ?? automationSettingCursorStore;
     const result: PendingDeletionSweepResult = {
         checked: 0, finished: 0, stillPending: 0, unvisited: 0, reason: null,
@@ -729,7 +745,9 @@ export async function sweepPendingDeletions(
 
     const page = async (after: string | null, take: number) => db.paymentSchedule.findMany({
         where: after ? { ...where, id: { gt: after } } : where,
-        select: { id: true, qbInvoiceId: true },
+        // `status` because a PAID row must never be handed to the delete below:
+        // it takes the probe branch instead.
+        select: { id: true, qbInvoiceId: true, status: true },
         orderBy: { id: "asc" },
         take,
     });
@@ -756,6 +774,29 @@ export async function sweepPendingDeletions(
         // ahead of everything else on the next run.
         checkpoint = row.id;
         try {
+            // A PAID row cannot go through the delete at all: settling cancels the
+            // intent (see PENDING_DELETION_MARKER), so this is a row that predates
+            // that rule or one whose settle raced the marker write. Deleting a
+            // paid QuickBooks invoice would destroy a real payment record, and the
+            // final unlink refuses a Paid row anyway — which is how this used to
+            // loop forever. Probe instead, and reach a terminal state either way.
+            if (row.status === "Paid") {
+                const probe = await probeRemote(tokens, row.qbInvoiceId as string, deadline);
+                if (probe.state === "ok") {
+                    // The invoice is there and the milestone is paid: the deletion
+                    // intent is simply wrong now. Cancel it.
+                    await releaseIntent(row.id, null);
+                    result.finished++;
+                } else if (probe.state === "notFound" || probe.state === "voided") {
+                    // Gone remotely, Paid locally. Nothing automatic can reconcile
+                    // that — park it where an operator will see it, and take it out
+                    // of this sweep so it is not retried on every run.
+                    await releaseIntent(row.id, PAID_PENDING_DELETION_FLAG);
+                    result.stillPending++;
+                }
+                // A transient probe answer is left for the next run.
+                continue;
+            }
             // `false` is CONFIRMED ABSENCE, not a refusal — see deleteQBInvoice.
             // Reading it as "still there" was what left a manually-deleted
             // invoice parked forever: the sweep asked QuickBooks to remove a
@@ -1163,6 +1204,19 @@ export const PLATFORM_RESERVE_MS = 2_000;
  * mid-delete. One shared budget is what keeps the pair inside it.
  */
 export const BREAK_QB_LINK_BUDGET_MS = 50_000;
+
+/**
+ * A Paid milestone still carrying a deletion intent whose invoice is GONE.
+ *
+ * Both settle paths cancel the intent, so this only turns up on a row that
+ * predates that rule or a settle that raced the marker write. It cannot be
+ * resolved automatically: the milestone is Paid, so the unlink refuses, and the
+ * QuickBooks document it points at no longer exists. A plain flag, not a create
+ * marker — `markerKind` does not recognise it, so it blocks nothing; what it
+ * does is take the row OUT of the deletion sweep predicate, so a state a human
+ * must settle stops being retried on every run.
+ */
+export const PAID_PENDING_DELETION_FLAG = "paid-deletion-unresolvable";
 
 /**
  * Diagnostic flag for a milestone settled OUTSIDE QuickBooks while its
@@ -1983,6 +2037,16 @@ async function settleMilestonePaidInTx(
         },
     });
     if (claim.count === 0) return false;
+
+    // Same rule as the manual path: a QuickBooks payment against the very
+    // invoice somebody queued for deletion cancels that intent. QuickBooks will
+    // refuse to delete an invoice with a payment attached, so the intent was
+    // already doomed — leaving the marker behind only creates a row the sweep
+    // retries forever and the unlink can never finish.
+    await t.paymentSchedule.updateMany({
+        where: { id: paymentScheduleId, qbSyncError: PENDING_DELETION_MARKER },
+        data: { qbSyncError: null },
+    });
 
     const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
     if (!invoice) return false;

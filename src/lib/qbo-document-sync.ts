@@ -17,6 +17,10 @@
  */
 import { createHash } from "node:crypto";
 
+import type { Prisma } from "@prisma/client";
+import { prisma } from "./prisma";
+import { withTxRetry, lockMoneyParents } from "./tx-retry";
+
 import { toNum } from "./prisma-helpers";
 import { documentIssuanceHash } from "./qbo-issuance";
 import {
@@ -231,7 +235,20 @@ export async function probeDocumentSync(
     return { state: "unknown", reason: `${ours.length} QuickBooks documents match ${docNumber}` };
 }
 
-/** One rail worth of parked document syncs. */
+/** What one rail did this run. */
+export interface DocumentSyncRailResult {
+    checked: number;
+    recovered: number;
+    unrecognised: number;
+    /** Rows this rail looked at and could not settle, with the first reason why. */
+    unresolved: number;
+    /** Only ever a SHARED failure (budget, outage). A per-row refusal is not one. */
+    stopped: string | null;
+    /** The first per-row refusal, for the operator. Does not stop anything. */
+    note: string | null;
+}
+
+/** Both rails, plus the totals the maintenance response reports. */
 export interface DocumentSyncSweepResult {
     checked: number;
     /** Found in QuickBooks and adopted: the id is now recorded. */
@@ -242,7 +259,16 @@ export interface DocumentSyncSweepResult {
     unvisited: number;
     /** Rows whose marker this rail does not recognise, stepped over and reported. */
     unrecognised: number;
+    /**
+     * A SHARED stop only: out of budget, or QuickBooks unreachable.
+     *
+     * A per-row refusal used to land here, and the outer loop breaks on it — so
+     * one permanently-unresolvable estimate meant the invoice rail was never
+     * examined at all, run after run. Row-level trouble is now recorded against
+     * its own rail and the sweep carries on.
+     */
     reason: string | null;
+    rails: { estimate: DocumentSyncRailResult; invoice: DocumentSyncRailResult };
 }
 
 /** One record this sweep may act on. */
@@ -250,6 +276,8 @@ export interface ParkedDocumentRow {
     id: string;
     marker: string;
     kind: "estimate" | "invoice";
+    /** The Client the adoption decision locks; empty means the row cannot be billed. */
+    clientId: string;
 }
 
 export interface DocumentSyncSweepDeps {
@@ -313,8 +341,11 @@ export async function sweepPendingDocumentSyncs(
     deadline?: RouteDeadline,
     deps?: DocumentSyncSweepDeps,
 ): Promise<DocumentSyncSweepResult> {
+    const railResult = (): DocumentSyncRailResult =>
+        ({ checked: 0, recovered: 0, unrecognised: 0, unresolved: 0, stopped: null, note: null });
     const result: DocumentSyncSweepResult = {
         checked: 0, recovered: 0, stillParked: 0, unvisited: 0, unrecognised: 0, reason: null,
+        rails: { estimate: railResult(), invoice: railResult() },
     };
     if (!deps?.listParked || !deps?.adopt || !deps?.countParked) {
         // The caller owns the reads and the write. No default: a silent no-op
@@ -334,7 +365,10 @@ export async function sweepPendingDocumentSyncs(
         : ["invoice", "estimate"];
 
     for (const rail of rails) {
+        // ONLY a shared failure stops the other rail. A row this one could not
+        // settle says nothing about the other collection.
         if (result.reason) break;
+        const tally = result.rails[rail];
         const key = DOCUMENT_SYNC_CURSOR_KEYS[rail];
         const stored = (await cursors?.get(key).catch(() => null)) || null;
         // "" is how "start from the top" is stored; it is never a real id.
@@ -350,6 +384,7 @@ export async function sweepPendingDocumentSyncs(
         while (visited < pageSize) {
             if (isExhausted(deadline)) {
                 result.reason = "budget-exhausted";
+                tally.stopped = "budget-exhausted";
                 break;
             }
             const page = await deps.listParked(rail, cursor, pageSize - visited);
@@ -374,6 +409,7 @@ export async function sweepPendingDocumentSyncs(
             for (const row of page) {
                 if (isExhausted(deadline)) {
                     result.reason = "budget-exhausted";
+                    tally.stopped = "budget-exhausted";
                     break;
                 }
                 visited++;
@@ -383,11 +419,13 @@ export async function sweepPendingDocumentSyncs(
                 // operator can see the rail is carrying values nobody handles.
                 if (!syncMarkerKind(row.marker)) {
                     result.unrecognised++;
+                    tally.unrecognised++;
                     checkpoint = row.id;
                     cursor = row.id;
                     continue;
                 }
                 result.checked++;
+                tally.checked++;
                 const found = await probe(tokens, { kind: row.kind, marker: row.marker }, deadline);
                 // The cursor advances PAST every row this run looked at,
                 // resolved or not. That is the whole fix: a row that can never
@@ -399,10 +437,26 @@ export async function sweepPendingDocumentSyncs(
                     // `absent` is left for a real sync to act on; `unknown` is
                     // left for the next run. Either way the claim stands, so
                     // nothing can create a second document meanwhile.
-                    if (found.state === "unknown") result.reason = result.reason ?? found.reason;
+                    //
+                    // Recorded against THIS rail and nothing else. It used to set
+                    // the run-wide `reason`, which the outer loop breaks on, so a
+                    // single unresolvable estimate stopped the invoice rail from
+                    // being looked at at all.
+                    if (found.state === "unknown") {
+                        tally.unresolved++;
+                        tally.note = tally.note ?? found.reason;
+                    }
                     continue;
                 }
-                if (await deps.adopt(row, found.qbId) === 1) result.recovered++;
+                if (await deps.adopt(row, found.qbId) === 1) {
+                    result.recovered++;
+                    tally.recovered++;
+                } else {
+                    // The adopt refused (an identity mismatch, or the row moved).
+                    // Outstanding work, and it is this rail that carries it.
+                    tally.unresolved++;
+                    tally.note = tally.note ?? "a parked record no longer matches the document it claimed";
+                }
             }
             if (result.reason === "budget-exhausted") break;
         }
@@ -440,7 +494,49 @@ export interface DocumentIdentityFacts {
     customerId: string;
     /** Estimates only: the canonical optimistic-concurrency token for items. */
     itemsRevision: number | null;
+    /**
+     * Everything the outbound QuickBooks payload is built from, read in the
+     * SAME locked query that produced the hash above.
+     *
+     * The claim used to reload state under the locks while the POST still used
+     * the copy read before the token refresh and the customer resolve. An edit
+     * committed in that window made the marker fingerprint the NEW state while
+     * QuickBooks received the OLD lines and totals — and finalize, comparing
+     * the new state to a marker that also described it, happily recorded the
+     * link. Fingerprint and payload now come from one read, so they cannot
+     * describe different things.
+     */
+    payload: DocumentPayload;
 }
+
+/** The document to send, as the locked read saw it. */
+export type DocumentPayload =
+    | {
+        kind: "estimate";
+        id: string;
+        code: string;
+        title: string;
+        totalAmount: number;
+        projectName: string | null;
+        items: Array<{
+            id: string;
+            parentId: string | null;
+            name: string;
+            quantity: number;
+            unitCost: number;
+            total: number;
+            /** Non-null in the schema (defaults to "Material"); buildQBEstimateLines
+             *  needs it for legacy section detection, so it is not optional here. */
+            type: string;
+        }>;
+    }
+    | {
+        kind: "invoice";
+        code: string;
+        totalAmount: number;
+        balanceDue: number;
+        projectName: string | null;
+    };
 
 /** Why an identity comparison refused. Reported verbatim to the operator. */
 export type IdentityMismatch =
@@ -509,8 +605,14 @@ export async function loadDocumentIdentity(
             select: {
                 id: true, code: true, title: true, totalAmount: true, itemsRevision: true,
                 items: {
+                    // parentId/type feed buildQBEstimateLines section detection;
+                    // the hash reads only the money fields, so adding them here
+                    // does not move it.
                     orderBy: [{ order: "asc" }, { id: "asc" }],
-                    select: { id: true, name: true, quantity: true, unitCost: true, total: true },
+                    select: {
+                        id: true, parentId: true, name: true, quantity: true,
+                        unitCost: true, total: true, type: true,
+                    },
                 },
                 // The ASSOCIATION as well as the name: a reparent changes which
                 // client is billed, which no column on the estimate itself records.
@@ -536,6 +638,23 @@ export async function loadDocumentIdentity(
             total: toNum(row.totalAmount),
             customerId: row.project.client.qbCustomerId,
             itemsRevision: row.itemsRevision,
+            payload: {
+                kind: "estimate",
+                id: row.id,
+                code: row.code,
+                title: row.title,
+                totalAmount: toNum(row.totalAmount),
+                projectName: row.project.name,
+                items: row.items.map((i: any) => ({
+                    id: i.id,
+                    parentId: i.parentId ?? null,
+                    name: i.name,
+                    quantity: i.quantity,
+                    unitCost: toNum(i.unitCost),
+                    total: toNum(i.total),
+                    type: i.type,
+                })),
+            },
         };
     }
     const row = await tx.invoice.findUnique({
@@ -565,5 +684,72 @@ export async function loadDocumentIdentity(
         total: toNum(row.totalAmount),
         customerId: row.client.qbCustomerId,
         itemsRevision: null,
+        payload: {
+            kind: "invoice",
+            code: row.code,
+            totalAmount: toNum(row.totalAmount),
+            balanceDue: toNum(row.balanceDue),
+            projectName: row.project?.name ?? null,
+        },
     };
+}
+
+/**
+ * THE decision primitive. Every adopt, replay, finalize and fresh claim on
+ * this rail goes through it, and none of them re-derives its own subset of
+ * columns.
+ *
+ * Rounds 39, 40 and 41 each found the same bug in a different place: a
+ * decision comparing SOME of the state and missing whichever field the next
+ * reviewer thought of — the customer, then the line items, then the project
+ * association and the code. So this takes the canonical money locks
+ * (Estimate → Invoice → Client), recomputes the WHOLE payload identity from the
+ * database inside them (`loadDocumentIdentity`), optionally compares it to what
+ * the marker recorded (`identityMatchesMarker`), and only then runs the write.
+ *
+ * The Client lock is FOR SHARE: this reads the mapping, but must not straddle
+ * the FOR UPDATE remap in `resolveCustomerAndItem`, which may have run moments
+ * ago on this very request.
+ */
+export async function decideUnderIdentity<T>(args: {
+    kind: "estimate" | "invoice";
+    id: string;
+    clientId: string;
+    /** When set, the current identity must still equal what this claim recorded. */
+    expectMarker?: string;
+    /**
+     * When set, the customer read under the lock must be this one.
+     *
+     * A fresh claim passes what `resolveCustomerAndItem` just answered. If the
+     * locked read disagrees, the mapping moved between that call and this
+     * decision — and the payload is built from the resolved value, so proceeding
+     * would send an invoice to one customer while recording another. Fail
+     * closed; the retry resolves against the mapping that now stands.
+     */
+    expectCustomerId?: string;
+    decide: (tx: Prisma.TransactionClient, facts: DocumentIdentityFacts) => Promise<T>;
+}): Promise<{ ok: true; value: T; facts: DocumentIdentityFacts } | { ok: false; reason: string }> {
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(
+            tx,
+            {
+                estimateId: args.kind === "estimate" ? args.id : null,
+                invoiceId: args.kind === "invoice" ? args.id : null,
+                clientId: args.clientId,
+            },
+            { clientLock: "share" },
+        );
+        const facts = await loadDocumentIdentity(tx, args.kind, args.id);
+        if (!facts) {
+            return { ok: false as const, reason: "it no longer has a client and project to bill" };
+        }
+        if (args.expectCustomerId && facts.customerId !== args.expectCustomerId) {
+            return { ok: false as const, reason: "its QuickBooks customer changed while this was being prepared" };
+        }
+        if (args.expectMarker) {
+            const verdict = identityMatchesMarker(facts, args.expectMarker);
+            if (!verdict.ok) return { ok: false as const, reason: verdict.reason };
+        }
+        return { ok: true as const, value: await args.decide(tx, facts), facts };
+    }));
 }

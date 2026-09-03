@@ -69,6 +69,22 @@ export const PENDING_CREATE_MARKERS: readonly string[] = [CREATE_IN_FLIGHT_MARKE
  * the delete is confirmed, and this marker is what records the intent in the
  * meantime.
  *
+ * SETTLEMENT CANCELS THE INTENT. A payment arriving for a milestone whose
+ * QuickBooks invoice is queued for deletion is a contradiction, and money wins:
+ * both settle paths (recordPaymentCore for a manual payment,
+ * settleMilestonePaidInTx for a QuickBooks one) clear this marker in the SAME
+ * transaction as the settle. Refusing the settle instead would have blocked
+ * recording real money over a cleanup task, and QuickBooks will not delete an
+ * invoice with a payment attached anyway — the intent was already doomed.
+ *
+ * Without that rule the two formed a state nothing could leave: the sweep still
+ * selected the row, but the final unlink requires `status != Paid`, so a
+ * confirmed remote deletion left a permanent link to a document that no longer
+ * exists, and a live one was retried forever. `sweepPendingDeletions` also
+ * handles a Paid row it still finds (a legacy row, or a settle that raced): it
+ * probes rather than deletes, clears the intent if the invoice is there, and
+ * parks with a specific reason if it is gone.
+ *
  * Deliberately NOT one of PENDING_CREATE_MARKERS. Those mean "an invoice may
  * exist even though qbInvoiceId is null"; this row still HAS its qbInvoiceId,
  * and that is what stops a second create. Listing it there would also offer it

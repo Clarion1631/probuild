@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getFreshQBTokens, QBNotConnectedError, sweepPendingPayLinks, sweepPendingDeletions, automationSettingCursorStore } from "@/lib/quickbooks-payments";
-import { documentSyncMarkerWhere, sweepPendingDocumentSyncs } from "@/lib/qbo-document-sync";
+import { decideUnderIdentity, documentSyncMarkerWhere, sweepPendingDocumentSyncs } from "@/lib/qbo-document-sync";
 import {
     createRouteDeadline,
     isBudgetExhausted,
@@ -351,7 +351,7 @@ export async function POST(req: Request) {
                                 ...markerWhere, qbEstimateId: null,
                                 ...(after ? { id: { gt: after } } : {}),
                             },
-                            select: { id: true, qbSyncMarker: true },
+                            select: { id: true, qbSyncMarker: true, project: { select: { clientId: true } } },
                             orderBy: { id: "asc" }, take,
                         })
                         : await prisma.invoice.findMany({
@@ -359,28 +359,52 @@ export async function POST(req: Request) {
                                 ...markerWhere, qbInvoiceId: null,
                                 ...(after ? { id: { gt: after } } : {}),
                             },
-                            select: { id: true, qbSyncMarker: true },
+                            select: { id: true, qbSyncMarker: true, clientId: true },
                             orderBy: { id: "asc" }, take,
                         });
                     // No in-memory filter: the WHERE above already restricts this
                     // to markers the vocabulary knows, and the sweep steps over
                     // (and counts) anything that still slips through, so a page is
                     // only ever empty when the rail really is.
-                    return rows.map((r) => ({ id: r.id, marker: r.qbSyncMarker as string, kind: rail }));
+                    return rows.map((r) => ({
+                        id: r.id,
+                        marker: r.qbSyncMarker as string,
+                        kind: rail,
+                        // The Client the identity decision locks. Read here so the
+                        // sweep never has to guess it from the row it is holding.
+                        clientId: rail === "estimate"
+                            ? ((r as any).project?.clientId ?? "")
+                            : ((r as any).clientId ?? ""),
+                    }));
                 },
                 // CAS-pinned to the exact marker the probe was run against, so a row
                 // that moved in between keeps whatever replaced it.
+                // THE SAME identity decision the interactive recovery makes, through
+                // the same primitive. This used to be a bare marker CAS, and the
+                // probe only ever compares QuickBooks against the HISTORICAL
+                // marker — so nothing here asked whether the record still
+                // describes it. A record edited after an ambiguous create would
+                // have had the stale QuickBooks document linked to it,
+                // unattended, by a background sweep.
                 adopt: async (row, qbId) => {
-                    const written = row.kind === "estimate"
-                        ? await prisma.estimate.updateMany({
-                            where: { id: row.id, qbEstimateId: null, qbSyncMarker: row.marker },
-                            data: { qbEstimateId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
-                        })
-                        : await prisma.invoice.updateMany({
-                            where: { id: row.id, qbInvoiceId: null, qbSyncMarker: row.marker },
-                            data: { qbInvoiceId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
-                        });
-                    return written.count;
+                    const decided = await decideUnderIdentity({
+                        kind: row.kind, id: row.id, clientId: row.clientId, expectMarker: row.marker,
+                        decide: async (tx) => {
+                            const written = row.kind === "estimate"
+                                ? await tx.estimate.updateMany({
+                                    where: { id: row.id, qbEstimateId: null, qbSyncMarker: row.marker },
+                                    data: { qbEstimateId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
+                                })
+                                : await tx.invoice.updateMany({
+                                    where: { id: row.id, qbInvoiceId: null, qbSyncMarker: row.marker },
+                                    data: { qbInvoiceId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
+                                });
+                            return written.count;
+                        },
+                    });
+                    // A mismatch is not an error to retry — the row stays parked
+                    // for an operator, and the sweep reports it as unresolved.
+                    return decided.ok ? decided.value : 0;
                 },
                 countParked: async () => {
                     const [e, i] = await Promise.all([
@@ -423,7 +447,13 @@ export async function POST(req: Request) {
         // digest can tell it apart from a row that merely errored.
         ?? (missingInQbo > 0 ? "qbo-invoice-missing" : null)
         ?? (payLinkUnvisited > 0 ? "pay-link-unvisited" : null)
-        ?? (payLinkUnresolved > 0 ? "pay-link-unresolved" : null);
+        ?? (payLinkUnresolved > 0 ? "pay-link-unresolved" : null)
+        // The two newest sweeps used to affect `ok` and `truncated` and appear
+        // in neither the reason chain nor the body, so a caller got
+        // {ok:false, truncated:true, retry:true} with nothing at all to act on.
+        ?? (docSyncsFailed ? "document-sync-failed" : null)
+        ?? (deletionsPending > 0 ? "pending-deletions-outstanding" : null)
+        ?? (docSyncsParked > 0 ? "document-sync-parked" : null);
 
     return NextResponse.json({
         ok,
@@ -441,6 +471,36 @@ export async function POST(req: Request) {
         ...(reason ? { reason } : {}),
         ...(abortedReason ? { remaining } : {}),
         ...(payLinks ? { payLinks } : {}),
+        // Both new sweeps report themselves. Counts, what is left, why it
+        // stopped, and (for the document rail) the per-rail breakdown — so an
+        // unattended runner can say WHICH queue is outstanding and why, instead
+        // of only that something is.
+        ...(deletions
+            ? {
+                pendingDeletions: {
+                    checked: deletions.checked,
+                    finished: deletions.finished,
+                    remaining: deletions.stillPending,
+                    unvisited: deletions.unvisited,
+                    reason: deletions.reason,
+                },
+            }
+            : {}),
+        ...(docSyncs || docSyncsFailed
+            ? {
+                documentSyncs: docSyncs
+                    ? {
+                        checked: docSyncs.checked,
+                        recovered: docSyncs.recovered,
+                        remaining: docSyncs.stillParked,
+                        unvisited: docSyncs.unvisited,
+                        unrecognised: docSyncs.unrecognised,
+                        reason: docSyncs.reason,
+                        rails: docSyncs.rails,
+                    }
+                    : { failed: docSyncsFailed },
+            }
+            : {}),
         results,
     });
 }
