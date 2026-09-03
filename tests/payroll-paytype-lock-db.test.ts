@@ -50,6 +50,9 @@ const PERIOD_START = new Date("2026-08-17T07:00:00.000Z");
 const PERIOD_END = new Date("2026-08-31T07:00:00.000Z");
 const START_KEY = "2026-08-17";
 const END_KEY = "2026-08-31";
+/** 08:00-16:00 company-local on a Monday well inside the period — 8 hours, one week, no overtime. */
+const PUNCH_START = "2026-08-24T15:00:00Z";
+const PUNCH_END = "2026-08-24T23:00:00Z";
 const ADMIN = { role: "ADMIN" };
 /** The key acquirePayrollLockCreationLock takes — see PAYROLL_ADVISORY_LOCK_KEY. */
 const PAYROLL_LOCK_KEY = "payroll-period";
@@ -64,11 +67,22 @@ function stillPending(promise: Promise<unknown>, ms: number): Promise<boolean> {
 }
 
 /**
- * A settings pair the export can read, plus one ACTIVATED HOURLY team member —
- * enough to put exactly one known row on the roster.
+ * A settings pair the export can read, plus one ACTIVATED HOURLY team member
+ * WHO ACTUALLY PUNCHED inside the period — enough to put exactly one known row
+ * on the roster, and to keep it there across a pay-type change.
+ *
+ * The punch is load-bearing, not decoration. loadGustoExport's roster is
+ * `ACTIVATED && payType HOURLY` OR `punched inside the period`, so a member with
+ * NO hours leaves the roster entirely the moment they become SALARY — correctly:
+ * a salaried person with no punches has nothing to say on a Gusto hours file.
+ * Seeded without hours, this test's closing re-read found no row at all and read
+ * `undefined` where it meant to read the NEW pay type, which says nothing about
+ * whether the lock held. One punch inside the period keeps the same person on
+ * the roster under both pay types, so the before/after comparison is about the
+ * value that changed rather than about roster membership.
  *
  * The singleton rows are RESTORED, not deleted: they are shared with every
- * other test in this CI job. The user is removed.
+ * other test in this CI job. The user, their punch and its job are removed.
  */
 async function seed(db: PrismaClient, suffix: string) {
     const { encryptObject } = await import("../src/lib/crypto");
@@ -101,9 +115,41 @@ async function seed(db: PrismaClient, suffix: string) {
         select: { id: true, email: true },
     });
 
+    // One closed 8-hour punch, inside the period and inside one workweek, so it
+    // adds hours without adding overtime. TimeEntry.projectId is NOT NULL and
+    // Project.clientId is too, so both come along; every id is suffixed, so the
+    // three tests in this file never collide.
+    const clientId = `paytype-client-${suffix}`;
+    const projectId = `paytype-project-${suffix}`;
+    const entryId = `paytype-entry-${suffix}`;
+    await db.$executeRawUnsafe(
+        `INSERT INTO "Client" ("id","name","initials") VALUES ($1,'Pay Type Lock','PL')`,
+        clientId
+    );
+    await db.$executeRawUnsafe(
+        `INSERT INTO "Project" ("id","name","clientId","updatedAt") VALUES ($1,'Pay Type Lock Job',$2,now())`,
+        projectId,
+        clientId
+    );
+    await db.$executeRawUnsafe(
+        `INSERT INTO "TimeEntry" ("id","userId","projectId","startTime","endTime","durationHours","updatedAt")
+         VALUES ($1,$2,$3,$4::timestamptz,$5::timestamptz,8,now())`,
+        entryId,
+        user.id,
+        projectId,
+        PUNCH_START,
+        PUNCH_END
+    );
+
     return {
         user,
         restore: async () => {
+            // Entry first: TimeEntry.userId and .projectId are both RESTRICT, so
+            // the person and the job cannot go while the punch still points at
+            // them.
+            await db.$executeRawUnsafe(`DELETE FROM "TimeEntry" WHERE "id" = $1`, entryId).catch(() => {});
+            await db.$executeRawUnsafe(`DELETE FROM "Project" WHERE "id" = $1`, projectId).catch(() => {});
+            await db.$executeRawUnsafe(`DELETE FROM "Client" WHERE "id" = $1`, clientId).catch(() => {});
             await db.user.deleteMany({ where: { email } }).catch(() => {});
             if (priorCompany) {
                 await db.companySettings
@@ -139,6 +185,7 @@ test("the export's FOR SHARE blocks a concurrent pay-type change, and hashes the
             release = resolve;
         });
         let sawSalaried: boolean | null = null;
+        let sawHours: number | null = null;
         let sawHash: string | null = null;
 
         const exporting = reader.$transaction(
@@ -151,6 +198,7 @@ test("the export's FOR SHARE blocks a concurrent pay-type change, and hashes the
                 const row = result.employees.find((employee) => employee.user.id === user.id);
                 assert.ok(row, "the seeded hourly member is on this period's roster");
                 sawSalaried = row.salaried;
+                sawHours = row.totalHours;
                 sawHash = result.exportHash;
                 await held;
             },
@@ -160,6 +208,10 @@ test("the export's FOR SHARE blocks a concurrent pay-type change, and hashes the
         // Let A actually reach and pass its locks.
         await new Promise((resolve) => setTimeout(resolve, 400));
         assert.equal(sawSalaried, false, "the export read the pay type it is about to hash a period around");
+        // The seeded punch really is in this period. If it ever stopped being,
+        // roster membership would go back to depending on payType alone and the
+        // closing re-read below would quietly stop testing anything.
+        assert.equal(sawHours, 8, "and the hours it is about to freeze");
 
         // Connection B: somebody switches that member to salaried, through the
         // real writer every route and the rates panel use. It must WAIT.
@@ -183,9 +235,14 @@ test("the export's FOR SHARE blocks a concurrent pay-type change, and hashes the
         assert.equal(after?.payType, "SALARY");
 
         // And a fresh read now sees the change — so the first read was a
-        // snapshot, not a stale cache.
+        // snapshot, not a stale cache. The seeded punch is what keeps this
+        // person on the roster under BOTH pay types (see seed): without it the
+        // row is simply absent here and `salaried` reads undefined, which would
+        // prove nothing about the lock.
         const reread = await loadGustoExport(PERIOD_START, PERIOD_END, { startKey: START_KEY, endKey: END_KEY });
-        assert.equal(reread.employees.find((employee) => employee.user.id === user.id)?.salaried, true);
+        const rereadRow = reread.employees.find((employee) => employee.user.id === user.id);
+        assert.ok(rereadRow, "the member still has hours in this period, so they are still on the roster");
+        assert.equal(rereadRow.salaried, true, "and the fresh read sees the pay type that committed after the export");
         assert.notEqual(reread.exportHash, sawHash, "a pay-type change really does change the frozen bytes");
     } finally {
         await restore();
