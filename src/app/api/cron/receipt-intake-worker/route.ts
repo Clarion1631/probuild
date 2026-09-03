@@ -756,6 +756,9 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             deadline: invocationDeadline,
             isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
             isPushPaused: () => isPaused(PAUSE_KEYS.receiptPush),
+            // Same env read as the worker's own isDryRunEnabled — read fresh
+            // here too, since book() is the last stop before a real QBO write.
+            isDryRunEnabled: () => process.env.RECEIPT_INTAKE_DRYRUN !== "false",
             getTokens: deadline => getFreshQBTokens(deadline),
             createPurchase: (tokens, input, deadline, onBeforeCreate, onExistingPurchase) =>
                 createQBReceiptPurchase(tokens, input, { onBeforeCreate, onExistingPurchase }, deadline),

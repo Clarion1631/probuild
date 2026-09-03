@@ -314,7 +314,13 @@ missing bucket policy is invisible until a 400 MB object is already stored.
   5. On `ok:true`, one transaction: create `Expense` (estimateId; costCodeId = chosen, else
      `matchCostCode(suggestedPhaseCode)`; **amount = the GROSS total paid, tax INCLUDED**
      (Justin, 2026-09-01 — this REPLACES the "pre-tax" rule this line used to state; see
-     the as-built note in §7); vendor; date=txnDate; status "Pending"; receiptUrl
+     the as-built note in §7); vendor; date=txnDate; **status "Reviewed"** (as-built — not
+     "Pending": the row is created WITH `qbPurchaseId` already set, so it is QBO-managed
+     from birth exactly like a QBO import, and `assertExpenseMutableOutsideQbo`
+     (`qbo-expense-guard.ts`) rejects approve/edit/delete on anything carrying a
+     `qbPurchaseId`. A booked-then-"Pending" row would sit in the bookkeeper queue's
+     actionable list (`manager/receipts/page.tsx` lists `status: "Pending"`) with no route
+     able to act on it — "Pending" is not a reachable state for a booked row); receiptUrl
      = Drive view URL when a Drive fileId is known, else the `secure:` ref; qbPurchaseId)
      and set the row BOOKED {qbPurchaseId, expenseId, bookedAt}. Also log one
      `AutomationEvent {kind:"receipt-push", source:"intake-worker"}` so the /automation
@@ -653,8 +659,14 @@ an overlap safe in general.
    - before the boundary, NO evidence, and **not** a Drive row -> `SHADOW_QUARANTINE`.
      There is no shared identity here: v2 would book under the intake UUID, which v1 never
      saw, so a duplicate would go through silently. Booking risks double-paying; retiring
-     risks losing a real expense. Terminal, never auto-requeued — it surfaces on the
-     Receipts tab with a "book anyway" action for whoever has checked QuickBooks.
+     risks losing a real expense. Terminal, never auto-requeued. **Phase 1b follow-up, not
+     built here:** the design is a Receipts tab with a "book anyway" action for whoever has
+     checked QuickBooks — same deferral as `NEEDS_JOB` and `NEEDS_REVIEW` rows, which also
+     have no review UI in Phase 1 (see §3's GET /api/receipts/intake note: the Phase 2
+     `/automation` Receipts tab is the intended consumer). Until that ships, rows in any of
+     these three states are visible via the `ReceiptIntake` table directly (or
+     `GET /api/receipts/intake?state=`) and via the pipeline-health report's NEEDS_REVIEW /
+     NEEDS_JOB counts.
    - after the boundary -> handed to v2. v1 had already stopped, so nobody booked these.
    With no boundary recorded in live mode the worker **halts the entire pass before
    claiming anything** and logs `cutover-boundary-missing`. Not just the retire: booking

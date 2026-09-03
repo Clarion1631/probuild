@@ -208,6 +208,14 @@ export interface BookDependencies {
     isPushEnabled: () => boolean;
     /** Command Center pause switch (pause-only; fail-CLOSED on a read error). */
     isPushPaused: () => Promise<boolean>;
+    /**
+     * RECEIPT_INTAKE_DRYRUN, read FRESH at booking time — not the row's
+     * persisted `dryRun` flag, which is snapshotted once at intake and never
+     * rechecked. A row claimed while the switch was off keeps dryRun=false
+     * forever, so it alone is not a kill switch: reverting the env var to stop
+     * live QBO writes would not stop that row. Both must agree for a write.
+     */
+    isDryRunEnabled: () => boolean;
     getTokens: (deadline?: RouteDeadline) => Promise<QBTokens>;
     createPurchase: (
         tokens: QBTokens,
@@ -342,8 +350,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // Shadow mode is enforced by the WORKER, which never routes a dryRun row
     // here. This second check exists because "no QBO calls in dry run" is the
     // whole safety promise of the shadow week, and one guard in one caller is
-    // not a promise.
-    if (row.dryRun) {
+    // not a promise. BOTH the row's persisted flag and the CURRENT global
+    // switch gate the write — see isDryRunEnabled's doc comment for why the
+    // row flag alone cannot serve as a kill switch.
+    if (row.dryRun || deps.isDryRunEnabled()) {
         return { outcome: "deferred", reason: "push-disabled" };
     }
 

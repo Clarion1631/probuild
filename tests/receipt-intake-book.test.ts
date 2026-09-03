@@ -141,6 +141,7 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         db: tx as any,
         isPushEnabled: () => true,
         isPushPaused: async () => false,
+        isDryRunEnabled: () => false,
         getTokens: async () => ({ accessToken: "t", realmId: "r" }) as any,
         createPurchase: atCreate(async (_tokens: any, input: any) => {
             purchaseCalls.push(input);
@@ -345,6 +346,17 @@ test("a dryRun row can never reach QuickBooks, even called directly", async () =
     const r = recorder();
     const result = await bookReceipt(row({ dryRun: true }), r.deps);
     assert.equal(result.outcome, "deferred");
+    assert.equal(r.purchaseCalls.length, 0);
+    assert.equal(r.expenses.length, 0);
+});
+
+test("the global kill switch stops a row even when its persisted flag says live", async () => {
+    // A row's dryRun flag is snapshotted once at intake, so it is not itself a
+    // kill switch: reverting RECEIPT_INTAKE_DRYRUN after rows were already
+    // claimed dryRun=false must still stop them from reaching QuickBooks.
+    const r = recorder({ isDryRunEnabled: () => true });
+    const result = await bookReceipt(row({ dryRun: false }), r.deps);
+    assert.deepEqual(result, { outcome: "deferred", reason: "push-disabled" });
     assert.equal(r.purchaseCalls.length, 0);
     assert.equal(r.expenses.length, 0);
 });

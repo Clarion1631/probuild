@@ -373,9 +373,31 @@ export async function POST(req: Request) {
             if (existing.uploadUrlExpiresAt && existing.uploadUrlExpiresAt.getTime() > Date.now()) {
                 const resigned = await signUpload(existing.storagePath);
                 if (!resigned) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-                return NextResponse.json({
-                    ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resigned,
+                // The DB lease must move with the URL it reissues. A resigned
+                // URL is good for a fresh ~2h window, but leaving
+                // uploadUrlExpiresAt untouched meant the row still recorded the
+                // ORIGINAL, older expiry — so the sweeper could judge the lease
+                // dead and reclaim the row while the client was still holding a
+                // perfectly live URL. CAS'd on the identity this retry already
+                // proved (id, state, storagePath, uploadLeaseVersion): if the
+                // row moved under us between the read and here, this loses the
+                // race and falls through to the resume-with-a-new-lease path
+                // below rather than handing out a URL for a lease we could not
+                // actually extend.
+                const { count } = await prisma.receiptIntake.updateMany({
+                    where: {
+                        id: existing.id,
+                        state: "STAGING",
+                        storagePath: existing.storagePath,
+                        uploadLeaseVersion: existing.uploadLeaseVersion,
+                    },
+                    data: { uploadUrlExpiresAt: uploadLeaseExpiry() },
                 });
+                if (count > 0) {
+                    return NextResponse.json({
+                        ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resigned,
+                    });
+                }
             }
 
             // A RESUME IS A NEW LEASE, taken BEFORE the URL is signed and in one

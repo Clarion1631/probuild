@@ -3,11 +3,23 @@ import { prisma } from "@/lib/prisma";
 import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import { resolveReceiptUrls } from "@/lib/receipt-intake/receipt-url";
+import { STAFF_READ_ROLES } from "@/lib/receipt-intake/intake-auth";
 import ReceiptQueueClient from "./ReceiptQueueClient";
 
 export default async function BookkeeperReceiptsPage() {
     const session = await getSessionOrDev();
     if (!session?.user) redirect("/login");
+
+    // Same role gate as the GET /api/receipts/intake staff-queue read
+    // (STAFF_READ_ROLES): this page queries Expense directly and mints
+    // short-lived signed URLs for every receipt, so a session check alone let
+    // ANY logged-in role — not just ADMIN/MANAGER/FINANCE — browse the
+    // bookkeeper queue and its receipt images. Deny-by-default: no matching
+    // User (outside local dev) is not staff.
+    const user = await prisma.user.findUnique({ where: { email: session.user.email! } });
+    if (!user ? process.env.NODE_ENV !== "development" : !STAFF_READ_ROLES.includes(user.role)) {
+        return <div className="p-8 text-red-500">Access Denied. Bookkeeping staff only.</div>;
+    }
 
     const [
         pendingExpenses,

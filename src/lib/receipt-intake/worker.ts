@@ -533,9 +533,15 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
             if (row.state === "RECEIVED") {
                 bump(await processReceived(row, deps));
             } else if (row.state === "READ") {
-                // Dry-run rows PARK at READ. This is the shadow-week gate: the
-                // only thing that moves a row to BOOKING is dryRun === false.
-                if (row.dryRun) { bump("READ"); continue; }
+                // Dry-run rows PARK at READ. This is the shadow-week gate: a
+                // row only moves to BOOKING when BOTH its persisted flag AND
+                // the CURRENT global switch say live. The persisted flag alone
+                // is not a kill switch — it is written once at intake and
+                // never rechecked, so a row claimed while RECEIPT_INTAKE_DRYRUN
+                // was off keeps dryRun=false even after the switch is reverted
+                // to stop live QBO writes.
+                const live = !row.dryRun && !deps.isDryRunEnabled();
+                if (!live) { bump("READ"); continue; }
                 const promotion = await deps.promoteToBooking(row.id, row.dedupWeakKey, row.claimToken);
                 if (promotion.stale) {
                     // Superseded between the claim and the promotion. The
@@ -557,7 +563,7 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                 await deps.applyBookResult(row.id, result, row.claimToken);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
-                if (row.dryRun) { bump("BOOKING"); continue; }
+                if (row.dryRun || deps.isDryRunEnabled()) { bump("BOOKING"); continue; }
                 const result = await deps.book(row);
                 await deps.applyBookResult(row.id, result, row.claimToken);
                 bump(stateForBookResult(result));
