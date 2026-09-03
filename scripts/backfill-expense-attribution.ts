@@ -33,7 +33,7 @@
  *
  * TWO THINGS IT MUST NEVER DO, both in the update predicate rather than in the
  * loop's discipline: overwrite an existing cost code, and overwrite a HUMAN's
- * (costCodeSource "capture" or "manual").
+ * (costCodeSource "capture", "manual" or "manual-none" — HUMAN_COST_CODE_SOURCES).
  *
  * RUNTIME: this file imports TypeScript from src/, so it needs a TS loader.
  *   node --import=tsx scripts/...
@@ -57,6 +57,7 @@ import { dirname, join } from "node:path";
 import { writeFileSync } from "node:fs";
 import { suggestCode } from "../src/lib/expense-cost-suggest";
 import {
+    HUMAN_COST_CODE_SOURCES,
     notHumanCodedExpenseWhere,
     resolveExpenseCostCodeId,
     resolveExpenseProjectId,
@@ -208,7 +209,13 @@ export function planBackfill({
         // predicate — this one keeps the dry-run table honest, that one keeps
         // the write safe, and neither is allowed to be the only guard.
         if (expense.costCodeId) continue;
-        if (expense.costCodeSource === "capture" || expense.costCodeSource === "manual") continue;
+        // Read off HUMAN_COST_CODE_SOURCES rather than naming the values here:
+        // this line used to spell out "capture" and "manual", and when
+        // "manual-none" joined them (round 36, item 3) the update predicate
+        // below learned about it through notHumanCodedExpenseWhere() while this
+        // one did not. A dry-run table that lists a row the write then refuses
+        // is the mildest version of that bug; the loud one is the reverse.
+        if ((HUMAN_COST_CODE_SOURCES as readonly string[]).includes(expense.costCodeSource ?? "")) continue;
 
         // (b) ITEM FALLBACK — and the link has to be checked before it is
         // trusted (Codex round 1, blocker 3).
@@ -436,9 +443,25 @@ export async function writeUnderAttributionLocks(db, locks, run) {
     } = locks;
     if (typeof db.$transaction !== "function") return run(db);
     return db.$transaction(async tx => {
+        // THE JOB FIRST (round 36, item 4). The canonical order every other
+        // holder of these rows uses is the one inside lockPhaseRowsForShare:
+        // Project, then Estimate, then EstimateItem, then CostCode. This
+        // function used to call that helper THIRD, after taking Estimate and
+        // EstimateItem itself — so it reached Project last while a live writer
+        // reached it first. Two transactions taking the same tables in
+        // opposite orders is the textbook deadlock, and the loser is a
+        // bookkeeper saving an expense, not a script somebody is watching.
+        //
+        // Hoisting the helper to the front makes the WHOLE set acquire in that
+        // one order, because the two calls below are the same two tables the
+        // helper has already reached: Estimate then EstimateItem. Re-locking a
+        // row this transaction already holds is a no-op, and the ids these two
+        // add (an expense whose estimate belongs to no job, or to another one)
+        // are rows the helper never saw, so nothing is lost by ordering them
+        // after it.
+        await lockPhaseRowsForShare(tx, phaseProjectId);
         await lockRowsForShare(tx, '"Estimate"', estimateIds);
         await lockRowsForShare(tx, '"EstimateItem"', estimateItemIds);
-        await lockPhaseRowsForShare(tx, phaseProjectId);
         // THE CANDIDATE CODE ITSELF (round 20, item 5). `isActive` is a
         // company-wide switch with nothing to do with this job's phase rows, so
         // locking those did not hold it: a code retired while this pass ran was

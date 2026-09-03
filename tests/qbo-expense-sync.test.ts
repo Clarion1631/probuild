@@ -1586,7 +1586,10 @@ test("the write is guarded on uncoded AND not-human-coded, with a NULL branch", 
     assert.equal(where.costCodeId, null);
     assert.deepEqual(where.OR, [
         { costCodeSource: null },
-        { costCodeSource: { notIn: ["capture", "manual"] } },
+        // "manual-none" joined the human list in round 36, item 3: clearing a
+        // phase is a decision, and NULL provenance is what every automated pass
+        // reads as "a machine may write here".
+        { costCodeSource: { notIn: ["capture", "manual", "manual-none"] } },
     ]);
     // Everything the decision depended on is re-asserted at write time, so a
     // row re-attributed between the read and the write is skipped rather than
@@ -2623,4 +2626,43 @@ test("a row with its OWN projectId needs no estimate read at all", async () => {
     );
     assert.equal(estimateReads, 0, "the column answers for itself");
     assert.equal(writes[0].where.projectId, "project-1");
+});
+
+test("round 36 item 3: a CLEARED phase is a human decision the suggester must not undo", async () => {
+    // The bug this replaces. Clearing the phase wrote `costCodeId: null,
+    // costCodeSource: null`, and NULL provenance is exactly the state this
+    // function reads as "no human has spoken, a machine may write". So the very
+    // next sync re-applied the same regex suggestion the bookkeeper had just
+    // removed, and the clear came undone with nothing to show it had happened.
+    //
+    // A cleared row now carries "manual-none" — the same shape `taxSource`
+    // uses for "a person looked and the answer is nothing" — and both the
+    // read-side guard and the update predicate refuse it.
+    const fake = fakeSuggestionClient({
+        ...STORED_DEFAULT!,
+        costCodeId: null,
+        costCodeSource: "manual-none",
+    });
+    const result = await applyQboExpenseCostCodeSuggestion(
+        fake.client,
+        { qbPurchaseId: "purchase-1" },
+        COST_CODE_IDS,
+    );
+    assert.equal(result, "not-written");
+    assert.equal(fake.calls.length, 0, "the suggester must not even attempt the write");
+});
+
+test("round 36 item 3: the clear survives even if the read-side guard is bypassed", async () => {
+    // Belt and braces, and the braces are the part that actually holds: the
+    // read guard stops us COMPUTING a suggestion nobody may use, the update
+    // predicate is the guarantee. A row cleared between the read and the write
+    // must be excluded by the WHERE, not merely by the early return.
+    const fake = fakeSuggestionClient({ ...STORED_DEFAULT!, costCodeId: null, costCodeSource: null });
+    await applyQboExpenseCostCodeSuggestion(fake.client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS);
+    const branches = fake.calls[0].where.OR as { costCodeSource?: { notIn?: string[] } | null }[];
+    const notIn = branches.find(branch => branch.costCodeSource && "notIn" in branch.costCodeSource)!;
+    assert.ok(
+        notIn.costCodeSource!.notIn!.includes("manual-none"),
+        "a row cleared after the read must still be excluded by the write predicate",
+    );
 });

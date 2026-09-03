@@ -471,10 +471,21 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 ...(editsCostCode
                     ? {
                         costCodeId: nextCostCodeId,
-                        // Clearing the code clears the provenance with it —
-                        // leaving "manual" on a null code would guard a row
-                        // that has nothing to guard.
-                        costCodeSource: nextCostCodeId ? "manual" : null,
+                        // CLEARING THE PHASE IS A DECISION, SO IT IS RECORDED AS ONE
+                        // (round 36, item 3). This used to write a null source
+                        // beside the null code, reasoning that provenance for no
+                        // code has nothing to guard. Null is the exact state the
+                        // QBO suggester and the backfill both read as "no human has
+                        // spoken here, a machine may write", so the next sync put
+                        // the same regex suggestion straight back and the
+                        // bookkeeper's clear vanished within the hour.
+                        //
+                        // "manual-none" is the same shape `taxSource` already uses
+                        // for "a person looked and the answer is nothing" — it is
+                        // in HUMAN_COST_CODE_SOURCES, so notHumanCodedExpenseWhere()
+                        // holds every automated pass off it, while a human later
+                        // picking a real phase still overwrites it with "manual".
+                        costCodeSource: nextCostCodeId ? "manual" : "manual-none",
                         costCodeConfidence: null,
                     }
                     : {}),
@@ -1111,7 +1122,8 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                 ...(editsCostCode
                     ? {
                         costCodeId: nextCostCodeId,
-                        costCodeSource: nextCostCodeId ? "manual" : null,
+                        // Same decision, same recording — see the block above.
+                        costCodeSource: nextCostCodeId ? "manual" : "manual-none",
                         costCodeConfidence: null,
                     }
                     : {}),

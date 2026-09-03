@@ -302,6 +302,146 @@ export const MISMATCHED_PAIRS_QUERY =
         AND est."projectId" IS NOT NULL
         AND e."projectId" <> est."projectId"`;
 
+
+/**
+ * THE ROLLOUT WINDOW CAN SPLIT A ROW ACROSS TWO JOBS (round 36, item 1).
+ *
+ * The sequence this migration runs in has a gap neither backfill can close on
+ * its own, because the damage happens BETWEEN them:
+ *
+ *   1. this script runs (it has to — the new build selects these columns);
+ *      PROJECT_ID_BACKFILL stamps `Expense.projectId` from the estimate.
+ *   2. the OLD build is still serving. Its QBO sync writes the whole expense
+ *      record on every changed purchase (`transaction.expense.update({ data:
+ *      write })`), and `write` carries `estimateId` — but its Prisma client
+ *      predates `projectId`, so it cannot carry that. It re-points the row at
+ *      another job's estimate and leaves the projectId this script just wrote.
+ *   3. the row is now `projectId = job A, estimateId = job B`. Every reader
+ *      that trusts one of the two reports the other job's money.
+ *
+ * The --post-deploy pass cannot repair this by re-running the fill: that fill
+ * matches `"projectId" IS NULL`, and these rows HAVE a projectId. It is a
+ * non-null WRONG answer, the one shape a null-guarded backfill is blind to.
+ *
+ * So the window is closed rather than cleaned up afterwards. This trigger goes
+ * in BEFORE the backfill below, and from that moment any writer that moves
+ * `estimateId` while saying nothing about `projectId` — precisely the old
+ * build, and precisely nothing in the new one — has the pair re-derived for
+ * it inside the same statement.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO. It fires only when the UPDATE leaves
+ * `projectId` untouched (`NEW IS NOT DISTINCT FROM OLD`). Every writer in the
+ * new build sets both columns from one locked read, and this must never
+ * second-guess them: a bookkeeper deliberately re-attributing an expense to
+ * another job keeps the estimate of the job it left, on purpose (see the
+ * "RE-ATTRIBUTED expense" note in src/app/api/expenses/[id]/route.ts), and a
+ * trigger that "corrected" that would silently revert the human.
+ *
+ * It also refuses to null a projectId out: if the incoming estimate belongs to
+ * no job, the row keeps the attribution it had. Losing attribution is not a
+ * better outcome than holding a stale one.
+ *
+ * Idempotent by DROP-then-CREATE: Postgres has no CREATE TRIGGER IF NOT
+ * EXISTS, and a re-run must not fail on the trigger it created last time.
+ */
+export const SPLIT_JOB_GUARD_SQL = [
+    `CREATE OR REPLACE FUNCTION probuild_expense_estimate_pair_guard()
+     RETURNS trigger
+     LANGUAGE plpgsql
+     AS $guard$
+     DECLARE
+         est_project TEXT;
+     BEGIN
+         IF NEW."estimateId" IS DISTINCT FROM OLD."estimateId"
+            AND NEW."projectId" IS NOT DISTINCT FROM OLD."projectId"
+            AND OLD."projectId" IS NOT NULL
+            AND NEW."estimateId" IS NOT NULL
+         THEN
+             SELECT est."projectId" INTO est_project
+               FROM "Estimate" est
+              WHERE est.id = NEW."estimateId";
+             IF est_project IS NOT NULL THEN
+                 NEW."projectId" := est_project;
+             END IF;
+         END IF;
+         RETURN NEW;
+     END;
+     $guard$`,
+    `DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard ON "Expense"`,
+    `CREATE TRIGGER probuild_expense_estimate_pair_guard
+     BEFORE UPDATE OF "estimateId" ON "Expense"
+     FOR EACH ROW
+     EXECUTE FUNCTION probuild_expense_estimate_pair_guard()`,
+];
+
+/**
+ * Dropped in the --post-deploy pass, once the old instances have drained and
+ * every writer of `estimateId` is one that owns `projectId` too.
+ *
+ * It is compatibility scaffolding for ONE deploy, not a permanent invariant.
+ * Left in place it would quietly overrule a future writer that legitimately
+ * moves an estimate without restating the job — the same class of surprise it
+ * exists to prevent, pointing the other way.
+ */
+export const SPLIT_JOB_GUARD_DROP_SQL = [
+    `DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard ON "Expense"`,
+    `DROP FUNCTION IF EXISTS probuild_expense_estimate_pair_guard()`,
+];
+
+/**
+ * The repair, for a database where the guard was NOT in place — an earlier run
+ * of this script, or a deploy that went out before this fix existed.
+ *
+ * IT IS OPT-IN (`--repair-split-jobs`), AND THAT IS NOT TIMIDITY. Once the new
+ * build is live, `projectId <> estimate.projectId` has TWO causes that are
+ * indistinguishable in the row:
+ *
+ *   * the rollout window above — the estimate is right, the projectId is a
+ *     stale leftover, and re-deriving from the estimate is the fix; and
+ *   * a bookkeeper re-attributing an expense to another job — the projectId IS
+ *     the human's answer, the estimate belongs to the job the row LEFT, and
+ *     re-deriving from the estimate silently reverts them.
+ *
+ * Nothing in the schema records which happened. Running this by default would
+ * mean choosing to overwrite human decisions whenever the guess is wrong, on a
+ * money-attribution column, leaving no trace that it happened. So the verifier
+ * REPORTS the count and fails (MISMATCHED_PAIRS_QUERY), a person reads the
+ * rows, and this runs only once they have concluded the estimate is right.
+ *
+ * Scoped to `qbPurchaseId IS NOT NULL` because the old QBO sync is the only
+ * writer that rewrites `estimateId` without `projectId`: a row that never came
+ * from QuickBooks cannot have been damaged this way, so it is never a
+ * candidate however the flag is passed.
+ *
+ * Same locked-CTE shape and same `ORDER BY est.id` as PROJECT_ID_BACKFILL, for
+ * the same two reasons — the estimate must hold still between the read and the
+ * write, and the acquisition order must match `lockMoneyParentsMany`.
+ */
+export const SPLIT_JOB_REPAIR =
+    `WITH locked AS (
+       SELECT est.id, est."projectId"
+         FROM "Estimate" est
+        WHERE est."projectId" IS NOT NULL
+          AND EXISTS (
+                SELECT 1 FROM "Expense" e
+                 WHERE e."estimateId" = est.id
+                   AND e."qbPurchaseId" IS NOT NULL
+                   AND e."projectId" IS NOT NULL
+                   AND e."projectId" <> est."projectId"
+              )
+        ORDER BY est.id
+          FOR SHARE
+     )
+     UPDATE "Expense" e
+        SET "projectId" = locked."projectId",
+            "attributionAnchoredAt" = now()
+       FROM locked
+      WHERE e."estimateId" = locked.id
+        AND e."qbPurchaseId" IS NOT NULL
+        AND e."projectId" IS NOT NULL
+        AND e."projectId" <> locked."projectId"`;
+
+
 export const statements = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "projectId" TEXT`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAmount" DECIMAL(65,30)`,
@@ -493,6 +633,10 @@ END $$`,
     // those were written by time-expense-core, which has always used the shared
     // parser.
     // The backfill. Idempotent by predicate, and a no-op on an empty database.
+    // THE COMPATIBILITY GUARD GOES IN BEFORE THE FILL, not after: from the
+    // moment the column carries values, an old instance moving `estimateId`
+    // can split the row across two jobs. See SPLIT_JOB_GUARD_SQL.
+    ...SPLIT_JOB_GUARD_SQL,
     // See PROJECT_ID_BACKFILL and the POST-DEPLOY note above it.
     PROJECT_ID_BACKFILL,
 
@@ -518,6 +662,29 @@ END $$`,
  */
 export function postDeployStatements(timeZone) {
     return [PROJECT_ID_BACKFILL, reanchorSql(timeZone), SOURCE_FILE_ID_BACKFILL];
+}
+
+/**
+ * The rest of the --post-deploy pass: the compatibility guard comes OUT, and
+ * (only when asked) the split-job repair runs before it does.
+ *
+ * Deliberately NOT part of postDeployStatements: that function's invariant is
+ * that it is a strict SUBSET of the main run, which is what stops the two
+ * drifting into different backfills. These statements have no counterpart in
+ * the main run — the teardown is the opposite of what the main run does, and
+ * the repair must never run unasked — so folding them in would quietly break
+ * the one property that test asserts.
+ *
+ * Order matters: repair first, drop second. The repair moves `projectId` and
+ * leaves `estimateId` alone, so the guard never sees it; but if a future
+ * version ever touched `estimateId`, doing it while the guard still stands is
+ * the safe order, not the other way round.
+ */
+export function postDeployTeardownStatements({ repairSplitJobs = false } = {}) {
+    return [
+        ...(repairSplitJobs ? [SPLIT_JOB_REPAIR] : []),
+        ...SPLIT_JOB_GUARD_DROP_SQL,
+    ];
 }
 
 export const expectedColumns = {
@@ -587,15 +754,93 @@ export const expectedCheckConstraints = [
     },
 ];
 
+/**
+ * Verified by SHAPE, not by name (round 36, item 2) — the same lesson
+ * expectedConstraints learned in round 1.
+ *
+ * Every creation above is `CREATE ... IF NOT EXISTS`, which matches on the
+ * NAME alone. An index already carrying one of these names is therefore left
+ * exactly as it is, whatever it indexes: the dedupe backstop could be a
+ * non-unique index, could be over the wrong columns, or could have lost its
+ * `WHERE "sourceFileId" IS NOT NULL` and so drag every NULL row into the
+ * uniqueness. Checking `pg_class.relname` existed proved only that the CREATE
+ * had been skipped, and the script printed "verified 3 index(es)" over a
+ * duplicate-receipt guard that did not guard anything.
+ *
+ * So each entry carries what the index must BE, and the check reads the
+ * catalog: `indisunique` for uniqueness, the key-column names in order
+ * (`indkey`, cut to `indnkeyatts` so an INCLUDE column cannot pad it), and
+ * `pg_get_expr(indpred)` for the partial predicate — `null` here means the
+ * index must NOT be partial, which is a real assertion and not a skip.
+ *
+ * Drift fails the run rather than silently re-skipping the CREATE, and says
+ * to drop and recreate, because that is the only thing that fixes it: no
+ * `CREATE INDEX IF NOT EXISTS` will ever replace a wrong index in place.
+ */
 export const expectedIndexes = [
-    { name: "Expense_projectId_idx", table: "Expense" },
-    { name: "Expense_sourceFileId_idx", table: "Expense" },
-    // The partial UNIQUE index. Verified by name like the others: the shape it
-    // must have is asserted against a real catalog by
-    // scripts/check-migrations-match.mjs, which reads it out of
-    // prisma/prisma-blind-spots.json.
-    { name: "Expense_sourceFileId_sourceGroupIndex_key", table: "Expense" },
+    { name: "Expense_projectId_idx", table: "Expense", unique: false, keyColumns: ["projectId"], predicate: null },
+    { name: "Expense_sourceFileId_idx", table: "Expense", unique: false, keyColumns: ["sourceFileId"], predicate: null },
+    // The partial UNIQUE index. Its shape is ALSO asserted against a real
+    // catalog by scripts/check-migrations-match.mjs (out of
+    // prisma/prisma-blind-spots.json); this checks the database the migration
+    // actually ran against, which that one never sees.
+    {
+        name: "Expense_sourceFileId_sourceGroupIndex_key",
+        table: "Expense",
+        unique: true,
+        keyColumns: ["sourceFileId", "sourceGroupIndex"],
+        // pg renders it with the column quoted and the whole thing parenthesised.
+        predicate: /^\("?sourceFileId"? IS NOT NULL\)$/,
+    },
 ];
+
+/**
+ * Phase 1's table, checked only when it is present (see the guarded DO block).
+ * `costCodeSource` was missing from this list while the DDL above added it —
+ * so the one column the receipt-intake path needs for provenance was the one
+ * column nothing verified.
+ */
+
+/**
+ * Does the index in the database differ from the one we asked for?
+ *
+ * Pulled out of the verification loop so it can be tested against every wrong
+ * shape without needing a database. Returns a human sentence describing the
+ * FIRST difference, or null when the index is what it should be.
+ *
+ * `actual` is one row of the catalog query in main(): `table_name`,
+ * `is_unique`, `key_columns` (ordered, NULL for an expression column) and
+ * `predicate` (`pg_get_expr` of `indpred`, null when the index is total).
+ */
+export function indexDrift(expected, actual) {
+    if (actual.table_name !== expected.table) {
+        return `wrong table: expected ${expected.table}, found ${actual.table_name}`;
+    }
+    if (actual.is_unique !== expected.unique) {
+        return `wrong uniqueness: expected indisunique = ${expected.unique}, found ${actual.is_unique}`;
+    }
+    const found = (actual.key_columns ?? []).map(column => column ?? "<expression>");
+    if (found.length !== expected.keyColumns.length
+        || found.some((column, index) => column !== expected.keyColumns[index])) {
+        return `wrong key columns: expected (${expected.keyColumns.join(", ")}), found (${found.join(", ")})`;
+    }
+    // A null expectation ASSERTS the index is total. A partial index where a
+    // total one belongs silently narrows whatever the index was meant to cover,
+    // so "no predicate expected" cannot mean "predicate not checked".
+    if (expected.predicate === null) {
+        return actual.predicate === null
+            ? null
+            : `expected no predicate (a total index), found: ${actual.predicate}`;
+    }
+    if (actual.predicate === null) {
+        return `expected the partial predicate ${expected.predicate}, but the index is not partial`;
+    }
+    return expected.predicate.test(actual.predicate)
+        ? null
+        : `wrong predicate: expected ${expected.predicate}, found: ${actual.predicate}`;
+}
+
+export const expectedReceiptIntakeColumns = ["taxAtSource", "installedAtCustomer", "costCodeSource"];
 
 async function main() {
     if (!process.argv.includes("--yes")) {
@@ -651,11 +896,25 @@ async function main() {
         // has already run; re-running it would be harmless but the point of
         // this mode is to be an obviously-narrow second pass.
         const postDeployOnly = process.argv.includes("--post-deploy");
+        // OPT-IN, and only meaningful in the post-deploy pass. See
+        // SPLIT_JOB_REPAIR for why this cannot be the default: after the new
+        // build is live, a mismatched pair is either the rollout window or a
+        // bookkeeper's deliberate re-attribution, and the row cannot say which.
+        const repairSplitJobs = process.argv.includes("--repair-split-jobs");
+        if (repairSplitJobs && !postDeployOnly) {
+            console.error("--repair-split-jobs is only valid together with --post-deploy.");
+            process.exit(1);
+        }
         const toRun = postDeployOnly
-            ? postDeployStatements(companyTimeZone)
+            ? [...postDeployStatements(companyTimeZone), ...postDeployTeardownStatements({ repairSplitJobs })]
             : [...statements, reanchorSql(companyTimeZone)];
         if (postDeployOnly) {
-            console.log("--post-deploy: running the two backfills only (see PROJECT_ID_BACKFILL).");
+            console.log("--post-deploy: the three backfills, then the compatibility guard comes out (see PROJECT_ID_BACKFILL).");
+            console.log(
+                repairSplitJobs
+                    ? "--repair-split-jobs: ALSO re-deriving projectId from the estimate for QBO-synced rows whose pair disagrees. Read SPLIT_JOB_REPAIR before trusting this on a database where humans have re-attributed expenses."
+                    : "split-job repair NOT running (pass --repair-split-jobs to enable it; the verifier below reports the count either way).",
+            );
         }
         await prisma.$transaction(async tx => {
             for (const sql of toRun) {
@@ -724,16 +983,50 @@ async function main() {
             }
             console.log(`verified check constraint ${name}: ${row.def}`);
         }
-        for (const { name, table } of expectedIndexes) {
+        for (const { name, table, unique, keyColumns, predicate } of expectedIndexes) {
+            // ONE catalog read per index, answering every question at once.
+            // `indkey` is cut to `indnkeyatts` so an INCLUDE column cannot pad
+            // the key list, and the LEFT JOIN leaves a NULL name for an
+            // EXPRESSION column (attnum 0) rather than dropping it — an
+            // expression where a plain column belongs must read as a mismatch,
+            // not as a shorter list that happens to compare equal.
             const [row] = await prisma.$queryRawUnsafe(
-                `SELECT 1 AS ok FROM pg_class WHERE relname = $1 AND relnamespace = 'public'::regnamespace`, name,
+                `SELECT c.relname                              AS table_name,
+                        i.indisunique                          AS is_unique,
+                        pg_get_expr(i.indpred, i.indrelid)     AS predicate,
+                        pg_get_indexdef(i.indexrelid)          AS def,
+                        (SELECT array_agg(a.attname ORDER BY k.ord)
+                           FROM unnest(i.indkey::smallint[]) WITH ORDINALITY AS k(attnum, ord)
+                           LEFT JOIN pg_attribute a
+                                  ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                          WHERE k.ord <= i.indnkeyatts)        AS key_columns
+                   FROM pg_index i
+                   JOIN pg_class ic     ON ic.oid = i.indexrelid
+                   JOIN pg_class c      ON c.oid  = i.indrelid
+                   JOIN pg_namespace n  ON n.oid  = ic.relnamespace
+                  WHERE ic.relname = $1 AND n.nspname = 'public'`,
+                name,
             );
             if (!row) {
                 console.error(`VERIFY FAILED: index ${name} missing on ${table}`);
                 process.exit(1);
             }
+            // The mismatch reports the SAME remedy whatever it is, because it
+            // is the only one that works: `CREATE INDEX IF NOT EXISTS` matched
+            // this name and skipped, and will skip again on every future run.
+            // The index has to be dropped and recreated by hand.
+            const drift = indexDrift({ name, table, unique, keyColumns, predicate }, row);
+            if (drift) {
+                console.error(
+                    `VERIFY FAILED: index ${name} has drifted \u2014 ${drift}\r\n` +
+                    `  actual definition: ${row.def}\r\n` +
+                    `  This script's CREATE ... IF NOT EXISTS matched the NAME and skipped, so a\r\n` +
+                    `  re-run will NOT repair it. DROP INDEX "${name}" and re-run this script.`,
+                );
+                process.exit(1);
+            }
+            console.log(`verified index ${name}: ${row.def}`);
         }
-        console.log(`verified ${expectedIndexes.length} index(es)`);
 
         // The backfill's own assertion: after this script, no expense may have
         // a NULL projectId while its estimate knows one. A count, not a sample
@@ -794,12 +1087,12 @@ async function main() {
                 `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='ReceiptIntake'`,
             );
             const found = new Set(rows.map(r => r.column_name));
-            const missing = ["taxAtSource", "installedAtCustomer"].filter(c => !found.has(c));
+            const missing = expectedReceiptIntakeColumns.filter(c => !found.has(c));
             if (missing.length) {
                 console.error(`VERIFY FAILED: ReceiptIntake missing columns: ${missing.join(", ")}`);
                 process.exit(1);
             }
-            console.log("verified ReceiptIntake: 2 columns");
+            console.log(`verified ReceiptIntake: ${expectedReceiptIntakeColumns.length} columns`);
         } else {
             console.log("ReceiptIntake not present — Phase 1 has not landed here yet; RE-RUN this script after it does.");
         }

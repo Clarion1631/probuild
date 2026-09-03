@@ -221,6 +221,53 @@ ALTER TABLE "Expense" DROP CONSTRAINT IF EXISTS "Expense_taxAtSource_check";
 ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAtSource_check"
   CHECK ("taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0));
 
+-- THE ROLLOUT-WINDOW GUARD (round 36, item 1). Created BEFORE the backfill
+-- below, because the damage happens between them: once `projectId` carries
+-- values, an OLD app instance whose Prisma client predates that column can
+-- still rewrite `estimateId` (its QBO sync writes the whole record), leaving
+-- the row on job A by projectId and job B by estimate.
+--
+-- It fires ONLY when the UPDATE leaves `projectId` untouched, which is exactly
+-- the old build and exactly nothing in the new one. A bookkeeper deliberately
+-- re-attributing an expense keeps the estimate of the job it left, on purpose,
+-- and this must never revert that.
+--
+-- Dropped again at the end of this file: it is compatibility scaffolding for
+-- one deploy, not a standing invariant. In production the drop is the
+-- --post-deploy pass (see scripts/apply-expense-attribution.mjs); here the two
+-- run back to back, so a database built from these migrations ends in the same
+-- shape production ends in — with no trigger.
+CREATE OR REPLACE FUNCTION probuild_expense_estimate_pair_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $guard$
+DECLARE
+    est_project TEXT;
+BEGIN
+    IF NEW."estimateId" IS DISTINCT FROM OLD."estimateId"
+       AND NEW."projectId" IS NOT DISTINCT FROM OLD."projectId"
+       AND OLD."projectId" IS NOT NULL
+       AND NEW."estimateId" IS NOT NULL
+    THEN
+        SELECT est."projectId" INTO est_project
+          FROM "Estimate" est
+         WHERE est.id = NEW."estimateId";
+        IF est_project IS NOT NULL THEN
+            NEW."projectId" := est_project;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$guard$;
+
+DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard ON "Expense";
+
+CREATE TRIGGER probuild_expense_estimate_pair_guard
+BEFORE UPDATE OF "estimateId" ON "Expense"
+FOR EACH ROW
+EXECUTE FUNCTION probuild_expense_estimate_pair_guard();
+
+
 -- THE BACKFILL READS THE ESTIMATE UNDER A LOCK (Codex round 32). A plain
 -- `UPDATE ... FROM "Estimate"` join takes no row lock, so under READ COMMITTED
 -- an estimate moved to another job right after the read leaves the expense
@@ -261,3 +308,11 @@ DO $$ BEGIN
     ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT;
   END IF;
 END $$;
+
+-- ...and the guard comes back out. In production this half is the
+-- --post-deploy pass, run once the old instances have drained; here it runs
+-- immediately, so a fresh database matches production's END state rather than
+-- its mid-deploy one. Left standing, the trigger would quietly overrule any
+-- future writer that legitimately moves an estimate without restating the job.
+DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard ON "Expense";
+DROP FUNCTION IF EXISTS probuild_expense_estimate_pair_guard();

@@ -97,6 +97,56 @@ Planner output for the executor: build exactly this; do not guess.
    Verify: the script's own output — "verified backfill: 0 expenses left
    unattributed" and "verified re-anchor: 0 expenses left at UTC midnight" —
    both reporting zero is the proof, not merely that the command exited 0.
+
+   **THE FOUR STEPS, IN ORDER, AND WHAT EACH ONE IS FOR.** The window between
+   them can put a single expense on two different jobs at once, so the order is
+   not a suggestion:
+
+   | # | Step | Why it cannot move |
+   |---|------|--------------------|
+   | 1 | **pre-deploy**: `node scripts/apply-expense-attribution.mjs --yes --expect-db <name> --expect-host <host>` | Adds the columns and installs the split-job guard BEFORE the backfill gives `projectId` any values. |
+   | 2 | **merge** (auto-deploy ships `main`) | The new build starts serving; it sets `projectId` and `estimateId` together from one locked read. |
+   | 3 | **drain** — wait for the previous Vercel deployment to stop serving | Until it does, an old instance is still writing rows that know nothing about `projectId`. |
+   | 4 | **post-deploy**: same command with `--post-deploy` | Re-runs the three backfills for what the old build wrote in the window, then REMOVES the guard. |
+
+   **The window step 1→3 leaves open, and why the guard is in step 1 rather
+   than step 4.** The pre-deploy backfill sets `Expense.projectId` while the old
+   build is still live. That build's QBO sync rewrites the whole expense record
+   on every changed purchase (`transaction.expense.update({ data: write })`) and
+   `write` carries `estimateId` — but its Prisma client predates `projectId`, so
+   it cannot carry that. It re-points the row at another job's estimate and
+   leaves the projectId step 1 just wrote. The row is then `projectId = job A,
+   estimateId = job B`, and every reader that trusts one of the two reports the
+   other job's money.
+
+   The post-deploy pass **cannot clean that up afterwards**: its projectId fill
+   matches `"projectId" IS NULL`, and these rows have a projectId. It is a
+   non-null WRONG answer, the one shape a null-guarded backfill is blind to. So
+   the window is closed instead of repaired — step 1 installs a BEFORE UPDATE OF
+   `"estimateId"` trigger (`probuild_expense_estimate_pair_guard`) that
+   re-derives the pair for any writer that moves the estimate without saying
+   anything about the job. That is precisely the old build and precisely nothing
+   in the new one, because the trigger fires only when `NEW."projectId" IS NOT
+   DISTINCT FROM OLD."projectId"`. Step 4 drops it again: it is compatibility
+   scaffolding for one deploy, and left standing it would overrule a future
+   writer that legitimately moves an estimate.
+
+   **If a database DID go out without the guard** (an earlier run of this
+   script, or a deploy that predates this fix), the post-deploy verifier reports
+   the count — "verified pair: N expense(s) disagree with their estimate's
+   project" — and fails. Repairing it is **opt-in**, via
+   `--post-deploy --repair-split-jobs`, and deliberately not the default: once
+   the new build is live, that same shape has two causes the row cannot tell
+   apart. Either the rollout window (the estimate is right, the projectId is
+   stale) or a bookkeeper re-attributing an expense to another job (the
+   projectId IS the human's answer, and the estimate belongs to the job the row
+   LEFT — see the "RE-ATTRIBUTED expense" note in
+   `src/app/api/expenses/[id]/route.ts`). Running the repair unasked would mean
+   overwriting human decisions whenever the guess went the wrong way, on a
+   money-attribution column, with nothing recording that it happened. **Read the
+   rows before passing the flag.** The repair is scoped to
+   `qbPurchaseId IS NOT NULL` regardless, because the old QBO sync is the only
+   writer that can produce the damage.
 2. **Every writer stamps projectId** (§3): after deploy, a new expense from each writer has
    `projectId` set. Verify: writer unit tests + one prod row per path spot-checked.
 3. **Capture/manual codes are never overwritten** (§3): the QBO sync and the backfill only

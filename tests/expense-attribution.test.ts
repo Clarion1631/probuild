@@ -162,8 +162,12 @@ test("notHumanCodedExpenseWhere has an explicit NULL branch", () => {
     const branches = where.OR as Record<string, unknown>[];
     assert.equal(branches.length, 2);
     assert.deepEqual(branches[0], { costCodeSource: null });
-    assert.deepEqual(branches[1], { costCodeSource: { notIn: ["capture", "manual"] } });
-    assert.deepEqual([...HUMAN_COST_CODE_SOURCES], ["capture", "manual"]);
+    // "manual-none" joined the list in round 36, item 3: clearing a phase is a
+    // person's decision, and a NULL provenance is exactly what the QBO suggester
+    // and the backfill both read as "a machine may write here" — so the clear
+    // used to be undone by the next sync.
+    assert.deepEqual(branches[1], { costCodeSource: { notIn: ["capture", "manual", "manual-none"] } });
+    assert.deepEqual([...HUMAN_COST_CODE_SOURCES], ["capture", "manual", "manual-none"]);
 });
 
 // ── the display/routing label, for the readers converted last ──────────────

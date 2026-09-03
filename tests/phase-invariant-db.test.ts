@@ -341,6 +341,98 @@ test("the backfill's cost-code write holds the row its phase verdict came from",
     }
 });
 
+/**
+ * ROUND 36, ITEM 4: the backfill used to reach Project LAST.
+ *
+ * `lockPhaseRowsForShare` is the canonical order for these tables — Project,
+ * then Estimate, then EstimateItem, then CostCode — and every live writer goes
+ * through it. `writeUnderAttributionLocks` took the estimate and the line item
+ * FIRST and only then called the helper, so it walked the same two tables in
+ * the opposite order from everything else in the system.
+ *
+ * Opposite orders only deadlock when something conflicts, and two FOR SHARE
+ * locks never do. The collision needs a real writer: a job being edited holds
+ * its Project row FOR UPDATE and then reaches for the estimate. Against the old
+ * order that is a cycle — the backfill holds Estimate and wants Project, the
+ * editor holds Project and wants Estimate — and Postgres breaks it by killing
+ * one of them with 40P01. The victim is chosen by the server, so half the time
+ * it is the bookkeeper's save, not the unattended script.
+ *
+ * With Project taken first there is no cycle: the backfill simply waits for the
+ * editor to commit, then proceeds. So this asserts BOTH halves — nobody was
+ * killed, and the write still landed.
+ */
+test("a Project-first writer and the backfill do not deadlock — one waits", { skip }, async () => {
+    await seedWithoutTheItem();
+    await seedTheExpense();
+    try {
+        const projectHeld = gate();
+        let editorError: unknown = null;
+
+        // THE LIVE WRITER: Project first, the way the app takes them.
+        const editor = (async () => {
+            try {
+                await inserter!.$transaction(async tx => {
+                    await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+                    await tx.$executeRawUnsafe(`SELECT id FROM "Project" WHERE id = $1 FOR UPDATE`, PROJECT);
+                    projectHeld.open();
+                    // Long enough that the backfill has certainly reached its
+                    // first lock, whichever table that turns out to be.
+                    await new Promise(resolve => setTimeout(resolve, 750));
+                    await tx.$executeRawUnsafe(`SELECT id FROM "Estimate" WHERE id = $1 FOR UPDATE`, CARRIER);
+                });
+            } catch (error) {
+                editorError = error;
+            }
+        })();
+
+        await projectHeld.reached;
+
+        let backfillError: unknown = null;
+        let written: { count: number } | null = null;
+        const backfill = (async () => {
+            try {
+                written = await writeUnderAttributionLocks(
+                    holder!,
+                    {
+                        expenseId: EXPENSE,
+                        estimateIds: [CARRIER],
+                        estimateItemIds: [null],
+                        phaseProjectId: PROJECT,
+                        costCodeId: CODE,
+                    },
+                    async (tx: any) => tx.expense.updateMany({
+                        where: { id: EXPENSE, costCodeId: null },
+                        data: { costCodeId: CODE, costCodeSource: "backfill", costCodeConfidence: null },
+                    }),
+                );
+            } catch (error) {
+                backfillError = error;
+            }
+        })();
+
+        await Promise.all([editor, backfill]);
+
+        const deadlocked = (error: unknown) =>
+            /deadlock detected|40P01/i.test(String((error as { message?: string })?.message ?? error ?? ""));
+        assert.equal(deadlocked(editorError), false, `the live writer was killed by a deadlock: ${editorError}`);
+        assert.equal(deadlocked(backfillError), false, `the backfill was killed by a deadlock: ${backfillError}`);
+        assert.equal(editorError, null, `the live writer failed: ${editorError}`);
+        assert.equal(backfillError, null, `the backfill failed: ${backfillError}`);
+
+        // Waiting is only the right answer if the work still happened.
+        assert.deepEqual(written, { count: 1 }, "the backfill waited and then wrote");
+        const coded = await deleter!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { costCodeId: true, costCodeSource: true },
+        });
+        assert.deepEqual(coded, { costCodeId: CODE, costCodeSource: "backfill" });
+    } finally {
+        await cleanup();
+    }
+});
+
+
 after(async () => {
     await Promise.all([holder?.$disconnect(), inserter?.$disconnect(), deleter?.$disconnect()]);
 });

@@ -546,7 +546,10 @@ test("apply writes both passes, each behind its own predicate", async () => {
     assert.equal(codeWrite.where.costCodeId, null);
     assert.deepEqual(codeWrite.where.OR, [
         { costCodeSource: null },
-        { costCodeSource: { notIn: ["capture", "manual"] } },
+        // "manual-none" joined the human list in round 36, item 3: clearing a
+        // phase is a decision, and NULL provenance is what every automated pass
+        // reads as "a machine may write here".
+        { costCodeSource: { notIn: ["capture", "manual", "manual-none"] } },
     ]);
     // The POST-FILL project. Asserting `null` here is what let the ordering
     // bug through: pass (a) had already set it, so the write matched nothing.
@@ -1311,4 +1314,32 @@ test("the write phase asks the shared invariant, not a list it read itself", () 
     const proofAt = source.indexOf("await provePhaseMembershipTx(");
     const writeAt = source.indexOf("return tx.expense.updateMany({");
     assert.ok(proofAt > 0 && writeAt > proofAt, "proved immediately before the update, not after it");
+});
+
+test("round 36 item 3: the backfill PLAN skips a cleared phase, not just its write", () => {
+    // Two guards, and this is the one that was hand-written. The update
+    // predicate reads HUMAN_COST_CODE_SOURCES through
+    // notHumanCodedExpenseWhere(), so it learned about "manual-none" for free;
+    // the planner spelled out "capture" and "manual" itself and did not. A
+    // dry-run table offering a row the write then refuses is the mild version
+    // of that split, and the only real fix is both sides reading one constant.
+    const plan = planBackfill({
+        expenses: [
+            expense({ id: "cleared", projectId: "job-1", costCodeSource: "manual-none", vendor: "Summit Plumbing" }),
+            expense({ id: "cleared-capture", projectId: "job-1", costCodeSource: "capture", vendor: "Summit Plumbing" }),
+            expense({ id: "machine", projectId: "job-1", costCodeSource: "ai", vendor: "Summit Plumbing" }),
+            expense({ id: "untouched", projectId: "job-1", costCodeSource: null, vendor: "Summit Plumbing" }),
+        ],
+        items: NO_ITEMS,
+        costCodeIdByCode: COST_CODE_IDS,
+        scopedProjectIds: ["job-1"],
+        allowedCodesByProject: ALL_PHASES,
+    });
+
+    const offered = plan.codeFills.map((fill: { id: string }) => fill.id).sort();
+    assert.deepEqual(
+        offered,
+        ["machine", "untouched"],
+        "a phase a person deliberately cleared must not be offered back to them",
+    );
 });

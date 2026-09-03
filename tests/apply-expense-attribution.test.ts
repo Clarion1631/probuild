@@ -22,13 +22,19 @@ import {
     expectedColumns,
     expectedConstraints,
     expectedIndexes,
+    expectedReceiptIntakeColumns,
+    indexDrift,
     needsReanchorPredicate,
     pickCompanyTimeZone,
     MISMATCHED_PAIRS_QUERY,
     postDeployStatements,
+    postDeployTeardownStatements,
     PROJECT_ID_BACKFILL,
     reanchorSql,
     SOURCE_FILE_ID_BACKFILL,
+    SPLIT_JOB_GUARD_DROP_SQL,
+    SPLIT_JOB_GUARD_SQL,
+    SPLIT_JOB_REPAIR,
     statements,
     targetMatches,
 } from "../scripts/apply-expense-attribution.mjs";
@@ -212,23 +218,42 @@ test("the FK is SET NULL, named the way Prisma would name it, and guarded on its
         "an ON DELETE CASCADE constraint of the same name must be rejected",
     );
 
+    // SHAPE, not just a name (round 36, item 2). Each entry has to say what the
+    // index must BE, because `CREATE INDEX IF NOT EXISTS` matches on the name
+    // alone and leaves a wrong index of the right name exactly where it is.
     assert.deepEqual(expectedIndexes, [
-        { name: "Expense_projectId_idx", table: "Expense" },
-        { name: "Expense_sourceFileId_idx", table: "Expense" },
-        { name: "Expense_sourceFileId_sourceGroupIndex_key", table: "Expense" },
+        { name: "Expense_projectId_idx", table: "Expense", unique: false, keyColumns: ["projectId"], predicate: null },
+        { name: "Expense_sourceFileId_idx", table: "Expense", unique: false, keyColumns: ["sourceFileId"], predicate: null },
+        {
+            name: "Expense_sourceFileId_sourceGroupIndex_key",
+            table: "Expense",
+            unique: true,
+            keyColumns: ["sourceFileId", "sourceGroupIndex"],
+            predicate: /^\("?sourceFileId"? IS NOT NULL\)$/,
+        },
     ]);
 });
 
 test("every statement is additive — nothing drops, renames, or rewrites data", () => {
     for (const statement of statements as string[]) {
-        // ONE exception, and it is not data: the tax CHECK is dropped and
-        // re-added by name so a database carrying the OLD definition (which
-        // refused every refund) is corrected rather than skipped. Nothing else
-        // may drop anything, and nothing may drop a table, column or index.
+        // TWO exceptions, and neither is data.
+        //
+        // 1. the tax CHECK is dropped and re-added by name so a database
+        //    carrying the OLD definition (which refused every refund) is
+        //    corrected rather than skipped; and
+        // 2. the rollout-window guard drops its own trigger immediately before
+        //    creating it — Postgres has no CREATE TRIGGER IF NOT EXISTS, so
+        //    drop-then-create is the only way a re-run does not fail on the
+        //    trigger the previous run left. It drops a TRIGGER, never a row.
+        //
+        // Nothing else may drop anything, and nothing may drop a table, column
+        // or index.
         const isConstraintReplace =
             /DROP CONSTRAINT IF EXISTS "Expense_(taxAmount|taxDeductibleBase|taxAtSource)_check"/.test(statement);
+        const isGuardTriggerReplace =
+            /^DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard ON "Expense"$/.test(statement.trim());
         assert.ok(
-            isConstraintReplace || !/\bDROP\b/i.test(statement),
+            isConstraintReplace || isGuardTriggerReplace || !/\bDROP\b/i.test(statement),
             `destructive statement: ${statement}`,
         );
         assert.ok(!/DROP (TABLE|COLUMN|INDEX)/i.test(statement), `destructive: ${statement}`);
@@ -721,4 +746,218 @@ test("the sourceFileId backfill parses the id EXACTLY, or leaves it null", () =>
     // above proves it), and the array holds the exported constant rather
     // than a copy that could drift from it.
     assert.ok((statements as string[]).includes(SOURCE_FILE_ID_BACKFILL));
+});
+
+/* ------------------------------------------------------------------ *
+ * Round 36, item 2: the index verifier checks SHAPE, not just a name.
+ * ------------------------------------------------------------------ */
+
+/** One catalog row, shaped the way the verifier's query returns it. */
+function catalogRow(over: Record<string, unknown> = {}) {
+    return {
+        table_name: "Expense",
+        is_unique: true,
+        key_columns: ["sourceFileId", "sourceGroupIndex"],
+        predicate: '("sourceFileId" IS NOT NULL)',
+        def: "CREATE UNIQUE INDEX ...",
+        ...over,
+    };
+}
+
+const dedupeIndex = expectedIndexes.find(
+    i => i.name === "Expense_sourceFileId_sourceGroupIndex_key",
+)!;
+
+test("a correctly shaped index is not drift", () => {
+    assert.equal(indexDrift(dedupeIndex, catalogRow()), null);
+    // pg renders the predicate with the column quoted; an unquoted rendering of
+    // the same predicate is the same index and must also pass.
+    assert.equal(indexDrift(dedupeIndex, catalogRow({ predicate: "(sourceFileId IS NOT NULL)" })), null);
+});
+
+test("a same-named index that is NOT unique is caught", () => {
+    // The whole point of this index is that a duplicate receipt is
+    // unrepresentable. A non-unique index of the same name enforces nothing,
+    // and `CREATE UNIQUE INDEX IF NOT EXISTS` would skip right over it.
+    const drift = indexDrift(dedupeIndex, catalogRow({ is_unique: false }));
+    assert.match(String(drift), /uniqueness/);
+    assert.match(String(drift), /expected indisunique = true/);
+});
+
+test("a same-named index over the WRONG columns is caught", () => {
+    assert.match(
+        String(indexDrift(dedupeIndex, catalogRow({ key_columns: ["sourceFileId"] }))),
+        /wrong key columns/,
+    );
+    // Right columns, wrong ORDER is a different index with the same members.
+    assert.match(
+        String(indexDrift(dedupeIndex, catalogRow({ key_columns: ["sourceGroupIndex", "sourceFileId"] }))),
+        /wrong key columns/,
+    );
+    // An EXPRESSION where a plain column belongs (attnum 0 -> null attname).
+    assert.match(
+        String(indexDrift(dedupeIndex, catalogRow({ key_columns: [null, "sourceGroupIndex"] }))),
+        /<expression>/,
+    );
+    // An INCLUDE column must not be able to pad the list into a match either;
+    // the query cuts at indnkeyatts, so a third name here is a real third key.
+    assert.match(
+        String(indexDrift(dedupeIndex, catalogRow({ key_columns: ["sourceFileId", "sourceGroupIndex", "id"] }))),
+        /wrong key columns/,
+    );
+});
+
+test("a same-named index that LOST its partial predicate is caught", () => {
+    // Without `WHERE "sourceFileId" IS NOT NULL` every legacy row with a NULL
+    // sourceFileId is dragged into the uniqueness, which is a different
+    // constraint entirely.
+    assert.match(
+        String(indexDrift(dedupeIndex, catalogRow({ predicate: null }))),
+        /is not partial/,
+    );
+    assert.match(
+        String(indexDrift(dedupeIndex, catalogRow({ predicate: '("sourceGroupIndex" IS NOT NULL)' }))),
+        /wrong predicate/,
+    );
+});
+
+test("a null predicate expectation ASSERTS the index is total, it does not skip the check", () => {
+    // The two plain indexes expect `predicate: null`. If that meant "not
+    // checked", a partial index of the same name would pass while covering only
+    // part of the table.
+    const plain = expectedIndexes.find(i => i.name === "Expense_projectId_idx")!;
+    assert.equal(
+        indexDrift(plain, catalogRow({ is_unique: false, key_columns: ["projectId"], predicate: null })),
+        null,
+    );
+    assert.match(
+        String(indexDrift(plain, catalogRow({
+            is_unique: false,
+            key_columns: ["projectId"],
+            predicate: '("projectId" IS NOT NULL)',
+        }))),
+        /expected no predicate/,
+    );
+});
+
+test("an index on the wrong TABLE is caught", () => {
+    assert.match(String(indexDrift(dedupeIndex, catalogRow({ table_name: "ReceiptIntake" }))), /wrong table/);
+});
+
+test("the ReceiptIntake column check covers every column the DDL adds", () => {
+    // costCodeSource was added by the guarded DO block and left out of the
+    // verifier's list, so the one column the receipt-intake provenance depends
+    // on was the one column nothing checked (round 36, item 2).
+    const guarded = (statements as string[]).find(s => s.includes("ReceiptIntake"))!;
+    const added = [...guarded.matchAll(/ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "(\w+)"/g)]
+        .map(m => m[1])
+        .sort();
+    assert.deepEqual(added, [...expectedReceiptIntakeColumns].sort());
+    assert.ok(expectedReceiptIntakeColumns.includes("costCodeSource"));
+});
+
+/* ------------------------------------------------------------------ *
+ * Round 36, item 1: the rollout window cannot split a row across jobs.
+ * ------------------------------------------------------------------ */
+
+test("the split-job guard is created BEFORE the projectId backfill", () => {
+    // Order is the whole fix. Created after the fill, there is a window in
+    // which the column already carries values and nothing maintains the pair.
+    const trigger = (statements as string[]).findIndex(s => /^CREATE TRIGGER probuild_expense_estimate_pair_guard/m.test(s.trim()));
+    const backfill = (statements as string[]).indexOf(PROJECT_ID_BACKFILL);
+    assert.ok(trigger > -1, "the guard must be part of the main run");
+    assert.ok(backfill > -1, "the backfill must be part of the main run");
+    assert.ok(trigger < backfill, "the guard has to be in place before the column has values");
+});
+
+test("the guard only fires when the writer left projectId alone", () => {
+    // This is what stops it reverting a bookkeeper. The new build's writers set
+    // BOTH columns from one locked read; a trigger that corrected them would
+    // silently overrule a deliberate re-attribution, which is the same class of
+    // wrong answer it exists to prevent.
+    const fn = SPLIT_JOB_GUARD_SQL.find(s => s.includes("CREATE OR REPLACE FUNCTION"))!;
+    assert.match(fn, /NEW\."estimateId" IS DISTINCT FROM OLD\."estimateId"/);
+    assert.match(fn, /NEW\."projectId" IS NOT DISTINCT FROM OLD\."projectId"/);
+    assert.match(fn, /OLD\."projectId" IS NOT NULL/);
+    // And it never nulls an attribution out: an estimate belonging to no job
+    // leaves the row with the projectId it had.
+    assert.match(fn, /IF est_project IS NOT NULL THEN/);
+    // BEFORE UPDATE OF estimateId — it must not fire on every expense write.
+    const trigger = SPLIT_JOB_GUARD_SQL.find(s => s.includes("CREATE TRIGGER"))!;
+    assert.match(trigger, /BEFORE UPDATE OF "estimateId" ON "Expense"/);
+});
+
+test("the guard is idempotent: it drops its own trigger before creating it", () => {
+    // Postgres has no CREATE TRIGGER IF NOT EXISTS, so a second run of the
+    // script would fail on the trigger the first one left behind.
+    const dropIndex = SPLIT_JOB_GUARD_SQL.findIndex(s => /^DROP TRIGGER IF EXISTS/.test(s.trim()));
+    const createIndex = SPLIT_JOB_GUARD_SQL.findIndex(s => /^CREATE TRIGGER/.test(s.trim()));
+    assert.ok(dropIndex > -1 && createIndex > -1);
+    assert.ok(dropIndex < createIndex, "drop must come before create");
+});
+
+test("the post-deploy pass takes the guard back out", () => {
+    // It is compatibility scaffolding for ONE deploy. Left standing it would
+    // overrule a future writer that legitimately moves an estimate.
+    const teardown = postDeployTeardownStatements();
+    assert.ok(teardown.some(s => /DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard/.test(s)));
+    assert.ok(teardown.some(s => /DROP FUNCTION IF EXISTS probuild_expense_estimate_pair_guard/.test(s)));
+    assert.deepEqual(teardown, SPLIT_JOB_GUARD_DROP_SQL);
+});
+
+test("the split-job repair is OPT-IN and never runs by default", () => {
+    // After the new build is live, a mismatched pair is EITHER the rollout
+    // window OR a bookkeeper's deliberate re-attribution, and the row cannot
+    // say which. Running the repair by default would mean choosing to overwrite
+    // human decisions whenever the guess is wrong.
+    assert.equal(postDeployTeardownStatements().includes(SPLIT_JOB_REPAIR), false);
+    assert.equal(postDeployTeardownStatements({ repairSplitJobs: false }).includes(SPLIT_JOB_REPAIR), false);
+    assert.equal(postDeployTeardownStatements({ repairSplitJobs: true }).includes(SPLIT_JOB_REPAIR), true);
+});
+
+test("the repair runs BEFORE the guard is dropped, and only on QBO-synced rows", () => {
+    const withRepair = postDeployTeardownStatements({ repairSplitJobs: true });
+    assert.equal(withRepair[0], SPLIT_JOB_REPAIR, "repair first, teardown second");
+
+    // The old QBO sync is the only writer that rewrites estimateId without
+    // projectId, so a row that never came from QuickBooks cannot have been
+    // damaged this way and is never a candidate however the flag is passed.
+    assert.match(SPLIT_JOB_REPAIR, /"qbPurchaseId" IS NOT NULL/);
+    // It targets the NON-NULL wrong answer the backfill is blind to...
+    assert.match(SPLIT_JOB_REPAIR, /e\."projectId" <> locked\."projectId"/);
+    // ...and re-derives from the estimate under the same locked CTE and the
+    // same ascending-id order as PROJECT_ID_BACKFILL.
+    assert.match(SPLIT_JOB_REPAIR, /ORDER BY est\.id\s+FOR SHARE/);
+    assert.match(SPLIT_JOB_REPAIR, /"attributionAnchoredAt" = now\(\)/);
+});
+
+test("the repair is NOT in the main run, and the post-deploy subset invariant still holds", () => {
+    // postDeployStatements' invariant is that it is a strict SUBSET of the main
+    // run. The teardown and the repair have no counterpart there — the teardown
+    // is the opposite of what the main run does — so they must stay out of it.
+    assert.equal((statements as string[]).includes(SPLIT_JOB_REPAIR), false);
+    const main = [...(statements as string[]), reanchorSql("America/Los_Angeles")];
+    for (const sql of postDeployStatements("America/Los_Angeles")) {
+        assert.ok(main.includes(sql), `not part of the main run:\n  ${sql}`);
+    }
+});
+
+test("the guard and its teardown are BOTH in the committed migration", () => {
+    // A fresh CI/dev database replays the migration end to end, so it must
+    // finish in the shape production finishes in: with no trigger. A migration
+    // that created it and never dropped it would leave every dev database
+    // carrying compatibility scaffolding forever.
+    for (const sql of SPLIT_JOB_GUARD_SQL) {
+        assert.ok(normalizedMigration.includes(normalize(sql).replace(/;$/, "")), `migration.sql is missing:\n  ${sql}`);
+    }
+    for (const sql of SPLIT_JOB_GUARD_DROP_SQL) {
+        assert.ok(normalizedMigration.includes(normalize(sql).replace(/;$/, "")), `migration.sql is missing:\n  ${sql}`);
+    }
+    // ...and the drop comes last, after the backfill it was protecting.
+    const create = migrationSql.indexOf("CREATE TRIGGER probuild_expense_estimate_pair_guard");
+    const fill = migrationSql.indexOf('UPDATE "Expense" e SET "projectId" = locked."projectId"');
+    const drop = migrationSql.lastIndexOf("DROP FUNCTION IF EXISTS probuild_expense_estimate_pair_guard");
+    assert.ok(create > -1 && fill > -1 && drop > -1);
+    assert.ok(create < fill, "the guard has to exist before the fill gives the column values");
+    assert.ok(fill < drop, "and it comes out only after the fill is done");
 });

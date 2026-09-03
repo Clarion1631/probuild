@@ -160,11 +160,26 @@ export function expenseHasAnyProjectWhere(): Prisma.ExpenseWhereInput {
 }
 
 /**
- * Cost-code sources a MACHINE produced. The complement — "capture" and
- * "manual" — is a human's answer and is never rewritten by the sync or the
- * backfill.
+ * Cost-code sources a MACHINE produced. The complement — "capture", "manual"
+ * and "manual-none" — is a human's answer and is never rewritten by the sync
+ * or the backfill.
+ *
+ * "manual-none" IS A DECISION, NOT AN ABSENCE (round 36, item 3). Clearing the
+ * phase used to write `costCodeSource: null` alongside `costCodeId: null`, on
+ * the reasoning that provenance for a null code has nothing to guard. It has
+ * exactly one thing to guard: the person's answer. NULL provenance is the
+ * state every automated pass reads as "machine-writable", so the QBO
+ * suggester's very next run re-applied the same regex suggestion the
+ * bookkeeper had just removed, and the backfill would do it again after that.
+ * The clear was undone in minutes and looked like the sync had never been
+ * told.
+ *
+ * So a human clearing the phase writes "manual-none" — the same shape and the
+ * same meaning `taxSource` already uses for "a person looked and the answer is
+ * nothing here" (see HUMAN_TAX_SOURCES below). A human later picking a real
+ * phase overwrites it with "manual" normally; only the machines are held off.
  */
-export const HUMAN_COST_CODE_SOURCES = ["capture", "manual"] as const;
+export const HUMAN_COST_CODE_SOURCES = ["capture", "manual", "manual-none"] as const;
 
 /**
  * "This row's cost code was not chosen by a human."
