@@ -25,6 +25,34 @@ export function isE2eStorageMockEnabled(): boolean {
     );
 }
 
+/**
+ * A client whose every request carries an AbortSignal.
+ *
+ * `getSupabase()` returns a process-wide singleton, and storage-js exposes no
+ * per-call signal — `download`/`upload`/`remove`/`list`/`createSignedUploadUrl`
+ * take no request options at all. So a caller that needs to bound a storage
+ * call gets its OWN client, built over a fetch that injects the signal. The
+ * construction is config only (no network, no auth round trip), which is what
+ * makes per-call cheap enough to be the rule rather than an optimisation.
+ *
+ * The e2e mock is returned unchanged: it never touches the network, so there
+ * is nothing to abort and building a real client would defeat the gate.
+ */
+export function getSupabaseWithSignal(signal: AbortSignal): SupabaseClient | null {
+    if (isE2eStorageMockEnabled()) return getSupabase();
+
+    const supabaseUrl = process.env.SUPABASE_URL || "";
+    const supabaseKey = process.env.SUPABASE_SERVICE_KEY || "";
+    if (!supabaseUrl || !supabaseKey) return null;
+
+    return createClient(supabaseUrl, supabaseKey, {
+        global: {
+            fetch: (input: RequestInfo | URL, init?: RequestInit) =>
+                fetch(input, { ...init, signal }),
+        },
+    });
+}
+
 export function getSupabase(): SupabaseClient | null {
     if (_initialized) return _supabase;
     _initialized = true;

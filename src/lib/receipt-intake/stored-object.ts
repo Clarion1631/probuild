@@ -16,6 +16,7 @@ import { createHash } from "node:crypto";
 import type { Prisma } from "@prisma/client";
 import type { DocBytesResult } from "@/lib/secure-storage";
 import { downloadReceiptObject, receiptObjectSize, type SizeResult } from "./bucket";
+import type { RouteDeadline } from "@/lib/quickbooks";
 import { EXT_BY_MIME, sniffMime } from "./file-type";
 import { MAX_STORED_BYTES } from "./intake-core";
 
@@ -299,9 +300,11 @@ export async function sealAndPublish(
 export async function downloadVerified(
     storagePath: string,
     expectedSha256: string,
-    download: (storagePath: string) => Promise<DocBytesResult> = downloadReceiptObject,
+    download: (storagePath: string, deadline?: RouteDeadline) => Promise<DocBytesResult> = downloadReceiptObject,
+    /** Bounds the storage read — see withStorageDeadline in bucket.ts. */
+    deadline?: RouteDeadline,
 ): Promise<VerifiedBytes> {
-    const result = await download(storagePath);
+    const result = await download(storagePath, deadline);
     if (!result.ok) {
         return result.kind === "not-found"
             ? { ok: false, kind: "missing" }

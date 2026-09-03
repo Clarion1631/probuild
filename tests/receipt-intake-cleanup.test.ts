@@ -102,7 +102,13 @@ test("a missing storage client is an ERROR for the cleanup path", () => {
     // misconfigured deployment and lose them permanently.
     assert.match(bucket, /export async function removeReceiptObject/);
     const strict = bodyOf(bucket, "export async function removeReceiptObject");
-    assert.match(strict, /throw new Error\("receipt storage is not configured"\)/);
+    // The throw moved into the shared deadline guard when every storage call
+    // was put under one — the property is unchanged and now applies to ALL of
+    // them, so it is asserted where it lives plus at this caller's own use.
+    assert.match(strict, /await withStorageDeadline\("remove"/);
+    assert.ok(!/return;/.test(strict), "and this one never returns quietly");
+    const guard = bodyOf(bucket, "async function withStorageDeadline");
+    assert.match(guard, /throw new Error\("receipt storage is not configured"\)/);
     // ...and cleanup never reaches for a best-effort variant, or for any bucket
     // but the receipts one.
     assert.ok(!/removeSecureDoc/.test(cleanup), "cleanup never uses the quiet variant");

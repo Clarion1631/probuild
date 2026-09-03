@@ -479,18 +479,43 @@ export function readBookedPurchase(purchase: Record<string, unknown>, taxAccount
 function attributionAgrees(lines: BookedExpenseLine[], expectedProjectName: string): boolean {
     if (lines.length === 0) return false;
     const expected = normalizeProjectName(expectedProjectName);
+
+    // EVERY MONETARY LINE CARRIES THE SAME CUSTOMER ID — tax included.
+    //
+    // The previous rule accepted three shapes it should not have, and each one
+    // let money onto a job nobody had attributed it to while the worker
+    // recorded the WHOLE gross against that project:
+    //
+    //   - a non-tax line with a matching display NAME and no customer id. The
+    //     "not attributed at all" guard read `!tax && !customerId &&
+    //     !customerName`, so a name alone satisfied it — and a name is not an
+    //     identity. One named line then validated every other line beside it.
+    //   - a TAX line with no customer ref at all. Tax was excluded from that
+    //     guard entirely, so reclaimable sales tax could sit unassigned on a
+    //     Purchase this check called fully attributed.
+    //   - `ids.size <= 1`, which is satisfied by ZERO ids: a Purchase whose
+    //     lines carried names and no ids passed with nothing pinned.
+    //
+    // So the id is derived from the lines themselves and then required of all
+    // of them: exactly one distinct id across every line, at least one line
+    // confirming that id belongs to the expected project BY NAME (the expected
+    // customer's own id is not resolvable on this branch — resolving it would
+    // CREATE a QBO customer on a replay path), and no line missing either.
     const ids = new Set<string>();
     let confirmedByName = false;
     for (const line of lines) {
         if (!line.readable) return false;
+        // Tax is money too. A line we cannot attribute is a line that has to
+        // go to a human, whichever account it posts to.
+        if (!line.customerId) return false;
+        ids.add(line.customerId);
         if (line.customerName) {
             if (normalizeProjectName(line.customerName) !== expected) return false;
             confirmedByName = true;
         }
-        if (!line.tax && !line.customerId && !line.customerName) return false;
-        if (line.customerId) ids.add(line.customerId);
     }
-    return ids.size <= 1 && confirmedByName;
+    // `=== 1`, not `<= 1`: zero ids is not agreement, it is an absence.
+    return ids.size === 1 && confirmedByName;
 }
 
 /**

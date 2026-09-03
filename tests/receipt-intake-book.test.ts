@@ -1776,3 +1776,101 @@ test("reconcile reports the effective attribution, three ways", () => {
         costCodeId: null, costCodeSource: "none", preserved: false,
     });
 });
+
+// ── The intake row records what POSTED (Codex round-16 item 3) ─────────────
+//
+// "QuickBooks is authoritative for an existing Purchase" was only half true:
+// booking derived the total, vendor, date and tax from QBO and wrote them to
+// the Expense, but left the intake row carrying the OCR read. So `taxCents` —
+// the column Phase 3's sales-tax reporting is specified to read — kept a
+// figure no Purchase ever posted, and the row disagreed with its own Expense
+// under a qbPurchaseId asserting the two are one document. The audit event
+// reported `row.vendor` (the OCR spelling) while the Expense carried QBO's.
+
+test("BOOKED persists QBO's tax, vendor, total and date on the intake row", async () => {
+    // The read says Lowes / 364.98 / 29.20; QuickBooks posted Home Depot /
+    // 372.10 / 31.00 on a different day, and identified the same purchase.
+    const r = recorder(fromBooks(booksSay("derive", ["amount", "vendor", "date"], {
+        totalAmount: 372.10,
+        vendor: "Home Depot",
+        txnDate: "2026-08-04",
+        taxAmount: 31.0,
+    })));
+
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+
+    const booked = r.intakeUpdates.find(u => u.state === "BOOKED");
+    assert.ok(booked, "the row reached BOOKED");
+    assert.equal(booked.vendor, "Home Depot", "QBO's vendor, not the read's");
+    assert.equal(booked.totalCents, 37210);
+    assert.equal(booked.taxCents, 3100, "the column Phase 3 reads");
+    assert.equal(
+        (booked.txnDate as Date).toISOString().slice(0, 10),
+        "2026-08-04",
+        "and QBO's calendar day",
+    );
+
+    // PRE-FIX CONTROL: every one of those is a DIFFERENT value from the OCR
+    // read, so these assertions cannot pass for code that left the row alone.
+    assert.equal(row().vendor, "Lowes");
+    assert.equal(row().totalCents, 36498);
+    assert.equal(row().taxCents, 2920);
+});
+
+test("the audit event reports exactly what the Expense got", async () => {
+    const r = recorder(fromBooks(booksSay("derive", ["amount", "vendor"], {
+        totalAmount: 372.10,
+        vendor: "Home Depot",
+        taxAmount: 31.0,
+    })));
+    await bookReceipt(row(), r.deps);
+
+    const event = r.events[0];
+    const expense = r.expenses[0];
+    assert.equal(event.vendor, "Home Depot", "not row.vendor");
+    assert.equal(event.vendor, expense.vendor, "the event and the Expense agree");
+    assert.equal(event.amountCents, 37210);
+    assert.equal(Math.round(Number(expense.amount) * 100), event.amountCents);
+    assert.equal(event.taxCents, 3100);
+});
+
+test("the row, the Expense and the audit are ONE object — asserted together", async () => {
+    // The property that keeps them from drifting again: all three writes read
+    // the same `booked`, so any disagreement is a code change, not a
+    // maintenance slip in one of three places.
+    const r = recorder(fromBooks(booksWithin({ totalAmount: 364.99, taxAmount: 29.25 })));
+    await bookReceipt(row(), r.deps);
+
+    const rowUpdate = r.intakeUpdates.find(u => u.state === "BOOKED")!;
+    const expense = r.expenses[0];
+    const event = r.events[0];
+    assert.equal(rowUpdate.totalCents, 36499);
+    assert.equal(Math.round(Number(expense.amount) * 100), 36499);
+    assert.equal(event.amountCents, 36499);
+    assert.equal(rowUpdate.taxCents, 2925);
+    assert.equal(event.taxCents, 2925);
+    assert.equal(rowUpdate.vendor, expense.vendor);
+});
+
+test("a FRESH create still records the read's own values", async () => {
+    // Nothing was in the books, so there is no posted figure to adopt — the
+    // control that stops the fix from reaching for `booked` unconditionally.
+    const r = recorder();
+    await bookReceipt(row(), r.deps);
+    const rowUpdate = r.intakeUpdates.find(u => u.state === "BOOKED")!;
+    assert.equal(rowUpdate.vendor, "Lowes");
+    assert.equal(rowUpdate.totalCents, 36498);
+    assert.equal(rowUpdate.taxCents, 2920);
+});
+
+test("readJson is NEVER rewritten, so the OCR original stays auditable", async () => {
+    // BOOKED overwrites the extracted values on purpose; this is what makes
+    // that safe. There is no `extracted*` column pair on the model and none is
+    // needed while the raw model response survives verbatim.
+    const r = recorder(fromBooks(booksSay("derive", ["vendor"], { vendor: "Home Depot" })));
+    await bookReceipt(row(), r.deps);
+    for (const update of r.intakeUpdates) {
+        assert.ok(!("readJson" in update), "no booking write touches the raw read");
+    }
+});

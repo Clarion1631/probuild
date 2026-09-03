@@ -659,7 +659,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             return phases.map(phase => ({ id: phase.id, code: phase.code, name: phase.name }));
         },
 
-        downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
+        downloadBytes: (storagePath, expectedSha256) =>
+            // THE INVOCATION deadline, threaded into storage exactly as it is
+            // into QuickBooks: a hung download must return control in time for
+            // the pass to release the rows it claimed.
+            downloadVerified(storagePath, expectedSha256, undefined, invocationDeadline),
 
         // The invocation's ONE deadline, not a fresh 25s per row (see
         // readBudgetFor). A row reached late in the batch gets whatever
@@ -887,7 +891,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             getTokens: deadline => getFreshQBTokens(deadline),
             createPurchase: (tokens, input, deadline, onBeforeCreate, onExistingPurchase) =>
                 createQBReceiptPurchase(tokens, input, { onBeforeCreate, onExistingPurchase }, deadline),
-            downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
+            downloadBytes: (storagePath, expectedSha256) =>
+            // THE INVOCATION deadline, threaded into storage exactly as it is
+            // into QuickBooks: a hung download must return control in time for
+            // the pass to release the rows it claimed.
+            downloadVerified(storagePath, expectedSha256, undefined, invocationDeadline),
             logEvent: logAutomationEvent,
             now: () => new Date(),
         }),

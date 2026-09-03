@@ -32,6 +32,7 @@ import {
 } from "@/lib/qbo-receipt-push";
 import { READ_BUDGET_MS, type ProjectPhase, type ReadOutcome } from "./read";
 import type { VerifiedBytes } from "./stored-object";
+import { STORAGE_TIMEOUT_MESSAGE } from "./bucket";
 
 /**
  * ONE global constant, deliberately not derived from anything per-row or
@@ -941,7 +942,15 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         if (download.kind === "sha-mismatch") {
             return parkTerminal(row, deps, "content-changed");
         }
-        return retryTransient(row, deps, `storage:${download.message}`);
+        // A TIMEOUT is tagged apart from every other transient storage fault,
+        // because only this one is self-inflicted enough to bound separately.
+        return retryTransient(
+            row,
+            deps,
+            download.message?.startsWith(STORAGE_TIMEOUT_MESSAGE)
+                ? `${STORAGE_TIMEOUT_PREFIX}1`
+                : `storage:${download.message}`,
+        );
     }
     const bytes = download.bytes;
 
@@ -1217,12 +1226,56 @@ export function ownershipOf(row: WorkerRow): Ownership {
 }
 
 /** A transport-class fault during a row's processing: spend an attempt, back off. */
+/**
+ * How many storage calls in a row may time out on ONE object before it stops
+ * heading the queue.
+ *
+ * A hung object is not a transient fault after the third go: it is a document
+ * that costs the pass its whole storage budget every time it is claimed, and
+ * because the claim is oldest-first it is claimed FIRST every time. Three is
+ * enough to ride out a Supabase blip and few enough that a genuinely stuck
+ * object stops crowding out the receipts behind it.
+ */
+export const MAX_STORAGE_TIMEOUTS = 3;
+
+/** The marker `lastError` carries so the run length survives between passes. */
+export const STORAGE_TIMEOUT_PREFIX = "storage-timeout:";
+
+/**
+ * How many CONSECUTIVE storage timeouts this row has now seen.
+ *
+ * The count lives in `lastError` rather than in a column of its own: it is a
+ * property of an unbroken run, it needs no migration, and `lastError` is
+ * already the column that records why the last pass gave up. Any other failure
+ * writes a different reason there, which is exactly what resets the run — so
+ * "consecutive" is enforced by the storage of the counter rather than by
+ * remembering to clear it.
+ */
+export function storageTimeoutRun(lastError: string | null | undefined): number {
+    const match = /^storage-timeout:(\d+)\b/.exec(lastError ?? "");
+    return match ? Number(match[1]) : 0;
+}
+
+/** A transport-class fault during a row's processing: spend an attempt, back off. */
 async function retryTransient(row: WorkerRow, deps: WorkerDependencies, reason: string): Promise<string> {
     const attempts = row.attempts + 1;
     if (attempts >= MAX_BOOK_ATTEMPTS) {
         // Through parkTerminal like every other terminal park, so the
         // strong-key release is decided in exactly one place.
         return parkTerminal(row, deps, "max-retries");
+    }
+    // A STALLED OBJECT STOPS HEADING THE QUEUE.
+    //
+    // Every other transient fault is worth twenty attempts because it costs
+    // almost nothing to retry. A storage timeout is different: it burns the
+    // pass's whole storage budget, and the claim is oldest-first, so the same
+    // object hangs the next run and the one after that. Bounded separately,
+    // and parked with its own reason so a human sees WHY rather than a generic
+    // "max-retries" twenty passes later.
+    if (reason.startsWith(STORAGE_TIMEOUT_PREFIX)) {
+        const run = storageTimeoutRun(row.lastError) + 1;
+        if (run >= MAX_STORAGE_TIMEOUTS) return parkTerminal(row, deps, "storage-timeout");
+        reason = `${STORAGE_TIMEOUT_PREFIX}${run}`;
     }
     const owned = await deps.retryRow(
         row.id,

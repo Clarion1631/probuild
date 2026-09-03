@@ -26,6 +26,7 @@ import {
     type WorkerDependencies,
     type WorkerRow,
     uploadLeaseActive,
+    storageTimeoutRun,
     uploadLeaseExpiry,
     SIGNED_UPLOAD_TTL_MS,
     readBudgetFor,
@@ -41,6 +42,11 @@ import { normalizeDocType, READ_BUDGET_MS, type ReadOutcome } from "../src/lib/r
 import type { BookResult } from "../src/lib/receipt-intake/book";
 import type { CutoverRequest } from "../src/lib/receipt-intake/worker";
 import { QBTimeoutError } from "../src/lib/quickbooks";
+import {
+    downloadReceiptObject,
+    storageBudgetMs,
+    STORAGE_CALL_MAX_MS,
+} from "../src/lib/receipt-intake/bucket";
 import { QboAccountConfigError, QboPurchaseFaultError } from "../src/lib/qbo-receipt-push";
 
 import { Prisma } from "@prisma/client";
@@ -1929,4 +1935,169 @@ test("the lease is released even when the pass throws", async () => {
     const h = harness([], { claim: async () => { throw new Error("prisma exploded"); } });
     await assert.rejects(() => runIntakeWorker(h.deps), /prisma exploded/);
     assert.equal(h.leaseReleases, 1);
+});
+
+// ── No storage call outlives its invocation (Codex round-16 item 1) ────────
+//
+// Every bucket.ts function used to `await` Supabase with no timeout and no
+// abort signal, and the worker's `shouldStop` only runs BETWEEN operations. So
+// one hung request ate the whole 60-second lifetime: the platform killed the
+// function mid-pass, the rows it had claimed never reached the release path,
+// and they sat leased for ten minutes — and because the claim is oldest-first,
+// the same object hung the next run too.
+
+test("the budget comes from the caller's deadline, and never exceeds the cap", () => {
+    // A call late in a pass gets what is actually LEFT, not a fresh fixed
+    // timeout that could straddle the platform ceiling.
+    const started = Date.now();
+    assert.equal(storageBudgetMs(undefined), STORAGE_CALL_MAX_MS, "no deadline: the cap");
+    assert.equal(
+        storageBudgetMs({ startedAt: started, budgetMs: 60_000 }),
+        STORAGE_CALL_MAX_MS,
+        "plenty left: still capped",
+    );
+    const nearlyOut = storageBudgetMs({ startedAt: started - 57_000, budgetMs: 60_000 });
+    assert.ok(nearlyOut > 0 && nearlyOut <= 3_100, `only what is left: ${nearlyOut}`);
+    assert.equal(storageBudgetMs({ startedAt: started - 61_000, budgetMs: 60_000 }), 0, "past it: none");
+});
+
+/**
+ * A Supabase that never answers. `getSupabaseWithSignal` builds its client over
+ * the global fetch, so replacing that is what makes a genuinely hung request
+ * reachable from a unit test — no network, no timers but ours.
+ */
+async function withHungStorage<T>(run: () => Promise<T>): Promise<{ out: T; aborted: boolean; fetches: number }> {
+    const realFetch = globalThis.fetch;
+    const realUrl = process.env.SUPABASE_URL;
+    const realKey = process.env.SUPABASE_SERVICE_KEY;
+    let aborted = false;
+    let fetches = 0;
+    process.env.SUPABASE_URL = "https://storage.invalid";
+    process.env.SUPABASE_SERVICE_KEY = "test-key";
+    globalThis.fetch = ((_input: unknown, init?: { signal?: AbortSignal }) => {
+        fetches++;
+        return new Promise<never>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => {
+                aborted = true;
+                reject(new Error("aborted"));
+            });
+        });
+    }) as typeof fetch;
+    try {
+        return { out: await run(), aborted, fetches };
+    } finally {
+        globalThis.fetch = realFetch;
+        if (realUrl === undefined) delete process.env.SUPABASE_URL; else process.env.SUPABASE_URL = realUrl;
+        if (realKey === undefined) delete process.env.SUPABASE_SERVICE_KEY; else process.env.SUPABASE_SERVICE_KEY = realKey;
+    }
+}
+
+test("a NEVER-SETTLING storage request returns before the deadline, and is aborted", async () => {
+    // The failure, exactly: a request that never answers. Without the guard
+    // this await would still be pending when the platform killed the function,
+    // so the pass never reached the code that releases its claimed rows.
+    const started = Date.now();
+    const { out, aborted } = await withHungStorage(() =>
+        downloadReceiptObject("receipts/intake/hung.png", { startedAt: started, budgetMs: 1_200 }));
+    const elapsed = Date.now() - started;
+
+    assert.equal(out.ok, false);
+    assert.equal((out as { kind: string }).kind, "transient", "retryable, never a verdict");
+    assert.match(String((out as { message?: string }).message), /storage-timeout/);
+    assert.ok(elapsed < 5_000, `returned in ${elapsed}ms rather than hanging`);
+    // The socket goes with the promise: a timer that only settled the await
+    // would leave the request running against the next invocation's budget.
+    assert.equal(aborted, true, "the request was actually aborted");
+});
+
+test("a call with no runway left never starts at all", async () => {
+    // Spending the pass's last milliseconds on a request whose answer it can
+    // never use is how the release path gets skipped.
+    const { out, fetches } = await withHungStorage(() =>
+        downloadReceiptObject("receipts/intake/a.png", {
+            startedAt: Date.now() - 60_000,
+            budgetMs: 60_000,
+        }));
+    assert.equal(out.ok, false);
+    assert.match(String((out as { message?: string }).message), /storage-timeout/);
+    // THE DISTINGUISHING PROPERTY: no request was made at all. Without the
+    // runway check the call is issued with a zero-millisecond timer, which
+    // rejects with the same tag — so only the absence of the request tells the
+    // two apart, and the point is not to spend the last of the budget on an
+    // answer the pass can never use.
+    assert.equal(fetches, 0, "no storage request was issued");
+});
+
+test("EVERY bucket export takes a deadline and runs under the guard", () => {
+    // The audit the finding asked for, as an assertion: a new storage call
+    // added without the guard is the same bug back.
+    const src = readFileSync(path.join(__dirname, "..", "src/lib/receipt-intake/bucket.ts"), "utf8");
+    for (const op of ["list", "download", "upload", "remove", "sign-upload", "sign-download"]) {
+        assert.ok(src.includes(`withStorageDeadline("${op}"`), `${op} is guarded`);
+    }
+    // The unsignalled singleton is unreachable from this file, so nothing here
+    // CAN make an unbounded call.
+    assert.ok(!/getSupabase\(\)/.test(src), "the unsignalled client is not reachable");
+    assert.match(src, /import \{ getSupabaseWithSignal \}/);
+    // ...and the guard aborts before it rejects, so the socket goes with it.
+    const guard = src.slice(src.indexOf("async function withStorageDeadline"));
+    const abortAt = guard.indexOf("controller.abort()");
+    const rejectAt = guard.indexOf("reject(new StorageTimeoutError");
+    assert.ok(abortAt > 0 && abortAt < rejectAt, "abort precedes the rejection");
+});
+
+test("consecutive timeouts are counted, and the run resets on any other failure", () => {
+    // The counter lives in `lastError`, so "consecutive" is a property of where
+    // it is stored: any other failure writes a different reason there.
+    assert.equal(storageTimeoutRun(null), 0);
+    assert.equal(storageTimeoutRun("worker-error: connection reset"), 0, "a different fault resets it");
+    assert.equal(storageTimeoutRun("storage-timeout:1"), 1);
+    assert.equal(storageTimeoutRun("storage-timeout:2"), 2);
+    assert.equal(storageTimeoutRun("storage:some other blip"), 0, "a non-timeout storage fault too");
+});
+
+test("a row that keeps timing out is PARKED so it stops heading the queue", async () => {
+    const hung = { ok: false as const, kind: "transient" as const, message: "storage-timeout:download" };
+
+    // First timeout: retried, and the run is recorded.
+    const first = harness([workerRow({ lastError: null })], { downloadBytes: async () => hung });
+    assert.deepEqual((await runIntakeWorker(first.deps)).byState, { RETRY: 1 });
+    assert.equal(first.retried[0].reason, "storage-timeout:1");
+
+    // Second: still retried, run of two.
+    const second = harness([workerRow({ lastError: "storage-timeout:1" })], { downloadBytes: async () => hung });
+    assert.deepEqual((await runIntakeWorker(second.deps)).byState, { RETRY: 1 });
+    assert.equal(second.retried[0].reason, "storage-timeout:2");
+
+    // Third: parked, with its OWN reason rather than a generic max-retries
+    // twenty passes later.
+    const third = harness([workerRow({ lastError: "storage-timeout:2" })], { downloadBytes: async () => hung });
+    assert.deepEqual((await runIntakeWorker(third.deps)).byState, { NEEDS_REVIEW: 1 });
+    assert.equal(third.states[0].reason, "storage-timeout");
+});
+
+test("CONTROL: an ordinary transient storage fault still gets all 20 attempts", async () => {
+    // Without this, the new ceiling could quietly apply to every storage blip
+    // and park good receipts after three.
+    const blip = { ok: false as const, kind: "transient" as const, message: "connection reset" };
+    const h = harness([workerRow({ attempts: 5, lastError: "storage:connection reset" })], {
+        downloadBytes: async () => blip,
+    });
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { RETRY: 1 });
+    assert.equal(h.retried[0].attempts, 6);
+    assert.match(h.retried[0].reason, /^storage:/);
+});
+
+test("the deadline reaches storage, not just QuickBooks", () => {
+    // The wiring: buildDeps threads the invocation deadline into the download
+    // exactly as it does into the QBO client.
+    const cron = readFileSync(
+        path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+        "utf8",
+    );
+    assert.equal(
+        (cron.match(/downloadVerified\(storagePath, expectedSha256, undefined, invocationDeadline\)/g) ?? []).length,
+        2,
+        "both the worker's read and the booking's read",
+    );
 });

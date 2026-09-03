@@ -754,6 +754,28 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // Hoisted: the reconcile compares against exactly what the create would
         // have written, so the two must be the same expression.
         const expenseDate = startOfDateInTimeZone(expenseCalendarDay, timeZone);
+
+        // ONE OBJECT, THREE WRITES.
+        //
+        // The Expense, the intake row's BOOKED update and the audit event all
+        // have to say the same thing about the same money. They were three
+        // separate expressions reaching for three different variables, and
+        // they drifted exactly where it mattered: the audit reported
+        // `row.vendor` (the OCR spelling) while the Expense carried QBO's, and
+        // the intake row kept the OCR tax while both of the others recorded
+        // what actually posted. Building it once makes agreement structural
+        // rather than something three call sites have to remember.
+        const booked = {
+            vendor: expenseVendor || "Unknown",
+            // The same instant `dateOnly` would produce for this calendar day —
+            // written from `expenseDate` rather than importing that helper,
+            // because it lives in worker.ts and worker.ts imports this file.
+            // `ReceiptIntake.txnDate` is `@db.Date`, so the day is what lands.
+            txnDate: expenseDate,
+            date: expenseDate,
+            totalCents: amountCents,
+            taxCents: taxApplied,
+        };
         const docRef = isCheck
             ? `Check #${(row.refNumber ?? "").replace(/^Check/, "") || "?"}${row.memo ? ` — "${row.memo}"` : ""}`
             : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
@@ -791,11 +813,15 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             });
             if (existing) {
                 // NEVER a blind link. See reconcileExistingExpense.
+                // From the SAME `booked` object the writes use: the reconcile
+                // has to compare against the values that will actually be
+                // persisted, or it is judging a row against numbers nobody
+                // ever stores.
                 const verdict = reconcileExistingExpense(existing, {
                     estimateId,
-                    amountCents,
-                    vendor: expenseVendor || "Unknown",
-                    date: expenseDate,
+                    amountCents: booked.totalCents,
+                    vendor: booked.vendor,
+                    date: booked.date,
                     calendarDay: expenseCalendarDay,
                     timeZone,
                     costCodeId,
@@ -818,8 +844,8 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 data: {
                     estimateId,
                     costCodeId,
-                    amount: amountCents / 100,
-                    vendor: expenseVendor || "Unknown",
+                    amount: booked.totalCents / 100,
+                    vendor: booked.vendor,
                     // RE-ANCHORED at write time. `txnDate` is a @db.Date column
                     // and round-trips as UTC midnight, so writing it straight
                     // into Expense.date (a full timestamp) records 5pm the
@@ -827,7 +853,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // report that bounds by local midnight then counts the
                     // expense in the wrong period. The intake row keeps the
                     // calendar day; this makes the instant match it.
-                    date: expenseDate,
+                    date: booked.date,
                     // Booked with a qbPurchaseId already set — the Purchase is
                     // live in QuickBooks by the time this row commits, so this
                     // Expense is QBO-managed from birth, exactly like a QBO
@@ -874,6 +900,27 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     bookedAt: now,
                     lastError: null,
                     nextRetryAt: null,
+                    // THE BOOKED VALUES, PERSISTED — the same object the
+                    // Expense and the audit event are built from.
+                    //
+                    // "QuickBooks is authoritative for an existing Purchase"
+                    // was only half true: booking DERIVED the total, vendor,
+                    // date and tax from QBO and wrote them to the Expense, but
+                    // left this row carrying the OCR read. So `taxCents` — the
+                    // column Phase 3's sales-tax reporting is specified to
+                    // read — kept a figure no Purchase ever posted, and the
+                    // row and its own Expense disagreed under a qbPurchaseId
+                    // asserting they are one document.
+                    //
+                    // BOOKED OVERWRITES THE EXTRACTED VALUES, deliberately.
+                    // There is no `extracted*` column pair on this model, and
+                    // none is needed: `readJson` holds the raw model response
+                    // verbatim and is never rewritten, so the OCR original
+                    // remains auditable after the row records what posted.
+                    vendor: booked.vendor,
+                    txnDate: booked.txnDate,
+                    totalCents: booked.totalCents,
+                    taxCents: booked.taxCents,
                     // Ownership is released by the write that completes the
                     // transition — a booked row is nobody's to hold.
                     claimToken: null,
@@ -891,15 +938,17 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             kind: "receipt-push",
             status: result.alreadyExists ? "already-exists" : "created",
             source: "intake-worker",
-            vendor: row.vendor ?? undefined,
+            // WHAT THE EXPENSE GOT, not what the read said. The audit used
+            // to report the OCR spelling while the Expense carried QBO's.
+            vendor: booked.vendor,
             projectName: project.name,
             docNumber: result.docNumber,
             fileName: row.fileName ?? undefined,
-            amountCents,
+            amountCents: booked.totalCents,
             // What POSTED, not what was requested — buildGroups rejects a tax
             // read on a check or when tax >= total, and the filing report has
             // to reconcile against the Purchase.
-            taxCents: taxApplied,
+            taxCents: booked.taxCents,
             detail: {
                 // `fileId` means a DRIVE file id — logAutomationEvent copies it
                 // into the typed `driveFileId` column, which the cutover reads

@@ -20,12 +20,100 @@
  * Everything intake does with storage goes through this module, so there is one
  * place that names the bucket and one place to audit.
  */
-import { getSupabase } from "@/lib/supabase";
+import type { SupabaseClient } from "@supabase/supabase-js";
+// Only the SIGNAL-BOUND factory: the unsignalled singleton is what let a hung
+// request eat an invocation, so this file must not be able to reach for it.
+import { getSupabaseWithSignal } from "@/lib/supabase";
+import { remainingBudgetMs, type RouteDeadline } from "@/lib/quickbooks";
 import { isNotFoundError, type DocBytesResult } from "@/lib/secure-storage";
 import { ACCEPTED_MIME_TYPES } from "./file-type";
 import { MAX_STORED_BYTES } from "./intake-core";
 
 export const RECEIPT_BUCKET = "receipt-intake";
+
+/**
+ * NO STORAGE CALL MAY OUTLIVE THE INVOCATION THAT MADE IT.
+ *
+ * Every function in this file used to `await` Supabase with no timeout and no
+ * abort signal, and the worker's own `shouldStop` only runs BETWEEN operations.
+ * So a single hung request ate the whole 60-second lifetime: the platform
+ * killed the function mid-pass, the rows it had claimed never reached the
+ * release path, and they sat leased for ten minutes — and because the same
+ * object headed the queue next time, the same request hung the next run too.
+ * One stalled object could stall the pipeline indefinitely.
+ *
+ * Two mechanisms, because either alone is not enough:
+ *   - an AbortSignal threaded into the client's fetch, so the request is
+ *     genuinely cancelled rather than left running;
+ *   - a timer that settles the promise, because an abort that the client
+ *     swallows would otherwise still hang the await.
+ *
+ * The budget is derived from the caller's RouteDeadline, so a call late in a
+ * pass gets only what is actually left rather than a fresh fixed timeout that
+ * could straddle the platform ceiling. With no deadline (tests, scripts) the
+ * default applies.
+ */
+export const STORAGE_CALL_MAX_MS = 15_000;
+/** Below this there is no point starting a storage call at all. */
+export const STORAGE_CALL_MIN_MS = 500;
+
+/** Tag for a call that ran out of budget. Callers map it to their transient path. */
+export const STORAGE_TIMEOUT_MESSAGE = "storage-timeout";
+
+export class StorageTimeoutError extends Error {
+    name = "StorageTimeoutError";
+    constructor(op: string) {
+        super(`${STORAGE_TIMEOUT_MESSAGE}:${op}`);
+    }
+}
+
+/** Name-based, like every other error guard here — see CLAUDE.md. */
+export function isStorageTimeout(error: unknown): boolean {
+    return error instanceof Error && error.name === "StorageTimeoutError";
+}
+
+export function storageBudgetMs(deadline?: RouteDeadline): number {
+    const left = remainingBudgetMs(deadline);
+    if (!Number.isFinite(left)) return STORAGE_CALL_MAX_MS;
+    return Math.min(STORAGE_CALL_MAX_MS, Math.max(0, Math.floor(left)));
+}
+
+/**
+ * Run one storage operation under the budget, with a client whose fetch it can
+ * abort. `run` receives the client so the operation is built INSIDE the guard —
+ * building it outside would bind it to the unsignalled singleton.
+ */
+async function withStorageDeadline<T>(
+    op: string,
+    deadline: RouteDeadline | undefined,
+    run: (client: SupabaseClient) => Promise<T>,
+): Promise<T> {
+    const budget = storageBudgetMs(deadline);
+    // Starting a call with no runway left is how a pass spends its last
+    // milliseconds on a request whose answer it can never use.
+    if (budget < STORAGE_CALL_MIN_MS) throw new StorageTimeoutError(op);
+
+    const controller = new AbortController();
+    const client = getSupabaseWithSignal(controller.signal);
+    if (!client) throw new Error("receipt storage is not configured");
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            run(client),
+            new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => {
+                    // Abort FIRST, so the socket goes with the promise.
+                    controller.abort();
+                    reject(new StorageTimeoutError(op));
+                }, budget);
+            }),
+        ]);
+    } finally {
+        // Never leave a pending timer holding the event loop open.
+        if (timer) clearTimeout(timer);
+    }
+}
 
 /**
  * The bucket policy, exported so scripts/apply-receipt-intake.mjs and this code
@@ -80,19 +168,18 @@ export async function receiptObjectSize(
     storagePath: string,
     /** Injected only by tests: the classification is the whole subject here. */
     lister: BucketLister | null = null,
+    deadline?: RouteDeadline,
 ): Promise<SizeResult> {
     const path = safePath(storagePath);
     if (!path) return { ok: false, kind: "missing" };
-    const from = lister ?? getSupabase()?.storage.from(RECEIPT_BUCKET) ?? null;
-    // No client is a CONFIGURATION fault, not an absent object. Saying "missing"
-    // here is what let a misconfigured deployment re-upload over a document that
-    // was really there.
-    if (!from) return { ok: false, kind: "transient", message: "storage-not-configured" };
     const slash = path.lastIndexOf("/");
     const dir = slash > 0 ? path.slice(0, slash) : "";
     const name = slash > 0 ? path.slice(slash + 1) : path;
     try {
-        const { data, error } = await from.list(dir, { search: name, limit: 100 });
+        const { data, error } = lister
+            ? await lister.list(dir, { search: name, limit: 100 })
+            : await withStorageDeadline("list", deadline, client =>
+                client.storage.from(RECEIPT_BUCKET).list(dir, { search: name, limit: 100 }));
         if (error) {
             return isNotFoundError(error as { message?: string; status?: number })
                 ? { ok: false, kind: "missing" }
@@ -117,13 +204,15 @@ export async function receiptObjectSize(
 }
 
 /** Tagged download, so a confirmed 404 and a storage blip cannot book the same. */
-export async function downloadReceiptObject(storagePath: string): Promise<DocBytesResult> {
+export async function downloadReceiptObject(
+    storagePath: string,
+    deadline?: RouteDeadline,
+): Promise<DocBytesResult> {
     const path = safePath(storagePath);
     if (!path) return { ok: false, kind: "not-found" };
-    const supabase = getSupabase();
-    if (!supabase) return { ok: false, kind: "transient", message: "storage-not-configured" };
     try {
-        const { data, error } = await supabase.storage.from(RECEIPT_BUCKET).download(path);
+        const { data, error } = await withStorageDeadline("download", deadline, client =>
+            client.storage.from(RECEIPT_BUCKET).download(path));
         if (error) {
             return isNotFoundError(error as { message?: string; status?: number })
                 ? { ok: false, kind: "not-found" }
@@ -145,16 +234,15 @@ export async function uploadReceiptObject(
     storagePath: string,
     bytes: Buffer,
     contentType: string,
-    opts: { upsert?: boolean } = {},
+    opts: { upsert?: boolean; deadline?: RouteDeadline } = {},
 ): Promise<boolean> {
     const path = safePath(storagePath);
     if (!path) return false;
-    const supabase = getSupabase();
-    if (!supabase) return false;
     try {
-        const { error } = await supabase.storage
-            .from(RECEIPT_BUCKET)
-            .upload(path, bytes, { contentType, upsert: opts.upsert ?? false });
+        const { error } = await withStorageDeadline("upload", opts.deadline, client =>
+            client.storage
+                .from(RECEIPT_BUCKET)
+                .upload(path, bytes, { contentType, upsert: opts.upsert ?? false }));
         if (error) {
             console.error("[receipts/intake] upload failed", error.message);
             return false;
@@ -167,14 +255,18 @@ export async function uploadReceiptObject(
 }
 
 /** Delete, and THROW on anything short of a confirmed removal. */
-export async function removeReceiptObject(storagePath: string): Promise<void> {
+export async function removeReceiptObject(
+    storagePath: string,
+    deadline?: RouteDeadline,
+): Promise<void> {
     const path = safePath(storagePath);
     if (!path) throw new Error(`not a receipt object path: ${String(storagePath).slice(0, 80)}`);
-    const supabase = getSupabase();
     // Never a silent success: the cleanup queue would mark an orphan resolved on
-    // a misconfigured deployment and lose it permanently.
-    if (!supabase) throw new Error("receipt storage is not configured");
-    const { error } = await supabase.storage.from(RECEIPT_BUCKET).remove([path]);
+    // a misconfigured deployment and lose it permanently. withStorageDeadline
+    // throws for a missing client and for a timeout alike, which is what this
+    // caller wants — both mean "not confirmed removed".
+    const { error } = await withStorageDeadline("remove", deadline, client =>
+        client.storage.from(RECEIPT_BUCKET).remove([path]));
     if (error) throw error;
 }
 
@@ -200,16 +292,15 @@ export async function removeReceiptObject(storagePath: string): Promise<void> {
  */
 export async function createReceiptUploadUrl(
     storagePath: string,
-    opts: { upsert?: boolean } = {},
+    opts: { upsert?: boolean; deadline?: RouteDeadline } = {},
 ): Promise<{ uploadUrl: string; token: string; storagePath: string } | null> {
     const path = safePath(storagePath);
     if (!path) return null;
-    const supabase = getSupabase();
-    if (!supabase) return null;
     try {
-        const { data, error } = await supabase.storage
-            .from(RECEIPT_BUCKET)
-            .createSignedUploadUrl(path, { upsert: opts.upsert ?? false });
+        const { data, error } = await withStorageDeadline("sign-upload", opts.deadline, client =>
+            client.storage
+                .from(RECEIPT_BUCKET)
+                .createSignedUploadUrl(path, { upsert: opts.upsert ?? false }));
         if (error || !data) {
             console.error("[receipts/intake] sign failed", error?.message);
             return null;
@@ -225,15 +316,15 @@ export async function createReceiptUploadUrl(
 export async function signReceiptDownloadUrl(
     storagePath: string,
     ttlSeconds: number,
+    deadline?: RouteDeadline,
 ): Promise<string | null> {
     const path = safePath(storagePath);
     if (!path) return null;
-    const supabase = getSupabase();
-    if (!supabase) return null;
     try {
-        const { data, error } = await supabase.storage
-            .from(RECEIPT_BUCKET)
-            .createSignedUrl(path, ttlSeconds);
+        const { data, error } = await withStorageDeadline("sign-download", deadline, client =>
+            client.storage
+                .from(RECEIPT_BUCKET)
+                .createSignedUrl(path, ttlSeconds));
         return error || !data ? null : data.signedUrl;
     } catch {
         return null;

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     createQBReceiptPurchase,
     ensureQBVendor,
@@ -1619,8 +1621,10 @@ test("TAX: a split the books do not have is a review, not a derive", () => {
     const split = compareExistingPurchase(
         readBooked({
             Line: [
-                { Amount: 137.5, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mueller Remodel" } } },
-                { Amount: 12.5, AccountBasedExpenseLineDetail: { AccountRef: { value: TAX_ACCOUNT_ID }, CustomerRef: { name: "Mueller Remodel" } } },
+                // BOTH lines carry the customer ID, not just its display name:
+                // a name is not an identity, and the tax line is money too.
+                { Amount: 137.5, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { value: "cust-1", name: "Mueller Remodel" } } },
+                { Amount: 12.5, AccountBasedExpenseLineDetail: { AccountRef: { value: TAX_ACCOUNT_ID }, CustomerRef: { value: "cust-1", name: "Mueller Remodel" } } },
             ],
         }),
         TAX_INPUT,
@@ -1760,14 +1764,37 @@ test("identity is compared on CustomerRef.value, so two customers sharing a NAME
     assert.deepEqual(check.differences, ["project"]);
 });
 
-test("an UNCODED TAX line is fine: the reclaimable account is its attribution", () => {
-    // The reseller-permit tax posts to its own account and is not job money in
-    // the same sense, so requiring a customer on it would park every honest
-    // split. A tax line naming a DIFFERENT job is still a review.
+test("an UNCODED TAX line is a REVIEW: reclaimable tax is money on a job too", () => {
+    // This test used to assert the opposite — that the reclaimable account was
+    // attribution enough and a tax line needed no customer. It is not: the
+    // Purchase's whole gross is then recorded against the project the OTHER
+    // lines name, including a tax split nobody attributed to it. Tax was
+    // excluded from the "is this line coded at all" guard entirely, so it was
+    // the one kind of money that could ride along unassigned.
     const taxLine = { Amount: 12.5, AccountBasedExpenseLineDetail: { AccountRef: { value: TAX_ACCOUNT_ID } } };
-    const ok = compareExistingPurchase(
+    const uncodedTax = compareExistingPurchase(
         readBooked({
             Line: [{ ...CODED, Amount: 137.5 }, taxLine],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(uncodedTax.verdict, "review");
+    assert.ok(uncodedTax.differences.includes("project"));
+
+    // THE CONTROL: the same split with the tax line CODED books clean, so this
+    // is not a rule that simply refuses every tax split.
+    const ok = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { ...CODED, Amount: 137.5 },
+                {
+                    Amount: 12.5,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: TAX_ACCOUNT_ID },
+                        CustomerRef: { value: "cust-1", name: "Mueller Remodel" },
+                    },
+                },
+            ],
         }),
         TAX_INPUT,
     );
@@ -1823,4 +1850,101 @@ test("a REVIEW outranks a DERIVE when both kinds of difference are present", () 
     );
     assert.equal(check.verdict, "review");
     assert.deepEqual(check.differences, ["amount", "project"]);
+});
+
+// ── EVERY monetary line carries the customer id (Codex round-16 item 2) ────
+//
+// The old rule let one NAMED line validate a Purchase while other money sat
+// unassigned, and the worker then recorded the whole gross against that
+// project. Three shapes got through; each is a test below, each with the
+// control that proves the rule is not simply "refuse everything".
+
+test("ONE CODED + ONE UNCODED line is a review, not a match", () => {
+    // The headline case: real money on this Purchase, on no job at all, waved
+    // through because a sibling line named the right one.
+    const mixed = compareExistingPurchase(
+        readBooked({ Line: [{ ...CODED, Amount: 60 }, { ...UNCODED, Amount: 40 }] }),
+        baseInput(),
+    );
+    assert.equal(mixed.verdict, "review");
+    assert.ok(mixed.differences.includes("project"));
+});
+
+test("a NAME without an id is not attribution — a name is not an identity", () => {
+    // The pre-fix hole: the "is this line coded at all" guard was
+    // `!tax && !customerId && !customerName`, so a display name alone
+    // satisfied it. QBO's `name` on a ReferenceType is documented optional and
+    // is a label, not a key.
+    const namedOnly = {
+        Amount: 100,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { name: "Mueller Remodel" },
+        },
+    };
+    const check = compareExistingPurchase(readBooked({ Line: [namedOnly] }), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.ok(check.differences.includes("project"));
+
+    // CONTROL: the same line WITH the id books clean.
+    const withId = compareExistingPurchase(readBooked({ Line: [{ ...CODED }] }), baseInput());
+    assert.equal(withId.verdict, "match");
+});
+
+test("ZERO ids across every line is an absence, not agreement", () => {
+    // `ids.size <= 1` was satisfied by an EMPTY set, so a Purchase whose lines
+    // carried names and no ids passed with nothing pinned at all.
+    const allNamed = [0, 1].map(i => ({
+        Amount: 50,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { name: "Mueller Remodel" },
+        },
+        _i: i,
+    }));
+    const check = compareExistingPurchase(readBooked({ Line: allNamed }), baseInput());
+    assert.equal(check.verdict, "review");
+
+    // HONEST NOTE ON `ids.size === 1`: the per-line `!line.customerId` guard
+    // now rejects this shape before the size is ever consulted, so the change
+    // from `<= 1` to `=== 1` is belt-and-braces rather than an independently
+    // load-bearing guard — a mutation back to `<= 1` alone changes nothing
+    // observable. It is written as `=== 1` because that is what the rule
+    // means, and so that relaxing the per-line guard cannot silently reopen
+    // the empty-set hole. Asserted here as a source fact, not a behaviour.
+    const src = readFileSync(path.join(__dirname, "..", "src/lib/qbo-receipt-push.ts"), "utf8");
+    assert.match(src, /return ids\.size === 1 && confirmedByName;/);
+    assert.match(src, /if \(!line\.customerId\) return false;/);
+});
+
+test("TWO DIFFERENT customer ids is still a review — the split-across-jobs case", () => {
+    // Unchanged behaviour, asserted so the `=== 1` tightening cannot be read
+    // as having relaxed anything.
+    const split = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { ...CODED, Amount: 50 },
+                {
+                    Amount: 50,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: EXPENSE_ACCOUNT_ID },
+                        CustomerRef: { value: "cust-2", name: "Mueller Remodel" },
+                    },
+                },
+            ],
+        }),
+        baseInput(),
+    );
+    assert.equal(split.verdict, "review");
+});
+
+test("ALL lines coded to one confirmed job is a match — the control", () => {
+    // Without this, a rule that refused every existing Purchase would pass
+    // every assertion above.
+    const ok = compareExistingPurchase(
+        readBooked({ Line: [{ ...CODED, Amount: 50 }, { ...CODED, Amount: 50 }] }),
+        baseInput(),
+    );
+    assert.equal(ok.verdict, "match");
+    assert.deepEqual(ok.differences, []);
 });
