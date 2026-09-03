@@ -650,7 +650,19 @@ test("postOwnerCard honours a shortened deadline, and a caller can never lengthe
     // is most of the budget the gate above exists to protect.
     const realFetch = globalThis.fetch;
     globalThis.fetch = ((_url: unknown, init: { signal: AbortSignal }) => new Promise((_resolve, reject) => {
-        init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+        // A real hung POST holds an open socket, and THAT handle is what keeps
+        // the event loop alive long enough for the deadline to land:
+        // `AbortSignal.timeout()` unrefs its own timer by design. A fake that
+        // holds nothing lets the loop drain first, so the abort never fires and
+        // this await never settles — CI (Node 20) cancelled the test with
+        // "Promise resolution is still pending but the event loop has already
+        // resolved", while Node 24 passed only on a handle its loader happened
+        // to keep. Stand in for the socket, and release it on abort.
+        const socketStandIn = setTimeout(() => {}, CARD_POST_TIMEOUT_MS);
+        init.signal.addEventListener("abort", () => {
+            clearTimeout(socketStandIn);
+            reject(new Error("aborted"));
+        });
     })) as unknown as typeof fetch;
     const card = {
         owner: "CJ", requestId: "receipt-req-CJ-2026-08-20", date: "2026-08-20",
