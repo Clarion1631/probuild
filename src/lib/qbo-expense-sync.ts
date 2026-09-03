@@ -942,14 +942,26 @@ export async function upsertQboExpense(
             // land a purchase classified for one job on another job's books, so
             // a disagreement refuses the write instead: the row stays
             // unimported and the next sync re-matches against the estimate's
-            // current project. A project-less estimate still leaves the row
-            // unattributed rather than stamped with a job it has left: half a
-            // pair is the bug.
+            // current project.
+            //
+            // A NULL PAIR IS THE SAME REFUSAL (round 32). It means the estimate
+            // this Purchase was matched to either no longer exists or no longer
+            // has a project, and the guard below — which only fires when a pair
+            // came back — used to be skipped entirely for it. What then ran was
+            // `create({ ...write, projectId: null })`, which still carries
+            // `write.estimateId`: on a DELETED estimate that is a foreign-key
+            // violation that takes down the whole sync run, and on a
+            // project-less one it is a row stamped with an estimate whose job
+            // nobody can resolve. Both are the same fact — the attribution the
+            // matcher decided on is gone — so both get the same answer the
+            // moved-estimate case gets.
             const plannedProjectId = write.projectId ?? null;
             const pair = await lockEstimateAttribution(transaction, write.estimateId);
-            if (pair && plannedProjectId !== null && pair.projectId !== plannedProjectId) {
+            if (!pair || (plannedProjectId !== null && pair.projectId !== plannedProjectId)) {
                 console.warn(
-                    "QBO expense import skipped: estimate moved between match and write",
+                    pair
+                        ? "QBO expense import skipped: estimate moved between match and write"
+                        : "QBO expense import skipped: estimate deleted or unassigned between match and write",
                     write.qbPurchaseId,
                     write.estimateId,
                 );
@@ -961,7 +973,7 @@ export async function upsertQboExpense(
                 return "skipped-attribution-race";
             }
             await transaction.expense.create({
-                data: { ...write, projectId: pair?.projectId ?? null },
+                data: { ...write, projectId: pair.projectId },
             });
             return "imported";
         }
@@ -988,25 +1000,32 @@ export async function upsertQboExpense(
             // what the fill was actually planned for: `plan.fill.projectId`
             // was computed for a specific job, not for whichever job the
             // estimate happens to be on by the time this transaction locks it.
+            //
+            // A NULL PAIR SKIPS THE FILL TOO (round 32). The `else` used to
+            // write `{ estimateId: plan.fill.estimateId }` — the PLAN's stale
+            // estimate — precisely when the lock had just proved that estimate
+            // no longer names a job (or no longer exists). That is the one
+            // write this whole block exists to prevent, done deliberately.
+            // There is nothing to fill from, so nothing is filled.
             const plannedProjectId = plan.fill.projectId ?? null;
             const pair = await lockEstimateAttribution(transaction, plan.fill.estimateId);
-            if (pair && plannedProjectId !== null && pair.projectId !== plannedProjectId) {
-                // The estimate moved between the plan and this lock. Skip the
-                // fill — the row stays unattributed and the next sync retries
-                // against the estimate's current project — but still apply the
-                // rest of `plan.data` below (tax/amount reconciliation is
-                // independent of attribution).
+            if (!pair || (plannedProjectId !== null && pair.projectId !== plannedProjectId)) {
+                // The estimate moved, was unassigned, or was deleted between the
+                // plan and this lock. Skip the fill — the row stays unattributed
+                // and the next sync retries against the estimate's current
+                // project — but still apply the rest of `plan.data` below
+                // (tax/amount reconciliation is independent of attribution).
                 console.warn(
-                    "QBO expense attribution fill skipped: estimate moved between plan and lock",
+                    pair
+                        ? "QBO expense attribution fill skipped: estimate moved between plan and lock"
+                        : "QBO expense attribution fill skipped: estimate deleted or unassigned between plan and lock",
                     write.qbPurchaseId,
                     plan.fill.estimateId,
                 );
             } else {
                 await transaction.expense.updateMany({
                     where: { id: existing.id, projectId: null },
-                    data: pair
-                        ? { projectId: pair.projectId, estimateId: pair.estimateId }
-                        : { estimateId: plan.fill.estimateId },
+                    data: { projectId: pair.projectId, estimateId: pair.estimateId },
                 });
             }
         }

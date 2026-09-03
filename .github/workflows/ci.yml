@@ -75,6 +75,14 @@ jobs:
         env:
           RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # The phase invariant's PHANTOM hole. Everything else in that suite runs
+      # against a scripted fake, which has no lock manager and so cannot tell a
+      # verdict that holds its rows from one that merely read them.
+      - name: Phase-invariant proof-query lock against real Postgres
+        run: npx tsx --test tests/phase-invariant-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

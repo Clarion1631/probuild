@@ -77,6 +77,38 @@ export async function reconcileLateFields(
     const current = await deps.read(id);
     if (!current) return null;
 
+    // PROVENANCE RIDES WITH THE PHASE; IT IS NOT A FIELD OF ITS OWN.
+    //
+    // `costCodeSource` is DERIVED — the route stamps it from the caller's
+    // AUTHENTICATION whenever a phase is supplied, and no client can send it.
+    // Scoring it in its own right refuses two correct requests: a retry against
+    // a row that already carries the phase reports a "conflict" on a field the
+    // caller never sent, and a machine-set phase re-confirmed by a person reads
+    // as a different value for an answer that did not change. It is only
+    // meaningful as a companion to a phase this call actually applies, so it is
+    // dropped once the row already has one.
+    const entriesToReconcile = current.costCodeId === null
+        ? entries
+        : entries.filter(([key]) => key !== "costCodeSource");
+    if (entriesToReconcile.length === 0) return null;
+
+    // A RECONCILED KEY THE READ DID NOT RETURN IS A WIRING BUG, NOT A CONFLICT.
+    //
+    // `undefined` is not `null`, so an unselected column scores as "already
+    // carries a different value" and 409s a request that should have succeeded
+    // — silently, and only in the route, because every unit test here builds
+    // its own row object. That is exactly how the finalize route shipped with
+    // `costCodeSource` missing from its select. Fail loudly instead: a caller
+    // cannot fix this, and a 409 tells them to.
+    const unread = entriesToReconcile.map(([key]) => key).filter(key => !(key in current));
+    if (unread.length > 0) {
+        throw new Error(
+            `reconcileLateFields: the row read omits ${unread.join(", ")}. A key that is ` +
+            `reconciled but not selected reads as undefined, which the null-or-equal rule ` +
+            `scores as a conflict and refuses a correct request.`,
+        );
+    }
+
     // NULL-OR-EQUAL only, and only BEFORE the row is routed.
     //
     // Past RECEIVED the read has already happened: the dedup keys, the phase
@@ -85,7 +117,7 @@ export async function reconcileLateFields(
     // that — it just makes the row disagree with its own history, and after
     // BOOKED it disagrees with a Purchase in the real books.
     if (!LATE_FIELD_STATES.includes(current.state)) {
-        const differs = entries.some(([key, value]) => current[key] !== value);
+        const differs = entriesToReconcile.some(([key, value]) => current[key] !== value);
         if (!differs) return null; // already exactly what the caller is asking for
         return {
             status: 409,
@@ -98,7 +130,9 @@ export async function reconcileLateFields(
         };
     }
 
-    const conflicts = entries.filter(([key, value]) => current[key] !== null && current[key] !== value);
+    const conflicts = entriesToReconcile.filter(
+        ([key, value]) => current[key] !== null && current[key] !== value,
+    );
     if (conflicts.length > 0) {
         return {
             status: 409,
@@ -113,7 +147,7 @@ export async function reconcileLateFields(
         };
     }
 
-    const toApply = Object.fromEntries(entries.filter(([key]) => current[key] === null));
+    const toApply = Object.fromEntries(entriesToReconcile.filter(([key]) => current[key] === null));
     if (Object.keys(toApply).length === 0) return null;
 
     // THE ROW MUST BE UNCLAIMED.
@@ -131,7 +165,7 @@ export async function reconcileLateFields(
     // state moved, and when a DIFFERENT project was written underneath us.
     // Re-read and decide from what is persisted, not from the stale read.
     const after = await deps.read(id);
-    const settled = after !== null && entries.every(([key, value]) => after[key] === value);
+    const settled = after !== null && entriesToReconcile.every(([key, value]) => after[key] === value);
     if (!settled) {
         return {
             status: 409,
@@ -248,6 +282,13 @@ export function mergeCapturedFields(
 
     for (const [key, supplied] of Object.entries(lateFields)) {
         if (supplied === undefined) continue;
+        // Provenance rides with the phase — the SAME rule reconcileLateFields
+        // applies, deliberately, because a caller cannot tell which of the two
+        // paths it hit. A row that already carries a phase keeps the source
+        // that came with it: `costCodeSource` is derived from the caller, so
+        // comparing it on a retry refuses a request over a field nobody sent,
+        // and applying it would relabel a person's phase as machine-set.
+        if (key === "costCodeSource" && (captured.costCodeId ?? null) !== null) continue;
         const stored = captured[key] ?? null;
         if (stored === null) {
             apply[key] = supplied;

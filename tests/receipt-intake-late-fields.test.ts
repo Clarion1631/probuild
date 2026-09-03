@@ -446,3 +446,108 @@ test("the publish CAS carries installedAtCustomer, so a concurrent finalize lose
     assert.match(fence.slice(0, 120), /\.\.\.merged\.guard/, "the CAS includes every captured value");
     assert.ok(commit.length > 0);
 });
+
+// ── provenance rides with the phase (the round-9/10 e2e 409s) ───────────────
+
+test("a late phase applies together with the source the route derived", async () => {
+    // The exact first request of e2e round 10: an un-phased row, a finalize
+    // carrying the job's own phase. The route always adds `costCodeSource`
+    // alongside `costCodeId`, so the rules see TWO keys, not one.
+    const t = deps([row({ projectId: "p1", costCodeSource: null })], 1);
+    assert.equal(
+        await reconcileLateFields("r1", { costCodeId: "c1", costCodeSource: "machine" }, t.deps),
+        null,
+    );
+    assert.deepEqual(t.applied, [{ costCodeId: "c1", costCodeSource: "machine" }]);
+});
+
+test("a reconciled key the READ omits throws, instead of 409ing a correct request", async () => {
+    // THE BUG (e2e/receipt-intake.spec.ts rounds 9 and 10). The finalize route
+    // reconciled `costCodeSource` but never SELECTed it, so `current` had no
+    // such key: `undefined !== null` and `undefined !== "machine"` both hold,
+    // which the null-or-equal rule scored as "already carries a different
+    // value". Every finalize carrying a costCodeId returned 409
+    // `late-fields-conflict` over a field the caller never sent, and the phase
+    // was never applied. A caller cannot fix that, so it must not look like a
+    // conflict.
+    const blind = { costCodeId: null, projectId: null, state: "RECEIVED", claimToken: null };
+    const t = deps([blind as LateFieldRow], 1);
+    await assert.rejects(
+        () => reconcileLateFields("r1", { costCodeId: "c1", costCodeSource: "machine" }, t.deps),
+        /the row read omits costCodeSource/,
+    );
+    assert.deepEqual(t.applied, [], "and nothing is written on a wiring bug");
+});
+
+test("re-sending the SAME phase on a row that has it is a no-op, not a conflict", async () => {
+    // e2e round 9's second call. `costCodeSource` is DERIVED from the caller,
+    // so comparing it in its own right made an idempotent retry fail over a
+    // field the client never sent — and a person re-confirming a machine-set
+    // phase fail over an answer that did not change.
+    const t = deps([row({ projectId: "p1", costCodeId: "c1", costCodeSource: "machine" })], 1);
+    assert.equal(
+        await reconcileLateFields("r1", { costCodeId: "c1", costCodeSource: "user" }, t.deps),
+        null,
+    );
+    assert.deepEqual(t.applied, [], "nothing to apply — the phase did not change");
+});
+
+test("a DIFFERENT phase is still a conflict, provenance or not", async () => {
+    // e2e round 9's third call. The relaxation above must not reach the id.
+    const t = deps([row({ projectId: "p1", costCodeId: "c1", costCodeSource: "machine" })], 1);
+    const denial = await reconcileLateFields("r1", { costCodeId: "c2", costCodeSource: "user" }, t.deps);
+    assert.equal(denial?.status, 409);
+    assert.equal(denial?.body.error, "late-fields-conflict");
+    assert.deepEqual(Object.keys(denial!.body.fields as object), ["costCodeId"], "and only the id is named");
+    assert.deepEqual(t.applied, []);
+});
+
+test("a ROUTED row accepts a repeat of the phase it already holds", async () => {
+    // The same relaxation on the too-late branch. Without it, an alreadyFinalized
+    // retry against a BOOKED row 409'd `late-fields-too-late` because the
+    // derived source differed — a state transition the caller cannot undo.
+    const t = deps([row({ state: "BOOKED", costCodeId: "c1", costCodeSource: "machine" })], 1);
+    assert.equal(
+        await reconcileLateFields("r1", { costCodeId: "c1", costCodeSource: "user" }, t.deps),
+        null,
+    );
+});
+
+test("the finalize route SELECTS every key it reconciles", () => {
+    // The tripwire for the whole class. The route derives `costCodeSource` into
+    // `lateFields`, so the adapter's read has to return it; the throw above
+    // only fires at runtime on a path an e2e happened to cover.
+    const adapter = FINALIZE.slice(FINALIZE.indexOf("async function applyLateFields"));
+    const select = adapter.slice(adapter.indexOf("select: {"), adapter.indexOf("applyIfNull"));
+    for (const key of ["costCodeId", "costCodeSource", "projectId", "installedAtCustomer", "state", "claimToken"]) {
+        assert.match(select, new RegExp(`\\b${key}: true`), `applyLateFields must select ${key}`);
+    }
+    // ...and the publish half reads it too, or mergeCapturedFields sees a null
+    // it is free to overwrite.
+    const merge = FINALIZE.slice(FINALIZE.indexOf("mergeCapturedFields("));
+    const call = merge.slice(0, merge.indexOf("lateFields,"));
+    assert.match(call, /costCodeSource: row\.costCodeSource/);
+});
+
+test("the publish path never relabels a phase that was already captured", async () => {
+    // /start stamps `costCodeSource` from ITS caller. A machine finalize of a
+    // row a person phased would otherwise overwrite "user" with "machine" —
+    // and booking treats a user-set phase as untouchable, a machine-set one as
+    // correctable, so that is a real change of authority.
+    const merged = mergeCapturedFields(
+        { projectId: "p1", costCodeId: "c1", costCodeSource: "user" },
+        { costCodeId: "c1", costCodeSource: "machine" } as never,
+    );
+    assert.ok(!("status" in merged), "and it is not a conflict either");
+    assert.deepEqual(merged.apply, {} as never);
+    assert.equal(merged.guard.costCodeSource, "user", "the CAS still fences on it");
+});
+
+test("the publish path DOES carry provenance for a phase landing late", async () => {
+    const merged = mergeCapturedFields(
+        { projectId: "p1", costCodeId: null, costCodeSource: null },
+        { costCodeId: "c1", costCodeSource: "machine" } as never,
+    );
+    assert.ok(!("status" in merged));
+    assert.deepEqual(merged.apply, { costCodeId: "c1", costCodeSource: "machine" } as never);
+});

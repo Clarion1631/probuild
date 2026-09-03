@@ -188,10 +188,75 @@ export function reanchorSql(timeZone) {
  * A re-run reporting 0 rows on both is the proof the gap is closed, and it is
  * the same check a second run of the whole script has always made.
  */
+/**
+ * THE BACKFILL READS THE ESTIMATE UNDER A LOCK (Codex round 32).
+ *
+ * The first version was a bare `UPDATE ... FROM "Estimate"`. A plain join takes
+ * no row lock: under READ COMMITTED the statement reads `est."projectId"` at
+ * its own snapshot, and a lead conversion (or any future move) committing right
+ * after that read leaves the expense stamped with the job the estimate has
+ * already left. That is the exact split-job row this whole migration exists to
+ * create correctly, manufactured by the migration itself.
+ *
+ * The locked CTE is the fix, and it is ONE statement rather than a lock query
+ * followed by an update — the rows the UPDATE writes from are, by construction,
+ * exactly the rows the CTE locked, with no window in between for a phantom to
+ * arrive. `FOR SHARE` (not `FOR UPDATE`): the backfill does not modify the
+ * estimates, it only needs them to hold still, and a share lock leaves other
+ * readers — including a concurrent expense booking — free.
+ *
+ * `ORDER BY est.id` keeps the acquisition order the same ascending-id rule
+ * `lockMoneyParentsMany` uses in the app, so this script and a live transaction
+ * cannot deadlock against each other on the Estimate table.
+ */
 export const PROJECT_ID_BACKFILL =
-    `UPDATE "Expense" e SET "projectId" = est."projectId"
-     FROM "Estimate" est
-     WHERE e."estimateId" = est.id AND e."projectId" IS NULL AND est."projectId" IS NOT NULL`;
+    `WITH locked AS (
+       SELECT est.id, est."projectId"
+         FROM "Estimate" est
+        WHERE est."projectId" IS NOT NULL
+          AND EXISTS (
+                SELECT 1 FROM "Expense" e
+                 WHERE e."estimateId" = est.id AND e."projectId" IS NULL
+              )
+        ORDER BY est.id
+          FOR SHARE
+     )
+     UPDATE "Expense" e SET "projectId" = locked."projectId"
+       FROM locked
+      WHERE e."estimateId" = locked.id AND e."projectId" IS NULL`;
+
+/**
+ * The pair, checked in BOTH directions after the run.
+ *
+ * The original verification asked only "is any expense still NULL against an
+ * estimate that knows a project?". That cannot see the failure this script can
+ * actually cause, or that a live estimate move causes: an expense with a
+ * NON-null projectId that DISAGREES with its estimate's. A row on two jobs at
+ * once passes a null check perfectly.
+ *
+ * WHY ZERO IS THE RIGHT EXPECTATION AT BOTH INTENDED RUN TIMES, and when it
+ * would not be. `Expense.projectId` is created BY this script, so on the
+ * pre-deploy run every non-null value in the column was written by the backfill
+ * itself and therefore equals its estimate's. On the --post-deploy run the new
+ * build has been live for minutes and every writer in it takes the pair from
+ * one locked read (`lockEstimateAttribution`), so it still equals.
+ *
+ * Later than that, a NON-zero count is not necessarily a defect: a bookkeeper
+ * re-attributing an expense to another job through the expense PATCH is a
+ * supported, deliberate operation, and it produces exactly this shape (see the
+ * "RE-ATTRIBUTED expense" note in src/app/api/expenses/[id]/route.ts). This
+ * check cannot tell that apart from an estimate moved out from under its
+ * expenses, so it reports the count either way and refuses to claim success —
+ * read the rows before overriding it. Re-running this script months later is
+ * not a supported operation, and a wedged re-run is the correct outcome for an
+ * operation nobody planned.
+ */
+export const MISMATCHED_PAIRS_QUERY =
+    `SELECT COUNT(*)::int AS n FROM "Expense" e
+       JOIN "Estimate" est ON est.id = e."estimateId"
+      WHERE e."projectId" IS NOT NULL
+        AND est."projectId" IS NOT NULL
+        AND e."projectId" <> est."projectId"`;
 
 export const statements = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "projectId" TEXT`,
@@ -497,7 +562,11 @@ async function main() {
                 const affected = await tx.$executeRawUnsafe(sql);
                 // Print the row count for the backfill: a SECOND run reporting
                 // 0 is the whole idempotency proof, and a silent "ok" hides it.
-                console.log(sql.trimStart().startsWith("UPDATE") ? `ok (${affected} rows)` : "ok");
+                // `WITH` as well as `UPDATE`: PROJECT_ID_BACKFILL is now a
+                // data-modifying CTE (it locks the estimates it reads), and
+                // matching only on "UPDATE" silently dropped the one row count
+                // this script's idempotency argument rests on.
+                console.log(/^(UPDATE|WITH)\b/i.test(sql.trimStart()) ? `ok (${affected} rows)` : "ok");
             }
         }, { timeout: 300_000, maxWait: 60_000 });
 
@@ -577,6 +646,24 @@ async function main() {
             process.exit(1);
         }
         console.log("verified backfill: 0 expenses left unattributed against a known estimate project");
+
+        // ...and the OTHER direction, which the null check above is blind to:
+        // an expense whose projectId disagrees with its estimate's. That is a
+        // row claiming two jobs, and it is what an unlocked backfill or an
+        // unguarded estimate move produces. Reported as a count either way, so
+        // a clean run says so out loud rather than saying nothing.
+        const [mismatched] = await prisma.$queryRawUnsafe(MISMATCHED_PAIRS_QUERY);
+        console.log(`verified pair: ${mismatched.n} expense(s) disagree with their estimate's project`);
+        if (mismatched.n !== 0) {
+            console.error(
+                `VERIFY FAILED: ${mismatched.n} expense(s) are attributed to a different job than their estimate. ` +
+                `On this script's two intended runs that count is necessarily zero (see MISMATCHED_PAIRS_QUERY). ` +
+                `If this is a much later re-run, some of these may be deliberate re-attributions rather than ` +
+                `estimates moved out from under their expenses — read the rows before concluding either way, ` +
+                `and do not trust a variance or profitability report until you have.`,
+            );
+            process.exit(1);
+        }
 
         // The re-anchor's own assertion, same reasoning as the one above: after
         // this script, no row may still need re-anchoring. This is the number a

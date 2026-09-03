@@ -577,19 +577,37 @@ type StoredExpense = Omit<QboExpenseWrite, "status"> & {
  * (Codex round 21, item 1). `estimateProjects` scripts the interleaving: seed
  * an entry to move an estimate to another job, or `null` to un-project it.
  * Anything unseeded is on `project-1`, which is where every WRITE points.
+ *
+ * `deletedEstimates` is the third state, and the one that used to CRASH (round
+ * 32): the estimate row is gone entirely, so the locked re-read comes back with
+ * no row at all. This fake enforces the foreign key the real database enforces,
+ * so a write that still carries the vanished `estimateId` fails here exactly as
+ * it fails in production — a P2003 that aborts the transaction and takes the
+ * rest of the sync run with it.
  */
 function createFakePrisma(
     initial: StoredExpense[] = [],
     estimateProjects: Map<string, string | null> = new Map(),
+    deletedEstimates: Set<string> = new Set(),
 ) {
     const rows = new Map(initial.map((row) => [row.qbPurchaseId, { ...row }]));
     const estimateProjectOf = (estimateId: string) =>
         estimateProjects.has(estimateId) ? estimateProjects.get(estimateId)! : "project-1";
+    const enforceEstimateFk = (estimateId: string | undefined) => {
+        if (estimateId !== undefined && deletedEstimates.has(estimateId)) {
+            const error: Error & { code?: string } = new Error(
+                "Foreign key constraint failed on the field: `Expense_estimateId_fkey`",
+            );
+            error.code = "P2003";
+            throw error;
+        }
+    };
     const expense = {
         async findUnique(args: { where: { qbPurchaseId: string } }) {
             return rows.get(args.where.qbPurchaseId) ?? null;
         },
         async create(args: { data: QboExpenseWrite }) {
+            enforceEstimateFk(args.data.estimateId);
             const next: StoredExpense = {
                 ...args.data,
                 id: `expense-${rows.size + 1}`,
@@ -617,6 +635,7 @@ function createFakePrisma(
         async updateMany(args: { where: Record<string, any>; data: Record<string, any> }) {
             const current = [...rows.values()].find(row => row.id === args.where.id);
             if (!current) return { count: 0 };
+            enforceEstimateFk(args.data.estimateId as string | undefined);
             const eq = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
             for (const key of ["projectId", "taxAmount", "taxDeductibleBase"]) {
                 if (key in args.where && !eq((current as any)[key], args.where[key])) {
@@ -654,6 +673,10 @@ function createFakePrisma(
                         // The FOR SHARE row lock returns nothing; the read
                         // after it answers.
                         if (/FROM "Estimate" WHERE id/.test(query)) {
+                            // A deleted estimate is not "a row with a null
+                            // project" — it is NO ROW. Both reach the caller as
+                            // a null pair, which is the point.
+                            if (deletedEstimates.has(args[0] as string)) return [];
                             if (/FOR SHARE/.test(query)) return [];
                             return [{ projectId: estimateProjectOf(args[0] as string) }];
                         }
@@ -1223,13 +1246,29 @@ test("an estimate MOVED mid-sync is refused, not silently imported onto its new 
     assert.equal(fake.rows.get("purchase-1"), undefined, "nothing is created on a mismatch");
 });
 
-test("an estimate that lost its project imports UNattributed, never half a pair", async () => {
-    // Writing project-1 beside an estimate that is on no job at all is the
-    // same split, reached the other way. Null is the honest answer: the row is
-    // a reportable gap a bookkeeper can close.
+test("an estimate that lost its project is REFUSED, not imported as half a pair", async () => {
+    // Round 32. This used to import with `projectId: null` and the stale
+    // `write.estimateId` beside it, on the theory that null is "the honest
+    // answer". It is not: the row is not unattributed, it is attributed to an
+    // estimate whose job nobody can resolve — `resolveExpenseProjectId` falls
+    // through to `estimate.projectId`, which is exactly the null this row was
+    // supposed to be reporting. The matcher's whole basis for the import is
+    // gone, so the import does not happen and the next sync re-matches.
     const fake = createFakePrisma([], new Map([["estimate-1", null]]));
-    assert.equal(await upsertQboExpense(fake.client, WRITE), "imported");
-    assert.equal(fake.rows.get("purchase-1")?.projectId, null);
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "skipped-attribution-race");
+    assert.equal(fake.rows.get("purchase-1"), undefined, "nothing is created");
+});
+
+test("a DELETED estimate is refused instead of taking down the sync run", async () => {
+    // The crash, in full. `lockEstimateAttribution` returns null for a vanished
+    // estimate exactly as it does for a project-less one, and the old guard —
+    // `if (pair && ...)` — was skipped for both. The create that followed still
+    // spread `write`, so it carried `estimateId: "estimate-1"` into a row whose
+    // estimate no longer exists: a foreign-key violation that aborts the
+    // transaction and every Purchase after it in the run.
+    const fake = createFakePrisma([], new Map(), new Set(["estimate-1"]));
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "skipped-attribution-race");
+    assert.equal(fake.rows.get("purchase-1"), undefined, "nothing is created");
 });
 
 test("the catch-up FILL refuses too, when the estimate moved out from under the plan", async () => {
@@ -1249,7 +1288,14 @@ test("the catch-up FILL refuses too, when the estimate moved out from under the 
     assert.equal(row?.qbSyncToken, "1", "the rest of the plan still lands");
 });
 
-test("a fill onto a project-less estimate writes the estimate alone, not a stale job", async () => {
+test("a fill onto a project-less estimate is SKIPPED, not written half", async () => {
+    // Round 32. The `else` branch used to write `{ estimateId: plan.fill.estimateId }`
+    // — the plan's estimate — in precisely the case where the lock had just
+    // proved that estimate names no job. That re-pointed a row from the
+    // estimate it had onto one that answers nothing, and it did so under the
+    // banner of a guard whose whole purpose is to refuse stale attribution.
+    // There is nothing to fill from, so nothing is filled; the rest of the plan
+    // still lands.
     const fake = createFakePrisma(
         [{ ...WRITE, id: "expense-1", projectId: null, estimateId: "estimate-old", receiptUrl: null }],
         new Map([["estimate-1", null]]),
@@ -1257,7 +1303,26 @@ test("a fill onto a project-less estimate writes the estimate alone, not a stale
     assert.equal(await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }), "updated");
     const row = fake.rows.get("purchase-1");
     assert.equal(row?.projectId, null, "no job to attribute against");
-    assert.equal(row?.estimateId, "estimate-1");
+    assert.equal(row?.estimateId, "estimate-old", "the row keeps the estimate it had");
+    assert.equal(row?.qbSyncToken, "1", "the rest of the plan still lands");
+});
+
+test("a fill onto a DELETED estimate is skipped, and the reconciliation still lands", async () => {
+    // Same null pair, reached by deletion. The old `else` wrote the vanished
+    // id, which the foreign key rejects — so an attribution race turned into a
+    // failed sync for every Purchase behind it. Skipping the fill leaves the
+    // row unattributed (a reportable gap) and lets the tax/amount half of the
+    // plan commit, which has nothing to do with attribution.
+    const fake = createFakePrisma(
+        [{ ...WRITE, id: "expense-1", projectId: null, estimateId: "estimate-old", receiptUrl: null }],
+        new Map(),
+        new Set(["estimate-1"]),
+    );
+    assert.equal(await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }), "updated");
+    const row = fake.rows.get("purchase-1");
+    assert.equal(row?.projectId, null);
+    assert.equal(row?.estimateId, "estimate-old", "never re-pointed at an estimate that is gone");
+    assert.equal(row?.qbSyncToken, "1");
 });
 
 test("an ALREADY-attributed row is untouched by the locked re-read", async () => {
@@ -2256,12 +2321,16 @@ function suggestionTxClient(world: {
                 world.onEstimateRead?.();
                 return [{ projectId: world.estimateProject }];
             }
+            // The phase PROOF query answers AND locks (round 32), so it has to
+            // be matched before the blanket FOR SHARE short-circuit below —
+            // otherwise every phase check here would silently read as
+            // "not-a-phase" and the suggester tests would prove nothing.
+            if (/SELECT 1 AS ok/.test(query)) return world.phaseOk === false ? [] : [{ ok: 1 }];
             if (/FOR SHARE/.test(query)) return [];
             if (/FROM "Project" WHERE id/.test(query)) return [{ id: args[0], status: "In Progress" }];
             if (/FROM "CostCode" WHERE id/.test(query)) {
                 return [{ id: args[0], code: "03-PLUMB", isActive: true }];
             }
-            if (/FROM "EstimateItem"/.test(query)) return world.phaseOk === false ? [] : [{ ok: 1 }];
             return [];
         },
         expense: {

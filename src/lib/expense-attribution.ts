@@ -17,6 +17,7 @@
 // Pure module: no I/O, no Prisma client, no clock. It builds `where` fragments
 // and resolves in-memory rows; the callers own the queries.
 import type { Prisma } from "@prisma/client";
+import { lockMoneyParentsMany } from "./tx-retry";
 
 /** The two ways a row can know its project. Both optional at the type level. */
 export interface ExpenseProjectFacts {
@@ -439,6 +440,126 @@ export async function lockEstimateAttribution(
     )) as { projectId: string | null }[];
     const projectId = rows?.[0]?.projectId ?? null;
     return projectId ? { estimateId, projectId } : null;
+}
+
+/** One job an estimate's expenses are already pinned to, and how many. */
+export interface EstimateAttributionConflict {
+    estimateId: string;
+    projectId: string;
+    expenses: number;
+}
+
+/**
+ * The write-once pair, from the OTHER end (Codex round 32).
+ *
+ * `lockEstimateAttribution` stops a WRITER from persisting a stale pair. It
+ * cannot stop anything from invalidating a pair that was already written
+ * correctly — and moving the estimate does exactly that. `Expense.projectId` is
+ * write-once; `Estimate.projectId` is not. Move an estimate from job A to job B
+ * and every expense booked through it still says A, while the estimate, the
+ * billing paths and the phase cascade all say B. The row is on two jobs at
+ * once, which is the precise shape this whole feature exists to prevent, and no
+ * variance or profitability report can be right about it.
+ *
+ * There are exactly two honest answers, and "silently move the expenses" is not
+ * one of them: those rows carry a cost code from job A's phase list, a receipt
+ * filed under job A, and possibly a QBO purchase classified for job A. Dragging
+ * them across is a re-attribution, which is a deliberate operation with its own
+ * rules (the documented Phase 3 follow-up), not a side effect of a lead
+ * conversion. So the move is REFUSED and the operator is told what to fix.
+ *
+ * A NULL `Expense.projectId` is not a conflict. That row has no pinned job at
+ * all — it resolves THROUGH the estimate (`resolveExpenseProjectId`), so the
+ * move takes it along and is the thing that finally gives it an answer.
+ *
+ * A DELIBERATELY re-attributed expense also trips this, and that is accepted
+ * rather than special-cased. A bookkeeper moving an expense to another job is a
+ * supported operation and leaves the same shape — this check cannot tell the
+ * two apart, and neither can any query. Refusing is still the right default:
+ * the false refusal costs one operator one clear message naming the estimate
+ * and the job, while the false acceptance silently splits a job's costs. Do not
+ * "fix" it by exempting rows that look re-attributed; there is no such marker.
+ *
+ * The estimates are locked FOR UPDATE first, through the canonical money-path
+ * helper, so the count cannot be taken and then falsified by a concurrent
+ * booking before the move commits. `lockMoneyParentsMany` is used rather than a
+ * hand-rolled scan precisely so this shares the Estimate → Invoice → children
+ * acquisition order every other money path uses, and its ascending-id rule
+ * within the table.
+ */
+export class EstimateAttributionPairConflictError extends Error {
+    readonly targetProjectId: string;
+    readonly conflicts: readonly EstimateAttributionConflict[];
+
+    constructor(targetProjectId: string, conflicts: readonly EstimateAttributionConflict[]) {
+        const total = conflicts.reduce((sum, conflict) => sum + conflict.expenses, 0);
+        const detail = conflicts
+            .map(conflict => `estimate ${conflict.estimateId} → job ${conflict.projectId} (${conflict.expenses})`)
+            .join("; ");
+        super(
+            `Cannot move ${conflicts.length} estimate(s) to job ${targetProjectId}: ` +
+            `${total} expense(s) are still attributed to their current job through them — ${detail}. ` +
+            `Re-attribute those expenses to the new job first, then retry the move.`,
+        );
+        // NAME-BASED identity, deliberately. Node 20 + tsx can load this module
+        // twice under different specifiers, which makes `instanceof` false for
+        // an error this very file threw. Callers must use
+        // `isEstimateAttributionPairConflict`.
+        this.name = "EstimateAttributionPairConflictError";
+        this.targetProjectId = targetProjectId;
+        this.conflicts = conflicts;
+    }
+}
+
+/** Identity by NAME, not `instanceof` — see the note in the constructor. */
+export function isEstimateAttributionPairConflict(
+    error: unknown,
+): error is EstimateAttributionPairConflictError {
+    return (
+        error instanceof EstimateAttributionPairConflictError ||
+        (error instanceof Error && error.name === "EstimateAttributionPairConflictError")
+    );
+}
+
+/** The transaction-client subset the estimate-move guard needs. */
+export type EstimateMoveTxClient = Prisma.TransactionClient;
+
+/**
+ * Refuse to move `estimateIds` onto `targetProjectId` while any expense booked
+ * through them is still pinned to a DIFFERENT job. See
+ * `EstimateAttributionPairConflictError` for why refusing is the answer.
+ *
+ * Call this INSIDE the transaction that performs the move, and move only the
+ * ids it was given — a `where: { leadId }` re-scan can pick up an estimate this
+ * never checked.
+ */
+export async function assertEstimateMoveKeepsAttributionPairs(
+    tx: EstimateMoveTxClient,
+    estimateIds: readonly string[],
+    targetProjectId: string,
+): Promise<void> {
+    const ids = [...new Set(estimateIds)].filter(Boolean).sort();
+    if (!ids.length) return;
+
+    await lockMoneyParentsMany(tx, { estimateIds: ids });
+
+    const conflicts = (await tx.$queryRawUnsafe(
+        `SELECT e."estimateId" AS "estimateId",
+                e."projectId"  AS "projectId",
+                COUNT(*)::int  AS "expenses"
+           FROM "Expense" e
+          WHERE e."estimateId" = ANY($1::text[])
+            AND e."projectId" IS NOT NULL
+            AND e."projectId" <> $2
+          GROUP BY e."estimateId", e."projectId"
+          ORDER BY e."estimateId", e."projectId"`,
+        ids,
+        targetProjectId,
+    )) as EstimateAttributionConflict[];
+
+    if (conflicts?.length) {
+        throw new EstimateAttributionPairConflictError(targetProjectId, conflicts);
+    }
 }
 
 /**

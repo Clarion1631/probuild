@@ -298,7 +298,18 @@ test.describe.serial("reconcileMilestoneToQbo", () => {
             { since: new Date("2026-01-01T00:00:00.000Z") },
             dependencies,
         );
-        expect(result).toEqual({ imported: 1, updated: 0, removed: 0, skipped: [] });
+        // `attributionRaceSkipped` is its own counter, deliberately NOT folded
+        // into `skipped` — that array is populated BEFORE a write is attempted,
+        // this counts a write-time estimate-move race. Asserted at 0 rather
+        // than dropped from the comparison: a clean import that quietly skipped
+        // a row would otherwise read as a pass.
+        expect(result).toEqual({
+            imported: 1,
+            updated: 0,
+            removed: 0,
+            attributionRaceSkipped: 0,
+            skipped: [],
+        });
 
         await page.goto(`/projects/${PFX}-project/time-expenses`);
         await page.getByRole("button", { name: /Expenses \(/ }).click();

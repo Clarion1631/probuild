@@ -2,6 +2,7 @@ import { revalidatePath as nextRevalidatePath } from "next/cache";
 import { prisma } from "@/lib/prisma";
 import { geocodeJobSiteAddress } from "./geocode";
 import { ensureStandardFolders } from "./project-folders";
+import { assertEstimateMoveKeepsAttributionPairs } from "./expense-attribution";
 
 // Session-free core of lead → project conversion, shared by the permission-gated
 // `convertLeadToProject` server action in actions.ts and by callers that have
@@ -66,7 +67,35 @@ export async function convertLeadToProjectCore(leadId: string) {
         // Relink child records to the new project.
         // Estimate has no onDelete:Cascade on its lead FK — keep leadId so it
         // remains visible from both the lead view and the project view.
-        await tx.estimate.updateMany({ where: { leadId }, data: { projectId: project.id } });
+        //
+        // MOVING AN ESTIMATE BREAKS THE WRITE-ONCE ATTRIBUTION PAIR (round 32).
+        // This is the ONE path in the codebase that changes an existing
+        // `Estimate.projectId` — everything else that "moves" an estimate
+        // actually creates a new one (duplicateEstimate). `Expense.projectId`
+        // is write-once and `Estimate.projectId` is not, so an estimate that
+        // already has expenses pinned to another job would leave those rows
+        // claiming job A while the estimate, the billing paths and the phase
+        // cascade all follow job B. The guard refuses rather than dragging the
+        // expenses across: those rows carry job A's cost codes and receipts,
+        // and re-attributing them is a deliberate operation, not a side effect
+        // of winning a lead.
+        //
+        // The ids are read, locked, checked and moved as ONE set. Re-scanning
+        // by `leadId` for the write would move an estimate the guard never saw
+        // — a row can acquire this leadId between the two statements under READ
+        // COMMITTED, and the whole point of the lock is that the set is fixed.
+        const movingEstimates = await tx.estimate.findMany({
+            where: { leadId },
+            select: { id: true },
+        });
+        const movingEstimateIds = movingEstimates.map(estimate => estimate.id);
+        await assertEstimateMoveKeepsAttributionPairs(tx, movingEstimateIds, project.id);
+        if (movingEstimateIds.length) {
+            await tx.estimate.updateMany({
+                where: { id: { in: movingEstimateIds } },
+                data: { projectId: project.id },
+            });
+        }
         // RoomDesign has an owner-XOR CHECK constraint (projectId XOR leadId), so we must
         // clear leadId when setting projectId in the same transaction.
         await tx.roomDesign.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });

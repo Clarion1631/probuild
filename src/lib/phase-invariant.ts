@@ -23,6 +23,13 @@
 // write, and two callers cannot deadlock against each other because the order
 // never varies.
 //
+// Those scans lock what EXISTS when they run, which under READ COMMITTED is not
+// the same set the verdict is read from — a row inserted and committed after
+// them is visible to the next statement and held by nothing. So the query that
+// actually answers the question locks its own rows too (`FOR SHARE OF ei, e`),
+// which is the only way the row that PROVED membership is guaranteed to still
+// prove it at commit.
+//
 // It is deliberately NOT a Prisma query. The whole point is that it runs on the
 // CALLER'S transaction client, so it sees, and holds, the same snapshot the
 // write will use. A helper that quietly reached for the global client would
@@ -141,8 +148,54 @@ export async function assertPhaseOfProjectTx(
         return { ok: true };
     }
 
+    return (await provePhaseMembershipTx(tx, projectId, costCodeId))
+        ? { ok: true }
+        : { ok: false, reason: "not-a-phase" };
+}
+
+/**
+ * THE QUERY THAT ANSWERS, AND LOCKS WHAT IT ANSWERED FROM.
+ *
+ * Split out of `assertPhaseOfProjectTx` so the lock it takes can be tested for
+ * what it actually is — the ONE thing standing between a verdict and a phantom
+ * row. `tests/phase-invariant-db.test.ts` drives it against a real Postgres
+ * after letting a concurrent insert land, which is not expressible while it is
+ * welded to the four scans that run before it.
+ *
+ * `true` means: an un-archived, eligible-status estimate of this project
+ * carries this cost code on a line item, and both of those rows are share-locked
+ * for the rest of the caller's transaction.
+ */
+export async function provePhaseMembershipTx(
+    tx: PhaseTxClient,
+    projectId: string,
+    costCodeId: string,
+): Promise<boolean> {
     const statuses = eligibleEstimateStatuses();
     const statusParams = statuses.map((_, index) => `$${index + 3}`).join(", ");
+    // THE PROOF QUERY TAKES ITS OWN LOCK (Codex round 32).
+    //
+    // `lockPhaseRowsForShare` locks the rows that EXIST when it runs. Under
+    // READ COMMITTED that is not the whole story: a concurrent transaction can
+    // INSERT an EstimateItem — or an Estimate — and commit it between those
+    // scans and this query, and this query WILL see it (each statement takes a
+    // fresh snapshot). A verdict resting on a row nobody locked is exactly the
+    // stale answer this module exists to prevent: the row can be deleted, or
+    // its estimate archived or reassigned, before the caller's expense write
+    // commits.
+    //
+    // `FOR SHARE OF ei, e` locks the exact pair that ANSWERS the question, so
+    // whatever proved membership is still true at commit. Lock order is
+    // unchanged: every row this can reach that already existed is held by the
+    // Estimate/EstimateItem scans, and re-acquiring a share lock this
+    // transaction owns is free — a PHANTOM is the only row it can block on, and
+    // a phantom is by definition not part of anybody's acquisition order.
+    //
+    // `LIMIT 1` before the locking clause is deliberate: Postgres locks only
+    // the row it returns. If that row is concurrently updated out of the
+    // predicate, READ COMMITTED re-checks it and the query yields nothing — a
+    // "not-a-phase" verdict. That is fail-CLOSED, which is the safe direction
+    // for a money write.
     const onProject = (await tx.$queryRawUnsafe(
         `SELECT 1 AS ok
            FROM "EstimateItem" ei
@@ -151,11 +204,12 @@ export async function assertPhaseOfProjectTx(
             AND ei."costCodeId" = $2
             AND e."archivedAt" IS NULL
             AND e.status IN (${statusParams})
-          LIMIT 1`,
+          LIMIT 1
+            FOR SHARE OF ei, e`,
         projectId,
         costCodeId,
         ...statuses,
     )) as unknown[];
 
-    return onProject?.length ? { ok: true } : { ok: false, reason: "not-a-phase" };
+    return Boolean(onProject?.length);
 }

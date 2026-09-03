@@ -24,6 +24,7 @@ import {
     expectedIndexes,
     needsReanchorPredicate,
     pickCompanyTimeZone,
+    MISMATCHED_PAIRS_QUERY,
     postDeployStatements,
     PROJECT_ID_BACKFILL,
     reanchorSql,
@@ -91,16 +92,76 @@ test("the ReceiptIntake columns are behind a to_regclass guard in both files", (
 test("the backfill UPDATE only ever touches rows whose projectId is still NULL", () => {
     // This is the whole of its idempotency. A re-run must report 0 rows, and a
     // manual re-attribution must survive it.
-    // Selected by what it WRITES, not by "the first UPDATE" — the script now
+    // Selected by what it WRITES, not by "the first UPDATE" — the script
     // carries a second one (the updatedAt backfill), and a positional match
-    // would have silently started asserting about the wrong statement.
-    const update = (statements as string[]).find(
-        s => s.trimStart().startsWith("UPDATE") && s.includes('SET "projectId"'),
-    );
+    // would have silently started asserting about the wrong statement. It no
+    // longer STARTS with UPDATE either: the projectId fill is a data-modifying
+    // CTE so it can lock the estimates it reads from.
+    const update = (statements as string[]).find(s => s.includes('SET "projectId"'));
     assert.ok(update, "the script must carry the backfill UPDATE");
+    assert.equal(update, PROJECT_ID_BACKFILL, "the array holds the exported constant, not a copy");
     assert.match(update!, /e\."projectId" IS NULL/);
     assert.match(update!, /est\."projectId" IS NOT NULL/);
-    assert.ok(!/SET "projectId" = est\."projectId"[\s\S]*WHERE(?![\s\S]*projectId" IS NULL)/.test(update!));
+});
+
+test("the backfill LOCKS the estimates it reads its answer from", () => {
+    // Codex round 32. A bare `UPDATE ... FROM "Estimate"` join takes no row
+    // lock: under READ COMMITTED the statement reads est."projectId" at its own
+    // snapshot, and an estimate moved right after that read leaves the expense
+    // stamped with the job it has already left. One statement, so there is no
+    // window between locking and writing for a phantom to arrive in.
+    assert.match(PROJECT_ID_BACKFILL, /FOR SHARE/, "the estimate read is locked");
+    assert.match(PROJECT_ID_BACKFILL, /ORDER BY est\.id/, "ascending ids, like lockMoneyParentsMany");
+    assert.ok(
+        PROJECT_ID_BACKFILL.trimStart().toUpperCase().startsWith("WITH"),
+        "the lock and the write are ONE statement",
+    );
+    assert.ok(
+        PROJECT_ID_BACKFILL.indexOf("FOR SHARE") < PROJECT_ID_BACKFILL.indexOf("UPDATE"),
+        "the rows are locked before they are written from",
+    );
+    // ...and the row count is still printed. The runner keyed off "UPDATE" at
+    // the head of the statement, which this no longer is — losing that count
+    // would silently retire the script's only idempotency proof.
+    const source = readFileSync(
+        path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
+        "utf8",
+    );
+    const ROW_COUNT_MATCHER = /^(UPDATE|WITH)\b/i;
+    assert.ok(
+        source.includes("/^(UPDATE|WITH)\\b/i.test(sql.trimStart())"),
+        "the runner must still decide the row-count print from the statement head",
+    );
+    assert.ok(
+        ROW_COUNT_MATCHER.test(PROJECT_ID_BACKFILL.trimStart()),
+        "and that matcher must actually match the backfill statement",
+    );
+});
+
+test("the pair is verified in BOTH directions after the run", () => {
+    // The original verification asked only "is any expense still NULL against
+    // an estimate that knows a project?". A row whose projectId DISAGREES with
+    // its estimate's — one expense on two jobs — passes that check perfectly,
+    // and it is exactly what an unlocked backfill or an unguarded estimate move
+    // produces.
+    assert.match(MISMATCHED_PAIRS_QUERY, /COUNT\(\*\)::int AS n/);
+    assert.match(MISMATCHED_PAIRS_QUERY, /e\."projectId" IS NOT NULL/);
+    assert.match(MISMATCHED_PAIRS_QUERY, /est\."projectId" IS NOT NULL/);
+    assert.match(MISMATCHED_PAIRS_QUERY, /e\."projectId" <> est\."projectId"/);
+
+    const source = readFileSync(
+        path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
+        "utf8",
+    );
+    assert.ok(
+        source.includes("$queryRawUnsafe(MISMATCHED_PAIRS_QUERY)"),
+        "main() must actually run it, not merely export it",
+    );
+    // The COUNT is REPORTED whatever it is — a verification that only speaks up
+    // on failure cannot be read as evidence that it ran.
+    assert.match(source, /disagree with their estimate's project/);
+    assert.match(source, /mismatched\.n !== 0/);
+    assert.match(source, /VERIFY FAILED: \$\{mismatched\.n\}/);
 });
 
 test("the FK is SET NULL, named the way Prisma would name it, and guarded on its DEFINITION", () => {

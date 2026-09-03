@@ -153,9 +153,31 @@ ALTER TABLE "Expense" DROP CONSTRAINT IF EXISTS "Expense_taxAtSource_check";
 ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAtSource_check"
   CHECK ("taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0));
 
-UPDATE "Expense" e SET "projectId" = est."projectId"
-FROM "Estimate" est
-WHERE e."estimateId" = est.id AND e."projectId" IS NULL AND est."projectId" IS NOT NULL;
+-- THE BACKFILL READS THE ESTIMATE UNDER A LOCK (Codex round 32). A plain
+-- `UPDATE ... FROM "Estimate"` join takes no row lock, so under READ COMMITTED
+-- an estimate moved to another job right after the read leaves the expense
+-- stamped with the job it has already left -- the split-job row this migration
+-- exists to prevent, manufactured by the migration itself. The locked CTE is
+-- ONE statement, so the rows written from are exactly the rows locked.
+-- `ORDER BY est.id` keeps the same ascending-id acquisition order the app's
+-- lockMoneyParentsMany uses, so this cannot deadlock against a live
+-- transaction. Kept byte-identical in meaning to PROJECT_ID_BACKFILL in
+-- scripts/apply-expense-attribution.mjs (asserted by
+-- tests/apply-expense-attribution.test.ts).
+WITH locked AS (
+  SELECT est.id, est."projectId"
+    FROM "Estimate" est
+   WHERE est."projectId" IS NOT NULL
+     AND EXISTS (
+           SELECT 1 FROM "Expense" e
+            WHERE e."estimateId" = est.id AND e."projectId" IS NULL
+         )
+   ORDER BY est.id
+     FOR SHARE
+)
+UPDATE "Expense" e SET "projectId" = locked."projectId"
+  FROM locked
+ WHERE e."estimateId" = locked.id AND e."projectId" IS NULL;
 
 -- ReceiptIntake is Phase 1's table. The guard keeps this runnable in EITHER
 -- merge order: if Phase 1 has not landed in the target database yet, these two

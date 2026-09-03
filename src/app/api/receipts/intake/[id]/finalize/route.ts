@@ -79,9 +79,20 @@ async function applyLateFields(
             where: { id: rowId },
             // `installedAtCustomer` rides the same null-or-equal,
             // only-before-routed, unclaimed rule as the two ids.
+            //
+            // `costCodeSource` MUST be here. This route adds it to `lateFields`
+            // whenever a phase is supplied (it is derived from the caller, not
+            // read off the body), so it is a key the rules reconcile — and a
+            // reconciled key that is not SELECTed comes back `undefined`, which
+            // the null-or-equal test scores as "already carries a different
+            // value". Every finalize carrying a costCodeId 409'd with
+            // `late-fields-conflict` on a field the caller never sent, and the
+            // phase was never applied (e2e/receipt-intake.spec.ts rounds 9+10).
+            // `reconcileLateFields` now throws rather than silently refusing if
+            // this drifts again.
             select: {
-                costCodeId: true, projectId: true, installedAtCustomer: true,
-                state: true, claimToken: true,
+                costCodeId: true, costCodeSource: true, projectId: true,
+                installedAtCustomer: true, state: true, claimToken: true,
             },
         }),
         applyIfNull: async (rowId, state, toApply) => {
@@ -219,6 +230,14 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             id: true, source: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
             mimeType: true, projectId: true, costCodeId: true, dryRun: true, createdById: true,
             fileSha256: true, expectedSha256: true, uploadLeaseVersion: true,
+            // Part of the merge and the publish CAS for the same reason
+            // `installedAtCustomer` is: a captured field this read omits is a
+            // field `mergeCapturedFields` sees as null and overwrites. /start
+            // stamps this from ITS caller, so leaving it out let a machine
+            // finalize relabel a person's phase as machine-set — and booking
+            // treats a user-set phase as untouchable and a machine-set one as
+            // correctable.
+            costCodeSource: true,
             // A CAPTURED TAX ANSWER, and therefore part of the merge and the
             // publish CAS. Leaving it out of this read made the publish the one
             // path that could overwrite it: `mergeCapturedFields` saw no stored
@@ -405,6 +424,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         {
             projectId: row.projectId,
             costCodeId: row.costCodeId,
+            costCodeSource: row.costCodeSource,
             installedAtCustomer: row.installedAtCustomer,
         },
         lateFields,
