@@ -62,21 +62,42 @@ const MILESTONE_STATE = {
     name: "Rough-in",
     dueDate: new Date("2026-09-15T00:00:00.000Z"),
     qbPaymentId: null as string | null,
+    // Round 35 gate: the TAX ALLOCATION is part of the payload, not just the
+    // grand total, so it is part of the issuance fingerprint too.
+    pretaxAmount: 1000,
+    taxAmount: 89,
 };
+/** The QuickBooks customer both rails' fixtures bill (Client.qbCustomerId). */
+const CUSTOMER_ID = "42";
+const MILESTONE_TAX = { preTaxAmount: 1000, taxAmount: 89 };
 const MILESTONE_IDENTITY = {
     docNumber: MILESTONE_DOC,
     privateNote: MILESTONE_NOTE,
-    issuanceHash: milestoneIssuanceHash(MILESTONE_STATE),
+    issuanceHash: milestoneIssuanceHash({ ...MILESTONE_STATE, tax: MILESTONE_TAX, customerId: CUSTOMER_ID }),
     // The invoice() fixture below defaults total=1089 to match — a mismatch
     // test overrides one side or the other, never both.
     expectedTotal: MILESTONE_STATE.amount,
+    // Round 35 gate: WHICH BOOKS and WHICH CUSTOMER the create POST went to.
+    // A marker without them is refused outright ("realm-unknown"), so every
+    // fixture that expects to reach the lookup has to carry them.
+    realmId: TOKENS.realmId,
+    customerId: CUSTOMER_ID,
 };
 
 const BILLING_STATE = {
     status: "Draft",
     subtotal: 1000,
     total: 1089,
+    taxAmount: 89,
     description: "Rough-in complete",
+};
+const BILLING_IDENTITY = {
+    docNumber: "INV-00171-P1",
+    privateNote: progressBillingPrivateNote("INV-00171", "INV-00171-P1"),
+    issuanceHash: progressBillingIssuanceHash({ ...BILLING_STATE, customerId: CUSTOMER_ID }),
+    expectedTotal: BILLING_STATE.total,
+    realmId: TOKENS.realmId,
+    customerId: CUSTOMER_ID,
 };
 
 function milestoneRow(overrides: Record<string, any> = {}): any {
@@ -90,6 +111,8 @@ function milestoneRow(overrides: Record<string, any> = {}): any {
         invoice: {
             code: "INV-00171",
             projectId: "proj-1",
+            taxRate: 8.9,
+            client: { qbCustomerId: CUSTOMER_ID },
             project: { name: "Mesplay Kitchen" },
             payments: [{ id: "ps-0" }, { id: "ps-1" }],
         },
@@ -103,14 +126,9 @@ function billingRow(overrides: Record<string, any> = {}): any {
         code: "INV-00171-P1",
         ...BILLING_STATE,
         qbInvoiceId: null,
-        qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, {
-            docNumber: "INV-00171-P1",
-            privateNote: progressBillingPrivateNote("INV-00171", "INV-00171-P1"),
-            issuanceHash: progressBillingIssuanceHash(BILLING_STATE),
-            expectedTotal: BILLING_STATE.total,
-        }, AMBIGUOUS_MARKER_AT),
+        qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, BILLING_IDENTITY, AMBIGUOUS_MARKER_AT),
         invoiceId: "inv-1",
-        invoice: { code: "INV-00171", projectId: "proj-1" },
+        invoice: { code: "INV-00171", projectId: "proj-1", client: { qbCustomerId: CUSTOMER_ID } },
         ...overrides,
     };
 }
@@ -643,4 +661,175 @@ test("a marker with no identity refuses, and confirmed-none cannot clear it", as
         assert.equal(row.qbSyncError, bare, "still parked, whatever the operator confirmed");
         assert.equal(row.qbInvoiceId, null);
     }
+});
+
+
+// --- Round 35 gate: a recovery must know WHICH BOOKS it is looking in --------
+
+test("round 35 gate: a marker from another QuickBooks realm is refused, never queried", async () => {
+    // The failure: ProBuild reconnects to a second company (or a sandbox, or
+    // another client file). The resolver queries with the credentials it has
+    // NOW, the DocNumber is not in those books, the answer comes back empty,
+    // the operator is offered "confirm none exists" — and clearing releases a
+    // row whose real, collectible invoice is sitting in the ORIGINAL company.
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    let asked = 0;
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        {
+            db, logEvent,
+            getTokens: async () => ({ ...TOKENS, realmId: "realm-OTHER" }),
+            findInvoices: async () => { asked++; return []; },
+        },
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "realm-mismatch");
+    assert.equal(asked, 0, "the wrong books are never even queried");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked — a confirmed-none must NOT clear it");
+});
+
+test("round 35 gate: a row re-pointed at a different QuickBooks customer is refused before any call", async () => {
+    // A merge in QuickBooks, or a re-ensureQBCustomer after a rename, moves
+    // Client.qbCustomerId. Document identity alone would still match, and the
+    // resolver would attach an invoice billed to somebody else.
+    const row = milestoneRow();
+    row.invoice = { ...row.invoice, client: { qbCustomerId: "99" } };
+    const db = makeDb(row, null);
+    let asked = 0;
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        {
+            db, logEvent,
+            getTokens: async () => TOKENS,
+            findInvoices: async () => { asked++; return [invoice("qb-9", MILESTONE_NOTE)]; },
+        },
+    );
+
+    assert.equal(!res.ok && res.refusal, "customer-mismatch");
+    assert.equal(asked, 0, "refused before spending a QuickBooks call");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
+});
+
+test("round 35 gate: a client with NO QuickBooks customer id at all is a mismatch, not a pass", async () => {
+    // `null !== "42"` has to fail closed: an unverifiable customer is exactly
+    // the state that must never be linked or cleared.
+    const row = milestoneRow();
+    row.invoice = { ...row.invoice, client: { qbCustomerId: null } };
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        deps([], db),
+    );
+    assert.equal(!res.ok && res.refusal, "customer-mismatch");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked");
+});
+
+test("round 35 gate: a marker predating the realm field is refused outright and cannot be cleared", async () => {
+    // Backward compatibility is NOT "any realm will do". A marker with no realm
+    // means the books are unknown, and an unknown realm is the same class of
+    // answer as an unknown identity: refuse, never auto-clear.
+    const { realmId: _realm, customerId: _customer, ...legacyIdentity } = MILESTONE_IDENTITY;
+    const row = milestoneRow({
+        qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, legacyIdentity, AMBIGUOUS_MARKER_AT),
+    });
+    const db = makeDb(row, null);
+    let asked = 0;
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        {
+            db, logEvent,
+            getTokens: async () => TOKENS,
+            findInvoices: async () => { asked++; return []; },
+        },
+    );
+
+    assert.equal(!res.ok && res.refusal, "realm-unknown");
+    assert.equal(asked, 0, "no QuickBooks call — we do not know which company to ask");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked");
+});
+
+test("round 35 gate: the marker's realm and customer ride through compose/parse", async () => {
+    const parsed = parseCreateMarker(composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY, AMBIGUOUS_MARKER_AT));
+    assert.deepEqual(parsed?.identity, MILESTONE_IDENTITY);
+    // And they are part of the marker STRING, which the link CAS pins — so
+    // extending the identity extends the CAS with no extra where clause.
+    const marker = composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY, AMBIGUOUS_MARKER_AT);
+    assert.ok(marker.includes(`~${TOKENS.realmId}|`), marker);
+    assert.ok(marker.includes("%42|"), marker);
+});
+
+// --- Round 35 gate: the issuance hash covers the whole billing payload ------
+
+test("round 35 gate: a tax-allocation change makes the issuance hash differ, so the invoice is not adopted", async () => {
+    // The amount is UNCHANGED — only the split between pre-tax and tax moved.
+    // The old hash covered the grand total alone, so a QuickBooks invoice
+    // carrying the OLD liability split was linked as though it still described
+    // the row, quietly misreporting sales tax.
+    const row = milestoneRow({ pretaxAmount: 900, taxAmount: 189 });
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE)], db),
+    );
+
+    assert.equal(!res.ok && res.refusal, "issuance-changed");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
+});
+
+test("round 35 gate: the tax split the hash uses is the one the PUSH sends, derived the same way", async () => {
+    const { milestoneTaxSplit } = await import("../src/lib/qbo-issuance");
+    // Both columns present: used verbatim.
+    assert.deepEqual(
+        milestoneTaxSplit({ pretaxAmount: 1000, taxAmount: 89, amount: 1089, invoiceTaxRate: 0 }),
+        { preTaxAmount: 1000, taxAmount: 89 },
+    );
+    // Neither: derived from the invoice rate off the tax-INCLUSIVE amount.
+    assert.deepEqual(
+        milestoneTaxSplit({ pretaxAmount: null, taxAmount: null, amount: 1089, invoiceTaxRate: 8.9 }),
+        { preTaxAmount: 1000, taxAmount: 89 },
+    );
+    // No rate: no tax line at all. An ABSENT tax line is a different answer
+    // from a $0 one, and the hash must not read them alike.
+    assert.equal(milestoneTaxSplit({ pretaxAmount: null, taxAmount: null, amount: 1089, invoiceTaxRate: 0 }), null);
+});
+
+// --- Round 35 gate: PrivateNote comparison must be symmetric ---------------
+
+test("round 35 gate: a PrivateNote with stray whitespace still matches its own invoice", async () => {
+    // The old code trimmed the value QuickBooks returned and compared it to the
+    // UNTRIMMED marker value. A project or milestone name carrying trailing
+    // whitespace therefore compared unequal to itself: the real invoice was
+    // invisible, the resolver reported "none found", the operator confirmed
+    // none, the marker was cleared, and the next send billed the client twice.
+    for (const variant of [
+        ` ${MILESTONE_NOTE}`,
+        `${MILESTONE_NOTE} `,
+        `\n${MILESTONE_NOTE}\t`,
+        MILESTONE_NOTE.replace(" · ", "  ·   "),
+    ]) {
+        const row = milestoneRow();
+        const db = makeDb(row, null);
+        const res = await resolveAmbiguousInvoiceCreateCore(
+            { ...base, expectedState: ambiguousCreateFingerprint(row) },
+            deps([invoice("qb-9", variant)], db),
+        );
+        assert.equal(res.ok, true, `variant did not match: ${JSON.stringify(variant)}`);
+        assert.equal(row.qbInvoiceId, "qb-9");
+    }
+});
+
+test("round 35 gate: canonicalPrivateNote truncates LAST, so the >4000-char case still matches", async () => {
+    const { canonicalPrivateNote, QB_PRIVATE_NOTE_MAX_LEN } = await import("../src/lib/quickbooks");
+    // Canonicalizing first is what keeps the two sides agreeing past the cap:
+    // both were cut at the same index of the same normalized text.
+    const long = `  ProBuild  ${"x".repeat(QB_PRIVATE_NOTE_MAX_LEN)}  `;
+    const ours = canonicalPrivateNote(long);
+    assert.equal(ours.length, QB_PRIVATE_NOTE_MAX_LEN);
+    // What QuickBooks hands back is the stored (already canonical) string,
+    // possibly re-whitespaced at the edges — it must still canonicalize equal.
+    assert.equal(canonicalPrivateNote(` ${ours}\n`), ours);
+    assert.equal(canonicalPrivateNote(null), "");
 });

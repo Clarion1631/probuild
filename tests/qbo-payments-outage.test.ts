@@ -2462,3 +2462,119 @@ test("the push returns the concurrent winner's id instead of compensating", asyn
     assert.ok(compensate > -1, "compensation is still there for the genuinely abandoned case");
     assert.ok(finalized < compensate, "the success return must come BEFORE any compensating delete");
 });
+
+
+// --- Round 35 gate: `checked` is the whole run, not just the milestone rail ---
+
+/**
+ * Enough of Prisma to drive the REAL `syncQuickBooksPayments` over both
+ * collections. src/lib/prisma.ts reads globalThis.prisma before building a
+ * client, which is the seam this uses — no database, real loop.
+ */
+function makeMixedRailPrisma(milestones: any[], billings: any[], settings: string) {
+    const events: any[] = [];
+    const table = (rows: any[]) => ({
+        async count(args: any) {
+            const gt = args?.where?.id?.gt;
+            return gt ? rows.filter((r) => r.id > gt).length : rows.length;
+        },
+        async findMany(args: any) {
+            const gt = args?.where?.id?.gt;
+            const list = gt ? rows.filter((r) => r.id > gt) : rows;
+            return list.slice(0, args?.take ?? list.length).map((r) => ({ ...r }));
+        },
+        async updateMany() {
+            return { count: 0 };
+        },
+    });
+    return {
+        events,
+        client: {
+            // The QBO connection state getFreshQBTokens reads. The E2E mock
+            // replaces the NETWORK, not the connection row — with no connected
+            // integration the preflight still (correctly) refuses.
+            integration: {
+                async findUnique() { return { settings }; },
+                async upsert() { return {}; },
+            },
+            paymentSchedule: table(milestones),
+            progressBilling: table(billings),
+            automationEvent: { async create(args: any) { events.push(args.data); return {}; } },
+        },
+    };
+}
+
+test("round 35 gate: checked counts progress-billing probes as well as milestone probes", async () => {
+    // The progress-billing handler never incremented `checked`, so a run that
+    // verified nothing but billings reported "checked: 0" — and any coverage
+    // number computed off it under-reported that rail entirely.
+    const milestones = [
+        { id: "ps-1", invoiceId: "inv-1", qbInvoiceId: "qb-1", qbSyncError: null, name: "Rough-in", amount: 100, invoice: { code: "INV-1", project: null, client: null } },
+        { id: "ps-2", invoiceId: "inv-1", qbInvoiceId: "qb-2", qbSyncError: null, name: "Final", amount: 100, invoice: { code: "INV-1", project: null, client: null } },
+    ];
+    const billings = [
+        { id: "pb-1", invoiceId: "inv-1", qbInvoiceId: "qb-3", code: "INV-1-P1", lines: [], invoice: { code: "INV-1", estimateId: null } },
+        { id: "pb-2", invoiceId: "inv-1", qbInvoiceId: "qb-4", code: "INV-1-P2", lines: [], invoice: { code: "INV-1", estimateId: null } },
+        { id: "pb-3", invoiceId: "inv-1", qbInvoiceId: "qb-5", code: "INV-1-P3", lines: [], invoice: { code: "INV-1", estimateId: null } },
+    ];
+    const previousNextauth = process.env.NEXTAUTH_SECRET;
+    process.env.NEXTAUTH_SECRET = "test-nextauth-secret";
+    const { encryptObject } = await import("../src/lib/crypto");
+    const { client, events } = makeMixedRailPrisma(milestones, billings, encryptObject({
+        quickbooks: { connected: true, accessToken: "a", refreshToken: "r", realmId: "realm-1", serviceItemId: "7" },
+    }));
+
+    const previousPrisma = (globalThis as any).prisma;
+    // The existing QBO mock gate: canned tokens with NO network I/O, so the
+    // preflight token refresh is not part of what this test exercises. All
+    // three env vars are the gate (see isE2eQboMockEnabled).
+    const previousEnv = {
+        mock: process.env.E2E_QBO_MOCK,
+        playwright: process.env.PLAYWRIGHT_TEST_SECRET,
+        vercel: process.env.VERCEL,
+    };
+    (globalThis as any).prisma = client;
+    process.env.E2E_QBO_MOCK = "1";
+    process.env.PLAYWRIGHT_TEST_SECRET = "pw";
+    delete process.env.VERCEL;
+    try {
+        const { syncQuickBooksPayments } = await import("../src/lib/quickbooks-payments");
+        const probed: string[] = [];
+        const cursors = new Map<string, string>();
+        const result = await syncQuickBooksPayments(undefined, {
+            source: "cron",
+            qboClient: {
+                async probeInvoice(id) {
+                    probed.push(id);
+                    // Part-paid: exercised, counted, but no settle side effects.
+                    return { state: "ok", balance: 5, total: 10, paymentTxnIds: [] };
+                },
+                async getPayment() { return null; },
+                async verifyConnection() {},
+            },
+            cursorStore: {
+                async get(key) { return cursors.get(key) ?? null; },
+                async set(key, value) { cursors.set(key, value); },
+            },
+        });
+
+        assert.equal(probed.length, 5, "every row on both rails was probed");
+        assert.equal(result.checked, 5, "and every probe is counted — 2 milestones + 3 progress billings");
+        assert.equal(result.partiallyPaid, 5);
+        assert.equal(result.skipped, 0);
+        // The audit event carries the same number the caller sees — the health
+        // digest reads THAT, so a rail missing from `checked` is invisible there too.
+        assert.equal(JSON.parse(String(events.at(-1)?.detail)).checked, 5);
+    } finally {
+        (globalThis as any).prisma = previousPrisma;
+        for (const [key, value] of Object.entries({
+            NEXTAUTH_SECRET: previousNextauth,
+            E2E_QBO_MOCK: previousEnv.mock,
+            PLAYWRIGHT_TEST_SECRET: previousEnv.playwright,
+            VERCEL: previousEnv.vercel,
+        })) {
+            if (value === undefined) delete (process.env as Record<string, string | undefined>)[key];
+            else (process.env as Record<string, string>)[key] = value;
+        }
+    }
+});

@@ -30,6 +30,7 @@ import {
     isQboConnectionFailure,
     isQBResultSetTruncatedError,
     findQBInvoicesByDocNumber,
+    canonicalPrivateNote,
     type QBInvoiceMatch,
     type QBTokens,
     type RouteDeadline,
@@ -43,7 +44,7 @@ import {
     getFreshQBTokens,
 } from "./quickbooks-payments";
 import type { CreateIdentity } from "./qbo-create-markers";
-import { milestoneIssuanceHash, progressBillingIssuanceHash } from "./qbo-issuance";
+import { milestoneIssuanceHash, progressBillingIssuanceHash, milestoneTaxSplit } from "./qbo-issuance";
 
 /** Whole-operation budget: a token refresh plus one query, and room to answer. */
 export const RESOLVE_AMBIGUOUS_BUDGET_MS = 25_000;
@@ -75,6 +76,9 @@ export type AmbiguousCreateRefusal =
     | "result-set-truncated"
     | "issuance-changed"
     | "issuance-unverifiable"
+    | "realm-unknown"
+    | "realm-mismatch"
+    | "customer-mismatch"
     | "mismatch";
 
 export type ResolveAmbiguousCreateResult =
@@ -167,6 +171,15 @@ interface ParkedRow {
     fingerprint: string;
     projectId: string | null;
     invoiceId: string | null;
+    /**
+     * The QuickBooks customer this row bills TODAY — the persisted
+     * `Client.qbCustomerId` the create path wrote when it ran
+     * `resolveCustomerAndItem`. Compared against the marker's own
+     * `customerId` before any QuickBooks call. `null` means the mapping is
+     * gone, which is a mismatch, not a pass: an unverifiable customer is
+     * exactly the state that must not be linked or cleared.
+     */
+    customerId: string | null;
 }
 
 export async function resolveAmbiguousInvoiceCreateCore(
@@ -264,17 +277,79 @@ export async function resolveAmbiguousInvoiceCreateCore(
         }
     }
 
+    // WHICH BOOKS, and WHICH CUSTOMER.
+    //
+    // Everything checked so far identifies a DOCUMENT. None of it identifies
+    // the QuickBooks COMPANY the document lives in, and the lookup below runs
+    // against whatever connection is active NOW — which can legitimately be a
+    // different realm than the create used (a reconnect to a second company, a
+    // sandbox↔production swap, an agency moving between client files). Against
+    // the wrong realm the DocNumber query finds nothing, the operator is asked
+    // "confirm none exists?", and a `confirmed-none` clear releases a row whose
+    // real, collectible invoice is sitting untouched in the original company —
+    // the exact double-bill this whole marker exists to prevent.
+    //
+    // A marker that carries neither field predates them. That is NOT "any
+    // realm will do": the realm is unknown, and an unknown realm is refused
+    // outright — never auto-cleared — the same way an unknown identity is.
+    if (!parked.identity.realmId || !parked.identity.customerId) {
+        return {
+            ok: false,
+            refusal: "realm-unknown",
+            message:
+                `${parked.code} was parked by an older release that did not record WHICH QuickBooks company the invoice was sent to, ` +
+                `so ProBuild cannot tell whether the connection it can read now is even the right set of books. ` +
+                `Find the invoice in QuickBooks by hand — nothing was changed here.`,
+        };
+    }
+    // The customer check is a pure database read, so it runs before the token
+    // fetch: a row whose client has been re-pointed at another QuickBooks
+    // customer (a merge in QuickBooks, a re-`ensureQBCustomer` after a rename)
+    // must not spend a QuickBooks call, let alone link an invoice billed to
+    // somebody else.
+    if (parked.customerId !== parked.identity.customerId) {
+        return {
+            ok: false,
+            refusal: "customer-mismatch",
+            message:
+                `${parked.code} was sent to QuickBooks customer ${parked.identity.customerId}, but it now bills ` +
+                `${parked.customerId ?? "no linked QuickBooks customer"}. Linking would attach an invoice billed to a different customer. ` +
+                `Check invoice ${parked.identity.docNumber} in QuickBooks — nothing was changed here.`,
+        };
+    }
+
     // Bounded: an unreachable QuickBooks must refuse quickly, not hang the
     // action to the platform ceiling — the original defect this PR exists for.
     const deadline = deps?.deadline ?? createRouteDeadline(RESOLVE_AMBIGUOUS_BUDGET_MS);
     let matches: QBInvoiceMatch[];
     try {
         const tokens = await getTokens(deadline);
+        // Before the query, not after: a wrong-realm lookup is not a harmless
+        // no-op, it is an answer that reads as "no invoice exists".
+        if (tokens.realmId !== parked.identity.realmId) {
+            return {
+                ok: false,
+                refusal: "realm-mismatch",
+                message:
+                    `${parked.code} was sent to QuickBooks company ${parked.identity.realmId}, but ProBuild is connected to ` +
+                    `company ${tokens.realmId} right now. Anything read from these books says nothing about that invoice. ` +
+                    `Reconnect the original company, or resolve invoice ${parked.identity.docNumber} there by hand — nothing was changed here.`,
+            };
+        }
         const found = await findInvoices(tokens, parked.identity.docNumber, deadline);
         // DocNumber is not unique in QuickBooks (duplicates can be enabled, and
         // the number is only 21 characters), so the PrivateNote is what says an
         // invoice is OURS. Both come from the marker written before the POST.
-        matches = found.filter((inv) => (inv.privateNote || "").trim() === parked.identity!.privateNote);
+        //
+        // Canonicalized on BOTH sides. The QuickBooks value used to be trimmed
+        // and compared against the raw marker value, so a project or milestone
+        // name carrying trailing whitespace made our own invoice invisible to
+        // this filter — zero matches, the operator confirms none, the marker is
+        // cleared, and the next send bills the client a second time. See
+        // canonicalPrivateNote.
+        matches = found.filter(
+            (inv) => canonicalPrivateNote(inv.privateNote) === canonicalPrivateNote(parked.identity!.privateNote),
+        );
     } catch (error) {
         // The query hit its page cap — there may be MORE invoices under this
         // DocNumber than we saw, including one on a page we never fetched.
@@ -447,10 +522,22 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
             select: {
                 id: true, name: true, qbInvoiceId: true, qbSyncError: true, invoiceId: true,
                 status: true, amount: true, dueDate: true, qbPaymentId: true,
-                invoice: { select: { code: true, projectId: true } },
+                // The tax allocation the create actually sent is not a stored
+                // column — it prefers these two and otherwise derives from the
+                // invoice's rate, so all three have to be read to recompute the
+                // same split (milestoneTaxSplit).
+                pretaxAmount: true, taxAmount: true,
+                invoice: {
+                    select: {
+                        code: true, projectId: true, taxRate: true,
+                        // Who this row bills in QuickBooks TODAY.
+                        client: { select: { qbCustomerId: true } },
+                    },
+                },
             },
         });
         if (!row) return null;
+        const customerId = row.invoice?.client?.qbCustomerId ?? null;
         return {
             id: row.id,
             code: row.name || row.invoice?.code || row.id,
@@ -460,27 +547,51 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
                 amount: row.amount,
                 dueDate: row.dueDate ?? null,
                 qbPaymentId: row.qbPaymentId ?? null,
+                tax: milestoneTaxSplit({
+                    pretaxAmount: row.pretaxAmount,
+                    taxAmount: row.taxAmount,
+                    amount: row.amount,
+                    invoiceTaxRate: row.invoice?.taxRate,
+                }),
+                customerId,
             }),
             issuanceWhere: {
                 status: row.status,
                 amount: row.amount,
                 dueDate: row.dueDate,
                 qbPaymentId: row.qbPaymentId,
+                // The tax columns are pinned too, for the same reason the
+                // amount is: the hash comparison is a read taken before the
+                // link write, so a tax edit landing in between would otherwise
+                // still be linked. `invoice.taxRate` and the client's customer
+                // id live on OTHER tables and cannot go in this `updateMany`
+                // where — they are covered instead by the marker string itself,
+                // which the CAS pins and which now carries both the issuance
+                // hash and the realm/customer identity.
+                pretaxAmount: row.pretaxAmount,
+                taxAmount: row.taxAmount,
             },
             fingerprint: ambiguousCreateFingerprint(row),
             projectId: row.invoice?.projectId ?? null,
             invoiceId: row.invoiceId ?? null,
+            customerId,
         };
     }
     const row = await db.progressBilling.findUnique({
         where: { id },
         select: {
             id: true, code: true, qbInvoiceId: true, qbSyncError: true, invoiceId: true,
-            status: true, subtotal: true, total: true,
-            invoice: { select: { code: true, projectId: true } },
+            status: true, subtotal: true, total: true, taxAmount: true,
+            invoice: {
+                select: {
+                    code: true, projectId: true,
+                    client: { select: { qbCustomerId: true } },
+                },
+            },
         },
     });
     if (!row) return null;
+    const customerId = row.invoice?.client?.qbCustomerId ?? null;
     return {
         id: row.id,
         code: row.code,
@@ -489,15 +600,19 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
             status: row.status ?? null,
             subtotal: row.subtotal,
             total: row.total,
+            taxAmount: row.taxAmount,
+            customerId,
         }),
         issuanceWhere: {
             status: row.status,
             subtotal: row.subtotal,
             total: row.total,
+            taxAmount: row.taxAmount,
         },
         fingerprint: ambiguousCreateFingerprint(row),
         projectId: row.invoice?.projectId ?? null,
         invoiceId: row.invoiceId ?? null,
+        customerId,
     };
 }
 

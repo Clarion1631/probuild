@@ -266,10 +266,20 @@ test("an unknown outcome parks the row ambiguous and records why", async () => {
             status: "Draft",
             subtotal: 1000,
             total: 1089,
+            // Round 35 gate: the payload's tax line is { subtotal, taxAmount },
+            // so a tax-only edit re-issues a different invoice while leaving
+            // subtotal and total alone — and the customer decides who is billed.
+            taxAmount: 89,
+            customerId: "42",
         }),
         // Round 33 gate: the resolver's total-match check reads this off the
         // marker, so it has to ride along with the rest of the identity.
         expectedTotal: 1089,
+        // Round 35 gate: WHICH BOOKS and WHICH CUSTOMER. Without these the
+        // resolver queries whatever realm is connected now, finds nothing, and
+        // offers to clear a row whose invoice is collectible elsewhere.
+        realmId: "realm-1",
+        customerId: "42",
     });
     assert.equal(row.qbInvoiceId, null, "we never learned an id to record");
     assert.equal(events.at(-1)?.reason, "ambiguous-create");

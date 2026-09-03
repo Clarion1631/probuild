@@ -273,7 +273,7 @@ export interface QboReceiptPushDependencies {
     refreshTokensFn: () => Promise<QBTokens>;
     /**
      * Mutual exclusion for one Drive file across concurrent deliveries — see
-     * `defaultWithReceiptFileLock`. Injectable so the interleaving can be
+     * `withReceiptFileLease`. Injectable so the interleaving can be
      * driven deterministically in a test with no database.
      */
     withFileLock: ReceiptFileLock;
@@ -833,13 +833,125 @@ async function verifyReceiptAccounts(
 }
 
 /**
- * How long one file's push may hold its lock, including the wait for it.
+ * How long one file's push may hold its lease, excluding the wait for it.
  *
  * The push is already bounded by its route deadline; this is the ceiling for
  * the case where no deadline was passed at all, and it stays under the route's
  * own 60s `maxDuration`.
  */
 export const RECEIPT_FILE_LOCK_MAX_MS = 55_000;
+
+/**
+ * Added to the work budget to get the lease TTL.
+ *
+ * The lease must outlive the work it protects, or a slow-but-alive holder's
+ * claim expires under it and a second push starts creating in parallel. It must
+ * not outlive it by much either, since this is exactly how long a crashed
+ * holder blocks the file.
+ */
+export const RECEIPT_FILE_LEASE_GRACE_MS = 15_000;
+
+/**
+ * How long a loser waits for the holder before giving up.
+ *
+ * Waiting is what preserves the old behaviour: the loser does NOT skip, it runs
+ * once the winner commits, its DocNumber lookup finds the committed Purchase,
+ * and it takes the `alreadyExists` re-check path. Bounded so an outage-stuck
+ * holder answers 409-and-retry instead of burning the route ceiling here.
+ */
+export const RECEIPT_FILE_LEASE_MAX_WAIT_MS = 15_000;
+
+/** How often a waiter re-checks. One tiny indexed read per poll. */
+const RECEIPT_FILE_LEASE_POLL_MS = 250;
+
+/** `AutomationSetting` key namespace, keyed by the FULL Drive file id. */
+const RECEIPT_FILE_LEASE_PREFIX = "qbo-receipt-push.lease:";
+
+/**
+ * A push is already running for this file and did not finish inside our wait.
+ *
+ * Retryable, not terminal: the winner is mid-create, so the correct thing for
+ * the caller to do is come back and take the `alreadyExists` path. Name-based
+ * identity for the same cross-module reason as the rest of the QBO error
+ * vocabulary.
+ */
+export class QBReceiptPushInProgressError extends Error {
+    name = "QBReceiptPushInProgressError";
+    constructor(fileId: string) {
+        super(`Another push is already running for receipt file ${fileId}`);
+    }
+}
+
+/** Name-based, same reason as isQBTimeoutError. */
+export function isReceiptPushInProgressError(error: unknown): error is QBReceiptPushInProgressError {
+    return error instanceof Error && error.name === "QBReceiptPushInProgressError";
+}
+
+/** The row operations the lease needs from AutomationSetting. Injectable for tests. */
+export interface ReceiptLeaseStore {
+    create(key: string, value: string): Promise<void>;
+    read(key: string): Promise<string | null>;
+    /** CAS: replace `key` only while it still holds `expected`. */
+    swap(key: string, expected: string, value: string): Promise<boolean>;
+    /** CAS: delete `key` only while it still holds `expected`. */
+    release(key: string, expected: string): Promise<void>;
+}
+
+/**
+ * Prisma-backed lease store. Every method is ONE statement in its own implicit
+ * transaction — nothing here holds a connection while the caller does QBO I/O.
+ */
+export const automationSettingLeaseStore: ReceiptLeaseStore = {
+    async create(key, value) {
+        await prisma.automationSetting.create({ data: { key, value } });
+    },
+    async read(key) {
+        const row = await prisma.automationSetting.findUnique({ where: { key }, select: { value: true } });
+        return row?.value ?? null;
+    },
+    async swap(key, expected, value) {
+        const claimed = await prisma.automationSetting.updateMany({ where: { key, value: expected }, data: { value } });
+        return claimed.count === 1;
+    },
+    async release(key, expected) {
+        await prisma.automationSetting.deleteMany({ where: { key, value: expected } });
+    },
+};
+
+/** A unique-constraint collision, however the client surfaces it. */
+function isLeaseKeyCollision(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const code = (error as { code?: unknown }).code;
+    return code === "P2002" || code === "23505";
+}
+
+/** `{"t":"<token>","x":<expiry epoch ms>}` — the whole lease value. */
+function leaseValue(token: string, expiresAt: number): string {
+    return JSON.stringify({ t: token, x: expiresAt });
+}
+
+/**
+ * When the stored lease expires. An UNPARSEABLE value reads as expired: it can
+ * only have come from us, it carries no live claim anybody is honouring, and
+ * treating it as held would block the file forever with no way back.
+ */
+function leaseExpiry(raw: string | null): number {
+    if (!raw) return 0;
+    try {
+        const parsed = JSON.parse(raw) as { x?: unknown };
+        return typeof parsed.x === "number" && Number.isFinite(parsed.x) ? parsed.x : 0;
+    } catch {
+        return 0;
+    }
+}
+
+export interface ReceiptFileLeaseDeps {
+    store?: ReceiptLeaseStore;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+    /** Overridable so a test can pin the value a lease is CAS-matched on. */
+    token?: () => string;
+}
 
 /**
  * Serialize every push of the SAME Drive file, so two concurrent deliveries
@@ -853,52 +965,95 @@ export const RECEIPT_FILE_LOCK_MAX_MS = 55_000;
  * carrying the same receipt twice. DocNumber/`requestid` idempotency is
  * QBO-side and per-call; it says nothing about what the two callers do NEXT.
  *
- * Implemented as `pg_advisory_xact_lock` inside one interactive transaction
- * wrapping the whole lookup→create→attach. Deliberately NOT a session-level
- * `pg_advisory_lock`: `DATABASE_URL` points at pgbouncer in transaction-pooling
- * mode, which hands out a different backend connection per statement, so a
- * session lock would be taken and released on unrelated connections (the same
- * reasoning recorded in review-alert-rollout.ts). A transaction-scoped lock is
- * held for exactly as long as its transaction and auto-releases on commit,
- * rollback, or a dead connection — no lease, no stale-claim reclaim, and
- * nothing durable left behind if the function is killed mid-push. That is also
- * why this is a lock rather than a claim marker: there is no receipt row to
- * CAS against, and a durable claim would need a schema change plus a
- * stale-lease reclaim, with a stuck claim able to block the receipt forever.
+ * This used to be `pg_advisory_xact_lock` inside ONE interactive transaction
+ * wrapping the whole lookup→create→attach. That was correct, and it was also a
+ * pooled connection held for up to 55 seconds across several QuickBooks HTTP
+ * round trips — while the callback's own Prisma reads need connections from
+ * that same pool. During an Intuit outage, when every push runs to its full
+ * deadline, concurrent receipts starve the pool and take unrelated requests
+ * down with them. A session-level `pg_advisory_lock` is not an option either:
+ * `DATABASE_URL` points at pgbouncer in transaction-pooling mode, which hands
+ * out a different backend connection per statement (the same reasoning recorded
+ * in review-alert-rollout.ts).
  *
- * The cost is one pooled connection held for the length of the push.
- * Contention is per-file, so ordinary traffic — different receipts — never
- * waits.
+ * So: a DURABLE LEASE in `AutomationSetting`, keyed by the full Drive file id,
+ * claimed and released by CAS in its own tiny transaction. Nothing is held
+ * across network I/O — between acquire and release this process holds no
+ * connection at all. The trade the advisory lock did not have to make is a
+ * stale claim: a killed holder leaves its row behind, so the TTL (work budget +
+ * `RECEIPT_FILE_LEASE_GRACE_MS`) is what lets the next push through, and the
+ * deterministic-filename attachment check stays as the second layer for the
+ * window where a lease is reclaimed early.
  *
- * The loser of the race does NOT skip: it runs once the winner is done, its
- * DocNumber lookup now finds the committed Purchase, and it takes the
+ * The loser of the race does NOT skip: it waits, runs once the winner is done,
+ * its DocNumber lookup now finds the committed Purchase, and it takes the
  * `alreadyExists` path, which re-checks the attachment by deterministic
- * FileName and returns the SAME purchase id. Fail-closed: if the lock cannot be
- * taken the error propagates and the route answers a retryable 500, rather than
+ * FileName and returns the SAME purchase id. Only a loser still waiting when
+ * `RECEIPT_FILE_LEASE_MAX_WAIT_MS` runs out gives up, and it does so by throwing
+ * `QBReceiptPushInProgressError` — which the route answers as a retryable 409,
+ * never as a terminal fallback. Fail-closed: if the lease cannot be taken at all
+ * the error propagates and the route answers a retryable 500, rather than
  * pushing unprotected.
  */
-async function defaultWithReceiptFileLock<T>(
+export async function withReceiptFileLease<T>(
     fileId: string,
     run: () => Promise<T>,
     deadline?: RouteDeadline,
+    deps: ReceiptFileLeaseDeps = {},
 ): Promise<T> {
+    const store = deps.store ?? automationSettingLeaseStore;
+    const now = deps.now ?? Date.now;
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const mintToken = deps.token ?? (() => `${now()}-${Math.random().toString(36).slice(2, 12)}`);
+
     const remaining = remainingBudgetMs(deadline);
-    const windowMs = Number.isFinite(remaining)
+    const workMs = Number.isFinite(remaining)
         ? Math.max(1_000, Math.min(Math.floor(remaining), RECEIPT_FILE_LOCK_MAX_MS))
         : RECEIPT_FILE_LOCK_MAX_MS;
-    return prisma.$transaction(
-        async (tx) => {
-            // A bound parameter, not interpolation. $executeRawUnsafe because
-            // pg_advisory_xact_lock returns void; hashtext() maps the
-            // namespaced key onto the integer the lock function takes.
-            await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtext($1))", `receipt-push:${fileId}`);
-            return run();
-        },
-        // `timeout` covers the wait for the lock AND the work under it; every
-        // QBO call inside is separately bounded by `deadline`, so the
-        // transaction can never outlive the route.
-        { timeout: windowMs, maxWait: windowMs },
-    );
+    const ttlMs = workMs + RECEIPT_FILE_LEASE_GRACE_MS;
+    const waitMs = Math.min(RECEIPT_FILE_LEASE_MAX_WAIT_MS, workMs);
+
+    const key = `${RECEIPT_FILE_LEASE_PREFIX}${fileId}`;
+    const waitUntil = now() + waitMs;
+    let held: string | null = null;
+
+    while (held === null) {
+        const at = now();
+        const candidate = leaseValue(mintToken(), at + ttlMs);
+        try {
+            await store.create(key, candidate);
+            held = candidate;
+            break;
+        } catch (error) {
+            // Anything but "a row is already there" is a real database failure
+            // and must not be mistaken for contention.
+            if (!isLeaseKeyCollision(error)) throw error;
+        }
+        // A row exists. Take it over ONLY if its claim has expired, and only by
+        // CAS against the exact value we read — two waiters reclaiming the same
+        // stale lease must not both win.
+        const existing = await store.read(key);
+        if (existing !== null && leaseExpiry(existing) <= at) {
+            if (await store.swap(key, existing, candidate)) {
+                held = candidate;
+                break;
+            }
+        }
+        // `existing === null` means the holder released between the failed
+        // create and this read: loop straight back round to the create.
+        if (now() >= waitUntil) throw new QBReceiptPushInProgressError(fileId);
+        await sleep(RECEIPT_FILE_LEASE_POLL_MS);
+    }
+
+    try {
+        return await run();
+    } finally {
+        // CAS-pinned to our own value: a lease that already expired and was
+        // reclaimed by somebody else must not be deleted out from under them.
+        // A failed release only costs the next push one TTL of waiting, so it
+        // must never turn a completed push into an error.
+        await store.release(key, held).catch(() => {});
+    }
 }
 
 /**
@@ -924,7 +1079,7 @@ export async function createQBReceiptPurchase(
     deadline?: RouteDeadline,
 ): Promise<CreateQBReceiptPurchaseResult> {
     const withFileLock: ReceiptFileLock =
-        deps.withFileLock ?? ((fileId, run) => defaultWithReceiptFileLock(fileId, run, deadline));
+        deps.withFileLock ?? ((fileId, run) => withReceiptFileLease(fileId, run, deadline));
     return withFileLock(input.fileId, () => createQBReceiptPurchaseUnderLock(tokens, input, deps, deadline));
 }
 

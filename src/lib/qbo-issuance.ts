@@ -48,24 +48,75 @@ import { toNum } from "./prisma-helpers";
  * made, so nothing is stranded.
  *
  * What IS here is every field a wrong link would misbill on: the amount, the
+ * TAX ALLOCATION that amount is split into, the customer it is billed to, the
  * status (Paid/Canceled), the due date, and whether a payment is already
  * attached.
+ *
+ * The tax split and the customer were added after a gate found the hash
+ * covering only the grand total. Both change the invoice PAYLOAD without
+ * changing `amount`: a milestone whose `pretaxAmount`/`taxAmount` columns were
+ * filled in (or whose invoice's `taxRate` moved) re-issues the same dollars as
+ * a different liability split, and a client re-pointed at another QuickBooks
+ * customer bills the same dollars to someone else. Either one leaves an
+ * identity-matching invoice in QuickBooks that no longer describes the row, and
+ * without them in the hash the resolver would adopt it.
  */
 export interface MilestoneIssuanceState {
     status: string | null;
     amount: unknown;
     dueDate: Date | string | null;
     qbPaymentId: string | null;
+    /**
+     * The pre-tax/tax split actually sent, as `milestoneTaxSplit` computes it —
+     * `null` when the invoice carries no separate tax line.
+     */
+    tax: { preTaxAmount: number; taxAmount: number } | null;
+    /** The QuickBooks `CustomerRef` id the invoice is billed to. */
+    customerId: string | null;
 }
 
 /**
  * The progress-billing equivalent. `description` is excluded for the same
  * reason `name` is above — it is the invoice's text, not its money.
+ *
+ * `taxAmount` and `customerId` are here for the same reason they are on the
+ * milestone state: the stage payload's tax line is `{ preTaxAmount: subtotal,
+ * taxAmount }`, so a tax-only edit that leaves `subtotal` and `total` alone
+ * still re-issues a different invoice; and the customer decides who is billed.
  */
 export interface ProgressBillingIssuanceState {
     status: string | null;
     subtotal: unknown;
     total: unknown;
+    taxAmount: unknown;
+    customerId: string | null;
+}
+
+/**
+ * The pre-tax/tax split one milestone's QuickBooks invoice carries.
+ *
+ * ONE definition, shared by `pushMilestoneToQuickBooks` (which sends it) and by
+ * the issuance hash (which has to fingerprint exactly what was sent). The split
+ * is NOT a stored column: it prefers the milestone's own `pretaxAmount`/
+ * `taxAmount` when both are set and otherwise derives from the invoice's
+ * `taxRate`, so a second copy of that rule would drift and the resolver would
+ * recompute a hash the create never wrote.
+ */
+export function milestoneTaxSplit(row: {
+    pretaxAmount: unknown;
+    taxAmount: unknown;
+    amount: unknown;
+    invoiceTaxRate: unknown;
+}): { preTaxAmount: number; taxAmount: number } | null {
+    if (row.pretaxAmount != null && row.taxAmount != null) {
+        return { preTaxAmount: toNum(row.pretaxAmount), taxAmount: toNum(row.taxAmount) };
+    }
+    const amount = toNum(row.amount);
+    const taxRate = toNum(row.invoiceTaxRate);
+    const preTaxAmount = Math.round((amount / (1 + taxRate / 100)) * 100) / 100;
+    const taxAmount = Math.round((amount - preTaxAmount) * 100) / 100;
+    if (taxRate > 0 && taxAmount > 0) return { preTaxAmount, taxAmount };
+    return null;
 }
 
 /**
@@ -114,6 +165,11 @@ export function milestoneIssuanceHash(row: MilestoneIssuanceState): string {
         money(row.amount),
         when(row.dueDate),
         row.qbPaymentId ?? "",
+        // An ABSENT tax line and a $0 one are different answers, so they must
+        // not hash alike: "" vs "0.00|0.00". Same reasoning as the takeoff
+        // tax-split fix.
+        row.tax ? `${money(row.tax.preTaxAmount)}/${money(row.tax.taxAmount)}` : "",
+        row.customerId ?? "",
     ]);
 }
 
@@ -123,5 +179,7 @@ export function progressBillingIssuanceHash(row: ProgressBillingIssuanceState): 
         row.status ?? "",
         money(row.subtotal),
         money(row.total),
+        money(row.taxAmount),
+        row.customerId ?? "",
     ]);
 }

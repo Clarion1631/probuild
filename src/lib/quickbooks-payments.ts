@@ -46,8 +46,8 @@ import {
     probeQBInvoice,
     getQBPayment,
     deleteQBInvoice,
-    QB_PRIVATE_NOTE_MAX_LEN,
     QB_DOC_NUMBER_MAX_LEN,
+    canonicalPrivateNote,
 } from "./quickbooks";
 import {
     AMBIGUOUS_CREATE_MARKER,
@@ -56,7 +56,7 @@ import {
     composeCreateMarker,
     isBlockedByAmbiguousCreate,
 } from "./qbo-create-markers";
-import { milestoneIssuanceHash } from "./qbo-issuance";
+import { milestoneIssuanceHash, milestoneTaxSplit } from "./qbo-issuance";
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 // One definition of the reconnect-QuickBooks reason string, shared with the
 // health probe that counts it. A second literal here is how the row loop and
@@ -1027,18 +1027,16 @@ export async function pushMilestoneToQuickBooks(
     // Carry the sales tax explicitly so Vanessa's QBO sales-tax reporting sees
     // the liability. The milestone amount is tax-inclusive; split it using the
     // invoice's rate (each milestone carries its proportional share of tax).
-    let tax: { preTaxAmount: number; taxAmount: number } | null = null;
-    if (schedule.pretaxAmount != null && schedule.taxAmount != null) {
-        tax = {
-            preTaxAmount: toNum(schedule.pretaxAmount),
-            taxAmount: toNum(schedule.taxAmount),
-        };
-    } else {
-        const taxRate = toNum(invoice.taxRate);
-        const preTaxAmount = Math.round((amount / (1 + taxRate / 100)) * 100) / 100;
-        const taxAmount = Math.round((amount - preTaxAmount) * 100) / 100;
-        if (taxRate > 0 && taxAmount > 0) tax = { preTaxAmount, taxAmount };
-    }
+    //
+    // The rule itself lives in qbo-issuance.ts because the issuance hash below
+    // has to fingerprint EXACTLY what this sends — a second copy here would
+    // drift and the resolver would recompute a hash the create never wrote.
+    const tax = milestoneTaxSplit({
+        pretaxAmount: schedule.pretaxAmount,
+        taxAmount: schedule.taxAmount,
+        amount: schedule.amount,
+        invoiceTaxRate: invoice.taxRate,
+    });
 
     const description = `${projectName} — ${schedule.name}`;
     // Truncated to QBO's PrivateNote cap BEFORE it goes anywhere — see the
@@ -1047,7 +1045,13 @@ export async function pushMilestoneToQuickBooks(
     // identity against it by exact equality, so an untruncated identity here
     // would never match and a `confirmed-none` clear on that false negative
     // would let a real duplicate invoice through.
-    const privateNote = milestonePrivateNote(invoice.code, schedule.name, projectName).slice(0, QB_PRIVATE_NOTE_MAX_LEN);
+    // canonicalPrivateNote, not a bare `.slice()`: it also collapses whitespace
+    // runs and trims the ends, and it is the SAME function createQBMilestoneInvoice
+    // applies to the payload. A raw slice here left the marker holding an
+    // untrimmed string while QuickBooks stored the trimmed one, so a project or
+    // milestone name with stray whitespace made our own invoice invisible to
+    // the resolver — "none found", operator clears, client billed twice.
+    const privateNote = canonicalPrivateNote(milestonePrivateNote(invoice.code, schedule.name, projectName));
     // Claim the send BEFORE the request goes out. Losing this CAS means another
     // sender got there first — refuse rather than race them into two invoices.
     // A failure to WRITE the marker must abort: without it a crash mid-create
@@ -1077,6 +1081,12 @@ export async function pushMilestoneToQuickBooks(
         qbPaymentId: null,
         amount: schedule.amount,
         dueDate: schedule.dueDate,
+        // The rest of the PAYLOAD this create is about to send. `amount` alone
+        // does not describe the invoice: the same dollars split differently
+        // between pre-tax and tax, or billed to a different QuickBooks
+        // customer, is a different bill.
+        tax,
+        customerId,
     });
     const identity = {
         docNumber, privateNote, issuanceHash,
@@ -1085,6 +1095,13 @@ export async function pushMilestoneToQuickBooks(
         // figure, so this is what lets the ambiguous-create resolver refuse a
         // coincidental match whose total is wrong instead of linking it blind.
         expectedTotal: amount,
+        // WHICH BOOK and WHICH CUSTOMER this POST is going to. Everything above
+        // identifies a document; none of it identifies the company the document
+        // lives in. A recovery run after a reconnect to a different realm would
+        // otherwise query the wrong books, find nothing, and offer to clear a
+        // row whose real invoice is collectible in the original company.
+        realmId: tokens.realmId,
+        customerId,
     };
     // Captured once and reused for the promotion below — the ambiguous-create
     // marker must carry this SAME claim time, not a fresh one taken after the
@@ -2280,6 +2297,13 @@ async function runPaymentsSync(
             { cursorId, originalCursor, wrapped },
         ),
         (page) => runQboRowLoop(page, result, async (billing) => {
+        // Counted exactly where the milestone pass counts it — BEFORE the
+        // probe, so a row that was looked at and then failed still shows up as
+        // looked at. Omitting it here made `checked` the milestone count alone:
+        // a run that verified nothing but progress billings reported
+        // "checked: 0" beside a real settle, and any coverage number computed
+        // off it under-reported the billing rail entirely.
+        result.checked++;
         {
             const probe = await qbo.probeInvoice(billing.qbInvoiceId!);
             if (probe.state === "error") {

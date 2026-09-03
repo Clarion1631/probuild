@@ -102,6 +102,38 @@ export interface CreateIdentity {
      * check on top of.
      */
     expectedTotal?: number;
+    /**
+     * The QuickBooks COMPANY (realm) the create POST went to.
+     *
+     * Everything above identifies a document. None of it identifies a BOOK.
+     * The resolver queries with whatever credentials are connected NOW, and
+     * that connection can legitimately point somewhere else than the one the
+     * create used — a reconnect to a second company, a sandbox↔production
+     * swap, an agency switching client files. Against the wrong realm the
+     * DocNumber lookup finds nothing, which the resolver reads as "no invoice
+     * exists" and offers to clear: the row becomes freely re-sendable while its
+     * real, collectible invoice sits untouched in the original company.
+     *
+     * `undefined` means the marker predates this field. That is NOT "any realm
+     * will do" -- the realm is then unknown, and an unknown realm is refused
+     * outright (never auto-cleared). See the `realm-unknown` refusal in
+     * qbo-ambiguous-create.ts.
+     */
+    realmId?: string;
+    /**
+     * The QuickBooks `CustomerRef` id the create POST billed.
+     *
+     * Same class of failure one level down. A DocNumber is unique to neither
+     * the company nor the customer, and the row's client can be re-pointed at a
+     * different QuickBooks customer between the create and the recovery (a
+     * merge in QuickBooks, a re-`ensureQBCustomer` after a rename). Linking on
+     * document identity alone would attach an invoice billed to one customer
+     * onto a row that now bills another.
+     *
+     * `undefined` is handled exactly like an absent `realmId`: unknown, so
+     * refused.
+     */
+    customerId?: string;
 }
 
 /** Separates the marker kind from its identity payload. */
@@ -150,6 +182,30 @@ const MARKER_HASH_PREFIX = "#";
  * same positional-safety reason as the hash prefix.
  */
 const MARKER_TOTAL_PREFIX = "$";
+/**
+ * Prefixes the QuickBooks realm (company) id, e.g.
+ * `ambiguous-create:#4f1c2ab90de7331a|$1089.00|~9130354...|INV-00171-2|ProBuild ...`.
+ *
+ * Sits after the optional `$total` field and before the docNumber, for the
+ * same positional-safety reason as the prefixes above.
+ */
+const MARKER_REALM_PREFIX = "~";
+/**
+ * Prefixes the QuickBooks CustomerRef id, e.g.
+ * `ambiguous-create:~9130354...|%58|INV-00171-2|ProBuild ...`.
+ *
+ * Last of the optional fields, immediately before the docNumber.
+ */
+const MARKER_CUSTOMER_PREFIX = "%";
+
+/** Every optional field prefix, in the order composeCreateMarker emits them. */
+const MARKER_OPTIONAL_PREFIXES = [
+    MARKER_TIME_PREFIX,
+    MARKER_HASH_PREFIX,
+    MARKER_TOTAL_PREFIX,
+    MARKER_REALM_PREFIX,
+    MARKER_CUSTOMER_PREFIX,
+] as const;
 
 /**
  * `create-in-flight:@1730000000000|INV-00171-2|ProBuild INV-00171 - Rough-in - Mesplay`
@@ -183,14 +239,21 @@ export function composeCreateMarker(
     // malformed field and the marker would parse as corrupt (fail-closed, but
     // silently unresolvable). Ours never do -- this is an invariant, not input
     // validation, same as the separator check above.
-    if (
-        identity.docNumber.startsWith(MARKER_TIME_PREFIX)
-        || identity.docNumber.startsWith(MARKER_HASH_PREFIX)
-        || identity.docNumber.startsWith(MARKER_TOTAL_PREFIX)
-    ) {
+    if (MARKER_OPTIONAL_PREFIXES.some((prefix) => identity.docNumber.startsWith(prefix))) {
         throw new Error(
-            `DocNumber must not start with "${MARKER_TIME_PREFIX}", "${MARKER_HASH_PREFIX}" or "${MARKER_TOTAL_PREFIX}": ${identity.docNumber}`,
+            `DocNumber must not start with ${MARKER_OPTIONAL_PREFIXES.map((p) => `"${p}"`).join(", ")}: ${identity.docNumber}`,
         );
+    }
+    // The realm and the customer are QuickBooks-generated numeric ids. A
+    // separator inside either would make the split ambiguous the same way a
+    // separator in the DocNumber would, and an EMPTY one would compose a field
+    // that parses back as absent -- i.e. silently downgrade to "unknown realm".
+    // Both are invariants of the ids QuickBooks issues, not input validation.
+    for (const [label, value] of [["realmId", identity.realmId], ["customerId", identity.customerId]] as const) {
+        if (value == null) continue;
+        if (value === "" || value.includes(MARKER_FIELD_SEP)) {
+            throw new Error(`${label} must be non-empty and must not contain "${MARKER_FIELD_SEP}": ${value}`);
+        }
     }
     if (identity.issuanceHash != null && !/^[0-9a-f]+$/.test(identity.issuanceHash)) {
         throw new Error(`Issuance hash must be lowercase hex: ${identity.issuanceHash}`);
@@ -208,7 +271,13 @@ export function composeCreateMarker(
     const totalPart = identity.expectedTotal != null
         ? `${MARKER_TOTAL_PREFIX}${identity.expectedTotal}${MARKER_FIELD_SEP}`
         : "";
-    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${totalPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
+    const realmPart = identity.realmId
+        ? `${MARKER_REALM_PREFIX}${identity.realmId}${MARKER_FIELD_SEP}`
+        : "";
+    const customerPart = identity.customerId
+        ? `${MARKER_CUSTOMER_PREFIX}${identity.customerId}${MARKER_FIELD_SEP}`
+        : "";
+    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${totalPart}${realmPart}${customerPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
 }
 
 /** Which pending-create marker is this, identity or not? `null` when it is neither. */
@@ -276,6 +345,27 @@ export function parseCreateMarker(
         }
         // A malformed `$...` field falls through unstripped, same as `@...`/`#...`.
     }
+    let realmId: string | undefined;
+    if (payload.startsWith(MARKER_REALM_PREFIX)) {
+        const end = payload.indexOf(MARKER_FIELD_SEP);
+        const raw = end > 0 ? payload.slice(MARKER_REALM_PREFIX.length, end) : "";
+        if (raw) {
+            realmId = raw;
+            payload = payload.slice(end + MARKER_FIELD_SEP.length);
+        }
+        // A malformed `~...` field falls through unstripped, same as the rest:
+        // it lands in docNumber and the marker reads as corrupt (fail-closed).
+    }
+    let customerId: string | undefined;
+    if (payload.startsWith(MARKER_CUSTOMER_PREFIX)) {
+        const end = payload.indexOf(MARKER_FIELD_SEP);
+        const raw = end > 0 ? payload.slice(MARKER_CUSTOMER_PREFIX.length, end) : "";
+        if (raw) {
+            customerId = raw;
+            payload = payload.slice(end + MARKER_FIELD_SEP.length);
+        }
+        // Same fall-through as `~...` above.
+    }
     const sep = payload.indexOf(MARKER_FIELD_SEP);
     // A payload with no separator, an empty docNumber or an empty note is a
     // corrupt marker. Same handling as the legacy shape: refuse, don't guess.
@@ -284,8 +374,8 @@ export function parseCreateMarker(
     const privateNote = payload.slice(sep + MARKER_FIELD_SEP.length);
     if (!docNumber || !privateNote) return { kind, identity: null, atMs };
     // Each optional key is OMITTED, not set to undefined, when the marker
-    // carries no hash / total: a deep-equality check against a two-field
-    // identity has to keep reading as equal for a legacy marker.
+    // carries no hash / total / realm / customer: a deep-equality check against
+    // a two-field identity has to keep reading as equal for a legacy marker.
     return {
         kind,
         identity: {
@@ -293,6 +383,8 @@ export function parseCreateMarker(
             privateNote,
             ...(issuanceHash ? { issuanceHash } : {}),
             ...(expectedTotal != null ? { expectedTotal } : {}),
+            ...(realmId ? { realmId } : {}),
+            ...(customerId ? { customerId } : {}),
         },
         atMs,
     };

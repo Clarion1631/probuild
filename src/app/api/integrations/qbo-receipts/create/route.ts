@@ -7,6 +7,7 @@ import {
     QboAccountConfigError,
     QboPurchaseFaultError,
     isQboAttachmentAuthError,
+    isReceiptPushInProgressError,
     isRetryableQboError,
     type CreateQBReceiptPurchaseInput,
     type CreateQBReceiptPurchaseResult,
@@ -352,6 +353,16 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 await logEvent(event);
                 return NextResponse.json(result);
             } catch (error) {
+                if (isReceiptPushInProgressError(error)) {
+                    // Another delivery of the SAME file holds the per-file
+                    // lease and did not finish inside our wait. Nothing was
+                    // pushed, and the winner is mid-create — so this is
+                    // explicitly RETRYABLE, never the terminal ok:false
+                    // fallback the deterministic outcomes take. The retry finds
+                    // the committed Purchase and returns already-exists.
+                    await logEvent(pushEventFromOutcome(input, { status: "error", reason: "push-in-progress" }));
+                    return NextResponse.json({ ok: false, retry: true, reason: "push-in-progress" }, { status: 409 });
+                }
                 if (isQBTimeoutError(error)) {
                     // QBO is unreachable, not saying no — 503 so the Apps
                     // Script retries on its next pass instead of falling back

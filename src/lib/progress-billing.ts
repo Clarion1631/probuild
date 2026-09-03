@@ -33,7 +33,7 @@ import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { toNum } from "./prisma-helpers";
 import type { ProgressBilling, ProgressBillingLine } from "@prisma/client";
-import { createRouteDeadline, remainingBudgetMs, QB_PRIVATE_NOTE_MAX_LEN, QB_DOC_NUMBER_MAX_LEN, type RouteDeadline, type QBTokens } from "./quickbooks";
+import { createRouteDeadline, remainingBudgetMs, QB_DOC_NUMBER_MAX_LEN, canonicalPrivateNote, type RouteDeadline, type QBTokens } from "./quickbooks";
 import {
     compensateAndUnlink,
     compensationWindowMs,
@@ -819,7 +819,12 @@ export async function stageProgressBillingToQuickBooksCore(
     // by exact equality, and a mismatch reads as "no invoice found" — which
     // lets a `confirmed-none` clear release a row that already has a real,
     // collectible duplicate sitting in QuickBooks.
-    const privateNote = progressBillingPrivateNote(invoice.code, billing.code).slice(0, QB_PRIVATE_NOTE_MAX_LEN);
+    // canonicalPrivateNote, not a bare `.slice()`: it also collapses whitespace
+    // runs and trims the ends, and it is the SAME function the create payload
+    // applies. A raw slice here left the marker holding an untrimmed string
+    // while QuickBooks stored the trimmed one, so a code carrying stray
+    // whitespace made our own invoice invisible to the resolver.
+    const privateNote = canonicalPrivateNote(progressBillingPrivateNote(invoice.code, billing.code));
     // Truncated to QBO's DocNumber cap BEFORE it goes anywhere — same reasoning
     // as the PrivateNote truncation above. `createInvoice` (createQBMilestoneInvoice)
     // truncates again defensively, but the marker's identity has to be composed
@@ -835,12 +840,24 @@ export async function stageProgressBillingToQuickBooksCore(
             status: "Draft",
             subtotal: billing.subtotal,
             total: billing.total,
+            // The payload's tax line is { preTaxAmount: subtotal, taxAmount },
+            // so a tax-only edit re-issues a different invoice while leaving
+            // subtotal and total alone — and the customer decides who is
+            // billed at all. Both belong in the fingerprint.
+            taxAmount: billing.taxAmount,
+            customerId,
         }),
         // The QBO invoice TOTAL this create expects to produce. DocNumber +
         // PrivateNote prove a resolved match is OURS; they carry no dollar
         // figure, so this is what lets the ambiguous-create resolver refuse a
         // coincidental match whose total is wrong instead of linking it blind.
         expectedTotal: total,
+        // WHICH BOOK and WHICH CUSTOMER this POST is going to — same reasoning
+        // as the milestone rail. Without the realm, a recovery run after a
+        // reconnect to a different company queries the wrong books, finds
+        // nothing, and offers to clear a row whose invoice is collectible.
+        realmId: tokens.realmId,
+        customerId,
     };
     // Captured once and reused for the promotion below — the ambiguous-create
     // marker must carry this SAME claim time, not a fresh one taken after the

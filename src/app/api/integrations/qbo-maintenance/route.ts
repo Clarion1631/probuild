@@ -28,6 +28,12 @@ export const maxDuration = 120;
  *     e.g. the brief bank-only window on 6/11 — without touching paid ones.
  *     Then finishes any row left `paylink-pending` by a pay-link timeout, on
  *     both the milestone and the progress-billing rail.
+ *
+ *     `ok` describes the RUN, not the fact that the handler returned. A row
+ *     whose LINKED invoice is no longer in QuickBooks counts as outstanding
+ *     work (`missingInQbo` + `missingInQboRows`, reason `qbo-invoice-missing`)
+ *     — it is a bill the client can no longer pay, so it must not be reported
+ *     inside a clean pass.
  */
 export async function POST(req: Request) {
     // One budget for the whole request, whichever action it turns out to be.
@@ -249,9 +255,21 @@ export async function POST(req: Request) {
             where: lastCompletedId ? { ...scheduleWhere, id: { gt: lastCompletedId } } : scheduleWhere,
         }).catch(() => -1);
     }
-    // Any row that actually failed, as opposed to being already correct or
-    // simply absent from QuickBooks.
+    // Any row that actually failed, as opposed to being already correct.
     const failedRows = results.filter((r) => r.result.startsWith("error:") || r.result === "update-failed").length;
+
+    // Rows whose LINKED QuickBooks invoice is not there any more.
+    //
+    // This used to be excluded from `failedRows` on the reading that a 404 is
+    // "a finding, not a failure" — the row was recorded and the sweep still
+    // returned ok:true. But a linked invoice that has vanished is not a neutral
+    // observation about QuickBooks: it is a bill the client can no longer pay,
+    // sitting on a row ProBuild still believes is outstanding, and nobody was
+    // told because the run read as a clean pass. It is outstanding work, so it
+    // makes the sweep ok:false and it is named — count plus row ids — where
+    // pipeline health can see it.
+    const missingRows = results.filter((r) => r.result === "not-found-in-qbo");
+    const missingInQbo = missingRows.length;
 
     // Same pass, second repair: rows whose invoice IS linked but whose pay-link
     // fetch timed out (marked `paylink-pending` by the milestone push / progress
@@ -271,14 +289,26 @@ export async function POST(req: Request) {
     // stopped early, left rows unvisited, or failed on a row has work
     // outstanding and must not read as a clean pass — that reading is what let
     // a 200-row cap look like a complete sweep for as long as it did.
-    const ok = !truncated && failedRows === 0;
+    const ok = !truncated && failedRows === 0 && missingInQbo === 0;
     return NextResponse.json({
         ok,
         checked: results.length,
         failed: failedRows,
+        ...(missingInQbo > 0
+            ? {
+                missingInQbo,
+                // The ids, not just the count: "3 invoices vanished" is not
+                // actionable, "these three" is.
+                missingInQboRows: missingRows.map((r) => ({ qbInvoiceId: r.qbInvoiceId, code: r.code })),
+            }
+            : {}),
         ...(truncated ? { truncated: true, retry: true } : {}),
         ...(abortedReason ? { reason: abortedReason, remaining } : {}),
         ...(!abortedReason && failedRows > 0 ? { reason: "row-errors" } : {}),
+        // A missing invoice is reported under its own reason so the health
+        // digest can tell it apart from a row that merely errored. Only when
+        // nothing louder already claimed `reason`.
+        ...(!abortedReason && failedRows === 0 && missingInQbo > 0 ? { reason: "qbo-invoice-missing" } : {}),
         ...(payLinks ? { payLinks } : {}),
         results,
     });

@@ -12,6 +12,7 @@ import {
     type QboReceiptPushDependencies,
     type ReceiptAttachmentStatus,
     type ReceiptFileLock,
+    type ReceiptLeaseStore,
 } from "../src/lib/qbo-receipt-push";
 import {
     createQboReceiptCreateHandlers,
@@ -2250,7 +2251,7 @@ test("two simultaneous pushes of one file upload the attachment ONCE and agree o
 test("the push cannot run outside the per-file lock", async () => {
     // The lock is only an invariant if there is no way round it: the
     // implementation must not be exported, and the exported entry point must
-    // take the lock before doing anything else.
+    // take the lease before doing anything else.
     const mod: Record<string, unknown> = await import("../src/lib/qbo-receipt-push");
     assert.equal(mod.createQBReceiptPurchaseUnderLock, undefined, "the unlocked implementation must stay private");
 
@@ -2260,10 +2261,178 @@ test("the push cannot run outside the per-file lock", async () => {
         src.indexOf("async function createQBReceiptPurchaseUnderLock("),
     );
     assert.match(entry, /withFileLock\(input\.fileId, \(\) => createQBReceiptPurchaseUnderLock\(/);
-    assert.match(
-        src,
-        /pg_advisory_xact_lock\(hashtext\(\$1\)\)/,
-        "the default lock is the transaction-scoped advisory lock, not a session one",
-    );
-    assert.doesNotMatch(src, /pg_advisory_lock\(/, "a session-level lock does not survive pgbouncer transaction pooling");
 });
+
+test("round 35 gate: no database transaction wraps any QuickBooks call in the push", async () => {
+    // The defect: `defaultWithReceiptFileLock` held `pg_advisory_xact_lock`
+    // inside ONE interactive transaction for the whole lookup→create→attach —
+    // up to 55 seconds of a pooled connection spanning several Intuit HTTP
+    // round trips, while the callback's own Prisma reads needed connections
+    // from that same pool. During an outage, when every push runs to its full
+    // deadline, concurrent receipts starve the pool and take unrelated requests
+    // down with them. A source assertion, because the property being protected
+    // is structural: there must be NO transaction here at all.
+    const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/qbo-receipt-push.ts", "utf8"));
+    assert.doesNotMatch(src, /\$transaction\(/, "nothing in the push may hold a transaction across QBO I/O");
+    assert.doesNotMatch(src, /pg_advisory_xact_lock\(/, "the transaction-scoped advisory lock is gone");
+    assert.doesNotMatch(src, /pg_advisory_lock\(/, "a session-level lock does not survive pgbouncer transaction pooling");
+    // Every lease store method is a single statement in its own implicit
+    // transaction — acquire, then release, with the QBO work in between.
+    assert.match(src, /export async function withReceiptFileLease</);
+});
+
+/**
+ * In-memory stand-in for the `AutomationSetting` row the lease lives in.
+ * `create` collides exactly the way the primary key does, which is the branch
+ * the acquire loop pivots on.
+ */
+function memoryLeaseStore(seed?: Record<string, string>) {
+    const rows = new Map<string, string>(Object.entries(seed ?? {}));
+    const store: ReceiptLeaseStore = {
+        async create(key, value) {
+            if (rows.has(key)) {
+                const collision = new Error("Unique constraint failed on the fields: (`key`)") as Error & { code?: string };
+                collision.code = "P2002";
+                throw collision;
+            }
+            rows.set(key, value);
+        },
+        async read(key) {
+            return rows.get(key) ?? null;
+        },
+        async swap(key, expected, value) {
+            if (rows.get(key) !== expected) return false;
+            rows.set(key, value);
+            return true;
+        },
+        async release(key, expected) {
+            if (rows.get(key) === expected) rows.delete(key);
+        },
+    };
+    return { rows, store };
+}
+
+const LEASE_KEY_PREFIX = "qbo-receipt-push.lease:";
+
+test("round 35 gate: two simultaneous pushes take the REAL lease — one upload, and the loser takes the re-check path", async () => {
+    // Same guarantee the advisory lock gave, now from a durable CAS lease that
+    // holds no connection across the QuickBooks calls. The loser does NOT skip:
+    // it waits, then finds the committed Purchase and re-checks the attachment
+    // by deterministic FileName.
+    const { withReceiptFileLease } = await import("../src/lib/qbo-receipt-push");
+    const input = baseInput({ ...FILE_INPUT });
+
+    let purchase: { Id: string; PrivateNote: string } | null = null;
+    const attachables: Array<Record<string, unknown>> = [];
+    const uploads: Array<{ purchaseId: string; fileName: string }> = [];
+    const shared = {
+        existingRowsImpl: () => (purchase ? [purchase] : []),
+        attachableQueryImpl: async () => attachables,
+        qbCreateImpl: (async (_t: unknown, payload: Record<string, unknown>) => {
+            if (!purchase) purchase = { Id: "77", PrivateNote: String(payload.PrivateNote) };
+            return { id: purchase.Id };
+        }) as QboReceiptPushDependencies["qbCreateFn"],
+        uploadAttachment: (async (_t: unknown, purchaseId: string, file: { fileName: string }) => {
+            uploads.push({ purchaseId, fileName: file.fileName });
+            attachables.push(attachableRow(purchaseId, file.fileName));
+            return "attached" as ReceiptAttachmentStatus;
+        }) as QboReceiptPushDependencies["uploadAttachment"],
+    };
+
+    const { rows, store } = memoryLeaseStore();
+    const entered: string[] = [];
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const lock: ReceiptFileLock = (fileId, run) =>
+        withReceiptFileLease(
+            fileId,
+            () => {
+                entered.push(fileId);
+                concurrent++;
+                maxConcurrent = Math.max(maxConcurrent, concurrent);
+                return run().finally(() => { concurrent--; });
+            },
+            undefined,
+            // A real (short) timer, so the winner's work actually gets to run
+            // between the loser's polls instead of starving it on microtasks.
+            { store, sleep: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, Math.min(ms, 5))) },
+        );
+
+    const [first, second] = await Promise.all([
+        createQBReceiptPurchase(TOKENS, input, createDeps({ ...shared, withFileLock: lock }).deps),
+        createQBReceiptPurchase(TOKENS, input, createDeps({ ...shared, withFileLock: lock }).deps),
+    ]);
+
+    assert.equal(entered.length, 2, "both deliveries ran");
+    assert.equal(maxConcurrent, 1, "but never at the same time");
+    assert.equal(uploads.length, 1, "the receipt image is uploaded exactly once");
+    assert.equal(first.ok && first.qbPurchaseId, "77");
+    assert.equal(second.ok && second.qbPurchaseId, "77");
+    const flags = [first.ok && first.alreadyExists, second.ok && second.alreadyExists].sort();
+    assert.deepEqual(flags, [false, true], "the loser took the already-exists re-check path");
+    assert.equal(rows.size, 0, "and both released their lease on the way out");
+});
+
+test("round 35 gate: a crashed holder's lease expires and the next push proceeds", async () => {
+    // The cost of trading a transaction-scoped lock for a durable claim: a
+    // killed process leaves its row behind. The TTL is what stops that from
+    // blocking the receipt forever.
+    const { withReceiptFileLease } = await import("../src/lib/qbo-receipt-push");
+    const key = `${LEASE_KEY_PREFIX}stranded-file`;
+    const dead = JSON.stringify({ t: "crashed-worker", x: Date.now() - 1 });
+    const { rows, store } = memoryLeaseStore({ [key]: dead });
+
+    let ran = false;
+    const result = await withReceiptFileLease("stranded-file", async () => { ran = true; return "done"; }, undefined, { store });
+
+    assert.equal(result, "done");
+    assert.equal(ran, true, "the expired claim did not block the next push");
+    assert.notEqual(rows.get(key), dead, "and it was taken over by CAS, not ignored");
+    assert.equal(rows.size, 0, "then released");
+});
+
+test("round 35 gate: a LIVE holder is waited for, and a loser that runs out of wait is retryable, not terminal", async () => {
+    // Nothing is pushed: the winner is mid-create, so the only correct answer
+    // is "come back", never the terminal ok:false fallback the deterministic
+    // outcomes take.
+    const { withReceiptFileLease, isReceiptPushInProgressError, RECEIPT_FILE_LEASE_MAX_WAIT_MS } =
+        await import("../src/lib/qbo-receipt-push");
+    const key = `${LEASE_KEY_PREFIX}busy-file`;
+    let clock = 1_000_000;
+    const held = JSON.stringify({ t: "the-winner", x: clock + 10 * 60_000 });
+    const { rows, store } = memoryLeaseStore({ [key]: held });
+
+    let ran = false;
+    await assert.rejects(
+        () => withReceiptFileLease("busy-file", async () => { ran = true; return 1; }, undefined, {
+            store,
+            now: () => clock,
+            // Advancing the clock IS the sleep: the wait is bounded by
+            // RECEIPT_FILE_LEASE_MAX_WAIT_MS, so this terminates deterministically.
+            sleep: async (ms: number) => { clock += ms; },
+        }),
+        (e: unknown) => isReceiptPushInProgressError(e),
+    );
+    assert.equal(ran, false, "the push never started");
+    assert.equal(rows.get(key), held, "the live holder's claim is untouched");
+    assert.ok(clock - 1_000_000 >= RECEIPT_FILE_LEASE_MAX_WAIT_MS, "it really did wait the whole window first");
+});
+
+test("round 35 gate: the route answers a lease loser with a retryable 409, never a terminal fallback", async () => {
+    const { QBReceiptPushInProgressError } = await import("../src/lib/qbo-receipt-push");
+    const events: AutomationEventInput[] = [];
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => { throw new QBReceiptPushInProgressError("file-1"); },
+        logEvent: event => { events.push(event); },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "push-in-progress" });
+    assert.equal(events[0].reason, "push-in-progress");
+});
+

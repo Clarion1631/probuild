@@ -290,9 +290,12 @@ test("a run that starts with no stored cursor at all behaves exactly as before",
     assert.deepEqual(seen, all.map((r) => r.id));
 });
 
-test("a 404 row is a finding, not a failure", async () => {
-    // "not-found-in-qbo" is a real answer about that invoice and must not make
-    // the sweep look broken.
+test("round 35 gate: an invoice that has vanished from QuickBooks is outstanding work, not a clean pass", async () => {
+    // This used to assert ok:true on the reading that a 404 is "a finding, not
+    // a failure". But a LINKED invoice that is no longer in QuickBooks is not a
+    // neutral observation: it is a bill the client can no longer pay, on a row
+    // ProBuild still believes is outstanding — and the sweep returning ok:true
+    // meant nobody was ever told. It is now named and counted.
     const all = rows(3);
     const { client } = makePrisma(all);
     const body = await withEnvAndFakes(client, makeFetch({ "qb-1": 404 }), async () => {
@@ -300,7 +303,25 @@ test("a 404 row is a finding, not a failure", async () => {
         return (await POST(request())).json();
     });
 
+    // Still not a row FAILURE — the call succeeded and gave a real answer.
     assert.equal(body.failed, 0);
-    assert.equal(body.ok, true);
+    assert.equal(body.ok, false, "a vanished invoice must not read as a clean sweep");
+    assert.equal(body.missingInQbo, 1);
+    assert.equal(body.reason, "qbo-invoice-missing", "actionable, and distinct from a row error");
+    // The ids, not just the count: "one invoice vanished" is not actionable.
+    assert.deepEqual(body.missingInQboRows, [{ qbInvoiceId: "qb-1", code: "INV-1" }]);
     assert.ok(body.results.some((r: any) => r.result === "not-found-in-qbo"));
+});
+
+test("round 35 gate: a sweep with nothing missing still reports ok", async () => {
+    // The guard above must not make every clean run look broken.
+    const all = rows(3);
+    const { client } = makePrisma(all);
+    const body = await withEnvAndFakes(client, makeFetch(), async () => {
+        const { POST } = await import("../src/app/api/integrations/qbo-maintenance/route");
+        return (await POST(request())).json();
+    });
+    assert.equal(body.ok, true);
+    assert.equal(body.missingInQbo, undefined);
+    assert.equal(body.reason, undefined);
 });

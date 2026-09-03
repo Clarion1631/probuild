@@ -28,6 +28,34 @@ export const QB_API_BASE = process.env.QB_SANDBOX === "true"
 export const QB_PRIVATE_NOTE_MAX_LEN = 4000;
 
 /**
+ * The ONE normalization of a PrivateNote, applied at every point the string is
+ * written OR read back.
+ *
+ * The bug this closes was an ASYMMETRY, not a missing trim. The resolver
+ * trimmed the value QuickBooks returned and compared it against the RAW marker
+ * value, so any note whose composed form carried whitespace — a project name
+ * ending in a space, a milestone name pasted with a trailing newline, a
+ * double space between words — compared unequal to itself. The real invoice
+ * became invisible to the lookup, the resolver reported "none found", the
+ * operator confirmed none, the marker was cleared, and the next send billed the
+ * client a second time.
+ *
+ * So: collapse every run of whitespace to a single space, trim the ends, and
+ * truncate to Intuit's cap. Applied to the POST payload, to the identity
+ * recorded in the create marker on BOTH rails, and to whatever QuickBooks hands
+ * back — three places that must agree byte for byte, which is only reliable if
+ * they all go through this function.
+ *
+ * Truncation is LAST, and it is why the two sides still agree past 4000
+ * characters: canonicalizing first means the string QuickBooks stored and the
+ * string in the marker were cut at the same index of the same text.
+ */
+export function canonicalPrivateNote(value: string | null | undefined): string {
+    if (!value) return "";
+    return value.replace(/\s+/g, " ").trim().slice(0, QB_PRIVATE_NOTE_MAX_LEN);
+}
+
+/**
  * Intuit's DocNumber field length cap. Every create path truncates to this
  * before sending — and, same reasoning as QB_PRIVATE_NOTE_MAX_LEN above, a
  * caller composing a create-marker's recovery identity (qbo-create-markers.ts)
@@ -977,7 +1005,11 @@ export async function createQBMilestoneInvoice(
         AllowOnlineACHPayment: true,
         ...(input.billEmail ? { BillEmail: { Address: input.billEmail } } : {}),
         ...(input.dueDate ? { DueDate: input.dueDate.toISOString().split("T")[0] } : {}),
-        ...(input.privateNote ? { PrivateNote: input.privateNote.slice(0, QB_PRIVATE_NOTE_MAX_LEN) } : {}),
+        // Canonicalized, not merely truncated — the create marker's recovery
+        // identity is composed from the SAME function, so what QuickBooks
+        // stores and what the resolver looks for cannot disagree. See
+        // canonicalPrivateNote.
+        ...(canonicalPrivateNote(input.privateNote) ? { PrivateNote: canonicalPrivateNote(input.privateNote) } : {}),
         Line: [
             {
                 LineNum: 1,
