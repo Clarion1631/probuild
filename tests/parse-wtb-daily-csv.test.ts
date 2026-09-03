@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
     buildDayStatements,
+    looksLikeCustomerDeposit,
     parseArgs,
+    sweepExcludedWarning,
     buildSweepPayload,
     canSweepDay,
     postSweep,
@@ -716,4 +718,94 @@ test("args: an unknown flag stops the run before anything is posted", async t =>
     } finally {
         globalThis.fetch = originalFetch;
     }
+});
+
+// ── A credit with no Bank Reference (first prod dry run, 2026-08-28) ────────
+//
+// It cannot be swept: the reference IS the idempotency key. The first cut
+// refused the whole day for it, which also stopped every LATER day — so one
+// unreferenced row would have failed the 6pm job forever. It is now declared
+// and skipped, with the bank's own day totals unchanged so the arithmetic
+// still has to tie.
+
+test("sweep: an unreferenced credit is excluded from the batch, not fatal", async t => {
+    const day = () => build([
+        OPEN("08/28/2026", "0.00"),
+        CLOSE("08/28/2026", "1600.00"),
+        row("08/28/2026", "TOTAL CREDITS", "100", "1600.00"),
+        CREDIT("08/28/2026", "1500.00", "REF-OK"),
+        CREDIT("08/28/2026", "100.00", ""), // the real row: no Bank Reference
+    ]).complete[0];
+
+    await t.test("the day is still sweepable", () => {
+        assert.equal(canSweepDay(day()).ok, true);
+    });
+
+    await t.test("the payload posts the sweepable credit and DECLARES the other", () => {
+        const payload = buildSweepPayload(day());
+        assert.equal(payload.credits.length, 1);
+        assert.equal(payload.credits[0].bankReference, "REF-OK");
+        assert.deepEqual(payload.excluded, [{
+            amount: 100,
+            description: "OTHER DEPOSITS",
+            transactionDetail: "DEPOSIT - DDA/MMKT",
+            reason: "no bank reference",
+        }]);
+        // The bank's OWN day figures, unchanged: the endpoint ties them to
+        // credits + excluded, so an exclusion cannot hide a deposit.
+        assert.equal(payload.creditCount, 2);
+        assert.equal(payload.creditSum, 1600);
+    });
+
+    await t.test("a day where EVERY credit lacks a reference is skipped, not failed", () => {
+        const allMissing = build([
+            OPEN("08/28/2026", "0.00"),
+            CLOSE("08/28/2026", "100.00"),
+            row("08/28/2026", "TOTAL CREDITS", "100", "100.00"),
+            CREDIT("08/28/2026", "100.00", ""),
+        ]).complete[0];
+        const verdict = canSweepDay(allMissing);
+        assert.equal(verdict.ok, false);
+        assert.equal(verdict.failure, false, "nothing to sweep is not a job failure");
+        assert.match(verdict.reason, /no credits carry a bank reference/);
+    });
+
+    await t.test("an excluded credit that looks like a customer payment is WARNED about", () => {
+        const deposit = { amount: 100, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT" };
+        assert.equal(looksLikeCustomerDeposit(deposit), true);
+        assert.equal(
+            sweepExcludedWarning("2026-08-28", deposit),
+            "WARNING 2026-08-28: a customer-deposit credit of $100.00 has NO Bank Reference, so it cannot be swept — " +
+            "check it by hand (OTHER DEPOSITS / DEPOSIT - DDA/MMKT)",
+            "the amount and the date are in the line, because that is what a human searches for",
+        );
+    });
+
+    await t.test("…but routine non-deposit credits are excluded quietly", () => {
+        // Interest, transfers and ACH credits are not customer payments; a
+        // daily WARNING for each would bury the one that matters.
+        for (const credit of [
+            { amount: 3.17, baiCode: "165", description: "INTEREST PAID", transactionDetail: "INTEREST" },
+            { amount: 500, baiCode: "195", description: "TRANSFER FROM SAVINGS", transactionDetail: "TRANSFER" },
+            { amount: 20, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "ACH REFUND" },
+            // Isolates the BAI clause: everything else reads like a deposit, so
+            // only the code itself can refuse this one.
+            { amount: 75, baiCode: "165", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT" },
+        ]) {
+            assert.equal(looksLikeCustomerDeposit(credit), false, `${credit.baiCode} / ${credit.description} / ${credit.transactionDetail}`);
+        }
+    });
+
+    await t.test("the summary line reports the exclusions", () => {
+        const counts = { credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 };
+        assert.equal(
+            sweepSummaryLine("2026-08-28", counts, 1),
+            "sweep 2026-08-28: 1 credits (1 excluded: no bank reference), 1 applied, 0 need-human, 0 proposed, 0 replay",
+        );
+        assert.equal(
+            sweepSummaryLine("2026-08-28", counts, 0),
+            "sweep 2026-08-28: 1 credits, 1 applied, 0 need-human, 0 proposed, 0 replay",
+            "and says nothing when there are none",
+        );
+    });
 });

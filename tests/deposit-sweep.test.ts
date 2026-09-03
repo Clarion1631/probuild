@@ -523,6 +523,58 @@ test("batch gate: a control-total mismatch refuses the WHOLE batch", async t => 
     });
 });
 
+test("batch gate: excluded rows keep the day's arithmetic honest", async t => {
+    const batch = (over: Row = {}) => ({
+        source: "bank",
+        postDate: SETTLED_DAY,
+        credits: [{ bankReference: "REF-OK", amount: 1500, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT", customerReference: null }],
+        excluded: [{ amount: 100, description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT", reason: "no bank reference" }],
+        creditCount: 2,
+        creditSum: 1600,
+        ...over,
+    });
+
+    await t.test("credits + excluded may account for the bank's day totals", () => {
+        const parsed = parseBankBatch(batch());
+        assert.equal(parsed.ok, true, (parsed as { reason?: string }).reason);
+        const b = (parsed as { batch: { credits: unknown[]; excluded: Array<{ amountCents: number; reason: string }> } }).batch;
+        assert.equal(b.credits.length, 1, "only the referenced credit is swept");
+        assert.equal(b.excluded.length, 1);
+        assert.equal(b.excluded[0].amountCents, 10_000);
+        assert.equal(b.excluded[0].reason, "no bank reference");
+    });
+
+    await t.test("…and are refused when they do NOT add up", () => {
+        // An exclusion must never be a way to quietly lose a deposit.
+        const shortSum = parseBankBatch(batch({ creditSum: 1500 }));
+        assert.equal(shortSum.ok, false);
+        assert.match((shortSum as { reason: string }).reason, /creditSum 1500 does not match the declared rows/);
+
+        const shortCount = parseBankBatch(batch({ creditCount: 1 }));
+        assert.equal(shortCount.ok, false);
+        assert.match((shortCount as { reason: string }).reason, /1 posted \+ 1 excluded/);
+    });
+
+    await t.test("an exclusion has to say why", () => {
+        const noReason = parseBankBatch(batch({ excluded: [{ amount: 100, description: "X", transactionDetail: "Y" }] }));
+        assert.equal(noReason.ok, false);
+        assert.match((noReason as { reason: string }).reason, /must carry a reason/);
+    });
+
+    await t.test("a malformed excluded row is refused like any other", () => {
+        for (const bad of [{ amount: 0, reason: "no bank reference" }, { amount: 1.005, reason: "no bank reference" }, "nope"]) {
+            assert.equal(parseBankBatch(batch({ excluded: [bad] })).ok, false, JSON.stringify(bad));
+        }
+        assert.equal(parseBankBatch(batch({ excluded: "nope" })).ok, false, "excluded must be an array");
+    });
+
+    await t.test("no excluded key at all is the ordinary case", () => {
+        const parsed = parseBankBatch({ ...batch(), excluded: undefined, creditCount: 1, creditSum: 1500 });
+        assert.equal(parsed.ok, true);
+        assert.deepEqual((parsed as { batch: { excluded: unknown[] } }).batch.excluded, []);
+    });
+});
+
 test("batch gate: a credit without a bankReference is rejected — it has no identity", () => {
     const parsed = parseBankBatch({
         source: "bank", postDate: SETTLED_DAY, creditCount: 1, creditSum: 100,
@@ -2313,6 +2365,29 @@ test("R7: job progress unlocks auto-apply without the switch (Justin's daily-log
         const { body } = await post(bankBatch([{ ref: "REF-SUBSTRING", amount: 13447.68 }]));
         assert.equal(creditResult(body, "REF-SUBSTRING").status, "proposed");
     });
+});
+
+test("excluded rows are echoed, recorded nowhere, and do not disturb the tally", async () => {
+    const milestone = seedMilestone({ amount: 1500 });
+    const { res, body } = await post({
+        source: "bank",
+        postDate: SETTLED_DAY,
+        credits: [{ bankReference: "REF-SWEEPABLE", amount: 1500, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT", customerReference: null }],
+        excluded: [{ amount: 100, description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT", reason: "no bank reference" }],
+        creditCount: 2,
+        creditSum: 1600,
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(body.excludedCount, 1, "the runner can prove the endpoint read the same day it sent");
+    assert.equal(creditResult(body, "REF-SWEEPABLE").status, "applied");
+    // `counts` partitions the credits actually PROCESSED — the excluded row is
+    // not one of them, and nothing was written for it.
+    assert.equal(body.counts.credits, 1);
+    assert.equal(body.ok, true);
+    assert.equal(tables.depositIngest.rows.length, 1, "no row exists for an excluded credit");
+    assert.equal(tables.depositIngest.rows[0].fileId, bankFileId("REF-SWEEPABLE"));
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Paid");
 });
 
 test("the batch response carries the counts the Bot Health line is built from", async () => {

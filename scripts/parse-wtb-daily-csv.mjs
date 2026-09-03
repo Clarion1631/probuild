@@ -94,6 +94,9 @@ import { pathToFileURL } from "node:url";
 
 const INGEST_PATH = "/api/integrations/bank-ledger/ingest";
 const DEPOSIT_SWEEP_PATH = "/api/payments/deposit-ingest";
+/** The one reason a credit is declared but not swept. Must match what the
+ *  endpoint stores nothing for. */
+const NO_BANK_REFERENCE = "no bank reference";
 const DEFAULT_ACCOUNT = "WTB-0723";
 // First calendar date the daily-CSV path owns (the first day ingested from a
 // daily export in prod, 2026-08-18). The monthly PDF parser must only cover
@@ -486,6 +489,12 @@ async function postStatement(baseUrl, secret, statement) {
  */
 export function canSweepDay(day) {
     if (day.credits.length === 0) return { ok: false, reason: "no credits", failure: false };
+    // Every credit on the day lacks a reference: there is nothing to sweep, and
+    // nothing about that is a job failure — the excluded rows are still
+    // reported, and any that look like customer deposits are warned about.
+    if (day.credits.every(c => !c.bankReference)) {
+        return { ok: false, reason: "no credits carry a bank reference", failure: false };
+    }
     if (day.totalCreditsCents === null || day.totalCreditsCents === undefined) {
         return {
             ok: false,
@@ -507,13 +516,25 @@ export function canSweepDay(day) {
  * posted, so a day that cannot be vouched for is never written.
  */
 export function buildSweepPayload(day, opts = {}) {
-    const credits = day.credits.map(c => ({
+    // A credit with no Bank Reference has no idempotency key, so it cannot be
+    // swept — but the bank publishes ONE total for the day, so dropping it
+    // silently would break the control totals and refusing the day would stall
+    // every later day. It is DECLARED instead: excluded from the work, included
+    // in the arithmetic.
+    const sweepable = day.credits.filter(c => c.bankReference);
+    const credits = sweepable.map(c => ({
         bankReference: c.bankReference,
         amount: c.amount,
         baiCode: c.baiCode,
         description: c.description,
         transactionDetail: c.transactionDetail,
         customerReference: c.customerReference,
+    }));
+    const excluded = day.credits.filter(c => !c.bankReference).map(c => ({
+        amount: c.amount,
+        description: c.description,
+        transactionDetail: c.transactionDetail,
+        reason: NO_BANK_REFERENCE,
     }));
     if (day.totalCreditsCents === null || day.totalCreditsCents === undefined) {
         // Unreachable via sweepDay (canSweepDay gates it); a hard error rather
@@ -526,7 +547,11 @@ export function buildSweepPayload(day, opts = {}) {
         source: "bank",
         postDate: day.periodStart,
         credits,
-        creditCount: credits.length,
+        excluded,
+        // The bank's OWN figures for the whole day, unchanged: the endpoint
+        // checks them against credits + excluded, so an exclusion can never be
+        // a way to quietly lose a deposit.
+        creditCount: credits.length + excluded.length,
         creditSum: creditSumCents / 100,
         ...(opts.dryRun ? { dryRun: true } : {}),
     };
@@ -581,6 +606,33 @@ export function sweepCreditNeedsAttention(credit) {
         || !CLEAN_SWEEP_STATUSES.includes(credit?.status);
 }
 
+/**
+ * Is this credit the kind a customer's check arrives as? Mirrors
+ * isCustomerDepositClass in src/lib/deposit-sweep.ts — this runner is plain
+ * .mjs and cannot import the TypeScript module. Only used to decide whether an
+ * EXCLUDED row is worth shouting about; the endpoint remains the authority on
+ * what may actually be swept.
+ */
+export function looksLikeCustomerDeposit(credit) {
+    const norm = (v) => (v ?? "").trim().toUpperCase().replace(/\s+/g, " ");
+    if (norm(credit.baiCode) !== "174") return false;
+    if (norm(credit.description) !== "OTHER DEPOSITS") return false;
+    const detail = norm(credit.transactionDetail);
+    return detail.startsWith("DEPOSIT") || detail.startsWith("MOBILE D");
+}
+
+/**
+ * The one-line warning for a credit that could not be swept but LOOKS like a
+ * customer payment. Not a job failure — the day still posts and later days
+ * still run — but somebody has to go and look at it, so it says the amount and
+ * the date out loud.
+ */
+export function sweepExcludedWarning(postDate, credit) {
+    const where = [credit.description, credit.transactionDetail].filter(Boolean).join(" / ");
+    return `WARNING ${postDate}: a customer-deposit credit of $${credit.amount.toFixed(2)} has NO Bank Reference, ` +
+        `so it cannot be swept — check it by hand${where ? ` (${where})` : ""}`;
+}
+
 /** The statuses that mean a credit is finished with. Mirrors
  *  CLEAN_SWEEP_STATUSES in src/lib/deposit-sweep.ts — this runner is plain
  *  .mjs and cannot import the TypeScript module. */
@@ -595,9 +647,10 @@ const bucket = (counts, key) => {
 /** The one line the Hermes job copies into its Bot Health report. Reports every
  *  bucket: a day whose credits all failed on a QuickBooks outage must not read
  *  the same as a quiet day. */
-export function sweepSummaryLine(postDate, counts) {
+export function sweepSummaryLine(postDate, counts, excludedCount = 0) {
     const needHuman = bucket(counts, "unmatched") + bucket(counts, "reconcile");
-    const line = `sweep ${postDate}: ${counts.credits} credits, ${counts.applied} applied, ` +
+    const excludedNote = excludedCount > 0 ? ` (${excludedCount} excluded: ${NO_BANK_REFERENCE})` : "";
+    const line = `sweep ${postDate}: ${counts.credits} credits${excludedNote}, ${counts.applied} applied, ` +
         `${needHuman} need-human, ${counts.proposed} proposed, ${counts.replay} replay`;
     const failed = bucket(counts, "failed");
     const qboUnknown = bucket(counts, "qboUnknown");
@@ -676,6 +729,13 @@ async function sweepDay(args, sweepSecret, statement, stalled) {
         console.log(`  sweep ${postDate}: 0 credits — nothing to apply`);
         return true;
     }
+    // A credit with no Bank Reference cannot be swept, but it must not take the
+    // day (or every later day) down with it. Report it, warn loudly if it looks
+    // like a customer deposit somebody should chase, and carry on.
+    const missingRef = statement.credits.filter(c => !c.bankReference);
+    for (const credit of missingRef.filter(looksLikeCustomerDeposit)) {
+        console.warn(`  ${sweepExcludedWarning(postDate, credit)}`);
+    }
     const sweepable = canSweepDay(statement);
     if (!sweepable.ok && sweepable.failure) {
         // The day HAS credits but the bank published no independent total for
@@ -684,13 +744,9 @@ async function sweepDay(args, sweepSecret, statement, stalled) {
         stalled();
         return false;
     }
-    const missingRef = statement.credits.filter(c => !c.bankReference);
-    if (missingRef.length > 0) {
-        // Refused here rather than posted: without the bank reference there is
-        // no idempotency key, and the endpoint would (correctly) 400 the batch.
-        console.error(`  sweep ${postDate}: ${missingRef.length} credit(s) carry no Bank Reference — refusing to post a batch with no idempotency key`);
-        stalled();
-        return false;
+    if (!sweepable.ok) {
+        console.log(`  sweep ${postDate}: ${sweepable.reason} — nothing to apply`);
+        return true;
     }
     const { status, body } = await postSweep(args.post, sweepSecret, statement, { dryRun: args.sweepDryRun });
     if (status !== 200 || !body?.counts) {
@@ -701,7 +757,7 @@ async function sweepDay(args, sweepSecret, statement, stalled) {
 
     // Always report the whole day, whichever way it went.
     const submitted = new Set(statement.credits.map(c => c.bankReference));
-    const summary = `  ${sweepSummaryLine(postDate, body.counts)}${args.sweepDryRun ? " (dry run)" : ""}`;
+    const summary = `  ${sweepSummaryLine(postDate, body.counts, body.excludedCount ?? 0)}${args.sweepDryRun ? " (dry run)" : ""}`;
     const failed = sweepBatchFailed(body, submitted);
     (failed ? console.error : console.log)(summary);
     // Every credit a human has to look at gets its own line, with the money on
