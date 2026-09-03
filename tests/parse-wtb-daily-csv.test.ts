@@ -389,7 +389,7 @@ test("sweep: the POST goes to the deposit endpoint as a bearer, with the day's b
         seen.push({ url: String(url), init });
         return new Response(JSON.stringify({
             ok: true, source: "bank", postDate: "2026-08-24",
-            counts: { credits: 1, applied: 1, needsHuman: 0, proposed: 0, replay: 0 },
+            counts: { credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 },
             credits: [{ bankReference: "REF-POST", status: "applied", replay: false }],
         }), { status: 200, headers: { "content-type": "application/json" } });
     }) as typeof fetch;

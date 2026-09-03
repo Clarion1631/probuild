@@ -513,13 +513,20 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
     const unmatched = [a, b].filter((r) => r.body.status === "unmatched");
     expect(applied, "exactly one of the two deposits applies").toHaveLength(1);
     expect(unmatched, "exactly one is refused by the reservation").toHaveLength(1);
-    expect(unmatched[0].body.reason).toContain("already being applied by another deposit");
+    // Both photos reach for the SAME milestone, so the reservation index (P2002)
+    // is what arbitrates — the cross-source claim check is scoped to the other
+    // source and does not fire between two photos. The loser's reason now NAMES
+    // the row that won, which is the point of the enriched message.
+    const loserIsA = unmatched[0].body === a.body;
+    const loserFileId = loserIsA ? F.reserve.fileIdA : F.reserve.fileIdB;
+    const winnerFileId = loserIsA ? F.reserve.fileIdB : F.reserve.fileIdA;
+    expect(unmatched[0].body.reason).toContain("already being applied by a deposit photo");
+    expect(unmatched[0].body.reason, "the loser's task names the row that won").toContain(winnerFileId);
     expect(unmatched[0].body.officeTaskId).toBeTruthy();
 
     const schedule = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: F.reserve.schedule } });
     expect(schedule.status).toBe("Paid");
 
-    const loserFileId = unmatched[0].body === a.body ? F.reserve.fileIdA : F.reserve.fileIdB;
     const loserRow = await prisma.depositIngest.findUniqueOrThrow({ where: { fileId: loserFileId } });
     expect(loserRow.status).toBe("unmatched");
     expect(loserRow.paymentScheduleId, "the losing row never holds the reservation").toBeNull();
@@ -980,6 +987,16 @@ const BANK_SCHEDULE_IDS = [
 
 type BankCreditSpec = { bankReference: string; amount: number; transactionDetail?: string };
 
+/** The full SweepCounts shape (src/lib/deposit-sweep.ts). Asserted whole, not
+ *  matched partially: the counts must PARTITION the batch, and a bucket that
+ *  quietly stopped being reported is exactly the bug `unresolved` exists for. */
+function sweepCounts(over: Partial<Record<string, number>> = {}) {
+  return {
+    credits: 0, applied: 0, proposed: 0, unmatched: 0, reconcile: 0,
+    failed: 0, qboUnknown: 0, unresolved: 0, replay: 0, ...over,
+  };
+}
+
 async function postBankBatch(
   request: APIRequestContext,
   opts: { postDate?: string; credits: BankCreditSpec[]; dryRun?: boolean; overrides?: Record<string, unknown> },
@@ -1069,7 +1086,7 @@ test.describe.serial("Deposit sweep — bank source", () => {
     const firstCredit = bankCredit(first.body, B.replay.bankReference);
     expect(firstCredit.status, `unexpected outcome: ${firstCredit.reason}`).toBe("applied");
     expect(firstCredit.scheduleId).toBe(B.replay.schedule);
-    expect(first.body.counts).toMatchObject({ credits: 1, applied: 1, needsHuman: 0, proposed: 0, replay: 0 });
+    expect(first.body.counts).toEqual(sweepCounts({ credits: 1, applied: 1 }));
 
     const schedule = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.replay.schedule } });
     expect(schedule.status).toBe("Paid");
@@ -1094,7 +1111,8 @@ test.describe.serial("Deposit sweep — bank source", () => {
     expect(replayCredit.status).toBe("applied");
     expect(replayCredit.alreadyApplied).toBe(true);
     expect(replayCredit.replay).toBe(true);
-    expect(second.body.counts.replay).toBe(1);
+    expect(second.body.counts).toEqual(sweepCounts({ credits: 1, applied: 1, replay: 1 }));
+    expect(second.body.ok, "a replay of an applied credit is a clean batch").toBe(true);
     expect((await getQboMockState(request)).calls.paymentCreate, "a replay creates no second payment").toBe(1);
     expect(await prisma.depositIngest.count({ where: { fileId: `bank:${B.replay.bankReference}` } })).toBe(1);
   });
@@ -1116,7 +1134,8 @@ test.describe.serial("Deposit sweep — bank source", () => {
       expect(credit.reason).toContain("different bank credits");
       expect(credit.officeTaskId).toBeTruthy();
     }
-    expect(body.counts.needsHuman).toBe(2);
+    expect(body.counts).toEqual(sweepCounts({ credits: 2, unmatched: 2 }));
+    expect(body.ok, "credits sent to a human are still a clean batch").toBe(true);
     expect((await getQboMockState(request)).calls.paymentCreate).toBe(0);
     expect((await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.collide.schedule } })).status).toBe("Pending");
   });
@@ -1131,7 +1150,8 @@ test.describe.serial("Deposit sweep — bank source", () => {
       dryRun: true,
     });
     expect(bankCredit(body, B.dry.bankReference).status).toBe("proposed");
-    expect(body.counts.proposed).toBe(1);
+    expect(body.counts).toEqual(sweepCounts({ credits: 1, proposed: 1 }));
+    expect(body.ok).toBe(true);
 
     const row = await prisma.depositIngest.findUniqueOrThrow({ where: { fileId: `bank:${B.dry.bankReference}` } });
     expect(row.status).toBe("proposed");
@@ -1161,6 +1181,7 @@ test.describe.serial("Deposit sweep — bank source", () => {
     expect(credit.reason).toContain("probably already booked");
     expect(credit.officeTaskId).toBeTruthy();
     expect(body.ok, "asking a human is still a clean batch").toBe(true);
+    expect(body.counts).toEqual(sweepCounts({ credits: 1, unmatched: 1 }));
     expect((await getQboMockState(request)).calls.paymentCreate).toBe(0);
 
     const row = await prisma.depositIngest.findUniqueOrThrow({ where: { fileId: `bank:${B.prebooked.bankReference}` } });
@@ -1187,6 +1208,7 @@ test.describe.serial("Deposit sweep — bank source", () => {
     expect(credit.reason).toContain("already applied from a deposit photo");
     expect(credit.reason).toContain(B.photoFirst.fileId);
     expect(credit.reason).toContain("Verify, then archive this task");
+    expect(body.counts).toEqual(sweepCounts({ credits: 1, unmatched: 1 }));
     expect((await getQboMockState(request)).calls.paymentCreate, "the sweep books nothing on top of the photo").toBe(0);
   });
 
@@ -1200,6 +1222,7 @@ test.describe.serial("Deposit sweep — bank source", () => {
     });
     const swept = bankCredit(sweep.body, B.bankFirst.bankReference);
     expect(swept.status, `sweep leg failed: ${swept.reason}`).toBe("applied");
+    expect(sweep.body.counts).toEqual(sweepCounts({ credits: 1, applied: 1 }));
 
     const photo = await postDeposit(request, {
       fileId: B.bankFirst.fileId, projectName: B.bankFirst.projectName, amount: B.bankFirst.amount,
