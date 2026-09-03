@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
     buildDayStatements,
+    looksLikeCustomerDeposit,
     parseArgs,
+    sweepableReferences,
+    sweepDay,
+    sweepExcludedWarning,
     buildSweepPayload,
     canSweepDay,
     postSweep,
@@ -715,5 +719,197 @@ test("args: an unknown flag stops the run before anything is posted", async t =>
         assert.equal(fetches, 0, "argument parsing never touches the network");
     } finally {
         globalThis.fetch = originalFetch;
+    }
+});
+
+// ── A credit with no Bank Reference (first prod dry run, 2026-08-28) ────────
+//
+// It cannot be swept: the reference IS the idempotency key. The first cut
+// refused the whole day for it, which also stopped every LATER day — so one
+// unreferenced row would have failed the 6pm job forever. It is now declared
+// and skipped, with the bank's own day totals unchanged so the arithmetic
+// still has to tie.
+
+test("sweep: an unreferenced credit is excluded from the batch, not fatal", async t => {
+    const day = () => build([
+        OPEN("08/28/2026", "0.00"),
+        CLOSE("08/28/2026", "1600.00"),
+        row("08/28/2026", "TOTAL CREDITS", "100", "1600.00"),
+        CREDIT("08/28/2026", "1500.00", "REF-OK"),
+        CREDIT("08/28/2026", "100.00", ""), // the real row: no Bank Reference
+    ]).complete[0];
+
+    await t.test("the day is still sweepable", () => {
+        assert.equal(canSweepDay(day()).ok, true);
+    });
+
+    await t.test("the payload posts the sweepable credit and DECLARES the other", () => {
+        const payload = buildSweepPayload(day());
+        assert.equal(payload.credits.length, 1);
+        assert.equal(payload.credits[0].bankReference, "REF-OK");
+        assert.deepEqual(payload.excluded, [{
+            amount: 100,
+            description: "OTHER DEPOSITS",
+            transactionDetail: "DEPOSIT - DDA/MMKT",
+            reason: "no bank reference",
+        }]);
+        // The bank's OWN day figures, unchanged: the endpoint ties them to
+        // credits + excluded, so an exclusion cannot hide a deposit.
+        assert.equal(payload.creditCount, 2);
+        assert.equal(payload.creditSum, 1600);
+    });
+
+    await t.test("a day where EVERY credit lacks a reference is skipped, not failed", () => {
+        const allMissing = build([
+            OPEN("08/28/2026", "0.00"),
+            CLOSE("08/28/2026", "100.00"),
+            row("08/28/2026", "TOTAL CREDITS", "100", "100.00"),
+            CREDIT("08/28/2026", "100.00", ""),
+        ]).complete[0];
+        const verdict = canSweepDay(allMissing);
+        assert.equal(verdict.ok, false);
+        assert.equal(verdict.failure, false, "nothing to sweep is not a job failure");
+        assert.match(verdict.reason, /no credits carry a bank reference/);
+    });
+
+    await t.test("an excluded credit that looks like a customer payment is WARNED about", () => {
+        const deposit = { amount: 100, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT" };
+        assert.equal(looksLikeCustomerDeposit(deposit), true);
+        assert.equal(
+            sweepExcludedWarning("2026-08-28", deposit),
+            "WARNING 2026-08-28: a customer-deposit credit of $100.00 has NO Bank Reference, so it cannot be swept — " +
+            "check it by hand (OTHER DEPOSITS / DEPOSIT - DDA/MMKT)",
+            "the amount and the date are in the line, because that is what a human searches for",
+        );
+    });
+
+    await t.test("…but routine non-deposit credits are excluded quietly", () => {
+        // Interest, transfers and ACH credits are not customer payments; a
+        // daily WARNING for each would bury the one that matters.
+        for (const credit of [
+            { amount: 3.17, baiCode: "165", description: "INTEREST PAID", transactionDetail: "INTEREST" },
+            { amount: 500, baiCode: "195", description: "TRANSFER FROM SAVINGS", transactionDetail: "TRANSFER" },
+            { amount: 20, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "ACH REFUND" },
+            // Isolates the BAI clause: everything else reads like a deposit, so
+            // only the code itself can refuse this one.
+            { amount: 75, baiCode: "165", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT" },
+        ]) {
+            assert.equal(looksLikeCustomerDeposit(credit), false, `${credit.baiCode} / ${credit.description} / ${credit.transactionDetail}`);
+        }
+    });
+
+    await t.test("the summary line reports the exclusions", () => {
+        const counts = { credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 };
+        assert.equal(
+            sweepSummaryLine("2026-08-28", counts, 1),
+            "sweep 2026-08-28: 1 credits (1 excluded: no bank reference), 1 applied, 0 need-human, 0 proposed, 0 replay",
+        );
+        assert.equal(
+            sweepSummaryLine("2026-08-28", counts, 0),
+            "sweep 2026-08-28: 1 credits, 1 applied, 0 need-human, 0 proposed, 0 replay",
+            "and says nothing when there are none",
+        );
+    });
+});
+
+// ── REPRO: 2026-08-28 in prod, after the excluded-credits fix ───────────────
+//
+// The day swept, its one $24,000 credit came back `unmatched` (need-human,
+// exactly right), and the runner then called the whole day a failure, printed
+// "unresolved credits", marked it NOT POSTED, stopped every later day and
+// exited 1.
+test("REPRO: an unmatched credit alongside an EXCLUDED one is a clean day", () => {
+    const body = {
+        ok: true,
+        counts: { credits: 1, applied: 0, proposed: 0, unmatched: 1, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 },
+        excludedCount: 1,
+        credits: [{ bankReference: "26241015003021", status: "unmatched", reason: "no requested pending milestone matches $24000.00" }],
+    };
+    // The set sweepDay used to build: every credit ON THE DAY, including the
+    // one with no reference — so it never matched what the endpoint answered.
+    const everyCredit = new Set(["26241015003021", ""]);
+    const posted = new Set(["26241015003021"]);
+
+    assert.equal(sweepBatchFailed(body, posted), false, "asking a human is a clean outcome");
+    assert.equal(
+        sweepBatchFailed(body, everyCredit), true,
+        "…and this is the bug: an excluded credit was counted as submitted, so the answer never tied",
+    );
+
+    // The fix, end to end: the payload and the expected-reference set come from
+    // ONE definition of "what this day posts", so they cannot disagree again.
+    const day = build([
+        OPEN("08/28/2026", "0.00"),
+        CLOSE("08/28/2026", "24100.00"),
+        row("08/28/2026", "TOTAL CREDITS", "100", "24100.00"),
+        CREDIT("08/28/2026", "24000.00", "26241015003021"),
+        CREDIT("08/28/2026", "100.00", ""), // the unreferenced row
+    ]).complete[0];
+
+    const payload = buildSweepPayload(day);
+    const expected = sweepableReferences(day);
+    assert.deepEqual([...expected], payload.credits.map((c: any) => c.bankReference));
+    assert.equal(expected.size, 1, "the excluded credit was never submitted");
+    assert.equal(payload.excluded.length, 1);
+    assert.equal(
+        sweepBatchFailed({ ...body, counts: { ...body.counts, credits: payload.credits.length } }, expected),
+        false,
+        "the response the endpoint actually sends, checked against what was actually posted",
+    );
+});
+
+test("REPRO at the call site: sweepDay reports the 2026-08-28 day as clean", async () => {
+    // The whole path, the way the cron runs it: a day with one sweepable credit
+    // and one unreferenced one, answered by the endpoint exactly as prod
+    // answered it. This is the test that would have caught the bug — the
+    // expected-reference set is built INSIDE sweepDay, so a test that calls the
+    // helper directly cannot see it go wrong.
+    const day = build([
+        OPEN("08/28/2026", "0.00"),
+        CLOSE("08/28/2026", "24100.00"),
+        row("08/28/2026", "TOTAL CREDITS", "100", "24100.00"),
+        CREDIT("08/28/2026", "24000.00", "26241015003021"),
+        CREDIT("08/28/2026", "100.00", ""),
+    ]).complete[0];
+
+    const originalFetch = globalThis.fetch;
+    const logged: string[] = [];
+    const errored: string[] = [];
+    const originalLog = console.log, originalError = console.error, originalWarn = console.warn;
+    console.log = (...args: unknown[]) => { logged.push(args.join(" ")); };
+    console.warn = (...args: unknown[]) => { logged.push(args.join(" ")); };
+    console.error = (...args: unknown[]) => { errored.push(args.join(" ")); };
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+        ok: true,
+        source: "bank",
+        postDate: "2026-08-28",
+        counts: { credits: 1, applied: 0, proposed: 0, unmatched: 1, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 },
+        excludedCount: 1,
+        credits: [{ bankReference: "26241015003021", status: "unmatched", replay: false, reason: "no requested pending milestone matches $24000.00" }],
+    }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
+
+    let stalledCalls = 0;
+    try {
+        const ok = await sweepDay(
+            { post: "https://probuild.example", sweepDryRun: false },
+            "s3cret",
+            day,
+            () => { stalledCalls += 1; },
+        );
+        assert.equal(ok, true, "a credit sent to a human is a clean day — later days must keep posting");
+        assert.equal(stalledCalls, 0, "and the day is never marked NOT POSTED");
+        assert.equal(
+            errored.some(line => line.includes("unresolved credits")), false,
+            "the 'unresolved' line is only for failed / qbo_unknown / reconcile / unresolved",
+        );
+        // It still SAYS what happened: the summary, the exclusion, and the
+        // credit the human has to look at.
+        const output = logged.join("\n");
+        assert.match(output, /sweep 2026-08-28: 1 credits \(1 excluded: no bank reference\)/);
+        assert.match(output, /26241015003021 \$24000\.00: unmatched/);
+        assert.match(output, /WARNING 2026-08-28: a customer-deposit credit of \$100\.00 has NO Bank Reference/);
+    } finally {
+        globalThis.fetch = originalFetch;
+        console.log = originalLog; console.error = originalError; console.warn = originalWarn;
     }
 });
