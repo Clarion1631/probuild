@@ -116,6 +116,10 @@ import {
     type CreateScheduleTaskInput,
     type UpdateScheduleTaskInput,
 } from "./schedule-task-core";
+import {
+    toScheduleTaskFailure,
+    type ScheduleTaskResult,
+} from "./schedule-task-result";
 import { convertLeadToProjectCore } from "./lead-conversion-core";
 import { buildContractMergeData, normalizeContractBody, resolveMergeFields, createContractFromTemplateCore, createContractBlankCore } from "./contract-creation-core";
 import { executedContractPdfFor } from "./contract-files-core";
@@ -4727,9 +4731,13 @@ async function assertScheduleProjectAccess(projectId: string) {
 }
 
 async function assertScheduleTaskAccess(taskId: string) {
+    // Authenticate BEFORE touching the row, and answer "Task not found" for
+    // any task outside the caller's scope, so the result contract never
+    // reveals whether an id exists to someone who may not see it.
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "schedules")) throw new Error("Forbidden");
     const task = await prisma.scheduleTask.findUnique({ where: { id: taskId }, select: { projectId: true } });
-    if (!task?.projectId) throw new Error("Task not found");
-    const user = await assertScheduleProjectAccess(task.projectId);
+    if (!task?.projectId || !canAccessProject(user, task.projectId)) throw new Error("Task not found");
     return { user, projectId: task.projectId };
 }
 
@@ -6305,6 +6313,30 @@ export async function getResolvedMergePreview(
     return buildContractMergeData(projectId, leadId);
 }
 
+/** Unsigned statuses that may be printed/proofed; signed ones use the executed PDF. */
+const PRINTABLE_CONTRACT_STATUSES = new Set(["Draft", "Sent", "Viewed"]);
+
+/**
+ * Everything the client needs to print one contract, built from a FRESH server
+ * snapshot: any staff user with the `contracts` permission who can see the
+ * contract gets its persisted title/body plus merge data for ITS owning
+ * project/lead (never caller-supplied ids). Printable status is enforced here.
+ */
+export async function getContractPrintPayload(contractId: string): Promise<{
+    title: string; body: string; mergeData: Record<string, string>;
+}> {
+    const { projectId, leadId } = await assertContractAccess(contractId);
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        select: { title: true, body: true, status: true, originalPdfPath: true },
+    });
+    if (!contract) throw new Error("Contract not found");
+    if (!PRINTABLE_CONTRACT_STATUSES.has(contract.status)) throw new Error("Signed contracts print from their executed PDF.");
+    if (contract.originalPdfPath) throw new Error("Imported PDF contracts print from the PDF viewer.");
+    const mergeData = await buildContractMergeData(projectId, leadId);
+    return { title: contract.title, body: contract.body || "", mergeData };
+}
+
 // `getContracts` was deleted here. It had no callers anywhere — the live staff
 // screens (projects/[id]/contracts, leads/[id]/contracts) query prisma.contract
 // directly with contractScopeWhere(viewer). Having no callers did NOT make it
@@ -7862,44 +7894,92 @@ function buildTaskCommentCreateData(taskId: string, text: string, author: TaskCo
     };
 }
 
-export async function createScheduleTask(projectId: string, data: CreateScheduleTaskInput) {
-    const user = await assertScheduleProjectAccess(projectId);
-    const note = data.note?.trim() || null;
-    const commentAuthor = note ? await resolveTaskCommentAuthor() : null;
-    const task = await withTxRetry(() => prisma.$transaction(tx =>
-        createScheduleTaskInTransaction(
-            tx,
-            projectId,
-            data,
-            { type: "TEAM", name: user.name || user.email },
-            commentAuthor,
-        ),
-    ));
-    revalidatePath("/company-dashboard");
-    revalidatePath(`/projects/${projectId}/schedule`);
-    return task;
+// Result contract, not throw: see schedule-task-result.ts — Next.js replaces a
+// thrown Server Action error's message with a generic one in production, so
+// expected failures (validation, access, not found) are returned instead of
+// thrown, and only truly unexpected errors are logged and thrown as opaque.
+export async function createScheduleTask(
+    projectId: string,
+    data: CreateScheduleTaskInput,
+): Promise<ScheduleTaskResult<Awaited<ReturnType<typeof createScheduleTaskInTransaction>>>> {
+    let task: Awaited<ReturnType<typeof createScheduleTaskInTransaction>>;
+    try {
+        const user = await assertScheduleProjectAccess(projectId);
+        const note = data.note?.trim() || null;
+        const commentAuthor = note ? await resolveTaskCommentAuthor() : null;
+        task = await withTxRetry(() => prisma.$transaction(tx =>
+            createScheduleTaskInTransaction(
+                tx,
+                projectId,
+                data,
+                { type: "TEAM", name: user.name || user.email },
+                commentAuthor,
+            ),
+        ));
+    } catch (e) {
+        const failure = toScheduleTaskFailure(e);
+        if (failure.code === "UNEXPECTED") console.error("[schedule-task] createScheduleTask failed", e);
+        return failure;
+    }
+    try {
+        revalidatePath("/company-dashboard");
+        revalidatePath(`/projects/${projectId}/schedule`);
+    } catch (e) {
+        console.warn("[schedule-task] createScheduleTask revalidation failed", e);
+    }
+    return { ok: true, task };
 }
 
-export async function updateScheduleTask(taskId: string, data: UpdateScheduleTaskInput) {
-    const { user, projectId } = await assertScheduleTaskAccess(taskId);
-    const task = await withTxRetry(() => prisma.$transaction(tx =>
-        updateScheduleTaskInTransaction(
-            tx,
-            taskId,
-            data,
-            { type: "TEAM", name: user.name || user.email },
-            projectId,
-        ),
-    ));
-    revalidatePath("/company-dashboard");
-    revalidatePath(`/projects/${projectId}/schedule`);
-    return task;
+export async function updateScheduleTask(
+    taskId: string,
+    data: UpdateScheduleTaskInput,
+): Promise<ScheduleTaskResult<Awaited<ReturnType<typeof updateScheduleTaskInTransaction>>>> {
+    let task: Awaited<ReturnType<typeof updateScheduleTaskInTransaction>>;
+    let projectId: string;
+    try {
+        const access = await assertScheduleTaskAccess(taskId);
+        projectId = access.projectId;
+        task = await withTxRetry(() => prisma.$transaction(tx =>
+            updateScheduleTaskInTransaction(
+                tx,
+                taskId,
+                data,
+                { type: "TEAM", name: access.user.name || access.user.email },
+                projectId,
+            ),
+        ));
+    } catch (e) {
+        const failure = toScheduleTaskFailure(e);
+        if (failure.code === "UNEXPECTED") console.error("[schedule-task] updateScheduleTask failed", e);
+        return failure;
+    }
+    try {
+        revalidatePath("/company-dashboard");
+        revalidatePath(`/projects/${projectId}/schedule`);
+    } catch (e) {
+        console.warn("[schedule-task] updateScheduleTask revalidation failed", e);
+    }
+    return { ok: true, task };
 }
-export async function deleteScheduleTask(taskId: string) {
-    await assertScheduleTaskAccess(taskId);
-    const task = await prisma.scheduleTask.delete({ where: { id: taskId } });
-    revalidatePath(`/projects/${task.projectId}/schedule`);
-    return task;
+
+export async function deleteScheduleTask(
+    taskId: string,
+): Promise<ScheduleTaskResult<Awaited<ReturnType<typeof prisma.scheduleTask.delete>>>> {
+    let task: Awaited<ReturnType<typeof prisma.scheduleTask.delete>>;
+    try {
+        await assertScheduleTaskAccess(taskId);
+        task = await prisma.scheduleTask.delete({ where: { id: taskId } });
+    } catch (e) {
+        const failure = toScheduleTaskFailure(e);
+        if (failure.code === "UNEXPECTED") console.error("[schedule-task] deleteScheduleTask failed", e);
+        return failure;
+    }
+    try {
+        revalidatePath(`/projects/${task.projectId}/schedule`);
+    } catch (e) {
+        console.warn("[schedule-task] deleteScheduleTask revalidation failed", e);
+    }
+    return { ok: true, task };
 }
 
 export async function reorderScheduleTasks(projectId: string, orderedIds: string[]) {
@@ -8516,12 +8596,14 @@ export async function getActiveSubcontractors() {
 export async function updateCompanyScheduleTaskDatesAction(taskId: string, dates: {
     startDate: string;
     endDate: string;
-}) {
+}): Promise<ScheduleTaskResult<Awaited<ReturnType<typeof updateScheduleTaskInTransaction>>>> {
     const session = await getServerSession(authOptions);
     const caller = session?.user?.email
         ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
         : null;
-    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) {
+        return { ok: false, code: "FORBIDDEN", error: "Only admins and managers can move tasks on the company board." };
+    }
     return updateScheduleTask(taskId, dates);
 }
 
@@ -8800,15 +8882,16 @@ export async function saveCompanyScheduleTaskDatesAction(
     const results: SaveCompanyScheduleTaskDateResult[] = [];
     for (const change of deduped) {
         try {
-            const task = await updateScheduleTask(change.taskId, {
+            const res = await updateScheduleTask(change.taskId, {
                 startDate: change.startDate,
                 endDate: change.endDate,
             });
+            if (!res.ok) throw new Error(res.error);
             results.push({
                 taskId: change.taskId,
                 ok: true,
-                startDate: task.startDate.toISOString(),
-                endDate: task.endDate.toISOString(),
+                startDate: res.task.startDate.toISOString(),
+                endDate: res.task.endDate.toISOString(),
             });
         } catch (err: any) {
             results.push({ taskId: change.taskId, ok: false, error: err?.message ?? String(err) });
