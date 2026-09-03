@@ -1432,7 +1432,7 @@ async function runGenerateScheduleFromEstimate(
             const mTask = await createTask({
                 name: eps.name,
                 startDate: canonical,
-                endDate: addDays(canonical, 1),
+                endDate: canonical, // milestones store end == start (schedule-dates.ts)
                 color: "#f59e0b",
                 order: nextOrder++,
                 type: "milestone",
@@ -2979,7 +2979,7 @@ async function runApplyChangeOrderToSchedule(
                     const task = await createTask({
                         name: row.name,
                         startDate: canonical,
-                        endDate: addDays(canonical, 1),
+                        endDate: canonical, // milestones store end == start (schedule-dates.ts)
                         color: "#f59e0b",
                         order: nextOrder++,
                         type: "milestone",
@@ -3065,7 +3065,7 @@ async function runApplyChangeOrderToSchedule(
                     const mTask = await createTask({
                         name: row.name,
                         startDate: canonical,
-                        endDate: addDays(canonical, 1),
+                        endDate: canonical, // milestones store end == start (schedule-dates.ts)
                         color: "#f59e0b",
                         order: nextOrder++,
                         type: "milestone",

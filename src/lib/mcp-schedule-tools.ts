@@ -400,7 +400,8 @@ export async function planSchedule(input: {
             ...resolved.tasks.map((task, index) => {
                 const source = input.tasks[index];
                 const crew = task.crew.map(member => member.name).join(", ") || "unassigned";
-                return `${index + 1}. ${source.name.trim()} — ${source.startDate} to ${source.endDate}; crew: ${crew}${task.lead ? `; lead: ${task.lead.name}` : ""}`;
+                // Confirmations speak the user's dates: End is the last day of work.
+                return `${index + 1}. ${source.name.trim()} — ${source.startDate} to ${displayEndDate(source.startDate, source.endDate, source.type)}; crew: ${crew}${task.lead ? `; lead: ${task.lead.name}` : ""}`;
             }),
         ].join("\n");
         return issueConfirmation("plan_schedule", args, preview, actorLabel);

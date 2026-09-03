@@ -5,7 +5,7 @@ import {
     UNEXPECTED_SCHEDULE_TASK_ERROR,
     toScheduleTaskFailure,
 } from "@/lib/schedule-task-result";
-import { UPDATE_LEGACY_ROWS, SELECT_LEGACY_ROWS, SELECT_REVIEW_ROWS, EXTEND_ROW } from "../scripts/apply-schedule-task-exclusive-end.mjs";
+import { UPDATE_LEGACY_ROWS, SELECT_LEGACY_ROWS, SELECT_REVIEW_ROWS, EXTEND_ROW, UPDATE_MILESTONE_ROWS } from "../scripts/apply-schedule-task-exclusive-end.mjs";
 
 test("ScheduleTaskValidationError carries the VALIDATION code and its own name", () => {
     const err = new ScheduleTaskValidationError("Task end date must be after its start date");
@@ -25,6 +25,10 @@ test("the backfill UPDATE only targets non-milestone rows with end <= start", ()
         assert.match(sql, /"projectId"\s+IS NOT NULL/);
         assert.match(sql, /<>\s*'milestone'/);
     }
+    // Milestones normalize to end == start, project tasks only.
+    assert.match(UPDATE_MILESTONE_ROWS, /SET\s+"endDate"\s*=\s*"startDate"/);
+    assert.match(UPDATE_MILESTONE_ROWS, /"type"\s*=\s*'milestone'/);
+    assert.match(UPDATE_MILESTONE_ROWS, /"projectId"\s+IS NOT NULL/);
     // Compare-and-set: one row by id, only while it still shows the reviewed End.
     assert.match(EXTEND_ROW, /"id"\s*=\s*\$1/);
     assert.match(EXTEND_ROW, /"endDate"\s*=\s*\(\$2::date\s*\+\s*interval\s*'1 day'\)/);

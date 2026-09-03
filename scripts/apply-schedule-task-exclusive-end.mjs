@@ -8,7 +8,9 @@
 // the UPDATE for real, inside a transaction.
 //
 //   node scripts/apply-schedule-task-exclusive-end.mjs           (dry run)
-//   node scripts/apply-schedule-task-exclusive-end.mjs --yes     (apply)
+//   node scripts/apply-schedule-task-exclusive-end.mjs --yes     (apply the legacy repair)
+//   node scripts/apply-schedule-task-exclusive-end.mjs --yes --extend <id>:<shownEnd>,<id>:<shownEnd>
+//                                                              (also extend reviewed rows; tokens come from the dry-run review list)
 //
 // Idempotent: re-running after a successful apply finds zero matching rows.
 import { PrismaClient } from "@prisma/client";
@@ -31,6 +33,19 @@ export const UPDATE_LEGACY_ROWS = `
     UPDATE "ScheduleTask"
     SET "endDate" = "startDate" + interval '1 day'
     WHERE "projectId" IS NOT NULL AND "type" <> 'milestone' AND "endDate" <= "startDate"`;
+
+// Milestones store end == start (schedule-task-core forces it on every update;
+// the estimate/change-order generators used to write start + 1 day).
+export const SELECT_MILESTONE_ROWS = `
+    SELECT "id", "name", "projectId", "startDate", "endDate"
+    FROM "ScheduleTask"
+    WHERE "projectId" IS NOT NULL AND "type" = 'milestone' AND "endDate" <> "startDate"
+    ORDER BY "startDate" ASC`;
+
+export const UPDATE_MILESTONE_ROWS = `
+    UPDATE "ScheduleTask"
+    SET "endDate" = "startDate"
+    WHERE "projectId" IS NOT NULL AND "type" = 'milestone' AND "endDate" <> "startDate"`;
 
 // Human-curated correction for multi-day tasks whose End was typed into the
 // old inclusive Calendar view: `--extend <id>:<shownEnd>,...` adds one day to
@@ -84,6 +99,9 @@ async function main() {
             );
         }
 
+        const milestones = await prisma.$queryRawUnsafe(SELECT_MILESTONE_ROWS);
+        console.log(`found ${milestones.length} milestone(s) with "endDate" <> "startDate" (will be set to start)`);
+
         const review = await prisma.$queryRawUnsafe(SELECT_REVIEW_ROWS);
         console.log(`\nreview: ${review.length} current/upcoming multi-day task(s). If a task's End was last set in the Calendar view before 2026-09-03, its shown End is now one day earlier than intended. Re-run with --extend <token,token,...> using the tokens below for the ones a human confirms:`);
         for (const row of review) {
@@ -109,8 +127,9 @@ async function main() {
             return;
         }
 
-        const { applied, extended } = await prisma.$transaction(async (tx) => {
+        const { applied, milestonesFixed, extended } = await prisma.$transaction(async (tx) => {
             const applied = await tx.$executeRawUnsafe(UPDATE_LEGACY_ROWS);
+            const milestonesFixed = await tx.$executeRawUnsafe(UPDATE_MILESTONE_ROWS);
             let extended = 0;
             for (const { id, shownEnd } of extendPairs) {
                 const n = await tx.$executeRawUnsafe(EXTEND_ROW, id, shownEnd);
@@ -119,9 +138,10 @@ async function main() {
                 }
                 extended += n;
             }
-            return { applied, extended };
+            return { applied, milestonesFixed, extended };
         });
         console.log(`applied: ${applied} rows`);
+        console.log(`applied: ${milestonesFixed} milestone(s) normalized to end == start`);
         if (extendPairs.length) console.log(`extended: ${extended} task(s) by one day`);
     } finally {
         await prisma.$disconnect();

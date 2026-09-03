@@ -4415,9 +4415,13 @@ async function assertScheduleProjectAccess(projectId: string) {
 }
 
 async function assertScheduleTaskAccess(taskId: string) {
+    // Authenticate BEFORE touching the row, and answer "Task not found" for
+    // any task outside the caller's scope, so the result contract never
+    // reveals whether an id exists to someone who may not see it.
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "schedules")) throw new Error("Forbidden");
     const task = await prisma.scheduleTask.findUnique({ where: { id: taskId }, select: { projectId: true } });
-    if (!task?.projectId) throw new Error("Task not found");
-    const user = await assertScheduleProjectAccess(task.projectId);
+    if (!task?.projectId || !canAccessProject(user, task.projectId)) throw new Error("Task not found");
     return { user, projectId: task.projectId };
 }
 
