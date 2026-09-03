@@ -57,6 +57,10 @@ function deps(overrides: {
         resolveTimeZone: async () => "America/Los_Angeles",
         // The frozen-file read (round 10, finding 4). These cases are about the
         // LIVE path; a snapshot short-circuits before it, so there is none here.
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => null,
         load: async () => {
             overrides.onLoad?.();
@@ -208,6 +212,10 @@ test("a lock is found by its STABLE day keys, not by reconstructed timestamps", 
         resolveTimeZone: async () => "America/New_York",
         // The frozen-file read (round 10, finding 4). These cases are about the
         // LIVE path; a snapshot short-circuits before it, so there is none here.
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => null,
         load: async (periodStart, _periodEnd, keys) => {
             seen.push({ start: periodStart, keys });
@@ -241,6 +249,10 @@ test("the loader is always given the request's day keys, on the live path too", 
         resolveTimeZone: async () => "America/Los_Angeles",
         // The frozen-file read (round 10, finding 4). These cases are about the
         // LIVE path; a snapshot short-circuits before it, so there is none here.
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => null,
         load: async (_s, _e, keys) => {
             seen.push(keys);
@@ -280,6 +292,10 @@ test("the zone the boundaries were built from is the zone the loader is given", 
         },
         // The frozen-file read (round 10, finding 4). These cases are about the
         // LIVE path; a snapshot short-circuits before it, so there is none here.
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => null,
         load: async (periodStart, periodEnd, keys) => {
             seen.push({ start: periodStart, end: periodEnd, timeZone: keys.timeZone });
@@ -316,6 +332,10 @@ test("a locked period whose frozen CSVs are missing is a 409, never live data", 
         resolveTimeZone: async () => "America/Los_Angeles",
         // The frozen-file read (round 10, finding 4). These cases are about the
         // LIVE path; a snapshot short-circuits before it, so there is none here.
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => null,
         load: async () => {
             throw new LockedSnapshotMissingError("2026-08-17", "2026-08-31");
@@ -339,6 +359,10 @@ test("an unrelated loader failure is NOT swallowed into that 409", async () => {
         resolveTimeZone: async () => "America/Los_Angeles",
         // The frozen-file read (round 10, finding 4). These cases are about the
         // LIVE path; a snapshot short-circuits before it, so there is none here.
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => null,
         load: async () => {
             throw new Error("connection terminated");
@@ -417,6 +441,10 @@ test("a complete snapshot is served while EVERY live dependency throws", async (
             loadedLive += 1;
             return EXPLODE();
         },
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => ({ summaryCsv: "FROZEN-S", detailCsv: "FROZEN-D", exportHash: "frozen" }),
     });
 
@@ -436,6 +464,10 @@ test("the detail format comes off the same frozen row, with the same live deps d
         authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
         resolveTimeZone: EXPLODE,
         load: EXPLODE,
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => ({ summaryCsv: "FROZEN-S", detailCsv: "FROZEN-D", exportHash: "frozen" }),
     });
     const res = await handler.GET(url("periodStart=2026-08-17&periodEnd=2026-08-31&format=detail"));
@@ -454,6 +486,10 @@ test("an INCOMPLETE snapshot is still 409 - and still never reaches live state",
             return EXPLODE();
         },
         load: EXPLODE,
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => {
             throw new LockedSnapshotMissingError("2026-08-17", "2026-08-31");
         },
@@ -481,6 +517,10 @@ test("with NO frozen row the live path runs exactly as before - the control", as
             loadedLive += 1;
             return loaded();
         },
+        // The live read runs under the payroll advisory lock (round 16,
+        // finding 2). A pass-through here: these cases exercise the
+        // handler's ORDER, and the DB test proves the lock itself.
+        withPayrollReadLock: <T,>(body: () => Promise<T>) => body(),
         loadSnapshot: async () => null,
     });
 

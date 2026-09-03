@@ -32,6 +32,10 @@ import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 
 const root = process.cwd();
+
+/** Only the documented-command case needs a database; everything else is pure. */
+const databaseUrl = process.env.PAYROLL_LOCK_TEST_URL;
+const skip = !databaseUrl && "set PAYROLL_LOCK_TEST_URL to a disposable PostgreSQL URL";
 const SCRIPT = path.join(root, "scripts", "apply-payroll-phase5.mjs");
 
 /** A URL that is unmistakably NOT production. */
@@ -269,8 +273,15 @@ test("the identity line is REDACTED — it goes into deploy notes", async () => 
 // Through the real script: the flag, and dotenv's precedence
 // ---------------------------------------------------------------------------
 
+/**
+ * Run the script. `args` may start with its own path (the documented-command
+ * cases pass the whole line through), in which case that path is used - so a
+ * case can prove the DOCUMENTED path is the one that exists.
+ */
 function run(args: string[], env: Record<string, string>) {
-    const result = spawnSync(process.execPath, [SCRIPT, ...args], {
+    const [first, ...rest] = args;
+    const spawned = first && first.endsWith(".mjs") ? [path.join(root, first), ...rest] : [SCRIPT, ...args];
+    const result = spawnSync(process.execPath, spawned, {
         cwd: root,
         env: { ...process.env, ...env },
         encoding: "utf8",
@@ -285,6 +296,81 @@ function assertExecutedNothing(out: string) {
     assert.ok(!/seeded \d+ user/.test(out), `it reached the seed:\n${out}`);
 }
 
+// ---------------------------------------------------------------------------
+// The DOCUMENTED invocation actually works (round 16, finding 1)
+// ---------------------------------------------------------------------------
+
+test("every env var the documentation names is one the script READS", async () => {
+    // THE BUG. The PR body told Justin to export
+    // `PAYROLL_APPLY_EXPECT_PROJECT_REF`; the script read
+    // `APPLY_EXPECT_PROJECT_REF`. Both spellings looked right in isolation, so
+    // the deploy command could not have succeeded and nothing would have said
+    // why — the refusal would have been "the project ref is not set" while the
+    // operator was looking at the line where they set it.
+    const { PROJECT_REF_ENV, PROD_DEPLOY_COMMANDS, TARGET_USAGE } = await script();
+    const source = readFileSync(SCRIPT, "utf8");
+
+    const documented = new Set<string>();
+    for (const text of [...PROD_DEPLOY_COMMANDS, TARGET_USAGE]) {
+        // SCREAMING_SNAKE with at least one underscore: an env var, not a
+        // shouted word like ONLY or REFUSES.
+        for (const name of String(text).match(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g) ?? []) documented.add(name);
+    }
+    assert.ok(documented.has(PROJECT_REF_ENV), "the docs must name the project-ref variable at all");
+    assert.ok(documented.has("DATABASE_URL"));
+
+    for (const name of documented) {
+        // Read through the shared constant, or by name. Either is a real read;
+        // a name that appears in NEITHER is a variable the operator sets and
+        // the script never looks at.
+        const read =
+            source.includes(`env.${name}`) ||
+            source.includes(`env[${name}]`) ||
+            source.includes(`process.env.${name}`) ||
+            source.includes(`= "${name}"`);
+        assert.ok(read, `${name} is documented but the script never reads it`);
+    }
+
+    // ...and the old spelling is gone from the script entirely, except where
+    // the comment explains what happened.
+    const code = source.replace(/^\s*\*.*$/gm, "");
+    assert.ok(!/PAYROLL_APPLY_EXPECT/.test(code), "the old env name must not survive in code");
+});
+
+test("the DOCUMENTED command runs — verbatim, against the throwaway database", { skip }, async () => {
+    // Not "the string looks right": the exact documented invocation, with only
+    // `prod` swapped for `ci` (there is no production database to point at from
+    // a test, and `--target prod` would refuse an ambient URL by design). Every
+    // other token — the script path, the flag order, the env var — is the one
+    // the PR body tells Justin to type.
+    const { PROD_DEPLOY_COMMANDS, PROJECT_REF_ENV } = await script();
+
+    const applyLine = PROD_DEPLOY_COMMANDS.find(
+        (line: string) => line.includes("--target prod") && !line.includes("--dry-run")
+    );
+    const dryRunLine = PROD_DEPLOY_COMMANDS.find((line: string) => line.includes("--dry-run"));
+    assert.ok(applyLine && dryRunLine, "the documented commands must include an apply and a dry run");
+
+    const toArgs = (line: string) =>
+        line
+            .replace(/^node /, "")
+            .replace("--target prod", "--target ci")
+            .split(" ")
+            .filter(Boolean);
+
+    // The project ref is set the way the docs say to set it. For `--target ci`
+    // it is not consulted, which is itself worth pinning: an operator who
+    // exports it and then runs a non-prod target must not be refused for it.
+    const env = { [PROJECT_REF_ENV]: "ghzdbzdnwjxazvmcefbh", DATABASE_URL: databaseUrl!, DIRECT_URL: databaseUrl! };
+
+    const applied = run(toArgs(applyLine!), env);
+    assert.equal(applied.status, 0, applied.out);
+    assert.match(applied.out, /target=ci/);
+
+    const dry = run(toArgs(dryRunLine!), env);
+    assert.equal(dry.status, 0, dry.out);
+    assert.match(dry.out, /nothing to do/, dry.out);
+});
 test("the end-to-end driver is WIRED, and refuses a hosted database", () => {
     // The driver is the only thing that ever executes the apply script's
     // main() over a database it has to BUILD. A step that quietly stops

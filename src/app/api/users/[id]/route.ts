@@ -141,10 +141,17 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // opened and the route answered 200 with the values unchanged — the save
         // silently did nothing (round 13, finding 2). The same predicate the
         // rate writer itself uses now decides it.
+        //
+        // `projectIds` is in the list for the same reason, one round later: a
+        // PROJECT-ONLY body skipped the guarded transaction entirely and wrote
+        // project access with no authority check of any kind (round 16,
+        // finding 4). Deciding which jobs somebody can see is a permission
+        // change; it belongs behind the same locks as every other one.
         if (
             Object.keys(data).length > 0 ||
             Object.keys(sanitizedPermissions).length > 0 ||
-            touchesPayrollRateState(rateChange)
+            touchesPayrollRateState(rateChange) ||
+            projectIds !== undefined
         ) {
             try {
                 await prisma.$transaction(async (tx) => {
@@ -204,6 +211,60 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                                     update: sanitizedPermissions,
                                 });
                             }
+                            // PROJECT ACCESS, in the SAME transaction as the
+                            // authority check.
+                            //
+                            // It used to run in its own `prisma.$transaction`
+                            // AFTER this one had committed, and a project-only
+                            // body never opened this one at all — so which jobs a
+                            // person can see was writable by an actor who had
+                            // been demoted, disabled or reset to PENDING, and on
+                            // a target who had become an ADMIN, in the gap
+                            // (round 16, finding 4). `target` is the row this
+                            // transaction locked FOR UPDATE.
+                            if (projectIds !== undefined) {
+                                const newIdSet = new Set(projectIds as string[]);
+                                // Read the current state INSIDE the transaction,
+                                // under the target lock — the diff below decides
+                                // what to disconnect, so reading it outside meant
+                                // diffing against a row somebody else could have
+                                // moved.
+                                const current = await tx.user.findUnique({
+                                    where: { id },
+                                    select: {
+                                        projectAccess: { select: { projectId: true } },
+                                        assignedProjects: { select: { id: true } },
+                                    },
+                                });
+                                const oldAccessIds = new Set(current?.projectAccess.map((pa) => pa.projectId) || []);
+                                const oldCrewIds = new Set(current?.assignedProjects.map((project) => project.id) || []);
+
+                                // Only connect/disconnect what changed via Team
+                                // Access — an untouched crew assignment stays.
+                                const toConnect = (projectIds as string[]).filter((pid) => !oldCrewIds.has(pid));
+                                const toDisconnect = [...oldAccessIds].filter(
+                                    (pid) => !newIdSet.has(pid) && oldCrewIds.has(pid)
+                                );
+
+                                await tx.projectAccess.deleteMany({ where: { userId: id } });
+                                if ((projectIds as string[]).length > 0) {
+                                    await tx.projectAccess.createMany({
+                                        data: (projectIds as string[]).map((pid) => ({ userId: id, projectId: pid })),
+                                        skipDuplicates: true,
+                                    });
+                                }
+                                if (toConnect.length > 0 || toDisconnect.length > 0) {
+                                    await tx.user.update({
+                                        where: { id },
+                                        data: {
+                                            assignedProjects: {
+                                                connect: toConnect.map((pid) => ({ id: pid })),
+                                                disconnect: toDisconnect.map((pid) => ({ id: pid })),
+                                            },
+                                        },
+                                    });
+                                }
+                            }
                         }
                     );
                 });
@@ -230,47 +291,6 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 const { autoAssignProjectsOnUserChange } = await import("@/lib/crew-auto-assign-sync");
                 after(() => autoAssignProjectsOnUserChange(id, { role: data.role, status: data.status }));
             }
-        }
-
-        // Update project access AND crew assignments if provided
-        if (projectIds !== undefined) {
-            const newIdSet = new Set(projectIds as string[]);
-
-            // Read current state to compute diffs
-            const currentUser = await prisma.user.findUnique({
-                where: { id },
-                select: {
-                    projectAccess: { select: { projectId: true } },
-                    assignedProjects: { select: { id: true } },
-                },
-            });
-            const oldAccessIds = new Set(currentUser?.projectAccess.map(pa => pa.projectId) || []);
-            const oldCrewIds = new Set(currentUser?.assignedProjects.map(p => p.id) || []);
-
-            // Compute crew diffs: only connect/disconnect what changed via Team Access
-            const toConnect = projectIds.filter((pid: string) => !oldCrewIds.has(pid));
-            const toDisconnect = [...oldAccessIds].filter(pid => !newIdSet.has(pid) && oldCrewIds.has(pid));
-
-            await prisma.$transaction([
-                prisma.projectAccess.deleteMany({ where: { userId: id } }),
-                ...(projectIds.length > 0
-                    ? [prisma.projectAccess.createMany({
-                        data: projectIds.map((pid: string) => ({ userId: id, projectId: pid })),
-                        skipDuplicates: true,
-                    })]
-                    : []),
-                ...(toConnect.length > 0 || toDisconnect.length > 0
-                    ? [prisma.user.update({
-                        where: { id },
-                        data: {
-                            assignedProjects: {
-                                connect: toConnect.map((pid: string) => ({ id: pid })),
-                                disconnect: toDisconnect.map(pid => ({ id: pid })),
-                            },
-                        },
-                    })]
-                    : []),
-            ]);
         }
 
         // Fetch updated user

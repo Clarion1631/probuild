@@ -334,8 +334,23 @@ export function checkActorUsable(actor: LockedUserRow | null): UserMutationVerdi
     if (!actor) {
         return { ok: false, status: 403, error: "Your account no longer exists." };
     }
-    if (actor.status === "DISABLED") {
-        return { ok: false, status: 403, error: "Your account has been disabled." };
+    // POSITIVE: the account must BE activated, not merely "not disabled".
+    //
+    // The denylist version let a PENDING account through (round 16,
+    // finding 3) — an invited-but-never-activated row, which is exactly what
+    // every create in this app produces, and what an admin revoking access by
+    // resetting somebody to PENDING would produce too. USER_STATUSES has three
+    // members and only one of them means "may act"; naming the other two is
+    // how the third one gets forgotten.
+    if (actor.status !== "ACTIVATED") {
+        return {
+            ok: false,
+            status: 403,
+            error:
+                actor.status === "DISABLED"
+                    ? "Your account has been disabled."
+                    : "Your account is not activated.",
+        };
     }
     return { ok: true };
 }

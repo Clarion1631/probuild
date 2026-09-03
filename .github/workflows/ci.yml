@@ -291,6 +291,18 @@ jobs:
           # pgbouncer reasoning as the rate-lock step above.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # The DOCUMENTED deploy command, RUN. The PR body told Justin to export
+      # PAYROLL_APPLY_EXPECT_PROJECT_REF while the script read
+      # APPLY_EXPECT_PROJECT_REF, so the command in the deploy procedure could
+      # not have succeeded and the refusal would have named the variable he was
+      # looking at (round 16, finding 1). This parses the invocation out of the
+      # script's own exported constant and runs it, with only `prod` swapped for
+      # `ci`, so the documentation cannot drift away from something that works.
+      - name: Prove the documented deploy command actually runs
+        run: npx tsx --test tests/payroll-apply-target.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # THE SCRIPT ITSELF, run end to end — the one thing nothing else did.
       #
       # The parity test reads it as text, the drift tests import its pure

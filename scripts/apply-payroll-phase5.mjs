@@ -96,7 +96,7 @@ export function expectedProdIdentity(env = {}) {
         // connection that actually identifies WHICH Supabase project this is,
         // and a default would be a guess about production baked into the repo.
         // Unset is a refusal, not a pass.
-        projectRef: env.APPLY_EXPECT_PROJECT_REF || null,
+        projectRef: env[PROJECT_REF_ENV] || null,
         baseline: PROD_BASELINE_MIGRATION,
     };
 }
@@ -131,10 +131,37 @@ export function projectRefFromUrl(raw) {
     return host ? host[1] : null;
 }
 
+/**
+ * The env var naming the production Supabase project. SHARED across all five
+ * apply scripts, so an operator sets it once.
+ *
+ * A CONSTANT rather than a string typed out in several places, because it was
+ * typed out in several places and one of them disagreed: the PR body told
+ * Justin to export PAYROLL_APPLY_EXPECT_PROJECT_REF while the script read
+ * APPLY_EXPECT_PROJECT_REF, so the documented deploy command could not have
+ * succeeded (round 16, finding 1). The usage banner, the refusals and the
+ * documented invocation below are all built from THIS.
+ */
+export const PROJECT_REF_ENV = "APPLY_EXPECT_PROJECT_REF";
+
+/**
+ * THE documented invocation, verbatim.
+ *
+ * The PR body quotes this, and tests/payroll-apply-target.test.ts RUNS it
+ * (with --target ci, against the throwaway database) rather than eyeballing
+ * it — a deploy command that is only ever read cannot be known to work.
+ */
+export const PROD_DEPLOY_COMMANDS = [
+    "export " + PROJECT_REF_ENV + "=<production project ref>",
+    "node scripts/apply-payroll-phase5.mjs --target prod",
+    "node scripts/apply-payroll-phase5.mjs --target prod --dry-run",
+];
+
 export const TARGET_USAGE =
     "usage: node scripts/apply-payroll-phase5.mjs --target <prod|local|ci> [--dry-run]\n" +
     "  --target prod   reads DATABASE_URL from .env.production.local ONLY (an ambient one is ignored)\n" +
-    "  --target <name> uses the ordinary .env.local/.env chain, and REFUSES if that points at production";
+    "  --target prod   also requires " + PROJECT_REF_ENV + " (the Supabase project ref)\n" +
+    "  --target <name> uses the ordinary .env.local/.env chain, and REFUSES any Supabase host";
 
 /** The target this invocation names. There is no default — a guess is the bug. */
 export function parseTarget(argv = process.argv) {
@@ -195,7 +222,7 @@ export function verifyTarget({ target, url, database, hasBaseline, env = {} }) {
         if (!expect.projectRef) {
             return {
                 ok: false,
-                error: "REFUSING: APPLY_EXPECT_PROJECT_REF is not set. It is the only part of the connection that identifies WHICH Supabase project this is (pooler hosts are shared across a whole region), so --target prod cannot be verified without it. Set it to the production project ref.",
+                error: `REFUSING: ${PROJECT_REF_ENV} is not set. It is the only part of the connection that identifies WHICH Supabase project this is (pooler hosts are shared across a whole region), so --target prod cannot be verified without it. Set it to the production project ref.`,
             };
         }
         if (!ref) {
@@ -207,7 +234,7 @@ export function verifyTarget({ target, url, database, hasBaseline, env = {} }) {
         if (ref !== expect.projectRef) {
             return {
                 ok: false,
-                error: `REFUSING: this connection is Supabase project "${ref}", and APPLY_EXPECT_PROJECT_REF says production is "${expect.projectRef}". Same pooler host and same database name mean nothing here — pooler hosts are shared across a region.`,
+                error: `REFUSING: this connection is Supabase project "${ref}", and ${PROJECT_REF_ENV} says production is "${expect.projectRef}". Same pooler host and same database name mean nothing here — pooler hosts are shared across a region.`,
             };
         }
         if (!looksProduction) {

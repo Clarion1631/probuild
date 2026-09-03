@@ -37,6 +37,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 const databaseUrl = process.env.PAYROLL_LOCK_TEST_URL;
 const skip = !databaseUrl && "set PAYROLL_LOCK_TEST_URL to a disposable PostgreSQL URL";
@@ -490,4 +492,158 @@ test("a manager editing THEMSELVES takes one lock, not two — and is still refu
         await restore();
         await db.$disconnect();
     }
+});
+
+// -- A PENDING actor is not an authorized actor (round 16, finding 3) -------
+
+test("PENDING mid-flight: refused — 'not disabled' was never the same as 'activated'", { skip }, async () => {
+    // checkActorUsable rejected only DISABLED. PENDING is the status EVERY
+    // create in this app produces, and it is what an admin revoking access by
+    // resetting somebody produces too — so an account that had been put back to
+    // 'invited, not yet activated' kept every authority it had a moment before.
+    const changer = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const writer = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const { actor, target, restore } = await seed(changer, "pending");
+    try {
+        const staged = stageActorChange(changer, actor.id, { user: { status: "PENDING" } });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        const write = guardedStatusWrite(writer, actor.id, target.id);
+        assert.equal(await stillPending(write, 700), true, "the write must wait on the actor's row");
+
+        staged.release();
+        await staged.running;
+
+        const verdict = await refusal(write);
+        assert.equal(verdict.status, 403, verdict.message);
+        assert.match(verdict.message, /not activated/i);
+
+        const after = await changer.user.findUnique({ where: { id: target.id }, select: { status: true } });
+        assert.equal(after?.status, "ACTIVATED", "a refusal is not a partial write");
+    } finally {
+        await restore();
+        await Promise.all([changer.$disconnect(), writer.$disconnect()]);
+    }
+});
+
+test("the status check is POSITIVE — every non-ACTIVATED status is refused", async () => {
+    // A denylist of two is correct until the third status exists. USER_STATUSES
+    // has three members and exactly one means 'may act'.
+    const { checkActorUsable } = await import("../src/lib/user-mutation-guard");
+    const { USER_STATUSES } = await import("../src/lib/user-mutation-guard");
+    for (const status of USER_STATUSES) {
+        const verdict = checkActorUsable({ id: "u1", role: "MANAGER", status });
+        assert.equal(verdict.ok, status === "ACTIVATED", status);
+    }
+    // ...including one nobody has added yet.
+    assert.equal(checkActorUsable({ id: "u1", role: "MANAGER", status: "SUSPENDED" }).ok, false);
+    assert.equal(checkActorUsable(null).ok, false);
+});
+
+// -- Project access is a permission change (round 16, finding 4) -----------
+
+/** A project-access write through the REAL guard, as PUT /api/users/[id] drives it. */
+async function guardedProjectWrite(db: PrismaClient, actorId: string, targetId: string, projectIds: string[]) {
+    const { withGuardedUserMutation } = await import("../src/lib/user-mutation-guard");
+    return db.$transaction(
+        async (tx) =>
+            withGuardedUserMutation(tx as never, { actorId, targetId, changes: {} }, async () => {
+                await tx.projectAccess.deleteMany({ where: { userId: targetId } });
+                if (projectIds.length > 0) {
+                    await tx.projectAccess.createMany({
+                        data: projectIds.map((projectId) => ({ userId: targetId, projectId })),
+                        skipDuplicates: true,
+                    });
+                }
+            }),
+        { timeout: 30_000 }
+    );
+}
+
+test("PROJECT ACCESS: a demoted, disabled or PENDING actor writes nothing", { skip }, async () => {
+    // It used to run in its own transaction AFTER the guarded one, and a
+    // project-only body never opened the guarded one at all — so which jobs a
+    // person can see was writable with no authority check of any kind.
+    const changer = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const writer = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    for (const [label, patch] of [
+        ["demoted", { user: { role: "FIELD_CREW" } }],
+        ["disabled", { user: { status: "DISABLED" } }],
+        ["pending", { user: { status: "PENDING" } }],
+    ] as const) {
+        const { actor, target, restore } = await seed(changer, `project-${label}`);
+        try {
+            const staged = stageActorChange(changer, actor.id, patch);
+            await new Promise((resolve) => setTimeout(resolve, 200));
+
+            const write = guardedProjectWrite(writer, actor.id, target.id, []);
+            assert.equal(await stillPending(write, 700), true, label);
+            staged.release();
+            await staged.running;
+
+            const verdict = await refusal(write);
+            assert.equal(verdict.status, 403, `${label}: ${verdict.message}`);
+        } finally {
+            await restore();
+        }
+    }
+    await Promise.all([changer.$disconnect(), writer.$disconnect()]);
+});
+
+test("PROJECT ACCESS: a target promoted to ADMIN mid-flight refuses a manager", { skip }, async () => {
+    // The target half, on the project path — round 12's fix reached the profile
+    // writes but not this one, because this one was not in the transaction.
+    const promoter = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const writer = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const { actor, target, restore } = await seed(promoter, "project-target");
+    try {
+        const staged = stageActorChange(promoter, target.id, { user: { role: "ADMIN" } });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        const write = guardedProjectWrite(writer, actor.id, target.id, []);
+        assert.equal(await stillPending(write, 700), true);
+        staged.release();
+        await staged.running;
+
+        const verdict = await refusal(write);
+        assert.equal(verdict.status, 403, verdict.message);
+        assert.match(verdict.message, /admin/i);
+    } finally {
+        await restore();
+        await Promise.all([promoter.$disconnect(), writer.$disconnect()]);
+    }
+});
+
+test("PROJECT ACCESS CONTROL: an undisturbed manager still writes it", { skip }, async () => {
+    // Without this every refusal above could be a path that never works.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const { actor, target, restore } = await seed(db, "project-ok");
+    try {
+        await guardedProjectWrite(db, actor.id, target.id, []);
+        assert.equal(await db.projectAccess.count({ where: { userId: target.id } }), 0);
+    } finally {
+        await restore();
+        await db.$disconnect();
+    }
+});
+
+test("a project-only PUT body goes through the guard at all", () => {
+    // The route-level half: the condition that decides whether the guarded
+    // transaction opens must include `projectIds`, or a body carrying only
+    // project ids skips every check above.
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "users", "[id]", "route.ts"),
+        "utf8"
+    );
+    assert.match(source, /projectIds !== undefined\s*\n?\s*\) \{/, "the guard must open for a project-only body");
+    // And the writes are INSIDE the guarded closure, not in a second
+    // transaction after it.
+    const guarded = source.slice(source.indexOf("withGuardedUserMutation("));
+    const closure = guarded.slice(0, guarded.indexOf("} catch (error) {"));
+    assert.match(closure, /tx\.projectAccess\.deleteMany/, "project access must be written on the guarded tx");
+    assert.match(closure, /tx\.projectAccess\.createMany/);
+    assert.ok(
+        !/prisma\.projectAccess\./.test(source),
+        "no project-access write may run on the singleton, outside the guard"
+    );
 });

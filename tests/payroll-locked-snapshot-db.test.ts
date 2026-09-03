@@ -32,6 +32,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { startOfDateInTimeZone } from "../src/lib/tz-date";
 
 const databaseUrl = process.env.PAYROLL_LOCK_TEST_URL;
 const skip = !databaseUrl && "set PAYROLL_LOCK_TEST_URL to a disposable PostgreSQL URL";
@@ -148,13 +151,30 @@ async function seed(db: PrismaClient, suffix: string) {
     };
 }
 
-/** The real endpoint, wired to the real loader against this database. */
-async function handlerFor(db: PrismaClient) {
+/**
+ * The real endpoint, wired to the real loader against this database.
+ *
+ * `beforeLiveRead` runs while the handler HOLDS the payroll advisory lock,
+ * just before it re-checks for a frozen row — the instant the round-16
+ * finding-2 race lives in.
+ */
+async function handlerFor(db: PrismaClient, beforeLiveRead?: () => Promise<void>) {
     const { createGustoExportHandler } = await import("../src/app/api/time-entries/export/gusto/route");
     const { loadGustoExport, loadLockedSnapshot } = await import("../src/lib/gusto-export-db");
+    const { acquirePayrollWriteLock } = await import("../src/lib/payroll-period");
     return createGustoExportHandler({
         authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
         resolveTimeZone: async () => TZ,
+        // The REAL lock, on this database.
+        withPayrollReadLock: (body) =>
+            db.$transaction(
+                async (tx) => {
+                    await acquirePayrollWriteLock(tx);
+                    if (beforeLiveRead) await beforeLiveRead();
+                    return body();
+                },
+                { timeout: 30_000, maxWait: 20_000 }
+            ),
         // The real frozen-file read, against this database — the endpoint tries
         // it before it touches any live input (round 10, finding 4).
         loadSnapshot: (keys) => loadLockedSnapshot(keys.startKey, keys.endKey, db),
@@ -499,4 +519,177 @@ test("loadLockedSnapshot reads ONE row — it is null for an unlocked period and
         await seeded.restore();
         await db.$disconnect().catch(() => {});
     }
+});
+
+// -- A live download racing a period lock (round 16, finding 2) -------------
+//
+// The endpoint checked for a frozen row, found none, and then spent the rest
+// of the request reading live data with NOTHING held. A lockPayrollPeriod
+// committing in that window meant the bytes going out said
+// `X-Export-Source: live` for a period that was, by then, locked and frozen
+// around different numbers — the one file payroll was actually paid from,
+// contradicted by a download that looked authoritative.
+//
+// The live path now runs under the payroll advisory lock in SHARE mode and
+// re-asks for the frozen row before it reads anything live.
+
+const RACED = {
+    exportHash: "racedhash",
+    summaryCsvSnapshot: "RACED-SUMMARY\n",
+    detailCsvSnapshot: "RACED-DETAIL\n",
+};
+
+/** Freeze the period on `db`, the way a lock that won the race leaves it. */
+async function freezePeriod(db: PrismaClient) {
+    await db.payrollPeriod.create({
+        data: {
+            periodStartKey: START_KEY,
+            periodEndKey: END_KEY,
+            periodStart: new Date(`${START_KEY}T08:00:00.000Z`),
+            periodEnd: new Date(`${END_KEY}T08:00:00.000Z`),
+            timeZone: TZ,
+            lockedAt: new Date(),
+            ...RACED,
+        },
+    });
+}
+
+const dropPeriod = (db: PrismaClient) =>
+    db.payrollPeriod
+        .deleteMany({ where: { periodStartKey: START_KEY, periodEndKey: END_KEY } })
+        .catch(() => {});
+
+test("a lock committing mid-download makes the response the SNAPSHOT, not live", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const locker = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const { restore } = await seed(db, "race");
+    try {
+        let raced = false;
+        // The lock is staged to commit at the exact instant the handler holds
+        // the shared lock and is about to re-check — the window the race lives
+        // in. It commits on a SECOND connection.
+        const handler = await handlerFor(db, async () => {
+            if (raced) return;
+            raced = true;
+            await freezePeriod(locker);
+        });
+
+        const res = await handler.GET(request());
+        assert.equal(raced, true, "the race must actually have been staged");
+        assert.equal(res.status, 200);
+        // THE point: the frozen bytes, not a recomputed live CSV.
+        assert.equal(res.headers.get("x-export-source"), "snapshot");
+        assert.equal(res.headers.get("x-export-hash"), RACED.exportHash);
+        assert.equal(await res.text(), RACED.summaryCsvSnapshot);
+    } finally {
+        await dropPeriod(locker);
+        await restore();
+        await Promise.all([db.$disconnect(), locker.$disconnect()]);
+    }
+});
+
+test("PRE-FIX CONTROL: the old sequence serves LIVE bytes for a locked period", { skip }, async () => {
+    // The vulnerable order, written out: ask once, then build the file with
+    // nothing held. Without this the case above could be passing on a race that
+    // never actually lands in the window.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const locker = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const { restore } = await seed(db, "race-prefix");
+    try {
+        const { loadGustoExport, loadLockedSnapshot } = await import("../src/lib/gusto-export-db");
+
+        // 1. The check. Nothing is locked yet, so this is null — and under the
+        //    old code that answer was final for the rest of the request.
+        assert.equal(await loadLockedSnapshot(START_KEY, END_KEY, db), null);
+
+        // 2. The lock commits, in full, in the gap.
+        await freezePeriod(locker);
+
+        // 3. The live read proceeds anyway, because nothing was held.
+        const live = await loadGustoExport(
+            startOfDateInTimeZone(START_KEY, TZ),
+            startOfDateInTimeZone(END_KEY, TZ),
+            { startKey: START_KEY, endKey: END_KEY, timeZone: TZ, client: db }
+        );
+
+        // The period IS locked now, and the bytes the old path would have sent
+        // are NOT the bytes payroll was paid from. That disagreement is the bug.
+        const frozen = await loadLockedSnapshot(START_KEY, END_KEY, db);
+        assert.ok(frozen, "the period really did get locked in the gap");
+        assert.equal(frozen!.summaryCsv, RACED.summaryCsvSnapshot);
+        assert.notEqual(
+            live.summaryCsv,
+            frozen!.summaryCsv,
+            "the live CSV must differ from the frozen one, or this proves nothing"
+        );
+    } finally {
+        await dropPeriod(locker);
+        await restore();
+        await Promise.all([db.$disconnect(), locker.$disconnect()]);
+    }
+});
+
+test("a REAL period lock waits behind an in-flight download", { skip }, async () => {
+    // The other half of the guarantee. The staged race above commits a row
+    // directly; a real lockPayrollPeriod takes the EXCLUSIVE advisory lock
+    // first, so while a download holds the shared one it cannot even start —
+    // which is why the shared mode is the right one: it queues writers without
+    // blocking other readers.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const locker = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const { restore } = await seed(db, "race-wait");
+    try {
+        const { acquirePayrollLockCreationLock } = await import("../src/lib/payroll-period");
+        let creating: Promise<unknown> = Promise.resolve();
+        let stillWaiting: boolean | null = null;
+
+        const handler = await handlerFor(db, async () => {
+            if (stillWaiting !== null) return;
+            creating = locker.$transaction(
+                async (tx) => {
+                    await acquirePayrollLockCreationLock(tx as never);
+                },
+                { timeout: 30_000 }
+            );
+            stillWaiting = await Promise.race([
+                creating.then(() => false).catch(() => false),
+                new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 600)),
+            ]);
+        });
+
+        const res = await handler.GET(request());
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("x-export-source"), "live", "nothing was locked, so this is a live export");
+        assert.equal(
+            stillWaiting,
+            true,
+            "a period lock must WAIT while a download holds the shared payroll lock"
+        );
+        // ...and once the download is done it goes through.
+        await creating;
+    } finally {
+        await dropPeriod(locker);
+        await restore();
+        await Promise.all([db.$disconnect(), locker.$disconnect()]);
+    }
+});
+
+test("the live path is WRAPPED — source order, because the race needs it", () => {
+    // The behavioural cases prove the re-check; this proves the LOCK is what it
+    // happens under, and that nothing live is read before it.
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "export", "gusto", "route.ts"),
+        "utf8"
+    );
+    const wrap = source.indexOf("dependencies.withPayrollReadLock(");
+    const recheck = source.indexOf("dependencies.loadSnapshot(", wrap);
+    const zone = source.indexOf("await dependencies.resolveTimeZone()");
+    const load = source.indexOf("await dependencies.load(");
+    assert.ok(wrap > 0, "the live path must run under the payroll lock");
+    assert.ok(recheck > wrap, "it must re-check for a snapshot INSIDE the lock");
+    assert.ok(zone > recheck, "and only then touch live state");
+    assert.ok(load > zone);
+    // SHARE mode: the same tier-1 lock every payroll writer takes, so two
+    // downloads do not block each other.
+    assert.match(source, /acquirePayrollWriteLock\(tx\)/);
 });

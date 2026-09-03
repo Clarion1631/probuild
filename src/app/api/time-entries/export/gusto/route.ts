@@ -5,6 +5,8 @@ import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { addDaysToKey, startOfDateInTimeZone } from "@/lib/tz-date";
 import { validatePayrollRange } from "@/lib/payroll-config";
 import { canActOnFinancialsResolved } from "@/lib/financial-access";
+import { prisma } from "@/lib/prisma";
+import { acquirePayrollWriteLock } from "@/lib/payroll-period";
 import {
     isLabelRowMissingError,
     isLockedSnapshotMissingError,
@@ -75,6 +77,23 @@ export interface GustoExportDependencies {
         detailCsv: string;
         exportHash: string;
     } | null>;
+    /**
+     * Run `body` while HOLDING the payroll advisory lock in SHARE mode.
+     *
+     * A live export used to race period creation (round 16, finding 2). The
+     * handler checked for a frozen row, found none, and then spent the rest of
+     * the request reading live data with nothing held — so a lockPayrollPeriod
+     * committing in between produced `X-Export-Source: live` for a period that
+     * was, by the time the bytes were sent, locked and frozen around DIFFERENT
+     * numbers.
+     *
+     * SHARE, not exclusive: two people downloading at once is fine, and this
+     * is the same tier-1 lock every payroll writer takes, so it queues behind
+     * an in-flight lock instead of overtaking it. Once acquired, no lock can
+     * COMMIT until this transaction ends — which is what makes the re-check
+     * inside it final rather than another guess.
+     */
+    withPayrollReadLock<T>(body: () => Promise<T>): Promise<T>;
 }
 
 export function createGustoExportHandler(dependencies: GustoExportDependencies) {
@@ -109,21 +128,21 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
             // put a live CompanySettings read in front of a download that is
             // supposed to depend on nothing live (round 11, finding 3).
             const lastDayKey = addDaysToKey(range.endKey, -1);
+            const frozenResponse = (snapshot: { summaryCsv: string; detailCsv: string; exportHash: string }) =>
+                new NextResponse(format === "detail" ? snapshot.detailCsv : snapshot.summaryCsv, {
+                    headers: {
+                        "Content-Type": "text/csv; charset=utf-8",
+                        "Content-Disposition": `attachment; filename="gusto-${format}-${range.startKey}_to_${lastDayKey}.csv"`,
+                        "X-Export-Hash": snapshot.exportHash,
+                        "X-Export-Source": "snapshot",
+                    },
+                });
             try {
                 const snapshot = await dependencies.loadSnapshot({
                     startKey: range.startKey,
                     endKey: range.endKey,
                 });
-                if (snapshot) {
-                    return new NextResponse(format === "detail" ? snapshot.detailCsv : snapshot.summaryCsv, {
-                        headers: {
-                            "Content-Type": "text/csv; charset=utf-8",
-                            "Content-Disposition": `attachment; filename="gusto-${format}-${range.startKey}_to_${lastDayKey}.csv"`,
-                            "X-Export-Hash": snapshot.exportHash,
-                            "X-Export-Source": "snapshot",
-                        },
-                    });
-                }
+                if (snapshot) return frozenResponse(snapshot);
             } catch (error) {
                 // A locked row whose frozen CSVs are not all there. Still fails
                 // closed (round 6) - but now it is the ONLY thing that can stop
@@ -137,8 +156,34 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
                 throw error;
             }
 
-            // No frozen file for this exact range, so this is a LIVE export and
-            // everything below is allowed to depend on live state.
+            // No frozen file for this exact range — YET.
+            //
+            // Everything from here on happens while HOLDING the payroll advisory
+            // lock in share mode, and the very first thing it does is ask again.
+            // Without that, the check above was a guess about a moving target: a
+            // period locked a millisecond later was served live, with numbers
+            // that disagreed with the file payroll actually received (round 16,
+            // finding 2). Under the lock the answer cannot change until this
+            // request is done with it.
+            return dependencies.withPayrollReadLock(async () => {
+                let frozen: Awaited<ReturnType<typeof dependencies.loadSnapshot>>;
+                try {
+                    frozen = await dependencies.loadSnapshot({
+                        startKey: range.startKey,
+                        endKey: range.endKey,
+                    });
+                } catch (error) {
+                    if (isLockedSnapshotMissingError(error)) {
+                        return NextResponse.json(
+                            { error: error.message, code: "LOCKED_SNAPSHOT_MISSING" },
+                            { status: 409 }
+                        );
+                    }
+                    throw error;
+                }
+                // It WAS locked, in the gap. Serve what payroll was paid.
+                if (frozen) return frozenResponse(frozen);
+
             const timeZone = await dependencies.resolveTimeZone();
             const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
             const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
@@ -251,6 +296,7 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
                     "X-Export-Source": "live",
                 },
             });
+            });
         },
     };
 }
@@ -266,6 +312,19 @@ const handler = createGustoExportHandler({
     // is computed in the same zone the boundaries were built in.
     load: (periodStart, periodEnd, keys) => loadGustoExport(periodStart, periodEnd, keys),
     loadSnapshot: (keys) => loadLockedSnapshot(keys.startKey, keys.endKey),
+    // The lock is held for the WHOLE body: the re-check and the live read both
+    // happen inside this transaction, so no period lock can commit between
+    // them. The reads themselves go through the singleton, which is fine —
+    // what serializes here is the advisory lock, not the connection.
+    withPayrollReadLock: (body) =>
+        prisma.$transaction(
+            async (tx) => {
+                await acquirePayrollWriteLock(tx);
+                return body();
+            },
+            // A full period's export is not a 5-second query on a big month.
+            { timeout: 120_000, maxWait: 30_000 }
+        ),
 });
 
 export async function GET(req: Request) {
