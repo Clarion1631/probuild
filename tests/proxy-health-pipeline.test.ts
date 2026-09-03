@@ -166,23 +166,44 @@ test("round 46: every bypassed path except the anonymous-action trees refuses a 
     });
 });
 
-test("round 46: the portal trees still dispatch their own anonymous actions (control)", async () => {
-    // Without this the rule above would also pass if the proxy refused EVERY
-    // action dispatch, which would break client approvals and portal payments.
+test("round 49: a portal dispatch needs the portal cookie, and then still works", async () => {
+    // Round 46 let EVERY dispatch through these two trees, on the theory that
+    // they serve anonymous actions. Round 49 (P0) found that far too wide:
+    // action ids are global, so an anonymous caller could POST any staff action
+    // id to /portal and have it run. The tree now has to present its own session
+    // cookie — and with it, the client flows still work, which is what the
+    // second half of this asserts. Without that half, the rule above would pass
+    // just as happily against a proxy that refused every dispatch and broke
+    // client approvals and portal payments.
     await inProduction(async () => {
         const { default: proxy } = await loadProxy();
         const { NextRequest } = await import("next/server");
         const event = { waitUntil() {} } as any;
-        for (const path of ["/portal/estimates/abc", "/sub-portal/projects/abc"]) {
-            const response = (await proxy(
+        const trees: Array<[string, string]> = [
+            ["/portal/estimates/abc", "client_portal_token"],
+            ["/sub-portal/projects/abc", "sub_portal_token"],
+        ];
+        for (const [path, cookie] of trees) {
+            // No cookie: refused, even though this tree is allowed to dispatch.
+            const anonymous = (await proxy(
                 new NextRequest(`https://probuild.test${path}`, {
                     method: "POST",
                     headers: { "next-action": "deadbeef" },
                 }),
                 event,
             )) as Response;
+            assert.equal(anonymous.status, 403, `${path} must refuse a cookieless dispatch`);
+
+            // With the tree's own session cookie, the client flow still works.
+            const withCookie = (await proxy(
+                new NextRequest(`https://probuild.test${path}`, {
+                    method: "POST",
+                    headers: { "next-action": "deadbeef", cookie: `${cookie}=whatever` },
+                }),
+                event,
+            )) as Response;
             assert.equal(
-                response.headers.get("x-middleware-next"),
+                withCookie.headers.get("x-middleware-next"),
                 "1",
                 `${path} serves anonymous actions and must still reach them`,
             );

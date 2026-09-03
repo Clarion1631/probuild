@@ -59,6 +59,31 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
 /**
+ * The cookie that has to be present before a bypassed tree may dispatch a
+ * Server Action at all.
+ *
+ * Round 48 narrowed the action exception to the two client-facing trees. Round
+ * 49 found that still far too wide: action ids are GLOBAL, so `/portal` being
+ * allowed to dispatch meant a caller with no session at all could POST any
+ * action id in the app to `/portal` and have it run — including staff
+ * mutations that authorize nothing themselves (`createCatalogItem` and 76
+ * others, now gated; see tests/server-action-gates.test.ts). An action id is
+ * not an authorization token: it is a public build artefact.
+ *
+ * So a dispatch through these trees now requires the tree's own session
+ * cookie. That is PRESENCE, not validity — the proxy runs on the edge and
+ * cannot verify a JWT without the signing secret, and it is not the
+ * authorization boundary: every action still authorizes itself (the portal
+ * ones through `resolveSessionClientId` / `getSubPortalSession`, which DO
+ * verify). What this closes is the anonymous vector: no cookie, no dispatch,
+ * anywhere in the bypass.
+ */
+const ANONYMOUS_ACTION_COOKIE: ReadonlyArray<{ pattern: RegExp; cookie: string }> = [
+    { pattern: /^\/portal(?:\/|$)/, cookie: "client_portal_token" },
+    { pattern: /^\/sub-portal(?:\/|$)/, cookie: "sub_portal_token" },
+];
+
+/**
  * The ONLY bypassed paths allowed to dispatch an anonymous Server Action.
  *
  * Next's action IDs are GLOBAL: a `next-action` POST to any path that reaches
@@ -73,8 +98,11 @@ const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?
  * actions (25 and 1 files importing actions respectively); those actions
  * authorize through their own client/token checks. `share` imports none, and
  * `login` is a client component that posts to NextAuth, so neither needs it.
+ *
+ * Kept as the list of trees that MAY dispatch; ANONYMOUS_ACTION_COOKIE above
+ * says what each of them must present first.
  */
-const ANONYMOUS_ACTION_PATTERN = /^\/(?:portal|sub-portal)(?:\/|$)/;
+export const ANONYMOUS_ACTION_PATTERN = /^\/(?:portal|sub-portal)(?:\/|$)/;
 
 /**
  * Is this an action dispatch?
@@ -185,13 +213,15 @@ export default async function proxy(req: any, event: any) {
     // the ops health reads, the webhook and ingest endpoints, the PDF routes and
     // the static legal pages all double as anonymous dispatchers for every
     // action in the app.
-    if (
-        isServerAction
-        && typeof pathname === "string"
-        && isPublicProxyBypass(pathname)
-        && !ANONYMOUS_ACTION_PATTERN.test(pathname)
-    ) {
-        return new NextResponse("Forbidden", { status: 403 });
+    if (isServerAction && typeof pathname === "string" && isPublicProxyBypass(pathname)) {
+        // Which tree is this, and does the caller hold its session cookie? A
+        // path that is not one of the two client-facing trees can never
+        // dispatch; one that is still needs the cookie.
+        const tree = ANONYMOUS_ACTION_COOKIE.find((t) => t.pattern.test(pathname));
+        const hasCookie = !!tree && !!req.cookies?.get?.(tree.cookie)?.value;
+        if (!tree || !hasCookie) {
+            return new NextResponse("Forbidden", { status: 403 });
+        }
     }
 
     if (typeof pathname === "string" && isPublicProxyBypass(pathname)) {

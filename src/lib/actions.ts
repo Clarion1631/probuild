@@ -26,7 +26,7 @@ import { normalizePercentCompleteInput } from "./percent-complete";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, isAdminOrManager, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
+import { assertActiveStaff, canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, isAdminOrManager, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
@@ -346,6 +346,7 @@ export const getLead = cache(async function getLead(id: string) {
 });
 
 export async function updateLeadStage(id: string, stage: string) {
+    await assertActiveStaff();
     await prisma.lead.update({
         where: { id },
         data: { stage }
@@ -367,7 +368,20 @@ async function findClientByName(name: string) {
     return candidates.find((c) => collapse(c.name) === collapse(name)) ?? null;
 }
 
-export async function createLead(data: { name: string; clientName: string; clientEmail?: string; clientPhone?: string; location?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; source?: string; projectType?: string; message?: string }) {
+export async function createLead(
+    data: { name: string; clientName: string; clientEmail?: string; clientPhone?: string; location?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; source?: string; projectType?: string; message?: string },
+    /**
+     * The MCP machine secret, when this is the `create_lead` tool rather than
+     * a person. Same shape as `sendEstimateToClient` — see
+     * assertDocumentSendPermission: ONLY `undefined` means omitted, so a
+     * supplied-but-wrong secret can never fall through to the session path.
+     */
+    mcpSecret?: string,
+) {
+    // Round 49: this authorized NOTHING. Server Action ids are public, so
+    // anyone who could name it could create leads and clients in the database.
+    // A staff session OR the machine secret — the MCP tool has no session.
+    await assertLeadCreatePermission(mcpSecret);
     // Find or create client
     const clientName = data.clientName.trim();
     if (!clientName) throw new Error("Client name is required.");
@@ -462,6 +476,7 @@ export async function createLead(data: { name: string; clientName: string; clien
 }
 
 export async function updateLeadMetadata(id: string, updates: { isUnread?: boolean; isArchived?: boolean; snoozedUntil?: Date | null; tags?: string; expectedProfit?: number; expectedStartDate?: Date | null; targetRevenue?: number }) {
+    await assertActiveStaff();
     await prisma.lead.update({
         where: { id },
         data: {
@@ -516,6 +531,7 @@ export async function deleteLead(id: string) {
 }
 
 export async function deleteLeads(ids: string[]): Promise<{ deleted: number; skipped: { id: string; reason: string }[] }> {
+    await assertActiveStaff();
     let deleted = 0;
     const skipped: { id: string; reason: string }[] = [];
     for (const id of ids) {
@@ -531,6 +547,7 @@ export async function deleteLeads(ids: string[]): Promise<{ deleted: number; ski
 }
 
 export async function copyLeads(ids: string[]): Promise<{ created: string[]; skipped: { id: string; reason: string }[] }> {
+    await assertActiveStaff();
     const created: string[] = [];
     const skipped: { id: string; reason: string }[] = [];
     for (const id of ids) {
@@ -594,6 +611,7 @@ export async function updateProjectManager(projectId: string, managerId: string 
 }
 
 export async function updateLeadInfo(id: string, data: any) {
+    await assertActiveStaff();
     // data contains all the EditLeadModal form data
     const lead = await prisma.lead.findUnique({ where: { id }});
     if (!lead) return;
@@ -691,6 +709,7 @@ export async function getClients() {
 }
 
 export async function getClient(id: string) {
+    await assertActiveStaff();
     return await prisma.client.findUnique({
         where: { id },
         include: {
@@ -703,6 +722,7 @@ export async function getClient(id: string) {
 
 export async function createClient(data: { name: string; email?: string; companyName?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; internalNotes?: string }) {
     "use server";
+    await assertActiveStaff();
     const name = data.name.trim();
     if (!name) throw new Error("Client name is required.");
     const initials = name
@@ -733,6 +753,7 @@ export async function createClient(data: { name: string; email?: string; company
 
 export async function updateClient(clientId: string, data: { name?: string; email?: string; additionalEmail?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string }) {
     "use server";
+    await assertActiveStaff();
     const name = data.name?.trim();
     if (data.name !== undefined && !name) throw new Error("Client name is required.");
     const client = await prisma.client.update({
@@ -800,6 +821,7 @@ async function revalidateClientCertSurfaces(clientId: string) {
  *  certificate is already on file (metadata-only edit); expiresAt is "YYYY-MM-DD" or "". */
 export async function saveClientTaxExemptCert(clientId: string, formData: FormData) {
     "use server";
+    await assertActiveStaff();
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Unauthorized");
 
@@ -860,6 +882,7 @@ export async function saveClientTaxExemptCert(clientId: string, formData: FormDa
 
 export async function removeClientTaxExemptCert(clientId: string) {
     "use server";
+    await assertActiveStaff();
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Unauthorized");
 
@@ -901,6 +924,7 @@ export async function removeClientTaxExemptCert(clientId: string) {
 
 export async function updateLead(leadId: string, data: { name?: string; source?: string; expectedStartDate?: string | null; targetRevenue?: number | null; location?: string; projectType?: string }) {
     "use server";
+    await assertActiveStaff();
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
     if (data.source !== undefined) updateData.source = data.source;
@@ -955,6 +979,7 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
 // =============================================
 
 export async function getLeadTasks(leadId: string) {
+    await assertActiveStaff();
     return await prisma.leadTask.findMany({
         where: { leadId },
         orderBy: { createdAt: "desc" },
@@ -969,6 +994,7 @@ export async function createLeadTask(leadId: string, data: {
     tags?: string | null;
     assigneeId?: string | null;
 }) {
+    await assertActiveStaff();
     const task = await prisma.leadTask.create({
         data: {
             leadId,
@@ -990,6 +1016,7 @@ export async function updateLeadTask(taskId: string, data: {
     tags?: string | null;
     assigneeId?: string | null;
 }) {
+    await assertActiveStaff();
     const updateData: any = {};
     if (data.title !== undefined) updateData.title = data.title;
     if (data.status !== undefined) updateData.status = data.status;
@@ -1006,6 +1033,7 @@ export async function updateLeadTask(taskId: string, data: {
 }
 
 export async function deleteLeadTask(taskId: string) {
+    await assertActiveStaff();
     const task = await prisma.leadTask.findUnique({ where: { id: taskId } });
     if (!task) return { success: false };
     await prisma.leadTask.delete({ where: { id: taskId } });
@@ -1018,6 +1046,7 @@ export async function deleteLeadTask(taskId: string) {
 // =============================================
 
 export async function getLeadMeetings(leadId: string) {
+    await assertActiveStaff();
     return await prisma.leadMeeting.findMany({
         where: { leadId },
         orderBy: { scheduledAt: "asc" },
@@ -1033,6 +1062,7 @@ export async function createLeadMeeting(leadId: string, data: {
     videoApp?: string | null;
     description?: string | null;
 }) {
+    await assertActiveStaff();
     const startDate = new Date(data.scheduledAt);
     const endDate = new Date(startDate.getTime() + data.duration * 60000);
 
@@ -1118,6 +1148,7 @@ export async function updateLeadMeeting(meetingId: string, data: {
     description?: string | null;
     status?: string;
 }) {
+    await assertActiveStaff();
     const updateData: any = {};
     if (data.title !== undefined) updateData.title = data.title;
     if (data.meetingType !== undefined) updateData.meetingType = data.meetingType;
@@ -1143,6 +1174,7 @@ export async function updateLeadMeeting(meetingId: string, data: {
 }
 
 export async function deleteLeadMeeting(meetingId: string) {
+    await assertActiveStaff();
     const meeting = await prisma.leadMeeting.findUnique({ where: { id: meetingId } });
     if (!meeting) return { success: false };
     await prisma.leadMeeting.delete({ where: { id: meetingId } });
@@ -1415,6 +1447,7 @@ export async function createDraftRoom(opts: {
     name?: string;
     roomType?: RoomType;
 }) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) throw new Error("Unauthorized");
 
@@ -1440,6 +1473,7 @@ export async function createDraftRoom(opts: {
 }
 
 export async function getRoom(id: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) return null;
 
@@ -1453,6 +1487,7 @@ export async function getRoom(id: string) {
 }
 
 export async function deleteRoom(id: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) throw new Error("Unauthorized");
 
@@ -1470,6 +1505,7 @@ export async function deleteRoom(id: string) {
 }
 
 export async function renameRoom(id: string, name: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) throw new Error("Unauthorized");
 
@@ -1494,6 +1530,7 @@ export async function renameRoom(id: string, name: string) {
 }
 
 export async function listRoomsForProject(projectId: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) return [];
     if (!(await callerCanAccessProject(caller, projectId))) return [];
@@ -1510,6 +1547,7 @@ export async function listRoomsForProject(projectId: string) {
 }
 
 export async function listRoomsForLead(leadId: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) return [];
     if (!(await callerCanAccessLead(caller, leadId))) return [];
@@ -1953,6 +1991,7 @@ export const getAllEstimates = cache(async function getAllEstimates() {
 // The partial unique index "MessageThread_projectId_client_unique" makes this safe under concurrency:
 // if two requests both see no thread and both call create, the second will get P2002 and re-read.
 export async function findOrCreateClientThread(projectId: string) {
+    await assertActiveStaff();
     let thread = await prisma.messageThread.findFirst({
         where: { projectId, subcontractorId: null },
         orderBy: { createdAt: "asc" },
@@ -1979,6 +2018,17 @@ export async function findOrCreateClientThread(projectId: string) {
 }
 
 export async function logPortalVisit(projectId: string, clientName: string) {
+    // Action ids are public, so this authorizes itself. Its one caller is
+    // PortalVisitTracker, which the portal project page renders only for a
+    // NON-staff viewer — so the gate is the same precondition that page already
+    // enforces before rendering: a client session that owns this project.
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) throw new Error("Unauthorized");
+    const owned = await prisma.project.findFirst({
+        where: { id: projectId, clientId: sessionClientId },
+        select: { id: true },
+    });
+    if (!owned) throw new Error("Unauthorized");
     // Dedup: skip if a portal visit was logged in the last 30 minutes
     const recent = await prisma.activityLog.findFirst({
         where: {
@@ -4404,11 +4454,7 @@ async function currentStaffUserOrNull(): Promise<any | null> {
     return currentStaffViewerOrNull();
 }
 
-async function assertActiveStaff(): Promise<any> {
-    const user = await currentStaffUserOrNull();
-    if (!user) throw new Error("Unauthorized");
-    return user;
-}
+
 
 async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts" | "manageVendors") {
     const user = await assertActiveStaff();
@@ -4919,6 +4965,22 @@ async function assertEstimateSendPermission(mcpSecret?: string): Promise<SendPri
  */
 async function assertContractSendPermission(mcpSecret?: string): Promise<SendPrincipal> {
     return assertDocumentSendPermission(mcpSecret, "contracts");
+}
+
+/**
+ * Creating a lead: a staff session, or the MCP machine secret.
+ *
+ * `createLead` is reachable two ways — the leads UI, and the `create_lead`
+ * MCP tool, which authenticates with a secret in the request and carries no
+ * session at all. Gating it on a session alone would have broken the tool;
+ * leaving it ungated (round 49) meant anyone who could name the action id
+ * could write leads and clients.
+ *
+ * Reuses the estimates permission for the session path: a lead becomes an
+ * estimate, and the same people do both.
+ */
+async function assertLeadCreatePermission(mcpSecret?: string): Promise<SendPrincipal> {
+    return assertDocumentSendPermission(mcpSecret, "estimates");
 }
 
 export async function addInvoiceMilestone(
@@ -5526,6 +5588,7 @@ export async function duplicateEstimate(estimateId: string, targetProjectId?: st
 // =============================================
 
 export async function deleteEstimates(ids: string[]): Promise<{ deleted: number; skipped: { id: string; reason: string }[] }> {
+    await assertActiveStaff();
     let deleted = 0;
     const skipped: { id: string; reason: string }[] = [];
     for (const id of ids) {
@@ -5544,6 +5607,7 @@ export async function duplicateEstimates(
     ids: string[],
     targetProjectId?: string,
 ): Promise<{ createdIds: string[]; skipped: { id: string; reason: string }[] }> {
+    await assertActiveStaff();
     const createdIds: string[] = [];
     const skipped: { id: string; reason: string }[] = [];
     for (const id of ids) {
@@ -7696,6 +7760,12 @@ export async function getEstimateItemsForProject(projectId: string) {
 }
 
 export async function getScheduleTasksForSub(projectId: string, subcontractorId: string) {
+    // Action ids are public, so this authorizes itself. Its one caller is the
+    // sub-facing portal schedule page, where the viewer is a subcontractor and
+    // never a staff user — same session check addTaskCommentAsSub makes.
+    const { getSubPortalSession } = await import("@/lib/sub-portal-auth");
+    const session = await getSubPortalSession();
+    if (!session || session.id !== subcontractorId) throw new Error("Unauthorized");
     return prisma.scheduleTask.findMany({
         where: {
             projectId,
@@ -7911,6 +7981,7 @@ export async function addTaskComment(taskId: string, text: string, photoUrls?: s
 }
 
 export async function getTaskComments(taskId: string) {
+    await assertActiveStaff();
     return prisma.taskComment.findMany({
         where: { taskId },
         orderBy: { createdAt: "asc" },
@@ -7922,6 +7993,7 @@ export async function getTaskComments(taskId: string) {
 }
 
 export async function getTaskTimeEntries(taskId: string) {
+    await assertActiveStaff();
     const [entries, total] = await Promise.all([
         prisma.timeEntry.findMany({
             where: { scheduleTaskId: taskId },
@@ -8350,6 +8422,7 @@ Rules:
 // ========== MASTER SCHEDULE ==========
 
 export async function getAllScheduleTasks() {
+    await assertActiveStaff();
     return prisma.scheduleTask.findMany({
         orderBy: [{ projectId: "asc" }, { order: "asc" }],
         include: {
@@ -8363,6 +8436,7 @@ export async function getAllScheduleTasks() {
 }
 
 export async function getTeamMembers() {
+    await assertActiveStaff();
     return prisma.user.findMany({
         orderBy: { name: "asc" },
         select: { id: true, name: true, email: true, role: true },
@@ -8411,6 +8485,7 @@ export async function clearAllTasks(projectId: string) {
 }
 
 export async function getActiveSubcontractors() {
+    await assertActiveStaff();
     return prisma.subcontractor.findMany({
         where: { status: "ACTIVE" },
         orderBy: { companyName: "asc" },
@@ -8923,6 +8998,7 @@ export async function updateCompanyProjectStatuses(statuses: string) {
 // ────────────────────────────────────────────────
 
 export async function getProjectMessages(projectId: string) {
+    await assertActiveStaff();
     let thread = await prisma.messageThread.findFirst({
         where: { projectId, subcontractorId: null },
         include: {
@@ -8943,6 +9019,7 @@ export async function getProjectMessages(projectId: string) {
 }
 
 export async function getUnreadMessageCount(projectId: string, forSenderType: "CLIENT" | "TEAM") {
+    await assertActiveStaff();
     // Count unread inbound ClientMessages for this project.
     // "Inbound" from the team's perspective = messages sent by the CLIENT.
     // Uses readAt to determine unread status — badge clears when markClientMessagesRead is called.
@@ -8953,6 +9030,7 @@ export async function getUnreadMessageCount(projectId: string, forSenderType: "C
 }
 
 export async function markClientMessagesRead(entityId: string, entityType: "lead" | "project") {
+    await assertActiveStaff();
     const where = entityType === "lead"
         ? { leadId: entityId, direction: "INBOUND", readAt: null }
         : { projectId: entityId, direction: "INBOUND", readAt: null };
@@ -9081,6 +9159,7 @@ export async function setPaymentRemindersEnabled(projectId: string, enabled: boo
 // =============================================
 
 export async function emailPortalLinkToClient(projectId: string) {
+    await assertActiveStaff();
     const project = await prisma.project.findUnique({
         where: { id: projectId },
         include: { client: true }
@@ -9168,6 +9247,7 @@ export async function emailPortalLinkToClient(projectId: string) {
 }
 
 export async function checkPortalEmailStatus(projectId: string) {
+    await assertActiveStaff();
     const visibility = await prisma.portalVisibility.findUnique({ where: { projectId } });
     if (!visibility?.lastShareEmailId) return null;
     
@@ -9189,6 +9269,7 @@ export async function checkPortalEmailStatus(projectId: string) {
 // =============================================
 
 export async function getCompanySubcontractorTrades() {
+    await assertActiveStaff();
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     if (!settings?.subcontractorTrades) return [];
     try {
@@ -9213,6 +9294,7 @@ export async function saveCompanySubcontractorTrades(trades: string[]) {
 // =============================================
 
 export async function getSubcontractorExplicitProjects(subId: string) {
+    await assertActiveStaff();
     const accesses = await prisma.subcontractorProjectAccess.findMany({
         where: { subcontractorId: subId },
         select: { projectId: true },
@@ -9221,6 +9303,7 @@ export async function getSubcontractorExplicitProjects(subId: string) {
 }
 
 export async function saveSubcontractorExplicitProjects(subId: string, projectIds: string[]) {
+    await assertActiveStaff();
     await prisma.$transaction([
         prisma.subcontractorProjectAccess.deleteMany({ where: { subcontractorId: subId } }),
         prisma.subcontractorProjectAccess.createMany({
@@ -9650,6 +9733,7 @@ export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ 
 
 export async function uploadSubcontractorCOI(subcontractorId: string, formData: FormData) {
     "use server";
+    await assertActiveStaff();
     
     const file = formData.get("file") as File;
     if (!file) throw new Error("No file uploaded");
@@ -9807,6 +9891,7 @@ Respond ONLY with the single date translated into YYYY-MM-DD format.
 
 export async function deleteSubcontractorCOI(subcontractorId: string) {
     "use server";
+    await assertActiveStaff();
     
     await prisma.subcontractor.update({
         where: { id: subcontractorId },
@@ -10030,6 +10115,7 @@ export async function deleteVendorFile(id: string) {
 
 export async function getVendorTags() {
     "use server";
+    await assertActiveStaff();
     return prisma.vendorTag.findMany({ orderBy: { name: "asc" } });
 }
 
@@ -11906,7 +11992,7 @@ export async function updateSelectionItemNote(
                 where: { id },
                 select: { id: true, projectId: true, deletedAt: true },
             }),
-        assertAccess: assertDecisionActorAccess,
+        assertAccess: (projectId) => assertDecisionActorAccess(projectId),
         updateNote: async (id, normalizedNote) => {
             // CAS on deletedAt: the findItem check above is non-atomic with
             // this write, so a concurrent soft-delete must make the update
@@ -11931,7 +12017,7 @@ export async function updateSelectionItemNote(
 export async function markSelectionItemThreadRead(itemId: string, seenCommentIds: string[]): Promise<void> {
     return markSelectionItemThreadReadCore(itemId, seenCommentIds, {
         findItem: findThreadItem,
-        assertAccess: assertDecisionActorAccess,
+        assertAccess: (projectId) => assertDecisionActorAccess(projectId),
         markRead: async (proposalId, seenIds, isStaff) => {
             // Mirrors the decision-soft-delete guard in createComment
             // (selection-item-thread-dependencies.ts): findThreadItem's
@@ -12100,10 +12186,12 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
 // selection-item-thread-core.ts/selection-item-note-persistence-core.ts use.
 
 export async function applySuggestedDecision(itemId: string, decisionId: string): Promise<{ applied: boolean }> {
+    await assertActiveStaff();
     return aiSortApplySuggestedDecision(itemId, decisionId);
 }
 
 export async function dismissSelectionSuggestion(itemId: string): Promise<{ success: true }> {
+    await assertActiveStaff();
     return aiSortDismissSelectionSuggestion(itemId);
 }
 
@@ -12111,6 +12199,7 @@ export async function createDecisionForSuggestion(
     projectId: string,
     name: string,
 ): Promise<{ decisionId: string; existed: boolean }> {
+    await assertActiveStaff();
     return aiSortCreateDecisionForSuggestion(projectId, name);
 }
 
@@ -12121,30 +12210,37 @@ export async function createDecisionForSuggestion(
 // split selection-ai-sort-apply-core.ts/selection-item-thread-core.ts use.
 
 export async function createDecisionTemplate(input: DecisionTemplateInput) {
+    await assertActiveStaff();
     return createDecisionTemplateCore(input);
 }
 
 export async function updateDecisionTemplate(templateId: string, input: DecisionTemplateInput) {
+    await assertActiveStaff();
     return updateDecisionTemplateCore(templateId, input);
 }
 
 export async function archiveDecisionTemplate(templateId: string) {
+    await assertActiveStaff();
     return archiveDecisionTemplateCore(templateId);
 }
 
 export async function unarchiveDecisionTemplate(templateId: string) {
+    await assertActiveStaff();
     return unarchiveDecisionTemplateCore(templateId);
 }
 
 export async function listDecisionTemplates() {
+    await assertActiveStaff();
     return listDecisionTemplatesCore();
 }
 
 export async function listActiveDecisionTemplatesForApply() {
+    await assertActiveStaff();
     return listActiveDecisionTemplatesForApplyCore();
 }
 
 export async function applyDecisionTemplate(projectId: string, templateId: string) {
+    await assertActiveStaff();
     return applyDecisionTemplateCore(projectId, templateId);
 }
 
@@ -12153,14 +12249,17 @@ export async function linkDecisionToSchedule(
     scheduleTaskId: string | null,
     leadTimeDays: number | null,
 ) {
+    await assertActiveStaff();
     return linkDecisionToScheduleCore(decisionId, scheduleTaskId, leadTimeDays);
 }
 
 export async function setDecisionDueDateOverride(decisionId: string, dueDate: Date | null) {
+    await assertActiveStaff();
     return setDecisionDueDateOverrideCore(decisionId, dueDate);
 }
 
 export async function setDecisionOrderInfo(decisionId: string, input: DecisionOrderInput) {
+    await assertActiveStaff();
     return setDecisionOrderInfoCore(decisionId, input);
 }
 
@@ -13348,6 +13447,7 @@ export async function createCatalogItem(data: {
     costCodeId?: string;
 }) {
     "use server";
+    await assertActiveStaff();
     const item = await prisma.catalogItem.create({
         data: {
             name: data.name,
@@ -13372,6 +13472,7 @@ export async function updateCatalogItem(id: string, data: {
     isActive?: boolean;
 }) {
     "use server";
+    await assertActiveStaff();
     const item = await prisma.catalogItem.update({
         where: { id },
         data,
@@ -13384,6 +13485,7 @@ export async function updateCatalogItem(id: string, data: {
 
 export async function deleteCatalogItem(id: string) {
     "use server";
+    await assertActiveStaff();
     await prisma.catalogItem.delete({ where: { id } });
     revalidatePath("/company/my-items");
     return { success: true };
@@ -13897,6 +13999,7 @@ export async function addDocumentComment(
 }
 
 export async function deleteDocumentComment(commentId: string) {
+    await assertActiveStaff();
     // Only the comment's own author, or an ADMIN/MANAGER, may delete it.
     // Non-staff (portal) callers never satisfy either check today — there's
     // no portal mount for this component yet, so portal-authored comments

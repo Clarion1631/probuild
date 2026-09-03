@@ -62,6 +62,22 @@ export async function getCurrentUserWithPermissions() {
  * ADMIN through. Production is unaffected: canUseDevAuthFallback returns false
  * outside NODE_ENV=development.
  */
+/**
+ * THE staff gate: an active staff session, or throw.
+ *
+ * It lives here rather than in actions.ts because actions.ts is a
+ * `"use server"` module — every export of that file is a REGISTERED SERVER
+ * ACTION with its own public id. Exporting a gate helper from there so the
+ * other action modules could import it would have created one more remotely
+ * dispatchable endpoint, which is the exact class of hole round 49 exists to
+ * close. This file is imported normally and exports nothing dispatchable.
+ */
+export async function assertActiveStaff(): Promise<any> {
+    const user = await currentStaffUserOrNull();
+    if (!user) throw new Error("Unauthorized");
+    return user;
+}
+
 export async function currentStaffUserOrNull(): Promise<any | null> {
     const user = await getCurrentUserWithPermissions();
     if (user) return user;

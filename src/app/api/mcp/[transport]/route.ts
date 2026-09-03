@@ -1219,7 +1219,9 @@ function createHandler(actor: RouteMcpActor) {
             },
             async args => {
                 const { createLead } = await import("@/lib/actions");
-                const lead = await createLead(args);
+                // The machine secret, so the action can authorize a caller that has
+                // no session (round 49). Same pattern as the document sends above.
+                const lead = await createLead(args, secretForActor(actor.actorLabel));
                 // Client matching is by exact name — if the caller supplied contact info
                 // that differs from what's on the matched client, surface it so a
                 // same-name collision doesn't silently attach to the wrong person.

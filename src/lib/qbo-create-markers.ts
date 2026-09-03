@@ -189,6 +189,35 @@ export const PENDING_DELETION_MARKER = "pending-deletion";
  */
 export const PENDING_DELETION_SETTLED_MARKER = "pending-deletion:settled";
 
+/**
+ * A deletion the sweep has CLAIMED and is about to perform remotely.
+ *
+ * The prefix of `pending-deletion:claimed:<token>`. Round 49: the sweep read a
+ * row's `status` once, at page time, and then decided whether to delete from
+ * that stale snapshot. A settlement committing in between — a manual Record
+ * Payment, a Stripe webhook — left the sweep deleting the QuickBooks invoice
+ * for a milestone that had just been PAID, and the post-delete unlink then lost
+ * its compare-and-set and left a paid row pointing at a destroyed invoice.
+ *
+ * The claim is what makes the decision and the deletion one atomic story: it is
+ * taken under the same money locks a settle takes, pinned to `status: Pending`
+ * and to the marker the row was observed carrying, so a settle that got there
+ * first makes the claim fail and no remote call happens at all. A settle that
+ * arrives AFTER the claim cancels it (promoting to the settled marker), and the
+ * sweep re-checks the claim immediately before the irreversible call.
+ */
+export const PENDING_DELETION_CLAIMED_PREFIX = "pending-deletion:claimed:";
+
+/** Is this row claimed by a deletion sweep right now? */
+export function isDeletionClaimed(marker: string | null | undefined): boolean {
+    return typeof marker === "string" && marker.startsWith(PENDING_DELETION_CLAIMED_PREFIX);
+}
+
+/** The claim marker for one sweep's attempt on one row. */
+export function deletionClaimMarker(token: string): string {
+    return `${PENDING_DELETION_CLAIMED_PREFIX}${token}`;
+}
+
 /** Is this row waiting for a QuickBooks delete to be confirmed? */
 export function isPendingDeletion(qbSyncError: string | null | undefined): boolean {
     if (!qbSyncError) return false;
@@ -241,6 +270,22 @@ export interface CreateIdentity {
      * check on top of.
      */
     expectedTotal?: number;
+    /**
+     * The SALES TAX this create expects the document to carry
+     * (`TxnTaxDetail.TotalTax`).
+     *
+     * The grand total is not enough. QuickBooks recomputes tax under Automated
+     * Sales Tax from the customer address and the item's tax code, and it can
+     * re-split the SAME grand total into a different pre-tax/tax pair — which
+     * is the number the sales-tax return reads, and the number that decides how
+     * much of the money is ours. A total-only comparison passes that document
+     * without noticing.
+     *
+     * `undefined` means the marker predates this field: the comparison is
+     * skipped rather than refused, exactly as for `expectedTotal`. A recorded
+     * value of 0 is an ASSERTION that no tax was sent, not an absence.
+     */
+    expectedTax?: number;
     /**
      * The QuickBooks COMPANY (realm) the create POST went to.
      *
@@ -362,6 +407,15 @@ const MARKER_HASH_PREFIX = "#";
  */
 const MARKER_TOTAL_PREFIX = "$";
 /**
+ * Prefixes the expected sales tax, e.g.
+ * `ambiguous-create:#4f1c2ab90de7331a|$1089.00|^89.00|INV-00171-2|ProBuild ...`.
+ *
+ * Sits immediately after the optional `$total` field it belongs with, and
+ * before the docNumber, for the same positional-safety reason as the prefixes
+ * above. `^` is not a character a ProBuild code or PrivateNote can begin with.
+ */
+const MARKER_TAX_PREFIX = "^";
+/**
  * Prefixes the QuickBooks realm (company) id, e.g.
  * `ambiguous-create:#4f1c2ab90de7331a|$1089.00|~9130354...|INV-00171-2|ProBuild ...`.
  *
@@ -402,6 +456,7 @@ const MARKER_OPTIONAL_PREFIXES = [
     MARKER_TIME_PREFIX,
     MARKER_HASH_PREFIX,
     MARKER_TOTAL_PREFIX,
+    MARKER_TAX_PREFIX,
     MARKER_REALM_PREFIX,
     MARKER_CUSTOMER_PREFIX,
     MARKER_QBID_PREFIX,
@@ -507,6 +562,9 @@ export function composeCreateMarker(
     if (identity.expectedTotal != null && !Number.isFinite(identity.expectedTotal)) {
         throw new Error(`Expected total must be finite: ${identity.expectedTotal}`);
     }
+    if (identity.expectedTax != null && !Number.isFinite(identity.expectedTax)) {
+        throw new Error(`Expected tax must be finite: ${identity.expectedTax}`);
+    }
     // Both marker kinds carry the timestamp now -- a promotion to
     // ambiguous-create must preserve the in-flight claim's original time, not
     // reset it. See the doc comment on MARKER_TIME_PREFIX.
@@ -516,6 +574,9 @@ export function composeCreateMarker(
         : "";
     const totalPart = identity.expectedTotal != null
         ? `${MARKER_TOTAL_PREFIX}${identity.expectedTotal}${MARKER_FIELD_SEP}`
+        : "";
+    const taxPart = identity.expectedTax != null
+        ? `${MARKER_TAX_PREFIX}${identity.expectedTax}${MARKER_FIELD_SEP}`
         : "";
     const realmPart = identity.realmId
         ? `${MARKER_REALM_PREFIX}${identity.realmId}${MARKER_FIELD_SEP}`
@@ -532,7 +593,7 @@ export function composeCreateMarker(
     const itemPart = identity.itemId
         ? `${MARKER_ITEM_PREFIX}${identity.itemId}${MARKER_FIELD_SEP}`
         : "";
-    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${totalPart}${realmPart}${customerPart}${qbIdPart}${txnDatePart}${itemPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
+    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${totalPart}${taxPart}${realmPart}${customerPart}${qbIdPart}${txnDatePart}${itemPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
 }
 
 /** Which pending-create marker is this, identity or not? `null` when it is neither. */
@@ -615,6 +676,8 @@ export function parseCreateMarker(
     const issuanceHash = field(MARKER_HASH_PREFIX, (raw) => /^[0-9a-f]+$/.test(raw));
     const totalRaw = field(MARKER_TOTAL_PREFIX, (raw) => Number.isFinite(Number(raw)));
     const expectedTotal = totalRaw === undefined ? undefined : Number(totalRaw);
+    const taxRaw = field(MARKER_TAX_PREFIX, (raw) => Number.isFinite(Number(raw)));
+    const expectedTax = taxRaw === undefined ? undefined : Number(taxRaw);
     // The three id fields carry QuickBooks-generated values. Composition refuses
     // an empty one or one containing the separator, so anything else here is a
     // marker that was not written by `composeCreateMarker`.
@@ -656,6 +719,7 @@ export function parseCreateMarker(
             privateNote,
             ...(issuanceHash ? { issuanceHash } : {}),
             ...(expectedTotal != null ? { expectedTotal } : {}),
+            ...(expectedTax != null ? { expectedTax } : {}),
             ...(realmId ? { realmId } : {}),
             ...(customerId ? { customerId } : {}),
             ...(qbId ? { qbId } : {}),

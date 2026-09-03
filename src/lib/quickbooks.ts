@@ -1120,7 +1120,7 @@ export async function createQBMilestoneInvoice(
         privateNote?: string;
     },
     deadline?: RouteDeadline,
-): Promise<{ qbId: string; qbUrl: string; total: number }> {
+): Promise<{ qbId: string; qbUrl: string; total: number; document: RemoteDocumentFacts | null }> {
     const withTax = !!input.tax && input.tax.taxAmount > 0;
     const lineAmount = withTax ? input.tax!.preTaxAmount : input.amount;
 
@@ -1184,7 +1184,20 @@ export async function createQBMilestoneInvoice(
     if (!qbId || !Number.isFinite(total)) {
         throw classifyDocumentCreateFailure({ status: res.status, missingId: true }, "QB milestone invoice create");
     }
-    return { qbId, qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`, total };
+    // The WHOLE document, not just its grand total. Every fact a caller needs
+    // to judge this create — DocNumber, PrivateNote, customer, total, TAX, date,
+    // line items — comes back through the SAME reducer a recovery's DocNumber
+    // lookup uses, so the direct path and the recovery path judge the identical
+    // shape. Returning only `total` is what let the direct path accept a
+    // document a recovery would have refused: Automated Sales Tax can re-split
+    // the same grand total into a different pre-tax/tax pair, and the tax was
+    // the one thing this path never looked at.
+    return {
+        qbId,
+        qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`,
+        total,
+        document: remoteDocumentFacts(invoice),
+    };
 }
 
 /**
@@ -1249,6 +1262,16 @@ export interface RemoteDocumentFacts {
     /** `TxnDate`, the accounting period this document lands in. */
     txnDate: string | null;
     /**
+     * `TxnTaxDetail.TotalTax` — the sales-tax liability QuickBooks booked.
+     *
+     * Equal grand totals do NOT mean equal documents: Automated Sales Tax can
+     * re-split the same total into a different pre-tax/tax pair, and the split
+     * is what the sales-tax return reads. `null` when QuickBooks gave no
+     * readable value — never 0, because "we could not read it" and "there is
+     * none" are different answers and only one of them may be accepted.
+     */
+    totalTax: number | null;
+    /**
      * Every line's `ItemRef`, in payload order. The item decides the INCOME
      * ACCOUNT the money books to, so a document built from a different item is
      * a different document however well its note and total match.
@@ -1286,6 +1309,13 @@ export function remoteDocumentFacts(raw: any): RemoteDocumentFacts | null {
             ? String(raw.CustomerRef.value)
             : null,
         txnDate: raw.TxnDate != null && String(raw.TxnDate) !== "" ? String(raw.TxnDate) : null,
+        // A missing TxnTaxDetail is NOT a $0 tax answer. The null check comes
+        // FIRST because `Number(null)` is 0, so an explicit `"TotalTax": null`
+        // would otherwise read as a confident "no tax on this document" — the
+        // same rule findQBInvoicesByDocNumber has always applied.
+        totalTax: raw.TxnTaxDetail?.TotalTax != null && Number.isFinite(Number(raw.TxnTaxDetail.TotalTax))
+            ? Number(raw.TxnTaxDetail.TotalTax)
+            : null,
         // ONE ENTRY PER SALES LINE, including the ones whose ItemRef cannot be
         // read. Dropping those was fail-open: a document with one correct line
         // and one line whose item is missing or unreadable collapsed to a

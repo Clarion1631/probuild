@@ -33,7 +33,8 @@ import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents, lockClientRow, lockProjectRow } from "./tx-retry";
 import { toNum } from "./prisma-helpers";
 import type { Prisma, ProgressBilling, ProgressBillingLine } from "@prisma/client";
-import { createRouteDeadline, remainingBudgetMs, QB_DOC_NUMBER_MAX_LEN, canonicalPrivateNote, type RouteDeadline, type QBTokens } from "./quickbooks";
+import { createRouteDeadline, remainingBudgetMs, QB_DOC_NUMBER_MAX_LEN, canonicalPrivateNote, qboTxnDate, type RouteDeadline, type QBTokens, type RemoteDocumentFacts } from "./quickbooks";
+import { documentMatchesClaim } from "./qbo-document-sync";
 import {
     compensateAndUnlink,
     compensationWindowMs,
@@ -51,20 +52,37 @@ import {
     PAYLINK_PENDING_MARKER,
     nextPayLinkState,
     QBResolveRequiredError,
+    type CreateIdentity,
 } from "./qbo-create-markers";
 import { progressBillingIssuanceHash } from "./qbo-issuance";
 import { logAutomationEvent } from "./automation-events";
 
 /**
- * How far QuickBooks' own invoice total may sit from the total we asked for
- * before the create is treated as drift rather than rounding.
+ * THE one judgement on a freshly-created QuickBooks invoice, and it is the same
+ * one the ambiguous-create resolver and the document-sync recovery make about a
+ * candidate they find by DocNumber.
  *
- * The same 0.05 the milestone rail's Drift Guard uses (billing-core.ts), on
- * purpose: two different answers to "is this the same amount of money?" on
- * two rails of the same integration is how one of them ends up quietly
- * billing a number the other would have refused.
+ * Two predicates was the bug (Codex round 49): this rail compared grand totals
+ * only, at a FIVE-cent tolerance and with no look at the tax at all, while the
+ * resolver compared total AND `TxnTaxDetail.TotalTax` at half a cent. The
+ * identical QuickBooks response was therefore accepted here and refused there,
+ * so whether a document was accepted turned on nothing but whether the first
+ * HTTP response arrived.
+ *
+ * `null` means accept. A string is the refusal, written for the operator.
  */
-const QB_CREATE_TOTAL_TOLERANCE = 0.05;
+function createdInvoiceRefusal(
+    document: RemoteDocumentFacts | null,
+    identity: CreateIdentity,
+): string | null {
+    // A 200 that described no invoice. `createQBMilestoneInvoice` already
+    // refuses that shape, so reaching here with it means the create is
+    // unverifiable, and an unverifiable create must never become a staged,
+    // collectible invoice.
+    if (!document) return "QuickBooks did not describe the invoice it created";
+    const verdict = documentMatchesClaim(document, identity);
+    return verdict.ok ? null : verdict.reason;
+}
 
 // Cent-round helper shared by every money computation below. EPSILON nudges
 // values like 1.005 (which float as 1.00499999999...) up to the cent they were
@@ -733,9 +751,20 @@ export interface ProgressBillingStageQbo {
             tax: { preTaxAmount: number; taxAmount: number } | null;
             billEmail: string | null;
             privateNote: string;
+            /**
+             * The accounting date, fixed at CLAIM time and recorded in the
+             * marker. Passed explicitly so the payload and the identity cannot
+             * disagree about which period this books to.
+             */
+            txnDate: string;
         },
         deadline: RouteDeadline,
-    ): Promise<{ qbId: string; total: number }>;
+        // Returns the WHOLE created document, not just its total: the stage
+        // judges it with `documentMatchesClaim`, the same predicate a recovery
+        // applies to a candidate it finds by DocNumber. A seam that reported
+        // only a total could not express the case that predicate exists for --
+        // a matching grand total hiding a different pre-tax/tax split.
+    ): Promise<{ qbId: string; total: number; document: RemoteDocumentFacts | null }>;
     getPaymentLink(tokens: QBTokens, qbInvoiceId: string, deadline: RouteDeadline): Promise<string | null>;
     deleteInvoice(tokens: QBTokens, qbInvoiceId: string, deadline: RouteDeadline): Promise<boolean>;
 }
@@ -973,7 +1002,7 @@ async function defaultStageQbo(): Promise<ProgressBillingStageQbo> {
         resolveCustomerAndItem: (tokens, clientId, deadline) => resolveCustomerAndItem(tokens, clientId, deadline),
         createInvoice: async (tokens, input, deadline) => {
             const created = await createQBMilestoneInvoice(tokens, input, deadline);
-            return { qbId: created.qbId, total: created.total };
+            return { qbId: created.qbId, total: created.total, document: created.document };
         },
         getPaymentLink: (tokens, qbInvoiceId, deadline) => getQBInvoicePaymentLink(tokens, qbInvoiceId, deadline),
         deleteInvoice: (tokens, qbInvoiceId, deadline) => deleteQBInvoice(tokens, qbInvoiceId, deadline),
@@ -1091,6 +1120,10 @@ export async function stageProgressBillingToQuickBooksCore(
     // applies. A raw slice here left the marker holding an untrimmed string
     // while QuickBooks stored the trimmed one, so a code carrying stray
     // whitespace made our own invoice invisible to the resolver.
+    // Captured once and reused for the marker, the payload and the promotion
+    // below — the ambiguous-create marker must carry this SAME claim time, not
+    // a fresh one taken after the request ends. See composeCreateMarker's `at`.
+    const claimedAt = new Date();
     const privateNote = canonicalPrivateNote(progressBillingPrivateNote(invoice.code, billing.code));
     // Truncated to QBO's DocNumber cap BEFORE it goes anywhere — same reasoning
     // as the PrivateNote truncation above. `createInvoice` (createQBMilestoneInvoice)
@@ -1123,17 +1156,28 @@ export async function stageProgressBillingToQuickBooksCore(
         // figure, so this is what lets the ambiguous-create resolver refuse a
         // coincidental match whose total is wrong instead of linking it blind.
         expectedTotal: total,
+        // ...and how that total is SPLIT. QuickBooks recomputes tax under
+        // Automated Sales Tax, and it can book the same grand total as a
+        // different pre-tax/tax pair, which is the number the sales-tax return
+        // reads. Recorded even when it is 0, because "we sent no tax" is an
+        // assertion the acceptance check has to be able to make.
+        expectedTax: taxAmount,
         // WHICH BOOK and WHICH CUSTOMER this POST is going to — same reasoning
         // as the milestone rail. Without the realm, a recovery run after a
         // reconnect to a different company queries the wrong books, finds
         // nothing, and offers to clear a row whose invoice is collectible.
         realmId: tokens.realmId,
         customerId,
+        // The accounting PERIOD and the INCOME ACCOUNT. Without these the
+        // shared predicate silently skipped both checks on this rail: it only
+        // compares a field the identity actually records, so a progress
+        // billing booked to the wrong item, or dated into another period by a
+        // replay, was accepted here while the document rail refused exactly
+        // the same document. One predicate is only one rule if both callers
+        // give it the same facts.
+        txnDate: qboTxnDate(claimedAt),
+        itemId,
     };
-    // Captured once and reused for the promotion below — the ambiguous-create
-    // marker must carry this SAME claim time, not a fresh one taken after the
-    // request ends. See composeCreateMarker's `at` param.
-    const claimedAt = new Date();
     const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity, claimedAt);
     // Pinned to the same content snapshot the create is about to build the
     // invoice from — status alone lets a concurrent edit change subtotal,
@@ -1157,7 +1201,7 @@ export async function stageProgressBillingToQuickBooksCore(
         throw new QBAmbiguousCreateError(billing.code);
     }
 
-    let created: { qbId: string; total: number };
+    let created: { qbId: string; total: number; document: RemoteDocumentFacts | null };
     try {
         created = await qbo.createInvoice(tokens, {
             docNumber,
@@ -1168,6 +1212,10 @@ export async function stageProgressBillingToQuickBooksCore(
             tax: taxAmount > 0 ? { preTaxAmount: subtotal, taxAmount } : null,
             billEmail: invoice.client?.email || null,
             privateNote,
+            // FROM THE IDENTITY, so the document QuickBooks books is dated the
+            // way the claim says it is — including on a replay of an
+            // unconfirmed create, which must not drift into today's period.
+            txnDate: identity.txnDate,
         }, stageDeadline);
     } catch (error) {
         if (!isAmbiguousCreateFailure(error)) {
@@ -1244,26 +1292,32 @@ export async function stageProgressBillingToQuickBooksCore(
             ? ` The abandoned QuickBooks invoice ${billing.code} was deleted, but the link in ProBuild could not be cleared — clear it before re-staging.`
             : "";
 
-    // QuickBooks decides what an invoice totals; we only propose a number.
-    // Automated Sales Tax recomputes the tax from the customer address and the
-    // item tax code, and a changed item, a rounding rule or a tax-exempt
-    // customer all move the answer. The create returns what QuickBooks
-    // actually booked, and this rail used to throw that number away: a billing
-    // for $10,890.00 could stage as a collectible invoice for some other
-    // amount, and ProBuild would report Staged and go on to bill against its
-    // OWN total forever. The milestone rail catches the same drift at SEND
-    // time (the Drift Guard in billing-core.ts) — same tolerance, applied here
-    // at CREATE time, because a progress billing has no equivalent review gate.
+    // QuickBooks decides what an invoice IS; we only propose one. Automated
+    // Sales Tax recomputes the tax from the customer address and the item tax
+    // code, and a changed item, a rounding rule or a tax-exempt customer all
+    // move the answer. The create returns what QuickBooks actually booked, and
+    // this rail used to throw all of it away but the grand total: a billing for
+    // $10,890.00 could stage as a collectible invoice for some other amount,
+    // and ProBuild would report Staged and go on to bill against its OWN total
+    // forever, because nothing on this rail ever looks again.
+    //
+    // The comparison is `documentMatchesClaim`, the SAME predicate the
+    // ambiguous-create resolver and the document-sync recovery apply. It was a
+    // five-cent, total-only check here and a half-cent check on total AND tax
+    // there, so the identical QuickBooks response was accepted on one path and
+    // refused on the other, decided by nothing but whether the first HTTP
+    // response arrived. It now checks customer, DocNumber, PrivateNote, date,
+    // item, cent-normalized total and the TAX SPLIT, the last of which a
+    // matching grand total can hide entirely.
     //
     // Checked while the row is still UNLINKED, so the guarded compensation path
-    // above is still usable. A non-finite total is a mismatch too: the real
-    // client already refuses to return one (createQBMilestoneInvoice), so
-    // reaching here with one means the total is unverifiable, and an
-    // unverifiable total must not become a staged invoice.
-    const createdTotal = created.total;
-    if (!Number.isFinite(createdTotal) || Math.abs(createdTotal - total) > QB_CREATE_TOTAL_TOLERANCE) {
-        const shown = Number.isFinite(createdTotal) ? `$${createdTotal.toFixed(2)}` : "an unreadable total";
-        const detail = `QuickBooks created this invoice for ${shown}, but billing ${billing.code} is $${total.toFixed(2)}`;
+    // above is still usable. An unreadable total or tax is a mismatch too: the
+    // real client already refuses to return a non-finite total
+    // (createQBMilestoneInvoice), so reaching here with one means the invoice
+    // is unverifiable, and an unverifiable invoice must not become a staged one.
+    const mismatch = createdInvoiceRefusal(created.document, identity);
+    if (mismatch) {
+        const detail = `QuickBooks did not create the invoice billing ${billing.code} asked for: ${mismatch}`;
         await logEvent({
             kind: "qbo-payments-sync",
             status: "error",
@@ -1274,7 +1328,10 @@ export async function stageProgressBillingToQuickBooksCore(
                 progressBillingId: billing.id,
                 qbInvoiceId: qbId,
                 expectedTotal: total,
-                createdTotal: Number.isFinite(createdTotal) ? createdTotal : null,
+                createdTotal: created.document?.total ?? null,
+                expectedTax: taxAmount,
+                createdTax: created.document?.totalTax ?? null,
+                mismatch,
             },
         }).catch(() => {});
         if (await compensate()) {

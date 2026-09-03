@@ -10,6 +10,7 @@
  * milestone Paid exactly like the Stripe webhook does. That keeps ProBuild,
  * QuickBooks, and the bank in sync, and keeps the sales-tax report truthful.
  */
+import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents, lockClientRow } from "./tx-retry";
@@ -66,6 +67,8 @@ import {
     isPendingDeletion,
     PENDING_DELETION_MARKER,
     PENDING_DELETION_SETTLED_MARKER,
+    deletionClaimMarker,
+    PENDING_DELETION_CLAIMED_PREFIX,
 } from "./qbo-create-markers";
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 // One definition of the reconnect-QuickBooks reason string, shared with the
@@ -738,6 +741,56 @@ export async function sweepPendingDeletions(
             data: { qbSyncError: flag },
         }).catch(() => ({ count: 0 }));
     };
+    /**
+     * CLAIM one row for deletion, or refuse.
+     *
+     * Round 49, P0. The page read `status` once and the delete decided from
+     * that snapshot, so a settlement committing in between meant this sweep
+     * deleted the QuickBooks invoice of a milestone that had just been PAID.
+     * The post-delete unlink then lost its compare-and-set, and the row was
+     * left Paid and still pointing at a destroyed invoice.
+     *
+     * This runs in its OWN short transaction, under the SAME canonical money
+     * locks a settle takes (`lockMoneyParents` on the parent invoice), and it
+     * pins BOTH `status: Pending` and the marker the row was observed
+     * carrying. A settle that got there first therefore makes the claim fail,
+     * and no remote call happens at all. No remote call is made inside the
+     * transaction — it exists only to make the decision and the marker one
+     * atomic step.
+     *
+     * Returns the claim marker on success, or null when the row moved.
+     */
+    const claim = async (row: { id: string; invoiceId: string | null; qbSyncError: string | null }) => {
+        const marker = deletionClaimMarker(randomUUID().slice(0, 8));
+        try {
+            const won = await withTxRetry(() => (db as typeof prisma).$transaction(async (tx) => {
+                if (row.invoiceId) await lockMoneyParents(tx, { invoiceId: row.invoiceId });
+                const claimed = await tx.paymentSchedule.updateMany({
+                    // Pinned to the state the DECISION was made from. Either half
+                    // moving means the decision is stale.
+                    where: { id: row.id, status: "Pending", qbSyncError: row.qbSyncError },
+                    data: { qbSyncError: marker },
+                });
+                return claimed.count === 1;
+            }));
+            return won ? marker : null;
+        } catch {
+            return null;
+        }
+    };
+    /**
+     * Is the claim STILL ours, immediately before the irreversible call?
+     *
+     * A settle arriving after the claim CANCELS it (payment-record-core.ts
+     * promotes a live claim to the settled marker under the same locks). This
+     * is the last look before the delete.
+     */
+    const claimStillHeld = async (id: string, marker: string) => {
+        const held = await db.paymentSchedule.count({
+            where: { id, qbSyncError: marker, status: "Pending" },
+        }).catch(() => 0);
+        return held === 1;
+    };
     const cursorStore = deps?.cursorStore ?? automationSettingCursorStore;
     const result: PendingDeletionSweepResult = {
         checked: 0, finished: 0, stillPending: 0, unvisited: 0, reason: null,
@@ -747,7 +800,16 @@ export async function sweepPendingDeletions(
     // so a row paid mid-delete stays visible to this sweep instead of dropping
     // out of it Paid, still linked, and unmarked.
     const where = {
-        qbSyncError: { in: [PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER] },
+        OR: [
+            { qbSyncError: { in: [PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER] } },
+            // A CLAIM is still a deletion intent. Leaving claimed rows out of
+            // this filter would have been worse than the race it closes: a row
+            // whose delete failed after the claim, or whose process died
+            // holding one, would vanish from the sweep that exists to finish it
+            // AND from the count that reports outstanding work — silently, and
+            // permanently.
+            { qbSyncError: { startsWith: PENDING_DELETION_CLAIMED_PREFIX } },
+        ],
         qbInvoiceId: { not: null },
     };
 
@@ -770,8 +832,10 @@ export async function sweepPendingDeletions(
     const page = async (after: string | null, take: number) => db.paymentSchedule.findMany({
         where: after ? { ...where, id: { gt: after } } : where,
         // `status` because a PAID row must never be handed to the delete below:
-        // it takes the probe branch instead.
-        select: { id: true, qbInvoiceId: true, status: true, qbSyncError: true },
+        // it takes the probe branch instead. `invoiceId` because the CLAIM below
+        // has to take the same money locks a settle takes, and those are keyed
+        // on the parent invoice.
+        select: { id: true, qbInvoiceId: true, status: true, qbSyncError: true, invoiceId: true },
         orderBy: { id: "asc" },
         take,
     });
@@ -793,10 +857,15 @@ export async function sweepPendingDeletions(
             break;
         }
         result.checked++;
-        // Advanced past every row this run looked at, resolved or not. That is
-        // the whole fix: a row that can never be resolved must not be retried
-        // ahead of everything else on the next run.
-        checkpoint = row.id;
+        // Where the cursor stood BEFORE this row. A shared failure puts it
+        // back: round 49 — the checkpoint used to advance before the QuickBooks
+        // call, so a row the connection prevented us from examining at all was
+        // stepped over and not retried until the next wrap.
+        const beforeRow = checkpoint;
+        // The claim this row is holding, if any. Every exit that does not
+        // finish the unlink gives it back, so a claimed row never sits in a
+        // state only this sweep understands.
+        let heldClaim: string | null = null;
         try {
             // A PAID row cannot go through the delete at all: settling cancels the
             // intent (see PENDING_DELETION_MARKER), so this is a row that predates
@@ -828,22 +897,70 @@ export async function sweepPendingDeletions(
             // concluded it had failed. Either value means the remote document is
             // gone and the local link may be released; a real refusal arrives as
             // a THROW and is handled below.
+            // CLAIM before the irreversible call. Losing it means a settle (or
+            // another sweep) got there first, so this row is not ours to
+            // delete: leave it exactly as it is for the next run.
+            const claimMarker = await claim(row);
+            heldClaim = claimMarker;
+            if (!claimMarker) {
+                result.stillPending++;
+                checkpoint = row.id;
+                continue;
+            }
+            // Last look. A settle landing between the claim and here cancels
+            // it, and cancelling is the only thing that can.
+            if (!(await claimStillHeld(row.id, claimMarker))) {
+                result.stillPending++;
+                checkpoint = row.id;
+                continue;
+            }
             await remove(tokens, row.qbInvoiceId as string, deadline);
-            if (await unlink(row.id, row.qbInvoiceId as string, row.qbSyncError)) result.finished++;
-            else result.stillPending++;
+            // Pinned to the CLAIM, not to the marker the page observed: the
+            // claim is what this sweep owns, and it is what a settle would have
+            // taken away from it.
+            if (await unlink(row.id, row.qbInvoiceId as string, claimMarker)) {
+                // Unlinked: the claim went with it.
+                heldClaim = null;
+                result.finished++;
+            } else {
+                result.stillPending++;
+            }
         } catch (e) {
             if (isQBBudgetExhaustedError(e)) {
                 result.reason = "budget-exhausted";
+                checkpoint = beforeRow;
+                result.checked--;
                 break;
             }
             if (isQboConnectionFailure(e)) {
                 // Shared connection: every remaining row fails the same way at
                 // full cost. Stop and say so.
-                result.reason = isQBTimeoutError(e) ? "qbo-timeout" : "qbo-unavailable";
+                //
+                // A 401/403 is NOT an outage: it is the credential, and only a
+                // human reconnecting fixes it. Filing it as `qbo-unavailable`
+                // meant pipeline-health never raised
+                // `quickbooks-reconnect-needed`, because that reason is
+                // deliberately excluded from QBO_RECONNECT_EVENT_REASONS.
+                result.reason = isQboReconnectRequired(e)
+                    ? QBO_AUTH_SYNC_REASON
+                    : isQBTimeoutError(e)
+                        ? "qbo-timeout"
+                        : "qbo-unavailable";
+                // The row was never examined, so the cursor stays before it.
+                checkpoint = beforeRow;
+                result.checked--;
                 break;
             }
             result.stillPending++;
+        } finally {
+            // Whatever happened, this row does not stay claimed. The delete may
+            // have landed or not; either way the NEXT run has to be able to see
+            // it, and `deleteQBInvoice` answering `false` for an already-gone
+            // invoice is exactly how it finishes.
+            if (heldClaim) await releaseIntent(row.id, heldClaim, row.qbSyncError);
         }
+        // Examined. Only now may the cursor step past it.
+        checkpoint = row.id;
     }
 
     // Persist where to resume. A run that walked its whole page keeps its

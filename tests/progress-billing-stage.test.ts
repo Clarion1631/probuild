@@ -13,7 +13,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { QBTimeoutError, createRouteDeadline, type QBTokens } from "../src/lib/quickbooks";
+import { QBTimeoutError, createRouteDeadline, qboTxnDate, type QBTokens } from "../src/lib/quickbooks";
 import {
     stageProgressBillingToQuickBooksCore,
     progressBillingPrivateNote,
@@ -94,6 +94,25 @@ function makeQbo(behaviour?: {
      * shape; the default keeps every other test on the matching path.
      */
     createdTotal?: number;
+    /**
+     * The accounting date QuickBooks booked it under, when that is not the one
+     * the payload sent — a replay drifting into today's period is the shape
+     * this models.
+     */
+    createdTxnDate?: string;
+    /** The ItemRef of each line, when they are not the item that was sent. */
+    createdItemIds?: string[];
+    /**
+     * What QuickBooks says the invoice's SALES TAX is (`TxnTaxDetail.TotalTax`),
+     * when that is not what we sent.
+     *
+     * The case a total-only check cannot see: Automated Sales Tax can book the
+     * SAME grand total as a different pre-tax/tax pair, and the split is the
+     * number the sales-tax return reads. `null` models a response that carries
+     * no readable TxnTaxDetail at all. Absent means "whatever we sent", which
+     * keeps every other test on the matching path.
+     */
+    createdTax?: number | null;
     payLinkThrows?: unknown;
     payLink?: string | null;
     deleteResult?: boolean;
@@ -111,7 +130,34 @@ function makeQbo(behaviour?: {
         async createInvoice(_t, input) {
             calls.created.push(input);
             if (behaviour?.createThrows) throw behaviour.createThrows;
-            return { qbId: "qb-1", total: behaviour?.createdTotal ?? input.amount };
+            const total = behaviour?.createdTotal ?? input.amount;
+            // The real `createQBMilestoneInvoice` now returns the created
+            // Invoice put through `remoteDocumentFacts`, because the stage
+            // judges it with `documentMatchesClaim` rather than comparing one
+            // number. So the fake returns the same shape, defaulting to the
+            // document that was actually SENT — a test then overrides exactly
+            // the one fact it is about, and nothing else drifts.
+            return {
+                qbId: "qb-1",
+                total,
+                document: {
+                    id: "qb-1",
+                    docNumber: input.docNumber,
+                    privateNote: input.privateNote,
+                    // `remoteDocumentFacts` maps an unreadable TotalAmt to null,
+                    // never to 0 — `Number(null)` is 0 and that would read as a
+                    // confident "this invoice is for nothing".
+                    total: Number.isFinite(total) ? total : null,
+                    customerId: input.customerId,
+                    txnDate: behaviour?.createdTxnDate ?? input.txnDate,
+                    itemIds: behaviour?.createdItemIds ?? [input.itemId],
+                    // Same rule for the tax: absent TxnTaxDetail is null, and an
+                    // untaxed create genuinely gets a response carrying none.
+                    totalTax: behaviour && "createdTax" in behaviour
+                        ? behaviour.createdTax ?? null
+                        : input.tax?.taxAmount ?? null,
+                },
+            };
         },
         async getPaymentLink(_t, qbId) {
             calls.payLinks.push(qbId);
@@ -287,11 +333,25 @@ test("an unknown outcome parks the row ambiguous and records why", async () => {
         // Round 33 gate: the resolver's total-match check reads this off the
         // marker, so it has to ride along with the rest of the identity.
         expectedTotal: 1089,
+        // Round 49 gate: and the TAX SPLIT, because equal grand totals do not
+        // mean equal invoices — Automated Sales Tax can book the same total as
+        // a different pre-tax/tax pair, and the split is what the sales-tax
+        // return reads. Recorded even when it is 0: "we sent no tax" is an
+        // assertion the acceptance check has to be able to make.
+        expectedTax: 89,
         // Round 35 gate: WHICH BOOKS and WHICH CUSTOMER. Without these the
         // resolver queries whatever realm is connected now, finds nothing, and
         // offers to clear a row whose invoice is collectible elsewhere.
         realmId: "realm-1",
         customerId: "42",
+        // Round 49 follow-up: the accounting PERIOD and the INCOME ACCOUNT.
+        // `documentMatchesClaim` only checks a field the identity actually
+        // records, so without these two the shared predicate silently skipped
+        // both checks on this rail — a progress billing booked to the wrong item,
+        // or dated into another period by a replay, was accepted here while the
+        // document rail refused the very same document.
+        txnDate: qboTxnDate(),
+        itemId: "7",
     });
     assert.equal(row.qbInvoiceId, null, "we never learned an id to record");
     assert.equal(events.at(-1)?.reason, "ambiguous-create");
@@ -549,7 +609,10 @@ test("a QuickBooks total that differs from the billing is deleted, never staged"
 
     await assert.rejects(
         () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
-        /QuickBooks created this invoice for \$1200\.00/,
+        // Round 49: the wording is now the shared predicate's own refusal
+        // (`documentMatchesClaim`), not a message this rail composed for
+        // itself. Same behaviour, one voice for both paths.
+        /its total is \$1200\.00, not the \$1089\.00 this claim issued/,
     );
 
     assert.deepEqual(calls.deleted, ["qb-1"], "the wrong invoice is removed from QuickBooks");
@@ -563,17 +626,82 @@ test("a QuickBooks total that differs from the billing is deleted, never staged"
     );
 });
 
-test("a total inside the tolerance still stages (control)", async () => {
-    // Without this, the test above would also pass against a rail that refused
+test("an invoice QuickBooks booked exactly as sent still stages (control)", async () => {
+    // Without this, the tests above would also pass against a rail that refused
     // EVERY create — which would be a different, worse bug.
+    //
+    // Round 49: this used to assert that a FOUR-CENT difference still staged,
+    // because the round-45 check carried its own five-cent tolerance. It is
+    // kept rather than deleted, retuned to the merged rule: the acceptance
+    // predicate is now `documentMatchesClaim`, which normalizes at the cent
+    // (half a cent either way) exactly as the ambiguous-create resolver always
+    // did. Two tolerances on the two halves of one integration is how the same
+    // QuickBooks response ended up accepted on one path and refused on the
+    // other, so the looser one had to go, not be preserved here.
     const { row, db } = makeDb(draftRow());
-    const { qbo, calls } = makeQbo({ createdTotal: 1089.04 });
+    const { qbo, calls } = makeQbo({ createdTotal: 1089, createdTax: 89 });
 
     const res = await stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent });
 
     assert.equal(res.success, true);
     assert.equal(row.qbInvoiceId, "qb-1");
-    assert.deepEqual(calls.deleted, [], "a rounding-sized difference is not drift");
+    assert.deepEqual(calls.deleted, [], "the invoice QuickBooks booked is the one we sent");
+});
+
+test("round 49: a two-cent difference is refused, not tolerated", async () => {
+    // The gap the round-45 check left open. It allowed FIVE cents; the
+    // ambiguous-create resolver, judging the very same document a moment later
+    // by DocNumber, allowed HALF A CENT and refused to link it. So a two-cent
+    // drift staged a collectible invoice that no recovery could ever adopt —
+    // and ProBuild would go on billing, reporting and reconciling against its
+    // own total forever, because nothing on this rail looks again.
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo({ createdTotal: 1089.02 });
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /its total is \$1089\.02, not the \$1089\.00 this claim issued/,
+    );
+    assert.deepEqual(calls.deleted, ["qb-1"], "the drifted invoice is removed from QuickBooks");
+    assert.equal(row.qbInvoiceId, null, "nothing was linked");
+    assert.equal(row.status, "Draft", "the billing can be staged again");
+});
+
+test("round 49: a matching grand total with a DIFFERENT tax split is refused", async () => {
+    // The case a total-only check cannot see, and the reason the resolver has
+    // always compared `TxnTaxDetail.TotalTax` as well. Automated Sales Tax
+    // recomputes tax from the customer address and the item tax code, so it can
+    // book $1,089.00 as $1,039.00 + $50.00 when we sent $1,000.00 + $89.00. The
+    // client pays the same money; the sales-tax liability, the income booked,
+    // and every figure on Vanessa's sales-tax return are wrong — and the
+    // five-cent, total-only check waved it straight through.
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo({ createdTax: 50 });
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /its sales tax is \$50\.00, not the \$89\.00 this claim issued/,
+    );
+    assert.deepEqual(calls.deleted, ["qb-1"], "the mis-split invoice is removed from QuickBooks");
+    assert.equal(row.qbInvoiceId, null, "nothing was linked");
+    assert.equal(row.status, "Draft");
+    assert.equal(row.qbSyncError, null, "the in-flight claim was released");
+});
+
+test("round 49: a tax QuickBooks did not report is a refusal on a taxed billing", async () => {
+    // "We could not check" is never "it matched". A response carrying no
+    // readable TxnTaxDetail says nothing about how QuickBooks split a billing
+    // we sent $89.00 of tax on, and `Number(null)` being 0 is exactly how that
+    // would otherwise read as a confident "no tax".
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo({ createdTax: null });
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /no readable sales tax for it, and this claim issued \$89\.00 of tax/,
+    );
+    assert.deepEqual(calls.deleted, ["qb-1"]);
+    assert.equal(row.qbInvoiceId, null);
 });
 
 test("an unreadable total is a mismatch, not a pass", async () => {
@@ -582,7 +710,10 @@ test("an unreadable total is a mismatch, not a pass", async () => {
 
     await assert.rejects(
         () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
-        /an unreadable total/,
+        // Round 49: the refusal is now the shared predicate's own wording for an
+        // absent TotalAmt. Same rule as before — an unverifiable total must not
+        // become a staged invoice.
+        /QuickBooks reported no readable total for it/,
     );
     assert.deepEqual(calls.deleted, ["qb-1"]);
     assert.equal(row.qbInvoiceId, null);
@@ -631,4 +762,47 @@ test("a null pay link on the direct path keeps the row queued for repair", async
     assert.equal(res.qbInvoiceLink, null);
     assert.equal(row.qbInvoiceId, "qb-1");
     assert.equal(row.qbSyncError, "paylink-pending:1", "still in the sweep's queue, with the attempt recorded");
+});
+
+test("round 49 follow-up: a progress billing dated into another period is refused", async () => {
+    // The shared predicate only checks what the identity records. Until the
+    // stage recorded a TxnDate, `documentMatchesClaim` skipped the date check
+    // entirely on this rail — so the document rail refused a document the
+    // progress-billing rail happily accepted, which is the same
+    // "accepted or refused depending on the path" the round-49 finding is about.
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo({ createdTxnDate: "2019-01-01" });
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /different accounting period/,
+    );
+    assert.deepEqual(calls.deleted, ["qb-1"], "the wrong-period document is removed");
+    assert.equal(row.qbInvoiceId, null);
+});
+
+test("round 49 follow-up: a progress billing booked to another ITEM is refused", async () => {
+    // The item decides the INCOME ACCOUNT. Note, customer, total, tax and date
+    // can all agree while the money books somewhere else entirely.
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo({ createdItemIds: ["7", "99"] });
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /QuickBooks item 99/,
+    );
+    assert.deepEqual(calls.deleted, ["qb-1"]);
+    assert.equal(row.qbInvoiceId, null);
+});
+
+test("round 49 follow-up: the payload is dated from the identity, not from send time", async () => {
+    // A replay of an unconfirmed create must re-send the SAME document. The
+    // date is fixed at claim time and recorded in the marker, so the payload
+    // and the identity cannot disagree about which period this books to.
+    const { db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo();
+
+    await stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent });
+
+    assert.equal(calls.created[0]?.txnDate, qboTxnDate(), "the create carries the claim's date");
 });

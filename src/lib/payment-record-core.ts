@@ -2,7 +2,7 @@ import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum } from "./prisma-helpers";
-import { PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER } from "./qbo-create-markers";
+import { PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER, PENDING_DELETION_CLAIMED_PREFIX } from "./qbo-create-markers";
 
 /**
  * Manual (non-QuickBooks) milestone settlement core — the transaction body of
@@ -85,6 +85,23 @@ export async function recordPaymentCore(
         // settleMilestonePaidInTx), and this is idempotent either way.
         await t.paymentSchedule.updateMany({
             where: { id: paymentId, qbSyncError: PENDING_DELETION_MARKER },
+            data: { qbSyncError: PENDING_DELETION_SETTLED_MARKER },
+        });
+        // ...and CANCEL a live deletion CLAIM the same way (round 49).
+        //
+        // The sweep claims a row before it calls QuickBooks, pinned to
+        // `status: Pending` under these same money locks, so a settle that gets
+        // there first makes the claim fail outright. This is the other order: the
+        // claim is already held and the settle arrives while the remote call is in
+        // flight. Cancelling it here is what the sweep re-checks immediately
+        // before the irreversible delete — it is the only thing that can take the
+        // claim away, and the check and this write serialize on the invoice lock.
+        //
+        // Still not conditional on a marker: the settle itself is unaffected: the
+        // money is recorded either way, and this only decides what the QuickBooks
+        // bookkeeping state says afterwards.
+        await t.paymentSchedule.updateMany({
+            where: { id: paymentId, qbSyncError: { startsWith: PENDING_DELETION_CLAIMED_PREFIX } },
             data: { qbSyncError: PENDING_DELETION_SETTLED_MARKER },
         });
 

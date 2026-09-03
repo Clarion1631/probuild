@@ -480,17 +480,77 @@ test("round 37 gate: pay-link counters cover BOTH rails and sum", async () => {
  * The link now survives until the delete is CONFIRMED, and a row left
  * `pending-deletion` is finished by this sweep rather than by nobody.
  */
-function pendingDeletionDb(rows: Array<{ id: string; qbInvoiceId: string }>) {
-    const live = [...rows];
-    return {
-        db: {
-            paymentSchedule: {
-                async findMany() { return live.map((r) => ({ ...r })); },
-                async count() { return live.length; },
-            },
+/**
+ * The PaymentSchedule table as the deletion sweep really uses it.
+ *
+ * Round 49 (P0) added a CLAIM before the irreversible delete: a short
+ * transaction, under the invoice money lock, that compare-and-sets the row
+ * from `{ status: Pending, qbSyncError: <observed> }` to a claim marker. So
+ * this fake now has to model a transaction, an `updateMany` that honours its
+ * WHERE, and a `count` that answers about ONE row rather than the whole
+ * table — a fake without them would make every claim fail and the tests would
+ * pass against a sweep that never deleted anything at all.
+ *
+ * `onClaimed` fires immediately after a claim commits: that is the window a
+ * settlement lands in, and the only place the post-claim race can be staged.
+ */
+function pendingDeletionDb(
+    rows: Array<{ id: string; qbInvoiceId: string; status?: string; qbSyncError?: string | null; invoiceId?: string | null }>,
+    opts: { onClaimed?: (id: string) => void } = {},
+) {
+    const live = rows.map((r) => ({
+        status: "Pending",
+        qbSyncError: "pending-deletion",
+        invoiceId: "inv-1",
+        ...r,
+    }));
+    const matches = (row: any, where: any): boolean =>
+        Object.entries(where ?? {}).every(([k, v]) => {
+            // A CLAIMED row is still a pending deletion, so the sweep selects
+            // with an OR. A fake that ignored it would hand back every row.
+            if (k === "OR") return (v as any[]).some((clause) => matches(row, clause));
+            if (v !== null && typeof v === "object") {
+                if ("startsWith" in (v as any)) {
+                    return typeof row[k] === "string" && row[k].startsWith((v as any).startsWith);
+                }
+                if ("in" in (v as any)) return (v as any).in.includes(row[k]);
+                if ("not" in (v as any)) return row[k] !== (v as any).not;
+                if ("gt" in (v as any)) return row[k] > (v as any).gt;
+                throw new Error(`unsupported condition on ${k}: ${JSON.stringify(v)}`);
+            }
+            return row[k] === v;
+        });
+    const table = {
+        async findMany(args: any) {
+            const hit = live.filter((r) => matches(r, args?.where)).map((r) => ({ ...r }));
+            return typeof args?.take === "number" ? hit.slice(0, args.take) : hit;
         },
-        live,
+        async count(args: any) {
+            return live.filter((r) => matches(r, args?.where)).length;
+        },
+        async updateMany(args: any) {
+            const hit = live.filter((r) => matches(r, args?.where));
+            for (const r of hit) Object.assign(r, args.data);
+            if (hit.length && String(args.data?.qbSyncError ?? "").startsWith("pending-deletion:claimed:")) {
+                opts.onClaimed?.(hit[0].id);
+            }
+            return { count: hit.length };
+        },
     };
+    const db = {
+        paymentSchedule: table,
+        // The claim takes the invoice lock; the fake records that it was asked
+        // for one rather than pretending locks do not exist.
+        locks: [] as string[],
+        async $queryRaw(strings: TemplateStringsArray, ...values: any[]) {
+            (db as any).locks.push(`${strings.join("?")}|${values.join(",")}`);
+            return [];
+        },
+        async $transaction<T>(fn: (tx: any) => Promise<T>): Promise<T> {
+            return fn(db);
+        },
+    };
+    return { db, live };
 }
 
 test("round 39: `false` from the delete is CONFIRMED ABSENCE, so the row still unlinks", async () => {
@@ -730,6 +790,65 @@ test("round 40: the document sweep wraps back to the head once its tail drains",
     assert.equal(kv.get(DOCUMENT_SYNC_CURSOR_KEYS.estimate), "est-1");
 });
 
+test("round 49: a run that started at the head never wraps, so no row is probed twice", async () => {
+    // The wrap was decided from `cursor !== null`, and `cursor` is ALSO non-null
+    // the moment the row loop has stepped past a row — it assigns `cursor =
+    // row.id` as it goes. So a run that began at the head (no stored cursor),
+    // walked a short page, and then saw an empty next page concluded it must
+    // have "started in the tail", wrapped back to null, and listed and probed
+    // the very rows it had just finished. Every parked row on the rail got two
+    // QuickBooks calls instead of one, `checked` and `unresolved` were reported
+    // at double their true value, and the route budget the pagination exists to
+    // protect was spent re-doing work — worse the emptier the rail, because a
+    // short page is exactly what a nearly-drained rail returns.
+    //
+    // Three rows, a page size far larger than that, and nothing stored: the run
+    // must touch each row EXACTLY once.
+    const { sweepPendingDocumentSyncs, DOCUMENT_SYNC_CURSOR_KEYS } =
+        await import("../src/lib/qbo-document-sync");
+    const rows = [
+        { id: "est-1", marker: "ambiguous-create:@1|EST-1|note", kind: "estimate" as const , clientId: "cli-1" },
+        { id: "est-2", marker: "ambiguous-create:@1|EST-2|note", kind: "estimate" as const , clientId: "cli-1" },
+        { id: "est-3", marker: "ambiguous-create:@1|EST-3|note", kind: "estimate" as const , clientId: "cli-1" },
+    ];
+    const kv = new Map<string, string>();
+    const probes: string[] = [];
+
+    const res = await sweepPendingDocumentSyncs(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        undefined,
+        {
+            cursors: {
+                get: async (k: string) => kv.get(k) ?? null,
+                set: async (k: string, v: string) => { kv.set(k, v); },
+            },
+            railFirst: "estimate",
+            pageSize: 25,
+            listParked: async (rail, after, limit) => {
+                if (rail !== "estimate") return [];
+                return rows.filter((r) => !after || r.id > after).slice(0, limit);
+            },
+            // `absent` keeps every row eligible, which is what makes a second
+            // pass over them visible here: nothing is consumed, so a wrap can
+            // hand the same three rows straight back.
+            probe: (async (_t: unknown, input: { marker: string }) => {
+                probes.push(input.marker);
+                return { state: "absent" };
+            }) as any,
+            adopt: async () => 1,
+            countParked: async () => rows.length,
+        },
+    );
+
+    assert.deepEqual(probes, rows.map((r) => r.marker),
+        "each parked row is asked about ONCE per run, in order");
+    assert.equal(probes.length, rows.length, "no row is re-probed by a bogus wrap");
+    assert.equal(res.checked, 3, "and the tally counts rows, not visits");
+    assert.equal(res.rails.estimate.checked, 3);
+    assert.equal(kv.get(DOCUMENT_SYNC_CURSOR_KEYS.estimate), "est-3",
+        "the checkpoint still lands past the last row visited, unchanged by this fix");
+});
+
 test("round 40: the sweep NEVER adopts on an unanswered question", async () => {
     // The mutation control. "Could not ask" must not read as "there is none",
     // and it must certainly not adopt: either would be a guess about a document
@@ -771,25 +890,20 @@ test("round 40: the deletion sweep pages by cursor too", async () => {
     // behind it were never touched.
     const { sweepPendingDeletions, PENDING_DELETION_CURSOR_KEY } =
         await import("../src/lib/quickbooks-payments");
-    const live = [
-        { id: "ps-1", qbInvoiceId: "qb-1" },   // QuickBooks always refuses this one
-        { id: "ps-2", qbInvoiceId: "qb-2" },
-    ];
     const kv = new Map<string, string>();
     const cursorStore = {
         get: async (k: string) => kv.get(k) ?? null,
         set: async (k: string, v: string) => { kv.set(k, v); },
     };
     const unlinked: string[] = [];
-    const db = {
-        paymentSchedule: {
-            async findMany(args: any) {
-                const after = args?.where?.id?.gt as string | undefined;
-                return live.filter((r) => !after || r.id > after).slice(0, args.take);
-            },
-            async count() { return live.length; },
-        },
-    };
+    // The shared fake, because the sweep now CLAIMS a row (a transaction, a
+    // lock and a pinned compare-and-set) before the irreversible delete. A
+    // hand-rolled table without those makes every claim fail, and the test
+    // would then pass against a sweep that deleted nothing at all.
+    const { db, live } = pendingDeletionDb([
+        { id: "ps-1", qbInvoiceId: "qb-1" },   // QuickBooks always refuses this one
+        { id: "ps-2", qbInvoiceId: "qb-2" },
+    ]);
     const opts = {
         db: db as any,
         cursorStore: cursorStore as any,
@@ -1535,10 +1649,13 @@ test("round 47: a ROW-specific ambiguity still advances, one probe per row (cont
     const sweep = connectionSweep(new Error("two documents match this code"));
     const res = await sweep.run();
 
-    // Every row on both rails, plus the bounded wrap back to the head that
-    // the round-40 cursor work added. What matters here is that it did NOT
-    // stop at the first ambiguous row.
-    assert.ok(sweep.probes.length > 5, `expected every row to be examined, got ${sweep.probes.length}`);
+    // Every row on both rails, and each of them ONCE. This used to assert
+    // `> 5` — five rows plus a second pass over them, because a run starting at
+    // the head wrapped back to the top the moment its first page ran out. That
+    // extra pass was the round-49 bug, not the bounded wrap: the wrap is for a
+    // run that RESUMED in the tail. What this control is actually for is that
+    // the sweep did NOT stop at the first ambiguous row.
+    assert.equal(sweep.probes.length, 5, `expected every row examined once, got ${sweep.probes.length}`);
     assert.equal(res.reason, null);
     assert.ok(res.rails.invoice.checked > 0, "the second rail ran");
 });
@@ -1627,4 +1744,208 @@ test("round 48: qbo-auth is a reason pipeline-health counts toward the reconnect
     // The cron files the event under the body's reason verbatim.
     const cron = await import("node:fs").then((fs) => fs.readFileSync("src/app/api/cron/qbo-maintenance/route.ts", "utf8"));
     assert.match(cron, /reason: ok \? undefined : String\(\(body as \{ reason\?: string \} \| null\)\?\.reason \?\? "maintenance-incomplete"\)/);
+});
+
+// --- Round 49: a settlement racing the deletion sweep (P0) ---
+
+/**
+ * The sweep read `status` once, at page time, and decided whether to delete
+ * from that snapshot. A settlement committing in between — a manual Record
+ * Payment, a Stripe webhook — left the sweep DELETING the QuickBooks invoice of
+ * a milestone that had just been paid. The post-delete unlink then lost its
+ * compare-and-set (the settle had promoted the marker), so the row stayed
+ * Paid, still linked, pointing at an invoice that no longer existed.
+ *
+ * The fix is a claim: a short transaction under the invoice money lock that
+ * compare-and-sets `{ status: Pending, qbSyncError: <observed> }` into a claim
+ * marker. A settle that got there first makes that CAS fail, so the remote
+ * call never happens — which is what these assert on the delete count.
+ */
+test("round 49: a settle that commits before the claim stops the delete entirely", async () => {
+    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const { db, live } = pendingDeletionDb([{ id: "ps-1", qbInvoiceId: "qb-1" }]);
+    // The settle lands between the page read and the claim: status Paid, and
+    // the marker promoted, exactly as payment-record-core does it.
+    live[0].status = "Paid";
+    live[0].qbSyncError = "pending-deletion:settled";
+    const deleted: string[] = [];
+
+    const res = await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        createRouteDeadline(30_000),
+        {
+            db: db as any,
+            deleteInvoice: async (_t, qbId) => { deleted.push(qbId); return true; },
+            unlink: async () => true,
+            // The row reads Paid, so the sweep takes the PROBE branch and finds
+            // the invoice alive: the deletion intent is simply wrong now.
+            probeInvoice: async () => ({ state: "ok", balance: 0, total: 100 }) as any,
+        },
+    );
+
+    assert.deepEqual(deleted, [], "a paid milestone's invoice is NEVER deleted");
+    assert.equal(res.finished, 1, "the intent is cancelled instead");
+});
+
+test("round 49: a settle that commits after the page read makes the CLAIM fail, and nothing is deleted", async () => {
+    // The exact interleaving from the finding: the page saw Pending, and the
+    // settle commits before the claim runs. The claim is pinned to BOTH the
+    // status and the marker it was decided from, so it loses.
+    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const deleted: string[] = [];
+    const { db, live } = pendingDeletionDb([{ id: "ps-1", qbInvoiceId: "qb-1" }]);
+    const realFindMany = db.paymentSchedule.findMany.bind(db.paymentSchedule);
+    db.paymentSchedule.findMany = async (args: any) => {
+        const page = await realFindMany(args);
+        // ...and NOW the settlement commits, after the sweep has its snapshot.
+        live[0].status = "Paid";
+        live[0].qbSyncError = "pending-deletion:settled";
+        return page;
+    };
+
+    const res = await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        createRouteDeadline(30_000),
+        {
+            db: db as any,
+            deleteInvoice: async (_t, qbId) => { deleted.push(qbId); return true; },
+            unlink: async () => true,
+        },
+    );
+
+    assert.deepEqual(deleted, [], "the claim lost, so the irreversible call never happened");
+    assert.equal(live[0].status, "Paid", "and the settlement stands");
+    assert.equal(res.finished, 0);
+});
+
+test("round 49: a settle CANCELLING a live claim stops the delete at the last look", async () => {
+    // The other order: the claim is already held and the settle arrives while
+    // the sweep is between the claim and the remote call. Cancelling the claim
+    // (payment-record-core promotes it to the settled marker) is the only thing
+    // that can take it away, and the sweep re-checks immediately before the
+    // irreversible call.
+    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const deleted: string[] = [];
+    const { db, live } = pendingDeletionDb(
+        [{ id: "ps-1", qbInvoiceId: "qb-1" }],
+        {
+            // Fires the instant the claim commits.
+            onClaimed: () => {
+                live[0].status = "Paid";
+                live[0].qbSyncError = "pending-deletion:settled";
+            },
+        },
+    );
+
+    await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        createRouteDeadline(30_000),
+        {
+            db: db as any,
+            deleteInvoice: async (_t, qbId) => { deleted.push(qbId); return true; },
+            unlink: async () => true,
+        },
+    );
+
+    assert.deepEqual(deleted, [], "the cancelled claim stops the delete");
+});
+
+test("round 49: an UNCONTESTED row still deletes (the control)", async () => {
+    // Without this, the three tests above would pass just as happily against a
+    // sweep that had stopped deleting anything at all.
+    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const deleted: string[] = [];
+    const { db } = pendingDeletionDb([{ id: "ps-1", qbInvoiceId: "qb-1" }]);
+
+    const res = await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        createRouteDeadline(30_000),
+        {
+            db: db as any,
+            deleteInvoice: async (_t, qbId) => { deleted.push(qbId); return true; },
+            unlink: async () => true,
+        },
+    );
+
+    assert.deepEqual(deleted, ["qb-1"]);
+    assert.equal(res.finished, 1);
+});
+
+test("round 49: the claim is taken under the invoice money lock", async () => {
+    // A claim that took no lock would serialize against nothing: the settle
+    // takes the same lock, and that is what makes the two orderings the only
+    // two orderings.
+    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const { db } = pendingDeletionDb([{ id: "ps-1", qbInvoiceId: "qb-1", invoiceId: "inv-7" }]);
+
+    await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        createRouteDeadline(30_000),
+        { db: db as any, deleteInvoice: async () => true, unlink: async () => true },
+    );
+
+    assert.ok(
+        (db as any).locks.some((l: string) => /"Invoice"[\s\S]*FOR UPDATE[\s\S]*inv-7/.test(l)),
+        `the claim must lock the parent invoice, got ${JSON.stringify((db as any).locks)}`,
+    );
+});
+
+// --- Round 49: the deletion sweep names a credential failure (P1) ---
+
+test("round 49: a 401 stops the deletion sweep as qbo-auth, not as an outage", async () => {
+    // `qbo-unavailable` is deliberately excluded from QBO_RECONNECT_EVENT_REASONS,
+    // so filing a credential failure under it meant pipeline-health never raised
+    // `quickbooks-reconnect-needed` — the one failure that cannot fix itself was
+    // the one nobody was told about.
+    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline, QboHttpError } = await import("../src/lib/quickbooks");
+    const { QBO_RECONNECT_EVENT_REASONS } = await import("../src/lib/pipeline-health");
+    const { db } = pendingDeletionDb([{ id: "ps-1", qbInvoiceId: "qb-1" }, { id: "ps-2", qbInvoiceId: "qb-2" }]);
+
+    const res = await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        createRouteDeadline(30_000),
+        {
+            db: db as any,
+            deleteInvoice: async () => { throw new QboHttpError("unauthorized", 401); },
+            unlink: async () => true,
+        },
+    );
+
+    assert.equal(res.reason, "qbo-auth");
+    assert.ok(QBO_RECONNECT_EVENT_REASONS.includes(res.reason as string), "health must act on it");
+});
+
+test("round 49: a shared failure leaves the cursor BEFORE the row it never examined", async () => {
+    // The checkpoint used to advance before the QuickBooks call, so a row the
+    // connection prevented us from examining was stepped over and not retried
+    // until the next wrap.
+    const { sweepPendingDeletions, PENDING_DELETION_CURSOR_KEY } =
+        await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline, QBTimeoutError } = await import("../src/lib/quickbooks");
+    const kv = new Map<string, string>();
+    const { db } = pendingDeletionDb([{ id: "ps-1", qbInvoiceId: "qb-1" }]);
+
+    const res = await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        createRouteDeadline(30_000),
+        {
+            db: db as any,
+            cursorStore: {
+                get: async (k: string) => kv.get(k) ?? null,
+                set: async (k: string, v: string) => { kv.set(k, v); },
+            } as any,
+            deleteInvoice: async () => { throw new QBTimeoutError("timed out"); },
+            unlink: async () => true,
+        },
+    );
+
+    assert.equal(res.reason, "qbo-timeout");
+    assert.equal(kv.get(PENDING_DELETION_CURSOR_KEY) || "", "", "the unexamined row is not stepped over");
+    assert.equal(res.checked, 0, "and it is not counted as examined either");
 });

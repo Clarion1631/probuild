@@ -34,6 +34,7 @@ const FULL: CreateIdentity = {
     privateNote: "ProBuild EST-00237 - Mesplay Kitchen",
     issuanceHash: "4f1c2ab90de7331a",
     expectedTotal: 1089.5,
+    expectedTax: 89.5,
     realmId: "9130354",
     customerId: "58",
     qbId: "1042",
@@ -51,7 +52,7 @@ test("round 48: every field survives compose -> parse unchanged", () => {
 test("round 48: each optional field can be absent, and is then OMITTED not undefined", () => {
     // A deep-equality check against a smaller identity has to keep reading as
     // equal for a marker that predates the newer fields.
-    const optional = ["issuanceHash", "expectedTotal", "realmId", "customerId", "qbId", "txnDate", "itemId"] as const;
+    const optional = ["issuanceHash", "expectedTotal", "expectedTax", "realmId", "customerId", "qbId", "txnDate", "itemId"] as const;
     for (const field of optional) {
         const identity: any = { ...FULL };
         delete identity[field];
@@ -72,6 +73,7 @@ test("round 48: a malformed field makes the WHOLE identity null", () => {
         "ambiguous-create:@|EST-00237|note",
         "ambiguous-create:#|EST-00237|note",
         "ambiguous-create:$|EST-00237|note",
+        "ambiguous-create:^|EST-00237|note",
         "ambiguous-create:~|EST-00237|note",
         "ambiguous-create:%|EST-00237|note",
         "ambiguous-create:!|EST-00237|note",
@@ -80,6 +82,7 @@ test("round 48: a malformed field makes the WHOLE identity null", () => {
         "ambiguous-create:@notanumber|EST-00237|note",
         "ambiguous-create:#NOTHEX|EST-00237|note",
         "ambiguous-create:$notmoney|EST-00237|note",
+        "ambiguous-create:^notmoney|EST-00237|note",
         "ambiguous-create:+notadate|EST-00237|note",
         // A prefix with no terminator at all.
         "ambiguous-create:&7",
@@ -100,7 +103,7 @@ test("round 48: a DocNumber that composition could not have written is refused",
     assert.equal(isComposableDocNumber(""), false);
     assert.equal(isComposableDocNumber("a|b"), false);
     assert.equal(isComposableDocNumber("x".repeat(MARKER_DOC_NUMBER_MAX_LEN + 1)), false);
-    for (const prefix of ["@", "#", "$", "~", "%", "!", "+", "&"]) {
+    for (const prefix of ["@", "#", "$", "^", "~", "%", "!", "+", "&"]) {
         assert.equal(isComposableDocNumber(`${prefix}EST-1`), false, prefix);
     }
 
@@ -134,7 +137,7 @@ test("round 48: a corruption OUTSIDE the document number can never change it", (
     assert.ok(docAt > 0, "the fixture must contain its own document number");
     const docEnd = docAt + FULL.docNumber.length;
 
-    const alphabet = ["|", "@", "#", "$", "~", "%", "!", "+", "&", "x", "0", ""];
+    const alphabet = ["|", "@", "#", "$", "^", "~", "%", "!", "+", "&", "x", "0", ""];
     let nulls = 0;
     const check = (parsed: ReturnType<typeof parseCreateMarker>, what: string) => {
         if (!parsed) return;
@@ -216,7 +219,11 @@ test("round 48: the target line is printed and carries no password", async () =>
     const line = redactTarget("postgresql://postgres.abc:sup3rs3cret@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true");
     assert.ok(!line.includes("sup3rs3cret"), `the password must not appear: ${line}`);
     assert.match(line, /aws-0-us-west-2\.pooler\.supabase\.com:6543/, "but the host must, so a human can check it");
-    assert.match(line, /\/postgres$/, "and the database name");
+    assert.match(line, /\/postgres /, "and the database name");
+    // The PROJECT REF, which is the only part of a Supabase connection string
+    // that says WHICH database this is: the pooler host is shared across every
+    // project in the region.
+    assert.match(line, /\(project abc\)/, "and which project");
     assert.equal(redactTarget("not a url"), "(unparseable connection string)");
 });
 
@@ -233,4 +240,51 @@ test("round 48: the script verifies the database it actually reached", async () 
     assert.ok(!/\.env\.local/.test(src), "no fallback env files to reason about");
     // Flags are parsed inside main(), so the module stays inert on import.
     assert.ok(src.indexOf("process.argv.slice(2)") > src.indexOf("async function main()"));
+});
+
+test("round 49: --target ci is a throwaway-database mode that can never reach production", async () => {
+    // It exists so CI can run the script for real (scripts/ci-apply-qb-sync-marker-e2e.mjs),
+    // because `main()` is the one part of that file no other test executes. The
+    // safety property is that this mode REFUSES a Supabase host, so the
+    // production guard cannot be satisfied through it even by accident.
+    const { execFileSync } = await import("node:child_process");
+    const run = (args: string[], env: Record<string, string>) => {
+        try {
+            return {
+                code: 0,
+                out: execFileSync(process.execPath, ["scripts/apply-qb-sync-marker.mjs", ...args], {
+                    encoding: "utf8",
+                    stdio: ["ignore", "pipe", "pipe"],
+                    env: { ...process.env, ...env },
+                }),
+            };
+        } catch (e: any) {
+            return { code: e.status ?? 1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
+        }
+    };
+
+    const supabase = run(["--target", "ci"], {
+        DATABASE_URL: "postgresql://postgres.abc:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres",
+    });
+    assert.equal(supabase.code, 1, "a Supabase URL must be refused in ci mode");
+    assert.match(supabase.out, /REFUSING/);
+    assert.ok(!/ok: ALTER TABLE/.test(supabase.out), "and refused before any DDL");
+
+    const noUrl = run(["--target", "ci"], { DATABASE_URL: "" });
+    assert.equal(noUrl.code, 1);
+    assert.match(noUrl.out, /needs DATABASE_URL/);
+});
+
+test("round 49: the CI driver builds a pre-marker database and proves idempotency", () => {
+    // The shape of the check, asserted from source: the driver has to move the
+    // marker migration aside (or it proves nothing about the script), run the
+    // script twice (or it proves nothing about re-running a half-finished
+    // apply), and compare the result against the committed migration.
+    const src = readFileSync("scripts/ci-apply-qb-sync-marker-e2e.mjs", "utf8");
+    assert.match(src, /renameSync\(migration, parked\)/, "the migration is parked so the script does the work");
+    assert.match(src, /migrate deploy/);
+    const runs = [...src.matchAll(/run\("node", \[script, "--target", "ci"\], env\)/g)];
+    assert.equal(runs.length, 2, "run once to apply, once more to prove idempotency");
+    assert.match(src, /information_schema\.columns/, "and the resulting shape is asserted");
+    assert.match(src, /REFUSING: APPLY_E2E_SERVER_URL looks like production/);
 });

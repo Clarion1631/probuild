@@ -300,6 +300,10 @@ export async function probeDocumentSync(
  *  - CustomerRef: proves it bills the party the claim addressed.
  *  - TotalAmt: proves it is for the money the claim issued. QuickBooks
  *    recomputes tax with Automated Sales Tax, so this genuinely moves.
+ *  - TxnTaxDetail.TotalTax: proves the money is SPLIT the way the claim issued
+ *    it. Equal grand totals do not settle this — Automated Sales Tax can book
+ *    the same total as a different pre-tax/tax pair, and the split is what the
+ *    sales-tax return reads. A total-only check accepts that document.
  *  - TxnDate: proves it lands in the ACCOUNTING PERIOD the claim recorded. A
  *    replay after midnight, or after a period close, otherwise books to a
  *    different month and was adopted silently.
@@ -313,7 +317,12 @@ export async function probeDocumentSync(
  * check" is never "it matched".
  */
 export function documentMatchesClaim(
-    doc: Pick<RemoteDocumentFacts, "docNumber" | "privateNote" | "customerId" | "total" | "txnDate" | "itemIds">,
+    // `totalTax` is optional on the parameter, not on RemoteDocumentFacts: an
+    // absent one is treated exactly like an unreadable one (refused whenever the
+    // claim issued tax), so a caller that cannot report it can never pass by
+    // omitting it.
+    doc: Pick<RemoteDocumentFacts, "docNumber" | "privateNote" | "customerId" | "total" | "txnDate" | "itemIds">
+        & Partial<Pick<RemoteDocumentFacts, "totalTax">>,
     identity: CreateIdentity,
 ): { ok: true } | { ok: false; reason: string } {
     const expectedDocNumber = identity.docNumber.slice(0, QB_DOC_NUMBER_MAX_LEN);
@@ -343,6 +352,33 @@ export function documentMatchesClaim(
             return {
                 ok: false,
                 reason: `its total is $${doc.total.toFixed(2)}, not the $${identity.expectedTotal.toFixed(2)} this claim issued`,
+            };
+        }
+    }
+    if (identity.expectedTax != null) {
+        // The SAME rule `resolveAmbiguousInvoiceCreateCore` applies to a
+        // candidate it finds by DocNumber, stated once here so the two cannot
+        // drift: an unreadable tax is a refusal when tax was actually sent
+        // ("could not check" is never "it matched"), and is accepted only when
+        // the claim asserts there was none — a create that sends no
+        // TxnTaxDetail gets a response that carries none either, and refusing
+        // that would refuse every untaxed document QuickBooks builds correctly.
+        const remoteTax = doc.totalTax ?? null;
+        if (remoteTax == null) {
+            if (identity.expectedTax > 0.005) {
+                return {
+                    ok: false,
+                    reason:
+                        `QuickBooks reported no readable sales tax for it, and this claim issued ` +
+                        `$${identity.expectedTax.toFixed(2)} of tax`,
+                };
+            }
+        } else if (!sameMoney(remoteTax, identity.expectedTax)) {
+            return {
+                ok: false,
+                reason:
+                    `its sales tax is $${remoteTax.toFixed(2)}, not the $${identity.expectedTax.toFixed(2)} this claim ` +
+                    `issued (the same grand total can hide a different tax split)`,
             };
         }
     }
@@ -543,6 +579,12 @@ export async function sweepPendingDocumentSyncs(
         // first row completes must leave the cursor where it was, or the next
         // run restarts from the top and the tail starves again.
         let checkpoint: string | null = cursor;
+        // Whether this run RESUMED in the tail, decided ONCE from the stored
+        // cursor. It cannot be re-derived from `cursor` inside the loop: the row
+        // loop assigns `cursor = row.id` as it goes, so from the second page on
+        // a run that began at the head is indistinguishable from one that
+        // resumed mid-rail.
+        const startedAtHead = cursor === null;
         let wrapped = false;
         let exhausted = false;
         let visited = 0;
@@ -564,7 +606,15 @@ export async function sweepPendingDocumentSyncs(
                 // Already wrapped: this run has seen the head portion as well.
                 // Keep the checkpoint so the next run continues AFTER the last
                 // row visited, rather than re-walking what was just done.
-                if (wrapped) break;
+                //
+                // Same for a run that STARTED at the head and simply ran off the
+                // end: `cursor` is non-null only because the row loop advanced it
+                // past the rows this run just processed. Reading that as "we must
+                // have started in the tail" wrapped back to the top and re-listed,
+                // re-probed and re-tallied every row this run had already done —
+                // double the QuickBooks calls, doubled `checked`/`unresolved`, and
+                // the route budget spent on work the pagination exists to protect.
+                if (wrapped || startedAtHead) break;
                 // Tail drained. Wrap ONCE back to the head so rows before the
                 // cursor are not stranded until somebody resets it by hand —
                 // and only once, or a run could walk the collection forever.
