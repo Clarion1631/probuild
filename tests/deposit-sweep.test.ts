@@ -766,7 +766,7 @@ test("job progress: the field has to agree that THIS PHASE is done", async t => 
             dailyLogs: [{ date: "2026-08-20", workPerformed: "Hung drywall in the hall bath and taped corners" }],
         });
         assert.equal(result.corroborated, false);
-        assert.match(result.detail, /no daily log mentioning "rough"/);
+        assert.match(result.detail, /no daily log saying "rough" is done/);
     });
 
     await t.test("a name with no distinctive words can never be corroborated", () => {
@@ -778,6 +778,91 @@ test("job progress: the field has to agree that THIS PHASE is done", async t => 
         });
         assert.equal(result.corroborated, false);
         assert.match(result.detail, /no distinctive words/);
+    });
+
+    await t.test("ALL of the phase's words, or it is not this phase", () => {
+        // Codex's example: a rough-in plumbing sign-off is not an electrical
+        // rough-in sign-off, and "some token matched" could not tell them apart.
+        const electrical = { ...base, milestoneName: "Electrical Rough Complete" };
+        assert.deepEqual(milestoneProgressTokens("Electrical Rough Complete"), ["ELECTRICAL", "ROUGH"]);
+        assert.equal(
+            progressCorroboration({ ...electrical, inspections: [{ result: "PASSED", type: "Rough-in plumbing", date: "2026-08-21" }] }).corroborated,
+            false,
+            "plumbing rough-in must not sign off electrical rough-in",
+        );
+        assert.equal(
+            progressCorroboration({ ...electrical, inspections: [{ result: "PASSED", type: "Electrical rough-in", date: "2026-08-21" }] }).corroborated,
+            true,
+        );
+        // Same rule for logs, within ONE entry.
+        assert.equal(
+            progressCorroboration({ ...electrical, dailyLogs: [{ date: "2026-08-20", workPerformed: "Rough plumbing done" }] }).corroborated,
+            false,
+        );
+        assert.equal(
+            progressCorroboration({ ...electrical, dailyLogs: [{ date: "2026-08-20", workPerformed: "Electrical rough finished today" }] }).corroborated,
+            true,
+        );
+    });
+
+    await t.test("a log saying the work is NOT done corroborates nothing", async tt => {
+        const cabinets = { ...base, milestoneName: "Cabinets Complete" };
+        const log = (workPerformed: string) => ({ ...cabinets, dailyLogs: [{ date: "2026-08-20", workPerformed }] });
+
+        await tt.test("Codex's example: the phase is named, but as what is missing", () => {
+            assert.equal(progressCorroboration(log("Cabinets not delivered")).corroborated, false);
+        });
+
+        await tt.test("every negation form is refused", () => {
+            for (const text of [
+                "Cabinets not delivered",
+                "No cabinets on site yet",
+                "Cabinets pending",
+                "Cabinets incomplete",
+                "Waiting on cabinets",
+                "Cabinets delayed at the shop",
+                "Cabinets on hold",
+                "Cabinets arriving tomorrow",
+                "Cabinets go in next week",
+                "Need cabinets from the supplier",
+                "Cabinets still remaining",
+                "Cabinets never showed up",
+            ]) {
+                assert.equal(progressCorroboration(log(text)).corroborated, false, text);
+            }
+        });
+
+        await tt.test("…and an affirmative one still corroborates", () => {
+            assert.equal(progressCorroboration(log("cabinets installed and complete")).corroborated, true);
+            assert.equal(progressCorroboration(log("Set and trimmed the cabinets")).corroborated, true);
+        });
+
+        await tt.test("the negation only has to be in the sentence that names the phase", () => {
+            // Other work being unfinished says nothing about THIS phase.
+            assert.equal(
+                progressCorroboration(log("Cabinets installed and complete. Countertops not templated yet")).corroborated,
+                true,
+            );
+            // …but a negation beside the phase does.
+            assert.equal(
+                progressCorroboration(log("Countertops templated. Cabinets not delivered")).corroborated,
+                false,
+            );
+            // Line breaks split as hard as full stops — daily logs are lists.
+            assert.equal(
+                progressCorroboration(log("Cabinets installed and complete\nCountertops not templated")).corroborated,
+                true,
+            );
+        });
+
+        await tt.test("Hoppe stays positive", () => {
+            const result = progressCorroboration({
+                ...base,
+                dailyLogs: [{ date: "2026-08-20", workPerformed: "rough in complete, inspector walked it" }],
+            });
+            assert.equal(result.corroborated, true);
+            assert.equal(result.via, "daily-log");
+        });
     });
 
     await t.test("nothing at all is not corroboration", () => {
@@ -919,6 +1004,19 @@ test("M2: `ok` means the batch finished cleanly, not that everything booked", ()
     // The catch-all is what makes a status nobody named (qbo_created after a
     // settle threw, a busy processing row) fail the batch instead of vanishing.
     assert.equal(sweepBatchOk({ ...base, credits: 4, unresolved: 1 }), false);
+});
+
+test("M2: a count that is not a count fails the batch", () => {
+    const base = { credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 };
+    assert.equal(sweepBatchOk(base), true);
+    // Codex's example: the partition ties (1 = 2 + -1) while describing
+    // something that cannot have happened.
+    assert.equal(sweepBatchOk({ ...base, credits: 1, applied: 2, unmatched: -1 }), false);
+    for (const bad of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 2]) {
+        assert.equal(sweepBatchOk({ ...base, replay: bad }), false, `replay ${bad}`);
+        assert.equal(sweepBatchOk({ ...base, credits: 1, applied: 1, unmatched: bad } as never), false, `unmatched ${bad}`);
+    }
+    assert.equal(sweepBatchOk({ ...base, applied: undefined } as never), false, "a missing bucket is not zero");
 });
 
 test("M2: buckets that do not add up to the credit count can never report success", () => {
@@ -1757,7 +1855,7 @@ test("P0: with the live-apply switch OFF, a perfect amount-only match is SUGGEST
     );
     assert.match(
         String(result.reason),
-        /no daily log mentioning|no distinctive words/,
+        /no daily log saying|no distinctive words/,
         "and explains what it looked for, or why it could not look",
     );
     assert.equal(calls.buildQBPaymentRequest.length, 0, "no money boundary is touched at all");
@@ -2165,7 +2263,7 @@ test("R7: job progress unlocks auto-apply without the switch (Justin's daily-log
         const result = creditResult(body, "REF-NOEVIDENCE");
         assert.equal(result.status, "proposed");
         assert.match(String(result.reason), /phase not corroborated by any daily log or inspection; no payment was booked/);
-        assert.match(String(result.reason), /no daily log mentioning "rough"/);
+        assert.match(String(result.reason), /no daily log saying "rough" is done/);
         assert.equal(calls.buildQBPaymentRequest.length, 0);
     });
 

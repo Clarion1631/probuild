@@ -673,6 +673,17 @@ export interface SweepCounts {
  * failure this whole function exists to make impossible.
  */
 export function sweepBatchOk(counts: SweepCounts): boolean {
+    // A tally is only a tally if every figure in it is a whole, non-negative
+    // number. A negative or fractional bucket can make the partition check
+    // below add up perfectly (credits 1 = applied 2 + unmatched -1) while
+    // describing something that cannot have happened, so the shape is checked
+    // before the arithmetic is trusted.
+    const values = [
+        counts.credits, counts.applied, counts.proposed, counts.unmatched,
+        counts.reconcile, counts.failed, counts.qboUnknown, counts.unresolved, counts.replay,
+    ];
+    if (!values.every(value => Number.isSafeInteger(value) && value >= 0)) return false;
+
     const bucketSum = counts.applied + counts.proposed + counts.unmatched
         + counts.reconcile + counts.failed + counts.qboUnknown + counts.unresolved;
     if (bucketSum !== counts.credits) return false;
@@ -731,6 +742,34 @@ export interface ProgressResult {
     detail: string;
 }
 
+/**
+ * Words that mean the work is NOT done. A log that names the phase inside a
+ * sentence like one of these is describing what is LEFT, not what is finished —
+ * "cabinets not delivered" is the opposite of evidence that cabinets are in.
+ *
+ * Deliberately blunt and deliberately over-eager: "rough in complete, no
+ * issues" is refused too. A false `proposed` costs a human ten seconds; a false
+ * apply moves somebody's money to the wrong job.
+ */
+const NEGATION_WORDS = new Set([
+    "NOT", "NO", "NEVER", "PENDING", "INCOMPLETE", "WAITING", "DELAYED", "HOLD",
+    "TOMORROW", "NEED", "NEEDS", "REMAINING", "STILL",
+]);
+/** Multi-word forms the single-word list cannot see. */
+const NEGATION_PHRASES = ["NEXT WEEK"];
+
+/** Sentence-ish fragments: real daily logs are as often line-broken lists as
+ *  prose, so line breaks split as hard as full stops do. */
+function sentencesOf(text: string): string[] {
+    return (text ?? "").split(/[.!?;\n\r]+/).map(part => part.trim()).filter(Boolean);
+}
+
+function saysNotDone(sentence: string): boolean {
+    const upper = sentence.toUpperCase();
+    if (NEGATION_PHRASES.some(phrase => upper.includes(phrase))) return true;
+    return upper.split(/[^A-Z0-9]+/).some(word => NEGATION_WORDS.has(word));
+}
+
 /** Whole-word, case-insensitive. Substring matching let "textile" corroborate
  *  a Tile milestone and "roughly" a Rough In one — the opposite of evidence. */
 function mentionsToken(text: string, token: string): boolean {
@@ -769,13 +808,18 @@ export function progressCorroboration(evidence: ProgressEvidence): ProgressResul
         };
     }
 
+    // ALL of the phase's distinctive words, in ONE piece of evidence. `some`
+    //     was too loose: "Electrical Rough Complete" needs both "electrical" and
+    //     "rough", or a passed "Rough-in plumbing" inspection corroborates it.
+    const namesWholePhase = (text: string) => tokens.every(token => mentionsToken(text, token));
+
     // (a) An inspection that PASSED is the strongest field signal there is: a
     //     third party attended and signed the phase off — PROVIDED it is this
     //     phase. An unrelated plumbing sign-off must never unlock cabinetry.
     const passed = evidence.inspections.find(i =>
         /^(PASSED|APPROVED)$/i.test((i.result ?? "").trim())
         && inWindow(i.date)
-        && tokens.some(token => mentionsToken(i.type ?? "", token)));
+        && namesWholePhase(i.type ?? ""));
     if (passed) {
         return {
             corroborated: true,
@@ -784,23 +828,26 @@ export function progressCorroboration(evidence: ProgressEvidence): ProgressResul
         };
     }
 
-    // (b) A daily log that names this phase.
+    // (b) A daily log that names this phase — AFFIRMATIVELY. The log has to
+    //     name the whole phase, and the sentences that name it must not be
+    //     saying the work is outstanding.
     for (const log of evidence.dailyLogs) {
         if (!inWindow(log.date)) continue;
-        const hit = tokens.find(token => mentionsToken(log.workPerformed ?? "", token));
-        if (hit) {
-            return {
-                corroborated: true,
-                via: "daily-log",
-                detail: `the daily log for ${log.date} mentions "${hit.toLowerCase()}"`,
-            };
-        }
+        const text = log.workPerformed ?? "";
+        if (!namesWholePhase(text)) continue;
+        const naming = sentencesOf(text).filter(sentence => tokens.some(token => mentionsToken(sentence, token)));
+        if (naming.length === 0 || naming.some(saysNotDone)) continue;
+        return {
+            corroborated: true,
+            via: "daily-log",
+            detail: `the daily log for ${log.date} says ${tokens.map(t => `"${t.toLowerCase()}"`).join(" and ")} is done`,
+        };
     }
 
-    const wanted = tokens.map(t => `"${t.toLowerCase()}"`).join(" or ");
+    const wanted = tokens.map(t => `"${t.toLowerCase()}"`).join(" and ");
     return {
         corroborated: false,
         via: null,
-        detail: `no daily log mentioning ${wanted}, and no passed inspection of that phase, in the ${PROGRESS_WINDOW_DAYS} days before the deposit`,
+        detail: `no daily log saying ${wanted} is done, and no passed inspection of that phase, in the ${PROGRESS_WINDOW_DAYS} days before the deposit`,
     };
 }

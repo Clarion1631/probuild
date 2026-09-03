@@ -635,6 +635,13 @@ export function sweepBatchFailed(body, submittedReferences = null) {
 
     const counts = body.counts;
     if (!counts || typeof counts !== "object") return true;
+    // Every figure must be a whole, non-negative number BEFORE any of them is
+    // added up: `bucket()` coerces junk to 0, and a negative bucket can make the
+    // sum tie perfectly while describing something that cannot have happened.
+    for (const key of [...SWEEP_BUCKETS, "credits", "replay"]) {
+        const value = counts[key];
+        if (!Number.isSafeInteger(value) || value < 0) return true;
+    }
     const sum = SWEEP_BUCKETS.reduce((total, key) => total + bucket(counts, key), 0);
     if (sum !== bucket(counts, "credits")) return true;
     if (bucket(counts, "reconcile") + bucket(counts, "failed") + bucket(counts, "qboUnknown") + bucket(counts, "unresolved") > 0) return true;

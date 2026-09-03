@@ -571,6 +571,23 @@ test("sweep: unresolved credits are a JOB FAILURE, so the watchdog fires", async
         assert.equal(sweepBatchFailed({ ok: true, counts: counts({ applied: 0, unresolved: 1 }) }), true);
     });
 
+    await t.test("a count that is not a whole, non-negative number is a failure", () => {
+        // Well-formed in EVERY other respect — a matching credits array and a
+        // clean status — so the count shape is the only thing that can fail it.
+        const wellFormed = (over: Record<string, unknown>) => ({
+            ok: true,
+            counts: counts(over as never),
+            credits: [{ bankReference: "A", status: "applied" }],
+        });
+        // The partition ties (1 = 2 + -1) but describes something impossible.
+        assert.equal(sweepBatchFailed(wellFormed({ credits: 1, applied: 2, unmatched: -1 })), true);
+        assert.equal(sweepBatchFailed(wellFormed({})), false, "control: the same body with sane counts passes");
+        for (const bad of [-1, 1.5, NaN, "3", null, undefined]) {
+            assert.equal(sweepBatchFailed(wellFormed({ applied: bad })), true, `applied ${bad}`);
+            assert.equal(sweepBatchFailed(wellFormed({ replay: bad })), true, `replay ${bad}`);
+        }
+    });
+
     await t.test("buckets that do not add up to the credit count are a failure", () => {
         // Some outcome went uncounted — an older deployment, or a status added
         // since. Reporting success off an incomplete tally is the exact bug.
