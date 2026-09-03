@@ -351,14 +351,18 @@ test("the apply script verifies the delivery-day index, on all three properties"
     const apply = read("scripts/apply-phase2-receipt-queue.mjs");
 
     assert.match(apply, /name: "ReceiptRequestCard_owner_deliveredOn_key",/);
-    assert.match(apply, /mustMatch: \[\/CREATE UNIQUE INDEX\/, \/\\\("owner", "deliveredOn"\\\)\/\],/,
-        "it must exist, be UNIQUE, and be on those two columns in that order");
-    assert.match(apply, /mustNotMatch: \[\/ WHERE \/\],/,
-        "and NOT be partial — Prisma cannot see a partial index, so CI would report it missing forever");
+    // It must exist, be UNIQUE, and be on those two columns IN THAT ORDER —
+    // now asserted against the catalog rather than a rendered definition, since
+    // Postgres quotes identifiers only when it has to (round-46 landing).
+    assert.match(apply, /table: "ReceiptRequestCard",[\s]*columns: \["owner", "deliveredOn"\],[\s]*partial: false,/);
+    // And NOT partial: a partial unique index enforces the same rule but is
+    // invisible to Prisma's diff engine, so CI would report it missing forever.
+    assert.match(apply, /\(i\.indpred IS NOT NULL\) AS "partial"/);
+    assert.match(apply, /i\.indisunique AS "unique"/);
 
     // The check has to actually run, not just be declared.
-    assert.match(apply, /for \(const \{ name, mustMatch, mustNotMatch = \[\] \} of expectedUniqueIndexes\)/);
-    assert.match(apply, /if \(pattern\.test\(row\.indexdef\)\) \{\s*\n\s*console\.error\(`VERIFY FAILED: index \$\{name\} must NOT match/);
+    assert.match(apply, /for \(const \{ name, table, columns, partial \} of expectedUniqueIndexes\)/);
+    assert.match(apply, /VERIFY FAILED: index \$\{name\} is not what this script requires/);
 });
 
 test("migration, apply script and schema describe the SAME index", () => {

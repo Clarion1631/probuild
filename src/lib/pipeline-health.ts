@@ -494,7 +494,11 @@ export function evaluatePipelineHealth(input: {
      * stamp until somebody accepts them. Reported whatever the pull's own
      * status, because a quarantine outlives the run that found it.
      */
-    if ((input.bankPull.quarantinedCount ?? 0) > 0) {
+    if ((input.bankPull.quarantinedCount ?? 0) < 0) {
+        // Unreadable, which is not the same as none — and is the state that let
+        // a run certify a ledger with rows missing.
+        reasons.push("bank-quarantine-unreadable");
+    } else if ((input.bankPull.quarantinedCount ?? 0) > 0) {
         reasons.push(`bank-quarantine:${input.bankPull.quarantinedCount}`);
     }
 
@@ -677,39 +681,83 @@ export interface BankPullQuarantineEntry {
     reason: string;
     count: number;
     firstSeenAt: string;
+    /** The last run that still saw this transaction quarantined. */
+    lastSeenAt: string;
+    /**
+     * Bumped whenever the CONDITION changes (a different reason, a different
+     * split count). An acceptance is bound to a version, so accepting a 2-split
+     * cardinality change never silently accepts the same id after it becomes a
+     * 40-split runaway (round-48 gate, finding 2).
+     */
+    version: number;
 }
 
-/** Parse the durable quarantine list. Anything unreadable reads as empty. */
-export function parseQuarantine(value: string | null | undefined): BankPullQuarantineEntry[] {
+/**
+ * Parse the durable quarantine list.
+ *
+ * `null` means UNREADABLE, and that is not the same as empty (round-48 gate,
+ * finding 2): reading a malformed store as "nothing quarantined" let a run
+ * certify a ledger with rows missing, and then overwrite the record of what was
+ * held. Absent is `[]`; malformed is `null`, and every caller must treat it as
+ * a blocker.
+ */
+export function parseQuarantine(value: string | null | undefined): BankPullQuarantineEntry[] | null {
     if (!value) return [];
+    let parsed: unknown;
     try {
-        const parsed: unknown = JSON.parse(value);
-        if (!Array.isArray(parsed)) return [];
-        return parsed.flatMap(row => {
-            if (!row || typeof row !== "object") return [];
-            const entry = row as Partial<BankPullQuarantineEntry>;
-            if (typeof entry.qbTxnId !== "string" || !entry.qbTxnId) return [];
-            return [{
-                qbTxnId: entry.qbTxnId,
-                reason: typeof entry.reason === "string" ? entry.reason : "unknown",
-                count: typeof entry.count === "number" ? entry.count : 0,
-                firstSeenAt: typeof entry.firstSeenAt === "string" ? entry.firstSeenAt : "",
-            }];
+        parsed = JSON.parse(value);
+    } catch {
+        return null;
+    }
+    if (!Array.isArray(parsed)) return null;
+    const out: BankPullQuarantineEntry[] = [];
+    for (const row of parsed) {
+        if (!row || typeof row !== "object") return null;
+        const entry = row as Partial<BankPullQuarantineEntry>;
+        if (typeof entry.qbTxnId !== "string" || !entry.qbTxnId) return null;
+        if (typeof entry.reason !== "string" || !entry.reason) return null;
+        if (typeof entry.count !== "number") return null;
+        out.push({
+            qbTxnId: entry.qbTxnId,
+            reason: entry.reason,
+            count: entry.count,
+            firstSeenAt: typeof entry.firstSeenAt === "string" ? entry.firstSeenAt : "",
+            lastSeenAt: typeof entry.lastSeenAt === "string" ? entry.lastSeenAt : "",
+            version: typeof entry.version === "number" ? entry.version : 1,
         });
-    } catch {
-        return [];
     }
+    return out;
 }
 
-/** Parse the accepted-id list. Anything unreadable reads as "nothing accepted". */
-export function parseAcceptedQuarantine(value: string | null | undefined): string[] {
+/**
+ * Parse the acceptance list. `null` means UNREADABLE — never "nothing
+ * accepted", which would silently re-block work a human had already cleared,
+ * and never "everything accepted", which would release it.
+ *
+ * An acceptance names an id AND the version it was granted against, so it
+ * lapses when the condition changes. A bare string is a pre-round-48
+ * acceptance and is honoured at version 1.
+ */
+export interface QuarantineAcceptance { qbTxnId: string; version: number }
+
+export function parseAcceptedQuarantine(value: string | null | undefined): QuarantineAcceptance[] | null {
     if (!value) return [];
+    let parsed: unknown;
     try {
-        const parsed: unknown = JSON.parse(value);
-        return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string" && !!id) : [];
+        parsed = JSON.parse(value);
     } catch {
-        return [];
+        return null;
     }
+    if (!Array.isArray(parsed)) return null;
+    const out: QuarantineAcceptance[] = [];
+    for (const row of parsed) {
+        if (typeof row === "string" && row) { out.push({ qbTxnId: row, version: 1 }); continue; }
+        if (!row || typeof row !== "object") return null;
+        const entry = row as Partial<QuarantineAcceptance>;
+        if (typeof entry.qbTxnId !== "string" || !entry.qbTxnId) return null;
+        out.push({ qbTxnId: entry.qbTxnId, version: typeof entry.version === "number" ? entry.version : 1 });
+    }
+    return out;
 }
 
 /**
@@ -720,10 +768,14 @@ export function parseAcceptedQuarantine(value: string | null | undefined): strin
  */
 export function outstandingQuarantine(
     entries: readonly BankPullQuarantineEntry[],
-    accepted: readonly string[],
+    accepted: readonly QuarantineAcceptance[],
 ): BankPullQuarantineEntry[] {
-    const ok = new Set(accepted);
-    return entries.filter(entry => !ok.has(entry.qbTxnId));
+    const byId = new Map(accepted.map(a => [a.qbTxnId, a.version]));
+    // An acceptance covers the version it was granted against, and anything
+    // older. A condition that CHANGED bumps the version, so the entry becomes
+    // outstanding again and a human is asked about the new situation rather
+    // than the old one.
+    return entries.filter(entry => (byId.get(entry.qbTxnId) ?? -1) < entry.version);
 }
 
 /**
@@ -868,10 +920,18 @@ async function readBankPullState(): Promise<{
         ambiguousCount: Number.isFinite(parsedAmbiguous) ? parsedAmbiguous : 0,
         // Only the OUTSTANDING ones: accepted quarantines stay in the record
         // for history but no longer hold the pipeline (round-46, finding 2).
-        quarantinedCount: outstandingQuarantine(
-            parseQuarantine(quarantineRow?.value),
-            parseAcceptedQuarantine(quarantineAcceptedRow?.value),
-        ).length,
+        /**
+         * A store that will not parse counts as BLOCKING, not as empty
+         * (round-48 gate, finding 2). `-1` is the signal, and
+         * `evaluatePipelineHealth` renders it as `bank-quarantine-unreadable`
+         * rather than a count nobody can act on.
+         */
+        quarantinedCount: (() => {
+            const entries = parseQuarantine(quarantineRow?.value);
+            const accepted = parseAcceptedQuarantine(quarantineAcceptedRow?.value);
+            if (entries === null || accepted === null) return -1;
+            return outstandingQuarantine(entries, accepted).length;
+        })(),
         unclearedCount: Number.isFinite(parsedUncleared) ? parsedUncleared : 0,
         staleAmbiguous: parseStaleAmbiguous(staleAmbiguousRow?.value),
         blockedReason: blockedRow?.value || null,

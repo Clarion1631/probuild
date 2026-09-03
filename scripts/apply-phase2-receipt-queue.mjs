@@ -561,18 +561,35 @@ const expectedConstraints = [
     { name: "ReceiptRequestCard_status_check", table: "ReceiptRequestCard" },
 ];
 
-// The unique index is the one object a "table exists" check cannot vouch for,
-// and it is not an optimisation: it IS the per-day claim. Verified on both
-// properties that matter — it must EXIST and be UNIQUE (a non-unique index
-// claims nothing, so every concurrent run would sail through and double-post).
-//
-// The memo-artifact pair is the same kind of object and the same kind of claim:
-// each one IS an invariant (one memo answers one charge; one charge is bound to
-// one memo), so a non-unique index would leave the route's own checks as the
-// only thing standing between a replayed affidavit and a second closed chase.
+/**
+ * THE INDEXES THIS SCRIPT VERIFIES, AS STRUCTURE RATHER THAN TEXT.
+ *
+ * These were regexes over `pg_get_indexdef` output, and they were wrong from
+ * the day they were written: Postgres quotes an identifier only when it HAS to,
+ * so the real rendering is `(owner, "pacificDate")` and a pattern pinning
+ * `("owner", "pacificDate")` can never match. The verifier refused a perfectly
+ * correct index — and no unit test could see it, because they read the
+ * statement list as text. The end-to-end CI driver caught it on its first real
+ * run against Postgres (run 33793141835).
+ *
+ * So the check reads the catalog instead: `pg_index` for uniqueness and for
+ * whether a predicate exists, `pg_attribute` for the ordered column names. That
+ * is quoting-independent, rendering-independent and version-independent, and it
+ * compares the three properties that actually carry the invariant:
+ *
+ *   * the index EXISTS,
+ *   * it is UNIQUE — a non-unique index claims nothing, so every concurrent
+ *     run would sail through and double-post,
+ *   * on exactly these columns IN THIS ORDER,
+ *   * and it is NOT PARTIAL where that matters: a partial unique index enforces
+ *     the same rule but is invisible to Prisma's diff engine, so CI's
+ *     migrations job would report it missing for ever.
+ */
 const expectedUniqueIndexes = [{
     name: "ReceiptRequestCard_owner_pacificDate_key",
-    mustMatch: [/CREATE UNIQUE INDEX/, /\("owner", "pacificDate"\)/],
+    table: "ReceiptRequestCard",
+    columns: ["owner", "pacificDate"],
+    partial: false,
 }, {
     // THE DELIVERY-DAY CLAIM (Codex PR #443 gate round 43, finding 6). The
     // sibling above claims the day a card was SELECTED for; this one claims the
@@ -580,27 +597,31 @@ const expectedUniqueIndexes = [{
     // keeps its original pacificDate on purpose — becoming a second message to
     // the same person on the same day.
     //
-    // `mustNotMatch` is as load bearing as `mustMatch` here: a PARTIAL index
-    // would enforce the same rule and be invisible to Prisma's diff engine, so
-    // CI's migrations job would report it missing forever. It needs no WHERE
-    // clause anyway — Postgres treats two NULLs as unequal in a unique index,
-    // so undelivered cards never collide.
+    // NOT PARTIAL, and that is load bearing: it needs no WHERE clause anyway,
+    // because Postgres treats two NULLs as unequal in a unique index, so
+    // undelivered cards never collide.
     name: "ReceiptRequestCard_owner_deliveredOn_key",
-    mustMatch: [/CREATE UNIQUE INDEX/, /\("owner", "deliveredOn"\)/],
-    mustNotMatch: [/ WHERE /],
+    table: "ReceiptRequestCard",
+    columns: ["owner", "deliveredOn"],
+    partial: false,
 }, {
     // The reservation itself (round-44 gate, finding 2). A non-unique index
     // here would let two invocations both insert a delivery row for the same
     // owner and day, which is the whole thing this table exists to stop.
     name: "ReceiptRequestCardDelivery_owner_deliveryDay_key",
-    mustMatch: [/CREATE UNIQUE INDEX/, /\("owner", "deliveryDay"\)/],
-    mustNotMatch: [/ WHERE /],
+    table: "ReceiptRequestCardDelivery",
+    columns: ["owner", "deliveryDay"],
+    partial: false,
 }, {
     name: "ReceiptMemoArtifact_pdfId_key",
-    mustMatch: [/CREATE UNIQUE INDEX/, /\("pdfId"\)/],
+    table: "ReceiptMemoArtifact",
+    columns: ["pdfId"],
+    partial: false,
 }, {
     name: "ReceiptMemoArtifact_targetType_targetKey_key",
-    mustMatch: [/CREATE UNIQUE INDEX/, /\("targetType", "targetKey"\)/],
+    table: "ReceiptMemoArtifact",
+    columns: ["targetType", "targetKey"],
+    partial: false,
 }];
 
 async function main() {
@@ -787,26 +808,53 @@ async function main() {
             console.log(`verified constraint ${name}`);
         }
 
-        for (const { name, mustMatch, mustNotMatch = [] } of expectedUniqueIndexes) {
-            const [row] = await prisma.$queryRawUnsafe(`SELECT indexdef FROM pg_indexes WHERE indexname = $1`, name);
+        for (const { name, table, columns, partial } of expectedUniqueIndexes) {
+            // The catalog, not the rendered text: `indkey` is the ordered list
+            // of attribute numbers, so the column names come back exactly as
+            // stored, with no quoting to guess at.
+            const [row] = await prisma.$queryRawUnsafe(
+                `SELECT c.relname AS "table",
+                        i.indisunique AS "unique",
+                        (i.indpred IS NOT NULL) AS "partial",
+                        ARRAY(
+                            SELECT a.attname
+                              FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                              JOIN pg_attribute a
+                                ON a.attrelid = c.oid AND a.attnum = k.attnum
+                             ORDER BY k.ord
+                        ) AS "columns"
+                   FROM pg_index i
+                   JOIN pg_class idx ON idx.oid = i.indexrelid
+                   JOIN pg_class c ON c.oid = i.indrelid
+                   JOIN pg_namespace n ON n.oid = idx.relnamespace
+                  WHERE n.nspname = 'public' AND idx.relname = $1`,
+                name,
+            );
             if (!row) {
                 console.error(`VERIFY FAILED: index ${name} missing`);
                 process.exit(1);
             }
-            for (const pattern of mustMatch) {
-                if (!pattern.test(row.indexdef)) {
-                    console.error(`VERIFY FAILED: index ${name} does not match ${pattern}\n  got: ${row.indexdef}`);
-                    process.exit(1);
-                }
+            const actual = {
+                table: row.table,
+                unique: row.unique === true,
+                partial: row.partial === true,
+                columns: row.columns ?? [],
+            };
+            const expected = { table, unique: true, partial, columns };
+            const same = actual.table === expected.table
+                && actual.unique === expected.unique
+                && actual.partial === expected.partial
+                && actual.columns.length === expected.columns.length
+                && actual.columns.every((column, at) => column === expected.columns[at]);
+            if (!same) {
+                console.error(
+                    `VERIFY FAILED: index ${name} is not what this script requires`
+                    + `\n  expected: ${JSON.stringify(expected)}`
+                    + `\n  actual:   ${JSON.stringify(actual)}`,
+                );
+                process.exit(1);
             }
-            for (const pattern of mustNotMatch) {
-                if (pattern.test(row.indexdef)) {
-                    console.error(`VERIFY FAILED: index ${name} must NOT match ${pattern}
-  got: ${row.indexdef}`);
-                    process.exit(1);
-                }
-            }
-            console.log(`verified unique index ${name}`);
+            console.log(`verified unique index ${name} on ${table}(${columns.join(", ")})`);
         }
 
         /**

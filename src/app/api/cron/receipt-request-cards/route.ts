@@ -1110,56 +1110,58 @@ export async function GET(request: Request) {
         try {
             marked = await prisma.$transaction(async tx => {
                 /**
+                 * THE CAS FIRST, THE RESERVATION ONLY IF IT WON (Codex PR #443
+                 * gate round 48, finding 3).
+                 *
+                 * The reservation used to be inserted BEFORE the CAS. A run
+                 * that had lost the claim token got `count === 0`, returned
+                 * normally, sent nothing — and its delivery row committed
+                 * anyway, burning that owner's only slot for the day on a card
+                 * nobody received. The loser of a race must leave nothing
+                 * behind.
+                 *
+                 * AND THE DELIVERY-DAY CLAIM STILL COMES BEFORE THE SEND
+                 * (round-43 gate, finding 1). `deliveredOn` used to be written
+                 * with the POSTED result, AFTER the webhook returned, which made
+                 * the unique index a detector of double-sends rather than a
+                 * preventer of them: two concurrent runs both passed the
+                 * in-memory check, both called Chat, and only then collided,
+                 * with two messages already in the space. A Chat message cannot
+                 * be recalled, so the claim is taken while losing it is free.
+                 */
+                const claimed = await tx.receiptRequestCard.updateMany({
+                    where: { id: rowId, claimToken: token, status: { in: ["PENDING", "POSTED"] } },
+                    // The snapshot is rewritten to WHAT IS ABOUT TO GO OUT. The
+                    // row is the record of the card that was posted; leaving the
+                    // pre-rebuild list on it would make a resumed run re-post
+                    // items this one deliberately dropped.
+                    data: { status: "POSTING", itemsJson: JSON.stringify(card.items), deliveredOn: date },
+                });
+                // Lost the claim: somebody else owns this card now. Return
+                // before the reservation exists, so the day stays free.
+                if (claimed.count === 0) return claimed;
+
+                /**
                  * THE RESERVATION IS ITS OWN IMMUTABLE ROW (round-44 gate,
                  * finding 2).
                  *
                  * `deliveredOn` on the card could not enforce one message per
                  * owner per day, because the reservation lived on the very row
-                 * being reserved: `resolveUncertainCard` flips today's
-                 * uncertain card back to PENDING and KEEPS `deliveredOn`, and
-                 * re-writing `deliveredOn = today` onto the SAME row cannot
-                 * violate that row's own unique key. POSTING -> UNCERTAIN ->
-                 * PENDING -> POSTING therefore posted twice, in one day, to one
-                 * person.
+                 * being reserved: `resolveUncertainCard` flips today's uncertain
+                 * card back to PENDING and KEEPS `deliveredOn`, and re-writing
+                 * `deliveredOn = today` onto the SAME row cannot violate that
+                 * row's own unique key. POSTING -> UNCERTAIN -> PENDING ->
+                 * POSTING therefore posted twice, in one day, to one person.
                  *
-                 * A separate row cannot be talked out of existing. It is
-                 * INSERTED here, in the same transaction as the POSTING write
-                 * and before the webhook, so a second attempt on the same day —
-                 * a resend, a concurrent invocation, a resumed uncertain card —
-                 * loses on the insert while losing is still free.
+                 * A separate row cannot be talked out of existing. A second
+                 * attempt on the same day — a resend, a concurrent invocation, a
+                 * resumed uncertain card — loses on this insert, and the whole
+                 * transaction rolls back with it.
                  */
                 await tx.receiptRequestCardDelivery.create({
                     data: { owner: card.owner, deliveryDay: date, cardId: rowId },
                 });
-                return tx.receiptRequestCard.updateMany({
-                where: { id: rowId, claimToken: token, status: { in: ["PENDING", "POSTED"] } },
-                // The snapshot is rewritten to WHAT IS ABOUT TO GO OUT. The row is
-                // the record of the card that was posted; leaving the pre-rebuild
-                // list on it would make a resumed run re-post items this one
-                // deliberately dropped.
-                /**
-                 * AND THE DELIVERY-DAY CLAIM, BEFORE THE SEND (Codex PR #443 gate
-                 * round 43, finding 1).
-                 *
-                 * `deliveredOn` used to be written with the POSTED result, AFTER
-                 * the webhook returned — which made the unique index a detector of
-                 * double-sends rather than a preventer of them: two concurrent
-                 * runs both passed the in-memory `deliveredToday` check, both
-                 * called Chat, and only then collided on a constraint, with two
-                 * messages already in the space. A Chat message cannot be recalled,
-                 * so the claim has to be taken while it is still cheap to lose.
-                 *
-                 * It rides on the POSTING write because that write is already the
-                 * commit point for "this run owns the send": one row, one CAS, one
-                 * transaction. A loser sees `count === 0` (lost the claim token) or
-                 * a unique violation (lost the day) and sends nothing.
-                 *
-                 * Released only on a DEFINITE rejection, below — an uncertain
-                 * delivery keeps it, because the card may be in the space and a
-                 * second one is the outcome this whole mechanism exists to avoid.
-                 */
-                    data: { status: "POSTING", itemsJson: JSON.stringify(card.items), deliveredOn: date },
-                });
+                return claimed;
             });
         } catch (error) {
             /**

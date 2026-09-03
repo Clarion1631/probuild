@@ -31,11 +31,34 @@ import {
     runBankRegisterPull,
     type BankRegisterIngestLine,
     type BankRegisterIngestResult,
+    type QuarantinedTxn,
 } from "@/lib/bank-register-pull";
 import { BANK_LINE_IDENTITY_LOCK, bankLineIdentityPayee, planQboMint } from "@/lib/bank-line-mint";
 import { bumpBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 import { bankLedgerIngestHandlers } from "@/app/api/integrations/bank-ledger/ingest/route";
 import { ambiguousGroupKey, bankLedgerReconcileHandlers } from "@/app/api/integrations/bank-ledger/reconcile/route";
+
+/**
+ * A manifest this run could not read AND validate. Fatal by design: see
+ * `loadSplitManifest` below.
+ */
+/**
+ * The health reason a run reports when it could not read its own split
+ * manifest. Named once, so the route, the probe and the digest cannot drift.
+ */
+export const MANIFEST_UNREADABLE_REASON = "bank-manifest-unreadable";
+
+/** Quarantine state this run could not read, or could not trust. */
+export const QUARANTINE_UNREADABLE_REASON = "bank-quarantine-unreadable";
+/** Quarantine state this run could not persist. */
+export const QUARANTINE_UNWRITABLE_REASON = "bank-quarantine-unwritable";
+
+class SplitManifestUnreadableError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "SplitManifestUnreadableError";
+    }
+}
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -246,46 +269,98 @@ async function mergeWindowState(fields: Record<string, unknown>): Promise<void> 
  * that finds nothing to do; losing the stamp costs the day's cards.
  */
 /**
- * Merge this run's quarantined ids into the durable record and report what is
- * still outstanding.
+ * Merge this run's quarantines into the durable record and report what is still
+ * outstanding.
+ *
+ * FAILS CLOSED (Codex PR #443 gate round 48, finding 2). This used to catch
+ * every read and write failure and return only the CURRENT fetch's quarantines
+ * — so a durable read that failed while this window happened to find none
+ * returned `[]`, the stamp was warranted, and the chaser was released over a
+ * ledger with rows missing that nobody could see. A quarantine store that
+ * cannot be read is not an empty one.
+ *
+ * Every failure path therefore returns a BLOCKER. On a write failure the known
+ * entries are preserved and reported, because forgetting them is the same lie
+ * from the other direction.
  *
  * MERGED, not replaced: a transaction quarantined last night is still missing
- * from the ledger tonight even if tonight's fetch did not reach it, and
- * `firstSeenAt` is kept so the age is visible. Accepted ids are dropped from
- * the outstanding list but stay in the record, so the history of what was
- * waved through survives.
+ * tonight even if this window did not reach it. `firstSeenAt` keeps the age
+ * visible, `lastSeenAt` says whether it is still being hit, and `version` is
+ * what an acceptance is bound to — accepting "A as it was" must not silently
+ * accept A after its reason or count changed.
  */
-async function persistQuarantine(found: readonly string[]): Promise<Array<{ qbTxnId: string }>> {
+interface QuarantineOutcome {
+    ok: boolean;
+    reason: string | null;
+    outstanding: Array<{ qbTxnId: string }>;
+}
+
+async function persistQuarantine(found: readonly QuarantinedTxn[]): Promise<QuarantineOutcome> {
+    const blocker = (reason: string, entries: Array<{ qbTxnId: string }>): QuarantineOutcome =>
+        ({ ok: false, reason, outstanding: entries });
+
+    let existingRow;
+    let acceptedRow;
     try {
-        const [existingRow, acceptedRow] = await Promise.all([
+        [existingRow, acceptedRow] = await Promise.all([
             prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_KEY } }),
             prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_ACCEPTED_KEY } }),
         ]);
-        const existing = parseQuarantine(existingRow?.value);
-        const accepted = parseAcceptedQuarantine(acceptedRow?.value);
-        const byId = new Map(existing.map(entry => [entry.qbTxnId, entry]));
-        const now = new Date().toISOString();
-        for (const qbTxnId of found) {
-            if (byId.has(qbTxnId)) continue;
-            byId.set(qbTxnId, { qbTxnId, reason: "implausible-split-count", count: 0, firstSeenAt: now });
-        }
-        const merged = [...byId.values()];
+    } catch (error) {
+        console.error("[cron/bank-register-pull] quarantine read failed", error instanceof Error ? error.message : "UnknownError");
+        return blocker(QUARANTINE_UNREADABLE_REASON, found.map((entry: QuarantinedTxn) => ({ ...entry })));
+    }
+
+    // A row that EXISTS but does not parse is not "nothing quarantined" — it is
+    // a store this run cannot reason about, and overwriting it would destroy
+    // the record of what was held.
+    if (existingRow?.value && parseQuarantine(existingRow.value) === null) {
+        console.error("[cron/bank-register-pull] quarantine state is malformed; refusing to overwrite it");
+        return blocker(QUARANTINE_UNREADABLE_REASON, found.map((entry: QuarantinedTxn) => ({ ...entry })));
+    }
+    if (acceptedRow?.value && parseAcceptedQuarantine(acceptedRow.value) === null) {
+        console.error("[cron/bank-register-pull] quarantine acceptances are malformed; refusing to read them as none");
+        return blocker(QUARANTINE_UNREADABLE_REASON, found.map((entry: QuarantinedTxn) => ({ ...entry })));
+    }
+
+    const existing = parseQuarantine(existingRow?.value) ?? [];
+    const accepted = parseAcceptedQuarantine(acceptedRow?.value) ?? [];
+    const now = new Date().toISOString();
+    const byId = new Map(existing.map(entry => [entry.qbTxnId, entry]));
+
+    for (const entry of found) {
+        const prior = byId.get(entry.qbTxnId);
+        // THE REAL TYPED ENTRY, not a hard-coded reason and a zero. `version`
+        // moves whenever the condition does, which is what an acceptance is
+        // bound to: accepting a 2-split cardinality change must not silently
+        // accept the same id after it becomes a 40-split runaway.
+        const conditionChanged = !prior || prior.reason !== entry.reason || prior.count !== entry.count;
+        byId.set(entry.qbTxnId, {
+            qbTxnId: entry.qbTxnId,
+            reason: entry.reason,
+            count: entry.count,
+            firstSeenAt: prior?.firstSeenAt ?? now,
+            lastSeenAt: now,
+            version: conditionChanged ? (prior?.version ?? 0) + 1 : (prior?.version ?? 1),
+        });
+    }
+
+    const merged = [...byId.values()];
+    try {
         const value = JSON.stringify(merged);
         await prisma.automationSetting.upsert({
             where: { key: BANK_PULL_QUARANTINE_KEY },
             update: { value },
             create: { key: BANK_PULL_QUARANTINE_KEY, value },
         });
-        return outstandingQuarantine(merged, accepted);
     } catch (error) {
         console.error("[cron/bank-register-pull] quarantine write failed", error instanceof Error ? error.message : "UnknownError");
-        /**
-         * A quarantine we could not RECORD is still a quarantine. Reporting the
-         * ids this run found holds the stamp, which is the safe direction: the
-         * alternative is stamping over rows nobody can see.
-         */
-        return found.map(qbTxnId => ({ qbTxnId }));
+        // The KNOWN entries, not just this fetch's: the store may now disagree
+        // with what we believe, and the safe belief is the larger one.
+        return blocker(QUARANTINE_UNWRITABLE_REASON, merged);
     }
+
+    return { ok: true, reason: null, outstanding: outstandingQuarantine(merged, accepted) };
 }
 
 async function commitFreshnessStamp(at: string): Promise<void> {
@@ -395,6 +470,30 @@ export async function GET(request: Request) {
     }
     try {
         return await runPull();
+    } catch (error) {
+        /**
+         * AN UNREADABLE SPLIT MANIFEST STOPS THE RUN (round-48 gate, finding 1).
+         *
+         * It is thrown before any ingest and before any state save, so nothing
+         * this invocation touched was written: no observations, no manifest
+         * overwrite, no high-water advance. What is left to do is make the
+         * failure VISIBLE and make sure somebody comes back for it — a silent
+         * `{}` was what let a cardinality change mint a duplicate line and then
+         * bury the evidence.
+         */
+        if (error instanceof SplitManifestUnreadableError) {
+            console.error("[cron/bank-register-pull] split manifest unreadable", error.message);
+            await mergeWindowState({
+                continuationPending: true,
+                continuationReason: MANIFEST_UNREADABLE_REASON,
+            });
+            await recordBlockedReason(MANIFEST_UNREADABLE_REASON);
+            return NextResponse.json(
+                { ok: false, error: MANIFEST_UNREADABLE_REASON, detail: error.message },
+                { status: 503 },
+            );
+        }
+        throw error;
     } finally {
         await releaseLease(CLAIM_LOCK_KEY, token);
     }
@@ -561,6 +660,19 @@ async function mintFromQbo(
 
 class ObservationClaimedError extends Error {}
 
+/** Write the health probe's blocked reason directly, outside a full run. */
+async function recordBlockedReason(reason: string): Promise<void> {
+    try {
+        await prisma.automationSetting.upsert({
+            where: { key: BANK_PULL_BLOCKED_REASON_KEY },
+            update: { value: reason },
+            create: { key: BANK_PULL_BLOCKED_REASON_KEY, value: reason },
+        });
+    } catch (error) {
+        console.error("[cron/bank-register-pull] blocked-reason write failed", error instanceof Error ? error.message : "UnknownError");
+    }
+}
+
 async function runPull() {
     const startedAt = Date.now();
     const windowState = await readWindowState();
@@ -570,29 +682,52 @@ async function runPull() {
         windowState,
         saveWindowState,
         /**
-         * The split manifest (round-46 gate, finding 1). One row, read before
-         * the fetch and written after it, so the next run can tell a
-         * QuickBooks restatement from a new observation and a 1↔N split
-         * transition from either.
+         * THE MANIFEST FAILS CLOSED (Codex PR #443 gate round 48, finding 1).
+         *
+         * This used to swallow every read and parse failure and return `{}`,
+         * which is not "no manifest" — it is "every transaction looks new".
+         * `convertRegisterRows` can only detect a 1↔N cardinality change by
+         * comparing against prior state, so a transient read failure emitted
+         * fresh `T#0`/`T#1` observations while the old bare `T` observation and
+         * its minted BankLine stayed behind, and the next successful write
+         * replaced the manifest and hid the transition for ever.
+         *
+         * So an unreadable or malformed manifest THROWS, before any ingest and
+         * before any state save. The route turns that into a 503 with a
+         * continuation obligation, and the health probe reports
+         * `bank-manifest-unreadable`. Losing a night is recoverable; minting a
+         * duplicate canonical line silently is not.
          */
         loadSplitManifest: async () => {
+            const row = await prisma.automationSetting.findUnique({
+                where: { key: BANK_PULL_SPLIT_MANIFEST_KEY },
+            });
+            // An ABSENT row is a real answer: no pull has written one yet. An
+            // unreadable one is not.
+            if (!row) return {};
+            if (!row.value) return {};
+            let parsed;
             try {
-                const row = await prisma.automationSetting.findUnique({ where: { key: BANK_PULL_SPLIT_MANIFEST_KEY } });
-                if (!row?.value) return {};
-                const parsed: unknown = JSON.parse(row.value);
-                if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-                const out: Record<string, string[]> = {};
-                for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-                    if (Array.isArray(value) && value.every(entry => typeof entry === "string")) out[key] = value as string[];
-                }
-                return out;
+                parsed = JSON.parse(row.value);
             } catch {
-                // An unreadable manifest reads as EMPTY, which makes every
-                // transaction look new — so nothing is restated and nothing is
-                // quarantined on a cardinality change this run cannot see. The
-                // write below then rebuilds it from what was actually fetched.
-                return {};
+                throw new SplitManifestUnreadableError("the stored split manifest is not valid JSON");
             }
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                throw new SplitManifestUnreadableError("the stored split manifest is not an object");
+            }
+            // SCHEMA-CHECKED, not merely parsed: a manifest whose shape is
+            // wrong tells the converter nothing, and silently telling it
+            // nothing is the failure this guard exists for.
+            const out: Record<string, string[]> = {};
+            for (const [qbTxnId, hashes] of Object.entries(parsed)) {
+                if (!Array.isArray(hashes) || !hashes.every(hash => typeof hash === "string")) {
+                    throw new SplitManifestUnreadableError(
+                        `the stored split manifest entry for ${qbTxnId} is not a list of hashes`,
+                    );
+                }
+                out[qbTxnId] = hashes as string[];
+            }
+            return out;
         },
         saveSplitManifest: async manifest => {
             const value = JSON.stringify(manifest);
@@ -821,9 +956,21 @@ async function runPull() {
      * does not un-miss the rows; it records that somebody looked and decided
      * the pipeline should move anyway, which is a judgement no rule can make.
      */
-    const quarantineHeld = await persistQuarantine(summary.quarantinedQbTxnIds ?? []);
+    const quarantine = await persistQuarantine(summary.quarantined ?? []);
+    /**
+     * A quarantine store this run could not READ or WRITE blocks the stamp just
+     * as a real quarantine does (round-48 gate, finding 2). "We do not know
+     * what is held" and "nothing is held" were the same answer before, and the
+     * first one certified a ledger with rows missing.
+     */
+    if (!quarantine.ok && quarantine.reason) {
+        summary.quarantineStateReason = quarantine.reason;
+        await recordBlockedReason(quarantine.reason);
+    }
+    const quarantineHeld = quarantine.ok ? quarantine.outstanding : quarantine.outstanding;
+    const quarantineBlocked = !quarantine.ok;
     const stampWarranted = summary.ok && summary.complete && summary.clearedProbeOk && ambiguousCount === 0
-        && quarantineHeld.length === 0
+        && quarantineHeld.length === 0 && !quarantineBlocked
         && !summary.uncertified;
     /**
      * A FAILED STAMP IS A FAILED RUN (round-36 gate, finding 4).

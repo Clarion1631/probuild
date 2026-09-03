@@ -998,6 +998,13 @@ export interface BankRegisterPullSummary {
     /** The quarantine records this run produced, with their reasons. */
     quarantined?: QuarantinedTxn[];
     /**
+     * Why the quarantine STORE itself could not be trusted this run — unreadable
+     * or unwritable. Distinct from having quarantines: this says we do not know
+     * what is held, which blocks certification for the same reason
+     * (round-48 gate, finding 2).
+     */
+    quarantineStateReason?: string;
+    /**
      * Transactions excluded for claiming an implausible number of splits.
      * Reported, never fatal: quarantining one transaction must not stop the
      * other rows, the freshness stamp, or every owner's chase cards.

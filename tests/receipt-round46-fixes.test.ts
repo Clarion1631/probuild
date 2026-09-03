@@ -106,12 +106,18 @@ test("a quarantine is durable, blocks the stamp, and is reported in health", () 
     // Persisted, then used as a gate. Round 45 only logged it, so the state
     // advanced, the clock stamped, and the chaser released cards over a
     // register that was short by exactly those rows.
-    assert.match(route, /const quarantineHeld = await persistQuarantine\(summary\.quarantinedQbTxnIds \?\? \[\]\);/);
-    assert.match(route, /quarantineHeld\.length === 0/);
+    assert.match(route, /const quarantine = await persistQuarantine\(summary\.quarantined \?\? \[\]\);/);
+    // And a store this run could not READ or WRITE blocks too (round-48 gate,
+    // finding 2): "we do not know what is held" and "nothing is held" were the
+    // same answer before, and the first one certified a short ledger.
+    assert.match(route, /const quarantineBlocked = !quarantine\.ok;/);
+    assert.match(route, /quarantineHeld\.length === 0 && !quarantineBlocked/);
+
 
     // A write failure still holds the stamp: the alternative is certifying over
     // rows nobody can see.
-    assert.match(route, /return found\.map\(qbTxnId => \(\{ qbTxnId \}\)\);/);
+    assert.match(route, /return blocker\(QUARANTINE_UNWRITABLE_REASON, merged\);/,
+        "a write failure preserves the KNOWN entries, not just this fetch");
 
     const health = read("src/lib/pipeline-health.ts");
     assert.match(health, /reasons\.push\(`bank-quarantine:\$\{input\.bankPull\.quarantinedCount\}`\);/);
@@ -119,19 +125,35 @@ test("a quarantine is durable, blocks the stamp, and is reported in health", () 
 
 test("accepting a quarantine releases the pipeline without un-missing the rows", () => {
     const entries = [
-        { qbTxnId: "A", reason: "implausible-split-count", count: 30, firstSeenAt: "2026-09-01T00:00:00Z" },
-        { qbTxnId: "B", reason: "split-cardinality-changed", count: 2, firstSeenAt: "2026-09-02T00:00:00Z" },
+        { qbTxnId: "A", reason: "implausible-split-count", count: 30, firstSeenAt: "2026-09-01T00:00:00Z", lastSeenAt: "2026-09-03T00:00:00Z", version: 1 },
+        { qbTxnId: "B", reason: "split-cardinality-changed", count: 2, firstSeenAt: "2026-09-02T00:00:00Z", lastSeenAt: "2026-09-03T00:00:00Z", version: 1 },
     ];
+    const accept = (qbTxnId: string, version = 1) => ({ qbTxnId, version });
     assert.deepEqual(outstandingQuarantine(entries, []).map(entry => entry.qbTxnId), ["A", "B"]);
-    assert.deepEqual(outstandingQuarantine(entries, ["A"]).map(entry => entry.qbTxnId), ["B"]);
-    assert.deepEqual(outstandingQuarantine(entries, ["A", "B"]), [], "accepted, so the pipeline moves");
+    assert.deepEqual(outstandingQuarantine(entries, [accept("A")]).map(entry => entry.qbTxnId), ["B"]);
+    assert.deepEqual(outstandingQuarantine(entries, [accept("A"), accept("B")]), [],
+        "accepted, so the pipeline moves");
 
-    // Unreadable state is not permission: it reads as nothing accepted, which
-    // keeps the block on.
-    assert.deepEqual(parseAcceptedQuarantine("not json"), []);
-    assert.deepEqual(parseAcceptedQuarantine(null), []);
-    assert.deepEqual(parseQuarantine("not json"), []);
-    assert.equal(parseQuarantine(JSON.stringify(entries)).length, 2);
+    /**
+     * AN ACCEPTANCE IS BOUND TO A VERSION (round-48 gate, finding 2). Accepting
+     * "B as a 2-split cardinality change" must not silently accept B after it
+     * becomes something else — the condition changed, so a human is asked again.
+     */
+    const changed = [{ ...entries[1], count: 40, reason: "implausible-split-count", version: 2 }];
+    assert.deepEqual(outstandingQuarantine(changed, [accept("B", 1)]).map(e => e.qbTxnId), ["B"],
+        "the old acceptance does not cover the new condition");
+    assert.deepEqual(outstandingQuarantine(changed, [accept("B", 2)]), [], "accepting the new one does");
+
+    // Unreadable state is NULL, not empty — reading a malformed store as
+    // "nothing quarantined" is what let a run certify a ledger with rows
+    // missing, and then overwrite the record of what was held.
+    assert.equal(parseAcceptedQuarantine("not json"), null);
+    assert.deepEqual(parseAcceptedQuarantine(null), [], "absent really is none");
+    assert.equal(parseQuarantine("not json"), null);
+    assert.equal(parseQuarantine(JSON.stringify([{ qbTxnId: "A" }])), null, "a half-typed entry is not readable");
+    assert.equal(parseQuarantine(JSON.stringify(entries))?.length, 2);
+    // A pre-round-48 acceptance was a bare string; it is honoured at version 1.
+    assert.deepEqual(parseAcceptedQuarantine(JSON.stringify(["A"])), [{ qbTxnId: "A", version: 1 }]);
 });
 
 // ═══ 3. The full-run handoff is durable ═══════════════════════════════════

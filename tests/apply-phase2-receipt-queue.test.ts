@@ -528,3 +528,58 @@ test("the REAL production pooler URL passes the host guard, port and all", () =>
     assert.equal(matches("ghzdbzdnwjxazvmcefbh"), true, "the real production URL is accepted");
     assert.equal(matches("someotherprojectref00"), false, "a different project is refused");
 });
+
+test("the index verifier reads the CATALOG, not the rendered definition", () => {
+    /**
+     * `pg_get_indexdef` quotes an identifier only when it HAS to, so the real
+     * rendering is `(owner, "pacificDate")` — and every regex that pinned the
+     * quoted form could never match. The verifier refused a perfectly correct
+     * index, and no unit test could see it: they read the statement list as
+     * text. The end-to-end CI driver caught it on its first real run against
+     * Postgres (run 33793141835).
+     *
+     * The fix is not a better regex. It is to stop comparing text at all.
+     */
+    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-phase2-receipt-queue.mjs"), "utf8");
+
+    assert.doesNotMatch(source, /mustMatch/, "no pattern matching over indexdef survives");
+    assert.doesNotMatch(source, /pg_indexes/, "nor the view that renders it");
+
+    // The catalog, and the three properties that carry the invariant.
+    assert.match(source, /i\.indisunique AS "unique"/);
+    assert.match(source, /\(i\.indpred IS NOT NULL\) AS "partial"/);
+    assert.match(source, /unnest\(i\.indkey\) WITH ORDINALITY/);
+    assert.match(source, /ORDER BY k\.ord/, "column ORDER is part of the identity");
+
+    // AND THE COMPARISON ACTUALLY COMPARES. Reading the catalog is worthless if
+    // the check then ignores what came back — each of these survived being
+    // replaced with `true` until it was pinned here.
+    assert.match(source, /&& actual\.unique === expected\.unique/);
+    assert.match(source, /&& actual\.partial === expected\.partial/);
+    assert.match(source, /const same = actual\.table === expected\.table/);
+    assert.match(source, /&& actual\.columns\.length === expected\.columns\.length/);
+    assert.match(source, /&& actual\.columns\.every\(\(column, at\) => column === expected\.columns\[at\]\);/);
+
+    // Every index it verifies declares its table, its ordered columns, and
+    // whether it may be partial.
+    const entries = [...source.matchAll(/name: "([A-Za-z_]+_key)",[\s]*table: "(\w+)",[\s]*columns: \[([^\]]*)\],[\s]*partial: (true|false),/g)];
+    assert.equal(entries.length, 5, "five unique indexes are verified");
+    const byName = Object.fromEntries(entries.map(m => [m[1], { table: m[2], columns: m[3], partial: m[4] }]));
+
+    assert.deepEqual(byName.ReceiptRequestCard_owner_pacificDate_key,
+        { table: "ReceiptRequestCard", columns: '"owner", "pacificDate"', partial: "false" });
+    assert.deepEqual(byName.ReceiptRequestCard_owner_deliveredOn_key,
+        { table: "ReceiptRequestCard", columns: '"owner", "deliveredOn"', partial: "false" });
+    assert.deepEqual(byName.ReceiptRequestCardDelivery_owner_deliveryDay_key,
+        { table: "ReceiptRequestCardDelivery", columns: '"owner", "deliveryDay"', partial: "false" });
+    assert.deepEqual(byName.ReceiptMemoArtifact_pdfId_key,
+        { table: "ReceiptMemoArtifact", columns: '"pdfId"', partial: "false" });
+    assert.deepEqual(byName.ReceiptMemoArtifact_targetType_targetKey_key,
+        { table: "ReceiptMemoArtifact", columns: '"targetType", "targetKey"', partial: "false" });
+
+    // PRE-FIX CONTROL: the pattern that used to be checked cannot match what
+    // Postgres actually renders, which is exactly how that CI run failed.
+    const rendered = 'CREATE UNIQUE INDEX "ReceiptRequestCard_owner_pacificDate_key" '
+        + 'ON public."ReceiptRequestCard" USING btree (owner, "pacificDate")';
+    assert.equal(/\("owner", "pacificDate"\)/.test(rendered), false);
+});
