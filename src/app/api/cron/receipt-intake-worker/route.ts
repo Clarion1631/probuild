@@ -16,6 +16,8 @@ import {
 import {
     deleteObjectOrRecord,
     queueObjectCleanup,
+    queueCanonicalIntent,
+    resolveCanonicalIntent,
     rejectRowAndQueueCleanup,
     retryPendingCleanups,
     sealObject,
@@ -532,6 +534,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         // the two have to commit together.
                         queueUploadCleanup: (tx, uploadPath) =>
                             queueObjectCleanup(tx, uploadPath, "sealed", cleanupNotBefore(row)),
+                        // Same intent the /finalize publisher takes: the seal
+                        // is an external write ahead of the CAS either way.
+                        queueCanonicalIntent: canonicalPath =>
+                            queueCanonicalIntent(canonicalPath, cleanupNotBefore(row)),
+                        resolveCanonicalIntent,
                         settleUploadCleanup: (eventId, uploadPath) =>
                             settleQueuedCleanup(eventId, uploadPath, cleanupNotBefore(row))
                                 .then(() => undefined),

@@ -167,3 +167,88 @@ test("leaseFence is a SUPERSET of publishFence, and names the lease generation",
     assert.match(body, /uploadLeaseNonce: row\.uploadLeaseNonce/);
     assert.match(body, /uploadUrlExpiresAt: row\.uploadUrlExpiresAt/);
 });
+
+// ── /finalize IS BOUND TO THE LEASE THAT ISSUED ITS URL (round-15 item 1) ──
+//
+// /start rotates `uploadLeaseNonce` on every issue and every adoption, and it
+// now RETURNS that value. /finalize used to read the row's CURRENT nonce, so a
+// delayed finalizer silently ADOPTED whichever lease had been issued since —
+// and both /start calls hand out URLs for the SAME path. Client A starts an
+// upload; B's retry refreshes the lease and gets a working URL; A's finalize
+// finally arrives, inspects B's half-written object, judges it unacceptable
+// and DELETES the row while B is still uploading to a URL that works.
+
+test("every /start response echoes the generation its URL was issued under", () => {
+    // Five ways out of /start, five leases. A branch that forgot to echo one
+    // would hand a client a URL it could never finalize.
+    const start = readFileSync(
+        path.join(ROOT, "src/app/api/receipts/intake/start/route.ts"),
+        "utf8",
+    );
+    assert.equal(
+        (start.match(/uploadLease: (leaseNonce|rearmedLease|resumedLease)/g) ?? []).length,
+        3,
+        "create, re-arm and resume each echo the nonce they wrote",
+    );
+    // The other two come through the shared reuse rule, which returns it.
+    const lease = readFileSync(path.join(ROOT, "src/lib/receipt-intake/upload-lease.ts"), "utf8");
+    assert.match(lease, /const uploadLease = \(deps\.nonce \?\? newLeaseNonce\)\(\);/);
+    assert.match(lease, /signed: \{ \.\.\.signed, uploadLease \}/);
+    // ...and it is the SAME value written to the row, not a second draw.
+    assert.match(lease, /uploadLeaseNonce: uploadLease,/);
+});
+
+test("/finalize REQUIRES the lease, and refuses a stale one before touching storage", () => {
+    const finalize = readFileSync(
+        path.join(ROOT, "src/app/api/receipts/intake/[id]/finalize/route.ts"),
+        "utf8",
+    );
+    // The gate exists, and says which lease it compares against.
+    assert.match(finalize, /if \(!declaredLease \|\| declaredLease !== row\.uploadLeaseNonce\)/);
+    assert.match(finalize, /error: "lease-stale"/);
+    assert.match(finalize, /retryable: false/, "a stale lease is not fixed by retrying");
+
+    // ORDER IS THE PROPERTY. After authorization (so a caller who may not see
+    // the row cannot learn its lease is stale), and before the declared-hash
+    // check, the disposition split, and every storage call.
+    const gateAt = finalize.indexOf('error: "lease-stale"');
+    const authAt = finalize.indexOf("const maySee");
+    const shaAt = finalize.indexOf("declaredShaConflict(row.fileSha256");
+    const inspectAt = finalize.indexOf("await inspectStoredObject(");
+    const rejectAt = finalize.indexOf("rejectRowAndQueueCleanup(");
+    const publishAt = finalize.indexOf("await sealAndPublish(");
+    assert.ok(authAt > 0 && authAt < gateAt, "authorization first");
+    for (const [name, at] of [["sha", shaAt], ["inspect", inspectAt], ["reject", rejectAt], ["publish", publishAt]] as const) {
+        assert.ok(at > gateAt, `the gate runs before ${name}`);
+    }
+});
+
+test("the fences pin the ECHOED lease, not the freshly read one", () => {
+    // Equal by the gate — and written this way so a future edit that moved or
+    // weakened the gate leaves these CASes pinning a generation nobody proved.
+    const finalize = readFileSync(
+        path.join(ROOT, "src/app/api/receipts/intake/[id]/finalize/route.ts"),
+        "utf8",
+    );
+    assert.match(finalize, /const leased = \{ \.\.\.row, uploadLeaseNonce: declaredLease \};/);
+    assert.match(finalize, /\.\.\.leaseFence\(leased\)/);
+    assert.match(finalize, /uploadLeaseNonce: leased\.uploadLeaseNonce,/, "the reject fence too");
+    // PRE-FIX CONTROL: no fence still reads the row's own nonce directly.
+    assert.ok(
+        !/\.\.\.leaseFence\(row\)/.test(finalize),
+        "nothing fences on the freshly-read row any more",
+    );
+});
+
+test("LEASE-STALE: the ordering, as a decision table", () => {
+    // The gate is a pure comparison, so its truth table is a unit test rather
+    // than a race. `stale` is what the route computes.
+    const stale = (declared: string | null, current: string | null) =>
+        !declared || declared !== current;
+
+    assert.equal(stale("nonce-a", "nonce-a"), false, "the lease it was issued under");
+    assert.equal(stale("nonce-a", "nonce-b"), true, "a lease that has since been refreshed");
+    assert.equal(stale(null, "nonce-a"), true, "omitting it is not a way round the gate");
+    assert.equal(stale("nonce-a", null), true, "a row that never had a signed URL");
+    assert.equal(stale(null, null), true, "and neither is the null/null case");
+});

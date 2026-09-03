@@ -605,14 +605,31 @@ For anything larger — most phone photos — use the two-step flow, which never
 through this server at all:
 
 1. `POST /api/receipts/intake/start` with `{mimeType, fileName?, fileSize?, source?,
-   sourceRef?, uploadId?, projectId?}` -> `{id, uploadUrl, token, storagePath, maxBytes}`.
+   sourceRef?, uploadId?, projectId?}` -> `{id, uploadUrl, token, storagePath, maxBytes,
+   uploadLease}`.
    Creates the row in `STAGING` (invisible to the worker) and returns a short-lived Supabase
-   signed upload URL bound to a server-chosen path.
+   signed upload URL bound to a server-chosen path. **`uploadLease` is the generation that
+   URL was issued under** — an opaque string; treat it as a token to hand back, never parse
+   it. Every `/start` branch returns one, including a retry that reuses a still-live lease.
 2. `PUT` the bytes straight to `uploadUrl`.
-3. `POST /api/receipts/intake/{id}/finalize` with `{sha256?}` -> publishes `STAGING` ->
-   `RECEIVED`. The server re-reads the object and derives the mime, the size and the sha
-   FROM STORAGE; a declared `sha256` is checked against that and a mismatch is a 409. Over
-   8 MiB or an unreadable format deletes the row and refuses.
+3. `POST /api/receipts/intake/{id}/finalize` with `{uploadLease, sha256?}` -> publishes
+   `STAGING` -> `RECEIVED`. The server re-reads the object and derives the mime, the size and
+   the sha FROM STORAGE; a declared `sha256` is checked against that and a mismatch is a 409.
+   Over 8 MiB or an unreadable format deletes the row and refuses.
+
+**`uploadLease` is REQUIRED on `/finalize`, and this is a breaking contract change.** A call
+that omits it, or that presents a generation the row has since moved past, is refused
+`409 {error: "lease-stale", retryable: false}` **before the server reads or writes a single
+object** — and the caller's remedy is to call `/start` again and use the URL and lease that
+come back, not to retry the same body.
+
+The reason it cannot be optional: `/start` rotates the generation on every issue and every
+adoption, and two `/start` calls for one row hand out URLs for the **same path**. Without
+the echo, `/finalize` read whichever generation was current when it happened to arrive, so a
+delayed finalizer silently adopted a lease issued after it started — inspecting a second
+client's half-written object and rejecting (deleting) the row while that client still held a
+working URL. The echoed value is also what every fence in `/finalize` pins, so a publish or a
+reject can only ever land on the lease the caller proved it holds.
 
 Both paths share `decideSource` (provenance and idempotency), so a session/Bearer caller can
 never choose `source` or `sourceRef` on either, and `uploadId` is scoped to the authenticated

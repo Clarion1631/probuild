@@ -35,6 +35,24 @@ export interface SignedUpload {
     storagePath: string;
 }
 
+/**
+ * What /start hands back, and what /finalize demands to see again.
+ *
+ * `uploadLease` is the row's `uploadLeaseNonce` — an opaque, single-use-ish
+ * generation stamp. It is returned so a finalizer can PROVE which lease its
+ * signed URL was issued under. Without it /finalize read the row's CURRENT
+ * nonce, so a delayed finalizer silently adopted whatever lease had been
+ * issued since: two /start calls hand out URLs for the SAME path, and the
+ * first client's stale finalize could then inspect a half-written object and
+ * reject the row out from under the second client's perfectly live URL.
+ *
+ * Opaque by contract. It is a random UUID with no meaning outside the CAS —
+ * not a capability (the signed URL is), and it grants nothing on its own.
+ */
+export interface IssuedLease extends SignedUpload {
+    uploadLease: string;
+}
+
 export interface LeaseClient {
     updateMany(args: {
         where: Record<string, unknown>;
@@ -74,7 +92,7 @@ export function newLeaseNonce(): string {
 }
 
 export type LeaseReuse =
-    | { kind: "signed"; signed: SignedUpload }
+    | { kind: "signed"; signed: IssuedLease }
     | { kind: "storage-unavailable" }
     | { kind: "conflict" };
 
@@ -131,6 +149,12 @@ export async function reuseLiveLease(
     const path = liveLeasePath(row, ext, deps.now ? deps.now() : Date.now());
     if (!path) return null;
 
+    // HOISTED, because the caller has to hand it back to the client: /finalize
+    // now requires the generation its URL was issued under, and this is the
+    // only place that value exists. Generated inline, the request that wrote
+    // it could not say what it had written.
+    const uploadLease = (deps.nonce ?? newLeaseNonce)();
+
     // Fenced on the identity this retry already proved AND on the publish
     // fence, so a row the worker claimed, or re-parked under a reason nobody
     // here looked at, is not quietly re-armed.
@@ -139,7 +163,7 @@ export async function reuseLiveLease(
         data: {
             ...rearm,
             uploadUrlExpiresAt: deps.expiresAt(),
-            uploadLeaseNonce: (deps.nonce ?? newLeaseNonce)(),
+            uploadLeaseNonce: uploadLease,
         },
     });
     if (count === 0) return { kind: "conflict" };
@@ -152,7 +176,7 @@ export async function reuseLiveLease(
     // bump has just made new, so a create-only token is enough there and the
     // weaker capability is what they get (see createReceiptUploadUrl).
     const signed = await deps.sign(path, { upsert: true });
-    return signed ? { kind: "signed", signed } : { kind: "storage-unavailable" };
+    return signed ? { kind: "signed", signed: { ...signed, uploadLease } } : { kind: "storage-unavailable" };
 }
 
 /** The lease /start just created, as the request that created it knows it. */

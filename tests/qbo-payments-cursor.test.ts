@@ -57,7 +57,7 @@ function memoryCursorStore(): PaymentsSyncCursorStore & { peek(): string | null;
 async function runOnce(
     store: PaymentsSyncCursorStore | undefined,
     total = TOTAL,
-    opts: { stopAfter?: number } = {},
+    opts: { stopAfter?: number; quietStopAfter?: number } = {},
 ): Promise<{ visited: string[]; result: QBPaymentSyncResult }> {
     const all = Array.from({ length: total }, (_, i) => ({ id: idAt(i) }));
     const visited: string[] = [];
@@ -90,6 +90,11 @@ async function runOnce(
                     result.abortedOnQboOutage = true;
                     break;
                 }
+                // A QUIET stop: the handler ran out of per-row budget and
+                // simply returned early, setting no flag. This is the case the
+                // short-page branch got wrong — it `return`s before the loop's
+                // own guards ever get to look at anything.
+                if (opts.quietStopAfter !== undefined && visited.length >= opts.quietStopAfter) break;
                 visited.push(row.id);
                 result.checked++;
                 lastCompletedId = row.id;
@@ -244,4 +249,69 @@ test("only the UNSCOPED sweep carries a cursor", () => {
     assert.match(paymentsSource, /const isSweep = !scope\?\.invoiceId && !scope\?\.projectId;/);
     assert.match(paymentsSource, /const milestoneCursor = isSweep\s*\r?\n\s*\?\s*\{ store: cursorStore, key: PAYMENTS_CURSOR_KEYS\.milestones \}\s*\r?\n\s*: undefined;/);
     assert.match(paymentsSource, /const billingCursor = isSweep\s*\r?\n\s*\?\s*\{ store: cursorStore, key: PAYMENTS_CURSOR_KEYS\.billings \}\s*\r?\n\s*: undefined;/);
+});
+
+// ── A SHORT page is not a DRAINED page (Codex round-15 item 3) ─────────────
+//
+// `page.length < take` means "the collection has no more rows", and the branch
+// that reads it resets the cursor to the top and RETURNS — skipping
+// `countRemaining` entirely. That is only true if the handler actually
+// finished the page. A 40-row final page stopped after row 10 by a deadline or
+// an outage had rows 11-40 thrown away AND never counted as skipped: the run
+// reported a clean drain and thirty payments went unverified until the window
+// happened to roll back over them.
+
+test("a SHORT final page stopped mid-way keeps its cursor and counts the tail", async () => {
+    const store = memoryCursorStore();
+    // 40 rows is fewer than one page, so the very first fetch is "short".
+    const { visited, result } = await runOnce(store, 40, { quietStopAfter: 10 });
+
+    assert.equal(visited.length, 10, "the handler stopped after ten rows");
+    assert.equal(
+        store.peek(),
+        idAt(9),
+        "the cursor stayed at the last row that actually completed",
+    );
+    assert.notEqual(store.peek(), "", "it was NOT reset to the top");
+    assert.equal(result.skipped, 30, "and the unvisited tail is counted, not lost");
+});
+
+test("the NEXT run resumes into the tail rather than re-walking the head", async () => {
+    // The consequence: the rows the short page never reached are the first
+    // thing the following run sees.
+    const store = memoryCursorStore();
+    await runOnce(store, 40, { quietStopAfter: 10 });
+    const second = await runOnce(store, 40);
+    assert.equal(second.visited[0], idAt(10), "it picks up exactly where the last one stopped");
+    assert.deepEqual(
+        second.visited.slice(0, 30),
+        Array.from({ length: 30 }, (_, i) => idAt(10 + i)),
+        "the tail the short page abandoned is walked first, in order",
+    );
+    // Then it WRAPS, because a run that resumed mid-collection has rows before
+    // its start point that a fixed start would never reach. 40 = the 30-row
+    // tail plus the 10-row head.
+    assert.equal(second.visited.length, 40);
+    assert.equal(second.visited[30], idAt(0), "and the head follows the wrap");
+});
+
+test("CONTROL: a short page the handler FINISHED still drains and wraps", async () => {
+    // Without this, a fix that simply never took the drain branch would pass
+    // the tests above while stalling the cursor forever.
+    const store = memoryCursorStore();
+    const { visited, result } = await runOnce(store, 40);
+    assert.equal(visited.length, 40, "the whole collection");
+    assert.equal(store.peek(), "", "drained: the next run starts at the top");
+    assert.equal(result.skipped, 0, "nothing left over");
+});
+
+test("CONTROL: a FULL page stopped mid-way is unchanged", async () => {
+    // The full-page case never went through the short-page branch, so it must
+    // behave exactly as it did — the loop's own outage guard stops it and the
+    // counting path runs.
+    const store = memoryCursorStore();
+    const { visited, result } = await runOnce(store, TOTAL, { stopAfter: 10 });
+    assert.equal(visited.length, 10);
+    assert.equal(store.peek(), idAt(9));
+    assert.equal(result.skipped, TOTAL - 10);
 });

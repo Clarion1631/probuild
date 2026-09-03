@@ -126,6 +126,31 @@ export interface SealPublishDeps {
      */
     queueUploadCleanup: (tx: PublishTx, uploadPath: string) => Promise<string>;
     /**
+     * TAKE OUT A DURABLE INTENT FOR THE CANONICAL PATH, in its OWN committed
+     * transaction, BEFORE the object is written to storage.
+     *
+     * The seal is an external write that happens before the database CAS, so
+     * everything after it can fail — the commit, the winner lookup, the
+     * transaction — and the sealed copy is then in the bucket with nothing
+     * referencing it, nothing remembering it, and no sweep looking for it (the
+     * stale-STAGING sweep reads ROWS). A later re-arm moves the row elsewhere
+     * and the object is undiscoverable.
+     *
+     * Recorded as `provisional`, which the publish-lock's reclaim deliberately
+     * ignores — otherwise taking the lock would cancel the intent taken out to
+     * survive losing it.
+     *
+     * A throw here means NOTHING is sealed: an object we cannot account for in
+     * advance must not be written at all.
+     */
+    queueCanonicalIntent: (canonicalPath: string) => Promise<string>;
+    /**
+     * Cancel that intent, in the SAME transaction as the pointer commit. The
+     * object is referenced from that instant, so the two facts commit together
+     * or neither does.
+     */
+    resolveCanonicalIntent: (tx: PublishTx, eventId: string) => Promise<void>;
+    /**
      * Try the queued deletion now, AFTER the pointer is committed and outside
      * the lock. Best-effort by design: the event is already durable, so a
      * failure here is just work the sweep picks up.
@@ -169,6 +194,22 @@ export async function sealAndPublish(
     // question outside the lock and deleting afterwards is the same two-step
     // race one level down: the winner can commit THIS path in the gap, and the
     // drop then deletes the object the winner just published.
+    // ACCOUNTED FOR BEFORE IT EXISTS. Outside and before the lock, in its own
+    // committed transaction, so it survives every way the critical section
+    // below can fail. If this throws we seal nothing: writing an object we
+    // could not first promise to clean up is the leak itself.
+    let intentId: string;
+    try {
+        intentId = await deps.queueCanonicalIntent(canonicalPath);
+    } catch (error) {
+        console.error(
+            "[receipts/intake] could not record the canonical seal intent; nothing sealed",
+            rowId,
+            error instanceof Error ? error.name : "error",
+        );
+        return null;
+    }
+
     const moved = await deps.withObjectLock(canonicalPath, async tx => {
         const sealed = await deps.seal(uploadPath, canonicalPath, check.bytes, check.mimeType);
         if (!sealed) return null;
@@ -183,6 +224,10 @@ export async function sealAndPublish(
             const eventId = uploadPath === canonicalPath
                 ? null
                 : await deps.queueUploadCleanup(tx, uploadPath);
+            // ...and the canonical object is REFERENCED from this instant, so
+            // its intent is cancelled in the same transaction that references
+            // it. A throw rolls both back and the intent correctly survives.
+            await deps.resolveCanonicalIntent(tx, intentId);
             return { count, eventId };
         }
 
@@ -203,9 +248,14 @@ export async function sealAndPublish(
         //     any more (the winner moved it), so the stale-STAGING sweep will
         //     never look at it again, and it would sit in the bucket forever.
         //
-        // A failed lookup answers "don't know" as the first case: never delete
-        // on uncertainty about what the winner is using.
-        const winnerPath = await deps.currentStoragePath(tx, rowId).catch(() => canonicalPath);
+        // A failed lookup used to be swallowed into "assume the winner is
+        // using it", which suppressed the cleanup entirely and leaked the
+        // object on every lookup fault. It no longer has to: the intent above
+        // already accounts for this path, so the honest answer is to let the
+        // throw roll this transaction back — the publish reports its retryable
+        // null, and the intent is swept on schedule with the sweeper's own
+        // live-reference recheck deciding whether the object may go.
+        const winnerPath = await deps.currentStoragePath(tx, rowId);
         if (winnerPath !== canonicalPath) {
             // NOT swallowed any more: a drop that can neither delete nor record
             // is an orphan nobody will find, and this transaction has nothing

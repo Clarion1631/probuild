@@ -24,6 +24,8 @@ import {
 import {
     deleteObjectOrRecord,
     queueObjectCleanup,
+    queueCanonicalIntent,
+    resolveCanonicalIntent,
     rejectRowAndQueueCleanup,
     sealObject,
     settleQueuedCleanup,
@@ -182,7 +184,12 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // bug never surfaced as an error the caller could see or retry against.
     // Reading the raw text first is what makes the difference legible: only a
     // body that is empty (or whitespace) after trimming may mean "no fields".
-    let body: { sha256?: unknown; costCodeId?: unknown; projectId?: unknown } = {};
+    let body: {
+        sha256?: unknown;
+        uploadLease?: unknown;
+        costCodeId?: unknown;
+        projectId?: unknown;
+    } = {};
     const rawBody = await req.text();
     if (rawBody.trim()) {
         let parsed: unknown;
@@ -203,6 +210,10 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         body = parsed as typeof body;
     }
     const declaredSha = typeof body.sha256 === "string" ? body.sha256.trim().toLowerCase() : null;
+    // THE LEASE THIS CALLER'S URL WAS ISSUED UNDER. Required — see the gate below.
+    const declaredLease = typeof body.uploadLease === "string" && body.uploadLease.trim()
+        ? body.uploadLease.trim()
+        : null;
 
     // LATE FIELDS. A client that learned the job only after starting the upload
     // sends them here. They are applied WHERE NULL and refused where they
@@ -238,6 +249,8 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
+
+
 
     // WHEN THIS ROW'S OBJECT MAY BE DELETED, computed ONCE from the row as
     // read, so the reject path and the seal path cannot disagree about it.
@@ -276,6 +289,55 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         row.createdById === auth.user.id ||
         STAFF_READ_ROLES.includes(auth.user.role);
     if (!maySee) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
+
+    // ── BOUND TO THE LEASE THAT ISSUED THIS CALLER'S URL ───────────────────
+    //
+    // /start rotates `uploadLeaseNonce` on every issue and every adoption, and
+    // it now RETURNS that value. This gate is what makes returning it mean
+    // something: a finalizer must present the generation its own signed URL was
+    // issued under, and one that does not match the row's current lease is
+    // refused before it reads a single byte.
+    //
+    // Reading the row's CURRENT nonce (which is all this used to do, implicitly)
+    // meant a delayed finalizer silently ADOPTED whichever lease had been
+    // issued since. Both /start calls hand out URLs for the SAME path, so:
+    // client A starts an upload, client B's retry refreshes the lease and gets
+    // a working URL, A's finalize finally arrives, inspects B's half-written
+    // object, finds it unacceptable and DELETES the row — while B is still
+    // uploading to a URL that works. The row, and the only record of an inbound
+    // receipt, are gone.
+    //
+    // BEFORE the storage inspection and before every mutation, deliberately:
+    // this must cost nothing and touch nothing. 409, and `retryable` is false —
+    // the caller cannot fix a stale lease by retrying the same request; it has
+    // to call /start again and use the URL that comes back.
+    //
+    // A row with a NULL nonce was never issued a signed URL at all (the
+    // single-shot inline path writes its bytes through the server), so no
+    // caller can hold a valid generation for it and the comparison correctly
+    // refuses every two-step finalize against one.
+    if (!declaredLease || declaredLease !== row.uploadLeaseNonce) {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "lease-stale",
+                reason: declaredLease
+                    ? "this upload lease has been superseded; call /start again for a fresh URL"
+                    : "uploadLease is required — send the value /start returned with your URL",
+                retryable: false,
+            },
+            { status: 409 },
+        );
+    }
+
+    // THE ROW, PINNED TO THE LEASE THE CALLER PROVED IT HOLDS.
+    //
+    // Equal to `row` by the gate immediately above — and written this way on
+    // purpose. Every fence below is built from the value the CLIENT echoed
+    // rather than from whatever the freshly-read row happened to say, so a
+    // future edit that moved or weakened the gate would leave these CASes
+    // pinning a generation nobody proved, which is the whole bug.
+    const leased = { ...row, uploadLeaseNonce: declaredLease };
 
     // THE DECLARED HASH IS ENFORCED HERE, ONCE, AHEAD OF EVERY OUTCOME.
     //
@@ -401,7 +463,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 // client's URL while we were inspecting the object makes this
                 // delete match zero rows instead of destroying a row whose
                 // upload link works again.
-                uploadLeaseNonce: row.uploadLeaseNonce,
+                uploadLeaseNonce: leased.uploadLeaseNonce,
                 uploadUrlExpiresAt: row.uploadUrlExpiresAt,
                 cleanupNotBefore: cleanupAfter,
             },
@@ -515,7 +577,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 // this write — a re-park under a different reason, a worker
                 // claim, a job filled in — invalidates what was checked above,
                 // so the publish must lose rather than overwrite it.
-                where: { id, ...leaseFence(row), ...merged.guard },
+                where: { id, ...leaseFence(leased), ...merged.guard },
                 data: {
                     state: "RECEIVED",
                     stateReason: null,
@@ -541,6 +603,11 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // commit with the pointer or not at all.
         queueUploadCleanup: (tx, uploadPath) =>
             queueObjectCleanup(tx, uploadPath, "sealed", cleanupAfter),
+        // The canonical copy is written before the pointer commit, so it is
+        // promised to the cleanup queue before it exists — same schedule, so a
+        // client still holding a live URL is never racing a sweep.
+        queueCanonicalIntent: canonicalPath => queueCanonicalIntent(canonicalPath, cleanupAfter),
+        resolveCanonicalIntent,
         settleUploadCleanup: (eventId, uploadPath) =>
             settleQueuedCleanup(eventId, uploadPath, cleanupAfter).then(() => undefined),
         currentStoragePath: async (tx, rowId) => {

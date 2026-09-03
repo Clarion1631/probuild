@@ -21,6 +21,25 @@ import { leaseFence } from "./stored-object";
 export const STORAGE_CLEANUP_KIND = "storage-cleanup-pending";
 
 /**
+ * `pending` — the object exists and is unreferenced; delete it when due.
+ * `provisional` — an INTENT for an object a publish is about to write. Same
+ * sweep, but invisible to `reclaimQueuedCleanups` so the publish that took it
+ * out cannot cancel it by taking the very lock it needs. See queueCanonicalIntent.
+ */
+export type CleanupStatus = "pending" | "provisional";
+export const CLEANUP_SWEEPABLE_STATUSES: CleanupStatus[] = ["pending", "provisional"];
+
+/** The one write `resolveCanonicalIntent` needs — injectable for tests. */
+export interface CleanupResolveTx {
+    automationEvent: {
+        update(args: {
+            where: { id: string };
+            data: { status: string; reason: string };
+        }): Promise<unknown>;
+    };
+}
+
+/**
  * THE SCHEDULE ON A QUEUED CLEANUP, and why one is needed at all.
  *
  * Deleting an object is not the same as making it undeletable-again. While a
@@ -68,7 +87,7 @@ export function cleanupDue(detail: string | null | undefined, now: Date = new Da
  */
 export interface CleanupIo {
     remove: (storagePath: string) => Promise<void>;
-    record: (storagePath: string, reason: string, notBefore: Date | null) => Promise<void>;
+    record: (storagePath: string, reason: string, notBefore: Date | null) => Promise<unknown>;
     resolve: (eventId: string) => Promise<void>;
     now: () => Date;
 }
@@ -228,25 +247,70 @@ export async function recordPendingCleanup(
     reason: string,
     /** When the object may be deleted — see cleanupDueAt. Null means now. */
     notBefore: Date | null = null,
-): Promise<void> {
+    /**
+     * `provisional` records an INTENT taken out before an external write, for
+     * an object that does not exist yet — see queueCanonicalIntent. It is
+     * deliberately invisible to `reclaimQueuedCleanups`, which would otherwise
+     * cancel the intent the moment the publish that took it out grabbed the
+     * path's lock. The sweeper picks up both statuses.
+     */
+    status: CleanupStatus = "pending",
+): Promise<string> {
     // THROWS on failure, unlike an audit write. This record is not an audit
     // trail — it is the ONLY thing that will remember the object once the row
     // pointing at it is gone. Swallowing the failure loses the orphan silently
     // and forever, so the caller must know and keep the row instead.
     await logAutomationEvent({
         kind: STORAGE_CLEANUP_KIND,
-        status: "pending",
+        status,
         reason,
         source: "receipt-intake",
         detail: notBefore ? { storagePath, notBefore: notBefore.toISOString() } : { storagePath },
     });
     const recorded = await prisma.automationEvent.findFirst({
-        where: { kind: STORAGE_CLEANUP_KIND, status: "pending", detail: { contains: storagePath } },
+        where: { kind: STORAGE_CLEANUP_KIND, status, detail: { contains: storagePath } },
+        orderBy: { createdAt: "desc" },
         select: { id: true },
     });
     // logAutomationEvent is fire-and-forget by contract, so "it did not throw"
     // is not proof it wrote. Read it back.
     if (!recorded) throw new Error(`could not record a cleanup for ${storagePath}`);
+    return recorded.id;
+}
+
+/**
+ * A CLEANUP INTENT FOR AN OBJECT THAT DOES NOT EXIST YET.
+ *
+ * `sealAndPublish` writes the canonical copy to Supabase BEFORE the database
+ * CAS that points a row at it. Everything after that write can fail — the
+ * commit, the winner lookup, the transaction itself — and the object is then
+ * in the bucket with nothing referencing it, nothing remembering it, and no
+ * sweep looking for it, because the stale-STAGING sweep reads ROWS. A re-arm
+ * later moves the row somewhere else and the sealed copy is undiscoverable.
+ *
+ * So the intent is taken out FIRST, in its own committed transaction, and the
+ * publish that succeeds cancels it in the SAME transaction as the pointer
+ * commit. Anything left provisional is swept on schedule by
+ * `retryPendingCleanups`, which rechecks live references inside the path lock
+ * before it deletes — so an intent that outlived a publish which actually
+ * worked resolves harmlessly instead of destroying a live receipt.
+ */
+export async function queueCanonicalIntent(
+    canonicalPath: string,
+    notBefore: Date | null = null,
+): Promise<string> {
+    return recordPendingCleanup(canonicalPath, "canonical-seal-intent", notBefore, "provisional");
+}
+
+/** Cancel an intent because the object it covers is now referenced by a row. */
+export async function resolveCanonicalIntent(
+    tx: CleanupResolveTx,
+    eventId: string,
+): Promise<void> {
+    await tx.automationEvent.update({
+        where: { id: eventId },
+        data: { status: "resolved", reason: "published" },
+    });
 }
 
 /** The one write `queueObjectCleanup` needs — injectable, so it is testable. */
@@ -550,7 +614,10 @@ export interface CleanupSweepDeps {
 
 const liveSweepDeps: CleanupSweepDeps = {
     findPending: take => prisma.automationEvent.findMany({
-        where: { kind: STORAGE_CLEANUP_KIND, status: "pending" },
+        // BOTH statuses. A provisional intent is an object a publish said it
+        // was about to write and then could not account for; leaving it out of
+        // the sweep would make the intent a note nobody ever reads.
+        where: { kind: STORAGE_CLEANUP_KIND, status: { in: CLEANUP_SWEEPABLE_STATUSES } },
         orderBy: { createdAt: "asc" },
         take,
         select: { id: true, detail: true },
@@ -664,7 +731,11 @@ export async function retryPendingCleanups(
             const siblings = await tx.automationEvent.findMany({
                 where: {
                     kind: STORAGE_CLEANUP_KIND,
-                    status: "pending",
+                    // Provisional intents included: they name the same object,
+                    // so they carry a schedule this delete must respect and
+                    // they must be resolved with it rather than left to retry
+                    // forever against bytes that are already gone.
+                    status: { in: CLEANUP_SWEEPABLE_STATUSES },
                     detail: { contains: JSON.stringify(storagePath) },
                 },
                 select: { id: true, detail: true },

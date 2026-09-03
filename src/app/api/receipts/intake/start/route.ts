@@ -323,6 +323,9 @@ export async function POST(req: Request) {
                 // no row referenced and no sweep would ever look at — silently,
                 // because the failure was swallowed. Now they commit together
                 // or the row never moves.
+                // Hoisted so the response can echo it: /finalize requires the
+                // generation its URL was issued under.
+                const rearmedLease = newLeaseNonce();
                 const repathed = await repathWithCleanup(
                     existing,
                     {
@@ -333,7 +336,7 @@ export async function POST(req: Request) {
                         // Same generation stamp every adoption writes, so a
                         // concurrent discard can never mistake this row for
                         // the lease it created.
-                        uploadLeaseNonce: newLeaseNonce(),
+                        uploadLeaseNonce: rearmedLease,
                         // The stored hash is what /finalize verifies against.
                         // Whatever was recorded describes bytes that are gone
                         // or were never right.
@@ -381,6 +384,7 @@ export async function POST(req: Request) {
                     state: existing.state,
                     maxBytes: MAX_STORED_BYTES,
                     ...rearmed,
+                    uploadLease: rearmedLease,
                 });
             }
 
@@ -521,13 +525,15 @@ export async function POST(req: Request) {
             // different. A lost CAS answers the same retryable 409 the re-arm
             // branch does, and the retry re-reads and re-decides rather than
             // orphaning anything — repathWithCleanup rolls back as one.
+            // Hoisted for the same reason as the re-arm's: the response echoes it.
+            const resumedLease = newLeaseNonce();
             const resumedRepath = await repathWithCleanup(
                 existing,
                 {
                     storagePath: resumePath,
                     uploadLeaseVersion: nextLease,
                     uploadUrlExpiresAt: uploadLeaseExpiry(),
-                    uploadLeaseNonce: newLeaseNonce(),
+                    uploadLeaseNonce: resumedLease,
                 },
                 resumePath,
                 "start-resumed-repath",
@@ -541,7 +547,8 @@ export async function POST(req: Request) {
             // through reuseLiveLease over that same path.
             if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
             return NextResponse.json({
-                ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resumed,
+                ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES,
+                ...resumed, uploadLease: resumedLease,
             });
         }
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2003") {
@@ -596,6 +603,7 @@ export async function POST(req: Request) {
         state: created.state,
         maxBytes: MAX_STORED_BYTES,
         ...signed,
+        uploadLease: leaseNonce,
     });
 }
 

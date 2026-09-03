@@ -28,6 +28,29 @@ import { createHash } from "node:crypto";
  */
 
 const prisma = new PrismaClient();
+/**
+ * THE LEASE GENERATION /finalize NOW REQUIRES.
+ *
+ * /start returns `uploadLease` with every URL it issues and /finalize refuses
+ * any call that does not echo the row's CURRENT one (409 `lease-stale`), so a
+ * delayed finalizer can no longer adopt a lease that was issued after it
+ * started. Tests whose subject is something else read the live value here.
+ *
+ * Rows seeded through the single-shot POST never had a signed URL and so carry
+ * no generation; those get one minted, which is the same shape /start would
+ * have written and keeps each test about its own subject.
+ */
+async function leaseOf(id: string): Promise<string> {
+    const row = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { uploadLeaseNonce: true },
+    });
+    if (row?.uploadLeaseNonce) return row.uploadLeaseNonce;
+    const minted = `e2e-lease-${id}`;
+    await prisma.receiptIntake.update({ where: { id }, data: { uploadLeaseNonce: minted } });
+    return minted;
+}
+
 const INTAKE_PATH = "/api/receipts/intake";
 const SECRET = process.env.RECEIPT_INTAKE_SECRET || "";
 // The archive mirror holds a DIFFERENT key: it may read BOOKED/ARCHIVED rows and
@@ -963,7 +986,7 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
 
         const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: "{}",
+            data: JSON.stringify({ uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(finalized.status()).toBe(409);
@@ -1026,7 +1049,7 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
 
         const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: "{}",
+            data: JSON.stringify({ uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(finalized.status()).toBe(200);
@@ -1270,7 +1293,7 @@ test.describe("round-9 intake contracts", () => {
         // /finalize: the alreadyFinalized path.
         const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: "{}",
+            data: JSON.stringify({ uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(finalized.status()).toBe(409);
@@ -1308,7 +1331,7 @@ test.describe("round-9 intake contracts", () => {
 
         const finalized = await request.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: "{}",
+            data: JSON.stringify({ uploadLease: await leaseOf(created.body.id) }),
             maxRedirects: 0,
         });
         expect(finalized.status()).toBe(200);
@@ -1359,7 +1382,7 @@ test.describe("round-9 intake contracts", () => {
 
         const applied = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify({ costCodeId: "e2e-mob-cc-demo" }),
+            data: JSON.stringify({ ...{ costCodeId: "e2e-mob-cc-demo" }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(applied.status()).toBe(200);
@@ -1369,7 +1392,7 @@ test.describe("round-9 intake contracts", () => {
         // Re-sending the SAME value is idempotent.
         const same = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify({ costCodeId: "e2e-mob-cc-demo" }),
+            data: JSON.stringify({ ...{ costCodeId: "e2e-mob-cc-demo" }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(same.status()).toBe(200);
@@ -1378,7 +1401,7 @@ test.describe("round-9 intake contracts", () => {
         // human may already have set.
         const conflicting = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify({ costCodeId: "e2e-mob-cc-dryw" }),
+            data: JSON.stringify({ ...{ costCodeId: "e2e-mob-cc-dryw" }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(conflicting.status()).toBe(409);
@@ -1400,10 +1423,10 @@ test.describe("round-9 intake contracts", () => {
 
 test.describe("round-10 finalize authorization and recovery", () => {
     const startPath = `${INTAKE_PATH}/start`;
-    const finalize = (request: APIRequestContext, id: string, body: Record<string, unknown>) =>
+    const finalize = async (request: APIRequestContext, id: string, body: Record<string, unknown>) =>
         request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify(body),
+            data: JSON.stringify({ ...body, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
 
@@ -1428,6 +1451,11 @@ test.describe("round-10 finalize authorization and recovery", () => {
         // catch. A Buffer bypasses that re-wrap and puts these exact bytes on
         // the wire.
         const res = await request.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: Buffer.from('{"costCodeId": "e2e-mob-cc-demo"', "utf8"), // truncated: missing closing brace
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(400);
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
             data: Buffer.from('{"costCodeId": "e2e-mob-cc-demo"', "utf8"), // truncated: missing closing brace
             maxRedirects: 0,
@@ -1486,7 +1514,7 @@ test.describe("round-10 finalize authorization and recovery", () => {
         });
         const res = await employee.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
             headers: { "content-type": "application/json" },
-            data: JSON.stringify({ projectId: "e2e-scope-oos-project" }),
+            data: JSON.stringify({ ...{ projectId: "e2e-scope-oos-project" }, uploadLease: await leaseOf(created.body.id) }),
             maxRedirects: 0,
         });
         // Either refused outright (403) or invisible to this caller (404) — what
@@ -1527,7 +1555,7 @@ test.describe("round-10 finalize authorization and recovery", () => {
 
         const res = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify({ projectId: PROJECT_ID }),
+            data: JSON.stringify({ ...{ projectId: PROJECT_ID }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(res.status()).toBe(403);
@@ -1567,7 +1595,7 @@ test.describe("round-10 finalize authorization and recovery", () => {
             headers: { "content-type": "application/json" },
             // No projectId in the body: the row already has one, and that is
             // the whole point of the case.
-            data: JSON.stringify({ costCodeId: "e2e-mob-cc-demo" }),
+            data: JSON.stringify({ ...{ costCodeId: "e2e-mob-cc-demo" }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(res.status()).toBe(403);

@@ -210,6 +210,7 @@ import {
     retryPendingCleanups,
     settleQueuedCleanup,
     CLEANUP_SCAN_FACTOR,
+    CLEANUP_SWEEPABLE_STATUSES,
     type CleanupIo,
     type CleanupSweepDeps,
 } from "../src/lib/receipt-intake/storage-cleanup";
@@ -263,7 +264,11 @@ function world(now: Date = T0) {
         now: () => new Date(clock),
     };
     const sweep: CleanupSweepDeps = {
-        findPending: async take => events.filter(e => e.status === "pending").slice(0, take),
+        // BOTH sweepable statuses, exactly as the live wiring queries: a
+        // provisional intent the sweep could not see would make the whole
+        // account-before-you-write design a note nobody reads.
+        findPending: async take =>
+            events.filter(e => (CLEANUP_SWEEPABLE_STATUSES as string[]).includes(e.status)).slice(0, take),
         abandon: async eventId => {
             const event = events.find(e => e.id === eventId);
             if (event) event.status = "abandoned";
@@ -295,7 +300,7 @@ function world(now: Date = T0) {
         objects, events, io, sweep,
         setRows: (next: typeof rows) => { rows = next; },
         advance: (ms: number) => { clock += ms; },
-        pending: () => events.filter(e => e.status === "pending"),
+        pending: () => events.filter(e => (CLEANUP_SWEEPABLE_STATUSES as string[]).includes(e.status)),
     };
 }
 
@@ -560,6 +565,8 @@ test("a cleanup-record failure ROLLS BACK the pointer transition it belongs to",
             staged.state = "RECEIVED";
             return 1;
         },
+        queueCanonicalIntent: async () => "intent-1",
+        resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => {
             if (queueThrows) throw new Error("cleanup insert failed");
             return "ev-1";
@@ -650,4 +657,87 @@ test("a newer schedule on a DIFFERENT path does not defer this one", async () =>
     assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1, "the due path is not held up");
     assert.equal(w.objects.has(due), false);
     assert.ok(w.objects.has(other), "and the deferred one is untouched");
+});
+
+// ── The canonical copy is accounted for BEFORE it is written (round-15 #2) ──
+//
+// `sealAndPublish` writes the canonical object to Supabase and only then runs
+// the database CAS that points a row at it. Everything after that write can
+// fail — the commit, the winner lookup, the transaction — and the object was
+// then in the bucket with nothing referencing it, nothing remembering it and
+// no sweep looking for it, because the stale-STAGING sweep reads ROWS. A later
+// re-arm moves the row elsewhere and the sealed copy is undiscoverable.
+
+test("a provisional intent is swept like any other cleanup, and resolves with it", async () => {
+    const w = world();
+    const CANON = "receipts/row-1/v1/abc.png";
+    w.objects.add(CANON);
+    // What queueCanonicalIntent writes: same queue, same schedule, its own
+    // status so the publish lock's reclaim cannot cancel it.
+    w.events.push({
+        id: "intent-1",
+        status: "provisional",
+        detail: JSON.stringify({ storagePath: CANON }),
+    });
+
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1, "the sweep sees it");
+    assert.equal(w.objects.has(CANON), false, "and the unreferenced copy is collected");
+    assert.equal(w.pending().length, 0);
+});
+
+test("a provisional intent NEVER deletes an object a row is using", async () => {
+    // The safety property the whole design rests on: an intent that outlived a
+    // publish which actually worked must resolve harmlessly. The sweeper's
+    // live-reference recheck runs inside the path lock, so a committed pointer
+    // always wins.
+    const w = world();
+    const CANON = "receipts/row-1/v1/abc.png";
+    w.objects.add(CANON);
+    w.setRows([{ id: "row-1", storagePath: CANON }]);
+    w.events.push({
+        id: "intent-1",
+        status: "provisional",
+        detail: JSON.stringify({ storagePath: CANON }),
+    });
+
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 0);
+    assert.ok(w.objects.has(CANON), "the published receipt is untouched");
+    assert.equal(w.pending().length, 0, "and the intent is resolved, not retried forever");
+});
+
+test("the publish lock's reclaim must NOT cancel a provisional intent", () => {
+    // The ordering trap: the intent is taken out before the lock, and
+    // `withReceiptPublishLock` reclaims pending cleanups for the path as its
+    // first act. If reclaim covered provisional too, every publish would
+    // cancel the intent it had just taken out to survive its own failure.
+    const cleanup = readFileSync(path.join(ROOT, "src/lib/receipt-intake/storage-cleanup.ts"), "utf8");
+    const reclaim = bodyOf(cleanup, "async function reclaimQueuedCleanups");
+    assert.match(reclaim, /status: "pending",/, "pending only");
+    assert.ok(!reclaim.includes("CLEANUP_SWEEPABLE_STATUSES"), "provisional is deliberately excluded");
+    // The sweep, by contrast, must cover both — or the intent is a note
+    // nobody ever reads.
+    // Scoped to the QUERY, not to a `bodyOf` slice: `const liveSweepDeps` ends
+    // in `};` rather than `}`, so the helper ran past it and the sibling
+    // lookup further down satisfied this assertion on its own — the pin passed
+    // while the sweep query itself had been mutated away.
+    const findPending = cleanup.slice(
+        cleanup.indexOf("findPending: take => prisma.automationEvent.findMany("),
+        cleanup.indexOf("orderBy: { createdAt: \"asc\" }"),
+    );
+    assert.ok(findPending.length > 0 && findPending.length < 600, "the slice is the query, not the file");
+    assert.match(findPending, /status: \{ in: CLEANUP_SWEEPABLE_STATUSES \}/);
+    // The sibling lookup inside the delete needs it too, for its own reason:
+    // an intent naming the same object carries a schedule the delete must
+    // respect, and must be resolved with it.
+    const siblingsAt = cleanup.indexOf("const siblings = await tx.automationEvent.findMany(");
+    assert.ok(siblingsAt > 0, "the sibling lookup exists");
+    // Searched FROM the sibling lookup: `select: { id: true, detail: true }`
+    // also closes findPending above, so a plain indexOf ran backwards and
+    // produced an empty slice that matched nothing and failed loudly.
+    const siblings = cleanup.slice(
+        siblingsAt,
+        cleanup.indexOf("select: { id: true, detail: true }", siblingsAt),
+    );
+    assert.match(siblings, /status: \{ in: CLEANUP_SWEEPABLE_STATUSES \}/);
+    assert.deepEqual(CLEANUP_SWEEPABLE_STATUSES, ["pending", "provisional"]);
 });

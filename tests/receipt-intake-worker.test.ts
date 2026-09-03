@@ -1519,11 +1519,27 @@ test("/start stamps a lease on every url it issues, including a live-lease retry
     // And the ADOPTION GENERATION alongside it, on every one of the four. The
     // expiry alone cannot identify a lease -- a reuse writes the same "now + 2h"
     // the original issue did, so the discard CAS pins this instead.
-    assert.match(lease, /uploadLeaseNonce: \(deps\.nonce \?\? newLeaseNonce\)\(\),/);
+    // Hoisted now, because /finalize requires the generation its URL was
+    // issued under and the caller has to hand it back — so the value written
+    // to the row and the value returned to the client must be the SAME draw,
+    // not two calls to the generator.
+    assert.match(lease, /const uploadLease = \(deps\.nonce \?\? newLeaseNonce\)\(\);/);
+    assert.match(lease, /uploadLeaseNonce: uploadLease,/);
+    assert.match(lease, /signed: \{ \.\.\.signed, uploadLease \}/);
+    // Both destructive branches still stamp a FRESH generation — hoisted into
+    // a const now, for the same reason as the reuse path: /finalize requires
+    // the generation, so the response has to echo the value that was written.
+    assert.match(start, /const rearmedLease = newLeaseNonce\(\);/);
+    assert.match(start, /const resumedLease = newLeaseNonce\(\);/);
     assert.equal(
-        (start.match(/uploadLeaseNonce: newLeaseNonce\(\)/g) ?? []).length,
+        (start.match(/uploadLeaseNonce: (rearmedLease|resumedLease),/g) ?? []).length,
         2,
-        "the re-arm and the resume each stamp a fresh generation inline",
+        "the re-arm and the resume each write the generation they minted",
+    );
+    assert.equal(
+        (start.match(/uploadLease: (rearmedLease|resumedLease),/g) ?? []).length,
+        2,
+        "...and each hands that same value back",
     );
     assert.equal(
         (start.match(/uploadLeaseNonce: leaseNonce/g) ?? []).length,
