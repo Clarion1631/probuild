@@ -18,6 +18,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
     discardUnresumedLease,
+    extendedExpiry,
+    issuedLeaseIsCurrent,
     liveLeasePath,
     newLeaseNonce,
     reuseLiveLease,
@@ -66,6 +68,7 @@ interface Store {
 function client(rows: (LeaseRow | Record<string, unknown>)[]) {
     const store: Store = { rows: rows.map(r => ({ ...r } as Record<string, unknown>)), signed: [], deleted: [] };
     let adoptions = 0;
+    let duringSign: () => Promise<void> | void = () => {};
     const matching = (where: Record<string, unknown>) => (row: Record<string, unknown>) =>
         Object.entries(where).every(([key, want]) => {
             const have = row[key];
@@ -88,8 +91,15 @@ function client(rows: (LeaseRow | Record<string, unknown>)[]) {
                 return { count: hits.length };
             },
         },
+        // Re-reads the LIVE row out of the store, so a loser of the adoption
+        // CAS sees what actually won rather than a snapshot the test posed.
+        reload: async (id: string) =>
+            (store.rows.find(r => r.id === id) as unknown as LeaseRow | undefined) ?? null,
         sign: async (storagePath: string) => {
             store.signed.push(storagePath);
+            // A hook for the tests that need somebody else to move the row
+            // WHILE the signing round trip is in flight.
+            await duringSign();
             return { uploadUrl: `https://example/${storagePath}`, token: "tok", storagePath };
         },
         expiresAt: () => new Date(Date.now() + 2 * HOUR),
@@ -97,7 +107,19 @@ function client(rows: (LeaseRow | Record<string, unknown>)[]) {
         // distinguishable from the lease it adopted.
         nonce: () => "lease-nonce-adopted-" + (++adoptions),
     };
-    return { store, deps };
+    return {
+        store,
+        deps,
+        /** Run `body` inside the signing round trip, once. */
+        onSign(body: () => Promise<void> | void) {
+            let fired = false;
+            duringSign = async () => {
+                if (fired) return;
+                fired = true;
+                await body();
+            };
+        },
+    };
 }
 
 // ── The finding: a recoverable row's retries were NOT idempotent ───────────
@@ -239,7 +261,7 @@ test("a row RE-PARKED under a different reason loses the fence", async () => {
     assert.deepEqual(store.signed, []);
 });
 
-test("the CAS carries the identity the retry proved: id, state, path and version", async () => {
+test("the CAS carries the WHOLE lease identity, generation included", async () => {
     const row = parked();
     const seen: Record<string, unknown>[] = [];
     const { deps } = client([row]);
@@ -253,6 +275,11 @@ test("the CAS carries the identity the retry proved: id, state, path and version
         },
     };
     await reuseLiveLease(row, "png", spy);
+    // THE NONCE AND THE EXPIRY ARE IN THE WHERE CLAUSE. They used to be
+    // left out on purpose, so two concurrent adopters both matched, both
+    // wrote their own generation, and the earlier one's 200 carried a
+    // lease /finalize would refuse. Pinning them makes exactly one
+    // adopter the writer of any given generation.
     assert.deepEqual(seen[0], {
         id: "row-1",
         storagePath: row.storagePath,
@@ -260,6 +287,8 @@ test("the CAS carries the identity the retry proved: id, state, path and version
         stateReason: "sha-mismatch",
         claimToken: null,
         uploadLeaseVersion: 2,
+        uploadLeaseNonce: CREATED_NONCE,
+        uploadUrlExpiresAt: row.uploadUrlExpiresAt,
     });
 });
 
@@ -387,12 +416,16 @@ test("SAME-MILLISECOND EXPIRY: an adopted row still survives the discard", async
     };
     const resumed = await reuseLiveLease(created, "png", sameInstant);
     assert.equal(resumed?.kind, "signed");
+    // THE GENERATION NO LONGER MOVES on an extension — an extension is the
+    // same lease, and both retries have to be able to finalize under it. So
+    // the expiry is what the discard's witness has to be, and the adoption
+    // FORCES it past what it found rather than hoping the clock does.
+    assert.equal(store.rows[0].uploadLeaseNonce, CREATED_NONCE, "same lease, same generation");
     assert.equal(
         (store.rows[0].uploadUrlExpiresAt as Date).getTime(),
-        created.uploadUrlExpiresAt!.getTime(),
-        "the expiry is byte-identical: the OLD CAS's only witness saw nothing",
+        created.uploadUrlExpiresAt!.getTime() + 1,
+        "one millisecond past the instant it found, by construction",
     );
-    assert.notEqual(store.rows[0].uploadLeaseNonce, CREATED_NONCE, "but the generation moved");
 
     assert.equal(await discardUnresumedLease(asCreated(created), deps.db), "resumed");
     assert.equal(store.rows.length, 1, "the row survives");
@@ -401,11 +434,12 @@ test("SAME-MILLISECOND EXPIRY: an adopted row still survives the discard", async
     assert.equal(signed.storagePath, store.rows[0].storagePath, "the retry's URL still names a live row");
 });
 
-test("CLOCK SKEW: an adoption whose expiry reads EARLIER also survives", async () => {
-    // Two hosts, two clocks. The adopter's "now + 2h" can land BEFORE ours, so
-    // any reasoning that treats the expiry as monotonic is wrong in both
-    // directions -- and a CAS written as a comparison rather than an equality
-    // would delete this row.
+test("CLOCK SKEW: an adoption never moves the expiry BACKWARDS", async () => {
+    // Two hosts, two clocks. The adopter's "now + 2h" can land BEFORE ours.
+    // Writing it would shorten a lease whose holder is still using a URL
+    // signed for a full window -- which is how the sweeper comes to reclaim a
+    // row somebody is actively uploading to. The extension takes the later of
+    // the two, and still moves it far enough for the discard to see.
     const created = staging();
     const { store, deps } = client([created]);
     const skewed = {
@@ -414,9 +448,10 @@ test("CLOCK SKEW: an adoption whose expiry reads EARLIER also survives", async (
     };
     const resumed = await reuseLiveLease(created, "png", skewed);
     assert.equal(resumed?.kind, "signed");
-    assert.ok(
-        (store.rows[0].uploadUrlExpiresAt as Date).getTime() < created.uploadUrlExpiresAt!.getTime(),
-        "the adopted lease really does expire earlier than the one we wrote",
+    assert.equal(
+        (store.rows[0].uploadUrlExpiresAt as Date).getTime(),
+        created.uploadUrlExpiresAt!.getTime() + 1,
+        "the skewed, EARLIER instant was refused; the lease only ever grows",
     );
 
     assert.equal(await discardUnresumedLease(asCreated(created), deps.db), "resumed");
@@ -433,17 +468,200 @@ test("the control, restated: with NO adoption the generation is untouched and th
     assert.deepEqual(store.rows, []);
 });
 
-test("every adoption stamps a FRESH generation, so two of them never collide", async () => {
+// -- Round 19: every 200 /start hands back must remain FINALIZABLE --------
+//
+// The test this replaces asserted the opposite, and blessed the bug: it
+// required two adoptions of the SAME live lease to stamp DIFFERENT
+// generations. Only the last one is stored, /finalize demands the generation
+// its URL was issued under, so the earlier caller -- holding a signed URL it
+// had just been handed for the same path -- was answered 409 lease-stale. An
+// endpoint whose entire purpose is idempotent retries was issuing responses
+// that could never be used.
+
+/** What /finalize does with an echoed lease, in one line. */
+const finalizable = (store: Store, uploadLease: string) =>
+    store.rows.length === 1 && store.rows[0].uploadLeaseNonce === uploadLease;
+
+test("CONCURRENT /start: both 200s carry the SAME lease, and both finalize", async () => {
     const created = staging();
     const { store, deps } = client([created]);
-    await reuseLiveLease(created, "png", deps);
-    const first = store.rows[0].uploadLeaseNonce;
-    await reuseLiveLease(created, "png", deps);
-    assert.notEqual(store.rows[0].uploadLeaseNonce, first, "the second adoption wrote its own");
-    assert.notEqual(first, CREATED_NONCE);
+
+    // Both requests read the row before either writes -- the actual shape of
+    // a double-tap, a network retry, or a forwarder's own retry policy.
+    const [a, b] = await Promise.all([
+        reuseLiveLease(created, "png", deps),
+        reuseLiveLease(created, "png", deps),
+    ]);
+
+    assert.equal(a?.kind, "signed", "the first retry got a URL");
+    assert.equal(b?.kind, "signed", "and so did the second");
+    const leaseA = (a as { signed: { uploadLease: string } }).signed.uploadLease;
+    const leaseB = (b as { signed: { uploadLease: string } }).signed.uploadLease;
+
+    assert.equal(leaseA, leaseB, "one live lease, one generation");
+    assert.equal(leaseA, CREATED_NONCE, "and it is the generation they adopted");
+    // THE PROPERTY, stated as /finalize would evaluate it.
+    assert.ok(finalizable(store, leaseA), "the first response is still finalizable");
+    assert.ok(finalizable(store, leaseB), "and so is the second");
+
+    // Same path, same version, nothing deleted -- the idempotency this rule
+    // exists for is intact.
+    assert.deepEqual(store.signed, [created.storagePath, created.storagePath]);
+    assert.equal(store.rows[0].uploadLeaseVersion, 1);
+    assert.deepEqual(store.deleted, []);
+});
+
+test("PRE-FIX CONTROL: minting a generation per adoption strands the first 200", async () => {
+    // The old rule, reproduced exactly: a fresh nonce on every adoption, and
+    // the nonce left out of the CAS so both writers land.
+    const created = staging();
+    const { store, deps } = client([created]);
+    const oldRule = async (lease: string) => {
+        await deps.db.updateMany({
+            where: { id: created.id, storagePath: created.storagePath, state: created.state },
+            data: { uploadUrlExpiresAt: deps.expiresAt(), uploadLeaseNonce: lease },
+        });
+        return lease;
+    };
+
+    const first = await oldRule("lease-nonce-adopted-1");
+    const second = await oldRule("lease-nonce-adopted-2");
+
+    assert.notEqual(first, second, "two 200s, two generations -- what shipped");
+    assert.ok(finalizable(store, second), "the last writer's response works");
+    assert.equal(
+        finalizable(store, first),
+        false,
+        "and the first caller's, handed out moments earlier, is dead on arrival",
+    );
+});
+
+test("a lease SUPERSEDED during the signing round trip is never returned", async () => {
+    // The other side of the same failure: the CAS proves the lease was ours
+    // when we wrote it, and signing is a network round trip. A concurrent
+    // resume repaths the row while it is in flight, so the generation we were
+    // about to hand back is one the row has already moved past.
+    const created = staging();
+    const { store, deps, onSign } = client([created]);
+    onSign(() => {
+        store.rows[0].uploadLeaseVersion = 2;
+        store.rows[0].storagePath = uploadPathFor("row-1", 2, "png");
+        store.rows[0].uploadLeaseNonce = "lease-nonce-resumed";
+    });
+
+    const outcome = await reuseLiveLease(created, "png", deps);
+
+    assert.deepEqual(outcome, { kind: "conflict" }, "a retryable 409, never a stale 200");
+});
+
+test("CONTROL: with nobody moving the row, the same call returns its lease", async () => {
+    // Without this, a revalidation that always failed would satisfy the test
+    // above while making every honest retry a 409.
+    const created = staging();
+    const { store, deps } = client([created]);
+    const outcome = await reuseLiveLease(created, "png", deps);
+    assert.equal(outcome?.kind, "signed");
+    const lease = (outcome as { signed: { uploadLease: string } }).signed.uploadLease;
+    assert.ok(finalizable(store, lease));
+});
+
+test("a legacy row with NO generation gets one, and only one writer mints it", async () => {
+    // A row that predates the nonce column carries null. The adoption has to
+    // mint a value -- and the CAS pins the null, so two concurrent adopters
+    // cannot each mint their own and strand one another.
+    const legacy = staging({ uploadLeaseNonce: null as unknown as string });
+    const { store, deps } = client([legacy]);
+
+    const [a, b] = await Promise.all([
+        reuseLiveLease(legacy, "png", deps),
+        reuseLiveLease(legacy, "png", deps),
+    ]);
+
+    assert.equal(a?.kind, "signed");
+    assert.equal(b?.kind, "signed");
+    const leaseA = (a as { signed: { uploadLease: string } }).signed.uploadLease;
+    const leaseB = (b as { signed: { uploadLease: string } }).signed.uploadLease;
+    assert.equal(leaseA, leaseB, "they converge on the one that was minted");
+    assert.ok(finalizable(store, leaseA));
+});
+
+test("extendedExpiry on its own: never equal, never earlier", () => {
+    const base = new Date(1_000_000);
+    assert.equal(extendedExpiry(base, new Date(1_000_000)).getTime(), 1_000_001, "equal is not allowed");
+    assert.equal(extendedExpiry(base, new Date(999_000)).getTime(), 1_000_001, "earlier is not allowed");
+    assert.equal(extendedExpiry(base, new Date(2_000_000)).getTime(), 2_000_000, "later is taken as is");
+    assert.equal(extendedExpiry(null, new Date(2_000_000)).getTime(), 2_000_000, "nothing to beat");
 });
 
 test("the real generator is unique per call -- the fake's determinism is the test's", () => {
     const seen = new Set(Array.from({ length: 200 }, () => newLeaseNonce()));
     assert.equal(seen.size, 200);
+});
+
+// -- The three MINTING branches re-read before they answer ------------------
+//
+// The create, the resume repath and the re-arm repath all write the row, then
+// sign, then answer -- and the sign is a network round trip a concurrent
+// /start can move the row inside. They were returning the nonce they had
+// generated, never re-checked, so a client could be handed a working signed
+// URL together with a lease /finalize had already moved past. Unlike the reuse
+// rule they cannot simply loop (their write was destructive), so a superseded
+// lease becomes the retryable publish-conflict the callers already answer.
+
+test("issuedLeaseIsCurrent: only the generation the row STILL holds is current", async () => {
+    const row = staging();
+    const reload = async () => row as unknown as LeaseRow;
+
+    assert.equal(
+        await issuedLeaseIsCurrent(
+            row.id,
+            { storagePath: row.storagePath, uploadLease: CREATED_NONCE },
+            reload,
+        ),
+        true,
+        "the lease the row holds, at the path the row points at",
+    );
+
+    // A generation the row has moved past. THIS is the case the mutation
+    // survived on: /finalize refuses it, so returning it hands the client a URL
+    // it can never use.
+    assert.equal(
+        await issuedLeaseIsCurrent(
+            row.id,
+            { storagePath: row.storagePath, uploadLease: "a-generation-since-superseded" },
+            reload,
+        ),
+        false,
+    );
+
+    // A row repathed under us: the lease may still match, the object does not.
+    assert.equal(
+        await issuedLeaseIsCurrent(
+            row.id,
+            { storagePath: uploadPathFor("row-1", 9, "png"), uploadLease: CREATED_NONCE },
+            reload,
+        ),
+        false,
+    );
+
+    // A row that is gone entirely is never current.
+    assert.equal(
+        await issuedLeaseIsCurrent(
+            row.id,
+            { storagePath: row.storagePath, uploadLease: CREATED_NONCE },
+            async () => null,
+        ),
+        false,
+    );
+
+    // And a row whose generation is NULL -- never issued a signed URL -- cannot
+    // match a lease somebody claims to hold.
+    assert.equal(
+        await issuedLeaseIsCurrent(
+            row.id,
+            { storagePath: row.storagePath, uploadLease: CREATED_NONCE },
+            async () => ({ ...row, uploadLeaseNonce: null }) as unknown as LeaseRow,
+        ),
+        false,
+    );
 });

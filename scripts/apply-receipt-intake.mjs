@@ -22,7 +22,16 @@
 // constraint adds. Safe to re-run; a second run reports every statement "ok"
 // and changes nothing. No existing table is touched.
 //
-//   node scripts/apply-receipt-intake.mjs --yes --expect-db <name> --expect-host <host>
+//   node scripts/apply-receipt-intake.mjs --target prod --yes \
+//        --expect-db <name> --expect-host <host>
+//
+// --target prod is REQUIRED and it is what decides which database this
+// talks to. Without it the script read an AMBIENT DATABASE_URL first, so a
+// developer with a local one exported in their shell could run this, watch
+// every statement report ok against their own Postgres, and merge believing
+// production had been migrated. `--target prod` reads
+// .env.production.local and nothing else -- an ambient DATABASE_URL is
+// ignored, not preferred.
 //
 // --expect-db and --expect-host are BOTH required alongside --yes, matching
 // scripts/apply-bank-image.mjs: "--yes" alone only proves you meant to run
@@ -31,14 +40,112 @@ import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
-export function resolveDatabaseUrl() {
-    if (process.env.DATABASE_URL) return { url: process.env.DATABASE_URL, from: "process.env.DATABASE_URL" };
-    for (const file of [".env.local", ".env"]) {
-        if (!fs.existsSync(file)) continue;
-        const match = fs.readFileSync(file, "utf8").match(/^DATABASE_URL\s*=\s*"?([^"\n]+)"?/m);
-        if (match) return { url: match[1], from: file };
+/** The only file --target prod will read a URL out of. */
+export const PROD_ENV_FILE = ".env.production.local";
+
+/**
+ * The baseline migration production is known to carry
+ * (prisma/migrations/20260814000000_baseline_production, marked applied in
+ * prod's _prisma_migrations by a deliberate one-off step). A database
+ * WITHOUT this row is not production, whatever its name is.
+ */
+export const PROD_BASELINE_MIGRATION = "20260814000000_baseline_production";
+
+/** Production reaches Postgres through Supabase's pooler, never directly. */
+export const PROD_POOLER_HOST_SUFFIX = ".pooler.supabase.com";
+
+/**
+ * WHICH DATABASE IS THIS RUN FOR? Decided from argv alone, never from the
+ * environment.
+ *
+ * The old resolver preferred `process.env.DATABASE_URL`, which meant the
+ * answer depended on whatever the operator happened to have exported. A
+ * developer with a local URL in their shell got a clean, green run against
+ * their own database and no signal at all that production was untouched.
+ * There is exactly one target and it has to be asked for by name.
+ *
+ * @param {string[]} argv
+ * @returns {{ ok: true, target: "prod" } | { ok: false, reason: string }}
+ */
+export function chooseTarget(argv) {
+    const at = argv.indexOf("--target");
+    const value = at >= 0 ? argv[at + 1] : undefined;
+    if (!value) {
+        return {
+            ok: false,
+            reason: "Refusing to run without --target prod. An ambient DATABASE_URL is NOT a target.",
+        };
     }
-    throw new Error("DATABASE_URL not found in process.env, .env.local, or .env");
+    if (value !== "prod") {
+        return { ok: false, reason: `Unknown --target ${value}. The only target is prod.` };
+    }
+    return { ok: true, target: "prod" };
+}
+
+/**
+ * The URL for a chosen target. `.env.production.local` ONLY -- an ambient
+ * DATABASE_URL is deliberately not consulted, and does not override it.
+ *
+ * @param {string} target
+ * @param {(file: string, encoding: string) => string} [readFile]
+ * @param {(file: string) => boolean} [exists]
+ * @returns {{ url: string, from: string }}
+ */
+export function resolveTargetUrl(target, readFile = fs.readFileSync, exists = fs.existsSync) {
+    if (target !== "prod") throw new Error(`no URL source for target ${target}`);
+    if (!exists(PROD_ENV_FILE)) {
+        throw new Error(`${PROD_ENV_FILE} not found. Run \`vercel env pull ${PROD_ENV_FILE} --environment=production\` first.`);
+    }
+    const match = String(readFile(PROD_ENV_FILE, "utf8")).match(/^DATABASE_URL\s*=\s*"?([^"\n]+)"?/m);
+    if (!match) throw new Error(`DATABASE_URL not found in ${PROD_ENV_FILE}`);
+    return { url: match[1], from: PROD_ENV_FILE };
+}
+
+/** The URL's hostname, or an empty string if it will not parse. */
+export function hostOf(url) {
+    try {
+        return new URL(url).hostname;
+    } catch {
+        return "";
+    }
+}
+
+/**
+ * THE TARGET LINE, printed before the first statement and in --dry-run.
+ *
+ * Host, database and whether the production baseline migration is there --
+ * and nothing else. No credentials pass through here: the caller hands it
+ * the hostname it parsed and the name the SERVER reported, never the URL.
+ */
+export function targetLine({ host, database, baseline }) {
+    return `TARGET host=${host} database=${database} baseline=${baseline ? "present" : "MISSING"}`;
+}
+
+/**
+ * Is the thing we just connected to actually production?
+ *
+ * Three independent facts, because each alone is forgeable by accident: the
+ * URL goes through the pooler, the server names a database, and that
+ * database carries the baseline migration row. A local Postgres can be
+ * called anything; it cannot have prod's migration history.
+ */
+export async function verifyProdIdentity(query, urlHost) {
+    const problems = [];
+    if (!urlHost.endsWith(PROD_POOLER_HOST_SUFFIX)) {
+        problems.push(`host ${urlHost || "(unparseable)"} is not a ${PROD_POOLER_HOST_SUFFIX} pooler host`);
+    }
+    const [row] = await query("SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host");
+    const database = String(row?.db ?? "");
+    if (!database) problems.push("the server did not report a database name");
+    const found = await query(
+        "SELECT migration_name FROM _prisma_migrations WHERE migration_name = $1",
+        PROD_BASELINE_MIGRATION,
+    ).catch(() => []);
+    const baseline = Array.isArray(found) && found.length > 0;
+    if (!baseline) {
+        problems.push(`_prisma_migrations has no ${PROD_BASELINE_MIGRATION} row: this is not production`);
+    }
+    return { problems, actual: row, line: targetLine({ host: urlHost, database, baseline }) };
 }
 
 /**
@@ -677,7 +784,15 @@ async function applyBucket() {
 }
 
 async function main() {
-    if (!process.argv.includes("--yes")) {
+    // EVERY flag is read here, inside main(), so the module stays inert on
+    // import -- see tests/apply-scripts-inert-on-import.test.ts.
+    const chosen = chooseTarget(process.argv);
+    if (!chosen.ok) {
+        console.error(chosen.reason);
+        process.exit(1);
+    }
+    const dryRun = process.argv.includes("--dry-run");
+    if (!dryRun && !process.argv.includes("--yes")) {
         console.error("Refusing to run without --yes (and --expect-db / --expect-host).");
         process.exit(1);
     }
@@ -688,18 +803,34 @@ async function main() {
         process.exit(1);
     }
 
-    const { url, from } = resolveDatabaseUrl();
+    const { url, from } = resolveTargetUrl(chosen.target);
     console.log(`DATABASE_URL from ${from}: ${maskUrl(url)}`);
     const prisma = new PrismaClient({ datasources: { db: { url } } });
 
     try {
-        const [actual] = await prisma.$queryRawUnsafe(
-            `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
+        // WHO ARE WE TALKING TO -- asserted, then PRINTED, before any DDL.
+        const identity = await verifyProdIdentity(
+            (sql, ...args) => prisma.$queryRawUnsafe(sql, ...args),
+            hostOf(url),
         );
+        console.log(identity.line);
+        if (identity.problems.length) {
+            for (const problem of identity.problems) console.error(`REFUSING: ${problem}`);
+            process.exit(1);
+        }
+        const actual = identity.actual;
         console.log(`connected to db="${actual.db}" host="${actual.host}"`);
         if (!targetMatches(actual, expectDb, expectHost)) {
             console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}".`);
             process.exit(1);
+        }
+
+        if (dryRun) {
+            console.log(`--dry-run: ${statements.length} statements would run against the target above.`);
+            for (const sql of statements) {
+                console.log(`  ${sql.replace(/\s+/g, " ").slice(0, 84)}`);
+            }
+            return;
         }
 
         for (const sql of statements) {

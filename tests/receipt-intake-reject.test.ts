@@ -307,12 +307,29 @@ test("both /start branches take the live-lease rule from the SAME place", () => 
     // Two copies of "may I reuse this lease" is how the STAGING path came to be
     // fixed while the recovery path stayed broken.
     assert.equal((start.match(/await reuseLiveLease\(/g) ?? []).length, 2, "recovery and resume");
-    assert.match(start, /import \{ discardUnresumedLease, newLeaseNonce, reuseLiveLease \} from "@\/lib\/receipt-intake\/upload-lease";/);
-    // And one 409 helper, so every lost claim answers identically.
+    assert.match(start, /import \{\s*\n\s*discardUnresumedLease,\s*\n\s*issuedLeaseIsCurrent,\s*\n\s*newLeaseNonce,\s*\n\s*reuseLiveLease,\s*\n\} from "@\/lib\/receipt-intake\/upload-lease";/);
+    // And one 409 helper, so every lost claim answers identically. SIX call
+    // sites on the existing row now: the two reuse callers, the two
+    // new-lease claims, and the two post-sign revalidations added in round
+    // 19 -- plus one on the created row, in the create branch.
     assert.equal(
         (start.match(/return leaseConflict\(existing\.id\)/g) ?? []).length,
-        4,
-        "both reuse callers and both new-lease claims",
+        6,
+        "reuse, new-lease claim and post-sign revalidation, on both branches",
+    );
+    // The create branch answers it twice as well, on the row it made: once
+    // when the signer-failure discard finds somebody else resumed the row
+    // (`leaseConflict(id)`, before `created` is in scope), and once when its
+    // own post-sign re-read finds the lease already superseded.
+    assert.equal(
+        (start.match(/return leaseConflict\(created\.id\)/g) ?? []).length,
+        1,
+        "the create branch revalidates its own lease before answering",
+    );
+    assert.equal(
+        (start.match(/return leaseConflict\(id\);/g) ?? []).length,
+        1,
+        "and defers to the request that resumed its row",
     );
     assert.match(start, /error: "publish-conflict",/, "which is still a publish-conflict");
 });
@@ -502,7 +519,7 @@ test("the sweeper and /start both fence on the lease version", () => {
     assert.equal((start.match(/error: "publish-conflict"/g) ?? []).length, 1, "one helper");
     assert.equal(
         (start.match(/return leaseConflict\(existing\.id\)/g) ?? []).length,
-        4,
+        6,
         "and every lost claim goes through it",
     );
 

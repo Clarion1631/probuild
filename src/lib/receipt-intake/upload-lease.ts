@@ -20,7 +20,7 @@
  * neither does this module — both /start branches go through it.
  */
 import { randomUUID } from "node:crypto";
-import { leaseFence, publishFence, uploadPathFor, type ObservedRow } from "./stored-object";
+import { leaseFence, uploadPathFor, type ObservedRow } from "./stored-object";
 
 export interface LeaseRow extends ObservedRow {
     id: string;
@@ -67,6 +67,13 @@ export interface LeaseDeps {
      * asks for it (see below), so every other issuer gets a create-only token.
      */
     sign: (storagePath: string, opts: { upsert: boolean }) => Promise<SignedUpload | null>;
+    /**
+     * Re-read the row. The adoption CAS is exclusive now, so a loser has to
+     * see what actually won; and every issued lease is re-checked after the
+     * signing round trip. Both need a fresh read, so it is a dependency
+     * rather than something the caller does around this rule.
+     */
+    reload: (id: string) => Promise<LeaseRow | null>;
     /** When a freshly issued URL stops working. */
     expiresAt: () => Date;
     now?: () => number;
@@ -114,6 +121,57 @@ export function liveLeasePath(row: LeaseRow, ext: string, now: number = Date.now
 }
 
 /**
+ * IS THIS THE SAME LEASE THE CALLER DECIDED ABOUT — only refreshed?
+ *
+ * A lost CAS may be re-tried, but ONLY against a row that is still the one the
+ * caller looked at. /start decides whether a row is recoverable, and whether
+ * its hash proves identity, from the row it read; a retry that silently
+ * re-aimed at whatever is there now would re-arm a row that has since been
+ * re-parked under a reason nobody here examined, or repathed to a new lease
+ * whose object this request knows nothing about.
+ *
+ * So exactly two columns may move: `uploadLeaseNonce` and `uploadUrlExpiresAt`
+ * — which is precisely the footprint of ANOTHER ADOPTER extending the same
+ * live lease, the one case two honest retries are supposed to converge on.
+ * Everything else is a conflict.
+ */
+function sameLease(decidedOn: LeaseRow, fresh: LeaseRow): boolean {
+    return fresh.id === decidedOn.id
+        && fresh.state === decidedOn.state
+        && fresh.stateReason === decidedOn.stateReason
+        && fresh.storagePath === decidedOn.storagePath
+        && fresh.uploadLeaseVersion === decidedOn.uploadLeaseVersion;
+}
+/**
+ * THE EXTENDED EXPIRY, GUARANTEED DIFFERENT FROM THE ONE IT REPLACES.
+ *
+ * `discardUnresumedLease` proves "nobody adopted the row I created" by pinning
+ * the exact expiry it wrote. An adoption that extends a live lease over the
+ * same path, at the same version and under the same generation, moves NOTHING
+ * ELSE — so if it can also write the same instant, the discard's witness sees
+ * nothing and deletes a row somebody is uploading to. Production computes both
+ * expiries as "now + 2h": milliseconds apart, or on two hosts whose clocks are
+ * merely close, they collide.
+ *
+ * So the adoption forces the difference instead of hoping for it: at least one
+ * millisecond past what was there. It also never moves the expiry BACKWARDS,
+ * which a skewed clock would otherwise do — shortening a lease whose holder is
+ * still using a freshly signed URL is how the sweeper reclaims a live row.
+ */
+export function extendedExpiry(observed: Date | null, fresh: Date): Date {
+    if (!observed) return fresh;
+    return fresh.getTime() > observed.getTime() ? fresh : new Date(observed.getTime() + 1);
+}
+
+/**
+ * How many times an adoption may lose its CAS and re-read before giving up.
+ * Each loss means somebody else moved the row, so each retry starts from a
+ * strictly newer observation; the bound is here to stop a pathological
+ * hot-spot spinning inside one request, not because progress is in doubt.
+ */
+export const MAX_LEASE_ADOPTION_ATTEMPTS = 4;
+
+/**
  * Extend a live lease and reissue a URL for its EXISTING path.
  *
  * `rearm` carries the identity writes a recovery needs (a corrected
@@ -121,24 +179,36 @@ export function liveLeasePath(row: LeaseRow, ext: string, now: number = Date.now
  * legitimately come back with a different hash — they simply land on the same
  * path and the same lease version instead of on a new one.
  *
- * The DB lease moves with the URL it reissues. A resigned URL is good for a
- * fresh window; leaving `uploadUrlExpiresAt` at the ORIGINAL, older value let
- * the sweeper judge the lease dead and reclaim a row whose client was still
- * holding a perfectly live URL.
+ * THE NONCE NAMES THE LEASE, NOT THE REQUEST — and that is the round-19 fix.
  *
- * A lost CAS is reported as `conflict`, never a fall-through to the destructive
- * branch: we know a live lease existed a moment ago, so re-pathing and deleting
- * on the strength of a row that just moved is precisely what this prevents. The
- * client retries and reads whatever the winner left.
+ * This function used to mint a fresh `uploadLeaseNonce` on every adoption and
+ * deliberately leave it OUT of its own CAS, so two concurrent /start retries
+ * both matched, both wrote, and both returned a 200 carrying their own nonce.
+ * Only the last write survived. /finalize demands the generation its URL was
+ * issued under, so the earlier caller's perfectly good signed URL was answered
+ * `409 lease-stale` for a lease it had been handed seconds before: an endpoint
+ * whose entire purpose is idempotent retries was issuing responses that could
+ * never be finalized.
  *
- * THE ADOPTION IS ALSO STAMPED, with a fresh `uploadLeaseNonce`. That column is
- * what `discardUnresumedLease` pins, and it is written here rather than being
- * inferred from the expiry: an extension and an original issue both compute
- * "now + 2h", so the expiry can legitimately come out identical and the discard
- * would then delete the very row this call just adopted. The nonce is NOT part
- * of this CAS's where clause — two honest retries may both reuse the same live
- * lease over the same path, and turning that into a 409 would break the
- * idempotency this module exists to provide.
+ * An extension is not a new lease. Same path, same version, same object
+ * identity — so it keeps the generation it adopted, and both retries hand back
+ * the SAME `uploadLease`. Both are finalizable, which is the property that was
+ * missing. A genuinely new lease (the create, the resume repath, the re-arm
+ * repath) still mints one, because those DO change the path or the version.
+ *
+ * The full `leaseFence` is now the CAS, nonce and expiry included, so exactly
+ * one adopter writes per observed generation. The loser is not a conflict: it
+ * re-reads and tries again against what it now sees, which is how two honest
+ * retries both end up holding the winner's lease rather than one of them being
+ * told 409. A lost CAS is only reported as `conflict` when the row has moved
+ * somewhere this rule cannot follow (repathed, published, parked) or the
+ * attempts run out.
+ *
+ * AND THE RESULT IS REVALIDATED AFTER SIGNING. The CAS proves the lease was
+ * ours when we wrote it; signing is a network round trip, and a concurrent
+ * resume can bump the version and repath the row while it is in flight. A
+ * nonce returned without that second look is one the row may already have
+ * moved past — the same un-finalizable 200, arrived at from the other side.
  */
 export async function reuseLiveLease(
     row: LeaseRow,
@@ -146,37 +216,98 @@ export async function reuseLiveLease(
     deps: LeaseDeps,
     rearm: Record<string, unknown> = {},
 ): Promise<LeaseReuse | null> {
-    const path = liveLeasePath(row, ext, deps.now ? deps.now() : Date.now());
-    if (!path) return null;
+    const now = () => (deps.now ? deps.now() : Date.now());
+    let observed: LeaseRow = row;
 
-    // HOISTED, because the caller has to hand it back to the client: /finalize
-    // now requires the generation its URL was issued under, and this is the
-    // only place that value exists. Generated inline, the request that wrote
-    // it could not say what it had written.
-    const uploadLease = (deps.nonce ?? newLeaseNonce)();
+    for (let attempt = 0; attempt < MAX_LEASE_ADOPTION_ATTEMPTS; attempt++) {
+        const path = liveLeasePath(observed, ext, now());
+        // No live lease to reuse. The caller falls through to its destructive
+        // branch, which is safe precisely because nothing live relies on this
+        // row any more. On a re-read this can also mean the winner took a NEW
+        // lease at a new path, which is equally a "not my business" answer.
+        if (!path) return null;
 
-    // Fenced on the identity this retry already proved AND on the publish
-    // fence, so a row the worker claimed, or re-parked under a reason nobody
-    // here looked at, is not quietly re-armed.
-    const { count } = await deps.db.updateMany({
-        where: { id: row.id, storagePath: row.storagePath, ...publishFence(row) },
-        data: {
-            ...rearm,
-            uploadUrlExpiresAt: deps.expiresAt(),
-            uploadLeaseNonce: uploadLease,
-        },
-    });
-    if (count === 0) return { kind: "conflict" };
+        // The generation this adoption will hand back. A row that already has
+        // one keeps it; a legacy row that never had one (null) gets a fresh
+        // value, and the CAS below pins the null so only one writer mints it.
+        const uploadLease = observed.uploadLeaseNonce ?? (deps.nonce ?? newLeaseNonce)();
 
-    // THE ONE PLACE AN UPSERT-CAPABLE TOKEN IS ISSUED.
-    //
-    // This is the reuse path: the path already exists as far as the client is
-    // concerned, and the whole point is to let it replace a partial or
-    // superseded upload of its own. Every other issuer signs a path a version
-    // bump has just made new, so a create-only token is enough there and the
-    // weaker capability is what they get (see createReceiptUploadUrl).
-    const signed = await deps.sign(path, { upsert: true });
-    return signed ? { kind: "signed", signed: { ...signed, uploadLease } } : { kind: "storage-unavailable" };
+        const { count } = await deps.db.updateMany({
+            where: { id: observed.id, storagePath: observed.storagePath, ...leaseFence(observed) },
+            data: {
+                ...rearm,
+                uploadUrlExpiresAt: extendedExpiry(observed.uploadUrlExpiresAt, deps.expiresAt()),
+                uploadLeaseNonce: uploadLease,
+            },
+        });
+
+        if (count === 0) {
+            // Somebody else wrote the row. Re-read — but only retry if what is
+            // there now is still the lease this caller decided about. Anything
+            // else is a conflict, and NEVER a fall-through to the destructive
+            // branch on the strength of a row that has demonstrably changed.
+            const fresh = await deps.reload(observed.id);
+            if (!fresh || !sameLease(row, fresh)) return { kind: "conflict" };
+            observed = fresh;
+            continue;
+        }
+
+        // THE ONE PLACE AN UPSERT-CAPABLE TOKEN IS ISSUED.
+        //
+        // This is the reuse path: the path already exists as far as the client
+        // is concerned, and the whole point is to let it replace a partial or
+        // superseded upload of its own. Every other issuer signs a path a
+        // version bump has just made new, so a create-only token is enough
+        // there and the weaker capability is what they get (see
+        // createReceiptUploadUrl).
+        const signed = await deps.sign(path, { upsert: true });
+        if (!signed) return { kind: "storage-unavailable" };
+
+        // POST-SIGN REVALIDATION. See the header: the sign is a round trip, and
+        // a lease returned without re-reading may already be superseded.
+        const confirmed = await deps.reload(observed.id);
+        if (!confirmed || !sameLease(row, confirmed)) return { kind: "conflict" };
+        if (confirmed.uploadLeaseNonce !== uploadLease) {
+            // Another adopter re-stamped the generation between our write and
+            // our signing. Converge on theirs rather than returning a nonce
+            // /finalize would refuse.
+            observed = confirmed;
+            continue;
+        }
+
+        return { kind: "signed", signed: { ...signed, uploadLease } };
+    }
+
+    // Every attempt lost. The client retries the whole call and reads whatever
+    // the winner left, which is the same answer a lost CAS has always given.
+    return { kind: "conflict" };
+}
+
+/**
+ * IS THE LEASE THIS RESPONSE IS ABOUT TO RETURN STILL THE PERSISTED ONE?
+ *
+ * The three branches that mint a genuinely new lease — the create, the resume
+ * repath and the re-arm repath — all write the row, then sign, then answer. The
+ * sign is a network round trip, and a concurrent /start can adopt or repath the
+ * row while it is in flight; the nonce those branches were returning was simply
+ * the one they had generated, never re-checked. A client that acted on it got
+ * `409 lease-stale` from /finalize for a URL it had just been given.
+ *
+ * `reuseLiveLease` handles its own supersession by looping, because it can:
+ * adopting an existing lease again is idempotent. These branches cannot — their
+ * write was destructive and re-running it would repath the row a second time —
+ * so a superseded lease is answered as the retryable publish-conflict the
+ * caller already has, and the client re-runs /start.
+ */
+export async function issuedLeaseIsCurrent(
+    id: string,
+    expect: { storagePath: string; uploadLease: string },
+    reload: (id: string) => Promise<LeaseRow | null>,
+): Promise<boolean> {
+    const fresh = await reload(id);
+    return !!fresh
+        && fresh.storagePath === expect.storagePath
+        && fresh.uploadLeaseNonce === expect.uploadLease;
 }
 
 /** The lease /start just created, as the request that created it knows it. */

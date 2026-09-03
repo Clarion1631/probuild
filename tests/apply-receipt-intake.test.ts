@@ -32,6 +32,14 @@ import {
     statements,
     targetMatches,
     verifyConstraints,
+    chooseTarget,
+    hostOf,
+    PROD_BASELINE_MIGRATION,
+    PROD_ENV_FILE,
+    PROD_POOLER_HOST_SUFFIX,
+    resolveTargetUrl,
+    targetLine,
+    verifyProdIdentity,
 } from "../scripts/apply-receipt-intake.mjs";
 import { RECEIPT_INTAKE_STATES as RUNTIME_STATES } from "../src/lib/receipt-intake/route-state";
 
@@ -722,4 +730,162 @@ test("the default comparison ignores how Postgres echoes the cast", () => {
     assert.equal(columnDefaultMatches("'RECEIVED'::text", "'STAGING'::text"), false);
     assert.equal(columnDefaultMatches(null, "'STAGING'::text"), false);
     assert.equal(columnDefaultMatches(undefined, "'STAGING'::text"), false);
+});
+
+// ── THE SCRIPT HAS TO PROVE WHICH DATABASE IT IS TALKING TO ───────────────
+//
+// It used to resolve its URL from `process.env.DATABASE_URL` FIRST. A
+// developer with a local one exported in their shell could run this, watch
+// every statement report ok against their own Postgres, and merge believing
+// production had been migrated -- there was no line in the output that said
+// otherwise. `--target prod` is now required, it reads .env.production.local
+// and nothing else, and the run prints a redacted target line before the
+// first statement.
+
+test("an ambient DATABASE_URL is NOT a target: no flag, no run", () => {
+    // The exact shape of the accident: a local URL in the environment and an
+    // otherwise complete command line.
+    const argv = [
+        "node", "scripts/apply-receipt-intake.mjs",
+        "--yes", "--expect-db", "postgres", "--expect-host", "10.0.0.5",
+    ];
+    const refused = chooseTarget(argv);
+    assert.equal(refused.ok, false);
+    assert.match(String((refused as { reason?: string }).reason), /--target prod/);
+    assert.match(String((refused as { reason?: string }).reason), /ambient DATABASE_URL is NOT a target/);
+
+    // A wrong target is refused too, rather than silently meaning prod.
+    const staging = chooseTarget(["node", "s.mjs", "--target", "staging", "--yes"]);
+    assert.equal(staging.ok, false);
+    assert.match(String((staging as { reason?: string }).reason), /only target is prod/);
+
+    // ...and a bare `--target` with nothing after it.
+    assert.equal(chooseTarget(["node", "s.mjs", "--target"]).ok, false);
+
+    // CONTROL: the real invocation is accepted.
+    assert.deepEqual(chooseTarget(["node", "s.mjs", "--target", "prod", "--yes"]), {
+        ok: true,
+        target: "prod",
+    });
+});
+
+test("--target prod reads .env.production.local, and IGNORES the environment", () => {
+    // The override is the point: preferring an ambient value is what let a
+    // local database be mistaken for production.
+    const before = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = "postgresql://dev:dev@localhost:5432/probuild_dev";
+    try {
+        const resolved = resolveTargetUrl(
+            "prod",
+            () => 'DATABASE_URL="postgresql://u:p@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true"\nOTHER=1\n',
+            () => true,
+        );
+        assert.equal(resolved.from, PROD_ENV_FILE);
+        assert.match(resolved.url, /pooler\.supabase\.com/);
+        assert.ok(!resolved.url.includes("localhost"), "the ambient URL never wins");
+    } finally {
+        if (before === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = before;
+    }
+
+    // A missing file is a refusal with a remedy, never a fallback.
+    assert.throws(
+        () => resolveTargetUrl("prod", () => "", () => false),
+        /not found/,
+    );
+    // A file with no DATABASE_URL is a refusal too.
+    assert.throws(
+        () => resolveTargetUrl("prod", () => "NEXTAUTH_SECRET=x\n", () => true),
+        /DATABASE_URL not found/,
+    );
+});
+
+test("the identity check needs the POOLER host and the production BASELINE", async () => {
+    const rows = {
+        identity: [{ db: "postgres", host: "10.0.0.5" }],
+        baseline: [{ migration_name: PROD_BASELINE_MIGRATION }],
+    };
+    const query = async (sql: string) =>
+        (/current_database/.test(sql) ? rows.identity : rows.baseline) as unknown[];
+
+    const good = await verifyProdIdentity(query, `aws-0-us-west-2${PROD_POOLER_HOST_SUFFIX}`);
+    assert.deepEqual(good.problems, [], "a pooler host with the baseline row IS production");
+
+    // A local host is refused even when the database is called `postgres`.
+    const local = await verifyProdIdentity(query, "localhost");
+    assert.equal(local.problems.length, 1);
+    assert.match(local.problems[0], /not a \.pooler\.supabase\.com pooler host/);
+
+    // And a pooler host WITHOUT the baseline row is refused: migration history
+    // is the fact a look-alike database cannot fake.
+    rows.baseline = [];
+    const noBaseline = await verifyProdIdentity(query, `aws-0-us-west-2${PROD_POOLER_HOST_SUFFIX}`);
+    assert.equal(noBaseline.problems.length, 1);
+    assert.match(noBaseline.problems[0], /no 20260814000000_baseline_production row/);
+
+    // A _prisma_migrations table that does not exist at all is the same answer,
+    // not a crash.
+    const noTable = await verifyProdIdentity(
+        async (sql: string) => {
+            if (/current_database/.test(sql)) return rows.identity as unknown[];
+            throw new Error('relation "_prisma_migrations" does not exist');
+        },
+        `aws-0-us-west-2${PROD_POOLER_HOST_SUFFIX}`,
+    );
+    assert.equal(noTable.problems.length, 1);
+    assert.match(noTable.problems[0], /this is not production/);
+});
+
+test("the TARGET LINE names host, database and baseline -- and no credentials", async () => {
+    const line = targetLine({
+        host: "aws-0-us-west-2.pooler.supabase.com",
+        database: "postgres",
+        baseline: true,
+    });
+    assert.equal(
+        line,
+        "TARGET host=aws-0-us-west-2.pooler.supabase.com database=postgres baseline=present",
+    );
+    // It is built from a PARSED hostname and the name the SERVER reported, so
+    // there is no path by which a password reaches it. (The URL log line's own
+    // redaction is covered by the maskUrl tests above.)
+    const secretish = "postgresql://user:pa:ss@aws-0-us-west-2.pooler.supabase.com:6543/postgres";
+    assert.equal(hostOf(secretish), "aws-0-us-west-2.pooler.supabase.com");
+    const built = targetLine({ host: hostOf(secretish), database: "postgres", baseline: false });
+    assert.ok(!built.includes("pa:ss"), "no credential can ride in on the host");
+    assert.ok(!built.includes("user"), "nor a username");
+    assert.match(built, /baseline=MISSING/);
+    assert.equal(hostOf("not a url at all"), "", "an unparseable URL yields no host, never a fragment");
+});
+
+test("main() refuses BEFORE it builds a client, and prints the target BEFORE any DDL", () => {
+    // Order is the property, and it is asserted on the shipped source: a check
+    // that runs after the first ALTER has already changed the wrong database.
+    const script = readFileSync(path.join(__dirname, "..", "scripts", "apply-receipt-intake.mjs"), "utf8");
+    const main = script.slice(script.indexOf("async function main()"));
+    const chooseAt = main.indexOf("chooseTarget(process.argv)");
+    const clientAt = main.indexOf("new PrismaClient(");
+    const identityAt = main.indexOf("await verifyProdIdentity(");
+    const printAt = main.indexOf("console.log(identity.line)");
+    const ddlAt = main.indexOf("await prisma.$executeRawUnsafe(sql)");
+
+    assert.ok(chooseAt > 0, "main asks for a target");
+    assert.ok(chooseAt < clientAt, "and refuses before a client is even built");
+    assert.ok(clientAt < identityAt && identityAt < ddlAt, "identity is proven before any DDL");
+    assert.ok(printAt > 0 && printAt < ddlAt, "and the target line is printed before it too");
+
+    // --dry-run reports the same target line and runs nothing.
+    assert.match(main, /if \(dryRun\) \{/);
+    const dryAt = main.indexOf("if (dryRun) {");
+    assert.ok(printAt < dryAt && dryAt < ddlAt, "a dry run has already printed the target, and returns before the DDL");
+
+    // The old ambient resolver is GONE, not merely unused.
+    assert.ok(!script.includes("resolveDatabaseUrl"), "no ambient-first resolver survives");
+    // A CALL, not a mention: the doc comment above the resolver names the
+    // ambient variable it stopped reading, so comment lines are stripped first.
+    const code = script
+        .split(/\r?\n/)
+        .filter(line => !line.trim().startsWith("*") && !line.trim().startsWith("//"))
+        .join("\n");
+    assert.ok(!code.includes("process.env.DATABASE_URL"), "and nothing reads the ambient URL");
 });

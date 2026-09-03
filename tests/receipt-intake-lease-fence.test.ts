@@ -141,20 +141,26 @@ test("the tripwire FAILS on a half fence — the pre-fix control", () => {
     assert.ok(fixed.args.includes("leaseFence("));
 });
 
-test("publishFence is the documented EXCEPTION, and only reuseLiveLease may use it", () => {
-    // The weaker fence exists for exactly one caller: two honest /start retries
-    // may both adopt the same live lease, and pinning the nonce there would
-    // turn the second into a 409 and break the idempotency upload-lease.ts
-    // exists to provide. Anywhere else it is the bug this tripwire is about.
+test("publishFence has NO caller left: every lease writer takes the full fence", () => {
+    // It used to have exactly one exception -- reuseLiveLease -- on the
+    // reasoning that pinning the nonce there would turn an honest second retry
+    // into a 409. That reasoning was the round-19 bug: leaving the nonce out
+    // let BOTH retries write, each stamping its own generation, so the earlier
+    // caller's 200 carried a lease /finalize refuses. The rule now pins the
+    // whole fence and CONVERGES the loser on the winner's lease instead, so
+    // the exception is gone and the weaker builder has no user outside the
+    // module that defines it.
     const users = LEASE_WRITERS.filter(rel => /\bpublishFence\(/.test(source(rel)));
     assert.deepEqual(
         users,
-        ["src/lib/receipt-intake/stored-object.ts", "src/lib/receipt-intake/upload-lease.ts"],
-        "publishFence is referenced only where it is defined and by reuseLiveLease",
+        ["src/lib/receipt-intake/stored-object.ts"],
+        "publishFence is referenced only where it is defined",
     );
     const lease = source("src/lib/receipt-intake/upload-lease.ts");
     const reuse = lease.slice(lease.indexOf("export async function reuseLiveLease"));
-    assert.match(reuse.slice(0, reuse.search(/\n\}\n/)), /publishFence\(row\)/);
+    const body = reuse.slice(0, reuse.search(/\n\}\n/));
+    assert.match(body, /\.\.\.leaseFence\(observed\)/, "the adoption CAS carries the generation");
+    assert.ok(!/publishFence\(/.test(body), "and nothing weaker");
 });
 
 test("leaseFence is a SUPERSET of publishFence, and names the lease generation", () => {
@@ -185,17 +191,29 @@ test("every /start response echoes the generation its URL was issued under", () 
         path.join(ROOT, "src/app/api/receipts/intake/start/route.ts"),
         "utf8",
     );
-    assert.equal(
-        (start.match(/uploadLease: (leaseNonce|rearmedLease|resumedLease)/g) ?? []).length,
-        3,
-        "create, re-arm and resume each echo the nonce they wrote",
-    );
+    // Each of the three appears TWICE now: once in the re-read that confirms
+    // it is still the persisted generation, and once in the response.
+    for (const name of ['leaseNonce', 'rearmedLease', 'resumedLease'] as const) {
+        const uses = (start.match(new RegExp(`uploadLease: ${name}\\b`, 'g')) ?? []).length;
+        assert.equal(uses, 2, `${name} is confirmed and then echoed`);
+    }
     // The other two come through the shared reuse rule, which returns it.
     const lease = readFileSync(path.join(ROOT, "src/lib/receipt-intake/upload-lease.ts"), "utf8");
-    assert.match(lease, /const uploadLease = \(deps\.nonce \?\? newLeaseNonce\)\(\);/);
+    // AN EXTENSION KEEPS THE GENERATION IT ADOPTED. Minting a fresh one per
+    // adoption is what stranded the first of two concurrent 200s: only the
+    // last write survives, and /finalize refuses every earlier nonce.
+    assert.match(lease, /const uploadLease = observed\.uploadLeaseNonce \?\? \(deps\.nonce \?\? newLeaseNonce\)\(\);/);
     assert.match(lease, /signed: \{ \.\.\.signed, uploadLease \}/);
     // ...and it is the SAME value written to the row, not a second draw.
     assert.match(lease, /uploadLeaseNonce: uploadLease,/);
+
+    // AND NO BRANCH RETURNS A LEASE IT HAS NOT RE-READ. The three that mint
+    // a genuinely new one write, then sign, then answer -- and a concurrent
+    // /start can move the row inside that gap.
+    const confirms = (start.match(/await issuedLeaseIsCurrent\(/g) ?? []).length;
+    assert.equal(confirms, 3, "create, re-arm and resume each re-read before answering");
+    // The reuse rule confirms its own, by looping rather than by conflicting.
+    assert.match(lease, /const confirmed = await deps\.reload\(observed\.id\);/);
 });
 
 test("/finalize REQUIRES the lease, and refuses a stale one before touching storage", () => {

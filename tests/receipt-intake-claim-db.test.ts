@@ -16,7 +16,7 @@ import { PrismaClient, Prisma } from "@prisma/client";
 import { CLAIM_LOCK_KEY, eligibleClaimWhere } from "../src/lib/receipt-intake/worker";
 import { lockQboExpense } from "../src/lib/qbo-expense-sync";
 import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
-import { verifyColumnDefaults } from "../scripts/apply-receipt-intake.mjs";
+import { statements, verifyColumnDefaults } from "../scripts/apply-receipt-intake.mjs";
 import { reconcileExistingExpense } from "../src/lib/receipt-intake/book";
 
 const url = process.env.RECEIPT_INTAKE_DB_TEST_URL ?? process.env.MIGRATION_HISTORY_TEST_URL;
@@ -736,4 +736,165 @@ test("the REAL ReceiptIntake ends up with the STAGING default", { skip }, async 
     );
     assert.equal(rows.length, 1, "the table exists");
     assert.match(String(rows[0].column_default), /STAGING/, `saw ${rows[0].column_default}`);
+});
+
+// ── The upgrade runs the SHIPPED statement list, on a PRE-EXISTING table ──
+//
+// The test above proves the repair statement works. It does not prove the
+// statement the script actually ships is in the list, or that it is in the
+// ADDITIVE section where an already-created table can still be reached by it
+// -- and a repair that only ever runs inside `CREATE TABLE IF NOT EXISTS` is
+// exactly the bug, because that CREATE is a no-op on the drifted table.
+//
+// So this one builds the OLD shape in a schema of its own and runs every
+// statement from `statements` over it, unchanged. `search_path` puts the
+// probe schema first and public second, so the unqualified names in those
+// statements resolve to the probe's table while the foreign keys still find
+// the real Project / CostCode / User. One interactive transaction, so every
+// statement shares the connection the SET LOCAL applies to.
+
+const UPGRADE_SCHEMA = "receipt_intake_upgrade_probe";
+
+/** The table as an EARLIER Phase-1 revision left it: old default, missing columns. */
+const DRIFTED_TABLE = `CREATE TABLE "ReceiptIntake" (
+       "id"                  TEXT NOT NULL,
+       "source"              TEXT NOT NULL,
+       "sourceRef"           TEXT NOT NULL,
+       "state"               TEXT NOT NULL DEFAULT 'RECEIVED',
+       "dryRun"              BOOLEAN NOT NULL DEFAULT true,
+       "stateReason"         TEXT,
+       "projectId"           TEXT,
+       "costCodeId"          TEXT,
+       "suggestedCostCodeId" TEXT,
+       "suggestedConfidence" DOUBLE PRECISION,
+       "createdById"         TEXT,
+       "storagePath"         TEXT NOT NULL,
+       "fileName"            TEXT,
+       "mimeType"            TEXT NOT NULL,
+       "fileSize"            INTEGER NOT NULL,
+       "fileSha256"          TEXT NOT NULL,
+       "vendor"              TEXT,
+       "txnDate"             DATE,
+       "totalCents"          INTEGER,
+       "taxCents"            INTEGER,
+       "docType"             TEXT,
+       "refNumber"           TEXT,
+       "memo"                TEXT,
+       "readJson"            TEXT,
+       "readAt"              TIMESTAMP(3),
+       "dedupStrongKey"      TEXT,
+       "dedupWeakKey"        TEXT,
+       "duplicateOfId"       TEXT,
+       "qbPurchaseId"        TEXT,
+       "expenseId"           TEXT,
+       "archiveDriveFileId"  TEXT,
+       "attempts"            INTEGER NOT NULL DEFAULT 0,
+       "lastError"           TEXT,
+       "nextRetryAt"         TIMESTAMP(3),
+       "bookedAt"            TIMESTAMP(3),
+       "createdAt"           TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       "updatedAt"           TIMESTAMP(3) NOT NULL,
+       CONSTRAINT "ReceiptIntake_pkey" PRIMARY KEY ("id")
+     )`;
+
+async function defaultIn(schema: string): Promise<string | null> {
+    const rows = await db!.$queryRawUnsafe<{ column_default: string | null }[]>(
+        `SELECT column_default FROM information_schema.columns
+          WHERE table_schema=$1 AND table_name='ReceiptIntake' AND column_name='state'`,
+        schema,
+    );
+    return rows[0]?.column_default ?? null;
+}
+
+test("the SHIPPED statements upgrade a table created with the old default", { skip }, async () => {
+    await db!.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${UPGRADE_SCHEMA}" CASCADE`);
+    try {
+        await db!.$executeRawUnsafe(`CREATE SCHEMA "${UPGRADE_SCHEMA}"`);
+        await db!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${UPGRADE_SCHEMA}", public`);
+            await tx.$executeRawUnsafe(DRIFTED_TABLE);
+        }, { timeout: 30_000 });
+
+        assert.match(
+            String(await defaultIn(UPGRADE_SCHEMA)),
+            /RECEIVED/,
+            "the drifted shape, as an earlier revision left it",
+        );
+
+        // EVERY statement the script ships, in order, unchanged.
+        await db!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${UPGRADE_SCHEMA}", public`);
+            for (const sql of statements as string[]) await tx.$executeRawUnsafe(sql);
+        }, { timeout: 60_000 });
+
+        assert.match(
+            String(await defaultIn(UPGRADE_SCHEMA)),
+            /STAGING/,
+            "the upgrade section reached a table CREATE TABLE IF NOT EXISTS could not",
+        );
+
+        // The columns the additive section adds are there too, so this really
+        // was an upgrade of the old table and not a fresh create.
+        const columns = await db!.$queryRawUnsafe<{ column_name: string }[]>(
+            `SELECT column_name FROM information_schema.columns
+              WHERE table_schema=$1 AND table_name='ReceiptIntake'`,
+            UPGRADE_SCHEMA,
+        );
+        const names = new Set(columns.map(c => c.column_name));
+        for (const added of ["busyPasses", "uploadLeaseNonce", "claimToken", "expectedSha256"]) {
+            assert.ok(names.has(added), `the additive section added ${added}`);
+        }
+
+        // And a row inserted with no state now lands in STAGING -- invisible to
+        // the worker's claim until its object is published, which is the whole
+        // point of the default.
+        await db!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${UPGRADE_SCHEMA}", public`);
+            await tx.$executeRawUnsafe(
+                `INSERT INTO "ReceiptIntake"
+                   ("id", "source", "sourceRef", "storagePath", "mimeType", "fileSize", "fileSha256", "updatedAt")
+                 VALUES ('probe-1', 'drive', 'drive:probe-1', 'receipts/intake/probe-1.png',
+                         'image/png', 4, 'b', NOW())`,
+            );
+        }, { timeout: 30_000 });
+        const inserted = await db!.$queryRawUnsafe<{ state: string }[]>(
+            `SELECT state FROM "${UPGRADE_SCHEMA}"."ReceiptIntake" WHERE id='probe-1'`,
+        );
+        assert.equal(inserted[0].state, "STAGING");
+
+        // IDEMPOTENT: the whole list again changes nothing.
+        await db!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${UPGRADE_SCHEMA}", public`);
+            for (const sql of statements as string[]) await tx.$executeRawUnsafe(sql);
+        }, { timeout: 60_000 });
+        assert.match(String(await defaultIn(UPGRADE_SCHEMA)), /STAGING/);
+    } finally {
+        await db!.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${UPGRADE_SCHEMA}" CASCADE`);
+    }
+});
+
+test("CONTROL: the drifted table WITHOUT the upgrade keeps the old default", { skip }, async () => {
+    // Without this, a statement list that happened to CREATE a fresh table
+    // would satisfy the test above while never repairing anything.
+    await db!.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${UPGRADE_SCHEMA}_ctl" CASCADE`);
+    try {
+        await db!.$executeRawUnsafe(`CREATE SCHEMA "${UPGRADE_SCHEMA}_ctl"`);
+        await db!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${UPGRADE_SCHEMA}_ctl", public`);
+            await tx.$executeRawUnsafe(DRIFTED_TABLE);
+            // Only the CREATE half of the shipped list -- what a script whose
+            // repair lived inside CREATE TABLE IF NOT EXISTS would achieve.
+            const createOnly = (statements as string[]).filter(sql => /CREATE TABLE IF NOT EXISTS/.test(sql));
+            assert.equal(createOnly.length, 1);
+            for (const sql of createOnly) await tx.$executeRawUnsafe(sql);
+        }, { timeout: 30_000 });
+
+        assert.match(
+            String(await defaultIn(`${UPGRADE_SCHEMA}_ctl`)),
+            /RECEIVED/,
+            "a no-op CREATE cannot change a default -- which is why the ALTER exists",
+        );
+    } finally {
+        await db!.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${UPGRADE_SCHEMA}_ctl" CASCADE`);
+    }
 });

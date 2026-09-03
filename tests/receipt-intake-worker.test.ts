@@ -1519,7 +1519,10 @@ test("/start stamps a lease on every url it issues, including a live-lease retry
     );
     assert.match(
         lease,
-        /uploadUrlExpiresAt: deps\.expiresAt\(\),/,
+        // Through extendedExpiry, which forces the written instant PAST the
+        // one it found: an extension moves nothing else, so the expiry is
+        // the only witness the signer-failure discard has.
+        /uploadUrlExpiresAt: extendedExpiry\(observed\.uploadUrlExpiresAt, deps\.expiresAt\(\)\),/,
         "the shared rule stamps it too",
     );
     // And the ADOPTION GENERATION alongside it, on every one of the four. The
@@ -1529,7 +1532,11 @@ test("/start stamps a lease on every url it issues, including a live-lease retry
     // issued under and the caller has to hand it back — so the value written
     // to the row and the value returned to the client must be the SAME draw,
     // not two calls to the generator.
-    assert.match(lease, /const uploadLease = \(deps\.nonce \?\? newLeaseNonce\)\(\);/);
+    // AN EXTENSION KEEPS the generation it adopted -- see the round-19 note
+    // in upload-lease.ts. Only a row that never had one (a legacy row, null)
+    // draws a fresh value, and the CAS pins the null so exactly one writer
+    // mints it.
+    assert.match(lease, /const uploadLease = observed\.uploadLeaseNonce \?\? \(deps\.nonce \?\? newLeaseNonce\)\(\);/);
     assert.match(lease, /uploadLeaseNonce: uploadLease,/);
     assert.match(lease, /signed: \{ \.\.\.signed, uploadLease \}/);
     // Both destructive branches still stamp a FRESH generation — hoisted into

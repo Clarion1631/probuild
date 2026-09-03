@@ -287,9 +287,17 @@ test("ALL THREE replay paths ask this one rule, and answer a mismatch with 409",
         assert.match(source, /error: "content-mismatch"/, `${route} has a mismatch answer`);
         assert.match(source, /retryable: false/, `${route}: resending the same bytes changes nothing`);
         // The mismatch branch must be decided BEFORE any success is returned.
+        //
+        // LAST occurrence of each, because /start now declares its response
+        // union up top and `alreadyReceived: true` appears there as a TYPE
+        // before it appears as an answer. Each marker is returned from exactly
+        // one place, so the last mention IS the answer.
+        const mismatchAt = source.lastIndexOf('error: "content-mismatch"');
+        const receivedAt = source.lastIndexOf("alreadyReceived: true");
+        const finalizedAt = source.lastIndexOf("alreadyFinalized: true");
         assert.ok(
-            source.indexOf('error: "content-mismatch"') < source.indexOf("alreadyReceived: true")
-            || source.indexOf('error: "content-mismatch"') < source.indexOf("alreadyFinalized: true"),
+            (receivedAt > 0 && mismatchAt < receivedAt)
+            || (finalizedAt > 0 && mismatchAt < finalizedAt),
             `${route}: the mismatch is answered before the success`,
         );
         // And never healed: a re-upload is exactly how bytes get replaced.

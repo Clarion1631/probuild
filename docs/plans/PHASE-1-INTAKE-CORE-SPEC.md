@@ -200,7 +200,7 @@ CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx" ON "ReceiptIntake"("cre
 Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2):
 
 ```bash
-SUPABASE_URL=... SUPABASE_SERVICE_KEY=...   node scripts/apply-receipt-intake.mjs --yes --expect-db postgres --expect-host <host>
+SUPABASE_URL=... SUPABASE_SERVICE_KEY=...   node scripts/apply-receipt-intake.mjs --target prod --yes --expect-db postgres --expect-host <host>
 ```
 
 It does BOTH halves of the rollout and verifies each:
@@ -509,7 +509,7 @@ URL bypasses this server entirely, so application code cannot stop the write —
 refuse the object afterwards, by which time the bytes are already paid for and sitting in
 the bucket. Set it where the write happens:
 
-> `node scripts/apply-receipt-intake.mjs --yes --expect-db … --expect-host …`, with
+> `node scripts/apply-receipt-intake.mjs --target prod --yes --expect-db … --expect-host …`, with
 > `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` in the environment. It creates the bucket when
 > missing and VERIFIES it when present, and exits **nonzero** if it exists with a different
 > file-size limit, a different MIME allow-list, or as a public bucket. It never silently
@@ -604,13 +604,44 @@ transport, not the document.
 For anything larger — most phone photos — use the two-step flow, which never puts the bytes
 through this server at all:
 
-1. `POST /api/receipts/intake/start` with `{mimeType, fileName?, fileSize?, source?,
-   sourceRef?, uploadId?, projectId?}` -> `{id, uploadUrl, token, storagePath, maxBytes,
-   uploadLease}`.
-   Creates the row in `STAGING` (invisible to the worker) and returns a short-lived Supabase
-   signed upload URL bound to a server-chosen path. **`uploadLease` is the generation that
-   URL was issued under** — an opaque string; treat it as a token to hand back, never parse
-   it. Every `/start` branch returns one, including a retry that reuses a still-live lease.
+1. `POST /api/receipts/intake/start` with
+   `{sha256, mimeType, fileName?, fileSize?, source?, sourceRef?, uploadId?, projectId?}`.
+
+   **`sha256` is REQUIRED** — 64 lowercase hex characters, the hash of the bytes you are
+   about to upload. Anything else is `400 {reason: "missing-sha256"}` and no row is created.
+   It is the only thing that gives the row an identity before any bytes exist: without it a
+   reused `sourceRef` carrying a DIFFERENT document is indistinguishable from an honest
+   retry, and `/start` would hand out an upsert-capable URL pointed at another document's
+   object — a swap that would only surface at `/finalize`, by which point the original bytes
+   are gone.
+
+   **The success response is a UNION, discriminated by `kind`.** Switch on it; `ok: true`
+   alone does NOT mean there is somewhere to PUT bytes.
+
+   ```ts
+   type StartResponse =
+     | { ok: true; kind: "upload"; id: string; uploadUrl: string; token: string;
+         storagePath: string; uploadLease: string; maxBytes: number;
+         sourceRef?: string; state?: string; resumed?: boolean; recovered?: boolean }
+     | { ok: true; kind: "settled"; alreadyReceived: true; id: string; state: string };
+   ```
+
+   - `kind: "upload"` — the row is `STAGING` (invisible to the worker) or a recoverable park
+     that has been re-armed, and the response carries a short-lived Supabase signed upload
+     URL bound to a server-chosen path. **`uploadLease` is the generation that URL was issued
+     under** — an opaque string; treat it as a token to hand back, never parse it.
+   - `kind: "settled"` — this `sourceRef` is already held AND its stored bytes still hash to
+     what was published, so there is nothing to upload. It carries **no `uploadUrl` and no
+     `uploadLease`**, deliberately. Do not look for them.
+
+   **Concurrent `/start` calls for one `sourceRef` return the SAME `uploadLease`.** A retry
+   that finds a still-live lease EXTENDS it rather than replacing it — same path, same lease
+   version, same generation — so every 200 this endpoint hands out stays finalizable. (Until
+   round 19 each adoption minted its own generation and only the last was stored, which made
+   the earlier caller's 200 carry a lease `/finalize` refused as stale.) A call that loses a
+   genuine race — the row was repathed or published while its URL was being signed — is
+   answered `409 {error: "publish-conflict", retryable: true}`, and the remedy is to call
+   `/start` again.
 2. `PUT` the bytes straight to `uploadUrl`.
 3. `POST /api/receipts/intake/{id}/finalize` with `{uploadLease, sha256?}` -> publishes
    `STAGING` -> `RECEIVED`. The server re-reads the object and derives the mime, the size and

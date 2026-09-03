@@ -15,7 +15,12 @@ import {
     uploadPathFor,
     verifyStoredCopy,
 } from "@/lib/receipt-intake/stored-object";
-import { discardUnresumedLease, newLeaseNonce, reuseLiveLease } from "@/lib/receipt-intake/upload-lease";
+import {
+    discardUnresumedLease,
+    issuedLeaseIsCurrent,
+    newLeaseNonce,
+    reuseLiveLease,
+} from "@/lib/receipt-intake/upload-lease";
 import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
 import { queueObjectCleanup } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
@@ -34,6 +39,66 @@ export const maxDuration = 30;
  * the platform kills at 30.
  */
 const ROUTE_BUDGET_MS = 27_000;
+
+/**
+ * THE /start SUCCESS RESPONSE IS A UNION, and `kind` is what tells them apart.
+ *
+ * The spec said every success carries an upload URL. It does not, and never
+ * did: a sourceRef whose document is already held and verified has nothing to
+ * upload, so that branch answers `alreadyReceived` with no `uploadUrl` and no
+ * `uploadLease`. A mobile client that assumed the URL was always there read
+ * `undefined` and had no way to tell that apart from a malformed response.
+ *
+ * Naming the two members, in the route and in the spec, is the fix: a client
+ * switches on `kind` and the compiler (theirs and ours) enumerates the cases.
+ * `ok: true` alone never implies there is somewhere to PUT bytes.
+ */
+const UPLOAD = "upload" as const;
+const SETTLED = "settled" as const;
+
+/** There is somewhere to PUT the bytes, and a lease to echo back at /finalize. */
+export interface StartUploadResponse {
+    ok: true;
+    kind: typeof UPLOAD;
+    id: string;
+    /** Where to PUT. Scoped to ONE path, derived here and bound to the row. */
+    uploadUrl: string;
+    token: string;
+    storagePath: string;
+    /**
+     * The generation this URL was issued under. /finalize REQUIRES it back and
+     * answers 409 `lease-stale` to anything else -- see the finalize route.
+     */
+    uploadLease: string;
+    maxBytes: number;
+    sourceRef?: string;
+    state?: string;
+    /** True when this row already existed and its lease was reused or renewed. */
+    resumed?: boolean;
+    /** True when a recoverable park was re-armed rather than freshly created. */
+    recovered?: boolean;
+}
+
+/** Nothing to upload: the document is already held, and verified byte-for-byte. */
+export interface StartSettledResponse {
+    ok: true;
+    kind: typeof SETTLED;
+    alreadyReceived: true;
+    id: string;
+    state: string;
+}
+
+export type StartResponse = StartUploadResponse | StartSettledResponse;
+
+/**
+ * EVERY /start SUCCESS GOES THROUGH HERE.
+ *
+ * The union is only worth declaring if it is checked. Routed through this
+ * helper, a branch that forgets `kind`, or returns an upload response with no
+ * `uploadLease`, is a compile error rather than a contract the mobile app
+ * discovers at runtime.
+ */
+const startOk = (body: StartResponse) => NextResponse.json(body);
 
 /**
  * Step 1 of the two-step upload: reserve the row, hand back a signed URL.
@@ -308,8 +373,9 @@ export async function POST(req: Request) {
                         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
                     }
                     if (keptRecovery.kind === "conflict") return leaseConflict(existing.id);
-                    return NextResponse.json({
+                    return startOk({
                         ok: true,
+                        kind: UPLOAD,
                         resumed: true,
                         recovered: true,
                         id: existing.id,
@@ -390,8 +456,20 @@ export async function POST(req: Request) {
                     // failure itself.
                     return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
                 }
-                return NextResponse.json({
+                // THE LEASE IS RE-READ BEFORE IT IS RETURNED. The CAS above
+                // proved this generation was ours when we wrote it; the sign
+                // is a network round trip, and a concurrent /start can adopt
+                // or repath the row while it is in flight. Returning the nonce
+                // we simply happened to generate would hand back a lease
+                // /finalize refuses -- see issuedLeaseIsCurrent.
+                if (!await issuedLeaseIsCurrent(
+                    existing.id,
+                    { storagePath: retryPath, uploadLease: rearmedLease },
+                    reloadLeaseRow,
+                )) return leaseConflict(existing.id);
+                return startOk({
                     ok: true,
+                    kind: UPLOAD,
                     resumed: true,
                     recovered: true,
                     id: existing.id,
@@ -490,9 +568,19 @@ export async function POST(req: Request) {
                         { status: 409 },
                     );
                 }
-                return NextResponse.json(
-                    { ok: true, alreadyReceived: true, id: existing.id, state: existing.state },
-                );
+                // THE OTHER MEMBER OF THE RESPONSE UNION. There is nothing to
+                // upload -- the document is already held and verified -- so
+                // this branch deliberately carries no uploadUrl and no
+                // uploadLease, and says so in `kind`. A client that keys off
+                // `kind` cannot mistake it for an upload response and go
+                // looking for a URL that was never going to be there.
+                return startOk({
+                    ok: true,
+                    kind: SETTLED,
+                    alreadyReceived: true,
+                    id: existing.id,
+                    state: existing.state,
+                });
             }
             // A LIVE LEASE IS NOT INVALIDATED BY A RETRY. Same rule, same
             // helper, as the recoverable re-arm above.
@@ -502,8 +590,9 @@ export async function POST(req: Request) {
                     return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
                 }
                 if (kept.kind === "conflict") return leaseConflict(existing.id);
-                return NextResponse.json({
-                    ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...kept.signed,
+                return startOk({
+                    ok: true, kind: UPLOAD, resumed: true, id: existing.id,
+                    maxBytes: MAX_STORED_BYTES, ...kept.signed,
                 });
             }
 
@@ -560,8 +649,14 @@ export async function POST(req: Request) {
             // The row is on the new path with a live expiry, so a retry resumes
             // through reuseLiveLease over that same path.
             if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-            return NextResponse.json({
-                ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES,
+            // Re-read before returning, for the same reason the re-arm does.
+            if (!await issuedLeaseIsCurrent(
+                existing.id,
+                { storagePath: resumePath, uploadLease: resumedLease },
+                reloadLeaseRow,
+            )) return leaseConflict(existing.id);
+            return startOk({
+                ok: true, kind: UPLOAD, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES,
                 ...resumed, uploadLease: resumedLease,
             });
         }
@@ -610,8 +705,18 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
 
-    return NextResponse.json({
+    // AND THE CREATOR RE-READS TOO. It writes the row, then signs, then
+    // answers -- and a concurrent /start for the same sourceRef can adopt or
+    // repath this row inside that gap. It was returning the nonce it had
+    // generated, never re-checked.
+    if (!await issuedLeaseIsCurrent(
+        created.id,
+        { storagePath, uploadLease: leaseNonce },
+        reloadLeaseRow,
+    )) return leaseConflict(created.id);
+    return startOk({
         ok: true,
+        kind: UPLOAD,
         id: created.id,
         sourceRef: created.sourceRef,
         state: created.state,
@@ -702,9 +807,29 @@ function leaseConflict(existingId: string) {
     );
 }
 
+/**
+ * THE ROW, RE-READ, in exactly the shape the lease rule fences on.
+ *
+ * Every column leaseFence pins is selected here. A partial select would hand
+ * the rule an `undefined` where the row has a value, and a CAS built from that
+ * matches nothing — a silent, permanent conflict rather than a lost race.
+ */
+async function reloadLeaseRow(id: string) {
+    return prisma.receiptIntake.findUnique({
+        where: { id },
+        select: {
+            id: true, state: true, stateReason: true, storagePath: true,
+            uploadLeaseVersion: true, uploadLeaseNonce: true, uploadUrlExpiresAt: true,
+        },
+    });
+}
+
 /** The live wiring for the shared lease rule (src/lib/receipt-intake/upload-lease.ts). */
 const leaseDepsFor = (leaseDeadline: RouteDeadline | undefined) => ({
     db: prisma.receiptIntake,
+    // The adoption CAS is exclusive, and every issued lease is re-read after
+    // signing, so the rule needs its own way back to the row.
+    reload: reloadLeaseRow,
     sign: (storagePath: string, opts: { upsert: boolean }) =>
         // The reuse rule runs inside a request, so it gets that request's
         // remaining budget rather than a fresh allowance of its own.
