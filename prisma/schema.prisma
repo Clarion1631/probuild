@@ -724,11 +724,24 @@ model PaymentSchedule {
   @@index([scheduleTaskId])
 }
 
-// Deposit auto-apply pipeline (Phase B1): one row per Drive file the GTR
-// receipt bot classifies as a `customer_payment` (an incoming check/deposit
-// photo). Backs the crash-safe idempotency + state machine owned by
+// Deposit auto-apply pipeline: one row per deposit, from either of TWO sources.
+//
+//   source = null   the photo path (Phase B1) — one Drive file the GTR receipt
+//                   bot classified as a `customer_payment`; fileId is the Drive
+//                   file id.
+//   source = "bank" the daily deposit sweep — one credit row from the
+//                   Washington Trust daily CSV; fileId is "bank:<bankReference>"
+//                   and bankReference is the bank's stable per-deposit id.
+//
+// Backs the crash-safe idempotency + state machine owned by
 // POST /api/payments/deposit-ingest — see that route for the full state
-// machine (processing/qbo_unknown/qbo_created/applied/unmatched/failed/reconcile).
+// machine (processing/qbo_unknown/qbo_created/applied/unmatched/failed/reconcile,
+// plus `proposed`, which only bank rows use).
+//
+// postDate + amountCents are written for BOTH sources (photo rows take them
+// from the payload's checkDate/amount) so the cross-source claim check — "is
+// the other path already working this same money?" — is an indexed query in
+// both directions rather than a scan of the `extracted` JSON.
 //
 // NOTE: a partial unique index reserves paymentScheduleId while a deposit is
 // in flight, so two different files can never both claim the same pending
@@ -742,10 +755,16 @@ model PaymentSchedule {
 //  is deliberately NOT — that transition releases the milestone.)
 model DepositIngest {
   id     String @id @default(cuid())
-  fileId String @unique // Drive file id — stable idempotency key across the bot's archive move
+  fileId String @unique // Drive file id, or "bank:<bankReference>" — stable idempotency key across the bot's archive move
 
-  status    String // processing | qbo_unknown | qbo_created | applied | unmatched | failed | reconcile
+  status    String // processing | qbo_unknown | qbo_created | applied | unmatched | failed | reconcile | proposed (bank only)
   extracted String // JSON snapshot of the inbound payload — carried into the OfficeTask + audit trail
+
+  // Deposit sweep (bank source). null source = the original photo path.
+  source        String? // null | "bank"
+  bankReference String? // the bank's per-deposit id, e.g. "26236015002406" (bank rows only)
+  postDate      DateTime? @db.Date // bank: the CSV Post Date; photo: the extracted checkDate
+  amountCents   Int? // the deposit amount, in cents, for both sources
 
   // Reserved milestone (see the partial unique index note above). NULLed on
   // pre-QBO-boundary retry exhaustion so the reservation frees the milestone.
@@ -768,6 +787,8 @@ model DepositIngest {
 
   @@index([status])
   @@index([paymentScheduleId])
+  @@index([postDate, amountCents])
+  @@index([bankReference])
 }
 
 // Progress billing: the billable artifact the user builds by picking
@@ -2556,6 +2577,11 @@ model PaymentNotification {
   processingStartedAt DateTime?
   createdAt           DateTime  @default(now())
   processedAt         DateTime?
+  // Deposit sweep: suppress the CLIENT receipt for this settlement (the team
+  // email and activity log still fire). Persisted on the row because delivery
+  // is async — the drainer reads it, not the settle path. Set only by the bank
+  // branch of deposit-ingest; null/false behaves exactly as before.
+  suppressClientReceipt Boolean?
 
   @@index([status])
   @@index([scheduleId])
