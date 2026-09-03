@@ -4,6 +4,9 @@ import type { DepositReviewItem } from "@/lib/deposit-review";
 function statusClass(status: string): string {
     if (status === "reconcile") return "bg-red-50 text-red-700 border-red-200";
     if (status === "unmatched") return "bg-amber-50 text-amber-700 border-amber-200";
+    // `proposed` is not a problem — it is the deposit sweep in suggest-only
+    // mode, waiting for a human to agree. Blue, not amber.
+    if (status === "proposed") return "bg-blue-50 text-blue-700 border-blue-200";
     return "bg-slate-100 text-slate-700 border-slate-200";
 }
 
@@ -14,7 +17,8 @@ export function DepositReviewPanel({ items, unavailable }: { items: DepositRevie
                 <div>
                     <h2 id="deposit-review-heading" className="text-base font-semibold text-hui-textMain">Incoming check review</h2>
                     <p className="text-sm text-hui-textMuted mt-1 max-w-3xl">
-                        Deposits that could not be safely applied. This panel is read-only: resolve the linked Office task before any retry.
+                        Deposits that could not be safely applied, plus the bank sweep&rsquo;s <span className="font-medium">proposed</span> suggestions —
+                        matches it found but did not book. This panel is read-only: resolve the linked Office task before any retry.
                     </p>
                 </div>
                 <a href="/tasks" className="text-sm font-medium text-hui-primary hover:underline">Open Office tasks ↗</a>
@@ -47,8 +51,10 @@ export function DepositReviewPanel({ items, unavailable }: { items: DepositRevie
                                         </span>
                                     </td>
                                     <td className="px-5 py-3 text-hui-textMain">
-                                        <div>{item.payerName ?? "Payer not read"}</div>
-                                        <div className="text-xs text-hui-textMuted mt-1">{item.projectName ?? "Project not read"}</div>
+                                        <div>{item.payerName ?? (item.source === "bank" ? "Bank credit (no payer named)" : "Payer not read")}</div>
+                                        <div className="text-xs text-hui-textMuted mt-1">
+                                            {item.candidate ?? item.projectName ?? "Project not read"}
+                                        </div>
                                     </td>
                                     <td className="px-5 py-3 text-hui-textMain whitespace-nowrap">
                                         <div>{item.checkNumber ? `#${item.checkNumber}` : "Number not read"}</div>

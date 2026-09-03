@@ -76,7 +76,12 @@ function receiptBodyHtml(opts: {
 // failed (retry). `dedupeKey` (the outbox row id) makes the activity-log dedupe per-settlement-
 // EVENT so an undo + re-pay of the same schedule still logs a second payment_received; direct
 // callers that omit it fall back to the scheduleId.
-export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { dedupeKey?: string }): Promise<{ ok: boolean }> {
+// `suppressClientReceipt` (deposit sweep only, carried on the outbox row) skips step 3
+// ONLY — the team email and the activity log still fire. It sits beside isBackdatedPayment
+// because the back-date rule cannot cover this case: a swept bank credit is typically 2
+// days old, well inside BACKDATED_RECEIPT_CUTOFF_DAYS, so it WOULD email the client a
+// receipt for money no human has looked at yet.
+export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { dedupeKey?: string; suppressClientReceipt?: boolean }): Promise<{ ok: boolean }> {
     try {
         const s = await prisma.paymentSchedule.findUnique({
             where: { id: paymentScheduleId },
@@ -172,7 +177,7 @@ export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { de
         //    the auto-receipt — a stale "Payment Confirmed" email blindsides the client.
         //    receiptSentAt stays null so staff can still send one via the Send Receipt
         //    button when they want to.
-        if (s.invoice.client?.email && !s.receiptSentAt && !isBackdatedPayment(s.paymentDate)) {
+        if (s.invoice.client?.email && !s.receiptSentAt && !opts?.suppressClientReceipt && !isBackdatedPayment(s.paymentDate)) {
             const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/portal/invoices/${s.invoice.id}`;
             const receiptSend = await sendNotification(
                 s.invoice.client.email,
