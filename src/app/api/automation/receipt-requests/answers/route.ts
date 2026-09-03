@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { authenticateBridge } from "@/lib/receipt-intake/intake-auth";
 import { evaluateReviewIssue } from "@/lib/review-alert-lifecycle";
@@ -9,7 +10,6 @@ import {
     hasResolution,
     isDurableArtifactUrl,
 } from "@/lib/receipt-requests";
-import { centsToAmount } from "@/lib/receipt-request-cards";
 import { isDriveFileId, probeDriveFile } from "@/lib/google-drive";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
@@ -65,10 +65,35 @@ const MAX_URL_LEN = 2_000;
  * cannot change): `MissingReceiptAffidavit_<date>_<vendor>_<amount>_<name>.pdf`.
  * It carries no fingerprint or bank-line id — Beverly's app never sees either
  * — so the strongest binding available without touching that external script
- * is the DOLLAR AMOUNT: a fixed "123.45" string the generator embeds verbatim,
- * specific enough that a PDF minted for a different charge will not carry it.
+ * is the DOLLAR AMOUNT field, parsed out at its own fixed position (the third
+ * underscore-delimited segment after the prefix) rather than searched for as
+ * a substring: `name.includes("12.34")` let a memo named "...112.34..." or
+ * "...12.345..." satisfy a $12.34 charge, because the target digits are a
+ * substring of a DIFFERENT amount too — prefix or suffix, either way a wrong
+ * charge (Codex PR #443 gate round 2 — round 1's fix reintroduced the exact
+ * bug it closed, in string form).
  */
 const AFFIDAVIT_NAME_PREFIX = "MissingReceiptAffidavit_";
+
+/** The amount field's own shape: digits, a point, exactly two decimal digits. */
+const AFFIDAVIT_AMOUNT_FIELD_RE = /^(\d+)\.(\d{2})$/;
+
+/**
+ * The amount FIELD, as cents — not a substring search. `<date>_<vendor>_
+ * <amount>_<name...>.pdf`: date and vendor are always exactly the first two
+ * fields (the sign flow's own contract), so the amount is always the third,
+ * regardless of how many underscores the trailing name carries. Anything
+ * that is not exactly two decimal digits (a truncated OR padded amount) is
+ * not a parse failure to shrug off — it is the exact shape a wrong-charge
+ * memo takes — so it returns null rather than guessing.
+ */
+function affidavitAmountFieldCents(name: string): number | null {
+    const fields = name.slice(AFFIDAVIT_NAME_PREFIX.length).split("_");
+    if (fields.length < 4) return null;
+    const match = AFFIDAVIT_AMOUNT_FIELD_RE.exec(fields[2]);
+    if (!match) return null;
+    return Number(match[1]) * 100 + Number(match[2]);
+}
 
 /**
  * True when a probed Drive filename could plausibly BE the signed memo for
@@ -78,15 +103,17 @@ const AFFIDAVIT_NAME_PREFIX = "MissingReceiptAffidavit_";
  * `signed:true` plus a Drive id that merely EXISTS used to be enough to close
  * a chase — nothing tied the artifact to the charge it claims to answer
  * (Codex PR #443 gate, finding 3). Not exact-format verification — Beverly's
- * vendor/date sanitization is not this route's to pin down — but a PDF minted
- * for a different amount will not contain this issue's own "123.45", and a
+ * vendor/date sanitization is not this route's to pin down — but the amount
+ * FIELD, parsed out and compared as an exact number of cents, is specific
+ * enough that a PDF minted for a different amount cannot carry it, and a
  * file with the wrong prefix was never produced by the sign flow at all.
  */
 function affidavitNameMatchesIssue(name: string | null, amountCents: number): boolean {
     if (!name) return false;
     if (!name.toLowerCase().endsWith(".pdf")) return false;
     if (!name.startsWith(AFFIDAVIT_NAME_PREFIX)) return false;
-    return name.includes(centsToAmount(amountCents));
+    const fieldCents = affidavitAmountFieldCents(name);
+    return fieldCents !== null && fieldCents === Math.abs(amountCents);
 }
 
 /**
@@ -107,9 +134,20 @@ function hasRecordedMemoRequest(details: Record<string, unknown>): boolean {
  * on a DIFFERENT bank-line issue. One signed affidavit answers exactly one
  * charge; accepting it a second time is how a single memo silently closes two
  * chases.
+ *
+ * Takes a TRANSACTION CLIENT, not the module-level `prisma` — this is now
+ * always called from inside the pdfId's advisory-locked transaction (see
+ * POST), so the read is against the same connection that holds the lock and
+ * will perform the write. A plain `prisma.*` read here used to run OUTSIDE
+ * any lock, so two concurrent signatures for the same pdfId could both read
+ * "not reused yet" before either had written (Codex round-2 gate).
  */
-async function pdfIdReusedElsewhere(pdfId: string, ownTargetKey: string): Promise<boolean> {
-    const candidates = await prisma.reviewIssue.findMany({
+async function pdfIdReusedElsewhere(
+    tx: Prisma.TransactionClient,
+    pdfId: string,
+    ownTargetKey: string,
+): Promise<boolean> {
+    const candidates = await tx.reviewIssue.findMany({
         where: {
             targetType: RECEIPT_REQUEST_TARGET_TYPE,
             targetKey: { not: ownTargetKey },
@@ -273,55 +311,95 @@ export async function POST(request: Request) {
     let mismatch = false;
     let reused = false;
 
+    type AttemptOutcome =
+        | { kind: "missing" }
+        | { kind: "reused" }
+        | { kind: "never-requested" }
+        | { kind: "mismatch" }
+        | { kind: "recorded"; alreadyCleared: boolean }
+        | { kind: "lost-race" };
+
     for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !mismatch && !reused; attempt++) {
-        const issue = await prisma.reviewIssue.findUnique({
-            where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: bankLineId } },
-            select: { id: true, version: true, displayDetails: true, clearedAt: true },
+        const outcome: AttemptOutcome = await prisma.$transaction(async tx => {
+            /**
+             * THE PDF-ID LOCK — taken BEFORE the reuse check, and held through
+             * the write, on EVERY attempt (not just the first).
+             *
+             * The reuse check used to be a plain read outside any lock, and
+             * only ran on attempt 0: two concurrent signatures naming the SAME
+             * pdfId against two DIFFERENT charges could both read "not reused
+             * yet" before either had written, and a lost-race retry skipped
+             * the check entirely, so the SECOND attempt of a losing request
+             * could still record a reuse the check exists to catch (Codex
+             * round-2 gate). One transaction-scoped advisory lock per pdfId,
+             * held across the read-check-write here, is what makes "not
+             * reused" a fact rather than a guess: a second writer for the same
+             * file blocks on this line until the first commits, and then sees
+             * its resolution.
+             */
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`memo-pdf:${pdfId}`}))`;
+
+            const issue = await tx.reviewIssue.findUnique({
+                where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: bankLineId } },
+                select: { id: true, version: true, displayDetails: true, clearedAt: true },
+            });
+            if (!issue) return { kind: "missing" };
+
+            // THE ARTIFACT MUST BE BOUND TO THIS CHARGE, not merely
+            // accessible. A caller-supplied fingerprint plus any readable
+            // Drive PDF used to be enough to close a chase: nothing checked
+            // that this item was ever actually asked about, that the file was
+            // minted FOR it, or that the SAME file was not already spent
+            // answering a different one (Codex PR #443 gate, finding 3).
+            if (await pdfIdReusedElsewhere(tx, pdfId, bankLineId)) return { kind: "reused" };
+
+            // Merged from THIS read, not from anything older: a card record or
+            // a corrected amount written since must survive.
+            const details = parseMissingReceiptDetails(issue.displayDetails);
+
+            if (!hasRecordedMemoRequest(details)) return { kind: "never-requested" };
+            const amountCents = typeof details.amountCents === "number" ? details.amountCents : null;
+            if (amountCents === null || !affidavitNameMatchesIssue(probe.name, amountCents)) {
+                return { kind: "mismatch" };
+            }
+
+            details.resolution = "memo-signed";
+            // The ID is the durable identity; the URL is how a human opens it.
+            details.pdfId = pdfId;
+            if (artifactUrl) details.pdfUrl = artifactUrl;
+            if (typeof body.at === "string") details.signedAt = body.at.slice(0, 64);
+            if (typeof body.thread === "string") details.signedThread = body.thread.slice(0, 200);
+
+            // RECORDED EVEN ON A CLEARED ISSUE (Codex round-4 item 3).
+            //
+            // A memo signed after the nightly matcher had already auto-closed
+            // the line used to be discarded — so when the matching receipt was
+            // later deleted, the sweep reopened a charge somebody had
+            // genuinely answered weeks earlier. A valid signature is evidence
+            // whatever the issue's current state, and `resolution` is exactly
+            // the field the matcher reads to suppress a reopen.
+            const written = await tx.reviewIssue.updateMany({
+                where: { id: issue.id, version: issue.version },
+                data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
+            });
+            if (written.count === 1) {
+                return { kind: "recorded", alreadyCleared: issue.clearedAt !== null };
+            }
+            return { kind: "lost-race" };
         });
-        if (!issue) { missing = true; break; }
 
-        // THE ARTIFACT MUST BE BOUND TO THIS CHARGE, not merely accessible.
-        // A caller-supplied fingerprint plus any readable Drive PDF used to be
-        // enough to close a chase: nothing checked that this item was ever
-        // actually asked about, that the file was minted FOR it, or that the
-        // SAME file was not already spent answering a different one (Codex
-        // PR #443 gate, finding 3). Checked on the FIRST attempt only — a
-        // fresh read on a lost race would repeat identically.
-        if (attempt === 0 && await pdfIdReusedElsewhere(pdfId, bankLineId)) { reused = true; break; }
-
-        // Merged from THIS read, not from anything older: a card record or a
-        // corrected amount written since must survive.
-        const details = parseMissingReceiptDetails(issue.displayDetails);
-
-        if (!hasRecordedMemoRequest(details)) { neverRequested = true; break; }
-        const amountCents = typeof details.amountCents === "number" ? details.amountCents : null;
-        if (amountCents === null || !affidavitNameMatchesIssue(probe.name, amountCents)) {
-            mismatch = true;
-            break;
-        }
-
-        details.resolution = "memo-signed";
-        // The ID is the durable identity; the URL is how a human opens it.
-        details.pdfId = pdfId;
-        if (artifactUrl) details.pdfUrl = artifactUrl;
-        if (typeof body.at === "string") details.signedAt = body.at.slice(0, 64);
-        if (typeof body.thread === "string") details.signedThread = body.thread.slice(0, 200);
-
-        // RECORDED EVEN ON A CLEARED ISSUE (Codex round-4 item 3).
-        //
-        // A memo signed after the nightly matcher had already auto-closed the
-        // line used to be discarded — so when the matching receipt was later
-        // deleted, the sweep reopened a charge somebody had genuinely answered
-        // weeks earlier. A valid signature is evidence whatever the issue's
-        // current state, and `resolution` is exactly the field the matcher
-        // reads to suppress a reopen.
-        const written = await prisma.reviewIssue.updateMany({
-            where: { id: issue.id, version: issue.version },
-            data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
-        });
-        if (written.count === 1) {
-            recorded = { targetKey: bankLineId };
-            alreadyCleared = issue.clearedAt !== null;
+        switch (outcome.kind) {
+            case "missing": missing = true; break;
+            case "reused": reused = true; break;
+            case "never-requested": neverRequested = true; break;
+            case "mismatch": mismatch = true; break;
+            case "recorded":
+                recorded = { targetKey: bankLineId };
+                alreadyCleared = outcome.alreadyCleared;
+                break;
+            case "lost-race":
+                // Loop again for a fresh read — still under a fresh lock.
+                break;
         }
     }
 

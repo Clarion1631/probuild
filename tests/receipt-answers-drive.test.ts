@@ -51,25 +51,78 @@ let issues: Map<string, { id: string; version: number; displayDetails: string | 
 let writes: Array<Record<string, unknown>>;
 let cleared: string[];
 
-const fakePrisma = {
+/** Advisory-lock calls recorded by pdfId, so a test can assert lock-before-check. */
+let lockCalls: string[];
+/** Every lock/read call, in order, so a test can assert lock-BEFORE-check per attempt. */
+let callOrder: string[];
+/**
+ * Forced `updateMany` results, consumed in order. Empty means "use real CAS
+ * semantics against `issues`" (see below) — set this to simulate a lost race
+ * on a specific attempt regardless of what real CAS would have returned.
+ */
+let updateManyCounts: number[];
+
+interface FakeIssueRow {
+    id: string;
+    version: number;
+    displayDetails: string | null;
+    clearedAt: Date | null;
+}
+
+/** The one shape the answers route needs from `prisma` — and from `tx`, since it's the same object. */
+interface FakePrisma {
     reviewIssue: {
-        findUnique: async ({ where }: { where: { targetType_targetKey?: { targetKey: string }; id?: string } }) => {
+        findUnique: (args: { where: { targetType_targetKey?: { targetKey: string }; id?: string } }) => Promise<FakeIssueRow | null>;
+        findMany: (args: { where: { targetKey?: { not?: string } } }) => Promise<Array<{ displayDetails: string | null }>>;
+        updateMany: (args: { where: { id: string; version: number }; data: Record<string, unknown> }) => Promise<{ count: number }>;
+    };
+    $executeRaw: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<undefined>;
+    $transaction: <T>(fn: (tx: FakePrisma) => Promise<T>) => Promise<T>;
+}
+
+const fakePrisma: FakePrisma = {
+    reviewIssue: {
+        findUnique: async ({ where }) => {
             const key = where.targetType_targetKey?.targetKey ?? where.id ?? "";
             return issues.get(key) ?? null;
         },
         // The reuse check's coarse pre-filter (Codex PR #443 gate, finding 3):
         // every OTHER issue, so it can be searched for the same pdf_id.
-        findMany: async ({ where }: { where: { targetKey?: { not?: string } } }) => {
+        findMany: async ({ where }) => {
+            callOrder.push("findMany");
             const excluded = where.targetKey?.not;
             return [...issues.entries()]
                 .filter(([key]) => key !== excluded)
                 .map(([, row]) => ({ displayDetails: row.displayDetails }));
         },
-        updateMany: async ({ data }: { data: Record<string, unknown> }) => {
+        // REAL CAS against `issues`, not just a recorder — a `count: 0` on a
+        // version mismatch (or a forced entry in `updateManyCounts`) and a
+        // GENUINE mutation on success, so a later `findUnique`/`findMany` in
+        // the SAME test — including from a second POST — actually observes
+        // what an earlier attempt or an earlier request committed.
+        updateMany: async ({ where, data }) => {
             writes.push(data);
+            if (updateManyCounts.length > 0) return { count: updateManyCounts.shift()! };
+            const row = [...issues.values()].find(r => r.id === where.id);
+            if (!row || row.version !== where.version) return { count: 0 };
+            if (typeof data.displayDetails === "string") row.displayDetails = data.displayDetails;
+            row.version += 1;
             return { count: 1 };
         },
     },
+    // The pdfId advisory lock (Codex round-2 gate, finding 1): a tagged
+    // template call, same shape `tx.$executeRaw` gets in the real route.
+    // Recorded so a test can assert it runs BEFORE the reuse check, on every
+    // attempt — the fake takes no real lock, but the call itself is the point.
+    $executeRaw: async (strings, ...values) => {
+        lockCalls.push(String(values[0]));
+        callOrder.push(`lock:${String(values[0])}`);
+        return undefined;
+    },
+    // The route runs everything for one attempt inside ONE transaction; the
+    // fake just hands the same object back as `tx` — the reviewIssue and
+    // $executeRaw methods above already do the recording tests need.
+    $transaction: async fn => fn(fakePrisma),
 };
 
 let POST: (request: Request) => Promise<Response>;
@@ -118,6 +171,9 @@ function reset() {
     probedIds = [];
     writes = [];
     cleared = [];
+    lockCalls = [];
+    callOrder = [];
+    updateManyCounts = [];
     issues = new Map([["bl-1", { id: "ri-1", version: 3, displayDetails: CARDED_DETAILS, clearedAt: null }]]);
 }
 
@@ -435,5 +491,111 @@ test("matching name, carded, and not reused → memo-signed, exactly the happy p
     const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
     assert.equal(res.status, 200);
     assert.deepEqual(await res.json(), { ok: true, cleared: true, memoRecorded: true, targetKey: "bl-1" });
+    assert.equal(JSON.parse(writes[0].displayDetails as string).resolution, "memo-signed");
+});
+
+// ── The reuse check is inside the pdfId lock, on EVERY attempt (Codex round-2 gate, finding 1) ──
+
+test("the pdfId lock is taken BEFORE the reuse check, on BOTH attempts of a lost-race retry", async () => {
+    reset();
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+    // Force attempt 0 to lose the optimistic-concurrency race so a real SECOND
+    // attempt runs. The bug this closes: the reuse check used to be gated on
+    // `attempt === 0`, so a losing first attempt's retry skipped it entirely.
+    updateManyCounts = [0, 1];
+
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 200);
+
+    assert.deepEqual(lockCalls, [`memo-pdf:${FILE_ID}`, `memo-pdf:${FILE_ID}`], "the lock is taken on BOTH attempts, not just the first");
+
+    const lockIndexes = callOrder.flatMap((tag, i) => (tag.startsWith("lock:") ? [i] : []));
+    const checkIndexes = callOrder.flatMap((tag, i) => (tag === "findMany" ? [i] : []));
+    assert.equal(lockIndexes.length, 2, "one lock per attempt");
+    assert.equal(checkIndexes.length, 2, "one reuse check per attempt");
+    assert.ok(lockIndexes[0] < checkIndexes[0], "attempt 0: lock precedes the reuse check");
+    assert.ok(lockIndexes[1] < checkIndexes[1], "attempt 1: lock precedes the reuse check");
+    // And the write only ever committed once — the first attempt's forced 0
+    // never wrote anything real; only the second attempt's write survives.
+    assert.equal(writes.length, 2, "both attempts reached the write step");
+});
+
+test("two requests signing the SAME pdf_id for DIFFERENT charges: the second observes the first's committed write", async () => {
+    // Real interleaving (two overlapping requests) is what the pdfId lock
+    // defends against; this drives it through two SEQUENTIAL POSTs against the
+    // SAME fake-Prisma state, so the second request's reuse check reads
+    // whatever the first request actually committed — not a pre-seeded
+    // fixture standing in for it.
+    reset();
+    issues.set("bl-9", { id: "ri-9", version: 1, displayDetails: CARDED_DETAILS, clearedAt: null });
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+
+    const first = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(first.status, 200);
+    assert.deepEqual(await first.json(), { ok: true, cleared: true, memoRecorded: true, targetKey: "bl-1" });
+    assert.equal(issues.get("bl-1")!.displayDetails!.includes('"pdfId":"1sEISJBJaGRYpivooQJBR"'), true, "the fake actually persisted the first write");
+
+    const second = await post({ fingerprint: "pb-bl-9", signed: true, pdf_id: FILE_ID });
+    assert.equal(second.status, 409, "the second request's reuse check sees the first request's own write");
+    const payload = await second.json() as { ok: boolean; reason: string };
+    assert.equal(payload.ok, false);
+    assert.equal(payload.reason, "artifact-reused");
+    // Only the FIRST request's resolution was ever written.
+    assert.equal(writes.length, 1);
+});
+
+// ── The amount is matched EXACTLY, not by substring (Codex round-2 gate, finding 2) ──
+
+test("a PDF named for a SUPERSET amount ($112.34) does not satisfy a $12.34 charge", async () => {
+    // `name.includes("12.34")` used to let "...112.34..." through: the target
+    // digits are a substring of a completely different dollar amount.
+    reset();
+    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1 }] }), clearedAt: null });
+    probeResult = {
+        kind: "found",
+        id: FILE_ID,
+        name: "MissingReceiptAffidavit_2026-08-16_LOWES_112.34_CJ.pdf",
+        trashed: false,
+        webViewLink: null,
+        mimeType: "application/pdf",
+    };
+    const res = await post({ fingerprint: "pb-bl-small", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 422);
+    assert.equal((await res.json() as { reason: string }).reason, "artifact-mismatch");
+    assert.deepEqual(writes, []);
+});
+
+test("a PDF named with an extra trailing digit ($12.345) does not satisfy a $12.34 charge", async () => {
+    // The amount field's own shape is always two decimal places; a third
+    // digit is not "close enough", it is a different, unparseable field.
+    reset();
+    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1 }] }), clearedAt: null });
+    probeResult = {
+        kind: "found",
+        id: FILE_ID,
+        name: "MissingReceiptAffidavit_2026-08-16_LOWES_12.345_CJ.pdf",
+        trashed: false,
+        webViewLink: null,
+        mimeType: "application/pdf",
+    };
+    const res = await post({ fingerprint: "pb-bl-small", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 422);
+    assert.equal((await res.json() as { reason: string }).reason, "artifact-mismatch");
+    assert.deepEqual(writes, []);
+});
+
+test("the EXACT amount field, and nothing else, satisfies the charge", async () => {
+    reset();
+    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1 }] }), clearedAt: null });
+    probeResult = {
+        kind: "found",
+        id: FILE_ID,
+        name: "MissingReceiptAffidavit_2026-08-16_LOWES_12.34_CJ.pdf",
+        trashed: false,
+        webViewLink: null,
+        mimeType: "application/pdf",
+    };
+    const res = await post({ fingerprint: "pb-bl-small", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 200);
     assert.equal(JSON.parse(writes[0].displayDetails as string).resolution, "memo-signed");
 });

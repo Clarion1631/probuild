@@ -411,9 +411,12 @@ test("the cron re-verifies against CURRENT receipt evidence, not just the issue'
         join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-request-cards/route.ts"),
         "utf8",
     );
-    // Reused from the nightly sweep rather than a second matcher.
+    // Reused from the nightly sweep rather than a second matcher. `recompute`
+    // defaults to it but is DI'd (Codex PR #443 gate finding 3) so a
+    // component-shared cache and a test double can both stand in for it.
     assert.match(source, /import \{ recomputeCodesFor \} from "@\/app\/api\/cron\/receipt-requests\/route";/);
-    assert.match(source, /await recomputeCodesFor\(row\.targetKey\)/);
+    assert.match(source, /const recompute = deps\.recompute \?\? recomputeCodesFor;/);
+    assert.match(source, /await recompute\(row\.targetKey, cache\)/);
     // Only spent on an item that would otherwise be sent — already dead for a
     // cheaper reason skips the real evidence query.
     assert.match(source, /clearedAt === null && !resolved && !acknowledged/);

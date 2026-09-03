@@ -383,6 +383,15 @@ export async function applyReceiptRequestPlan(
  * bias above is exactly right there too: erring toward NOT sending a chase
  * that might already be answered beats nagging a human for a receipt they
  * already sent.
+ *
+ * `cache`, when supplied, is an OPTIONAL per-run memo (Codex PR #443 gate,
+ * finding 3 in receipt-request-cards): computing one line's verdict already
+ * walks the whole competing COMPONENT and its evidence, so a caller re-asking
+ * for every sibling line in that same component was repeating the identical
+ * traversal once per item. Every member of the resolved component is written
+ * into the cache in one pass — not just the line that was asked about — so a
+ * later call for a sibling's targetKey is a map read instead of a second
+ * `loadCompetingComponent` walk.
  */
 /**
  * The most competing lines one recompute will load before it gives up.
@@ -428,7 +437,12 @@ async function loadCompetingComponent(seed: {
     );
 }
 
-export async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
+export async function recomputeCodesFor(
+    targetKey: string,
+    cache?: Map<string, ReasonCode[]>,
+): Promise<ReasonCode[]> {
+    if (cache?.has(targetKey)) return cache.get(targetKey)!;
+
     const [line, issue] = await Promise.all([
         prisma.bankLine.findUnique({
             where: { id: targetKey },
@@ -443,9 +457,9 @@ export async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]
         }),
     ]);
     // A line that no longer exists cannot owe a receipt.
-    if (!line) return [];
+    if (!line) { cache?.set(targetKey, []); return []; }
     // An answered issue is never re-asked.
-    if (hasResolution(parseMissingReceiptDetails(issue?.displayDetails ?? null))) return [];
+    if (hasResolution(parseMissingReceiptDetails(issue?.displayDetails ?? null))) { cache?.set(targetKey, []); return []; }
 
     // THE COMPLETE COMPETING SET, not this line alone. One-to-one assignment is
     // a property of the batch: two identical charges and one receipt resolve
@@ -463,6 +477,7 @@ export async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]
             // the chase open for a human, which is what a run of hundreds of
             // identical charges needs anyway.
             console.error("[cron/receipt-requests] component too large; leaving the chase open", targetKey, error.message);
+            cache?.set(targetKey, ["MISSING_RECEIPT"]);
             return ["MISSING_RECEIPT"];
         }
         throw error;
@@ -542,6 +557,15 @@ export async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]
             .map(i => i.targetKey),
         now: new Date(),
     });
+    // EVERY member of the component gets its verdict cached here, not just the
+    // one that was asked for — a later call for a sibling's targetKey is then
+    // a map read instead of a second full traversal of this same component.
+    if (cache) {
+        for (const memberId of componentIds) {
+            cache.set(memberId, plan.open.some(o => o.targetKey === memberId) ? ["MISSING_RECEIPT"] : []);
+        }
+        return cache.get(targetKey)!;
+    }
     // Only OUR line's verdict is returned; the rest of the set was recomputed
     // so that verdict is the one the batch would have reached.
     return plan.open.some(o => o.targetKey === targetKey) ? ["MISSING_RECEIPT"] : [];

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
-import { decodeReasonCodes } from "@/lib/review-alert-reasons";
+import { decodeReasonCodes, type ReasonCode } from "@/lib/review-alert-reasons";
 import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasResolution } from "@/lib/receipt-requests";
 import {
     CARD_OWNERS_ASKED,
@@ -88,6 +88,28 @@ const SCAN_MAX_PAGES = 200;
  * belongs to a run that died, and is up for grabs again.
  */
 const CLAIM_LEASE_MS = 10 * 60_000;
+
+/**
+ * The pre-send REVALIDATION budget (Codex PR #443 gate, finding 3), measured
+ * from the top of this invocation. `loadCardItemTruth` calls `recomputeCodesFor`
+ * per item, and each miss walks a whole competing component (up to
+ * `MAX_COMPONENT_LINES` expansions) plus its own evidence queries — a backlog
+ * of several owners' cards, each spanning a few components, can chain past the
+ * cron's `maxDuration = 60` ceiling.
+ *
+ * Once this much of the run is spent, remaining items are treated as NOT
+ * sendable this run rather than risking a mid-write kill: the same
+ * safe-direction bias `recomputeCodesFor`'s own doc comment describes — erring
+ * toward not sending a chase that might already be answered beats a card that
+ * never finishes going out at all. Left with headroom under 60s for the scan,
+ * selection, and the webhook posts themselves, which this budget does not cover.
+ */
+const REVALIDATION_DEADLINE_MS = 45_000;
+
+/** How much of the revalidation budget is left, measured from `startedAt`. */
+function remainingRevalidationBudgetMs(startedAt: number): number {
+    return REVALIDATION_DEADLINE_MS - (Date.now() - startedAt);
+}
 
 async function claim(): Promise<boolean> {
     return prisma.$transaction(async tx => {
@@ -190,9 +212,27 @@ async function scanCandidates(): Promise<{ candidates: CardCandidateIssue[]; pag
  * Current truth for the issues in a claimed snapshot, read right before the
  * send. The shape is exactly what `rebuildCardItems` needs, so the decision
  * itself stays pure and testable.
+ *
+ * `deps.cache` and `deps.recompute` are DI seams (Codex PR #443 gate, finding
+ * 3): the caller passes ONE cache spanning the whole run so a competing
+ * component that straddles two owners' cards is still walked only once, and
+ * tests can substitute a counting fake for `recomputeCodesFor` without a
+ * database. `deps.deadlineExceeded` is checked before each real recompute —
+ * once the run's revalidation budget is gone, remaining items are marked
+ * `revalidationSkipped` rather than spending a query that might not finish.
  */
-async function loadCardItemTruth(issueIds: string[]): Promise<Map<string, CardItemTruth>> {
+export async function loadCardItemTruth(
+    issueIds: string[],
+    deps: {
+        cache?: Map<string, ReasonCode[]>;
+        recompute?: (targetKey: string, cache?: Map<string, ReasonCode[]>) => Promise<ReasonCode[]>;
+        deadlineExceeded?: () => boolean;
+    } = {},
+): Promise<Map<string, CardItemTruth>> {
     if (issueIds.length === 0) return new Map();
+    const cache = deps.cache ?? new Map<string, ReasonCode[]>();
+    const recompute = deps.recompute ?? recomputeCodesFor;
+    const deadlineExceeded = deps.deadlineExceeded ?? (() => false);
     const rows = await prisma.reviewIssue.findMany({
         where: { id: { in: issueIds } },
         select: { id: true, targetKey: true, clearedAt: true, reasonCodes: true, acknowledgedCodes: true, displayDetails: true },
@@ -217,15 +257,27 @@ async function loadCardItemTruth(issueIds: string[]): Promise<Map<string, CardIt
          * queries (component load + evidence), and one already dead for a
          * cheaper reason (cleared/resolved/acknowledged) skips it for free.
          */
-        const evidenceSatisfied = clearedAt === null && !resolved && !acknowledged
-            ? (await recomputeCodesFor(row.targetKey)).length === 0
-            : false;
+        const needsRecompute = clearedAt === null && !resolved && !acknowledged;
+        let evidenceSatisfied = false;
+        let revalidationSkipped = false;
+        if (needsRecompute) {
+            if (deadlineExceeded()) {
+                // ERR TOWARD NOT SENDING. The budget for real re-verification
+                // is gone; sending this item unverified risks nagging someone
+                // for a receipt that already landed, which is the one failure
+                // mode this whole re-check exists to prevent.
+                revalidationSkipped = true;
+            } else {
+                evidenceSatisfied = (await recompute(row.targetKey, cache)).length === 0;
+            }
+        }
         truth.set(row.id, {
             clearedAt,
             acknowledged,
             resolved,
             evidenceSatisfied,
             owner: effectiveOwner(details),
+            ...(revalidationSkipped ? { revalidationSkipped: true } : {}),
         });
     }
     // Ids with no row are simply absent — rebuildCardItems drops them as
@@ -254,6 +306,8 @@ export async function GET(request: Request) {
     if (process.env.RECEIPT_REQUEST_CARDS_ENABLED !== "true") {
         return NextResponse.json({ ok: true, skipped: "disabled" });
     }
+    // The revalidation budget's own clock — see REVALIDATION_DEADLINE_MS.
+    const runStartedAt = Date.now();
     const now = new Date();
     if (!isPacificWeekday(now)) {
         return NextResponse.json({ ok: true, skipped: "weekend" });
@@ -468,6 +522,12 @@ export async function GET(request: Request) {
     // not a quiet day: a 200 here meant nobody was ever told the crew's card
     // did not go out.
     const failures: string[] = [];
+    // ONE cache for the whole run, not one per owner: two owners' cards can
+    // each carry a line from the SAME competing component (same amount,
+    // adjacent dates, different assignees), and a cache scoped to a single
+    // `loadCardItemTruth` call would still repeat that component's walk a
+    // second time for the other owner.
+    const revalidationCache = new Map<string, ReasonCode[]>();
     for (const { card: claimedCard, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
         // RE-VERIFY UNDER THE CLAIM, IMMEDIATELY BEFORE THE SEND.
         //
@@ -476,7 +536,10 @@ export async function GET(request: Request) {
         // signed memo arriving, or Marge reassigning it all happen in that
         // window, and the card went out regardless. Asking somebody for a
         // receipt they already sent is how the list becomes noise.
-        const truth = await loadCardItemTruth(claimedCard.items.map(item => item.issueId));
+        const truth = await loadCardItemTruth(claimedCard.items.map(item => item.issueId), {
+            cache: revalidationCache,
+            deadlineExceeded: () => remainingRevalidationBudgetMs(runStartedAt) <= 0,
+        });
         const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner);
         for (const drop of rebuilt.dropped) dropped.push({ owner: claimedCard.owner, ...drop });
 

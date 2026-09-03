@@ -438,9 +438,23 @@ export interface CardItemTruth {
     evidenceSatisfied: boolean;
     /** Who owns it NOW — a human may have reassigned it since selection. */
     owner: string;
+    /**
+     * Re-verification did not run for this item because the run's
+     * revalidation budget was already spent (Codex PR #443 gate, finding 3).
+     * Err toward not sending: an unverified item is dropped rather than risk
+     * asking for a receipt that already landed.
+     */
+    revalidationSkipped?: boolean;
 }
 
-export type CardItemDropReason = "missing" | "cleared" | "acknowledged" | "resolved" | "evidence-found" | "owner-changed";
+export type CardItemDropReason =
+    | "missing"
+    | "cleared"
+    | "acknowledged"
+    | "resolved"
+    | "evidence-found"
+    | "owner-changed"
+    | "revalidation-deadline";
 
 export interface RebuiltCard {
     items: CardItem[];
@@ -479,17 +493,19 @@ export function rebuildCardItems(
         const current = truth.get(item.issueId);
         const reason: CardItemDropReason | null = !current
             ? "missing"
-            : current.clearedAt !== null
-                ? "cleared"
-                : current.resolved
-                    ? "resolved"
-                    : current.evidenceSatisfied
-                        ? "evidence-found"
-                        : current.acknowledged
-                            ? "acknowledged"
-                            : current.owner !== owner
-                                ? "owner-changed"
-                                : null;
+            : current.revalidationSkipped
+                ? "revalidation-deadline"
+                : current.clearedAt !== null
+                    ? "cleared"
+                    : current.resolved
+                        ? "resolved"
+                        : current.evidenceSatisfied
+                            ? "evidence-found"
+                            : current.acknowledged
+                                ? "acknowledged"
+                                : current.owner !== owner
+                                    ? "owner-changed"
+                                    : null;
         if (reason) {
             dropped.push({ issueId: item.issueId, reason });
             continue;

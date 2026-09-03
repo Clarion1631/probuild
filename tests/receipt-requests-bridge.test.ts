@@ -176,7 +176,11 @@ test("the answers route never clears an issue whose resolution did not commit", 
 
     // Retry ONCE from a fresh read, not a reapplied snapshot.
     assert.match(source, /for \(let attempt = 0; attempt < 2/);
-    assert.match(source, /const issue = await prisma\.reviewIssue\.findUnique\(/);
+    // Codex round-2 gate, finding 1: the read (and the reuse check, and the
+    // write) all run inside the SAME pdfId-locked transaction, on every
+    // attempt — not a plain `prisma.*` read outside any lock.
+    assert.match(source, /await tx\.\$executeRaw`SELECT pg_advisory_xact_lock\(hashtext\(\$\{`memo-pdf:\$\{pdfId\}`\}\)\)`;/);
+    assert.match(source, /const issue = await tx\.reviewIssue\.findUnique\(/);
     // Round 4 item 3: the write is NOT gated on clearedAt any more — a valid
     // signature is evidence whatever the issue's current state.
     assert.match(source, /where: \{ id: issue\.id, version: issue\.version \}/);
@@ -193,9 +197,11 @@ test("the sweep recomputes source truth on an OCC retry instead of reapplying a 
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     assert.match(source, /recomputeCodes: \(\) => recomputeCodesFor\(targetKey\)/);
     // The recompute reads the line and the evidence again, and honours a
-    // resolution that landed since.
-    assert.match(source, /async function recomputeCodesFor\(targetKey: string\)/);
-    assert.match(source, /if \(hasResolution\(parseMissingReceiptDetails\(issue\?\.displayDetails \?\? null\)\)\) return \[\];/);
+    // resolution that landed since. `cache` is an OPTIONAL second param (Codex
+    // PR #443 gate finding 3 in receipt-request-cards) — this call site still
+    // passes only `targetKey`, so its per-call behaviour is unchanged.
+    assert.match(source, /async function recomputeCodesFor\(\s*targetKey: string,\s*cache\?: Map<string, ReasonCode\[\]>,\s*\): Promise<ReasonCode\[\]> \{/);
+    assert.match(source, /if \(hasResolution\(parseMissingReceiptDetails\(issue\?\.displayDetails \?\? null\)\)\) \{ cache\?\.set\(targetKey, \[\]\); return \[\]; \}/);
 });
 
 test("the missing-receipt loader pages when an owner filter is set", () => {
@@ -219,7 +225,7 @@ test("a signed memo is recorded even when the issue was already auto-closed", ()
     assert.match(source, /where: \{ id: issue\.id, version: issue\.version \}/);
     assert.doesNotMatch(source, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
     // A cleared issue still gets the record, and is not re-cleared.
-    assert.match(source, /alreadyCleared = issue\.clearedAt !== null;/);
+    assert.match(source, /alreadyCleared: issue\.clearedAt !== null/);
     assert.match(source, /alreadyCleared: true, memoRecorded: true/);
 });
 
@@ -709,8 +715,11 @@ test("the card snapshot is re-verified under the claim, immediately before the s
     const markAt = source.indexOf('data: { status: "POSTING", itemsJson: JSON.stringify(card.items) }');
     const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
     assert.ok(rebuildAt > 0 && markAt > rebuildAt && postAt > markAt);
-    // The truth is read fresh, not carried from the selection scan.
-    assert.match(source, /async function loadCardItemTruth\(issueIds: string\[\]\)/);
+    // The truth is read fresh, not carried from the selection scan. It is
+    // EXPORTED, and takes `cache`/`recompute`/`deadlineExceeded` DI seams
+    // (Codex PR #443 gate finding 3) so a run-wide cache and a test double can
+    // both stand in without a database.
+    assert.match(source, /export async function loadCardItemTruth\(\s*issueIds: string\[\],/);
     assert.match(source, /where: \{ id: \{ in: issueIds \} \}/);
     // An empty rebuild DELETES the row, so the owner's day is not consumed by
     // a slot that can never be posted.
