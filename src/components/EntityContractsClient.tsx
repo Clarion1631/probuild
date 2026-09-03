@@ -561,12 +561,21 @@ export default function EntityContractsClient({
         setPrinting(true);
         try {
             const escapeHtml = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-            const projectId = entity.type === "project" ? entity.id : null;
-            const leadId = entity.type === "lead" ? entity.id : null;
-            const mergeData = await getResolvedMergePreview(projectId, leadId);
-            // Merge values are inserted raw (payment_schedule is a formatted <table>);
-            // the DOMPurify pass below sanitizes the whole document.
-            const fill = (key: string): string | null => (key in mergeData ? (mergeData[key] || "") : null);
+            // Resolve against the contract's own job, not the surrounding page — this
+            // list also shows contracts owned by the linked lead/project.
+            const ownProjectId: string | null = editingContract.projectId ?? null;
+            const ownLeadId: string | null = editingContract.leadId ?? null;
+            const mergeData = (ownProjectId || ownLeadId)
+                ? await getResolvedMergePreview(ownProjectId, ownLeadId)
+                : await getResolvedMergePreview(entity.type === "project" ? entity.id : null, entity.type === "lead" ? entity.id : null);
+            // payment_schedule is a formatted <table> and is inserted raw (DOMPurify
+            // sanitizes the whole document below); every other value is plain text.
+            const RAW_HTML_FIELDS = new Set(["payment_schedule"]);
+            const fill = (key: string): string | null => {
+                if (!(key in mergeData)) return null;
+                const v = mergeData[key] || "";
+                return RAW_HTML_FIELDS.has(key) ? v : escapeHtml(v);
+            };
             const line = (label: string, width: number) =>
                 `<span style="display:inline-block;vertical-align:bottom;margin:6px 8px 0 0;"><span style="display:block;min-width:${width}px;border-bottom:1px solid #334155;height:28px;"></span><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">${label}</span></span>`;
             const contractorDate = editingContract.contractorSignedAt ? fmtDate(editingContract.contractorSignedAt) : "";
@@ -574,8 +583,10 @@ export default function EntityContractsClient({
                 SIGNATURE_BLOCK: line("Client signature", 240),
                 INITIAL_BLOCK: line("Initials", 70),
                 DATE_BLOCK: line("Date", 120),
-                CONTRACTOR_DATE_BLOCK: contractorDate ? `<strong>${contractorDate}</strong>` : line("Date", 120),
-                CONTRACTOR_SIGNATURE_BLOCK: editingContract.contractorSignatureUrl
+                CONTRACTOR_DATE_BLOCK: contractorDate && editBody === (editingContract.body || "") ? `<strong>${contractorDate}</strong>` : line("Date", 120),
+                // Only stamp the stored contractor signature onto the text it actually
+                // signed — unsaved edits print with a blank line (saving clears it anyway).
+                CONTRACTOR_SIGNATURE_BLOCK: editingContract.contractorSignatureUrl && editBody === (editingContract.body || "")
                     ? `<span style="display:inline-block;margin:4px 0;"><img src="${escapeHtml(editingContract.contractorSignatureUrl)}" alt="Contractor Signature" style="height:48px;object-fit:contain;" /><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">Contractor — ${escapeHtml(editingContract.contractorSignedBy || "")}</span></span>`
                     : line("Contractor signature", 240),
             };
