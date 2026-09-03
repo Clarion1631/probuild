@@ -994,7 +994,10 @@ async function persistCollisionVerdict(
                     postDate: isoDateToUtc(postDate), amountCents: credit.amountCents,
                 },
             });
-            await ensureReviewTask(created, reason, "unmatched");
+            const taskId = await ensureReviewTask(created, reason, "unmatched");
+            // Same rule as every other bank review: no task means nobody sees
+            // it, so the row must not stay a quiet `unmatched`.
+            await escalateUnseenBankReview(created, reason, taskId);
         } catch (e: any) {
             // Lost the create race to a concurrent POST of the same day; that
             // row is handled by the branch below on the next pass.
@@ -1028,7 +1031,10 @@ async function persistCollisionVerdict(
     });
     if (claimed.count === 0) return "recorded"; // another worker moved it; its own path decides
     const fresh = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
-    if (fresh && !fresh.officeTaskId) await ensureReviewTask(fresh, reason, status === "reconcile" ? "reconcile" : "unmatched");
+    if (fresh && !fresh.officeTaskId) {
+        const taskId = await ensureReviewTask(fresh, reason, status === "reconcile" ? "reconcile" : "unmatched");
+        if (status !== "reconcile") await escalateUnseenBankReview(fresh, reason, taskId);
+    }
     return "recorded";
 }
 
@@ -1156,6 +1162,12 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
         // daily replay would file the very task the class gate declined to file.
         const heals = !isNotCustomerDepositReason(row.lastError);
         const officeTaskId = heals ? (row.officeTaskId ?? await ensureReviewTask(row, row.lastError ?? kind, kind)) : row.officeTaskId;
+        // A replay that STILL cannot file the task must not keep answering
+        // "unmatched, all handled" every day for a review nobody can see.
+        if (heals && row.status === "unmatched") {
+            const escalated = await escalateUnseenBankReview(row, row.lastError ?? kind, officeTaskId);
+            if (escalated) return { kind: "settled", response: escalated };
+        }
         return { kind: "settled", response: NextResponse.json({ ok: true, status: row.status, reason: row.lastError, officeTaskId }) };
     }
 
@@ -1546,21 +1558,41 @@ async function finalizeUnmatched(
     const fileTask = opts.fileTask ?? true;
     const officeTaskId = fileTask ? (row.officeTaskId ?? await ensureReviewTask(row, reason, "unmatched")) : row.officeTaskId;
 
-    // A SWEPT credit that needs a human but has no task is invisible: the bot is
-    // unattended, the row is terminal, and nothing would ever surface it. Record
-    // it as `reconcile` instead, which the batch tallies as unresolved and the
-    // runner turns into a non-zero exit — a noisy failure beats a silent one.
-    // (The photo path is unchanged: its files also park in Drive's _Needs
-    // Review, so a missing task there is not the same dead end.)
-    if (fileTask && !officeTaskId && row.source === BANK_DEPOSIT_SOURCE) {
-        const escalated = `${reason} — AND the review task could not be filed, so nothing would have surfaced this`;
-        await prisma.depositIngest.update({
-            where: { id: row.id },
-            data: { status: "reconcile", lastError: escalated.slice(0, 1000) },
-        });
-        return NextResponse.json({ ok: true, status: "reconcile", reason: escalated, officeTaskId: null });
+    if (fileTask) {
+        const escalated = await escalateUnseenBankReview(row, reason, officeTaskId);
+        if (escalated) return escalated;
     }
     return NextResponse.json({ ok: true, status: "unmatched", reason, officeTaskId });
+}
+
+/**
+ * A SWEPT credit that needs a human but has NO OfficeTask is invisible: the bot
+ * is unattended, the row is terminal, and nothing anywhere would ever surface
+ * it. Record it as `reconcile` instead — the batch tallies that as unresolved
+ * and the runner turns it into a non-zero exit. A noisy failure beats a silent
+ * one, and this is the money path.
+ *
+ * Every bank route that files a task goes through here — the match paths, the
+ * collision preflight, and the replay healer — because "we asked a human" is
+ * only true if the asking actually happened.
+ *
+ * The photo path is deliberately exempt: its files also park in Drive's
+ * `_Needs Review` folder, so a missing task there is not the same dead end.
+ *
+ * Returns the response to send, or null when nothing needed escalating.
+ */
+async function escalateUnseenBankReview(
+    row: DepositIngest,
+    reason: string,
+    officeTaskId: string | null,
+): Promise<NextResponse | null> {
+    if (officeTaskId || row.source !== BANK_DEPOSIT_SOURCE) return null;
+    const escalated = `${reason} — AND the review task could not be filed, so nothing would have surfaced this`;
+    await prisma.depositIngest.update({
+        where: { id: row.id },
+        data: { status: "reconcile", lastError: escalated.slice(0, 1000) },
+    });
+    return NextResponse.json({ ok: true, status: "reconcile", reason: escalated, officeTaskId: null });
 }
 
 async function finalizeReconcile(row: DepositIngest, reason: string, opts: { nullReservation?: boolean }): Promise<NextResponse> {

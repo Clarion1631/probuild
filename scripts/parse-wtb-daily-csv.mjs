@@ -557,11 +557,21 @@ export function sweepCreditLine(credit, amount) {
     return `${credit?.bankReference} ${money}: ${credit?.status} — ${credit?.reason ?? ""}`;
 }
 
-/** True when this credit needs to appear in the job log: everything that is
- *  not finished with, PLUS `unmatched` (a clean batch outcome, but the one a
- *  human is being asked to act on). */
+/**
+ * True when this credit needs to appear in the job log.
+ *
+ * Everything that is not finished with, PLUS the two CLEAN outcomes a human
+ * still has to act on:
+ *   - `unmatched` — the sweep could not place the money and asked for help;
+ *   - `proposed`  — suggest-only mode (or the 2-day wait) matched it but did
+ *     not book it. Until the /automation panel grows a confirm button, this log
+ *     line IS the operator's worklist, so it must carry the candidate.
+ * Neither is a job failure; both are things somebody must look at.
+ */
 export function sweepCreditNeedsAttention(credit) {
-    return credit?.status === "unmatched" || !CLEAN_SWEEP_STATUSES.includes(credit?.status);
+    return credit?.status === "unmatched"
+        || credit?.status === "proposed"
+        || !CLEAN_SWEEP_STATUSES.includes(credit?.status);
 }
 
 /** The statuses that mean a credit is finished with. Mirrors

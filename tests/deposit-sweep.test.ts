@@ -1411,6 +1411,45 @@ test("M3: the SYNC path suppresses the client receipt on its own when a bank dep
         assert.equal(tables.paymentNotification.rows[0].suppressClientReceipt, true);
     });
 
+    await t.test("a merely PROCESSING bank row does not suppress — it has not touched the money", async () => {
+        // A bank row is `processing` from the moment it is claimed, before any
+        // match and before any QuickBooks request. If the client pays the
+        // Intuit link in that window, that settle is NOT the sweep's and the
+        // client must still get their receipt.
+        seedSettleFixture("sched-merely-processing");
+        tables.depositIngest.rows.push({
+            id: "bank-processing", fileId: bankFileId("REF-PROCESSING"), status: "processing", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-PROCESSING", extracted: "{}", attempts: 1, amountCents: 10_000,
+            postDate: utc(SETTLED_DAY), paymentScheduleId: "sched-merely-processing",
+            processingStartedAt: new Date(), updatedAt: new Date(),
+        });
+
+        await settleMilestoneFromQBPayment({
+            paymentScheduleId: "sched-merely-processing", invoiceId: "inv-settle",
+            qbPaymentId: "qb-payment-from-the-client", paidAt: new Date(), referenceNumber: "9999",
+        });
+        assert.notEqual(
+            tables.paymentNotification.rows[0].suppressClientReceipt, true,
+            "an unrelated payment must not lose its receipt to a sweep that had not started",
+        );
+    });
+
+    await t.test("…but once the sweep has reached QuickBooks, it does", async () => {
+        seedSettleFixture("sched-at-qbo");
+        tables.depositIngest.rows.push({
+            id: "bank-at-qbo", fileId: bankFileId("REF-AT-QBO"), status: "qbo_unknown", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-AT-QBO", extracted: "{}", attempts: 1, amountCents: 10_000,
+            postDate: utc(SETTLED_DAY), paymentScheduleId: "sched-at-qbo",
+            qbRequestPayload: "{}", processingStartedAt: new Date(), updatedAt: new Date(),
+        });
+
+        await settleMilestoneFromQBPayment({
+            paymentScheduleId: "sched-at-qbo", invoiceId: "inv-settle",
+            qbPaymentId: "qb-payment-recovered", paidAt: new Date(), referenceNumber: "REF-AT-QBO",
+        });
+        assert.equal(tables.paymentNotification.rows[0].suppressClientReceipt, true);
+    });
+
     await t.test("a TERMINAL-but-unmatched bank row does not suppress — it owns nothing", async () => {
         seedSettleFixture("sched-released");
         tables.depositIngest.rows.push({
@@ -1681,6 +1720,62 @@ test("P1: the preflight leaves an ACTIVE worker alone, and a cancelled one stops
             assert.equal(depositRow("REF-CANCELLED")!.qbRequestPayload ?? null, null, "no request body was persisted");
         } finally {
             fakeQuickbooks.buildQBPaymentRequest = realBuild;
+        }
+    });
+});
+
+test("B1: a COLLISION that cannot file its task is unresolved too, not a quiet unmatched", async t => {
+    await t.test("the preflight's own task create fails", async () => {
+        seedMilestone({ amount: 9191.91 });
+        // Fail ONLY the two preflight creates, then let the board recover. If
+        // the preflight ignored its own failure, the per-credit loop's healer
+        // would quietly file the task a moment later and the batch would answer
+        // a clean `unmatched` — so a test that fails every create cannot tell
+        // the two implementations apart. This one can.
+        const realCreate = tables.officeTask.create;
+        let failuresLeft = 2;
+        (tables.officeTask as Row).create = async (args: { data: Row }) => {
+            if (failuresLeft-- > 0) throw new Error("office board is on fire");
+            return realCreate.call(tables.officeTask, args);
+        };
+        try {
+            const { body } = await post(bankBatch([
+                { ref: "REF-COLL-A", amount: 9191.91 },
+                { ref: "REF-COLL-B", amount: 9191.91 },
+            ]));
+            for (const ref of ["REF-COLL-A", "REF-COLL-B"]) {
+                const result = creditResult(body, ref);
+                assert.equal(result.status, "reconcile", `${ref}: an invisible collision review is not a finished one`);
+                assert.equal(depositRow(ref)!.status, "reconcile");
+                assert.match(String(depositRow(ref)!.lastError), /review task could not be filed/);
+            }
+            assert.equal(body.counts.reconcile, 2);
+            assert.equal(body.counts.unmatched, 0);
+            assert.equal(body.ok, false, "the runner must fail on it");
+        } finally {
+            (tables.officeTask as Row).create = realCreate;
+        }
+    });
+
+    await t.test("a replay that still cannot file the task keeps saying so", async () => {
+        // The daily re-POST used to answer a clean `unmatched` forever for a
+        // review nobody could see.
+        seedMilestone({ amount: 9292.92 });
+        tables.depositIngest.rows.push({
+            id: "row-taskless", fileId: bankFileId("REF-TASKLESS"), status: "unmatched", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-TASKLESS", extracted: JSON.stringify({ fileId: bankFileId("REF-TASKLESS"), amount: 9292.92 }),
+            attempts: 1, amountCents: 929_292, postDate: utc(SETTLED_DAY),
+            lastError: "2 milestones match", officeTaskId: null, updatedAt: new Date(),
+        });
+        const realCreate = tables.officeTask.create;
+        (tables.officeTask as Row).create = async () => { throw new Error("still on fire"); };
+        try {
+            const { body } = await post(bankBatch([{ ref: "REF-TASKLESS", amount: 9292.92 }]));
+            const result = creditResult(body, "REF-TASKLESS");
+            assert.equal(result.status, "reconcile");
+            assert.equal(body.ok, false);
+        } finally {
+            (tables.officeTask as Row).create = realCreate;
         }
     });
 });

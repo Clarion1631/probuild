@@ -116,19 +116,27 @@ export const CLAIMING_STATUSES = [...RESERVATION_RETAINING_STATUSES, "proposed"]
 export const MONEY_BOUNDARY_CLAIM_STATUSES = [...RESERVATION_RETAINING_STATUSES] as const;
 
 /**
- * Statuses that mean a bank deposit is working on this milestone RIGHT NOW,
- * used to decide receipt suppression when some other caller finishes the
- * settle. Deliberately different from the list above in both directions:
+ * Statuses that mean a bank deposit has ALREADY REACHED QuickBooks for this
+ * milestone, used to decide receipt suppression when some other caller
+ * finishes the settle. Three deliberate boundaries:
  *
+ *   - `qbo_unknown` / `qbo_created` are here: a QuickBooks payment exists (or
+ *     may exist), so a settle landing now is almost certainly the sweep's.
  *   - `reconcile` IS here. A sweep payment parked for manual reconciliation is
  *     still the sweep's money; the client must not be emailed a receipt for it.
- *   - `applied` is NOT here. A finished deposit is history, and history must
- *     not suppress a LATER, unrelated settlement of the same milestone — an
- *     undo-and-repay would otherwise silently swallow the client's receipt
- *     forever. An applied row only suppresses when its own qbPaymentId matches
- *     the payment being settled (see settleMilestoneFromQBPayment).
+ *   - `processing` is NOT here, and this is the subtle one. A bank row is
+ *     `processing` from the moment it is claimed — before any match, before any
+ *     QuickBooks request. Treating that as ownership meant an UNRELATED payment
+ *     settling the same milestone (a client paying the Intuit link while the
+ *     sweep was still deciding) silently lost its receipt. A merely-processing
+ *     row has not touched the money yet, so it gets no say.
+ *   - `applied` is NOT here either. A finished deposit is history, and history
+ *     must not suppress a LATER, unrelated settlement of the same milestone —
+ *     an undo-and-repay would otherwise swallow the client's receipt forever.
+ *     An applied row only suppresses when its own qbPaymentId matches the
+ *     payment being settled (see settleMilestoneFromQBPayment).
  */
-export const MONEY_IN_FLIGHT_STATUSES = ["processing", "qbo_unknown", "qbo_created", "reconcile"] as const;
+export const MONEY_IN_FLIGHT_STATUSES = ["qbo_unknown", "qbo_created", "reconcile"] as const;
 
 /** BankImage.source that scripts/post-bank-images.mjs writes for WTB documents. */
 export const BANK_IMAGE_SOURCE = "WTB_ONLINE";

@@ -149,7 +149,10 @@ async function seedFixture(opts: {
     const paidFields = status === "Paid"
       ? { paidAt: new Date(), paymentDate: new Date(), paymentMethod: "quickbooks" }
       : { paidAt: null, paymentDate: null, paymentMethod: null };
-    const qbInvoiceSentAt = s.requested ? new Date() : null;
+    // Requested 30 days BEFORE anything posts. Stamping "now" put the request
+    // AFTER the credit's post date, which the chronology rule (correctly)
+    // refuses: money cannot pay a bill that had not been sent when it arrived.
+    const qbInvoiceSentAt = s.requested ? new Date(Date.now() - 30 * 86_400_000) : null;
     await prisma.paymentSchedule.upsert({
       where: { id: s.id },
       update: { status, amount: s.amount, qbInvoiceId: s.qbInvoiceId ?? null, qbPaymentId: s.qbPaymentId ?? null, referenceNumber: null, qbInvoiceSentAt, ...paidFields },

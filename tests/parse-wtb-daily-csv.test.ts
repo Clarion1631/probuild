@@ -635,7 +635,23 @@ test("sweep: every credit a human must look at gets its own line, with the money
         assert.equal(sweepCreditNeedsAttention({ status: "failed" }), true);
         assert.equal(sweepCreditNeedsAttention({ status: "qbo_created" }), true, "and anything unknown");
         assert.equal(sweepCreditNeedsAttention({ status: "applied" }), false);
-        assert.equal(sweepCreditNeedsAttention({ status: "proposed" }), false);
+        // Suggest-only mode has no confirm button yet (Phase C), so this log
+        // line IS the operator's worklist.
+        assert.equal(sweepCreditNeedsAttention({ status: "proposed" }), true);
+    });
+
+    await t.test("a proposed credit is named with its candidate milestone", () => {
+        // The endpoint's own reason already carries the candidate, so the
+        // operator gets reference, money, state and "would apply to …" on one
+        // line without the runner having to know anything about milestones.
+        assert.equal(
+            sweepCreditLine({
+                bankReference: "26236015002406",
+                status: "proposed",
+                reason: 'suggest-only: ... would apply to "Rough In complete" (Hoppe Hall Bath, INV-00173)',
+            }, 13447.68),
+            '26236015002406 $13447.68: proposed — suggest-only: ... would apply to "Rough In complete" (Hoppe Hall Bath, INV-00173)',
+        );
     });
 
     await t.test("the line carries reference, amount and reason", () => {
