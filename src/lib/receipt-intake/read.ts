@@ -318,11 +318,26 @@ export async function readReceipt(
             const code = response.status;
 
             if (code === 200) {
-                const json = await response.json().catch(() => null) as
-                    { candidates?: { content?: { parts?: { text?: string }[] } }[] } | null;
+                let json: { candidates?: { content?: { parts?: { text?: string }[] } }[] } | null;
+                try {
+                    json = await response.json() as typeof json;
+                } catch {
+                    // The body could not be read/parsed — an interrupted stream
+                    // (abort, timeout, reset) or a truncated transfer. That is a
+                    // SERVICE fact, not a document fact: the model never actually
+                    // answered, so retry it the same as a network error rather
+                    // than treating a dropped connection as "read and unreadable".
+                    if (attempts >= MAX_RETRIES) break;
+                    const wait = RETRY_BACKOFF_MS[attempts];
+                    attempts++;
+                    if (remaining() <= wait) break;
+                    await sleep(wait);
+                    continue;
+                }
                 const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
-                // The model answered; it just could not turn THIS document into
-                // usable data. Try the next model, then give up decisively.
+                // The model answered with a well-formed response; it just could
+                // not turn THIS document into usable data. Try the next model,
+                // then give up decisively.
                 if (!text) { sawDecisiveFailure = true; break; }
                 const parsed = parseReadJson(text, projectPhases);
                 if (parsed) return { ok: true, read: parsed };

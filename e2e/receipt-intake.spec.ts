@@ -402,16 +402,34 @@ test.describe("intake POST", () => {
         expect(forgedSource.body.reason).toBe("invalid-source");
     });
 
-    test("a session upload gets a server-minted web: sourceRef", async ({ request }) => {
-        const res = await request.post(INTAKE_PATH, {
+    test("a session upload with no uploadId is keyed by CONTENT, so a bare retry is idempotent", async ({ request }) => {
+        // The OLD behavior minted a random uuid here, so a retry with no
+        // client-supplied uploadId — a flaky connection, a double-tap on a
+        // slow spinner — was accepted as a brand new receipt every time. The
+        // fix derives a STABLE key from the bytes themselves, scoped to the
+        // user, so an identical retry collides with the row it already made.
+        const post = () => request.post(INTAKE_PATH, {
             headers: { "content-type": "application/json" },
             data: JSON.stringify({ fileBase64: PNG_BASE64, mimeType: "image/png", fileName: "web.png" }),
             maxRedirects: 0,
         });
-        expect(res.status()).toBe(200);
-        const body = await res.json();
-        expect(body.sourceRef).toMatch(/^web:[0-9a-f-]{36}$/);
-        minted.push(body.id);
+
+        const first = await post();
+        expect(first.status()).toBe(200);
+        const firstBody = await first.json();
+        minted.push(firstBody.id);
+        const sha256 = createHash("sha256").update(Buffer.from(PNG_BASE64, "base64")).digest("hex");
+        expect(firstBody.sourceRef).toMatch(/^session:[^:]+:[0-9a-f]{64}$/);
+        expect(firstBody.sourceRef.endsWith(`:${sha256}`)).toBe(true);
+
+        const second = await post();
+        expect(second.status()).toBe(200);
+        const secondBody = await second.json();
+        expect(secondBody.id).toBe(firstBody.id);
+        expect(secondBody.alreadyReceived).toBe(true);
+
+        const rows = await prisma.receiptIntake.findMany({ where: { sourceRef: firstBody.sourceRef } });
+        expect(rows).toHaveLength(1);
     });
 
     test("a secret caller may not declare a USER source", async ({ request }) => {
@@ -559,7 +577,7 @@ test.describe("archive callback", () => {
         });
         const unauthed = await anonymous.post(`${INTAKE_PATH}/${id}/archived`, {
             headers: { "content-type": "application/json" },
-            data: JSON.stringify({ driveFileId: "DRIVE1" }),
+            data: JSON.stringify({ driveFileId: "DRIVE1FILE" }),
             maxRedirects: 0,
         });
         expect(unauthed.status()).toBe(401);
@@ -569,14 +587,14 @@ test.describe("archive callback", () => {
         // can know that a file now exists in Drive.
         const sessionAttempt = await request.post(`${INTAKE_PATH}/${id}/archived`, {
             headers: { "content-type": "application/json" },
-            data: JSON.stringify({ driveFileId: "DRIVE1" }),
+            data: JSON.stringify({ driveFileId: "DRIVE1FILE" }),
             maxRedirects: 0,
         });
         expect(sessionAttempt.status()).toBe(401);
 
         const notBooked = await anonymous.post(`${INTAKE_PATH}/${id}/archived`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": ARCHIVE_SECRET },
-            data: JSON.stringify({ driveFileId: "DRIVE1" }),
+            data: JSON.stringify({ driveFileId: "DRIVE1FILE" }),
             maxRedirects: 0,
         });
         expect(notBooked.status()).toBe(409);
@@ -588,17 +606,17 @@ test.describe("archive callback", () => {
             maxRedirects: 0,
         });
 
-        const ok = await archive("DRIVE1");
+        const ok = await archive("DRIVE1FILE");
         expect(ok.status()).toBe(200);
         const row = await prisma.receiptIntake.findUnique({ where: { id } });
         expect(row?.state).toBe("ARCHIVED");
-        expect(row?.archiveDriveFileId).toBe("DRIVE1");
+        expect(row?.archiveDriveFileId).toBe("DRIVE1FILE");
 
         // IDEMPOTENT REPLAY. The mirror POSTs after writing the Drive file, so a
         // lost response leaves it holding a file it cannot confirm. Re-sending
         // the same id is the correct retry: a 409 would make the script treat
         // its own successful archive as a failure.
-        const replay = await archive("DRIVE1");
+        const replay = await archive("DRIVE1FILE");
         expect(replay.status()).toBe(200);
         expect((await replay.json()).alreadyArchived).toBe(true);
 
@@ -606,14 +624,14 @@ test.describe("archive callback", () => {
         // and the loser's conditional update matches nothing. The loser must
         // re-read and report success — a 409 there made the mirror treat its
         // OWN successful archive as a failure.
-        const [a, b] = await Promise.all([archive("DRIVE1"), archive("DRIVE1")]);
+        const [a, b] = await Promise.all([archive("DRIVE1FILE"), archive("DRIVE1FILE")]);
         expect([a.status(), b.status()]).toEqual([200, 200]);
 
         // A DIFFERENT file id on an archived row is not a replay — two Drive
         // copies exist and somebody has to say which one counts.
-        const conflicting = await archive("DRIVE2");
+        const conflicting = await archive("DRIVE2FILE");
         expect(conflicting.status()).toBe(409);
-        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.archiveDriveFileId).toBe("DRIVE1");
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.archiveDriveFileId).toBe("DRIVE1FILE");
 
         await anonymous.dispose();
     });
@@ -625,10 +643,48 @@ test.describe("archive callback", () => {
         });
         const res = await machine.post(`${INTAKE_PATH}/no-such-row/archived`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": ARCHIVE_SECRET },
-            data: JSON.stringify({ driveFileId: "DRIVE1" }),
+            data: JSON.stringify({ driveFileId: "DRIVE1FILE" }),
             maxRedirects: 0,
         });
         expect(res.status()).toBe(404);
+        await machine.dispose();
+    });
+
+    test("an implausible driveFileId is refused, and leaves the row untouched", async ({ request, playwright }) => {
+        // "Any non-empty string" let a single stray character become the
+        // permanent archive identity for a row. This value is held to the SAME
+        // shape a `drive` sourceRef's tail is (intake-core.ts SOURCE_REF_PATTERNS),
+        // since it lands in the same place: logs, equality checks, and
+        // `archiveDriveFileId`.
+        const ref = `${REF_PREFIX}archive-invalid`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        const id = created.body.id;
+        await prisma.receiptIntake.update({ where: { id }, data: { state: "BOOKED" } });
+
+        const machine = await playwright.request.newContext({
+            baseURL: "http://localhost:3000",
+            storageState: { cookies: [], origins: [] },
+        });
+        const post = (driveFileId: unknown) => machine.post(`${INTAKE_PATH}/${id}/archived`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": ARCHIVE_SECRET },
+            data: JSON.stringify({ driveFileId }),
+            maxRedirects: 0,
+        });
+
+        const tooShort = await post("x");
+        expect(tooShort.status()).toBe(400);
+        expect((await tooShort.json()).reason).toBe("invalid-driveFileId");
+
+        const tooLong = await post("a".repeat(200));
+        expect(tooLong.status()).toBe(400);
+        expect((await tooLong.json()).reason).toBe("invalid-driveFileId");
+
+        // Neither attempt moved the row at all.
+        const row = await prisma.receiptIntake.findUnique({ where: { id } });
+        expect(row?.state).toBe("BOOKED");
+        expect(row?.archiveDriveFileId).toBeNull();
+
         await machine.dispose();
     });
 });
@@ -799,9 +855,17 @@ test.describe("cutover retirement needs evidence, not just an old timestamp", ()
     test("a SESSION caller cannot claim v1 already booked something", async ({ request }) => {
         // That flag is what excuses v2 from booking a document. Only a
         // shared-secret forwarder may assert it.
+        //
+        // A distinct uploadId here (rather than relying on the no-uploadId
+        // content key) keeps this row independent of the identical PNG_BASE64
+        // bytes other session-auth tests in this file upload — this test is
+        // about archivedByV1, not about content-based idempotency.
         const res = await request.post(INTAKE_PATH, {
             headers: { "content-type": "application/json" },
-            data: JSON.stringify({ fileBase64: PNG_BASE64, mimeType: "image/png", archivedByV1: true }),
+            data: JSON.stringify({
+                fileBase64: PNG_BASE64, mimeType: "image/png", archivedByV1: true,
+                uploadId: "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
+            }),
             maxRedirects: 0,
         });
         expect(res.status()).toBe(200);
@@ -983,11 +1047,29 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
             maxRedirects: 0,
         });
         expect(first.status()).toBe(200);
-        const { id, storagePath } = await first.json();
+        const { id } = await first.json();
         minted.push(id);
+
+        // The row must actually HOLD its document, because `alreadyReceived` is
+        // now answered from the bucket and not from the row alone — the
+        // forwarder deletes its only copy on that answer, so /start confirms
+        // the object is really there first. /start never carries bytes and this
+        // spec cannot PUT to a signed URL, so the object is seeded the same way
+        // the two cases above do it: real bytes stored by the single-shot
+        // route, and the row pointed at them.
+        const seeded = await request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: intakeBody({ sourceRef: `${REF_PREFIX}swept-notrecoverable-src` }),
+            maxRedirects: 0,
+        });
+        expect(seeded.status()).toBe(200);
+        const seededRow = await prisma.receiptIntake.findUnique({ where: { id: (await seeded.json()).id } });
+        minted.push(seededRow!.id);
+        const storagePath = seededRow!.storagePath;
+
         await prisma.receiptIntake.update({
             where: { id },
-            data: { state: "NEEDS_REVIEW", stateReason: "vendor-mismatch" },
+            data: { state: "NEEDS_REVIEW", stateReason: "vendor-mismatch", storagePath },
         });
 
         const again = await request.post(startPath, {
@@ -1112,6 +1194,127 @@ test.describe("round-9 intake contracts", () => {
         expect(rows).toHaveLength(0);
     });
 
+    test("every sourceRef rule /start enforces, the inline endpoint enforces IDENTICALLY", async ({ request }) => {
+        // The inline endpoint used to check only the NAMESPACE PREFIX while
+        // /start ran decideSource(), so a secret caller could push a shape
+        // /start refuses through the other door: junk QuickBooks identities
+        // (a `drive` row books under its tail) and oversized values headed for
+        // a UNIQUE index.
+        //
+        // Prefix-only validation accepts every row below, which is why "both
+        // return 400" is not the assertion. The doors must agree on the REASON
+        // too — a forwarder that can tell them apart will learn to prefer the
+        // lenient one, and that is how the two implementations drifted in the
+        // first place.
+        const refused: Array<[string, string, string]> = [
+            // Right namespace, wrong SHAPE — precisely what a prefix check misses.
+            // One email message can carry several receipts, so the message id
+            // alone is not an identity.
+            ["email", "email:1993f0a3c9c4d0d2", "invalid-sourceRef"],
+            ["email", "email:1993f0a3c9c4d0d2:NOTHEX0123456789", "invalid-sourceRef"],
+            // A Chat ref without its attachment index, and one whose resource
+            // name is not a resource name.
+            ["chat", "chat:spaces/AAQANF47osY/messages/abc.def", "invalid-sourceRef"],
+            ["chat", "chat:not-a-resource-name:0", "invalid-sourceRef"],
+            // Control characters and whitespace: this value is echoed into logs
+            // and compared for equality. A LEADING one is deliberately not a
+            // case here — both doors trim before validating, and that agreement
+            // is itself part of the parity.
+            ["drive", "drive:1AbCdEfGh IjKlMnOp", "invalid-sourceRef"],
+            ["drive", "drive:1AbCdEfGh\u0001IjKlMnOp", "invalid-sourceRef"],
+            // Oversized, in a namespace the drive-only case above does not reach.
+            ["email", `email:${"a".repeat(600)}:0f1e2d3c4b5a6978`, "sourceRef-too-long"],
+            // A well-formed ref, in a namespace the caller did not declare.
+            ["drive", "email:1993f0a3c9c4d0d2:0f1e2d3c4b5a6978", "sourceRef-namespace-mismatch"],
+        ];
+
+        for (const [source, sourceRef, reason] of refused) {
+            const label = `${source} / ${JSON.stringify(sourceRef).slice(0, 64)}`;
+            const inline = await postIntake(request, intakeBody({ source, sourceRef }));
+            const started = await start(request, {
+                source, sourceRef, mimeType: "image/png", sha256: sha(PNG_BASE64),
+            });
+            expect(inline.res.status(), `inline ${label}`).toBe(400);
+            expect(started.status(), `start ${label}`).toBe(400);
+            expect(inline.body.reason, `inline ${label}`).toBe(reason);
+            expect((await started.json()).reason, `start ${label}`).toBe(reason);
+        }
+
+        // Neither door created a row for any of them. A 400 that still inserts
+        // is the oversized-unique-index half of the finding.
+        const rows = await prisma.receiptIntake.findMany({
+            where: { sourceRef: { in: refused.map(([, sourceRef]) => sourceRef) } },
+            select: { sourceRef: true },
+        });
+        expect(rows).toHaveLength(0);
+    });
+
+    test("a settled row whose object is GONE is 409 file-missing, never a cheerful 200", async ({ request }) => {
+        // Both replay paths used to answer success from the row alone. The
+        // forwarders treat that as permission to delete their only copy, so a
+        // row whose object had vanished got a 200 and the receipt ceased to
+        // exist anywhere.
+        const ref = `${REF_PREFIX}settled-gone`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        const id = created.body.id;
+        minted.push(id);
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.state).toBe("RECEIVED");
+
+        // Point the settled row at a path nothing was ever written to.
+        await prisma.receiptIntake.update({
+            where: { id },
+            data: { storagePath: `receipts/intake/${id}.vanished.png` },
+        });
+
+        // /finalize: the alreadyFinalized path.
+        const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: "{}",
+            maxRedirects: 0,
+        });
+        expect(finalized.status()).toBe(409);
+        const finalBody = await finalized.json();
+        expect(finalBody.error).toBe("file-missing");
+        expect(finalBody.retryable).toBe(true);
+
+        // /start: the alreadyReceived path, same sourceRef.
+        const started = await request.post(`${INTAKE_PATH}/start`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({
+                source: "drive", sourceRef: ref, mimeType: "image/png",
+                sha256: createHash("sha256").update(Buffer.from(PNG_BASE64, "base64")).digest("hex"),
+            }),
+            maxRedirects: 0,
+        });
+        expect(started.status()).toBe(409);
+        const startBody = await started.json();
+        expect(startBody.error).toBe("file-missing");
+        expect(startBody.retryable).toBe(true);
+        expect(startBody.uploadUrl).toBeUndefined();
+
+        // The row is untouched by either refusal.
+        const after = await prisma.receiptIntake.findUnique({ where: { id } });
+        expect(after?.state).toBe("RECEIVED");
+    });
+
+    test("a settled row that DOES still have its object replays as success", async ({ request }) => {
+        // The control: without it both refusals above would pass against an
+        // endpoint that had simply stopped answering 200 at all.
+        const ref = `${REF_PREFIX}settled-present`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        const finalized = await request.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: "{}",
+            maxRedirects: 0,
+        });
+        expect(finalized.status()).toBe(200);
+        expect((await finalized.json()).alreadyFinalized).toBe(true);
+    });
+
     test("a text receipt is refused with a 415 that says what to send instead", async ({ request }) => {
         // QuickBooks cannot attach a .txt, so accepting one meant reading it and
         // then stranding it unbookable mid-pipeline.
@@ -1203,6 +1406,72 @@ test.describe("round-10 finalize authorization and recovery", () => {
             data: JSON.stringify(body),
             maxRedirects: 0,
         });
+
+    test("truncated JSON in the finalize body is a 400, not silently treated as empty", async ({ request }) => {
+        // req.json() throws on BOTH a genuinely empty body and a malformed
+        // one; a bare try/catch collapsed truncated JSON into "no fields",
+        // which turned a request-level bug into a silent no-op instead of an
+        // error the caller could see and retry against.
+        const created = await postIntake(request, intakeBody({ sourceRef: `${REF_PREFIX}truncjson` }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        // MUST be a Buffer, not a plain string. Playwright's APIRequestContext
+        // treats a STRING `data` sent under an `application/json` content-type
+        // specially: if the string is not itself valid JSON, it silently
+        // re-wraps it with `JSON.stringify()` — turning this truncated body
+        // into a well-formed JSON payload whose value is the truncated text as
+        // a STRING, not the object it looks like. The route's `JSON.parse` then
+        // succeeds (on a string, not an object), every field reads as
+        // `undefined`, and the request looks exactly like a genuinely empty
+        // body — silently defeating the very truncation this test exists to
+        // catch. A Buffer bypasses that re-wrap and puts these exact bytes on
+        // the wire.
+        const res = await request.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: Buffer.from('{"costCodeId": "e2e-mob-cc-demo"', "utf8"), // truncated: missing closing brace
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(400);
+        expect((await res.json()).reason).toBe("invalid-json");
+
+        // Nothing was written: no late field applied and no state change.
+        const row = await prisma.receiptIntake.findUnique({ where: { id: created.body.id } });
+        expect(row?.state).toBe("RECEIVED");
+        expect(row?.costCodeId).toBeNull();
+    });
+
+    test("a JSON body that parses to a non-object is a 400, not silently treated as empty", async ({ request }) => {
+        // `"just a string"` is perfectly valid JSON — JSON.parse succeeds — but
+        // it is not an OBJECT, so body.sha256 / body.costCodeId / body.projectId
+        // all read as undefined off it, identical to a genuinely empty body.
+        // Without an explicit object check this fell through to 200 with
+        // nothing applied — the same silent-no-op shape as the truncated-JSON
+        // case above. A number, boolean, or bare array parses just as cleanly
+        // and would hit the same gap.
+        const created = await postIntake(request, intakeBody({ sourceRef: `${REF_PREFIX}nonobjjson` }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        // Buffer for the same reason as the truncated-JSON case above: a raw
+        // STRING `data` under an application/json content-type gets re-wrapped
+        // by Playwright when it isn't already valid JSON. This payload IS
+        // already valid JSON (a quoted string), so Playwright would send it
+        // as-is either way — the Buffer just keeps this test explicit about
+        // what bytes actually go on the wire.
+        const res = await request.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: Buffer.from('"just a string"', "utf8"),
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(400);
+        expect((await res.json()).reason).toBe("invalid-json");
+
+        // Nothing was written: no late field applied and no state change.
+        const row = await prisma.receiptIntake.findUnique({ where: { id: created.body.id } });
+        expect(row?.state).toBe("RECEIVED");
+        expect(row?.costCodeId).toBeNull();
+    });
 
     test("a session caller cannot attach a project it may not reach", async ({ playwright, request }) => {
         // Without this any authenticated user could file a receipt against any

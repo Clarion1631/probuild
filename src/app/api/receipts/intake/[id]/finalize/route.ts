@@ -5,6 +5,7 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
+import { receiptObjectSize } from "@/lib/receipt-intake/bucket";
 import {
     finalizeDisposition,
     inspectStoredObject,
@@ -27,6 +28,36 @@ import {
 } from "@/lib/receipt-intake/storage-cleanup";
 
 export const dynamic = "force-dynamic";
+
+/**
+ * A "we already have it" answer has to be TRUE.
+ *
+ * Both replay paths used to return success from the row alone. The forwarders
+ * treat that as permission to delete their only copy — so a row whose object had
+ * gone missing (a bad publish, a cleanup that ran on the wrong path, a bucket
+ * incident) got a cheerful 200 and the receipt ceased to exist anywhere.
+ *
+ * Metadata only, and bounded: one small `list` regardless of the object's size.
+ * The three answers are deliberately different — an absence is a 409 the sender
+ * can act on by re-uploading, a storage fault is a 503 it should simply retry,
+ * and only a confirmed presence is success.
+ */
+async function confirmStoredCopy(storagePath: string): Promise<NextResponse | null> {
+    const present = await receiptObjectSize(storagePath);
+    if (present.ok) return null;
+    if (present.kind === "transient") {
+        return NextResponse.json({ ok: false, reason: "storage-unavailable", retryable: true }, { status: 503 });
+    }
+    return NextResponse.json(
+        {
+            ok: false,
+            error: "file-missing",
+            reason: "this row exists but its stored document is gone; send the bytes again",
+            retryable: true,
+        },
+        { status: 409 },
+    );
+}
 
 /**
  * Route adapter over the late-field rules (src/lib/receipt-intake/late-fields.ts).
@@ -117,11 +148,32 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     const { id } = await context.params;
 
+    // A GENUINELY empty body means "no fields" — the declared hash and the
+    // late fields are all optional. But `req.json()` throws on malformed JSON
+    // too, and a bare try/catch could not tell the two apart: a truncated or
+    // corrupted body was silently treated as an empty one, so a request-level
+    // bug never surfaced as an error the caller could see or retry against.
+    // Reading the raw text first is what makes the difference legible: only a
+    // body that is empty (or whitespace) after trimming may mean "no fields".
     let body: { sha256?: unknown; costCodeId?: unknown; projectId?: unknown } = {};
-    try {
-        body = await req.json();
-    } catch {
-        // A finalize with no body is fine — the declared hash is optional.
+    const rawBody = await req.text();
+    if (rawBody.trim()) {
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(rawBody);
+        } catch {
+            return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
+        }
+        // Parsing can SUCCEED on a value that is not "no fields" either: a bare
+        // string, number, boolean, or array is valid JSON, but every field read
+        // off it (body.sha256, body.costCodeId, ...) comes back undefined —
+        // indistinguishable from a genuinely empty body, so it fell through to
+        // the same 200 with nothing applied. Only a plain object can carry late
+        // fields; anything else is refused the same as malformed JSON.
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
+        }
+        body = parsed as typeof body;
     }
     const declaredSha = typeof body.sha256 === "string" ? body.sha256.trim().toLowerCase() : null;
 
@@ -217,6 +269,10 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // floor while telling the caller it worked. Same behaviour as the
     // two-publisher path below, because a caller cannot tell which one it hit.
     if (!recoverable) {
+        // The object first: `alreadyFinalized` is what makes a forwarder drop
+        // its copy, so it must not be said about a row whose bytes are gone.
+        const missing = await confirmStoredCopy(row.storagePath);
+        if (missing) return missing;
         const conflict = await applyLateFields(id, lateFields, auth);
         if (conflict) return conflict;
         // PERSISTED values, re-read after the reconcile — the caller must be
@@ -383,6 +439,16 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             return count;
         },
         dropUpload: uploadPath => deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
+        currentStoragePath: async rowId => {
+            const r = await prisma.receiptIntake.findUnique({ where: { id: rowId }, select: { storagePath: true } });
+            return r?.storagePath ?? null;
+        },
+        // A lost CAS here means another /finalize (or the worker's
+        // stale-STAGING sweep) already published this row while we were
+        // mid-request — best-effort so a slow deleteObjectOrRecord failure
+        // still lands on the same retry queue as every other orphan.
+        dropOrphanedCanonical: canonicalPath =>
+            deleteObjectOrRecord(canonicalPath, "orphaned-lost-publish-cas").then(() => undefined),
     });
 
     if (!outcome) {
@@ -394,11 +460,27 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // or a captured value changed underneath a row that is still waiting to
         // publish, in which case nothing was published and saying otherwise
         // would be a lie the client acts on.
+        //
+        // "Not STAGING" is NOT enough evidence of the first case. A concurrent
+        // /start rearm can move a recoverable NEEDS_REVIEW row onto a fresh
+        // upload lease without ever publishing it — the row is still
+        // NEEDS_REVIEW, but a re-armed upload can genuinely be present at the
+        // (new) storagePath, so `confirmStoredCopy` alone cannot tell "someone
+        // published" from "someone is mid re-upload of something else". The
+        // only positive proof that ANOTHER publisher published THIS content is
+        // that the row's canonical path now equals the one this call itself
+        // just verified (sealAndPublish names it after id+sha+mime) — that
+        // string can only be written by a successful sealAndPublish commit, and
+        // only with these exact bytes.
         const current = await prisma.receiptIntake.findUnique({
             where: { id },
-            select: { state: true, sourceRef: true, projectId: true, dryRun: true },
+            select: { state: true, sourceRef: true, projectId: true, dryRun: true, storagePath: true, fileSha256: true },
         });
-        if (!current || current.state === "STAGING") {
+        const positivelyPublished = !!current
+            && current.state !== "STAGING"
+            && current.storagePath === outcome.canonicalPath
+            && current.fileSha256 === fileSha256;
+        if (!positivelyPublished) {
             return NextResponse.json(
                 {
                     ok: false,
@@ -409,8 +491,12 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 { status: 409 },
             );
         }
-        // Another publisher won. Same outcome for the caller — but the late
-        // fields still have to be reconciled against what that publisher wrote.
+        // Another publisher won, with the SAME content this call verified.
+        // Same outcome for the caller — but the late fields still have to be
+        // reconciled against what that publisher wrote, and the same "do we
+        // actually hold it" rule applies.
+        const missing = await confirmStoredCopy(current.storagePath);
+        if (missing) return missing;
         const reconciled = await applyLateFields(id, lateFields, auth);
         if (reconciled) return reconciled;
         return NextResponse.json({ ok: true, alreadyFinalized: true, id, state: current.state });

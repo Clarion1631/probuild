@@ -11,14 +11,10 @@
 //   node scripts/apply-selection-order-tracking.mjs
 import { PrismaClient } from "@prisma/client";
 import { config } from "dotenv";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-config({ path: join(__dirname, "..", ".env.local") });
-config({ path: join(__dirname, "..", ".env") });
-
-const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
 
 const statements = [
     // ── Decision — order tracking + delivery risk ────────────────────────
@@ -27,15 +23,27 @@ const statements = [
     `ALTER TABLE "Decision" ADD COLUMN IF NOT EXISTS "expectedArrivalAt" TIMESTAMP(3)`,
 ];
 
-try {
-    for (const sql of statements) {
-        await prisma.$executeRawUnsafe(sql);
-        console.log("OK:", sql.split("\n")[0].slice(0, 80));
+async function main() {
+    config({ path: join(__dirname, "..", ".env.local") });
+    config({ path: join(__dirname, "..", ".env") });
+
+    const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
+
+    try {
+        for (const sql of statements) {
+            await prisma.$executeRawUnsafe(sql);
+            console.log("OK:", sql.split("\n")[0].slice(0, 80));
+        }
+        console.log("\nSelection order tracking schema applied successfully.");
+    } catch (e) {
+        console.error("Migration failed:", e);
+        process.exit(1);
+    } finally {
+        await prisma.$disconnect();
     }
-    console.log("\nSelection order tracking schema applied successfully.");
-} catch (e) {
-    console.error("Migration failed:", e);
-    process.exit(1);
-} finally {
-    await prisma.$disconnect();
+}
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+    await main();
 }

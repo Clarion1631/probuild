@@ -37,7 +37,7 @@ import {
 } from "@/lib/qbo-receipt-push";
 import type { AutomationEventInput } from "@/lib/automation-events";
 import type { VerifiedBytes } from "./stored-object";
-import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS } from "./route-state";
+import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS, preservedTaxWarning } from "./route-state";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
 export interface BookableRow {
@@ -70,6 +70,13 @@ export interface BookableRow {
     attempts: number;
     /** Carries a previous attachment failure across a retry — see below. */
     lastError: string | null;
+    /**
+     * Whatever this row currently holds. It is not booking's to interpret in
+     * general — but the BOOKED write needs it to know whether a
+     * "tax-implausible" warning has to survive the transition (see
+     * preservedTaxWarning in route-state.ts).
+     */
+    stateReason: string | null;
     /**
      * True once a QBO create has been ATTEMPTED for this row. It is the only
      * honest answer to "could a Purchase exist?", and it is what decides whether
@@ -210,6 +217,14 @@ export interface BookDependencies {
     isPushEnabled: () => boolean;
     /** Command Center pause switch (pause-only; fail-CLOSED on a read error). */
     isPushPaused: () => Promise<boolean>;
+    /**
+     * RECEIPT_INTAKE_DRYRUN, read FRESH at booking time — not the row's
+     * persisted `dryRun` flag, which is snapshotted once at intake and never
+     * rechecked. A row claimed while the switch was off keeps dryRun=false
+     * forever, so it alone is not a kill switch: reverting the env var to stop
+     * live QBO writes would not stop that row. Both must agree for a write.
+     */
+    isDryRunEnabled: () => boolean;
     getTokens: (deadline?: RouteDeadline) => Promise<QBTokens>;
     createPurchase: (
         tokens: QBTokens,
@@ -344,8 +359,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // Shadow mode is enforced by the WORKER, which never routes a dryRun row
     // here. This second check exists because "no QBO calls in dry run" is the
     // whole safety promise of the shadow week, and one guard in one caller is
-    // not a promise.
-    if (row.dryRun) {
+    // not a promise. BOTH the row's persisted flag and the CURRENT global
+    // switch gate the write — see isDryRunEnabled's doc comment for why the
+    // row flag alone cannot serve as a kill switch.
+    if (row.dryRun || deps.isDryRunEnabled()) {
         return { outcome: "deferred", reason: "push-disabled" };
     }
 
@@ -362,11 +379,15 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         deps.deadline !== undefined && remainingBudgetMs(deps.deadline) < MIN_BOOKING_BUDGET_MS;
     if (outOfRunway()) return { outcome: "deferred", reason: "out-of-budget" };
 
-    // Everything down to the QBO call is a PRE-SEND refusal: nothing was ever
-    // sent, so the strong key must be handed back (see BookResult).
-    if (!row.projectId) return parkedBeforeSend("no-estimate");
-    if (row.totalCents === null || row.totalCents <= 0) return parkedBeforeSend("refund-or-zero");
-    if (!row.txnDate) return parkedBeforeSend("invalid-date");
+    // Everything down to the QBO call is a PRE-SEND refusal for THIS attempt —
+    // but row.sendAttempted (persisted when the row was claimed) can already be
+    // true from an EARLIER attempt that reached QBO before a later re-read hit
+    // one of these checks (e.g. the estimate was deleted between attempts).
+    // parkedBeforeSend folds that in, so the strong key is handed back only
+    // when no attempt, past or present, may have created a Purchase.
+    if (!row.projectId) return parkedBeforeSend(row, "no-estimate");
+    if (row.totalCents === null || row.totalCents <= 0) return parkedBeforeSend(row, "refund-or-zero");
+    if (!row.txnDate) return parkedBeforeSend(row, "invalid-date");
     // Hoisted so the calendar day is computed ONCE and both the QBO TxnDate and
     // the Expense.date instant are derived from the same value.
     const calendarDay = toCalendarDate(row.txnDate);
@@ -383,9 +404,9 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             estimates: { orderBy: { createdAt: "desc" }, take: 1, select: { id: true } },
         },
     });
-    if (!project) return parkedBeforeSend("no-estimate");
+    if (!project) return parkedBeforeSend(row, "no-estimate");
     const estimateId = project.estimates[0]?.id;
-    if (!estimateId) return parkedBeforeSend("no-estimate");
+    if (!estimateId) return parkedBeforeSend(row, "no-estimate");
 
     // 3. Category groups (tax split).
     const groups = buildGroups(row.docType, row.totalCents, row.taxCents, row.refNumber);
@@ -409,11 +430,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // back for a corrected re-upload.
     const download = await deps.downloadBytes(row.storagePath, row.fileSha256);
     if (!download.ok) {
-        if (download.kind === "missing") return parkedBeforeSend(NO_ARTIFACT_PARK_REASONS.bytesMissing);
+        if (download.kind === "missing") return parkedBeforeSend(row, NO_ARTIFACT_PARK_REASONS.bytesMissing);
         // The attachment about to ride along with a real Purchase is NOT the
         // document this row was verified as. Refuse — a Purchase carrying the
         // wrong receipt is worse than one carrying none.
-        if (download.kind === "sha-mismatch") return parkedBeforeSend(NO_ARTIFACT_PARK_REASONS.contentChanged);
+        if (download.kind === "sha-mismatch") return parkedBeforeSend(row, NO_ARTIFACT_PARK_REASONS.contentChanged);
         return retry(row, deps, now, `storage:${download.message}`);
     }
     const bytes = download.bytes;
@@ -428,7 +449,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // discovering it from `attachment:"skipped"` after a Purchase already
     // exists in the real books without its receipt.
     const blocker = attachmentBlocker(row.mimeType, bytes.length);
-    if (blocker) return parkedBeforeSend(`unsupported-attachment:${blocker}`);
+    if (blocker) return parkedBeforeSend(row, `unsupported-attachment:${blocker}`);
 
     // Phase check ONE: immediately before the QBO create. The project can be
     // reassigned while this row sits in the queue, and a stale phase should be
@@ -518,10 +539,12 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // A lost CAS from inside the create hook: nothing was sent.
         if (error instanceof StaleClaimError) return { outcome: "stale" };
         const terminal = terminalReasonFor(error);
-        // A send WAS attempted: QBO may hold a Purchase whose response we lost,
-        // so the key stays claimed even though the row is parked.
+        // A send WAS attempted — by THIS call (`sent`) or by an earlier one
+        // (row.sendAttempted, persisted at claim time) — QBO may hold a
+        // Purchase whose response we lost, so the key stays claimed even
+        // though the row is parked.
         if (terminal) {
-            return { outcome: "needs-review", reason: terminal, releaseStrongKey: !purchaseMayExist(sent) };
+            return { outcome: "needs-review", reason: terminal, releaseStrongKey: mayReleaseStrongKey(row, sent) };
         }
         // QBTimeoutError, QBNotConnectedError, network/fetch errors, QBO
         // 429/5xx and DB errors are all transport-class: try again later.
@@ -536,13 +559,17 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // overhead-*, and docnumber-conflict (which is the idempotency QUERY
         // finding somebody else's Purchase, not one of ours).
         //
-        // So no Purchase exists for this row, and holding the strong key would
+        // So THIS attempt created no Purchase, and holding the strong key would
         // quarantine the corrected re-submission against a booking that never
-        // happened. Release it. A THROWN fault is different — it can come from
+        // happened. Release it — UNLESS an earlier attempt already reached QBO
+        // (row.sendAttempted), in which case a Purchase may already exist and
+        // the key stays claimed. A THROWN fault is different — it can come from
         // inside the create — and keeps the key.
-        // ok:false is decided inside createQBReceiptPurchase BEFORE qbCreateFn
-        // runs, so no Purchase exists for this row and the key goes back.
-        return { outcome: "needs-review", reason: `qbo-fault:${result.reason}`, releaseStrongKey: true };
+        return {
+            outcome: "needs-review",
+            reason: `qbo-fault:${result.reason}`,
+            releaseStrongKey: mayReleaseStrongKey(row, sent),
+        };
     }
 
     // The Purchase exists. If the receipt is not ON it, that is not a success —
@@ -646,7 +673,15 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 where: { id: row.id, state: "BOOKING" },
                 data: {
                     state: "BOOKED",
-                    stateReason: null,
+                    // Every OTHER value this column carries at BOOKING (a
+                    // defer reason like "push-paused", a retry note) is
+                    // transient and must not survive into BOOKED — but a
+                    // dropped-tax-reading warning is a fact about the
+                    // DOCUMENT, not about why booking was delayed, and must.
+                    // This CAS *is* the BOOKED write (the void fence), so the
+                    // preservation belongs here, not on the claim-confirm
+                    // update below.
+                    stateReason: preservedTaxWarning(row.stateReason),
                     qbPurchaseId: result.qbPurchaseId,
                     bookedAt: now,
                     lastError: null,
@@ -697,14 +732,27 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // expense in the wrong period. The intake row keeps the
                     // calendar day; this makes the instant match it.
                     date: startOfDateInTimeZone(calendarDay, timeZone),
-                    status: "Pending",
+                    // Booked with a qbPurchaseId already set — the Purchase is
+                    // live in QuickBooks by the time this row commits, so this
+                    // Expense is QBO-managed from birth, exactly like a QBO
+                    // import. `assertExpenseMutableOutsideQbo` (qbo-expense-guard.ts)
+                    // rejects approve/edit/delete on anything carrying a
+                    // qbPurchaseId, and the bookkeeper queue (manager/receipts/page.tsx)
+                    // only lists `status: "Pending"` rows as actionable. Leaving
+                    // this "Pending" would put a QBO-managed row in that
+                    // actionable queue with no route able to act on it — and
+                    // a later QBO sync flipping it to "Reviewed" would look
+                    // like human review that never happened. "Reviewed" keeps
+                    // it out of the actionable queue and matches every other
+                    // QBO-linked Expense.
+                    status: "Reviewed",
                     receiptUrl,
                     qbPurchaseId: result.qbPurchaseId,
                     description:
                         `[Receipt intake] ${docRef}` +
                         phaseCheck.note +
                         (taxApplied > 0 ? ` · incl. $${(taxApplied / 100).toFixed(2)} sales tax` : "") +
-                        ` · pending bookkeeper review`,
+                        ` · booked to QuickBooks`,
                 },
                 select: { id: true },
             });
@@ -819,6 +867,23 @@ function purchaseMayExist(sent: { attempted: boolean; purchaseKnownToExist: bool
     return sent.attempted || sent.purchaseKnownToExist;
 }
 
+/**
+ * Centralized strong-key release decision for every needs-review path.
+ *
+ * A Purchase may exist for this row because of THIS attempt's send (`sent`)
+ * or because of an EARLIER attempt's send — `row.sendAttempted`, persisted
+ * when the row was claimed, so it survives even when this attempt never
+ * reaches QBO at all (a re-read hitting a deleted estimate, a missing
+ * object, or any other pre-send/ok:false refusal on a retry). The strong key
+ * may only be released when neither is true.
+ */
+function mayReleaseStrongKey(
+    row: BookableRow,
+    sent: { attempted: boolean; purchaseKnownToExist: boolean } = { attempted: false, purchaseKnownToExist: false },
+): boolean {
+    return !(row.sendAttempted || purchaseMayExist(sent));
+}
+
 function describe(error: unknown): string {
     if (error instanceof QBTimeoutError) return "QBTimeoutError";
     if (error instanceof Error) return `${error.name}: ${error.message}`.slice(0, 400);
@@ -883,15 +948,18 @@ async function resolvePhase(
 }
 
 /**
- * A refusal reached WITHOUT any QBO call — the strong key goes back.
+ * A refusal reached WITHOUT any QBO call in THIS attempt — the strong key goes
+ * back, UNLESS row.sendAttempted (persisted at claim time) means an EARLIER
+ * attempt may already hold a Purchase for this row.
  *
  * The rule is about the SEND, not about the reason: any terminal park that
- * provably created no Purchase releases the key, whatever the reason string
- * says. Holding it makes a corrected resubmission collide with a row that never
- * became a purchase, and the reviewer then has two stuck rows instead of one.
+ * provably created no Purchase — this attempt or any prior one — releases the
+ * key, whatever the reason string says. Holding it makes a corrected
+ * resubmission collide with a row that never became a purchase, and the
+ * reviewer then has two stuck rows instead of one.
  */
-function parkedBeforeSend(reason: string): BookResult {
-    return { outcome: "needs-review", reason, releaseStrongKey: true };
+function parkedBeforeSend(row: BookableRow, reason: string): BookResult {
+    return { outcome: "needs-review", reason, releaseStrongKey: mayReleaseStrongKey(row) };
 }
 
 function retry(

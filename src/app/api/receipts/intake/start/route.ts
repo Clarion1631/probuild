@@ -9,7 +9,7 @@ import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core
 import { uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { finalizeDisposition, publishFence, uploadPathFor } from "@/lib/receipt-intake/stored-object";
-import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
+import { createReceiptUploadUrl, receiptObjectSize } from "@/lib/receipt-intake/bucket";
 import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -102,6 +102,10 @@ export async function POST(req: Request) {
         source: str(body.source),
         sourceRef: str(body.sourceRef),
         uploadId: str(body.uploadId),
+        // Already validated above (64 lowercase hex): the client's own hash of
+        // what it is about to upload is exactly the checksum a no-uploadId
+        // session caller needs a STABLE key derived from.
+        checksum: expectedSha256,
     });
     if (!decided.ok) return NextResponse.json({ ok: false, reason: decided.reason }, { status: 400 });
 
@@ -175,7 +179,7 @@ export async function POST(req: Request) {
                 select: {
                     id: true, sourceRef: true, state: true, stateReason: true, storagePath: true,
                     createdById: true, expectedSha256: true, fileSha256: true,
-                    uploadLeaseVersion: true,
+                    uploadLeaseVersion: true, uploadUrlExpiresAt: true,
                 },
             });
             if (!existing) return NextResponse.json({ ok: false, reason: "conflict-retry" }, { status: 409 });
@@ -188,20 +192,59 @@ export async function POST(req: Request) {
             // A ROW THE SWEEPER PARKED AS RECOVERABLE GETS A NEW URL, NOT
             // "alreadyReceived".
             //
-            // file-missing and sha-mismatch both mean the bytes we hold are not
-            // the document (or are not there at all), and the row never
-            // published. Answering alreadyReceived told the forwarder we had a
-            // receipt we did not have — and it deletes its only copy on that
-            // answer — leaving the row parked forever with nothing to recover
-            // from. So the upload is re-armed instead: a fresh signed URL, and
-            // the sha the caller is about to upload becomes the expected one.
+            // file-missing and sha-mismatch both mean the bytes we hold RIGHT
+            // NOW are not the document (or are not there at all), and the row
+            // never published. Answering alreadyReceived told the forwarder we
+            // had a receipt we did not have — and it deletes its only copy on
+            // that answer — leaving the row parked forever with nothing to
+            // recover from. So the upload is re-armed instead: a fresh signed
+            // URL, and the sha the caller is about to upload becomes the
+            // expected one.
             //
-            // The identity check below is deliberately skipped for these two:
-            // it exists to stop receipt B overwriting receipt A's VERIFIED
-            // bytes, and here there are none to protect.
+            // BUT a row can be "recoverable" and still remember a REAL,
+            // previously verified identity — file-missing in particular is
+            // reached from a row that was already published (RECEIVED) and
+            // later found to have lost its object; its fileSha256 records the
+            // document that was actually published, not a stale guess. A
+            // recovery must not silently rebind that identity to different
+            // bytes: skipping the check entirely (as before) let a receipt
+            // published once, then physically lost, be "recovered" with an
+            // entirely unrelated document. Only a row with NO recorded hash at
+            // all (nothing to protect) may rearm without proving identity.
+            //
+            // "RECORDED" MEANS `fileSha256`, AND ONLY `fileSha256`.
+            //
+            // That column is written by the seal, from the bytes actually in
+            // the bucket — it is the one hash this system has ever verified,
+            // and the only one that can describe a document a human or
+            // QuickBooks has seen. `expectedSha256` is the opposite: a promise
+            // a client made about bytes it was ABOUT to upload, and on a
+            // recoverable park that promise is precisely what was never kept.
+            //
+            // OR-ing the two in bricked the recovery it was guarding. Both
+            // recoverable parks are reachable from STAGING, where `fileSha256`
+            // is "" — so the announced-but-unuploaded hash became the identity
+            // to protect, and a forwarder coming back with a corrected hash
+            // (a re-scanned Drive file, a recomputed digest) got 409 forever on
+            // a sourceRef that had never held a document at all. Nothing can
+            // be overwritten by narrowing it: a rearm writes to a NEW lease
+            // path, clears `fileSha256`, and leaves the row parked until
+            // /finalize verifies the bytes that actually land.
             const recoverable = existing.state !== "STAGING"
                 && finalizeDisposition(existing) === "publish";
             if (recoverable) {
+                const verifiedSha = (existing.fileSha256 || "").toLowerCase();
+                if (verifiedSha && verifiedSha !== expectedSha256) {
+                    return NextResponse.json(
+                        {
+                            ok: false,
+                            error: "sourceRef-conflict",
+                            reason: "this sourceRef's previously recorded document has a different hash; it cannot be rebound to different bytes",
+                            existingId: existing.id,
+                        },
+                        { status: 409 },
+                    );
+                }
                 // THE ROW MOVES FIRST, THEN THE URL IS SIGNED.
                 //
                 // The claim on the lease is made in ONE checked update: the
@@ -283,14 +326,91 @@ export async function POST(req: Request) {
             }
 
             if (existing.state !== "STAGING") {
+                // "We already have it" has to be TRUE: the forwarder deletes its
+                // only copy on this answer. Metadata only, and bounded — one
+                // small list call whatever the object weighs.
+                const present = await receiptObjectSize(existing.storagePath);
+                if (!present.ok && present.kind === "transient") {
+                    return NextResponse.json(
+                        { ok: false, reason: "storage-unavailable", retryable: true },
+                        { status: 503 },
+                    );
+                }
+                if (!present.ok) {
+                    // A settled row with no object. Recovering it is not this
+                    // endpoint's job — /start hands out an upload URL for rows
+                    // that are still STAGING or recoverably parked, and dragging
+                    // a BOOKED row back would rewrite a receipt behind a
+                    // Purchase. A 409 the sender can act on, never a 2xx.
+                    return NextResponse.json(
+                        {
+                            ok: false,
+                            error: "file-missing",
+                            reason: "this sourceRef exists but its stored document is gone; escalate",
+                            retryable: true,
+                            existingId: existing.id,
+                            state: existing.state,
+                        },
+                        { status: 409 },
+                    );
+                }
                 return NextResponse.json(
                     { ok: true, alreadyReceived: true, id: existing.id, state: existing.state },
                 );
             }
+            // A LIVE LEASE IS NOT INVALIDATED BY A RETRY.
+            //
+            // Every matching /start used to bump uploadLeaseVersion and repoint
+            // storagePath UNCONDITIONALLY, even when the existing lease had not
+            // expired. That invalidated the ORIGINAL caller's upload URL out
+            // from under it: two /start calls for the same sourceRef (a network
+            // retry, a double-tap, a forwarder's own retry policy) racing here
+            // meant whichever one finished second deleted the object the first
+            // was about to PUT its bytes to (`start-resumed-repath` below) —
+            // and the first request's signed URL now pointed at nothing.
+            //
+            // `createSignedUploadUrl` does not revoke a previously issued token
+            // when called again for the SAME path, so an unexpired lease can
+            // safely be served a fresh signed URL for its EXISTING path: same
+            // object identity, no repath, no delete of anything. This makes a
+            // retry against a live lease idempotent instead of destructive.
+            if (existing.uploadUrlExpiresAt && existing.uploadUrlExpiresAt.getTime() > Date.now()) {
+                const resigned = await signUpload(existing.storagePath);
+                if (!resigned) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                // The DB lease must move with the URL it reissues. A resigned
+                // URL is good for a fresh ~2h window, but leaving
+                // uploadUrlExpiresAt untouched meant the row still recorded the
+                // ORIGINAL, older expiry — so the sweeper could judge the lease
+                // dead and reclaim the row while the client was still holding a
+                // perfectly live URL. CAS'd on the identity this retry already
+                // proved (id, state, storagePath, uploadLeaseVersion): if the
+                // row moved under us between the read and here, this loses the
+                // race and falls through to the resume-with-a-new-lease path
+                // below rather than handing out a URL for a lease we could not
+                // actually extend.
+                const { count } = await prisma.receiptIntake.updateMany({
+                    where: {
+                        id: existing.id,
+                        state: "STAGING",
+                        storagePath: existing.storagePath,
+                        uploadLeaseVersion: existing.uploadLeaseVersion,
+                    },
+                    data: { uploadUrlExpiresAt: uploadLeaseExpiry() },
+                });
+                if (count > 0) {
+                    return NextResponse.json({
+                        ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resigned,
+                    });
+                }
+            }
+
             // A RESUME IS A NEW LEASE, taken BEFORE the URL is signed and in one
             // checked update. Without the version bump the sweep and the client
             // are talking about the same path, so a sweep that started before
             // this call could still reject the upload it is now waiting for.
+            // Reached only once the previous lease has EXPIRED (or this is a
+            // fresh STAGING row with no lease yet) — an expired lease is fair
+            // game to invalidate, since nothing live can still be relying on it.
             const nextLease = existing.uploadLeaseVersion + 1;
             const resumePath = uploadPathFor(existing.id, nextLease, ext);
             const { count } = await prisma.receiptIntake.updateMany({

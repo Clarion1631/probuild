@@ -155,6 +155,32 @@ export async function authenticateIntake(
 ): Promise<IntakeAuth> {
     const provided = req.headers.get(RECEIPT_INTAKE_SECRET_HEADER);
     if (provided !== null) {
+        // THE TWO-SECRET INVARIANT MUST HOLD REGARDLESS OF WHAT WAS PRESENTED.
+        //
+        // Both intake secrets configured, non-empty, and distinct — checked
+        // BEFORE any compare against `provided`. Checking it only by way of
+        // "both matched the same value" (the old shape) missed the far more
+        // likely misconfiguration: just ONE var set (a rotation half-done, a
+        // preview env missing a copy-paste). With only RECEIPT_INTAKE_SECRET
+        // set, `secretMatches(provided, archive)` is false for every input —
+        // not because the caller lacks the archive key, but because there IS
+        // no archive key — so a caller holding the ingest secret sailed
+        // through untouched while the archive program was silently
+        // unreachable by anyone AND the ingest key was one env-var away from
+        // also being accepted as the archive key the moment someone filled it
+        // in wrong.
+        //
+        // Scoped to the two INTAKE secrets deliberately: RECEIPT_BRIDGE_SECRET
+        // belongs to a different program (authenticateBridge) whose absence
+        // must not take the forwarders down. classifySecret below still runs
+        // all three compares and refuses any value that matches more than one.
+        const ingest = process.env.RECEIPT_INTAKE_SECRET;
+        const archive = process.env.RECEIPT_ARCHIVE_SECRET;
+        if (!ingest || !archive || ingest === archive) {
+            console.error("[receipts/intake] RECEIPT_INTAKE_SECRET / RECEIPT_ARCHIVE_SECRET misconfigured (missing or identical) — refusing every secret-authenticated request");
+            return { ok: false, response: unauthorized() };
+        }
+
         const verdict = classifySecret(provided);
         if (verdict === null) return { ok: false, response: unauthorized() };
         if (verdict !== need) return { ok: false, response: wrongCapability(verdict, need) };

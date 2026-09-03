@@ -30,7 +30,7 @@ import {
     QboPurchaseFaultError,
     QboVendorDuplicateError,
 } from "@/lib/qbo-receipt-push";
-import type { ProjectPhase, ReadOutcome } from "./read";
+import { READ_BUDGET_MS, type ProjectPhase, type ReadOutcome } from "./read";
 import type { VerifiedBytes } from "./stored-object";
 
 /**
@@ -81,23 +81,67 @@ export function uploadLeaseExpiry(now: Date = new Date()): Date {
 }
 
 /**
+ * Runway reserved AFTER a read for the write that records its result — the
+ * row's applyRead/applyState commit — plus whatever this pass still has left
+ * to do before the invocation ends. A read given every last millisecond of
+ * the run's own budget could return right as the platform kills the
+ * function, and its outcome would never be written at all.
+ */
+export const READ_SAFETY_MARGIN_MS = 2_000;
+/**
+ * Below this much runway (after the safety margin), starting a read is not
+ * worth it: the request itself needs at least this long to have any real
+ * chance of finishing. The row is handed back un-attempted — the same
+ * AI_UNAVAILABLE answer readReceipt gives for an exhausted budget — rather
+ * than begun and abandoned mid-flight when the invocation's own deadline
+ * lands.
+ */
+export const READ_MIN_BUDGET_MS = 5_000;
+
+/**
+ * How much of `READ_BUDGET_MS` a read starting now may actually use, given
+ * how much runway is left in the WHOLE invocation.
+ *
+ * `read.ts`'s own READ_BUDGET_MS (25s) is sized against a fresh 60s
+ * invocation and assumes it is the first thing to run. It is not: a batch of
+ * ten rows can reach its ninth row 45 seconds in, and handing that read
+ * another full 25 seconds is what let a row started at 40s still be reading
+ * at 65s — past the `maxDuration = 60` ceiling the whole run is supposed to
+ * respect. This caps the read's OWN budget at whatever is actually left, so
+ * the invocation's one deadline governs every read the same way it already
+ * governs every QuickBooks call (see `deps.book`'s `deadline`).
+ *
+ * Pure and exported so this is a unit test, not a fact about `buildDeps`
+ * that nothing without a live cron invocation could ever exercise.
+ */
+export function readBudgetFor(remainingRunMs: number): number {
+    const budget = Math.min(READ_BUDGET_MS, remainingRunMs - READ_SAFETY_MARGIN_MS);
+    return budget < READ_MIN_BUDGET_MS ? 0 : budget;
+}
+
+/**
  * Could the object still arrive under a live upload URL?
  *
- * ROW AGE IS THE WRONG QUESTION. A row whose URL was re-issued (a resumed
- * /start, or a re-arm after the sweeper parked it) is older than its lease, and
- * judging it on createdAt declared a receipt missing — or destroyed one it
- * called unacceptable — while the client's own upload link was still live and
- * about to land. `uploadUrlExpiresAt` is what /start actually promised.
+ * ROW AGE IS THE WRONG QUESTION for a two-step row. One whose URL was re-issued
+ * (a resumed /start, or a re-arm after the sweeper parked it) is older than its
+ * lease, and judging it on createdAt declared a receipt missing — or destroyed
+ * one it called unacceptable — while the client's own upload link was still
+ * live and about to land. `uploadUrlExpiresAt` is what /start actually
+ * promised, so that is what is honoured.
  *
- * Null means no signed URL was ever issued for this row (the single-shot path
- * writes its bytes through the server), so the row's own age is all there is.
+ * NULL IS NOT A TWO-HOUR GRACE. It means no signed URL was ever issued: the
+ * single-shot path writes its bytes through the server inside one request, so
+ * such a row is either published or it failed mid-request. Giving it the
+ * SIGNED-URL TTL made every inline STAGING orphan invisible to the sweep for
+ * two hours, waiting on a URL that does not exist. Its grace is the stale-
+ * STAGING threshold, the same one the sweep selects on.
  */
 export function uploadLeaseActive(
     row: { uploadUrlExpiresAt?: Date | null; createdAt: Date },
     now: Date = new Date(),
 ): boolean {
     if (row.uploadUrlExpiresAt) return row.uploadUrlExpiresAt.getTime() > now.getTime();
-    return row.createdAt.getTime() > now.getTime() - SIGNED_UPLOAD_TTL_MS;
+    return row.createdAt.getTime() > now.getTime() - STAGING_SWEEP_MINUTES * 60_000;
 }
 /**
  * Consecutive AI-unavailable passes before a row is parked for a human. Ported
@@ -489,9 +533,15 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
             if (row.state === "RECEIVED") {
                 bump(await processReceived(row, deps));
             } else if (row.state === "READ") {
-                // Dry-run rows PARK at READ. This is the shadow-week gate: the
-                // only thing that moves a row to BOOKING is dryRun === false.
-                if (row.dryRun) { bump("READ"); continue; }
+                // Dry-run rows PARK at READ. This is the shadow-week gate: a
+                // row only moves to BOOKING when BOTH its persisted flag AND
+                // the CURRENT global switch say live. The persisted flag alone
+                // is not a kill switch — it is written once at intake and
+                // never rechecked, so a row claimed while RECEIPT_INTAKE_DRYRUN
+                // was off keeps dryRun=false even after the switch is reverted
+                // to stop live QBO writes.
+                const live = !row.dryRun && !deps.isDryRunEnabled();
+                if (!live) { bump("READ"); continue; }
                 const promotion = await deps.promoteToBooking(row.id, row.dedupWeakKey, row.claimToken);
                 if (promotion.stale) {
                     // Superseded between the claim and the promotion. The
@@ -513,7 +563,7 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                 await deps.applyBookResult(row.id, result, row.claimToken);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
-                if (row.dryRun) { bump("BOOKING"); continue; }
+                if (row.dryRun || deps.isDryRunEnabled()) { bump("BOOKING"); continue; }
                 const result = await deps.book(row);
                 await deps.applyBookResult(row.id, result, row.claimToken);
                 bump(stateForBookResult(result));

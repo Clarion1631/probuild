@@ -8,7 +8,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { backoffMs, MAX_BOOK_ATTEMPTS, retryTargetFor, routeState } from "../src/lib/receipt-intake/route-state";
+import { backoffMs, MAX_BOOK_ATTEMPTS, preservedTaxWarning, retryTargetFor, routeState } from "../src/lib/receipt-intake/route-state";
 
 const NO_HITS = { strong: null, weak: null };
 const clean = { docType: "receipt", amount: "364.98", totalCents: 36498, canonicalVendor: "lowes" };
@@ -129,6 +129,20 @@ test("a clean document with a job and no hits is READ", () => {
     assert.deepEqual(routeState(clean, NO_HITS, true), {
         state: "READ", stateReason: null, duplicateOfId: null,
     });
+});
+
+test("preservedTaxWarning keeps only the tax-implausible marker", () => {
+    assert.equal(preservedTaxWarning("tax-implausible"), "tax-implausible");
+    // A compound reason (a park reason plus the warning, joined by ";" the
+    // same way worker.ts's note() builds it) still yields the marker alone —
+    // the other half of the reason is a park explanation, not a fact worth
+    // carrying into BOOKED.
+    assert.equal(preservedTaxWarning("weak-dup:row-a;tax-implausible"), "tax-implausible");
+    // Anything else — a defer reason, a park reason with no warning, absence —
+    // must NOT be mistaken for the marker and ride along into BOOKED.
+    assert.equal(preservedTaxWarning("push-paused"), null);
+    assert.equal(preservedTaxWarning(null), null);
+    assert.equal(preservedTaxWarning(undefined), null);
 });
 
 test("backoff is 5m / 15m / 1h / 6h and then stays at 6h", () => {

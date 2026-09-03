@@ -13,7 +13,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import path, { dirname, join } from "node:path";
 import {
     evaluatePipelineHealth,
     formatPipelineDigest,
@@ -632,6 +632,29 @@ test("STAGING gets a much shorter fuse than the working states", () => {
     assert.equal(INTAKE_STAGING_STUCK_MINUTES, 30);
     assert.equal(INTAKE_STUCK_HOURS, 6);
     assert.ok(INTAKE_STAGING_STUCK_MINUTES * 60_000 < INTAKE_STUCK_HOURS * 3_600_000);
+});
+
+// ── A STAGING row's own upload lease, not just its age (Codex round-17 item 5) ──
+
+test("a STAGING row is not counted as stuck while its own upload lease is still live", () => {
+    // The count() query talks to real Prisma, so this is a source-level pin
+    // (same technique receipt-url.test.ts and receipt-intake-stored-object.
+    // test.ts use for the properties a live DB is needed to exercise for
+    // real): the STAGING branch of intakeStuck must gate on the lease, not
+    // on createdAt alone, or a client mid-upload on a slow connection —
+    // whose /start re-issued a signed URL without touching createdAt — reads
+    // as "stuck" while its own link is still perfectly good.
+    const root = path.resolve(__dirname, "..");
+    const src = readFileSync(path.join(root, "src/lib/pipeline-health.ts"), "utf8");
+    const stagingBranch = src.slice(
+        src.indexOf('state: "STAGING"'),
+        src.indexOf('state: "READ"'),
+    );
+    assert.match(
+        stagingBranch,
+        /uploadUrlExpiresAt/,
+        "the STAGING stuck-count must consult the upload lease, not createdAt alone",
+    );
 });
 
 test("the digest prints all three intake numbers", () => {

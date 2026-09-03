@@ -922,9 +922,12 @@ test("book.ts and the chaser share ONE list of no-evidence reasons", () => {
     // gone.
     assert.deepEqual([...NO_ARTIFACT_STATE_REASONS].sort(), ["content-changed", "receipt-bytes-missing"]);
     const book = readFileSync(join(repoRoot, "src/lib/receipt-intake/book.ts"), "utf8");
-    assert.match(book, /parkedBeforeSend\(NO_ARTIFACT_PARK_REASONS\.bytesMissing\)/);
-    assert.match(book, /parkedBeforeSend\(NO_ARTIFACT_PARK_REASONS\.contentChanged\)/);
-    assert.doesNotMatch(book, /parkedBeforeSend\("receipt-bytes-missing"\)/);
+    // Phase 1 gave parkedBeforeSend a leading `row` argument (row.sendAttempted
+    // is what decides whether the strong key may be released). The constants are
+    // still the only spelling either reason may have.
+    assert.match(book, /parkedBeforeSend\(row, NO_ARTIFACT_PARK_REASONS\.bytesMissing\)/);
+    assert.match(book, /parkedBeforeSend\(row, NO_ARTIFACT_PARK_REASONS\.contentChanged\)/);
+    assert.doesNotMatch(book, /parkedBeforeSend\((?:row, )?"receipt-bytes-missing"\)/);
     const worker = readFileSync(join(repoRoot, "src/lib/receipt-intake/worker.ts"), "utf8");
     assert.match(worker, /parkTerminal\(row, deps, NO_ARTIFACT_PARK_REASONS\.contentChanged\)/);
     // And the cron actually SELECTS the column the predicate needs.
