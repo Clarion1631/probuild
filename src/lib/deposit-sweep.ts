@@ -236,10 +236,37 @@ export function isNotCustomerDepositReason(reason: string | null | undefined): b
     return typeof reason === "string" && reason.startsWith(NOT_CUSTOMER_DEPOSIT_PREFIX);
 }
 
+/**
+ * A credit the runner deliberately did NOT send for sweeping, declared so the
+ * day's control totals still tie.
+ *
+ * The only reason today is a missing Bank Reference. That reference is the
+ * deposit's identity — without it there is no idempotency key, so the credit
+ * cannot be swept at all. Refusing the whole day for it (the first cut) meant
+ * one such row on 2026-08-28 would have stalled every later day forever, which
+ * is a much worse failure than not sweeping one credit: the bank publishes ONE
+ * total for the day, so a partial batch cannot simply recompute its own totals
+ * and still be checkable. Declaring the excluded rows keeps the arithmetic
+ * honest — credits + excluded must account for the bank's own figures exactly —
+ * while the sweepable subset gets on with it.
+ *
+ * Nothing is recorded for these rows. They are evidence in the request, not
+ * deposits in the system.
+ */
+export interface BankExcludedCredit {
+    amount: number;
+    amountCents: number;
+    description: string | null;
+    transactionDetail: string | null;
+    reason: string;
+}
+
 export interface BankBatch {
     /** YYYY-MM-DD — the CSV Post Date the whole batch belongs to. */
     postDate: string;
     credits: BankCredit[];
+    /** Declared, never processed — see BankExcludedCredit. */
+    excluded: BankExcludedCredit[];
     dryRun: boolean;
 }
 
@@ -362,7 +389,14 @@ export function parseBankBatch(raw: Record<string, unknown>): BankBatchParse {
 
     if (!Array.isArray(raw.credits)) return { ok: false, reason: "credits must be an array" };
     if (raw.credits.length === 0) return { ok: false, reason: "credits must not be empty" };
-    if (raw.credits.length > MAX_BANK_CREDITS_PER_BATCH) {
+    if (raw.excluded !== undefined && !Array.isArray(raw.excluded)) {
+        return { ok: false, reason: "excluded must be an array when present" };
+    }
+    const rawExcluded = Array.isArray(raw.excluded) ? raw.excluded : [];
+    // The cap is a deadline budget for the rows this request will PROCESS, but a
+    // batch whose declared rows are wildly out of range is a merged export
+    // either way.
+    if (raw.credits.length + rawExcluded.length > MAX_BANK_CREDITS_PER_BATCH) {
         return {
             ok: false,
             reason: `credits exceeds the ${MAX_BANK_CREDITS_PER_BATCH}-row batch cap — post one day at a time ` +
@@ -410,13 +444,46 @@ export function parseBankBatch(raw: Record<string, unknown>): BankBatchParse {
         });
     }
 
-    // Control totals, from the CSV's own ledger/total rows. Both must tie to
-    // the rows actually present.
+    const excluded: BankExcludedCredit[] = [];
+    for (const [i, entry] of rawExcluded.entries()) {
+        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+            return { ok: false, reason: `excluded[${i}] is not an object` };
+        }
+        const e = entry as Record<string, unknown>;
+        const amount = Number(e.amount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+            return { ok: false, reason: `excluded[${i}] amount must be a positive number` };
+        }
+        const amountCents = Math.round(amount * 100);
+        if (Math.abs(amount * 100 - amountCents) > 1e-6 || amountCents <= 0) {
+            return { ok: false, reason: `excluded[${i}] amount must have at most 2 decimal places` };
+        }
+        const reason = typeof e.reason === "string" ? e.reason.trim() : "";
+        // A row is only excusable when the runner says WHY: an undeclared
+        // exclusion is indistinguishable from a dropped row.
+        if (!reason) return { ok: false, reason: `excluded[${i}] must carry a reason` };
+        excluded.push({
+            amount: amountCents / 100,
+            amountCents,
+            description: boundedString(e.description, 200),
+            transactionDetail: boundedString(e.transactionDetail, 500),
+            reason: reason.slice(0, 200),
+        });
+    }
+
+    // Control totals, from the CSV's own ledger/total rows. They describe the
+    // WHOLE day, so they must tie to the swept rows PLUS the declared ones —
+    // that is what stops an excluded row from being a way to hide a deposit.
     // Real numbers, not numeric strings: a control total is evidence, and
     // evidence that needed coercing to compare is not evidence.
     const creditCount = typeof raw.creditCount === "number" ? raw.creditCount : NaN;
-    if (!Number.isInteger(creditCount) || creditCount !== credits.length) {
-        return { ok: false, reason: `creditCount ${raw.creditCount} does not match the ${credits.length} credit row(s) posted` };
+    const declaredRows = credits.length + excluded.length;
+    if (!Number.isInteger(creditCount) || creditCount !== declaredRows) {
+        return {
+            ok: false,
+            reason: `creditCount ${raw.creditCount} does not match the ${declaredRows} credit row(s) declared ` +
+                `(${credits.length} posted + ${excluded.length} excluded)`,
+        };
     }
     // Required, with no fallback anywhere in the chain: a creditSum derived from
     // the same rows it is checking proves nothing. It must come from the bank's
@@ -428,15 +495,17 @@ export function parseBankBatch(raw: Record<string, unknown>): BankBatchParse {
     const creditSum = typeof raw.creditSum === "number" ? raw.creditSum : NaN;
     if (!Number.isFinite(creditSum)) return { ok: false, reason: "creditSum must be a number" };
     const declaredCents = Math.round(creditSum * 100);
-    const actualCents = credits.reduce((sum, c) => sum + c.amountCents, 0);
+    const actualCents = credits.reduce((sum, c) => sum + c.amountCents, 0)
+        + excluded.reduce((sum, e) => sum + e.amountCents, 0);
     if (Math.abs(creditSum * 100 - declaredCents) > 1e-6 || declaredCents !== actualCents) {
         return {
             ok: false,
-            reason: `creditSum ${creditSum} does not match the posted rows (${(actualCents / 100).toFixed(2)})`,
+            reason: `creditSum ${creditSum} does not match the declared rows (${(actualCents / 100).toFixed(2)}: ` +
+                `${credits.length} posted + ${excluded.length} excluded)`,
         };
     }
 
-    return { ok: true, batch: { postDate, credits, dryRun: raw.dryRun === true } };
+    return { ok: true, batch: { postDate, credits, excluded, dryRun: raw.dryRun === true } };
     // (raw.dryRun is already known to be a boolean or absent by here.)
 }
 
