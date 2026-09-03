@@ -1441,6 +1441,51 @@ test("an implausible read FILLS nothing on an already-booked Purchase", () => {
     });
 });
 
+test("a manual deduction base that no longer fits a fresh OCR tax is flagged, not overwritten", () => {
+    // scripts/apply-expense-attribution.mjs's Expense_taxDeductibleBase_check:
+    // base <= amount - COALESCE(taxAmount, 0). A bookkeeper's PATCH can set
+    // taxDeductibleBase while leaving taxAmount (and taxSource) null -- the
+    // exact case from the finding: { amount: 100, taxAmount: null,
+    // taxDeductibleBase: 100, taxSource: null }. Writing an OCR taxAmount on
+    // top of that, unguarded, would shrink the ceiling below the base and
+    // violate the CHECK on every retry of this already-booked Purchase.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        taxDeductibleBase: 100, amount: 100,
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    return bookReceipt(row({ totalCents: 10_000, taxCents: 900 }), rec.deps).then(result => {
+        assert.equal(result.outcome, "booked", "the Purchase is real; the conflict is only about the tax fill");
+        assert.equal(rec.existingExpense.taxAmount, null, "an OCR figure that would break the CHECK is never written");
+        assert.equal(rec.existingExpense.taxAtSource, false);
+        assert.equal(rec.existingExpense.taxSource, null, "provenance is untouched -- nothing was decided");
+        assert.equal(rec.existingExpense.taxDeductibleBase, 100, "the human's base stands");
+        assert.equal(rec.existingExpense.needsTaxReview, true, "a person resolves the conflict instead");
+    });
+});
+
+test("an OCR tax that fits inside a manual deduction base's ceiling is booked normally", () => {
+    // The control for the test above: same manually-set base, but small
+    // enough that amount - taxAmount never dips below it.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null, needsTaxReview: false,
+        taxDeductibleBase: 50, amount: 100,
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    return bookReceipt(row({ totalCents: 10_000, taxCents: 900 }), rec.deps).then(result => {
+        assert.equal(result.outcome, "booked");
+        assert.equal(rec.existingExpense.taxAmount, 9);
+        assert.equal(rec.existingExpense.taxAtSource, true);
+        assert.equal(rec.existingExpense.taxSource, "ocr");
+        assert.equal(rec.existingExpense.taxDeductibleBase, 50, "the base is untouched by this write");
+        assert.equal(rec.existingExpense.needsTaxReview, false);
+    });
+});
+
 // ── the two provenances do not gate each other (round 16, item 1) ──────────
 
 test("an ANSWERED installedAtCustomer is never overwritten, whatever taxSource says", () => {

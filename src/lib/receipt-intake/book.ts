@@ -186,6 +186,8 @@ export interface BookPrismaClient {
             costCodeSource?: string | null;
             taxAmount?: unknown;
             taxAtSource?: boolean;
+            taxDeductibleBase?: unknown;
+            amount?: unknown;
             installedAtCustomer?: boolean | null;
             estimate?: { projectId: string | null } | null;
         } | null>;
@@ -746,6 +748,8 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                         taxAmount: true,
                         taxAtSource: true,
                         taxSource: true,
+                        taxDeductibleBase: true,
+                        amount: true,
                         receiptUrl: true,
                         installedAtCustomer: true,
                         estimate: { select: { projectId: true } },
@@ -852,39 +856,94 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                         data: { costCodeId, costCodeSource, costCodeConfidence },
                     });
                 }
-                // Tax is filled only where there is none recorded at all — a
-                // stored figure came either from an earlier booking of this
-                // same document or from a bookkeeper, and both outrank a
-                // re-read.
+                // Tax is filled only where there is none recorded at all -
+                // a stored figure came either from an earlier booking of
+                // this same document or from a bookkeeper, and both outrank
+                // a re-read.
                 if (taxApplied > 0) {
-                    await tx.expense.updateMany({
-                        where: {
-                            id: existing.id,
-                            projectId: expectedProjectId ?? row.projectId,
-                            taxAmount: null,
-                            // A NULL taxAmount is NOT proof that nobody has
-                            // decided. A bookkeeper who looked at the receipt
-                            // and concluded there is no tax on it leaves
-                            // exactly that shape, and an OCR re-read would then
-                            // overwrite their answer with a number they had
-                            // already rejected. `taxSource` is what tells the
-                            // two apart. The explicit NULL branch is required:
-                            // SQL `<> 'manual'` is NULL for a NULL column, so a
-                            // bare not-equals would drop every legacy row.
-                            ...taxNotHumanDecidedWhere(),
-                        },
-                        data: {
-                            // Same bound as the create path above: an
-                            // implausible read fills NOTHING and asks for a
-                            // person instead. Writing it here would be worse
-                            // than on a new row — this row may already be in a
-                            // filing period somebody has reconciled.
-                            taxAmount: taxToStore,
-                            taxAtSource: taxToStore !== null,
-                            taxSource: "ocr",
-                            ...(taxNeedsReview ? { needsTaxReview: true } : {}),
-                        },
-                    });
+                    // A MANUAL BASE CAN OUTLIVE A NULL taxAmount.
+                    //
+                    // The tax PATCH lets a bookkeeper set `taxDeductibleBase`
+                    // while leaving `taxAmount` unanswered, and a base-only
+                    // edit does not stamp `taxSource` either - so a row like
+                    // that matches the guard below exactly like a legacy row
+                    // with no tax opinion at all. It is not one: writing this
+                    // OCR figure on top could push the human's base above the
+                    // new ceiling (`amount - taxAmount`), which the DB CHECK
+                    // (Expense_taxDeductibleBase_check,
+                    // scripts/apply-expense-attribution.mjs) then refuses -
+                    // and since the Purchase already exists in QBO, every
+                    // retry of this row would hit the same violation again.
+                    //
+                    // Mirrors that CHECK verbatim: NULL and 0 always fit
+                    // (nothing to violate); otherwise the base must point the
+                    // same way as the amount and fit inside
+                    // `amount - COALESCE(taxAmount, 0)`.
+                    const existingBase =
+                        existing.taxDeductibleBase == null ? null : Number(existing.taxDeductibleBase);
+                    const amount = Number(existing.amount);
+                    const nextTaxAmount = taxToStore ?? 0;
+                    const ceilingMagnitude = Math.abs(Math.round((amount - nextTaxAmount) * 100) / 100);
+                    const baseFitsNewTax =
+                        existingBase === null ||
+                        existingBase === 0 ||
+                        (Math.sign(existingBase) === Math.sign(amount) &&
+                            Math.abs(existingBase) <= ceilingMagnitude);
+
+                    if (baseFitsNewTax) {
+                        await tx.expense.updateMany({
+                            where: {
+                                id: existing.id,
+                                projectId: expectedProjectId ?? row.projectId,
+                                taxAmount: null,
+                                // A NULL taxAmount is NOT proof that nobody has
+                                // decided. A bookkeeper who looked at the receipt
+                                // and concluded there is no tax on it leaves
+                                // exactly that shape, and an OCR re-read would then
+                                // overwrite their answer with a number they had
+                                // already rejected. `taxSource` is what tells the
+                                // two apart. The explicit NULL branch is required:
+                                // SQL `<> 'manual'` is NULL for a NULL column, so a
+                                // bare not-equals would drop every legacy row.
+                                ...taxNotHumanDecidedWhere(),
+                            },
+                            data: {
+                                // Same bound as the create path above: an
+                                // implausible read fills NOTHING and asks for a
+                                // person instead. Writing it here would be worse
+                                // than on a new row - this row may already be in a
+                                // filing period somebody has reconciled.
+                                taxAmount: taxToStore,
+                                taxAtSource: taxToStore !== null,
+                                // Provenance for `taxAmount` ONLY. A manually-set
+                                // `taxDeductibleBase` from an earlier PATCH is not
+                                // touched by this write and keeps whatever
+                                // provenance it already had.
+                                taxSource: "ocr",
+                                ...(taxNeedsReview ? { needsTaxReview: true } : {}),
+                            },
+                        });
+                    } else {
+                        // The manual base outranks a machine read: leave
+                        // `taxAmount` and `taxSource` untouched and flag the
+                        // row instead of writing a figure the CHECK would
+                        // refuse. Recorded here, once, so a bookkeeper resolves
+                        // the conflict rather than this write retrying against
+                        // the same numbers on every future pass.
+                        console.warn(
+                            "[receipt-intake] tax-conflict: OCR tax would violate the deduction-base CHECK; flagging for review",
+                            JSON.stringify({ rowId: row.id, expenseId: existing.id, existingBase, amount, ocrTax: taxToStore }),
+                        );
+                        await tx.expense.updateMany({
+                            where: {
+                                id: existing.id,
+                                projectId: expectedProjectId ?? row.projectId,
+                                taxAmount: null,
+                                ...taxNotHumanDecidedWhere(),
+                            },
+                            data: { needsTaxReview: true },
+                        });
+                    }
                 }
                 if (row.installedAtCustomer !== null) {
                     await tx.expense.updateMany({
