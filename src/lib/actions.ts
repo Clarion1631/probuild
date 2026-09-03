@@ -22,6 +22,7 @@ import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from 
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
 import { POSSIBLE_ORPHAN_REASON, UNKNOWN_ORPHAN_STATES, planParkWrites, type ParkPlan } from "./receipt-intake/park";
+import { duplicateChainRefusal, lockWithInboundDuplicates } from "./receipt-intake/duplicate-guard";
 import { driveFileIdOf } from "./receipt-intake/book";
 import { parseChatDelivery, requestIdFor, type CardItem } from "./receipt-request-cards";
 import { recordCardOnIssues } from "./receipt-card-history";
@@ -15420,13 +15421,14 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
      * `FOR UPDATE` on a plain SELECT of both ids, ordered — one statement, so
      * there is no window between taking the first lock and the second.
      */
-    const [first, second] = [id, duplicateOfId].sort();
     await prisma.$transaction(async tx => {
-        await tx.$queryRaw`
-            SELECT "id" FROM "ReceiptIntake"
-            WHERE "id" IN (${first}, ${second})
-            ORDER BY "id"
-            FOR UPDATE`;
+        /**
+         * BOTH ROWS AND EVERY ROW THAT POINTS AT EITHER (round-39 gate,
+         * finding 2). One statement, ordered by id, so the lock order is the
+         * same for every transaction and this cannot deadlock — and so the
+         * inbound references cannot change between the read and the write.
+         */
+        const inbound = await lockWithInboundDuplicates(tx, [id, duplicateOfId]);
 
         // RE-READ INSIDE THE LOCK. Everything below was read a moment ago on
         // the page; under the lock it is read again because that is the only
@@ -15447,6 +15449,17 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
         // NO CYCLES. A points at B while B points at A is unresolvable, and the
         // chain check above does not catch it on its own.
         if (original.duplicateOfId === id) throw new Error("Those two receipts already point at each other");
+        /**
+         * AND THIS ROW MUST NOT ALREADY BE SOMEBODY ELSE'S ORIGINAL.
+         *
+         * The target check above stops A→B when B is a duplicate; this stops
+         * the same chain built from the other end — A→B already exists and B is
+         * now being marked a duplicate of C, leaving A pointing at a copy.
+         * Refused rather than retargeted: which receipt is the real original is
+         * a human's call, and unmarking A is how they make it.
+         */
+        const inboundToSource = inbound.get(id) ?? [];
+        if (inboundToSource.length > 0) throw duplicateChainRefusal("duplicate", inboundToSource);
 
         // CAS on the exact state the view saw. The lease fence matters most on
         // this path: BOOKING is a legal source state, and BOOKING is where the
@@ -15491,13 +15504,25 @@ export async function voidReceiptIntake(id: string, expectedState: string, expec
     const now = new Date();
     const expected = assertExpectedState(expectedState);
     if (["BOOKED", "ARCHIVED"].includes(expected)) throw new Error("A booked receipt can't be voided");
-    await runParkWrites(planParkWrites({
-        id,
-        expectedState: expected,
-        targetState: "VOID",
-        stateReason: "voided-by-user",
-        claimFence: { updatedAt: assertExpectedUpdatedAt(expectedUpdatedAt), ...notClaimedByWorker(now) },
-    }), id, expected, now);
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+    /**
+     * VOIDING AN ORIGINAL LEAVES ITS DUPLICATES POINTING AT A CANCELLED ROW
+     * (round-39 gate, finding 2) — the same broken relation the mark path
+     * refuses to create when it checks the target for VOID, arriving a
+     * different way. Locked and checked in ONE transaction with the write, or
+     * a duplicate marked a moment later slips through the gap.
+     */
+    await prisma.$transaction(async tx => {
+        const inbound = (await lockWithInboundDuplicates(tx, [id])).get(id) ?? [];
+        if (inbound.length > 0) throw duplicateChainRefusal("void", inbound);
+        await runParkWrites(planParkWrites({
+            id,
+            expectedState: expected,
+            targetState: "VOID",
+            stateReason: "voided-by-user",
+            claimFence: { updatedAt: seenAt, ...notClaimedByWorker(now) },
+        }), id, expected, now, tx);
+    });
     revalidateReceiptQueue();
     return { success: true };
 }

@@ -17,11 +17,18 @@
  *   1. A deterministic request id / thread key — `receipt-req-<owner>-<Pacific
  *      date>` — so a retried cron lands in the same Chat thread rather than
  *      starting a second one.
- *   2. The authoritative check: every issue a card listed records
- *      `displayDetails.card.date`. A re-run on the same Pacific day sees that
- *      stamp and builds no card at all. This is the one that actually holds,
- *      because an incoming webhook gives no message-level idempotency of its
- *      own — it must not be trusted for it.
+ *   2. The authoritative check: the `ReceiptRequestCard` row itself, whose
+ *      UNIQUE (owner, pacificDate) is taken in the SAME transaction as the
+ *      selection — so two concurrent runs cannot both claim an owner's day, and
+ *      the loser sees the constraint rather than posting a second card. An
+ *      incoming webhook gives no message-level idempotency of its own, so it
+ *      must not be trusted for any of this.
+ *
+ *      `displayDetails.card` / `cards[]` on each issue is HISTORY, not the
+ *      guard (round-39 gate, finding 4): it is written AFTER a confirmed post,
+ *      it is what routes a "sign N" reply back to the item it names, and a
+ *      crash between the post and that write leaves it missing — which is
+ *      exactly why the claim cannot live there.
  *
  * Only CJ and Richard are asked. `office`, `Justin` and `unassigned` items are
  * page-only by policy (receipt-policy.ts) — Justin's spend is overwhelmingly
@@ -391,8 +398,10 @@ export type PostOutcome =
 
 /**
  * Post one owner card to the Receipts Need Review space via an incoming
- * webhook. `threadKey` is the deterministic request id, so a retried cron
- * replies into the same thread instead of starting a new one.
+ * webhook. `thread.threadKey` is the deterministic request id and
+ * `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD` is the query
+ * parameter that acts on it, so a retried cron replies into the same thread
+ * instead of starting a new one.
  *
  * Never throws — every failure mode is one of the three outcomes above.
  */
@@ -419,13 +428,24 @@ export async function postOwnerCard(
     }
     let res: Response;
     try {
+        /**
+         * THE THREAD KEY GOES IN THE BODY, NOT THE URL (Codex PR #443 gate
+         * round 39, finding 1).
+         *
+         * `spaces.messages.create` takes `messageReplyOption` as a query
+         * parameter and the key itself as `thread.threadKey` in the message —
+         * `?threadKey=` is the deprecated spelling, and an unsupported query
+         * parameter is a 400 from an API that validates them. Worse if it is
+         * merely ignored: every retry then opens a NEW thread, so the sweep's
+         * reply routing points at a thread nobody answered in and "sign 2"
+         * resolves against a message that is not the one the owner is reading.
+         */
         const url = new URL(webhookUrl.trim());
-        url.searchParams.set("threadKey", card.requestId);
         url.searchParams.set("messageReplyOption", "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
         res = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json; charset=UTF-8" },
-            body: JSON.stringify({ text: card.text }),
+            body: JSON.stringify({ text: card.text, thread: { threadKey: card.requestId } }),
             signal: AbortSignal.timeout(timeoutMs),
         });
     } catch (error) {

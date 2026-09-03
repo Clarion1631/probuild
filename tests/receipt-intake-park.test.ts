@@ -256,10 +256,12 @@ test("every queue action CASes on updatedAt, and the page hands it over", () => 
     // And each one reaches the WHERE clause, not just the signature.
     const wheres = actions.match(/where: \{ id[^}]*updatedAt: seenAt/g) ?? [];
     assert.ok(wheres.length >= 4, `expected the direct updateMany paths to pin it, saw ${wheres.length}`);
-    // void takes it inline; mark-duplicate resolves it before opening its
-    // transaction, and both reach the park plan's claim fence.
-    assert.match(actions, /claimFence: \{ updatedAt: assertExpectedUpdatedAt\(expectedUpdatedAt\), \.\.\.notClaimedByWorker\(now\) \}/);
-    assert.match(actions, /claimFence: \{ updatedAt: seenAt, \.\.\.notClaimedByWorker\(now\) \}/);
+    // Both void and mark-duplicate resolve it before opening their transaction
+    // (void gained one in round 39, finding 2, to lock its inbound duplicate
+    // references), and both reach the park plan's claim fence.
+    const fences = actions.match(/claimFence: \{ updatedAt: seenAt, \.\.\.notClaimedByWorker\(now\) \}/g) ?? [];
+    assert.ok(fences.length >= 2, `expected both transactional parks to fence on seenAt, saw ${fences.length}`);
+    assert.match(actions, /const seenAt = assertExpectedUpdatedAt\(expectedUpdatedAt\);/);
 
     // The rendered row carries it, and every control is handed it.
     const data = readFileSync(join(repoRoot, "src/app/automation/receipts-data.ts"), "utf8");

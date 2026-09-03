@@ -129,17 +129,26 @@ test("both rows are locked, in id order, before anything is read", () => {
     const fn = source.slice(source.indexOf("export async function markReceiptIntakeDuplicate("));
     const body = fn.slice(0, fn.indexOf("\n}"));
 
-    // One transaction, one locking statement, both ids, ORDER BY id.
-    assert.match(body, /const \[first, second\] = \[id, duplicateOfId\]\.sort\(\);/);
+    // One transaction, one locking statement, both ids AND every row pointing
+    // at either — the lock widened in round 39 (finding 2) so a chain cannot be
+    // built from the other end while this transaction is deciding.
     assert.match(body, /await prisma\.\$transaction\(async tx => \{/);
-    assert.match(body, /SELECT "id" FROM "ReceiptIntake"[\s\S]{0,200}FOR UPDATE/);
-    assert.match(body, /WHERE "id" IN \(\$\{first\}, \$\{second\}\)/);
-    assert.match(body, /ORDER BY "id"/);
+    assert.match(body, /const inbound = await lockWithInboundDuplicates\(tx, \[id, duplicateOfId\]\);/);
+
+    const guard = readFileSync(join(repoRoot, "src/lib/receipt-intake/duplicate-guard.ts"), "utf8");
+    assert.match(guard, /SELECT "id", "duplicateOfId" FROM "ReceiptIntake"[\s\S]{0,400}FOR UPDATE/);
+    assert.match(guard, /ORDER BY "id"/);
+    // BOTH directions in the one statement: the rows themselves, and their
+    // inbound references. Two statements would be two lock acquisitions and a
+    // deadlock waiting for a second transaction taking them the other way.
+    assert.match(guard, /WHERE "id" IN \(\$\{wanted\[0\]\}, \$\{wanted\[1\]\}\)\s*\n\s*OR "duplicateOfId" IN/);
 
     // The validation READ comes after the lock, and the write after that.
     const lockAt = body.indexOf("FOR UPDATE");
     const readAt = body.indexOf("const original = await tx.receiptIntake.findUnique(");
     const writeAt = body.indexOf("await runParkWrites(");
+    const chainAt = body.indexOf("throw duplicateChainRefusal(\"duplicate\"");
+    assert.ok(chainAt > readAt && chainAt < writeAt, "the chain refusal sits between the read and the write");
     assert.ok(lockAt > 0 && readAt > lockAt, "reading before the lock is the bug");
     assert.ok(writeAt > readAt, "and the write comes last");
 

@@ -17,6 +17,7 @@ import { Prisma } from "@prisma/client";
 import { canonicalVendor, dedupKeys } from "./keys";
 import { dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
 import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS, routeState, type DedupHits, type ReceiptIntakeState } from "./route-state";
+import { duplicateChainReason } from "./duplicate-guard";
 import {
     appliedTaxCents,
     buildGroups,
@@ -251,6 +252,17 @@ export interface WorkerDependencies {
         ownership: Ownership,
     ) => Promise<{ strongOwner: StrongOwner | null; owned: boolean }>;
     findWeakHit: (rowId: string, weakKey: string) => Promise<{ id: string } | null>;
+    /**
+     * Rows already filed as duplicates OF this row (round-39 gate, finding 2).
+     *
+     * Routing can reach DUPLICATE for a row that is itself somebody else's
+     * original — the strong-key owner it matches may have been claimed while
+     * this row was still being routed — and parking it there leaves those rows
+     * pointing at a copy, which is the chain the manual path refuses to build.
+     * Optional so a caller that predates this simply keeps the old behaviour
+     * rather than crashing; the cron wires it.
+     */
+    findInboundDuplicates?: (rowId: string) => Promise<string[]>;
     /** Marks a row NEEDS_REVIEW / NON_RECEIPT / whatever routing decided, with no keys claimed. */
     applyState: (
         rowId: string,
@@ -624,6 +636,33 @@ export async function handleRowError(
     return ownedRetry ? "RETRY" : "STALE";
 }
 
+/**
+ * A row other rows are already filed behind may not itself become a
+ * DUPLICATE (Codex PR #443 gate round 39, finding 2).
+ *
+ * Routing can reach DUPLICATE for such a row: the strong-key owner it
+ * matches was claimed while this row was still being routed, so nothing had
+ * published it as an original yet — and parking it there leaves every row
+ * pointing at it filed behind a copy, the exact chain the manual path
+ * refuses to build.
+ *
+ * NEEDS_REVIEW rather than a throw: this is a background pass over a batch,
+ * and one row that needs a human is not a reason to abandon the rest. The
+ * reason names the referencing rows so the human can see what to unmark, and
+ * `duplicateOfId` is kept because it is the evidence for the decision they
+ * are being asked to make (route-state.ts already pairs the two this way).
+ */
+async function guardDuplicateChain(
+    deps: Pick<WorkerDependencies, "findInboundDuplicates">,
+    rowId: string,
+    decision: { state: ReceiptIntakeState; stateReason: string | null; duplicateOfId: string | null },
+): Promise<{ state: ReceiptIntakeState; stateReason: string | null; duplicateOfId: string | null }> {
+    if (decision.state !== "DUPLICATE" || !deps.findInboundDuplicates) return decision;
+    const inbound = await deps.findInboundDuplicates(rowId);
+    if (inbound.length === 0) return decision;
+    return { state: "NEEDS_REVIEW", stateReason: duplicateChainReason(inbound), duplicateOfId: decision.duplicateOfId };
+}
+
 /** QBTimeoutError is deliberately NOT here — a timeout is transport, not a verdict. */
 export function isTerminalQboFault(error: unknown): boolean {
     if (error instanceof QBTimeoutError) return false;
@@ -801,13 +840,14 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         //
         // Safe to swap: the unique-violation path applyRead exists for cannot
         // fire here, because a gated row claims no strong key at all.
-        const owned = await deps.applyState(row.id, gate.state, note(gate.stateReason), {
+        const gated = await guardDuplicateChain(deps, row.id, gate);
+        const owned = await deps.applyState(row.id, gated.state, note(gated.stateReason), {
             ...base,
-            state: gate.state,
+            state: gated.state,
             dedupStrongKey: null,
-            duplicateOfId: gate.duplicateOfId,
+            duplicateOfId: gated.duplicateOfId,
         }, ownershipOf(row));
-        return owned ? gate.state : "STALE";
+        return owned ? gated.state : "STALE";
     }
 
     // The strong claim IS the partial unique index: a rejection is the hit.
@@ -835,7 +875,9 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     if (!applied.owned) return "STALE";
 
     if (applied.strongOwner) {
-        const second = routeState(routeInput, { strong: applied.strongOwner, weak: null }, hasProject);
+        const second = await guardDuplicateChain(
+            deps, row.id, routeState(routeInput, { strong: applied.strongOwner, weak: null }, hasProject),
+        );
         const owned = await deps.applyState(row.id, second.state, note(second.stateReason), {
             ...base,
             dedupStrongKey: null,
@@ -855,7 +897,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     // re-checks the weak net.
     const weak = await deps.findWeakHit(row.id, keys.weak);
     if (weak) {
-        const third = routeState(routeInput, { strong: null, weak }, hasProject);
+        const third = await guardDuplicateChain(deps, row.id, routeState(routeInput, { strong: null, weak }, hasProject));
         // RELEASE the strong key. Nothing was sent to QuickBooks, so this row
         // is parked pre-send and the documented rule applies to it like any
         // other. Holding the key made a CORRECTED resend of the same receipt

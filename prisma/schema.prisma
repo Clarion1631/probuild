@@ -2854,9 +2854,14 @@ model ReceiptMemoArtifact {
 // ── Bank ledger (Receipt Automation Phase 1) ────────────────────────────────
 // docs/RECEIPT-AUTOMATION-PHASES.md, "Persistence decision" (2026-08-14) +
 // Codex peer-review round-1 amendments (2026-08-14): BankLine is the
-// canonical transaction ledger, and the bank STATEMENT is true north — a
-// canonical BankLine is only ever minted from a STATEMENT observation, never
-// from QBO. BankLineObservation holds one row per source sighting (a
+// canonical transaction ledger, and the bank STATEMENT is true north.
+// SUPERSEDED IN PART by Phase 2 (Justin, decision 3; Codex round-39 gate,
+// finding 4): a canonical BankLine is minted from a STATEMENT observation and,
+// when BANK_LINE_MINT_FROM_QBO is on, from a QuickBooks GENERAL LEDGER posting
+// QuickBooks says has cleared the bank. The statement still wins — it ADOPTS a
+// QBO-minted line when it arrives (sourceOfRecord flips QBO -> STATEMENT, never
+// back) and it remains the only source that sees a charge QuickBooks never
+// posted. BankLineObservation holds one row per source sighting (a
 // statement line, a QBO register row, ...), uniquely identified by its own
 // source locator, so two sources reporting the "same" transaction both stay
 // on record instead of one silently overwriting the other via a hash
@@ -2868,9 +2873,14 @@ model ReceiptMemoArtifact {
 // carries one) — never a side effect of ingest, and never on
 // amount+date/rails alone (see the Chevron/Cash App wrong-match lesson in
 // that doc — amount+date alone is zero confidence). Immutable source
-// identity, mutable workflow state: BankLine/BankLineObservation/
-// StatementImport rows are never overwritten; BankLine.state and the
-// validation columns change as automation progresses. The /automation
+// identity, mutable workflow state: a row's source IDENTITY is never
+// rewritten — BankLine.amountCents is immutable by trigger, and an observation
+// keeps its own source locator — while workflow columns change as automation
+// progresses: BankLine.state, the validation columns, BankLine.sourceOfRecord
+// and rawDescriptor/normalizedPayee on statement adoption, and
+// BankLineObservation.clearedStatus every time QuickBooks answers the clearance
+// question (round-39 gate, finding 4: "never overwritten" was written before
+// either of those existed). The /automation
 // dashboard becomes a report over these tables instead of a live in-memory
 // merge.
 //

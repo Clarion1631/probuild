@@ -17,6 +17,7 @@ import {
 } from "@/lib/receipt-card-history";
 import { isDriveFileId, probeDriveFile } from "@/lib/google-drive";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
+import { affidavitNameVerdict } from "@/lib/receipt-affidavit-name";
 
 export const dynamic = "force-dynamic";
 
@@ -114,64 +115,6 @@ async function recordAnswerRejection(targetKey: string, reason: string, detail: 
 const MAX_URL_LEN = 2_000;
 
 /**
- * The affidavit generator's own naming contract
- * (PHASE-2-QUEUE-AND-MEMOS-SPEC.md §"Sign flow", verified against
- * `chatAffidavitApp.js:524-573` — a SEPARATE Apps Script repo this route
- * cannot change): `MissingReceiptAffidavit_<date>_<vendor>_<amount>_<name>.pdf`.
- * It carries no fingerprint or bank-line id — Beverly's app never sees either
- * — so the strongest binding available without touching that external script
- * is the DOLLAR AMOUNT field, parsed out at its own fixed position (the third
- * underscore-delimited segment after the prefix) rather than searched for as
- * a substring: `name.includes("12.34")` let a memo named "...112.34..." or
- * "...12.345..." satisfy a $12.34 charge, because the target digits are a
- * substring of a DIFFERENT amount too — prefix or suffix, either way a wrong
- * charge (Codex PR #443 gate round 2 — round 1's fix reintroduced the exact
- * bug it closed, in string form).
- */
-const AFFIDAVIT_NAME_PREFIX = "MissingReceiptAffidavit_";
-
-/** The amount field's own shape: digits, a point, exactly two decimal digits. */
-const AFFIDAVIT_AMOUNT_FIELD_RE = /^(\d+)\.(\d{2})$/;
-
-/**
- * The amount FIELD, as cents — not a substring search. `<date>_<vendor>_
- * <amount>_<name...>.pdf`: date and vendor are always exactly the first two
- * fields (the sign flow's own contract), so the amount is always the third,
- * regardless of how many underscores the trailing name carries. Anything
- * that is not exactly two decimal digits (a truncated OR padded amount) is
- * not a parse failure to shrug off — it is the exact shape a wrong-charge
- * memo takes — so it returns null rather than guessing.
- */
-function affidavitAmountFieldCents(name: string): number | null {
-    const fields = name.slice(AFFIDAVIT_NAME_PREFIX.length).split("_");
-    if (fields.length < 4) return null;
-    const match = AFFIDAVIT_AMOUNT_FIELD_RE.exec(fields[2]);
-    if (!match) return null;
-    return Number(match[1]) * 100 + Number(match[2]);
-}
-
-/**
- * True when a probed Drive filename could plausibly BE the signed memo for
- * THIS charge, rather than some other PDF the bridge secret happens to be
- * able to read.
- *
- * `signed:true` plus a Drive id that merely EXISTS used to be enough to close
- * a chase — nothing tied the artifact to the charge it claims to answer
- * (Codex PR #443 gate, finding 3). Not exact-format verification — Beverly's
- * vendor/date sanitization is not this route's to pin down — but the amount
- * FIELD, parsed out and compared as an exact number of cents, is specific
- * enough that a PDF minted for a different amount cannot carry it, and a
- * file with the wrong prefix was never produced by the sign flow at all.
- */
-function affidavitNameMatchesIssue(name: string | null, amountCents: number): boolean {
-    if (!name) return false;
-    if (!name.toLowerCase().endsWith(".pdf")) return false;
-    if (!name.startsWith(AFFIDAVIT_NAME_PREFIX)) return false;
-    const fieldCents = affidavitAmountFieldCents(name);
-    return fieldCents !== null && fieldCents === Math.abs(amountCents);
-}
-
-/**
  * True when this Drive file is already recorded as the memo-signed evidence
  * on a DIFFERENT bank-line issue. One signed affidavit answers exactly one
  * charge; accepting it a second time is how a single memo silently closes two
@@ -238,7 +181,17 @@ type AttemptOutcome =
     | { kind: "association-incomplete"; detail: string }
     | { kind: "wrong-thread"; detail: string }
     | { kind: "mismatch" }
-    | { kind: "recorded"; alreadyCleared: boolean; alreadyResolved: boolean }
+    | {
+        kind: "recorded";
+        alreadyCleared: boolean;
+        alreadyResolved: boolean;
+        /**
+         * The memo filename carried no amount field to cross-check (round-39
+         * gate, finding 3). Reported by the caller; never a refusal, because
+         * the card association is what binds this memo to this charge.
+         */
+        unparseableName: string | null;
+    }
     | { kind: "lost-race" };
 
 /**
@@ -437,6 +390,13 @@ export async function POST(request: Request) {
     let missing = false;
     let neverRequested = false;
     let incompleteAssociation: string | null = null;
+    /**
+     * A memo whose filename carried no amount to cross-check (round-39 gate,
+     * finding 3). Accepted — the card association is what binds it — and
+     * reported, because a generator whose escaping has drifted is something an
+     * operator should fix before it can hide a genuinely wrong memo.
+     */
+    let unparseableName: string | null = null;
     let wrongThread: string | null = null;
     let mismatch = false;
     let reused = false;
@@ -561,12 +521,12 @@ export async function POST(request: Request) {
             // recording it again is idempotent, and nothing is closed by it.
             const alreadyAnswered = hasResolution(details);
             const amountCents = typeof details.amountCents === "number" ? details.amountCents : null;
-            if (amountCents === null || !affidavitNameMatchesIssue(probe.name, amountCents)) {
-                // Checked BEFORE the already-resolved answer below, so a memo
-                // for a DIFFERENT charge can never be waved through as "already
-                // resolved" just because this issue happens to be closed.
-                return { kind: "mismatch" };
-            }
+            // Checked BEFORE the already-resolved answer below, so a memo for a
+            // DIFFERENT charge can never be waved through as "already resolved"
+            // just because this issue happens to be closed.
+            if (amountCents === null) return { kind: "mismatch" };
+            const nameVerdict = affidavitNameVerdict(probe.name, amountCents);
+            if (nameVerdict === "mismatch") return { kind: "mismatch" };
 
             details.resolution = "memo-signed";
             // The ID is the durable identity; the URL is how a human opens it.
@@ -608,6 +568,7 @@ export async function POST(request: Request) {
                     kind: "recorded",
                     alreadyCleared: issue.clearedAt !== null,
                     alreadyResolved: alreadyAnswered,
+                    unparseableName: nameVerdict === "unparseable" ? probe.name ?? "" : null,
                 };
             }
             return { kind: "lost-race" };
@@ -625,6 +586,7 @@ export async function POST(request: Request) {
                 recorded = { targetKey: bankLineId };
                 alreadyCleared = outcome.alreadyCleared;
                 alreadyResolved = outcome.alreadyResolved;
+                unparseableName = outcome.unparseableName;
                 break;
             case "lost-race":
                 // Loop again for a fresh read — still under a fresh lock.
@@ -678,6 +640,13 @@ export async function POST(request: Request) {
     // memo from the same thread cannot make it belong to this charge. It is a
     // separate reason from `not-requested` because it means something
     // different, and the difference is what a human reading the log needs.
+    if (typeof unparseableName === "string") {
+        await recordAnswerRejection(
+            bankLineId,
+            "affidavit-name-unparseable",
+            `accepted on its card association; the filename carried no amount field to cross-check: ${unparseableName.slice(0, 200)}`,
+        );
+    }
     if (incompleteAssociation) {
         return NextResponse.json(
             {

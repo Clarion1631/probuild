@@ -152,5 +152,9 @@ test("applyRead is the ONE lease-keeping write, and it can only say RECEIVED", (
     assert.match(body, /nextRetryAt is deliberately/, "with the reason written down at the write itself");
 
     // Every TERMINAL outcome goes through applyState, which does release.
-    assert.match(worker, /const owned = await deps\.applyState\(row\.id, gate\.state, note\(gate\.stateReason\)/);
+    // `gated`, not `gate`, since round 39 (finding 2): a routed DUPLICATE for a
+    // row other rows are filed behind becomes NEEDS_REVIEW first. Still ONE
+    // applyState, and still the write that releases the claim.
+    assert.match(worker, /const gated = await guardDuplicateChain\(deps, row\.id, gate\);/);
+    assert.match(worker, /const owned = await deps\.applyState\(row\.id, gated\.state, note\(gated\.stateReason\)/);
 });

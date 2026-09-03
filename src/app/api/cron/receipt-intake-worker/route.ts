@@ -628,6 +628,21 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             orderBy: { createdAt: "asc" },
         }),
 
+        /**
+         * Rows already filed as duplicates OF this one (round-39 gate, finding
+         * 2). A plain read, not a lock: this is a background pass with no
+         * transaction around its routing write, and the honest thing it buys is
+         * "do not reclassify a row somebody is filed behind". The manual paths
+         * hold the real lock, and a race that slips past here leaves the same
+         * state a human can fix, not a booking.
+         */
+        findInboundDuplicates: async rowId => (await prisma.receiptIntake.findMany({
+            where: { duplicateOfId: rowId },
+            select: { id: true },
+            orderBy: { id: "asc" },
+            take: 10,
+        })).map(row => row.id),
+
         applyState: async (rowId, state, stateReason, patch, ownership) => {
             const { count } = await prisma.receiptIntake.updateMany({
                 where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
