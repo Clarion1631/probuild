@@ -91,6 +91,28 @@ jobs:
           # on the rate-lock step below.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # The change-order tag racing a logistics reroute, both orders, on real
+      # connections. tests/time-expense-core-guards.test.ts pins the SHAPE of
+      # that fix from the source; only this step shows PostgreSQL actually
+      # serializes the two the way the code assumes, and that a refused tag
+      # leaves nothing behind.
+      - name: Prove the change-order tag and a logistics reroute cannot both win
+        run: npx tsx --test tests/change-order-tag-race-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Runs the real tagTimeEntriesToChangeOrderCore, which reaches the
+          # app's prisma singleton — see the note on the rate-lock step below.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # The $0-rate guard through the real create core, then the ROW read back:
+      # the regression it replaced was a completed, unflagged, $0 TimeEntry row,
+      # which no predicate test can see.
+      - name: Prove the $0-rate guard refuses, flags and exempts the right rows
+        run: npx tsx --test tests/zero-rate-create-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the apply script is idempotent and --dry-run is read-only
         run: npx tsx --test tests/payroll-apply-idempotent-db.test.ts
         env:
