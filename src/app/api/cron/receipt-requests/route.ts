@@ -27,6 +27,8 @@ import {
     groupCompetingLines,
     isComponentKey,
     pageComponents,
+    MEMO_CONFLICT_RESOLUTION,
+    MEMO_SIGNED_RESOLUTION,
     hasBackedResolution,
     hasResolution,
     mergeReceiptRequestDetails,
@@ -322,6 +324,37 @@ async function readBankPullFreshness(now: Date): Promise<{ fresh: boolean; lastS
  * what says a cycle is unfinished when neither cursor is parked.
  */
 export type { SweepPhase };
+
+/**
+ * Should this apply-transaction leave an existing resolution alone, and does it
+ * have to quarantine one on the way past? (Codex PR #443 gate round 38,
+ * finding 2.)
+ *
+ * PURE, and the whole of the rule, because the guard it replaces was a second
+ * opinion that disagreed with the planner. Planning uses
+ * `hasBackedResolution`, so an unbacked `memo-signed` — the losing side of a
+ * duplicated pdfId, or a row the OLD build wrote in the window between running
+ * the migration and this deploy — is planned as a REOPEN. The guard then asked
+ * `hasResolution`, saw a resolution, and turned that reopen into a no-op: the
+ * charge stayed closed for ever on a memo that answered a different charge.
+ *
+ * `boundPdfId` is read under the same transaction and locks as the write, so
+ * the answer cannot go stale between the check and the decision.
+ *
+ * Quarantining is what makes the reopen STICK. `memo-conflict` is deliberately
+ * not a resolution `hasResolution` honours, so the next run does not re-suppress
+ * from the same blob; only the resolution changes, and `pdfId` and the rest of
+ * the history stay, because what happened still happened.
+ */
+export function memoReopenDecision(
+    details: Record<string, unknown> | null | undefined,
+    boundPdfId: string | null,
+    codes: readonly unknown[],
+): { suppressReopen: boolean; quarantine: boolean } {
+    if (codes.length === 0) return { suppressReopen: false, quarantine: false };
+    if (hasBackedResolution(details, boundPdfId)) return { suppressReopen: true, quarantine: false };
+    return { suppressReopen: false, quarantine: details?.resolution === MEMO_SIGNED_RESOLUTION };
+}
 
 /**
  * Where the cycle stands once a run ends. ONE place, so the marker can never
@@ -1362,11 +1395,31 @@ async function processBatch(
                             ? parseMissingReceiptDetails(fresh.displayDetails)
                             : detailsByKey.get(targetKey) ?? {};
 
-                        // A resolution that appeared since the snapshot: do not
-                        // reopen. Belt and braces now that the rows are locked.
-                        if (codes.length > 0 && hasResolution(freshDetails)) {
+                        /**
+                         * A resolution that appeared since the snapshot: do not
+                         * reopen. Belt and braces now that the rows are locked.
+                         *
+                         * RE-CHECKED AGAINST THE BINDING, NOT JUST THE BLOB
+                         * (Codex PR #443 gate round 38, finding 2). The planner
+                         * uses `hasBackedResolution`, so an unbacked
+                         * `memo-signed` — the losing side of a duplicated pdfId,
+                         * or a row the OLD build wrote during the window between
+                         * the migration and this deploy — is planned as a reopen.
+                         * This guard then read the blob alone, found a
+                         * resolution, and turned that reopen into a no-op: the
+                         * charge stayed closed for ever on a memo that answered
+                         * a different charge. The artifact lookup happens HERE,
+                         * under the same transaction and locks as the write.
+                         */
+                        const boundPdfId = (await tx.receiptMemoArtifact.findUnique({
+                            where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
+                            select: { pdfId: true },
+                        }))?.pdfId ?? null;
+                        const guard = memoReopenDecision(freshDetails, boundPdfId, codes);
+                        if (guard.suppressReopen) {
                             return { decision: { step: 1, action: "noop", canonicalCodes: [], reasonHash: "" }, applied: false };
                         }
+                        if (guard.quarantine) freshDetails.resolution = MEMO_CONFLICT_RESOLUTION;
 
                         return evaluateReviewIssue(
                             RECEIPT_REQUEST_TARGET_TYPE,

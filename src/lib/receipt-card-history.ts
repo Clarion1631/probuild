@@ -141,16 +141,36 @@ export function cardRecordsOf(details: Record<string, unknown> | null | undefine
 export interface AnswerAssociation {
     /** The Chat thread the answer came from — `spaces/<s>/threads/<t>`. */
     thread: string | null;
-    /** The "sign N" number on the card, when the answer carries it. */
+    /** The "sign N" number of the item on that card. REQUIRED. */
     n: number | null;
-    /** The card's request id, when the answer carries it. */
+    /** The card's request id. REQUIRED. */
     requestId: string | null;
 }
 
 export type CardAssociationVerdict =
     | { kind: "never-carded" }
     | { kind: "matched"; record: CardRecord }
+    /** The answer named fewer than all three parts of the association. */
+    | { kind: "incomplete"; detail: string }
     | { kind: "wrong-thread"; detail: string };
+
+/** The three fields an answer must carry to name ONE asked-about item. */
+export const REQUIRED_ASSOCIATION_FIELDS = ["thread", "n", "request_id"] as const;
+
+/**
+ * Which of them this answer is missing, in the bridge's own spelling.
+ *
+ * Exported so the route can refuse an answer BEFORE it spends a Drive round
+ * trip on it, and so the operator is told exactly what the bridge failed to
+ * send rather than "wrong thread".
+ */
+export function missingAssociationFields(answer: AnswerAssociation): string[] {
+    const missing: string[] = [];
+    if (!answer.thread?.trim()) missing.push("thread");
+    if (answer.n === null) missing.push("n");
+    if (!answer.requestId?.trim()) missing.push("request_id");
+    return missing;
+}
 
 /**
  * Does this answer come from a card WE posted about THIS issue?
@@ -164,11 +184,15 @@ export type CardAssociationVerdict =
  * chase nobody had answered. The `thread` the bridge already sends was stored
  * and never compared with the thread the card actually went out in.
  *
- * So the answer must name a card record ON THIS ISSUE: the thread exactly, and
- * `n`/`requestId` too when it carries them. An answer with no thread at all
- * cannot be associated with anything and is refused rather than assumed —
- * fail-closed, because the whole point is that "we cannot tell" must never be
- * recorded as "it checked out".
+ * So the answer must name a card record ON THIS ISSUE — and name it EXACTLY
+ * (Codex PR #443 gate round 38, finding 1). Thread, `n` and `requestId` are all
+ * three required, because a card lists several charges in ONE thread and the
+ * memo filenames of two same-amount charges are interchangeable: with `n`
+ * optional, an answer that simply omitted it was matched by the thread alone
+ * and could close either of them. There is no amount-only and no thread-only
+ * path left; an answer that cannot say which item it answers is refused rather
+ * than assumed — fail-closed, because "we cannot tell" must never be recorded
+ * as "it checked out".
  */
 export function matchCardAssociation(
     details: Record<string, unknown> | null | undefined,
@@ -180,30 +204,28 @@ export function matchCardAssociation(
     // the other means somebody asked but not where this reply came from.
     if (records.length === 0) return { kind: "never-carded" };
 
-    const thread = answer.thread?.trim() ?? "";
-    if (!thread) {
-        return { kind: "wrong-thread", detail: "the answer carries no originating thread" };
+    const missing = missingAssociationFields(answer);
+    if (missing.length > 0) {
+        return {
+            kind: "incomplete",
+            detail: `the answer must name the card item it answers: missing ${missing.join(", ")}`,
+        };
     }
 
+    const thread = (answer.thread as string).trim();
     let candidates = records.filter(record => typeof record.threadName === "string" && record.threadName.trim() === thread);
     if (candidates.length === 0) {
         return { kind: "wrong-thread", detail: "no card for this charge was posted in that thread" };
     }
-    // `n` and `requestId` NARROW an already-matching thread; they never widen
-    // it. A card lists several charges in one thread, so the thread alone can
-    // be satisfied by a sibling item — when the bridge tells us which item it
-    // was, that has to agree too.
-    if (answer.n !== null) {
-        candidates = candidates.filter(record => record.n === answer.n);
-        if (candidates.length === 0) {
-            return { kind: "wrong-thread", detail: "that thread's card did not ask about this charge under that number" };
-        }
+    // ALL THREE, ALWAYS. Each one narrows; none of them is optional, so no
+    // answer can be satisfied by a sibling item that merely shares the thread.
+    candidates = candidates.filter(record => record.n === answer.n);
+    if (candidates.length === 0) {
+        return { kind: "wrong-thread", detail: "that thread's card did not ask about this charge under that number" };
     }
-    if (answer.requestId !== null) {
-        candidates = candidates.filter(record => record.requestId === answer.requestId);
-        if (candidates.length === 0) {
-            return { kind: "wrong-thread", detail: "the answer names a different card request" };
-        }
+    candidates = candidates.filter(record => record.requestId === answer.requestId);
+    if (candidates.length === 0) {
+        return { kind: "wrong-thread", detail: "the answer names a different card request" };
     }
     return { kind: "matched", record: candidates[0] };
 }

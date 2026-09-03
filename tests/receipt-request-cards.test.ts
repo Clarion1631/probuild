@@ -170,6 +170,7 @@ test("the threads serializer emits EXACTLY sweepChatReceipts.js's shape", () => 
         threadName: "spaces/AAQAKhvMYtg/threads/abc",
         messageName: "spaces/AAQAKhvMYtg/messages/def",
         owner: "CJ",
+        requestId: "receipt-req-CJ-2026-08-20",
         items: [{ n: 1, fingerprint: "pb-bl-1", date: "2026-08-16", vendor: "LOWES #02516", cents: 12_345, amount: "123.45" }],
     }], ownerChatUsers);
 
@@ -180,6 +181,11 @@ test("the threads serializer emits EXACTLY sweepChatReceipts.js's shape", () => 
                 owner: "CJ",
                 owner_user: "users/111",
                 message_name: "spaces/AAQAKhvMYtg/messages/def",
+                // ADDED alongside `cleared` (round-38 gate, finding 1): the
+                // answers route now REQUIRES `request_id` with every signed
+                // memo, and a Chat reply carries no such thing — this export is
+                // the only place the bridge can learn it.
+                request_id: "receipt-req-CJ-2026-08-20",
                 // `cleared` is an ADDED key, not a renamed one — the sweep
                 // indexes the five it knows and ignores the rest. It is what
                 // lets an ANSWERED item stay in its thread (so "sign 2" still
@@ -190,7 +196,7 @@ test("the threads serializer emits EXACTLY sweepChatReceipts.js's shape", () => 
         },
     });
     // Key order/name matters to the sweep — assert the keys, not just the values.
-    assert.deepEqual(Object.keys(out.threads["spaces/AAQAKhvMYtg/threads/abc"]), ["owner", "owner_user", "message_name", "items"]);
+    assert.deepEqual(Object.keys(out.threads["spaces/AAQAKhvMYtg/threads/abc"]), ["owner", "owner_user", "message_name", "request_id", "items"]);
     // The five the sweep reads come FIRST and unrenamed; `cleared` is appended.
     assert.deepEqual(Object.keys(out.threads["spaces/AAQAKhvMYtg/threads/abc"].items[0]),
         ["n", "fingerprint", "date", "vendor", "cents", "amount", "cleared"]);
@@ -204,6 +210,7 @@ test("an answered item still ships, marked cleared — the numbering must not mo
         threadName: "t/1",
         messageName: "m/1",
         owner: "CJ",
+        requestId: "receipt-req-CJ-2026-08-20",
         items: [
             { n: 1, fingerprint: "pb-bl-1", date: "2026-08-16", vendor: "LOWES", cents: 100, amount: "1.00", cleared: true },
             { n: 2, fingerprint: "pb-bl-2", date: "2026-08-16", vendor: "ARCO", cents: 200, amount: "2.00" },
@@ -213,7 +220,7 @@ test("an answered item still ships, marked cleared — the numbering must not mo
 });
 
 test("a missing owner_user is an empty string, never undefined — the JSON must stay valid", () => {
-    const out = serializeThreads([{ threadName: "t/1", messageName: "m/1", owner: "CJ", items: [] }], {});
+    const out = serializeThreads([{ threadName: "t/1", messageName: "m/1", owner: "CJ", requestId: "receipt-req-CJ-2026-08-20", items: [] }], {});
     assert.equal(out.threads["t/1"].owner_user, "");
 });
 

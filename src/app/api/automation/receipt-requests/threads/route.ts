@@ -5,6 +5,7 @@ import { decodeReasonCodes } from "@/lib/review-alert-reasons";
 import { CARD_HISTORY_DAYS, RECEIPT_REQUEST_TARGET_TYPE } from "@/lib/receipt-requests";
 import {
     parseOwnerChatUsers,
+    requestIdFor,
     serializeThreads,
     type CardItem,
     type PostedCardRecord,
@@ -83,7 +84,7 @@ export async function GET(request: Request) {
         where: { pacificDate: { gte: cutoff }, postedAt: { not: null }, threadName: { not: null } },
         orderBy: { pacificDate: "desc" },
         take: 200,
-        select: { owner: true, itemsJson: true, threadName: true, messageName: true },
+        select: { owner: true, pacificDate: true, itemsJson: true, threadName: true, messageName: true },
     });
     if (cards.length === 0) {
         return NextResponse.json(serializeThreads([], parseOwnerChatUsers(process.env.RECEIPT_OWNER_CHAT_USERS)));
@@ -139,6 +140,10 @@ export async function GET(request: Request) {
             threadName: card.threadName as string,
             messageName: card.messageName ?? "",
             owner: card.owner,
+            // DERIVED, not stored: the id is deterministic per owner and Pacific
+            // date, and it is the same one the card record on each issue carries
+            // — which is what the answers route matches against.
+            requestId: requestIdFor(card.owner, card.pacificDate),
             items: items.sort((a, b) => a.n - b.n),
         });
     }

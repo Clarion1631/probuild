@@ -13,6 +13,7 @@ import {
     type ReceiptEvidenceExpense,
     type ReceiptRequestBankLine,
 } from "../src/lib/receipt-requests";
+import { memoReopenDecision } from "../src/app/api/cron/receipt-requests/route";
 import {
     applyReceiptRequestPlan,
     evidenceBoundsFor,
@@ -241,6 +242,10 @@ test("a memo signed DURING the sweep is not un-answered by it", async () => {
     signed.displayDetails = JSON.stringify({
         ...JSON.parse(signed.displayDetails!),
         resolution: "memo-signed",
+        // The ID, not just the link: a real answers-route write always records
+        // it, and it is what the artifact binding is checked against (round-38
+        // gate, finding 2). A memo resolution with no id names no evidence.
+        pdfId: "pdf-1",
         pdfUrl: "https://drive.example/memo.pdf",
     });
     signed.clearedAt = NOW;
@@ -251,7 +256,10 @@ test("a memo signed DURING the sweep is not un-answered by it", async () => {
     const summary = await applyReceiptRequestPlan(plan, async (targetKey, codes, displayDetails) => {
         const fresh = store.issues.get(`${RECEIPT_REQUEST_TARGET_TYPE}::${targetKey}`);
         const freshDetails = fresh?.displayDetails ? JSON.parse(fresh.displayDetails) : {};
-        if (codes.length > 0 && hasResolution(freshDetails)) {
+        // The SAME rule the route runs (round-38 gate, finding 2): a memo
+        // resolution counts only where the artifact table binds it to this
+        // charge. `pdf-1` is that binding here — the answer is real.
+        if (memoReopenDecision(freshDetails, "pdf-1", codes).suppressReopen) {
             return { decision: { step: 1, action: "noop", canonicalCodes: [], reasonHash: "" }, applied: false };
         }
         return evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, targetKey, codes,
@@ -274,7 +282,12 @@ test("the sweep's real apply path reads fresh, not from the run-start snapshot",
     const applyAt = source.indexOf("const applied = await applyReceiptRequestPlan(");
     const freshReadAt = source.indexOf("const fresh = await tx.reviewIssue.findUnique(");
     assert.ok(applyAt > 0 && freshReadAt > applyAt, "the read must be INSIDE the per-issue callback");
-    assert.match(source, /if \(codes\.length > 0 && hasResolution\(freshDetails\)\)/);
+    // ARTIFACT-BACKED since round 38, finding 2: the blob-only guard turned a
+    // planned reopen of an UNBACKED memo into a no-op, so a charge stayed
+    // closed for ever on a memo that had answered a different one. The binding
+    // is read in the same transaction, and the decision is one pure function.
+    assert.match(source, /const guard = memoReopenDecision\(freshDetails, boundPdfId, codes\);/);
+    assert.match(source, /if \(guard\.suppressReopen\)/);
     assert.match(source, /mergeReceiptRequestDetails\(freshDetails, displayDetails\)/);
 });
 

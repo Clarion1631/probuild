@@ -290,6 +290,14 @@ export interface ThreadRecord {
     owner: string;
     owner_user: string;
     message_name: string;
+    /**
+     * The card's request id, so a reply from this thread can name the ask it
+     * answers (Codex PR #443 gate round 38, finding 1). The answers route now
+     * REQUIRES `request_id` alongside `n`; without this key the bridge had no
+     * way to know it — the deterministic `receipt-req-<owner>-<date>` shape is
+     * ours, not something a Chat reply carries.
+     */
+    request_id: string;
     items: ThreadRecordItem[];
 }
 
@@ -297,6 +305,8 @@ export interface PostedCardRecord {
     threadName: string;
     messageName: string;
     owner: string;
+    /** `requestIdFor(owner, pacificDate)` — the id the answer must echo back. */
+    requestId: string;
     items: ThreadRecordItem[];
 }
 
@@ -317,6 +327,7 @@ export function serializeThreads(
             owner: card.owner,
             owner_user: ownerChatUsers[card.owner] ?? "",
             message_name: card.messageName,
+            request_id: card.requestId,
             items: card.items.map(item => ({
                 n: item.n,
                 fingerprint: item.fingerprint,

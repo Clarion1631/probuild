@@ -10,10 +10,19 @@
  *
  * WHAT THIS IS NOT: it does not create, edit, or void anything in QuickBooks.
  * QBO stays read-only (money-map rule 2). Observations are CORROBORATING
- * EVIDENCE — the bank statement remains true north, canonical `BankLine` rows
- * are minted ONLY from STATEMENT observations, and linking an observation to a
- * canonical line is the separate, explicit reconcile step, never an
- * ingest-time side effect.
+ * EVIDENCE, and linking an observation to a canonical line is the separate,
+ * explicit reconcile step, never an ingest-time side effect.
+ *
+ * WHICH SOURCES MINT (Codex PR #443 gate round 38, finding 3 — this paragraph
+ * predates the nightly mint and said statements were the only minter).
+ * Canonical `BankLine` rows are minted from STATEMENT observations and, when
+ * `BANK_LINE_MINT_FROM_QBO` is on, from QuickBooks GENERAL LEDGER postings that
+ * QuickBooks says have cleared the bank. The statement is still the preferred
+ * source and adopts a QBO-minted line when it arrives. It is also the ONLY
+ * source for a charge the bank has cleared that QuickBooks has not posted —
+ * pending, excluded or unmatched in "For Review" — because no QBO API returns
+ * those rows at all. The pull narrows the statement-import gap to exactly that
+ * set; it does not close it.
  *
  * The fetch goes through `fetchBankRegister`, which calls `qbFetch` — so this
  * inherits the shared QBO timeout/`QBTimeoutError` contract rather than
@@ -48,9 +57,10 @@ export interface BankRegisterRowLike {
     name: string | null;
     amountCents: number;
     /**
-     * The GL's memo/description cell. The bank feed usually leaves the ORIGINAL
-     * POS descriptor here — "LOWES #02516 POS DEB C#8516" — which is the only
-     * place a QBO row carries the card tail. Without it every QBO-minted line
+     * The GL's memo/description cell. When QuickBooks posts a row it matched
+     * from the bank, it usually leaves the ORIGINAL POS descriptor here —
+     * "LOWES #02516 POS DEB C#8516" — which is the only place a posted QBO row
+     * carries the card tail. Without it every QBO-minted line
      * resolved to `office` and the crew was never asked (Codex round-4 item 7).
      */
     memo?: string | null;
@@ -108,7 +118,7 @@ export const BANK_REGISTER_PULL_DAYS = 7;
  */
 export function registerRowToIngestLine(row: BankRegisterRowLike): BankRegisterIngestLine | null {
     if (!row.qbTxnId) return null; // balance/summary rows carry no txn identity
-    // THE BANK FEED'S OWN TEXT, or QuickBooks' name when there is none. NOT a
+    // THE POSTED ROW'S ORIGINAL DESCRIPTOR, or QuickBooks' name when there is none. NOT a
     // concatenation, and never the transaction type: no statement carries
     // " Expense" on the end, so appending it gave the same transaction two
     // identities and nothing ever reconciled. (Rows really are distinguishable

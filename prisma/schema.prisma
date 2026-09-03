@@ -2921,10 +2921,12 @@ model BankLine {
   state           String   @default("POSTED") // POSTED, EVIDENCE_FOUND, TRANSACTION_CREATED, ATTACHMENT_CONFIRMED, MATCHED, JOB_CODED, TAX_VALIDATED, EXCEPTION
   exceptionReason String?
   /// Which source MINTED this canonical line. "STATEMENT" is the historical and
-  /// still-preferred answer — the bank statement is true north. "QBO" means the
-  /// nightly register pull minted it because QuickBooks had a posted, cleared
-  /// row and no statement had arrived yet (Justin, decision 3: the QBO bank feed
-  /// is bank truth). When the statement observation later lands and matches
+  /// still-preferred answer — the bank statement is true north, and the only
+  /// source that sees a charge QuickBooks has not posted. "QBO" means the
+  /// nightly register pull minted it because the QuickBooks GENERAL LEDGER had a
+  /// posted row QuickBooks said had cleared the bank, and no statement had
+  /// arrived yet (Justin, decision 3: a posted, cleared register row is good
+  /// enough to chase against). When the statement observation later lands and matches
   /// exactly (payee+date+amount+check#), the ingest ADOPTS this line rather than
   /// minting a second one, and flips this back to "STATEMENT". A line therefore
   /// only ever moves QBO -> STATEMENT, never the other way.

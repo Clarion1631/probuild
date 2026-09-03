@@ -10,7 +10,11 @@ import {
     hasResolution,
     isDurableArtifactUrl,
 } from "@/lib/receipt-requests";
-import { matchCardAssociation } from "@/lib/receipt-card-history";
+import {
+    REQUIRED_ASSOCIATION_FIELDS,
+    matchCardAssociation,
+    missingAssociationFields,
+} from "@/lib/receipt-card-history";
 import { isDriveFileId, probeDriveFile } from "@/lib/google-drive";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
@@ -79,6 +83,31 @@ function associationFromBody(body: AnswerBody): { thread: string | null; n: numb
         n: typeof body.n === "number" && Number.isInteger(body.n) ? body.n : null,
         requestId,
     };
+}
+
+/**
+ * Record a refused memo answer where the morning digest will see it.
+ *
+ * `pipeline-health`'s 24h error count reads AutomationEvent for ANY kind, so an
+ * "error" row here surfaces the same day rather than leaving a chase that
+ * quietly never resolves and a bridge nobody knows is misconfigured. Never
+ * throws: the refusal is the answer, and failing to log it must not turn a 422
+ * into a 500.
+ */
+async function recordAnswerRejection(targetKey: string, reason: string, detail: string): Promise<void> {
+    try {
+        await prisma.automationEvent.create({
+            data: {
+                kind: "receipt-memo-answer",
+                status: "error",
+                reason,
+                source: "bridge",
+                detail: JSON.stringify({ targetKey, detail }).slice(0, 2_000),
+            },
+        });
+    } catch (error) {
+        console.error("[automation/receipt-requests/answers] rejection not recorded", error instanceof Error ? error.message : "UnknownError");
+    }
 }
 
 /** A stored URL is display data; cap it so a stray blob cannot bloat the row. */
@@ -206,6 +235,7 @@ type AttemptOutcome =
     | { kind: "reused" }
     | { kind: "already-bound"; detail: string }
     | { kind: "never-requested" }
+    | { kind: "association-incomplete"; detail: string }
     | { kind: "wrong-thread"; detail: string }
     | { kind: "mismatch" }
     | { kind: "recorded"; alreadyCleared: boolean; alreadyResolved: boolean }
@@ -275,6 +305,35 @@ export async function POST(request: Request) {
     });
     if (!targetIssue) {
         return NextResponse.json({ ok: true, ignored: true, reason: "unknown-target" });
+    }
+
+    /**
+     * THE ANSWER MUST NAME THE ITEM IT ANSWERS (Codex PR #443 gate round 38,
+     * finding 1).
+     *
+     * One card lists several charges in ONE thread, and two same-amount charges
+     * mint memos with interchangeable filenames — so `thread` alone identifies
+     * the CARD, never the item on it. With `n` and `request_id` optional, an
+     * answer that simply omitted them was matched by the thread and could close
+     * either charge; the amount in the filename cannot break the tie because it
+     * is the same amount.
+     *
+     * Refused HERE, before the Drive round trip, and refused rather than
+     * guessed: a memo we cannot attribute is not evidence about any particular
+     * charge. The reason names the missing fields so the operator can see it is
+     * the BRIDGE that needs fixing, not the memo — and it is recorded as an
+     * automation error so the digest surfaces it the same day (a rejection
+     * nobody sees is a chase that quietly never resolves).
+     */
+    const association = associationFromBody(body);
+    const missingAssociation = missingAssociationFields(association);
+    if (missingAssociation.length > 0) {
+        const detail = `the bridge must send ${REQUIRED_ASSOCIATION_FIELDS.join(", ")}; missing ${missingAssociation.join(", ")}`;
+        await recordAnswerRejection(bankLineId, "association-incomplete", detail);
+        return NextResponse.json(
+            { ok: false, reason: "association-incomplete", detail, targetKey: bankLineId },
+            { status: 422 },
+        );
     }
 
     /**
@@ -377,15 +436,14 @@ export async function POST(request: Request) {
     let alreadyResolved = false;
     let missing = false;
     let neverRequested = false;
+    let incompleteAssociation: string | null = null;
     let wrongThread: string | null = null;
     let mismatch = false;
     let reused = false;
     /** The pdfId this issue is already bound to, when a DIFFERENT one arrived. */
     let alreadyBound: string | null = null;
 
-    const association = associationFromBody(body);
-
-    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !wrongThread && !mismatch && !reused && !alreadyBound; attempt++) {
+    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !incompleteAssociation && !wrongThread && !mismatch && !reused && !alreadyBound; attempt++) {
         const outcome: AttemptOutcome = await withBindingBackstop(() => prisma.$transaction(async tx => {
             /**
              * THE PDF-ID LOCK — taken BEFORE the reuse check, and held through
@@ -493,6 +551,10 @@ export async function POST(request: Request) {
              */
             const verdict = matchCardAssociation(details, association);
             if (verdict.kind === "never-carded") return { kind: "never-requested" };
+            // Unreachable behind the guard above, and kept because the guard is
+            // not what makes this safe — this is. A future caller that reaches
+            // the transaction another way must hit the same wall.
+            if (verdict.kind === "incomplete") return { kind: "association-incomplete", detail: verdict.detail };
             if (verdict.kind === "wrong-thread") return { kind: "wrong-thread", detail: verdict.detail };
             // Already answered BEFORE this write — the forwarder retrying, or a
             // memo landing after the matcher auto-closed the line. Either way
@@ -556,6 +618,7 @@ export async function POST(request: Request) {
             case "reused": reused = true; break;
             case "already-bound": alreadyBound = outcome.detail; break;
             case "never-requested": neverRequested = true; break;
+            case "association-incomplete": incompleteAssociation = outcome.detail; break;
             case "wrong-thread": wrongThread = outcome.detail; break;
             case "mismatch": mismatch = true; break;
             case "recorded":
@@ -615,6 +678,17 @@ export async function POST(request: Request) {
     // memo from the same thread cannot make it belong to this charge. It is a
     // separate reason from `not-requested` because it means something
     // different, and the difference is what a human reading the log needs.
+    if (incompleteAssociation) {
+        return NextResponse.json(
+            {
+                ok: false,
+                reason: "association-incomplete",
+                detail: incompleteAssociation,
+                targetKey: bankLineId,
+            },
+            { status: 422 },
+        );
+    }
     if (wrongThread) {
         return NextResponse.json(
             {

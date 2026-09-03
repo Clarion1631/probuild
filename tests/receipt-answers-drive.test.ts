@@ -39,6 +39,8 @@ const MATCHING_NAME = "MissingReceiptAffidavit_2026-08-16_LOWES_123.45_CJ.pdf";
  * PR #443 gate round 33, finding 3).
  */
 const CARD_THREAD = "spaces/x/threads/y";
+/** The request id of that same card — the third part of the association. */
+const CARD_REQUEST_ID = "receipt-req-CJ-2026-08-16";
 
 /** A `displayDetails` blob that has been CARDED (see matchCardAssociation). */
 const CARDED_DETAILS = JSON.stringify({
@@ -307,18 +309,22 @@ function reset() {
 }
 
 /**
- * `thread` defaults to the fixture's own card thread, because that is what a
- * real bridge answer carries — every one of these cases is otherwise about
- * something else, and spelling it out in twenty bodies would only obscure the
- * tests that ARE about the association. A case that cares passes its own
- * `thread` (or `thread: undefined` to send none at all).
+ * The association defaults to the fixture's own card item, because that is what
+ * a real bridge answer carries — every one of these cases is otherwise about
+ * something else, and spelling all three fields out in twenty bodies would only
+ * obscure the tests that ARE about the association. A case that cares passes its
+ * own `thread`/`n`/`request_id` (or `undefined` to send none at all).
+ *
+ * ALL THREE, since round 38 finding 1: thread, `n` and `request_id` together
+ * name ONE item on ONE card, which is the only thing that distinguishes two
+ * same-amount charges asked about in the same thread.
  */
 const post = (body: Record<string, unknown>) => POST(new Request(
     "https://probuild.test/api/automation/receipt-requests/answers",
     {
         method: "POST",
         headers: { "content-type": "application/json", "x-receipt-intake-secret": "bridge-secret" },
-        body: JSON.stringify({ thread: CARD_THREAD, ...body }),
+        body: JSON.stringify({ thread: CARD_THREAD, n: 1, request_id: CARD_REQUEST_ID, ...body }),
     },
 ));
 
@@ -612,7 +618,7 @@ test("re-answering the SAME issue with the SAME pdf_id is not a reuse conflict",
             amountCents: -12_345,
             resolution: "memo-signed",
             pdfId: FILE_ID,
-            cards: [{ n: 1, date: "2026-08-16", threadName: CARD_THREAD }],
+            cards: [{ n: 1, date: "2026-08-16", threadName: CARD_THREAD, requestId: CARD_REQUEST_ID }],
         }),
         clearedAt: null,
     });
@@ -686,7 +692,7 @@ test("a PDF named for a SUPERSET amount ($112.34) does not satisfy a $12.34 char
     // `name.includes("12.34")` used to let "...112.34..." through: the target
     // digits are a substring of a completely different dollar amount.
     reset();
-    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1, threadName: CARD_THREAD }] }), clearedAt: null });
+    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1, threadName: CARD_THREAD, requestId: CARD_REQUEST_ID }] }), clearedAt: null });
     probeResult = {
         kind: "found",
         id: FILE_ID,
@@ -705,7 +711,7 @@ test("a PDF named with an extra trailing digit ($12.345) does not satisfy a $12.
     // The amount field's own shape is always two decimal places; a third
     // digit is not "close enough", it is a different, unparseable field.
     reset();
-    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1, threadName: CARD_THREAD }] }), clearedAt: null });
+    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1, threadName: CARD_THREAD, requestId: CARD_REQUEST_ID }] }), clearedAt: null });
     probeResult = {
         kind: "found",
         id: FILE_ID,
@@ -722,7 +728,7 @@ test("a PDF named with an extra trailing digit ($12.345) does not satisfy a $12.
 
 test("the EXACT amount field, and nothing else, satisfies the charge", async () => {
     reset();
-    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1, threadName: CARD_THREAD }] }), clearedAt: null });
+    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1, threadName: CARD_THREAD, requestId: CARD_REQUEST_ID }] }), clearedAt: null });
     probeResult = {
         kind: "found",
         id: FILE_ID,
@@ -766,7 +772,12 @@ test("an answer carrying NO thread at all is refused too — fail-closed, never 
     foundMatchingMemo();
     const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID, thread: undefined });
     assert.equal(res.status, 422);
-    assert.equal((await res.json() as { reason: string }).reason, "wrong-thread");
+    // `association-incomplete` since round 38, finding 1: the refusal now happens
+    // before the Drive round trip and NAMES the field the bridge failed to send,
+    // so an operator sees a bridge to fix rather than a memo to re-sign.
+    const payload = await res.json() as { reason: string; detail: string };
+    assert.equal(payload.reason, "association-incomplete");
+    assert.match(payload.detail, /missing thread/);
     assert.deepEqual(writes, []);
 });
 
@@ -858,7 +869,7 @@ test("re-submitting the same memo on the same issue answers 200 alreadyResolved"
             amountCents: -12_345,
             resolution: "memo-signed",
             pdfId: FILE_ID,
-            cards: [{ n: 1, date: "2026-08-16", threadName: CARD_THREAD }],
+            cards: [{ n: 1, date: "2026-08-16", threadName: CARD_THREAD, requestId: CARD_REQUEST_ID }],
         }),
         clearedAt: new Date("2026-08-20T00:00:00Z"),
     });

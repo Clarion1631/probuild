@@ -3,10 +3,12 @@
 //   1. BankLine."sourceOfRecord" — which source MINTED the canonical line.
 //      Defaults to 'STATEMENT', which is true for every row that exists today,
 //      so the backfill is the default and no UPDATE is needed. 'QBO' marks a
-//      line minted by the nightly register pull because QuickBooks had a
-//      posted, cleared row and no statement had arrived yet (Justin, decision
-//      3: the QBO bank feed is bank truth). It flips back to 'STATEMENT' when
-//      the statement observation lands and is adopted.
+//      line minted by the nightly register pull because the QuickBooks GENERAL
+//      LEDGER had a posted row QuickBooks said had cleared the bank, and no
+//      statement had arrived yet (Justin, decision 3: a posted, cleared register
+//      row is good enough to chase against). It flips back to 'STATEMENT' when
+//      the statement observation lands and is adopted. Statement import stays
+//      the only source for a cleared charge QuickBooks never posted.
 //
 //   2. "ReceiptRequestCard" — the durable outbox for the per-owner Chat digest.
 //      UNIQUE (owner, pacificDate) is the whole point: the row is created in

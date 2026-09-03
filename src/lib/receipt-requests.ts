@@ -960,7 +960,13 @@ export function evidenceComponents(
  * needs to find its replies.
  */
 export const PRESERVED_DETAIL_KEYS = [
-    "resolution", "pdfUrl", "signedAt", "signedThread", "cards", "card",
+    // `pdfId` RIDES WITH `resolution` (Codex PR #443 gate round 38, finding 2).
+    // It is not decoration: `hasBackedResolution` compares it against the
+    // ReceiptMemoArtifact bound to this charge, so a recompute that kept the
+    // resolution and dropped the id turned a backed memo into an unbacked one —
+    // the chase reopens, the owner is asked again for a receipt they signed for,
+    // and the artifact table still refuses a second memo for the same charge.
+    "resolution", "pdfId", "pdfUrl", "signedAt", "signedThread", "cards", "card",
     // A human's owner assignment outlives every nightly recompute. Without it
     // the sweep would overwrite Marge's decision within 24 hours and the card
     // would never go out.

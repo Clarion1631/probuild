@@ -278,7 +278,7 @@ Planner output for the executor: build exactly this; do not guess.
   the PR description as a required companion, never silently assume it.
 - **Close the loop**: `POST /api/automation/receipt-requests/answers`
   (`RECEIPT_BRIDGE_SECRET`) accepting
-  `{fingerprint, signed?, pdf_id, pdf_url?, job?, at, message, thread}` — a
+  `{fingerprint, signed?, pdf_id, pdf_url?, job?, at, message, thread, n, request_id}` — a
   qbo-clasp forwarder posts each NEW `chat-job-answers.json` record. For
   `fingerprint = "pb-<bankLineId>"` with `signed:true` the artifact is
   **VERIFIED, not trusted**: `pdf_id` is required and its Drive metadata is read
@@ -304,9 +304,21 @@ Planner output for the executor: build exactly this; do not guess.
      so a memo signed for one charge and replayed against the other's fingerprint
      satisfied both this check and check 3. The `thread` the bridge already sends was
      stored and never compared. It is now matched exactly against a card record on THIS
-     issue (plus `n`/`request_id` when the answer carries them); no match ⇒ **422**
-     `wrong-thread`, and an answer with no thread at all is refused the same way rather
-     than assumed. The cleared-issue exemption round 32 added here is GONE: it was a real
+     issue. **ALL THREE ARE REQUIRED (round-38 gate, finding 1).** `thread` names the
+     CARD, never the item on it: one card lists several charges in one thread, and two
+     same-amount charges mint memos with interchangeable filenames — so an answer that
+     omitted `n` was matched by the thread alone and could close either of them. An
+     answer missing `thread`, `n` or `request_id` is **422** `association-incomplete`,
+     refused before the Drive round trip, with the missing field names in `detail` and an
+     `AutomationEvent` (`kind: "receipt-memo-answer"`, `status: "error"`) so the morning
+     digest surfaces it; a triple that does not match a stored card record on this issue
+     is **422** `wrong-thread`. There is no amount-only and no thread-only path left.
+     **COMPANION CHANGE (Beverly's forwarder, not in this repo):** it must send `n` and
+     `request_id`. `n` it already has from the thread export; `request_id` is now
+     exported alongside it (`GET .../threads` emits `request_id` per thread), because a
+     Chat reply carries no such field — it is ours, derived from owner + Pacific date.
+     Until the forwarder sends both, signed memos are refused rather than mis-attributed:
+     fail-closed on purpose, and visible the same day. The cleared-issue exemption round 32 added here is GONE: it was a real
      race, it was fixed at the source (`recordCardOnIssues` writes on cleared issues too),
      and leaving it meant any already-closed charge accepted a memo nobody had asked for.
      A cleared issue that never had a card is **422** `not-requested`. (Recording on a
