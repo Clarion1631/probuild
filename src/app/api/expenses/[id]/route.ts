@@ -4,12 +4,16 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { canAccessProject, getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import {
-    QboManagedExpenseError,
     assertExpenseMutableOutsideQbo,
+    isQboManagedExpenseError,
 } from "@/lib/qbo-expense-guard";
 import {
+    COST_CODE_ID_INVALID_MESSAGE,
+    deductionCeiling,
     expenseStillOnProjectWhere,
     hasTaxClassification,
+    parseCostCodeIdEdit,
+    taxDeductibleBaseFits,
     isPlausibleReceiptTax,
     itemBelongsToProjectTx,
     maxPlausibleTaxAmount,
@@ -98,7 +102,7 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
 
         return NextResponse.json({ success: true, deleted: removed.count });
     } catch (error) {
-        if (error instanceof QboManagedExpenseError) {
+        if (isQboManagedExpenseError(error)) {
             return NextResponse.json({ error: error.message }, { status: 409 });
         }
         console.error("Error deleting expense:", error);
@@ -241,9 +245,24 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // assert its own provenance — it is derived from the fact that a person
         // used this endpoint. The key is only acted on when it is present, so
         // existing callers that send {amount, vendor, date, ...} are unchanged.
-        const editsCostCode = Object.prototype.hasOwnProperty.call(body, "costCodeId");
+        // THE SHARED PARSER, not a third reading of the same key (round 40,
+        // item 3). This used to collapse EVERY non-string to `null` and then
+        // write `costCodeId: null, costCodeSource: "manual-none"` — so a
+        // malformed payload such as `{ costCodeId: { id: "cc-1" } }` did not
+        // fail: it CLEARED the phase and stamped the clear as a person's
+        // deliberate decision, which is exactly the provenance every automated
+        // pass is forbidden to repair. A typo in a client became a permanent,
+        // unrepairable loss of attribution.
+        const costCodeEdit = parseCostCodeIdEdit(body);
+        if (costCodeEdit.kind === "invalid") {
+            return NextResponse.json(
+                { error: COST_CODE_ID_INVALID_MESSAGE, field: "costCodeId" },
+                { status: 400 },
+            );
+        }
+        const editsCostCode = costCodeEdit.kind !== "untouched";
         const nextCostCodeId: string | null =
-            typeof body.costCodeId === "string" && body.costCodeId.trim() ? body.costCodeId.trim() : null;
+            costCodeEdit.kind === "set" ? costCodeEdit.costCodeId : null;
         if (editsCostCode && nextCostCodeId) {
             // BOTH checks, per the SCOPE note on resolveCostCode: existence and
             // active-ness are ATTRIBUTION, "this code belongs to this job" is
@@ -338,9 +357,17 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 typeof body.amount === "number"
                     ? body.amount
                     : Number(String(body.amount).trim());
-            if (!Number.isFinite(raw) || raw < 0) {
+            // MONEY HERE IS SIGNED (round 40, item 2). A refund or a vendor
+            // credit is a NEGATIVE expense — the QBO sync says so in as many
+            // words, both tax CHECK constraints are written for it, and the
+            // PATCH's own sign rules exist to serve it. This route refused
+            // every negative gross, so the one handler that can change a
+            // receipt's total could not correct a credit at all: the amount
+            // was the very thing it would not accept. Only NON-FINITE is
+            // refused now.
+            if (!Number.isFinite(raw)) {
                 return NextResponse.json(
-                    { error: "Amount must be a number of dollars, zero or more.", field: "amount" },
+                    { error: "Amount must be a finite number of dollars.", field: "amount" },
                     { status: 400 },
                 );
             }
@@ -349,17 +376,24 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const resultingAmount = nextAmount ?? Number(expense.amount);
         const existingBase =
             expense.taxDeductibleBase === null ? null : Number(expense.taxDeductibleBase);
-        if (existingBase !== null) {
-            const ceiling =
-                Math.round((resultingAmount - Number(expense.taxAmount ?? 0)) * 100) / 100;
-            if (!Number.isFinite(ceiling) || existingBase > ceiling) {
-                return NextResponse.json(
-                    {
-                        error: `This amount would leave a deduction base of ${existingBase.toFixed(2)} above the pre-tax total (${ceiling.toFixed(2)}). Clear or lower the deduction base first.`,
-                    },
-                    { status: 400 },
-                );
-            }
+        // THE FAST FAIL ASKS THE SAME QUESTION THE DATABASE DOES, SIGNED.
+        //
+        // It used to compare `existingBase > ceiling`, unsigned. On a credit
+        // that is backwards: a valid row (amount -50, tax -4, base -40) has
+        // `-40 > -46` and was refused — so a request that merely edited the
+        // VENDOR of a legitimate credit got a 400 naming a deduction base it
+        // never mentioned, and the row became permanently uneditable through
+        // this route. The locked re-check further down already used the signed
+        // rule, so the two disagreed about the same row; both now read
+        // `taxDeductibleBaseFits`.
+        if (!taxDeductibleBaseFits(existingBase, resultingAmount, Number(expense.taxAmount ?? 0))) {
+            const ceiling = deductionCeiling(resultingAmount, Number(expense.taxAmount ?? 0));
+            return NextResponse.json(
+                {
+                    error: `This amount would leave a deduction base of ${existingBase!.toFixed(2)} outside the pre-tax total (${ceiling.toFixed(2)}). Clear or lower the deduction base first.`,
+                },
+                { status: 400 },
+            );
         }
 
 
@@ -484,13 +518,11 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             // see every shape Postgres refuses. Reaching it means something
             // moved under the request, and it is answered as a 400 naming the
             // remedy instead of as the 500 a CHECK violation surfaces as.
-            const ceiling = Math.round((finalAmount - (lockedTax ?? 0)) * 100) / 100;
-            const baseFits =
-                lockedBase === null ||
-                lockedBase === 0 ||
-                (Number.isFinite(ceiling) &&
-                    Math.sign(lockedBase) === Math.sign(finalAmount) &&
-                    Math.abs(lockedBase) <= Math.abs(ceiling));
+            const ceiling = deductionCeiling(finalAmount, lockedTax);
+            // The SAME helper the fast fail above uses, so the pre-transaction
+            // answer and the under-lock answer can never disagree about one row
+            // (round 40, item 2 — they did, and the disagreement was the bug).
+            const baseFits = taxDeductibleBaseFits(lockedBase, finalAmount, lockedTax);
             if (!baseFits) {
                 return { expense: null, phaseRejected: null, denied: "base" } as const;
             }
@@ -695,7 +727,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
         return NextResponse.json(legacyWrite.expense);
     } catch (error) {
-        if (error instanceof QboManagedExpenseError) {
+        if (isQboManagedExpenseError(error)) {
             return NextResponse.json({ error: error.message }, { status: 409 });
         }
         console.error("Error updating expense:", error);
@@ -822,7 +854,8 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         const editsInstalled = has("installedAtCustomer");
         const editsBase = has("taxDeductibleBase");
         const editsTaxAmount = has("taxAmount");
-        const editsCostCode = has("costCodeId");
+        const patchCostCodeEdit = parseCostCodeIdEdit(body);
+        const editsCostCode = patchCostCodeEdit.kind !== "untouched";
 
         // CLEARING A REVIEW FLAG IS ITS OWN DECISION.
         //
@@ -1095,20 +1128,16 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         const resultingTax = editsTaxAmount
             ? (nextTaxAmount ?? 0)
             : Number(expense.taxAmount ?? 0);
-        if (resultingBase !== null && resultingBase !== 0) {
-            const ceiling = Math.round((Number(expense.amount) - resultingTax) * 100) / 100;
-            // MAGNITUDE, because both sides are signed. On a refund the ceiling
-            // is negative and `base > ceiling` would pass anything.
-            if (
-                !Number.isFinite(ceiling) ||
-                Math.sign(resultingBase) !== Math.sign(ceiling) ||
-                Math.abs(resultingBase) > Math.abs(ceiling)
-            ) {
-                return NextResponse.json(
-                    { error: `The deduction base can't exceed the pre-tax receipt total (${ceiling.toFixed(2)}).` },
-                    { status: 400 },
-                );
-            }
+        // MAGNITUDE AND DIRECTION, because all three figures are signed — and
+        // through the SHARED helper, so the PUT's two checks, this one, the
+        // booking fill and the database CHECK are one rule rather than four
+        // transcriptions of it (round 40, item 2).
+        if (!taxDeductibleBaseFits(resultingBase, Number(expense.amount), resultingTax)) {
+            const ceiling = deductionCeiling(Number(expense.amount), resultingTax);
+            return NextResponse.json(
+                { error: `The deduction base can't exceed the pre-tax receipt total (${ceiling.toFixed(2)}).` },
+                { status: 400 },
+            );
         }
 
         // The flag follows the figure, computed from the row this request
@@ -1121,21 +1150,22 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
 
         let nextCostCodeId: string | null = null;
         if (editsCostCode) {
-            // STRICT TYPE. `has("costCodeId")` only proves the key is
-            // present — the value can still be a number, boolean, array, or
-            // object, and treating every one of those as "clear the cost
-            // code" would silently strip a real attribution off a bad
-            // request instead of rejecting it.
-            if (body.costCodeId !== null && typeof body.costCodeId !== "string") {
+            // STRICT TYPE, through the SHARED parser (round 40, item 3).
+            // `has("costCodeId")` only proves the key is present — the value
+            // can still be a number, boolean, array, or object, and treating
+            // every one of those as "clear the cost code" would silently strip
+            // a real attribution off a bad request instead of rejecting it.
+            // This handler was the only one of the three that got that right;
+            // it now shares the rule rather than being the copy that happens
+            // to be correct.
+            if (patchCostCodeEdit.kind === "invalid") {
                 return NextResponse.json(
-                    { error: "costCodeId must be a string, or null." },
+                    { error: COST_CODE_ID_INVALID_MESSAGE },
                     { status: 400 },
                 );
             }
             nextCostCodeId =
-                typeof body.costCodeId === "string" && body.costCodeId.trim()
-                    ? body.costCodeId.trim()
-                    : null;
+                patchCostCodeEdit.kind === "set" ? patchCostCodeEdit.costCodeId : null;
             if (nextCostCodeId) {
                 const resolved = await resolveCostCode(prismaCostCodingDataSource, {
                     costCodeId: nextCostCodeId,

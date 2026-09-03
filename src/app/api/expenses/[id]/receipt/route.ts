@@ -6,6 +6,7 @@ import {
     resolveExpenseProjectUnderLock,
 } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
+import { lockAttributionParents } from "@/lib/phase-invariant";
 import { getCurrentUserWithPermissions, canAccessProject } from "@/lib/permissions";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 
@@ -67,7 +68,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
         const expense = await prisma.expense.findUnique({
             where: { id },
-            select: { id: true, projectId: true, estimate: { select: { projectId: true } } },
+            select: { id: true, projectId: true, estimateId: true, estimate: { select: { projectId: true } } },
         });
         if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
         // Fail closed: an expense with no resolvable project cannot be
@@ -140,18 +141,38 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         // uploaded (lost the race) or the one it replaced (won it).
         const settled = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // THE PARENTS FIRST, THEN THE ROW (round 40, item 1). The global
+            // order is Project -> Estimate -> EstimateItem -> CostCode ->
+            // Expense, and EXPENSE IS LAST.
+            //
+            // This took the per-expense lock and only then called
+            // `resolveExpenseProjectUnderLock`, which for a fallback-attributed
+            // row share-locks the ESTIMATE to answer: Expense -> Estimate,
+            // against a booking path that goes Estimate -> Expense. A cycle,
+            // and this route has no `withTxRetry` — the 40P01 surfaces as a
+            // failed upload with the object already in the bucket.
+            await lockAttributionParents(raw, { projectId, estimateId: expense.estimateId });
             await lockExpense(raw, id);
             const locked = await tx.expense.findUnique({
                 where: { id },
                 select: { projectId: true, estimateId: true, receiptUrl: true },
             });
             if (!locked) return { outcome: "gone" } as const;
+            // THE ROW MUST STILL BE THE ONE WHOSE PARENTS ARE HELD. Both halves
+            // are checked because either can move the resolver onto an estimate
+            // this transaction never locked: a different `estimateId` sends it
+            // to a row outside the lock set, and a different resolved project
+            // means the FK write below would reach a `Project` row acquired
+            // after the Expense. "lost" is the existing 409, and it deletes the
+            // object that was just uploaded.
+            if (locked.estimateId !== expense.estimateId) return { outcome: "lost" } as const;
             // Re-resolved through the SHARED resolver, against the share-locked
             // estimate — not the value read before the upload.
             const lockedProjectId = await resolveExpenseProjectUnderLock(raw, locked);
             if (!lockedProjectId || !canAccessProject(user, lockedProjectId)) {
                 return { outcome: "forbidden" } as const;
             }
+            if (lockedProjectId !== projectId) return { outcome: "lost" } as const;
             const previousUrl = locked.receiptUrl ?? null;
             const result = await tx.expense.updateMany({
                 where: {

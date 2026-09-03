@@ -16,7 +16,10 @@ import { resolveCostCode, type CostCodingDataSource } from "../src/lib/cost-codi
 // From the PURE module, not the route: importing the route pulls in
 // mobile-auth, which throws at import time unless NEXTAUTH_SECRET is set —
 // true in CI, and a unit test has no business needing a JWT secret.
-import { resolveInstalledAtCustomer } from "../src/lib/expense-attribution";
+import {
+    parseCostCodeIdEdit,
+    resolveInstalledAtCustomer,
+} from "../src/lib/expense-attribution";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { captureActorSource, optionalBool } from "../src/lib/receipt-capture-validation";
@@ -146,6 +149,75 @@ test("optionalBool is tri-state across JSON and multipart", () => {
     for (const silent of [undefined, null, "", "yes", 1, {}]) {
         assert.equal(optionalBool(silent), null, JSON.stringify(silent) ?? "undefined");
     }
+});
+
+// ── one reading of `costCodeId` (Codex round 40, item 3) ───────────────────
+
+test("the parser separates UNTOUCHED from CLEAR from INVALID", () => {
+    // Three handlers read this key and all three read it differently. The PUT
+    // collapsed every non-string to null and then wrote
+    // `costCodeSource: "manual-none"` — a malformed payload did not fail, it
+    // CLEARED the phase and stamped the clear as a person's decision, which no
+    // automated pass may then repair. The POST read the same shape as if the
+    // key had never been sent, silently dropping a phase the crew had picked.
+    // Only the PATCH refused it.
+    assert.deepEqual(parseCostCodeIdEdit({}), { kind: "untouched" });
+    assert.deepEqual(parseCostCodeIdEdit({ vendor: "Lowe's" }), { kind: "untouched" });
+    // `undefined` under an EXPLICIT key is still "the client sent nothing
+    // usable"; JSON cannot express it, and treating it as a clear would make
+    // an absent field destructive.
+    assert.deepEqual(parseCostCodeIdEdit({ costCodeId: undefined }), { kind: "invalid" });
+
+    assert.deepEqual(parseCostCodeIdEdit({ costCodeId: null }), { kind: "clear" });
+    assert.deepEqual(parseCostCodeIdEdit({ costCodeId: "" }), { kind: "clear" });
+    assert.deepEqual(parseCostCodeIdEdit({ costCodeId: "   " }), { kind: "clear" });
+
+    assert.deepEqual(parseCostCodeIdEdit({ costCodeId: "cc-1" }), { kind: "set", costCodeId: "cc-1" });
+    assert.deepEqual(parseCostCodeIdEdit({ costCodeId: "  cc-1  " }), { kind: "set", costCodeId: "cc-1" });
+
+    for (const value of [123, 0, false, true, [], ["cc-1"], { id: "cc-1" }]) {
+        assert.deepEqual(
+            parseCostCodeIdEdit({ costCodeId: value }),
+            { kind: "invalid" },
+            JSON.stringify(value),
+        );
+    }
+    // A non-object body has no key at all.
+    assert.deepEqual(parseCostCodeIdEdit(null), { kind: "untouched" });
+    assert.deepEqual(parseCostCodeIdEdit("cc-1"), { kind: "untouched" });
+});
+
+test("all three expense handlers read the key through that parser", () => {
+    // The PUT and PATCH behaviours are exercised end to end in
+    // tests/expense-edit-authz.test.ts. The POST has no route-level harness
+    // (it imports mobile-auth, which throws at import without NEXTAUTH_SECRET),
+    // so its wiring is pinned here — and pinned as "uses the shared parser AND
+    // answers 400", not merely "mentions it".
+    for (const rel of [
+        "src/app/api/expenses/route.ts",
+        "src/app/api/expenses/[id]/route.ts",
+    ]) {
+        const source = readFileSync(path.join(ROOT, rel), "utf8");
+        assert.match(source, /parseCostCodeIdEdit\(body\)/, `${rel} does not use the shared parser`);
+        assert.match(
+            source,
+            /kind === "invalid"[\s\S]{0,400}?COST_CODE_ID_INVALID_MESSAGE/,
+            `${rel} does not answer 400 for a malformed costCodeId`,
+        );
+        // ...and the old collapse is gone. `typeof body.costCodeId === "string"`
+        // falling through to null is the exact line that turned a typo into a
+        // permanent clear.
+        assert.ok(
+            !/typeof body\.costCodeId === "string"/.test(source),
+            `${rel} still collapses a non-string to null`,
+        );
+    }
+    // The `[id]` route holds BOTH the PUT and the PATCH, so it must parse twice.
+    const editRoute = readFileSync(path.join(ROOT, "src/app/api/expenses/[id]/route.ts"), "utf8");
+    assert.equal(
+        (editRoute.match(/parseCostCodeIdEdit\(body\)/g) ?? []).length, 2,
+        "PUT and PATCH each parse the key once",
+    );
 });
 
 // ── who supplied the captured phase (Codex round 18, item 3) ───────────────

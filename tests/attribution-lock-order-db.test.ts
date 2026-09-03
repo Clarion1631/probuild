@@ -33,7 +33,11 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
 import { assertPhaseOfProjectTx, lockAttributionParents } from "../src/lib/phase-invariant";
-import { lockEstimateAttribution } from "../src/lib/expense-attribution";
+import {
+    lockEstimateAttribution,
+    resolveExpenseProjectUnderLock,
+} from "../src/lib/expense-attribution";
+import { lockExpense } from "../src/lib/expense-lock";
 import {
     applyQboExpenseCostCodeSuggestion,
     upsertQboExpense,
@@ -518,6 +522,164 @@ test("the BACKFILL's project-fill pass, for real, against a Project-first editor
             select: { projectId: true },
         });
         assert.deepEqual(filled, { projectId: PROJECT });
+    } finally {
+        await cleanup();
+    }
+});
+
+// ── EXPENSE IS LAST (round 40, item 1) ─────────────────────────────────────
+//
+// The other half of the order, and the half rounds 37 and 38 never checked.
+// The approve and receipt routes took the per-expense lock FIRST and only then
+// called `resolveExpenseProjectUnderLock`, which share-locks the ESTIMATE for a
+// fallback-attributed row. That is Expense -> Estimate; booking is
+// Estimate -> Expense. Neither route runs under `withTxRetry`, so the 40P01
+// surfaces as a failed approval, or a failed upload with the object already
+// sitting in the bucket.
+//
+// Both handlers are driven here as the SEQUENCE OF SHARED HELPERS they are
+// made of, not through their HTTP entry points: those return 401 before
+// opening a transaction unless a real NextAuth session exists, so a
+// route-level call would prove nothing about locks. What ties this to the
+// shipped code is tests/attribution-lock-order.test.ts, which fails if either
+// route stops calling `lockAttributionParents` before `lockExpense` (both
+// directions mutation-checked).
+
+/**
+ * THE OTHER SIDE: hold the Estimate EXCLUSIVELY, then reach for the same
+ * per-expense lock.
+ *
+ * `lockExpense` is a `pg_advisory_xact_lock`, not a row lock, so the cycle
+ * needs a holder that blocks a FOR SHARE on the estimate -- i.e. FOR UPDATE,
+ * which is exactly what `lockMoneyParents` takes. Every writer that reaches
+ * both tables TODAY takes the estimate FOR SHARE, so this inversion is a
+ * LATENT hazard rather than a live outage: it costs nothing until the first
+ * transaction that locks an estimate exclusively also takes a per-expense
+ * lock, and then it is a 40P01 on a money path with no `withTxRetry` around
+ * it. The control below proves the cycle is real; the fix removes it before
+ * that writer exists.
+ */
+function estimateExclusiveWriter(estimateHeld: ReturnType<typeof gate>) {
+    let error: unknown = null;
+    const done = (async () => {
+        try {
+            await editorDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+                await tx.$executeRawUnsafe(`SELECT id FROM "Estimate" WHERE id = $1 FOR UPDATE`, ESTIMATE);
+                estimateHeld.open();
+                await new Promise(resolve => setTimeout(resolve, 750));
+                await lockExpense(
+                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                    EXPENSE,
+                );
+            });
+        } catch (caught) {
+            error = caught;
+        }
+    })();
+    return { done, get error() { return error; } };
+}
+
+test("CONTROL: taking the Expense row before the Estimate really does deadlock", { skip }, async () => {
+    // The pre-fix sequence of BOTH routes, verbatim: the per-expense lock, and
+    // then the resolver's share lock on the estimate.
+    await seed();
+    try {
+        const estimateHeld = gate();
+        const booker = estimateExclusiveWriter(estimateHeld);
+        await estimateHeld.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            await raw.$queryRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            await lockExpense(raw, EXPENSE);
+            await resolveExpenseProjectUnderLock(raw, { projectId: null, estimateId: ESTIMATE });
+        }).catch(caught => { writerError = caught; });
+
+        await booker.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(booker.error),
+            `expected 40P01 from Expense -> Estimate; writer=${writerError} other=${booker.error}`,
+        );
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the APPROVE sequence, parents first, against an exclusive Estimate holder", { skip }, async () => {
+    await seed();
+    try {
+        const estimateHeld = gate();
+        const booker = estimateExclusiveWriter(estimateHeld);
+        await estimateHeld.reached;
+
+        let writerError: unknown = null;
+        let approved: number | null = null;
+        await writerDb!.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            await raw.$queryRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            await lockAttributionParents(raw, { projectId: PROJECT, estimateId: ESTIMATE });
+            await lockExpense(raw, EXPENSE);
+            const locked = await resolveExpenseProjectUnderLock(raw, {
+                projectId: null,
+                estimateId: ESTIMATE,
+            });
+            if (locked !== PROJECT) { approved = 0; return; }
+            const result = await tx.expense.updateMany({
+                where: { id: EXPENSE, status: "Pending" },
+                data: { status: "Reviewed" },
+            });
+            approved = result.count;
+        }, { timeout: 30_000 }).catch(caught => { writerError = caught; });
+
+        await booker.done;
+
+        assert.equal(deadlocked(writerError), false, `the approval was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(booker.error), false, `the other writer was killed by a deadlock: ${booker.error}`);
+        assert.equal(writerError, null, `the approval failed: ${writerError}`);
+        assert.equal(booker.error, null, `the other writer failed: ${booker.error}`);
+        // Waiting is only the right answer if the work still happened.
+        assert.equal(approved, 1, "it waited for the other writer and then stamped the row Reviewed");
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the RECEIPT sequence, parents first, against an exclusive Estimate holder", { skip }, async () => {
+    await seed();
+    try {
+        const estimateHeld = gate();
+        const booker = estimateExclusiveWriter(estimateHeld);
+        await estimateHeld.reached;
+
+        let writerError: unknown = null;
+        let outcome: string | null = null;
+        await writerDb!.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            await raw.$queryRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            await lockAttributionParents(raw, { projectId: PROJECT, estimateId: ESTIMATE });
+            await lockExpense(raw, EXPENSE);
+            const locked = await tx.expense.findUnique({
+                where: { id: EXPENSE },
+                select: { projectId: true, estimateId: true, receiptUrl: true },
+            });
+            const lockedProjectId = await resolveExpenseProjectUnderLock(raw, locked!);
+            const result = await tx.expense.updateMany({
+                where: { id: EXPENSE, receiptUrl: locked!.receiptUrl },
+                data: { receiptUrl: `https://example.test/${PFX}.jpg` },
+            });
+            outcome = result.count > 0 && lockedProjectId === PROJECT ? "won" : "lost";
+        }, { timeout: 30_000 }).catch(caught => { writerError = caught; });
+
+        await booker.done;
+
+        assert.equal(deadlocked(writerError), false, `the upload was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(booker.error), false, `the other writer was killed by a deadlock: ${booker.error}`);
+        assert.equal(writerError, null, `the upload failed: ${writerError}`);
+        assert.equal(booker.error, null, `the other writer failed: ${booker.error}`);
+        assert.equal(outcome, "won", "it waited and then wrote the receipt url");
     } finally {
         await cleanup();
     }

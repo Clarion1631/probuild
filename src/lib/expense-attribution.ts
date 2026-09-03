@@ -314,6 +314,94 @@ export function isPlausibleReceiptTax(taxAmount: number, grossAmount: number): b
     return Math.abs(taxAmount) <= maxPlausibleTaxAmount(grossAmount);
 }
 
+/**
+ * THE PRE-TAX REMAINDER A DEDUCTION BASE MUST FIT INSIDE, SIGNED.
+ *
+ * Stated exactly as `Expense_taxDeductibleBase_check` states it —
+ * `amount - COALESCE(taxAmount, 0)` — rather than as `|amount| - |tax|`. The
+ * two agree while the tax CHECK holds (same sign, smaller magnitude), and the
+ * database's version is the one that actually refuses a write, so it is the
+ * one worth mirroring.
+ */
+export function deductionCeiling(amount: number, taxAmount: number | null | undefined): number {
+    return Math.round((amount - (taxAmount ?? 0)) * 100) / 100;
+}
+
+/**
+ * DOES THIS DEDUCTION BASE FIT THIS ROW? ONE DEFINITION, SIGNED
+ * (Codex round 40, item 2).
+ *
+ * Money on an Expense is SIGNED throughout Phase 3: a refund or a vendor
+ * credit is a negative gross, its tax comes back with it, and the portion that
+ * was resold is negative too. Three places checked that and a fourth did not:
+ * the PUT's fast-fail compared `base > ceiling` UNSIGNED, so a perfectly valid
+ * credit (amount -50, tax -4, base -40) failed `-40 > -46` and the route
+ * answered 400 to a request that merely edited the vendor. The row it refused
+ * to touch satisfies every other check in the system, including the database's
+ * own CHECK, which is how a legitimate credit became permanently uneditable.
+ *
+ * The rule, mirroring `Expense_taxDeductibleBase_check` clause for clause:
+ *   * NULL and 0 always fit -- there is nothing to violate;
+ *   * otherwise the base points the same way as the AMOUNT (not the ceiling:
+ *     a zero ceiling has sign 0 and would reject every base), and
+ *   * its magnitude fits inside the pre-tax remainder's magnitude.
+ *
+ * Non-finite inputs never fit: a NaN comparison is false in both directions,
+ * which is the one way an invariant can silently answer "fine".
+ */
+export function taxDeductibleBaseFits(
+    base: number | null | undefined,
+    amount: number,
+    taxAmount: number | null | undefined,
+): boolean {
+    if (base === null || base === undefined || base === 0) return true;
+    if (!Number.isFinite(base) || !Number.isFinite(amount)) return false;
+    if (taxAmount !== null && taxAmount !== undefined && !Number.isFinite(taxAmount)) return false;
+    const ceiling = deductionCeiling(amount, taxAmount);
+    if (!Number.isFinite(ceiling)) return false;
+    if (Math.sign(base) !== Math.sign(amount)) return false;
+    return Math.abs(base) <= Math.abs(ceiling);
+}
+
+/**
+ * WHAT A REQUEST SAID ABOUT `costCodeId`, PARSED ONCE (Codex round 40, item 3).
+ *
+ * Three handlers read this key and all three read it differently. The PUT
+ * collapsed every non-string to `null` and then wrote
+ * `costCodeId: null, costCodeSource: "manual-none"` -- so a malformed payload
+ * like `{ costCodeId: { id: "cc-1" } }` did not fail, it CLEARED the phase and
+ * stamped it as a person's deliberate decision, which every automated pass is
+ * then forbidden to repair. The POST treated the same shape as if the key had
+ * never been sent, silently dropping an attribution the caller believed it had
+ * supplied. Only the PATCH refused it.
+ *
+ * Four outcomes, and the distinction that matters is between the last two:
+ *   * `untouched` -- the key is absent. Leave the column alone.
+ *   * `clear` -- an explicit `null` (or an empty/whitespace string, which every
+ *     one of these handlers has always treated as "none"). A person choosing
+ *     no phase, recorded as `manual-none`.
+ *   * `set` -- a non-empty string, trimmed.
+ *   * `invalid` -- anything else. A 400, never a silent clear and never a
+ *     silent omission.
+ */
+export type CostCodeIdEdit =
+    | { kind: "untouched" }
+    | { kind: "clear" }
+    | { kind: "set"; costCodeId: string }
+    | { kind: "invalid" };
+
+export const COST_CODE_ID_INVALID_MESSAGE = "costCodeId must be a string, or null.";
+
+export function parseCostCodeIdEdit(body: unknown, key = "costCodeId"): CostCodeIdEdit {
+    if (!body || typeof body !== "object") return { kind: "untouched" };
+    if (!Object.prototype.hasOwnProperty.call(body, key)) return { kind: "untouched" };
+    const value = (body as Record<string, unknown>)[key];
+    if (value === null) return { kind: "clear" };
+    if (typeof value !== "string") return { kind: "invalid" };
+    const trimmed = value.trim();
+    return trimmed ? { kind: "set", costCodeId: trimmed } : { kind: "clear" };
+}
+
 
 /**
  * `Expense.taxSource` — WHO decided the two tax FIGURES (`taxAmount` and

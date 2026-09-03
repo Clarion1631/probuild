@@ -501,6 +501,54 @@ test("a non-string, non-null costCodeId is refused, not silently cleared", async
     }
 });
 
+// ── the PUT read the same key a third way (Codex round 40, item 3) ─────────
+
+test("PUT: a malformed costCodeId is a 400, not a silent CLEAR", async () => {
+    // THE CASE FROM THE REVIEW, and worse than the POST's version of it.
+    // PUT collapsed every non-string to `null` and then wrote
+    // `costCodeId: null, costCodeSource: "manual-none"` — so
+    // `{ costCodeId: { id: "cc-1" } }` did not fail: it CLEARED the phase and
+    // stamped the clear as a person's deliberate decision, which is the one
+    // provenance every automated pass is forbidden to repair. A typo in a
+    // client became a permanent, unrepairable loss of attribution.
+    for (const value of [123, false, [], {}, ["cc-frame"], { id: "cc-frame" }]) {
+        updateArgs = null;
+        const res = await call({ costCodeId: value as unknown as string });
+        assert.equal(res.status, 400, `costCodeId: ${JSON.stringify(value)}`);
+        assert.equal((await res.json()).field, "costCodeId");
+        assert.equal(updateArgs, null, `costCodeId: ${JSON.stringify(value)} must not write`);
+    }
+});
+
+test("PUT: an EXPLICIT null still clears the phase, recorded as a decision", async () => {
+    // The control that keeps the fix from being "reject everything": a person
+    // choosing no phase is a real edit, and it is what `manual-none` is for.
+    const res = await call({ costCodeId: null });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.costCodeId, null);
+    assert.equal(updateArgs?.data.costCodeSource, "manual-none");
+});
+
+test("PUT: an ABSENT costCodeId leaves the column alone", async () => {
+    // The other control. `untouched` is not `clear`, and conflating them is
+    // how a vendor edit would wipe a phase.
+    const res = await call({ vendor: "Lowe's" });
+    assert.equal(res.status, 200);
+    assert.equal("costCodeId" in (updateArgs?.data ?? {}), false);
+    assert.equal("costCodeSource" in (updateArgs?.data ?? {}), false);
+});
+
+test("PUT: an empty or whitespace string is a clear, as it always was", async () => {
+    for (const value of ["", "   "]) {
+        updateArgs = null;
+        const res = await call({ costCodeId: value });
+        assert.equal(res.status, 200, JSON.stringify(value));
+        const written = updateArgs as { data: Record<string, unknown> } | null;
+        assert.equal(written?.data.costCodeId, null);
+        assert.equal(written?.data.costCodeSource, "manual-none");
+    }
+});
+
 // ── the item link is judged on the RESOLVED job (item 4) ───────────────────
 
 test("a re-attributed expense may take an item from its NEW job", async () => {
@@ -676,10 +724,71 @@ test("a junk amount is REFUSED, not silently truncated", async () => {
     assert.equal(updateArgs, null, "nothing is written");
 });
 
-test("a negative amount is refused", async () => {
+// ── money here is SIGNED (Codex round 40, item 2) ──────────────────────────
+
+test("a NEGATIVE amount is a refund, not an error", async () => {
+    // This route refused every negative gross, so the one handler that can
+    // change a receipt's total could not correct a credit at all — the amount
+    // was the very thing it would not accept. The QBO sync writes negative
+    // grosses, both tax CHECK constraints are written for them, and the
+    // PATCH's sign rules exist to serve them.
     const res = await call({ amount: -5 });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.amount, -5);
+});
+
+test("a NON-FINITE amount is still refused", async () => {
+    // The control: loosening the sign rule must not loosen the parse. "10junk"
+    // and Infinity are not amounts.
+    for (const amount of ["10junk", "-", Number.POSITIVE_INFINITY, Number.NaN]) {
+        updateArgs = null;
+        const res = await call({ amount });
+        assert.equal(res.status, 400, String(amount));
+        assert.equal((await res.json()).field, "amount");
+        assert.equal(updateArgs, null);
+    }
+});
+
+test("an unrelated edit to a VALID credit is not refused by the base check", async () => {
+    // THE CASE FROM THE REVIEW. A legitimate credit — amount -50, tax -4,
+    // base -40 — satisfies the database CHECK, the PATCH and the locked
+    // re-check. The PUT's fast fail compared `base > ceiling` UNSIGNED, so
+    // `-40 > -46` was true and a request that merely changed the VENDOR came
+    // back 400, naming a deduction base it never mentioned. The row was
+    // uneditable through this route for as long as it held those figures.
+    storedExpense = {
+        ...(storedExpense as object),
+        amount: -50, taxAmount: -4, taxAtSource: true,
+        taxDeductibleBase: -40, taxSource: "manual", taxDeductibleBaseSource: "manual",
+    } as Record<string, unknown>;
+    const res = await call({ vendor: "Lowe's" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.vendor, "Lowe's");
+});
+
+test("...and lowering that credit's magnitude past the base IS refused", async () => {
+    // The control for the test above: the signed rule still has teeth. A -$40
+    // base does not fit inside a -$20 receipt's -$16 pre-tax remainder.
+    storedExpense = {
+        ...(storedExpense as object),
+        amount: -50, taxAmount: -4, taxAtSource: true,
+        taxDeductibleBase: -40, taxSource: "manual", taxDeductibleBaseSource: "manual",
+    } as Record<string, unknown>;
+    const res = await call({ amount: -20 });
     assert.equal(res.status, 400);
     assert.equal(updateArgs, null);
+});
+
+test("a base pointing the WRONG way is refused, whichever way round", async () => {
+    // The sign half of the invariant, which the unsigned comparison could
+    // never see: a positive base on a credit would ADD to a filing that should
+    // be reduced.
+    storedExpense = {
+        ...(storedExpense as object),
+        amount: -50, taxAmount: -4, taxAtSource: true,
+        taxDeductibleBase: 40, taxSource: "manual", taxDeductibleBaseSource: "manual",
+    } as Record<string, unknown>;
+    assert.equal((await call({ vendor: "Lowe's" })).status, 400);
 });
 
 test("ZERO is a real amount, not an omission", async () => {

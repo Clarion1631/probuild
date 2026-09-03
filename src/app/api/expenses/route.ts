@@ -6,7 +6,12 @@ import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
-import { itemBelongsToEstimateTx, lockEstimateAttribution } from "@/lib/expense-attribution";
+import {
+    COST_CODE_ID_INVALID_MESSAGE,
+    itemBelongsToEstimateTx,
+    lockEstimateAttribution,
+    parseCostCodeIdEdit,
+} from "@/lib/expense-attribution";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 
@@ -28,8 +33,22 @@ export async function POST(req: NextRequest) {
         // the spend being recorded at all. `costCodeSource` is NEVER read off
         // the body: provenance is something the server observes, not something
         // a client asserts.
+        // THE SHARED PARSER (round 40, item 3). This used to read a non-string
+        // as if the key had never been sent, so a crew app posting
+        // `{ costCodeId: { id: "cc-1" } }` recorded the spend UNCODED and
+        // reported success — the phase the person picked on the phone simply
+        // vanished, and nothing in the response said so. Malformed is a 400
+        // now; a genuinely absent key is still optional, which is the whole
+        // reason this route tolerates one.
+        const costCodeEdit = parseCostCodeIdEdit(body);
+        if (costCodeEdit.kind === "invalid") {
+            return NextResponse.json(
+                { error: COST_CODE_ID_INVALID_MESSAGE, field: "costCodeId" },
+                { status: 400 },
+            );
+        }
         const requestedCostCodeId: string | null =
-            typeof body.costCodeId === "string" && body.costCodeId.trim() ? body.costCodeId.trim() : null;
+            costCodeEdit.kind === "set" ? costCodeEdit.costCodeId : null;
 
         if (!estimateId && !projectId) {
             return NextResponse.json(

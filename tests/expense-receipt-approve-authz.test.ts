@@ -346,9 +346,19 @@ test("approve takes the shared per-expense lock", async () => {
     fakePrisma.$queryRawUnsafe = async (...args: unknown[]) => { locks.push(args); return [{}]; };
     try {
         await callApprove();
-        assert.equal(locks.length, 1);
-        assert.match(String(locks[0][0]), /pg_advisory_xact_lock/);
-        assert.equal(locks[0][1], "expense:e1", "the same key every other writer uses");
+        // The attribution PARENTS are share-locked ahead of it (round 40,
+        // item 1), so this counts the per-expense lock specifically rather
+        // than every raw statement.
+        const advisory = locks.filter(call => /pg_advisory_xact_lock/.test(String(call[0])));
+        assert.equal(advisory.length, 1, "exactly one per-expense lock");
+        assert.equal(advisory[0][1], "expense:e1", "the same key every other writer uses");
+        // ...and it comes AFTER them. Expense is LAST in the global order, and
+        // this handler taking it first is exactly what round 40 found.
+        assert.ok(
+            locks.findIndex(call => /FOR SHARE/.test(String(call[0]))) <
+                locks.findIndex(call => /pg_advisory_xact_lock/.test(String(call[0]))),
+            "the attribution parents are locked before the expense row",
+        );
     } finally {
         fakePrisma.$queryRawUnsafe = original;
     }

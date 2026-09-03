@@ -30,7 +30,7 @@ import { lockExpense } from "@/lib/expense-lock";
 import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import {
-    QBTimeoutError,
+    isQBTimeoutError,
     remainingBudgetMs,
     type QBTokens,
     type RouteDeadline,
@@ -1341,7 +1341,7 @@ function mayReleaseStrongKey(
 }
 
 function describe(error: unknown): string {
-    if (error instanceof QBTimeoutError) return "QBTimeoutError";
+    if (isQBTimeoutError(error)) return "QBTimeoutError";
     if (error instanceof Error) return `${error.name}: ${error.message}`.slice(0, 400);
     return "UnknownError";
 }

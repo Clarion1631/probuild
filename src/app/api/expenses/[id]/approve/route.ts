@@ -11,6 +11,7 @@ import {
     resolveExpenseProjectUnderLock,
 } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
+import { lockAttributionParents } from "@/lib/phase-invariant";
 
 /**
  * APPROVING AN EXPENSE IS A MUTATION OF THE SAME ROW, SO IT TAKES THE SAME
@@ -65,12 +66,36 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
         const approved = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // THE PARENTS FIRST, THEN THE ROW (round 40, item 1). The global
+            // order is Project -> Estimate -> EstimateItem -> CostCode ->
+            // Expense, and EXPENSE IS LAST.
+            //
+            // This transaction took the per-expense lock and only then called
+            // `resolveExpenseProjectUnderLock`, which for a fallback-attributed
+            // row (no `projectId` of its own) share-locks the ESTIMATE to
+            // answer. That is Expense -> Estimate, and the booking path is
+            // Estimate -> Expense — a cycle, broken by Postgres killing one
+            // side with 40P01, and neither of these routes runs under
+            // `withTxRetry`. Round 37 and 38 missed it because the tripwire
+            // only knew about the Project/Estimate half of the order.
+            //
+            // `projectId` is the job the access check above was answered
+            // about, so it is both the right row to hold and the value the
+            // guard below refuses to differ from.
+            await lockAttributionParents(raw, { projectId, estimateId: expense.estimateId });
             // The shared per-expense lock, so this is ordered against the tax
             // PATCH and the QBO sync rather than merely racing them.
             await lockExpense(raw, id);
             const locked = await resolveExpenseProjectUnderLock(raw, expense);
             if (!locked || !canAccessProject(user, locked)) {
                 return { count: 0, denied: true } as const;
+            }
+            // ...and if the locked answer is a job whose row this transaction
+            // is NOT holding, it stops: continuing would reach for that
+            // Project after the Expense lock, which is the inversion again one
+            // job over. `count: 0` is the 409 the caller already understands.
+            if (locked !== projectId) {
+                return { count: 0, denied: false } as const;
             }
             const result = await tx.expense.updateMany({
                 where: {

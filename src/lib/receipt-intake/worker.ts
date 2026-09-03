@@ -24,7 +24,7 @@ import {
     type BookableRow,
     type BookResult,
 } from "./book";
-import { QBTimeoutError } from "@/lib/quickbooks";
+import { isQBTimeoutError } from "@/lib/quickbooks";
 import {
     QboAccountConfigError,
     QboPurchaseFaultError,
@@ -628,7 +628,11 @@ export async function handleRowError(
 
 /** QBTimeoutError is deliberately NOT here — a timeout is transport, not a verdict. */
 export function isTerminalQboFault(error: unknown): boolean {
-    if (error instanceof QBTimeoutError) return false;
+    // NAME-BASED (round 40, item 4): Node 20 + tsx can load quickbooks.ts
+    // twice under different specifiers, and an `instanceof` that answers false
+    // for a timeout the QBO client itself threw would classify it as a
+    // TERMINAL fault  parking a row that only needed a retry.
+    if (isQBTimeoutError(error)) return false;
     return (
         error instanceof QboPurchaseFaultError ||
         error instanceof QboAccountConfigError ||

@@ -185,15 +185,26 @@ function fkWritePosition(body: string, column: "projectId" | "estimateId"): numb
 }
 
 /**
- * Where this transaction first touches the ESTIMATE and the PROJECT — counting
- * the implicit foreign-key locks, not just the helper calls.
+ * Calls that lock the EXPENSE row itself. It is LAST in the global order, so
+ * one of these appearing before the parents are held is the whole of round
+ * 40's item 1: the approve and receipt routes took the per-expense lock and
+ * only then called `resolveExpenseProjectUnderLock`, which share-locks the
+ * ESTIMATE for a fallback-attributed row. Expense -> Estimate, against a
+ * booking path that goes Estimate -> Expense.
  */
-function acquisitions(body: string): { estimate?: number; project?: number } {
+const EXPENSE_LOCKS = ['lockExpense(', 'FROM "Expense" WHERE id = $1 FOR UPDATE'];
+
+/**
+ * Where this transaction first touches the ESTIMATE, the PROJECT and the
+ * EXPENSE — counting the implicit foreign-key locks, not just the helper calls.
+ */
+function acquisitions(body: string): { estimate?: number; project?: number; expense?: number } {
     const first = (values: (number | undefined)[]) =>
         values.filter((value): value is number => value !== undefined).sort((a, b) => a - b)[0];
     return {
         estimate: first([firstIndexOf(body, ESTIMATE_FIRST), fkWritePosition(body, "estimateId")]),
         project: first([firstIndexOf(body, PROJECT_FIRST), fkWritePosition(body, "projectId")]),
+        expense: firstIndexOf(body, EXPENSE_LOCKS),
     };
 }
 
@@ -252,21 +263,32 @@ const firstIndexOf = (body: string, needles: string[]) =>
         .filter(index => index >= 0)
         .sort((a, b) => a - b)[0];
 
-/** Every `$transaction` in `src/` that reaches BOTH the Project and an Estimate. */
+/**
+ * Every `$transaction` in `src/` whose lock order can be WRONG — meaning it
+ * reaches at least two of the ordered tables, in any combination:
+ *   * Project and Estimate (round 37/38), or
+ *   * the Expense row and either parent (round 40, item 1).
+ *
+ * Scoping this to "Project AND Estimate" is exactly how the approve and
+ * receipt routes were cleared twice while still inverted: they never touch a
+ * Project at all, and Expense -> Estimate is a cycle on its own.
+ */
 function mixedOrderTransactions(): { file: string; index: number; body: string }[] {
     const found: { file: string; index: number; body: string }[] = [];
     for (const file of walk(path.join(ROOT, "src"))) {
         const source = readFileSync(file, "utf8");
         for (const [index, body] of transactionBodies(source).entries()) {
-            const { estimate, project } = acquisitions(body);
-            if (estimate === undefined || project === undefined) continue;
+            const { estimate, project, expense } = acquisitions(body);
+            const parents = [estimate, project].filter(at => at !== undefined).length;
+            const ordered = parents + (expense === undefined ? 0 : 1);
+            if (ordered < 2) continue;
             found.push({ file: path.relative(ROOT, file).replace(/\\/g, "/"), index, body });
         }
     }
     return found;
 }
 
-test("every transaction that reaches both tables takes the whole set first", () => {
+test("every transaction that reaches two ordered tables takes the whole set first", () => {
     const offenders: string[] = [];
     const mixed = mixedOrderTransactions();
     for (const { file, index, body } of mixed) {
@@ -275,14 +297,40 @@ test("every transaction that reaches both tables takes the whole set first", () 
             offenders.push(`${file} $transaction #${index + 1}: no lockAttributionParents call`);
             continue;
         }
-        const { estimate, project } = acquisitions(body);
-        if (setAt > estimate! || setAt > project!) {
-            offenders.push(`${file} $transaction #${index + 1}: lockAttributionParents is not first`);
+        const { estimate, project, expense } = acquisitions(body);
+        for (const [label, at] of [["estimate", estimate], ["project", project], ["expense", expense]] as const) {
+            if (at !== undefined && setAt > at) {
+                offenders.push(
+                    `${file} $transaction #${index + 1}: lockAttributionParents comes after the ${label} lock`,
+                );
+            }
         }
     }
     assert.deepEqual(offenders, [], offenders.join("\n  "));
     // A tripwire that scans nothing passes forever.
-    assert.ok(mixed.length >= 8, `only ${mixed.length} mixed-order transactions found`);
+    assert.ok(mixed.length >= 10, `only ${mixed.length} ordered-table transactions found`);
+});
+
+test("EXPENSE IS LAST: no transaction locks the row before its parents", () => {
+    // The rule round 40 added, stated on its own so a regression names it. The
+    // Expense row is the CHILD; every table the decision is derived from is
+    // locked before it, and a transaction that reverses that is a cycle
+    // against the booking path whatever else it does.
+    const offenders: string[] = [];
+    let checked = 0;
+    for (const { file, index, body } of mixedOrderTransactions()) {
+        const { expense } = acquisitions(body);
+        if (expense === undefined) continue;
+        checked += 1;
+        const setAt = body.indexOf("lockAttributionParents(");
+        if (setAt < 0 || setAt > expense) {
+            offenders.push(
+                `${file} $transaction #${index + 1}: the Expense row is locked before its parents`,
+            );
+        }
+    }
+    assert.deepEqual(offenders, [], offenders.join("\n  "));
+    assert.ok(checked >= 5, `only ${checked} transactions lock an Expense row — has the scan stopped reaching them?`);
 });
 
 test("a foreign-key write of projectId/estimateId counts as reaching those tables", () => {
