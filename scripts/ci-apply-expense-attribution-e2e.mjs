@@ -81,4 +81,16 @@ run("node", [script, "--post-deploy", ...guard], env);
 // between the phases has to be safe to re-run from the top.
 console.log("\n=== pre-deploy, again (idempotency) ===");
 run("node", [script, ...guard], env);
+// ...AND THE MONEY BACKFILL, through the same guard (round 48, item 5).
+// It writes `projectId`/`costCodeId`/`costCodeSource`, so its target guard is
+// the one that most needs proving end to end: `--target ci` resolves the
+// ambient URL, refuses a Supabase-looking host, and prints the redacted
+// identity line before a single row is touched. The database is empty here,
+// so the run is a no-op by construction — what is under test is that it LOADS
+// under tsx, passes the guard, and reaches its own reporting.
+const backfill = path.join("scripts", "backfill-expense-attribution.ts");
+console.log("");
+console.log("=== money backfill (--target ci) ===");
+run("node", ["--import=tsx", backfill, "--target", "ci", "--expect-db", DB, "--expect-host", host, "--apply"], env);
+
 console.log("\napply script end-to-end: OK");

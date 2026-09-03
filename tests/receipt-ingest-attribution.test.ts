@@ -154,15 +154,32 @@ const fakePrisma: any = {
         // regression back to matching a substring of the caller-supplied
         // `receiptUrl` throws rather than quietly passing the substring tests
         // below by doing the very thing they exist to forbid.
+        //
+        // TWO ARMS SINCE ROUND 48, ITEM 1: the file id, and a LEGACY row (one
+        // an old instance inserted with `sourceFileId` NULL) matched by its
+        // exact `receiptUrl`. Both are modelled as equality, and anything else
+        // still throws — a regression to `contains` on the caller-supplied url
+        // is what round 34 removed and it must not come back through this door.
         findFirst: async (args: any) => {
-            const wanted = args?.where?.sourceFileId;
-            if (typeof wanted !== "string") {
+            const arms = args?.where?.OR;
+            if (!Array.isArray(arms) || arms.length !== 2) {
+                throw new Error(
+                    "receipt-ingest dedupe must ask for an exact sourceFileId OR a legacy receiptUrl, got " +
+                        JSON.stringify(args?.where),
+                );
+            }
+            const wanted = arms[0]?.sourceFileId;
+            const legacy = arms[1]?.AND;
+            const legacyUrl = legacy?.[1]?.receiptUrl;
+            if (typeof wanted !== "string" || legacy?.[0]?.sourceFileId !== null || typeof legacyUrl !== "string") {
                 throw new Error(
                     "receipt-ingest dedupe must ask for an exact sourceFileId, got " +
                         JSON.stringify(args?.where),
                 );
             }
-            const hit = created.find(row => row.sourceFileId === wanted);
+            const hit = created.find(row =>
+                row.sourceFileId === wanted ||
+                (row.sourceFileId == null && row.receiptUrl === legacyUrl));
             return hit ? { id: "exp-existing" } : null;
         },
         create: async (args: { data: Record<string, unknown> }) => {
@@ -594,4 +611,53 @@ test("the date is judged BEFORE any group is inserted", async () => {
     });
     assert.equal(res.status, 400);
     assert.deepEqual(created, []);
+});
+
+// ── the mixed-version drain window (Codex round 48, item 1) ────────────────
+
+test("a row an OLD instance inserted still counts as this file", async () => {
+    // The failure this closes: during the rollout, old instances insert with
+    // `sourceFileId` NULL (their Prisma client predates the column). A dedupe
+    // on that column alone cannot see them, so a delivery whose response was
+    // lost — retried against a NEW instance — inserted the whole receipt a
+    // second time, and the later backfill made the duplicate permanent.
+    created.push({
+        sourceFileId: null,
+        sourceGroupIndex: null,
+        receiptUrl: "https://drive.google.com/file/d/drive-file-1/view",
+        amount: 120.5,
+    });
+    const res = await post(PAYLOAD);
+    const json = await res.json();
+    assert.deepEqual(json, { ok: true, alreadyIngested: true, created: 0 });
+    assert.equal(created.length, 1, "nothing new was written");
+});
+
+test("...and a legacy row for a DIFFERENT file does not block this one", async () => {
+    // The legacy arm is exact equality on the stored url, never a substring
+    // test — that is what round 34 removed and it must not come back.
+    created.push({
+        sourceFileId: null,
+        sourceGroupIndex: null,
+        receiptUrl: "https://drive.google.com/file/d/some-other-file/view",
+        amount: 9.99,
+    });
+    const res = await post(PAYLOAD);
+    const json = await res.json();
+    assert.equal(json.created, 1, "this delivery still lands");
+    assert.equal(created.length, 2);
+});
+
+test("a legacy row whose url the caller did not send is not matched by accident", async () => {
+    // A `fileUrl` the caller supplies is what gets stored, so the legacy arm
+    // compares against the url THIS delivery would write, not a guess.
+    created.push({
+        sourceFileId: null,
+        sourceGroupIndex: null,
+        receiptUrl: "https://drive.google.com/uc?export=download&id=drive-file-1",
+        amount: 120.5,
+    });
+    const res = await post({ ...PAYLOAD, fileUrl: "https://drive.google.com/uc?export=download&id=drive-file-1" });
+    const json = await res.json();
+    assert.deepEqual(json, { ok: true, alreadyIngested: true, created: 0 });
 });

@@ -52,6 +52,8 @@ import {
     reanchorSql,
     SOURCE_FILE_ID_BACKFILL,
     SPLIT_JOB_GUARD_DROP_SQL,
+    SOURCE_FILE_BRIDGE_DROP_SQL,
+    SOURCE_FILE_BRIDGE_SQL,
     SPLIT_JOB_GUARD_SQL,
     SPLIT_JOB_REPAIR,
     SPLIT_JOB_REPAIR_LOCK_PROJECTS,
@@ -287,7 +289,7 @@ test("every statement is additive — nothing drops, renames, or rewrites data",
             statement.includes("Expense_estimateId_fkey") &&
             statement.includes("ON DELETE SET NULL");
         const isGuardTriggerReplace =
-            /^DROP TRIGGER IF EXISTS probuild_expense_(estimate_pair|amount_tax)_(guard|ack) ON "Expense"$/.test(statement.trim());
+            /^DROP TRIGGER IF EXISTS probuild_expense_(estimate_pair_guard|amount_tax_(guard|ack)|source_file_bridge) ON "Expense"$/.test(statement.trim());
         assert.ok(
             isConstraintReplace || isGuardTriggerReplace || isNullabilityWidening || isEstimateFkReplace || !/\bDROP\b/i.test(statement),
             `destructive statement: ${statement}`,
@@ -1140,7 +1142,14 @@ test("the post-deploy pass takes BOTH guards back out", () => {
             `${name}'s function is never dropped`,
         );
     }
-    assert.deepEqual(teardown, [...SPLIT_JOB_GUARD_DROP_SQL, ...AMOUNT_TAX_GUARD_DROP_SQL]);
+    // The Drive-receipt bridge comes out in the same pass, LAST (round 48,
+    // item 1): while it stands, a straggler instance is still stamped and
+    // still serialized, so the sourceFileId backfill above it cannot race one.
+    assert.deepEqual(teardown, [
+        ...SPLIT_JOB_GUARD_DROP_SQL,
+        ...AMOUNT_TAX_GUARD_DROP_SQL,
+        ...SOURCE_FILE_BRIDGE_DROP_SQL,
+    ]);
 });
 
 test("the amount/tax guard is a transcription of planExpenseUpdate, not a new policy", () => {
@@ -1616,4 +1625,86 @@ test("the banner names the project, still redacted", () => {
     });
     assert.match(line, /project="ghzdbzdnwjxazvmcefbh"/);
     assert.doesNotMatch(line, /sup3rs3cret/);
+});
+
+// ── the Drive-receipt drain-window bridge (round 48, item 1) ───────────────
+
+test("the bridge locks the SAME key the ingest route locks", () => {
+    // The one way this bridge could look installed and do nothing: hash a
+    // different string, take a different lock, serialize with nobody. The
+    // route's key is read out of the route rather than restated here.
+    const route = readFileSync(
+        path.resolve(__dirname, "..", "src", "app", "api", "integrations", "receipt-ingest", "route.ts"),
+        "utf8",
+    );
+    const prefix = route.match(/RECEIPT_INGEST_LOCK_PREFIX = "([^"]+)"/)?.[1];
+    assert.equal(prefix, "receipt-ingest:", "the route's lock prefix moved");
+    assert.match(route, /pg_advisory_xact_lock\(hashtextextended\(\$1, 0\)\)/,
+        "the route hashes with hashtextextended");
+
+    const fn = SOURCE_FILE_BRIDGE_SQL[0];
+    assert.match(fn, /pg_advisory_xact_lock\(/);
+    assert.match(fn, /hashtextextended\('receipt-ingest:' \|\| NEW\."sourceFileId", 0\)/,
+        "the trigger must hash the SAME prefixed id, with the SAME function");
+    assert.doesNotMatch(fn, /hashtext\(/, "hashtext() is a different lock space");
+});
+
+test("the bridge derives the file id the same way the backfill does", () => {
+    // Two extractors that disagree would stamp one id at INSERT and a
+    // different one at backfill time, which is a duplicate with extra steps.
+    for (const pattern of ["/d/([A-Za-z0-9_-]+)", "[?&]id=([A-Za-z0-9_-]+)"]) {
+        assert.ok(SOURCE_FILE_ID_BACKFILL.includes(pattern), `backfill lost ${pattern}`);
+        assert.ok(SOURCE_FILE_BRIDGE_SQL[0].includes(pattern), `bridge lost ${pattern}`);
+    }
+});
+
+test("the ordinal counts within the TRANSACTION, not within the table", () => {
+    // MAX(existing) + 1 is the obvious rule and it is the wrong one: a
+    // re-delivery would land on fresh ordinals and insert cleanly, which is
+    // exactly the duplicate this bridge exists to stop. Counting per
+    // transaction makes a second delivery collide with the rows already there.
+    const fn = SOURCE_FILE_BRIDGE_SQL[0];
+    assert.match(fn, /set_config\(counter_key, next_index::text, true\)/,
+        "the counter must be TRANSACTION-local");
+    assert.match(fn, /current_setting\(counter_key, true\)/);
+    assert.doesNotMatch(fn, /MAX\("sourceGroupIndex"\)/,
+        "a table-wide MAX lets a re-delivery insert cleanly");
+});
+
+test("it fires BEFORE INSERT and only touches rows that stay silent", () => {
+    assert.match(SOURCE_FILE_BRIDGE_SQL[2], /BEFORE INSERT ON "Expense"/);
+    assert.match(SOURCE_FILE_BRIDGE_SQL[2], /FOR EACH ROW/);
+    // A row that names its own file id is the NEW build's; the trigger must
+    // not renumber it.
+    assert.match(SOURCE_FILE_BRIDGE_SQL[0], /IF NEW\."sourceFileId" IS NULL AND NEW\."receiptUrl" IS NOT NULL THEN/);
+    assert.match(SOURCE_FILE_BRIDGE_SQL[0], /IF NEW\."sourceGroupIndex" IS NULL THEN/);
+    // ...and an expense with no Drive url at all pays nothing.
+    assert.match(SOURCE_FILE_BRIDGE_SQL[0], /IF NEW\."sourceFileId" IS NULL THEN\s+RETURN NEW;/);
+});
+
+test("the bridge and its teardown are BOTH in the committed migration", () => {
+    // Same contract as the other two guards: a fresh CI/dev database replays
+    // this migration end to end and must finish in production's END state,
+    // with no scaffolding standing.
+    for (const sql of [...SOURCE_FILE_BRIDGE_SQL, ...SOURCE_FILE_BRIDGE_DROP_SQL]) {
+        assert.ok(normalizedMigration.includes(normalize(sql).replace(/;$/, "")), `migration.sql is missing:\n  ${sql}`);
+    }
+    const create = migrationSql.indexOf("CREATE TRIGGER probuild_expense_source_file_bridge");
+    const fill = migrationSql.indexOf('UPDATE "Expense" e SET "projectId" = locked."projectId"');
+    const drop = migrationSql.lastIndexOf("DROP FUNCTION IF EXISTS probuild_expense_source_file_bridge");
+    assert.ok(create > -1 && fill > -1 && drop > -1);
+    assert.ok(create < fill, "it has to stand before the backfill stamps ids");
+    assert.ok(fill < drop, "and it comes out only after the backfill is done");
+});
+
+test("--post-deploy drops the bridge AFTER it has stamped the stragglers", () => {
+    // Order is the whole argument: the backfill can only be safe if nothing
+    // is still inserting unstamped rows behind it.
+    const teardown = postDeployStatements("America/Los_Angeles")
+        .concat(postDeployTeardownStatements({}));
+    const backfillAt = teardown.findIndex(sql => sql.includes('SET "sourceFileId" = COALESCE'));
+    const dropAt = teardown.findIndex(sql => sql.includes("DROP TRIGGER IF EXISTS probuild_expense_source_file_bridge"));
+    assert.ok(backfillAt > -1, "the sourceFileId backfill runs in --post-deploy");
+    assert.ok(dropAt > -1, "and the bridge is dropped in the same pass");
+    assert.ok(backfillAt < dropAt, "the stamping happens while the bridge still stands");
 });

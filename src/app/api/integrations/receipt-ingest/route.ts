@@ -94,8 +94,25 @@ export async function POST(req: Request) {
     // of a file whose Drive folder has since been renamed used to answer
     // `alreadyIngested`, and must keep doing so rather than suddenly
     // reporting `project-not-matched`.
+    // ...AND A LEGACY ROW IS STILL THIS FILE (round 48, item 1).
+    //
+    // During the rollout, old instances insert rows with `sourceFileId` NULL —
+    // their Prisma client predates the column — so a dedupe on that column
+    // alone cannot see them, and a delivery retried against a new instance
+    // inserts the whole receipt again. The drain-window trigger
+    // (`probuild_expense_source_file_bridge`) stamps those rows on INSERT and
+    // serializes them against this route's advisory lock; this OR is the second
+    // half of the same fix, for a row whose `receiptUrl` the trigger could not
+    // parse an id out of. `receiptUrl` is exact-matched, never `contains` —
+    // that substring test is what round 34 removed.
+    const alreadyIngestedWhere = {
+        OR: [
+            { sourceFileId: body.fileId },
+            { AND: [{ sourceFileId: null }, { receiptUrl }] },
+        ],
+    };
     const existing = await prisma.expense.findFirst({
-        where: { sourceFileId: body.fileId },
+        where: alreadyIngestedWhere,
         select: { id: true },
     });
     if (existing) {
@@ -270,7 +287,12 @@ export async function POST(req: Request) {
                 `${RECEIPT_INGEST_LOCK_PREFIX}${body.fileId}`,
             );
             const alreadyIngested = await tx.expense.findFirst({
-                where: { sourceFileId: body.fileId },
+                // The same predicate as the fast path, including the legacy
+                // `receiptUrl` arm — this is the authoritative one, taken under
+                // the per-file advisory lock that the drain-window trigger
+                // takes too, so an old instance's in-flight insert is either
+                // already visible here or still blocking this read.
+                where: alreadyIngestedWhere,
                 select: { id: true },
             });
             if (alreadyIngested) return null;

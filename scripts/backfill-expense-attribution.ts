@@ -52,6 +52,9 @@
  */
 import { PrismaClient } from "@prisma/client";
 import { config } from "dotenv";
+// The SHARED target guard — the same module scripts/apply-expense-attribution.mjs
+// imports, so the two scripts cannot check different things (round 48, item 5).
+import { resolveTargetOrRefuse, verifyTargetIdentity } from "./lib/apply-target.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { writeFileSync } from "node:fs";
@@ -118,11 +121,21 @@ export function scopedItemCostCodes(rows, items, allowedCodesByProject) {
         const item = items.get(row.itemId);
         if (!item || !item.costCodeId) continue;
         const projectId = resolveExpenseProjectId(row);
-        // Same two gates the writer applies: the link must not cross jobs, and
-        // the code must be a live phase of that job.
+        // The cross-job gate is unconditional: a link to another job's line
+        // item resolves to nothing on the variance page and must resolve to
+        // nothing here.
         if (!projectId || item.projectId !== projectId) continue;
-        const allowed = allowedCodesByProject.get(projectId);
-        if (!allowed || !allowed.has(item.costCodeId)) continue;
+        // The PHASE gate is optional (round 48, item 3). It is the WRITE rule
+        // — an active code carried by a committed estimate — and belongs to
+        // callers deciding what this script may write. A caller MEASURING what
+        // the variance report shows passes null, because that report keeps
+        // draft/archived attribution-only items and never checks `isActive`;
+        // applying the write rule there reported money as unattributed that the
+        // page itself attributes.
+        if (allowedCodesByProject) {
+            const allowed = allowedCodesByProject.get(projectId);
+            if (!allowed || !allowed.has(item.costCodeId)) continue;
+        }
         scoped.set(coverageKey(projectId, row.itemId), item.costCodeId);
     }
     return scoped;
@@ -553,7 +566,27 @@ export async function runBackfill({
     // already lives (`allowedCodesByProject`, built from committed estimates).
     // Scoped to the items expenses actually LINK to, so widening the filter
     // does not turn this into a full-table read.
-    const linkedItemIds = [...new Set(expenses.map(e => e.itemId).filter(Boolean))];
+    // ...AND THE ITEMS ONLY TIME ENTRIES POINT AT (round 48, item 3).
+    //
+    // The labor half of the coverage metric resolves `TimeEntry.estimateItemId`
+    // through this very map, and the query below used to be scoped to the items
+    // EXPENSES link to. Labor whose phase comes only from its line item —
+    // exactly what the clock-in flow produces — therefore found no entry and
+    // was reported as unattributed, which understated the one metric the
+    // rollout is judged on. The time entries are read here, before the map,
+    // rather than in the middle of the report where they used to be.
+    const timeEntries = await db.timeEntry.findMany({
+        where: { projectId: { in: scopedProjectIds } },
+        select: {
+            costCodeId: true, estimateItemId: true, laborCost: true, burdenCost: true,
+            // Needed to scope the item fallback to the entry's OWN job.
+            projectId: true,
+        },
+    });
+    const linkedItemIds = [...new Set([
+        ...expenses.map(e => e.itemId),
+        ...timeEntries.map(t => t.estimateItemId),
+    ].filter(Boolean))];
     const itemRowsRaw = linkedItemIds.length
         ? await db.estimateItem.findMany({
             where: { id: { in: linkedItemIds } },
@@ -571,6 +604,14 @@ export async function runBackfill({
         // item, and every reader of `costCodeId` gets the same answer it got
         // when the query itself did the filtering.
         costCodeId: row.costCode?.isActive ? row.costCodeId : null,
+        // WHAT THE VARIANCE REPORT SEES (round 48, item 3). The report's
+        // attribution pool is every coded line item on the project's estimates
+        // — any status, and with no `costCode.isActive` filter (see
+        // `attributionOnlyItems` in src/lib/job-variance-db.ts). Measuring
+        // coverage through the WRITE-eligibility view above called those rows
+        // unattributed when the page itself attributes them, so the script and
+        // the page disagreed about the same seed.
+        reportedCostCodeId: row.costCodeId ?? null,
         estimateId: row.estimateId,
         projectId: row.estimate?.projectId ?? null,
     }));
@@ -580,6 +621,14 @@ export async function runBackfill({
         projectId: row.projectId,
     }]));
     const itemCostCodeById = new Map(itemRows.map(row => [row.id, row.costCodeId]));
+    // The same ownership, with the code the REPORT would use. Two maps rather
+    // than one flag, because every reader of `items` is a WRITE decision and
+    // every reader of this one is a MEASUREMENT.
+    const reportingItems = new Map(itemRows.map(row => [row.id, {
+        costCodeId: row.reportedCostCodeId,
+        estimateId: row.estimateId,
+        projectId: row.projectId,
+    }]));
 
     // THE PHASES EACH JOB ACTUALLY HAS — the same set the app itself uses.
     //
@@ -646,11 +695,20 @@ export async function runBackfill({
                 estimate: { select: { projectId: true } },
             },
         });
-        // An item whose code was cleared, or whose code was deactivated, is no
-        // longer a source of one — the same rule the snapshot query applies.
-        if (!row?.costCodeId || row.costCode?.isActive === false) return fresh;
+        // OWNERSHIP SURVIVES A MISSING CODE (round 48, item 4).
+        //
+        // This used to return an EMPTY map when the item had no code, or a
+        // retired one — which `planBackfill` cannot tell apart from "there is
+        // no such item". So a cross-job link whose code had just been cleared
+        // stopped being reported as `item-outside-estimate` and fell through to
+        // regex inference instead: the locked re-plan reintroduced, one
+        // transaction later, exactly the bug round 44 fixed in the snapshot.
+        //
+        // The two questions stay separate here, as they do in the snapshot: the
+        // row still says who OWNS the item, and an unusable code reads as null.
+        if (!row) return fresh;
         fresh.set(row.id, {
-            costCodeId: row.costCodeId,
+            costCodeId: row.costCode?.isActive ? row.costCodeId : null,
             estimateId: row.estimateId,
             projectId: row.estimate?.projectId ?? null,
         });
@@ -664,9 +722,13 @@ export async function runBackfill({
     // ── the table ───────────────────────────────────────────────────────────
     const scoped = new Set(scopedProjectIds);
     const inScopeExpenses = expenses.filter(e => scoped.has(resolveExpenseProjectId(e) ?? ""));
-    // Project-scoped and phase-validated, so a cross-job item link stays
-    // unattributed in the metric exactly as it does on the variance page.
-    const coverageItems = scopedItemCostCodes(inScopeExpenses, items, allowedCodesByProject);
+    // Project-scoped, exactly as the variance page is — but NOT phase-validated
+    // (round 48, item 3). Passing `allowedCodesByProject` here applied the
+    // WRITE rule (an active code on a committed estimate) to a MEASUREMENT of
+    // what the report shows, and the report keeps draft/archived
+    // attribution-only items and never checks `isActive`. The cross-job scope
+    // stays, because the page really does drop a link to another job's item.
+    const coverageItems = scopedItemCostCodes(inScopeExpenses, reportingItems, null);
     const before = measureCoverage(inScopeExpenses, coverageItems);
     const after = measureCoverage(projectedRows(inScopeExpenses, plan.codeFills), coverageItems);
 
@@ -691,14 +753,6 @@ export async function runBackfill({
     // The §1.6 headline is measured on the variance page's basis, which counts
     // LABOR as well. Reporting only the expense share would flatter the number,
     // because clock-in already requires a phase.
-    const timeEntries = await db.timeEntry.findMany({
-        where: { projectId: { in: scopedProjectIds } },
-        select: {
-            costCodeId: true, estimateItemId: true, laborCost: true, burdenCost: true,
-            // Needed to scope the item fallback to the entry's OWN job.
-            projectId: true,
-        },
-    });
     // PROJECT-SCOPED, exactly like the expense side. A time entry pointing at
     // another job's estimate item is unattributed on the variance page, so
     // resolving it through a global id->code map counted labor dollars as
@@ -710,8 +764,8 @@ export async function runBackfill({
             estimate: null,
             itemId: t.estimateItemId,
         })),
-        items,
-        allowedCodesByProject,
+        reportingItems,
+        null,
     );
     const laborRows = timeEntries.map(t => ({
         costCodeId: resolveExpenseCostCodeId(
@@ -756,10 +810,21 @@ export async function runBackfill({
         log(`wrote ${csvPath} (${plan.remainder.length} rows for Marge)`);
     }
 
+    // The measured numbers, RETURNED and not merely printed (round 48, item 3).
+    // tests/backfill-coverage-parity-db.test.ts re-computes the same figures
+    // with `computeProjectVariance` over the same seed and asserts they agree;
+    // a metric nobody can compare against its own source is a claim, not a
+    // measurement.
+    const coverage = {
+        expenses: { before, after },
+        labor,
+        varianceBasis: { before: variancedBefore, after: variancedAfter, total: variancedTotal },
+    };
+
     if (!apply) {
         log("");
         log("DRY RUN — nothing written. Re-run with --apply once the table above is reviewed.");
-        return { plan, before, after, written: { projectIds: 0, costCodes: 0 } };
+        return { plan, before, after, coverage, written: { projectIds: 0, costCodes: 0 } };
     }
 
     // ── the writes ──────────────────────────────────────────────────────────
@@ -853,9 +918,21 @@ export async function runBackfill({
         // do not cover it.
         const plannedEstimateId = fill.expense?.estimateId ?? null;
         const plannedItemId = fill.expense?.itemId ?? null;
+        // THE ITEM OWNER IS PART OF THE ANSWER (round 48, item 4).
+        //
+        // `readItem` reads the item's estimate to decide whether the link
+        // crosses jobs. That estimate is not necessarily the expense's own, and
+        // it was not in the lock set — so the fact the verdict rests on could
+        // move while this transaction held everything else still. Named here,
+        // from the plan, so `lockAttributionParents` takes it in the canonical
+        // order with the rest; the re-read below then refuses if the ownership
+        // it locked is not the ownership that exists.
+        const plannedItemOwnerEstimateId = plannedItemId
+            ? (items.get(plannedItemId)?.estimateId ?? null)
+            : null;
         const result = await writeUnderAttributionLocks(db, {
             expenseId: fill.id,
-            estimateIds: [plannedEstimateId],
+            estimateIds: [plannedEstimateId, plannedItemOwnerEstimateId],
             estimateItemIds: [plannedItemId],
             phaseProjectId: fill.expectedProjectId ?? null,
             costCodeId: fill.costCodeId,
@@ -914,6 +991,17 @@ export async function runBackfill({
             // re-read here any more; see the proof below.
             const resolvedProjectId = current.projectId ?? current.estimate?.projectId ?? null;
             const freshItems = await readItem(tx, current.itemId);
+            // THE OWNERSHIP THIS WRITE LOCKED IS THE OWNERSHIP IT JUDGES.
+            //
+            // If the item has been moved onto a different estimate since the
+            // plan, the estimate whose `projectId` decides "does this link
+            // cross jobs" is one nothing here is holding. Skipped and counted,
+            // like every other moved-under-us case; a re-run plans it against
+            // the truth and locks what that truth rests on.
+            const freshOwner = current.itemId ? freshItems.get(current.itemId) : undefined;
+            if (current.itemId && (freshOwner?.estimateId ?? null) !== plannedItemOwnerEstimateId) {
+                return { count: 0 };
+            }
             // THE RE-PLAN PROPOSES; THE LOCKED PROOF DECIDES.
             //
             // `planBackfill`'s phase gate is a set-membership test against a
@@ -1015,18 +1103,39 @@ export async function runBackfill({
         plan,
         before,
         after,
+        coverage,
+        // Skips are part of the outcome, not just a log line: a run that plans
+        // a write and then refuses it because the row moved is the correct
+        // behaviour, and a test has to be able to see the difference between
+        // that and a write that never happened.
+        skipped: { costCodes: costCodesSkipped },
         written: { projectIds: projectIdsWritten, costCodes: costCodesWritten },
     };
+}
+
+/** A flag's value from argv, read inside main() so import stays inert. */
+function expectFlag(flag: string): string | undefined {
+    const idx = process.argv.indexOf(flag);
+    return idx >= 0 ? process.argv[idx + 1] : undefined;
 }
 
 const HELP = `Backfill Expense attribution (Receipt Pipeline v2, Phase 3).
 
   node --import=tsx scripts/backfill-expense-attribution.ts                # dry run
   node --import=tsx scripts/backfill-expense-attribution.ts --csv out.csv  # + remainder CSV
-  node --import=tsx scripts/backfill-expense-attribution.ts --apply        # write
+  node --import=tsx scripts/backfill-expense-attribution.ts --target prod \
+      --expect-db <db> --expect-host <host> --apply                        # write
 
 Dry run is the DEFAULT. --apply writes; re-run dry afterwards and it must
 report zero planned changes.
+
+--apply REQUIRES --target (prod or ci) plus --expect-db and --expect-host, the
+same guard scripts/apply-expense-attribution.mjs uses and from the same shared
+module. --target prod reads the URL from .env.production.local (an ambient
+DATABASE_URL is IGNORED), requires the Supabase pooler host, requires
+APPLY_EXPECT_PROJECT_REF to match the project ref in that URL, and requires the
+production baseline migration to be applied. A redacted identity line is
+printed before anything is written.
 
 The --import=tsx loader is required: this script imports TypeScript from src/,
 and plain node only strips types on Node 22.6+.`;
@@ -1049,8 +1158,54 @@ async function main() {
     const csvIdx = process.argv.indexOf("--csv");
     const csvPath = csvIdx > -1 ? process.argv[csvIdx + 1] : null;
 
-    const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
+    // WHICH DATABASE (round 48, item 5).
+    //
+    // This script WRITES MONEY COLUMNS — `projectId`, `costCodeId`,
+    // `costCodeSource` — and until now it took whatever `DATABASE_URL` the
+    // shell happened to hold, after loading .env.local and .env. The DDL apply
+    // script had already grown a target guard, a project-ref check and a
+    // redacted identity line; this one had none of it, so the more dangerous of
+    // the two scripts was the less guarded. Same helper, same checks, imported
+    // rather than copied.
+    //
+    // A DRY RUN still needs no target: it only reads, and forcing a target on
+    // it would push people toward `--apply` to get any output at all.
+    let url = process.env.DATABASE_URL;
+    let target: string | null = null;
+    let from = "process.env.DATABASE_URL";
+    if (apply) {
+        const targeted = resolveTargetOrRefuse(process.argv);
+        if (targeted.error) {
+            console.error(`REFUSING: ${targeted.error}`);
+            process.exitCode = 1;
+            return;
+        }
+        ({ target, url, from } = targeted as { target: string; url: string; from: string });
+        if (!expectFlag("--expect-db") || !expectFlag("--expect-host")) {
+            console.error(
+                "REFUSING: --apply requires --expect-db and --expect-host as well as --target.",
+            );
+            process.exitCode = 1;
+            return;
+        }
+    }
+
+    const prisma = new PrismaClient({ datasources: { db: { url } } });
     try {
+        if (apply && target) {
+            const identity = await verifyTargetIdentity(prisma, {
+                target, url, from,
+                expectDb: expectFlag("--expect-db"),
+                expectHost: expectFlag("--expect-host"),
+            });
+            console.log(identity.banner);
+            if (!identity.ok) {
+                console.error(identity.error);
+                process.exitCode = 1;
+                return;
+            }
+            for (const note of identity.notes ?? []) console.log(note);
+        }
         await runBackfill({ db: prisma, apply, csvPath });
     } finally {
         await prisma.$disconnect();

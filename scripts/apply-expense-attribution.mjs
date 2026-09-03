@@ -49,206 +49,40 @@ export function resolveDatabaseUrl() {
     throw new Error("DATABASE_URL not found in process.env, .env.local, or .env");
 }
 
-/**
- * WHICH DATABASE, SAID OUT LOUD (cross-PR rule, round 46).
- *
- * `resolveDatabaseUrl` above prefers an AMBIENT `DATABASE_URL`. That is the
- * right default for a driver that hands the script a throwaway container, and
- * the wrong one for a person: a developer with a local Postgres in their shell
- * runs this, watches every "verified ..." line print, and merges believing
- * production has the columns. Nothing in the output contradicts them —
- * `--expect-db postgres --expect-host ...` can be satisfied by a local server
- * as easily as by the real one, because the operator supplies both sides of
- * that comparison.
- *
- * So the TARGET is now an explicit argument, and each target decides where the
- * URL may come from:
- *
- *   * `--target prod` reads `.env.production.local` and IGNORES the ambient
- *     `DATABASE_URL` entirely — the file Vercel writes is the only thing that
- *     can name production — and additionally requires the pooler host and the
- *     production baseline migration row.
- *   * `--target ci` is the throwaway container: ambient `DATABASE_URL`, no
- *     baseline row (a database built from `migrate deploy` in a fresh
- *     container has one, but a hand-rolled fixture may not), and it REFUSES a
- *     Supabase-looking URL so the CI path can never be pointed at prod.
- *
- * Both are named on the command line. There is deliberately no default: a
- * missing `--target` is an error, not a guess.
- */
-export const APPLY_TARGETS = {
-    prod: {
-        envFile: ".env.production.local",
-        allowAmbient: false,
-        requireBaseline: true,
-        hostMustMatch: /(^|\.)pooler\.supabase\.com$/i,
-        hostDescription: "the Supabase pooler",
-        // THE HOST IS NOT THE IDENTITY. Supabase's pooler hostnames are shared
-        // REGIONALLY — `aws-0-us-west-2.pooler.supabase.com` is every project
-        // in that region — and the database is called `postgres` in all of
-        // them. A migrated staging clone therefore matches the host, the
-        // database name AND the baseline row. What actually names the project
-        // is the URL's USERNAME: `postgres.<project-ref>`.
-        requireProjectRef: true,
-    },
-    ci: {
-        envFile: null,
-        allowAmbient: true,
-        requireBaseline: false,
-        hostMustNotMatch: /supabase\.(co|com)$/i,
-        hostDescription: "a throwaway container",
-        // A container has no project ref, and requiring one would only mean
-        // inventing a fake to satisfy the check.
-        requireProjectRef: false,
-    },
+import {
+    APPLY_TARGETS,
+    PRODUCTION_BASELINE_MIGRATION,
+    maskUrl,
+    parseTarget,
+    projectRefFromUrl,
+    projectRefVerdict,
+    resolveTargetDatabaseUrl,
+    targetBanner,
+    targetHostVerdict,
+    resolveTargetOrRefuse,
+    targetMatches,
+    verifyTargetIdentity,
+} from "./lib/apply-target.mjs";
+
+// Re-exported so this file stays the one import site its tests and the CI
+// driver already use; the DEFINITIONS live in scripts/lib/apply-target.mjs so
+// the money backfill checks the same things (round 48, item 5).
+export {
+    APPLY_TARGETS,
+    PRODUCTION_BASELINE_MIGRATION,
+    maskUrl,
+    parseTarget,
+    projectRefFromUrl,
+    projectRefVerdict,
+    resolveTargetDatabaseUrl,
+    targetBanner,
+    targetHostVerdict,
+    targetMatches,
 };
-
-/** The migration whose presence proves this is the real, baselined database. */
-export const PRODUCTION_BASELINE_MIGRATION = "20260814000000_baseline_production";
-
-/**
- * `--target <name>` out of an argv array. Returns the name or an error string;
- * never throws, so `main()` can print and exit rather than stack-trace.
- */
-export function parseTarget(argv) {
-    const idx = argv.indexOf("--target");
-    if (idx < 0) {
-        return { error: `--target is required: one of ${Object.keys(APPLY_TARGETS).join(", ")}.` };
-    }
-    const name = argv[idx + 1];
-    if (!name || !Object.prototype.hasOwnProperty.call(APPLY_TARGETS, name)) {
-        return { error: `Unknown --target ${JSON.stringify(name ?? null)}: expected one of ${Object.keys(APPLY_TARGETS).join(", ")}.` };
-    }
-    return { name, target: APPLY_TARGETS[name] };
-}
-
-/**
- * The URL this target is allowed to use.
- *
- * `env` and the two fs functions are parameters so the rule can be tested
- * without a `.env.production.local` on the machine running the tests — and so
- * the "ambient DATABASE_URL is ignored for prod" claim is checked rather than
- * asserted.
- */
-export function resolveTargetDatabaseUrl(
-    name,
-    { env = process.env, exists = fs.existsSync, read = file => fs.readFileSync(file, "utf8") } = {},
-) {
-    const target = APPLY_TARGETS[name];
-    if (!target) return { error: `Unknown target ${name}.` };
-    if (target.envFile) {
-        if (!exists(target.envFile)) {
-            return { error: `--target ${name} reads ${target.envFile}, which does not exist. Run: vercel env pull ${target.envFile}` };
-        }
-        const match = String(read(target.envFile)).match(/^DATABASE_URL\s*=\s*"?([^"\n]+)"?/m);
-        if (!match) return { error: `${target.envFile} has no DATABASE_URL.` };
-        // Deliberately NOT falling back to the ambient value: for this target
-        // the file is the only authority, and a missing key is an error rather
-        // than a reason to use whatever is in the shell.
-        return { url: match[1], from: target.envFile };
-    }
-    if (!env.DATABASE_URL) return { error: `--target ${name} needs DATABASE_URL in the environment.` };
-    return { url: env.DATABASE_URL, from: "process.env.DATABASE_URL" };
-}
-
-/**
- * Does the URL's HOST agree with what this target is? Checked on the URL and
- * not on `inet_server_addr()`, because the latter is an IP address and "is
- * this the pooler" is a question about the name we dialled.
- */
-export function targetHostVerdict(name, url) {
-    const target = APPLY_TARGETS[name];
-    if (!target) return `Unknown target ${name}.`;
-    let host;
-    try {
-        host = new URL(url).hostname;
-    } catch {
-        return `The resolved DATABASE_URL is not a valid URL.`;
-    }
-    if (target.hostMustMatch && !target.hostMustMatch.test(host)) {
-        return `--target ${name} expects ${target.hostDescription}, but the URL points at ${host}.`;
-    }
-    if (target.hostMustNotMatch && target.hostMustNotMatch.test(host)) {
-        return `--target ${name} must never point at ${host} — that is production.`;
-    }
-    return null;
-}
-
-/**
- * The Supabase PROJECT REF out of a connection URL, or null.
- *
- * The pooler username is `postgres.<project-ref>`; a direct connection uses a
- * bare `postgres` with the ref in the HOST (`db.<ref>.supabase.co`). Both are
- * read, because a future change of connection style must not silently turn the
- * check off.
- */
-export function projectRefFromUrl(url) {
-    let parsed;
-    try {
-        parsed = new URL(url);
-    } catch {
-        return null;
-    }
-    const user = decodeURIComponent(parsed.username ?? "");
-    const dotted = /^postgres\.([a-z0-9]+)$/i.exec(user);
-    if (dotted) return dotted[1];
-    const host = /^db\.([a-z0-9]+)\.supabase\.co$/i.exec(parsed.hostname ?? "");
-    return host ? host[1] : null;
-}
-
-/**
- * Is this the project the operator meant? `APPLY_EXPECT_PROJECT_REF` is the
- * shared name every apply script uses, so setting it once covers all of them.
- *
- * UNSET IS A REFUSAL, not a skip. A guard that disables itself when its input
- * is missing protects nothing on the machine that matters — the one where
- * somebody is running this in a hurry.
- */
-export function projectRefVerdict(name, url, env = process.env) {
-    const target = APPLY_TARGETS[name];
-    if (!target?.requireProjectRef) return null;
-    const expected = (env.APPLY_EXPECT_PROJECT_REF ?? "").trim();
-    if (!expected) {
-        return `--target ${name} requires APPLY_EXPECT_PROJECT_REF (the Supabase project ref, e.g. the value in postgres.<ref>). Set it and re-run.`;
-    }
-    const actual = projectRefFromUrl(url);
-    if (!actual) {
-        return `--target ${name} could not read a project ref from the connection URL — expected a postgres.<ref> username or a db.<ref>.supabase.co host.`;
-    }
-    if (actual !== expected) {
-        return `REFUSING: this URL is for project ${actual}, not ${expected}. The pooler host and the database name are shared across projects in a region, so they cannot tell production from a staging clone.`;
-    }
-    return null;
-}
-
-/** The one line printed before any DDL, with the credentials removed. */
-export function targetBanner(name, { url, from, db, host }) {
-    const ref = projectRefFromUrl(url);
-    return (
-        `TARGET ${name}: db="${db}" server="${host || "(local socket)"}" ` +
-        `project="${ref ?? "(none)"}" url=${maskUrl(url)} (from ${from})`
-    );
-}
-
-export function maskUrl(url) {
-    return url.replace(/:[^:@]*@/, ":****@");
-}
 
 function readFlagValue(flag) {
     const idx = process.argv.indexOf(flag);
     return idx >= 0 ? process.argv[idx + 1] : undefined;
-}
-
-/**
- * Pure comparison, exported for unit testing without a live DB. Compares BOTH
- * database name and server host, and both EXACTLY — same rule and same reason
- * as apply-receipt-intake.mjs: a guard that accepts a substring gets looser the
- * shorter the operator's input is.
- */
-export function targetMatches(actual, expectDb, expectHost) {
-    if (!actual || typeof actual !== "object") return false;
-    if (String(actual.db ?? "") !== String(expectDb ?? "")) return false;
-    return String(actual.host ?? "") === String(expectHost ?? "");
 }
 
 /**
@@ -846,6 +680,11 @@ export const AMOUNT_TAX_GUARD_DROP_SQL = [
 export const COMPATIBILITY_TRIGGERS = [
     "probuild_expense_estimate_pair_guard",
     "probuild_expense_amount_tax_guard",
+    // The Drive-receipt bridge (round 48, item 1). Listed here so the verify
+    // pass reports it standing during the drain window and gone afterwards,
+    // like the other two -- a scaffolding trigger nobody checks for is one that
+    // outlives its window.
+    "probuild_expense_source_file_bridge",
 ];
 
 /**
@@ -1229,7 +1068,127 @@ export function toConcurrentIndexSql(sql) {
  * for either FK, and well before phase B's backfill — see the comment at
  * SPLIT_JOB_GUARD_SQL for why they must exist before the columns carry values.
  */
-export const TRIGGER_STATEMENTS = [...SPLIT_JOB_GUARD_SQL, ...AMOUNT_TAX_GUARD_SQL];
+/**
+ * THE DRAIN-WINDOW BRIDGE FOR DRIVE RECEIPTS (Codex round 48, item 1).
+ *
+ * THE FAILURE. During the rollout, old instances are still serving
+ * `/api/integrations/receipt-ingest`. Their Prisma client predates
+ * `sourceFileId`/`sourceGroupIndex`, so every row they insert carries NULL in
+ * both — including rows inserted AFTER the pre-deploy `SOURCE_FILE_ID_BACKFILL`
+ * has already run. The NEW route dedupes on `sourceFileId` alone, in both its
+ * fast path and its locked re-check, so it cannot see those rows: a delivery
+ * whose response was lost, retried against a new instance, inserts the whole
+ * receipt a second time. The `--post-deploy` backfill then stamps the legacy
+ * row's `sourceFileId` and the duplicate is permanent — and the partial unique
+ * index never objected, because it only covers rows where `sourceFileId` is NOT
+ * NULL, which the legacy row was not at insert time.
+ *
+ * THE BRIDGE. A BEFORE INSERT trigger, created pre-deploy and dropped by
+ * `--post-deploy` exactly like the amount/tax guard, that does two things for
+ * any insert which does not speak for itself:
+ *
+ *   1. derives `sourceFileId` from `receiptUrl` with the SAME expression
+ *      `SOURCE_FILE_ID_BACKFILL` uses, so an old build's row is identified the
+ *      moment it lands rather than minutes later, and
+ *   2. takes THE SAME per-file advisory lock the new route takes, with the same
+ *      key expression, so an old-version insert and a new-version request for
+ *      one file serialize against each other. Whichever runs second sees the
+ *      first: the new route because its locked dedupe now finds a stamped row,
+ *      the old route because the unique index refuses the second copy of a
+ *      group.
+ *
+ * The group ordinal is assigned MAX+1 per file, under that lock, so a document
+ * the old build writes as N rows becomes N distinct keys rather than N
+ * conflicting NULLs. Rows already in the table when this trigger is created are
+ * the backfill's job, not the trigger's.
+ *
+ * WHY A TRIGGER AND NOT AN APPLICATION FIX. The instances that need fixing are
+ * running code that predates the columns. There is no application change that
+ * reaches them; the database is the only writer both versions go through.
+ */
+/**
+ * The advisory-lock key, byte-for-byte what the route computes.
+ *
+ * `src/app/api/integrations/receipt-ingest/route.ts` locks
+ * `hashtextextended('receipt-ingest:' || fileId, 0)`. A trigger that hashed
+ * anything else -- `hashtext` instead of `hashtextextended`, or the bare id
+ * without the prefix -- would take a DIFFERENT lock and serialize with nobody,
+ * which is the one way this bridge could look installed and do nothing.
+ * tests/apply-expense-attribution.test.ts pins the two against each other.
+ */
+export const SOURCE_FILE_BRIDGE_SQL = [
+    `CREATE OR REPLACE FUNCTION probuild_expense_source_file_bridge()
+     RETURNS trigger
+     LANGUAGE plpgsql
+     AS $bridge$
+     DECLARE
+         derived TEXT;
+         next_index INT;
+         counter_key TEXT;
+     BEGIN
+         -- A row that already names its file speaks for itself: the new build
+         -- inserted it, and it has chosen its own group ordinal.
+         IF NEW."sourceFileId" IS NULL AND NEW."receiptUrl" IS NOT NULL THEN
+             derived := COALESCE(
+                 substring(NEW."receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
+                 substring(NEW."receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
+             );
+             NEW."sourceFileId" := derived;
+         END IF;
+
+         IF NEW."sourceFileId" IS NULL THEN
+             RETURN NEW;
+         END IF;
+
+         -- THE SAME LOCK THE ROUTE TAKES, so an old-version insert and a
+         -- new-version request for one file cannot both believe they are first.
+         -- Transaction-scoped: released at COMMIT or ROLLBACK, nothing to leak.
+         PERFORM pg_advisory_xact_lock(
+             hashtextextended('receipt-ingest:' || NEW."sourceFileId", 0)
+         );
+
+         -- THE ORDINAL COUNTS WITHIN THIS TRANSACTION, NOT WITHIN THE TABLE.
+         --
+         -- MAX(existing) + 1 was the obvious rule and it is the wrong one: it
+         -- makes a RE-DELIVERY of a document the table already holds land on
+         -- fresh ordinals and insert cleanly, which is the duplicate this whole
+         -- bridge exists to stop. Counting per transaction instead means the N
+         -- groups of one delivery get 0,1,2..., and a SECOND delivery of the
+         -- same file starts at 0 again -- colliding with the row already there
+         -- and aborting on the partial unique index
+         -- ("sourceFileId", "sourceGroupIndex"). An old instance that retries a
+         -- document therefore fails loudly instead of duplicating it, and its
+         -- Apps Script does not archive the file.
+         --
+         -- set_config(..., true) is transaction-local, so the counter cannot
+         -- survive a COMMIT or leak into another session. The key is hashed
+         -- because a Drive file id is not a legal GUC name.
+         IF NEW."sourceGroupIndex" IS NULL THEN
+             counter_key := 'probuild.bridge_' || md5(NEW."sourceFileId");
+             next_index := COALESCE(NULLIF(current_setting(counter_key, true), '')::int, -1) + 1;
+             PERFORM set_config(counter_key, next_index::text, true);
+             NEW."sourceGroupIndex" := next_index;
+         END IF;
+
+         RETURN NEW;
+     END;
+     $bridge$`,
+    `DROP TRIGGER IF EXISTS probuild_expense_source_file_bridge ON "Expense"`,
+    `CREATE TRIGGER probuild_expense_source_file_bridge
+     BEFORE INSERT ON "Expense"
+     FOR EACH ROW
+     EXECUTE FUNCTION probuild_expense_source_file_bridge()`,
+];
+
+export const SOURCE_FILE_BRIDGE_DROP_SQL = [
+    // Dropped by --post-deploy with the other compatibility scaffolding: once
+    // every instance names its own file id, this only costs an advisory lock
+    // and a MAX() on every expense insert in the system.
+    `DROP TRIGGER IF EXISTS probuild_expense_source_file_bridge ON "Expense"`,
+    `DROP FUNCTION IF EXISTS probuild_expense_source_file_bridge()`,
+];
+
+export const TRIGGER_STATEMENTS = [...SPLIT_JOB_GUARD_SQL, ...AMOUNT_TAX_GUARD_SQL, ...SOURCE_FILE_BRIDGE_SQL];
 
 /**
  * ReceiptIntake is Phase 1's table, not Project, Estimate, or even Expense —
@@ -1491,6 +1450,13 @@ export function postDeployTeardownStatements({ repairSplitJobs = false } = {}) {
         // rewrites `projectId` and `attributionAnchoredAt` and never touches
         // `amount`, so this trigger never sees it either way.
         ...AMOUNT_TAX_GUARD_DROP_SQL,
+        // ...and the Drive-receipt bridge (round 48, item 1). It comes out
+        // LAST, after SOURCE_FILE_ID_BACKFILL has run in this same
+        // --post-deploy pass: while it stands, an old instance's insert is
+        // still stamped and still serialized, so the backfill cannot race a
+        // straggler and leave the very duplicate this bridge exists to
+        // prevent.
+        ...SOURCE_FILE_BRIDGE_DROP_SQL,
     ];
 }
 
@@ -1735,62 +1701,33 @@ async function main() {
         process.exit(1);
     }
 
-    // The TARGET decides where the URL comes from — for `prod` that is
-    // `.env.production.local` and the ambient `DATABASE_URL` is ignored, which
-    // is the whole point: a local server in the shell must not be able to
-    // impersonate production.
-    const resolved = resolveTargetDatabaseUrl(chosen.name);
-    if (resolved.error) {
-        console.error(`REFUSING: ${resolved.error}`);
+    // WHICH DATABASE, decided before a client exists (round 48, item 5). The
+    // target picks where the URL may come from — for `prod` that is
+    // `.env.production.local` and the ambient `DATABASE_URL` is ignored — and
+    // the host and project ref readable from that URL are checked here, so a
+    // wrong answer never opens a connection. Shared with the money backfill.
+    const targeted = resolveTargetOrRefuse(process.argv);
+    if (targeted.error) {
+        console.error(`REFUSING: ${targeted.error}`);
         process.exit(1);
     }
-    const { url, from } = resolved;
-    const hostProblem = targetHostVerdict(chosen.name, url);
-    if (hostProblem) {
-        console.error(`REFUSING: ${hostProblem}`);
-        process.exit(1);
-    }
-    // ...and WHICH project, not just which kind of host. Checked before the
-    // client is even constructed, so a wrong ref never opens a connection.
-    const refProblem = projectRefVerdict(chosen.name, url);
-    if (refProblem) {
-        console.error(refProblem.startsWith("REFUSING") ? refProblem : `REFUSING: ${refProblem}`);
-        process.exit(1);
-    }
+    const { url, from } = targeted;
     const prisma = new PrismaClient({ datasources: { db: { url } } });
 
     try {
-        const [actual] = await prisma.$queryRawUnsafe(
-            `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
-        );
-        // The REDACTED target line, before a single statement of phase A —
-        // so what the operator sees first is which database is about to be
-        // changed, with the credentials removed.
-        console.log(targetBanner(chosen.name, { url, from, db: actual.db, host: actual.host }));
-        if (!targetMatches(actual, expectDb, expectHost)) {
-            console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}".`);
+        // The server's OWN answer about what it is, plus the baseline-row
+        // proof for a target that demands one, plus the REDACTED identity
+        // line — one shared call, so this script and the money backfill can
+        // never check different things (round 48, item 5).
+        const identity = await verifyTargetIdentity(prisma, {
+            target: chosen.name, url, from, expectDb, expectHost,
+        });
+        console.log(identity.banner);
+        if (!identity.ok) {
+            console.error(identity.error);
             process.exit(1);
         }
-        // AND THE DATABASE'S OWN IDENTITY, not just the one we dialled. The
-        // production baseline row is written once, by the deliberate
-        // `migrate resolve --applied` step documented in CLAUDE.md; a local
-        // database somebody built with `db push` does not have it, and neither
-        // does a fresh container built from a subset of the migrations.
-        if (APPLY_TARGETS[chosen.name].requireBaseline) {
-            const baseline = await prisma.$queryRawUnsafe(
-                `SELECT 1 AS present FROM "_prisma_migrations"
-                  WHERE migration_name = $1 AND finished_at IS NOT NULL`,
-                PRODUCTION_BASELINE_MIGRATION,
-            );
-            if (!baseline?.length) {
-                console.error(
-                    `REFUSING: this database has no applied ${PRODUCTION_BASELINE_MIGRATION} row, ` +
-                    `so it is not the baselined production database.`,
-                );
-                process.exit(1);
-            }
-            console.log(`verified baseline ${PRODUCTION_BASELINE_MIGRATION} is applied here`);
-        }
+        for (const note of identity.notes ?? []) console.log(note);
 
         // The company zone, for the legacy re-anchor below. Read before the DDL
         // so a bad answer fails before anything is written.

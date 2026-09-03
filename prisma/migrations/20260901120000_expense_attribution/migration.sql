@@ -430,6 +430,84 @@ BEFORE UPDATE OF "amount" ON "Expense"
 FOR EACH ROW
 EXECUTE FUNCTION probuild_expense_amount_tax_guard();
 
+-- THE DRAIN-WINDOW BRIDGE FOR DRIVE RECEIPTS (Codex round 48, item 1).
+--
+-- Old instances insert receipt rows with NULL sourceFileId/sourceGroupIndex,
+-- because their Prisma client predates both columns. The new route dedupes on
+-- sourceFileId, so it cannot see those rows and a retried delivery inserts the
+-- whole receipt twice. This trigger stamps the id from receiptUrl on INSERT and
+-- takes the SAME per-file advisory lock the route takes, so the two versions
+-- serialize; the ordinal counts within the transaction, so a re-delivery lands
+-- on the ordinals already there and the partial unique index refuses it.
+--
+-- Like the two guards above it is drain-window scaffolding: created here and
+-- dropped at the end of this file, so a fresh database finishes in the shape
+-- production finishes in.
+CREATE OR REPLACE FUNCTION probuild_expense_source_file_bridge()
+     RETURNS trigger
+     LANGUAGE plpgsql
+     AS $bridge$
+     DECLARE
+         derived TEXT;
+         next_index INT;
+         counter_key TEXT;
+     BEGIN
+         -- A row that already names its file speaks for itself: the new build
+         -- inserted it, and it has chosen its own group ordinal.
+         IF NEW."sourceFileId" IS NULL AND NEW."receiptUrl" IS NOT NULL THEN
+             derived := COALESCE(
+                 substring(NEW."receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
+                 substring(NEW."receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
+             );
+             NEW."sourceFileId" := derived;
+         END IF;
+
+         IF NEW."sourceFileId" IS NULL THEN
+             RETURN NEW;
+         END IF;
+
+         -- THE SAME LOCK THE ROUTE TAKES, so an old-version insert and a
+         -- new-version request for one file cannot both believe they are first.
+         -- Transaction-scoped: released at COMMIT or ROLLBACK, nothing to leak.
+         PERFORM pg_advisory_xact_lock(
+             hashtextextended('receipt-ingest:' || NEW."sourceFileId", 0)
+         );
+
+         -- THE ORDINAL COUNTS WITHIN THIS TRANSACTION, NOT WITHIN THE TABLE.
+         --
+         -- MAX(existing) + 1 was the obvious rule and it is the wrong one: it
+         -- makes a RE-DELIVERY of a document the table already holds land on
+         -- fresh ordinals and insert cleanly, which is the duplicate this whole
+         -- bridge exists to stop. Counting per transaction instead means the N
+         -- groups of one delivery get 0,1,2..., and a SECOND delivery of the
+         -- same file starts at 0 again -- colliding with the row already there
+         -- and aborting on the partial unique index
+         -- ("sourceFileId", "sourceGroupIndex"). An old instance that retries a
+         -- document therefore fails loudly instead of duplicating it, and its
+         -- Apps Script does not archive the file.
+         --
+         -- set_config(..., true) is transaction-local, so the counter cannot
+         -- survive a COMMIT or leak into another session. The key is hashed
+         -- because a Drive file id is not a legal GUC name.
+         IF NEW."sourceGroupIndex" IS NULL THEN
+             counter_key := 'probuild.bridge_' || md5(NEW."sourceFileId");
+             next_index := COALESCE(NULLIF(current_setting(counter_key, true), '')::int, -1) + 1;
+             PERFORM set_config(counter_key, next_index::text, true);
+             NEW."sourceGroupIndex" := next_index;
+         END IF;
+
+         RETURN NEW;
+     END;
+     $bridge$;
+
+DROP TRIGGER IF EXISTS probuild_expense_source_file_bridge ON "Expense";
+
+CREATE TRIGGER probuild_expense_source_file_bridge
+     BEFORE INSERT ON "Expense"
+     FOR EACH ROW
+     EXECUTE FUNCTION probuild_expense_source_file_bridge();
+
+
 
 -- THE BACKFILL READS THE ESTIMATE UNDER A LOCK (Codex round 32). A plain
 -- `UPDATE ... FROM "Estimate"` join takes no row lock, so under READ COMMITTED
@@ -585,3 +663,9 @@ DROP TRIGGER IF EXISTS probuild_expense_amount_tax_guard ON "Expense";
 DROP FUNCTION IF EXISTS probuild_expense_amount_tax_guard();
 DROP TRIGGER IF EXISTS probuild_expense_amount_tax_ack ON "Expense";
 DROP FUNCTION IF EXISTS probuild_expense_amount_tax_ack();
+
+-- ...and the bridge comes out with them. It is the most expensive of the
+-- three to leave standing: an advisory lock on every expense insert that
+-- carries a Drive url, forever.
+DROP TRIGGER IF EXISTS probuild_expense_source_file_bridge ON "Expense";
+DROP FUNCTION IF EXISTS probuild_expense_source_file_bridge();

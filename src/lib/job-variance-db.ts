@@ -214,6 +214,16 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
                 })),
                 expenses: expenseRows.map((e) => ({
                     costCodeId: e.costCodeId,
+                    // ...AND IT IS PASSED THROUGH (round 48, item 2). The
+                    // select above has carried this column since round 42 and
+                    // this mapper dropped it, so every row reached
+                    // `computeProjectVariance` with `costCodeSource:
+                    // undefined` — which reads as "nobody has spoken" and runs
+                    // the item fallback. A bookkeeper's explicit "no phase"
+                    // (`manual-none`) therefore kept charging the phase its
+                    // line item names, on the one report that decision exists
+                    // to correct. Selecting a column is not using it.
+                    costCodeSource: e.costCodeSource,
                     itemId: e.itemId,
                     amount: Number(e.amount ?? 0),
                 })),

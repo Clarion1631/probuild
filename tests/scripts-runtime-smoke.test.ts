@@ -84,3 +84,50 @@ test("the report scopes by the canonical overhead id, not the name \"Shop\"", ()
     assert.ok(source.includes("resolveExpenseProjectId"));
     assert.ok(source.includes("csvCell"), "OCR'd vendor text is formula-neutralized");
 });
+
+// ── the money backfill names its target (Codex round 48, item 5) ──────────
+
+test("--apply refuses an ambient DATABASE_URL with no --target, before any write", () => {
+    // This script writes `projectId`, `costCodeId` and `costCodeSource`. It
+    // used to load .env.local/.env and take whatever DATABASE_URL was in the
+    // shell — so the more dangerous of the two Phase 3 scripts was the less
+    // guarded one, while the DDL script already had a target guard, a
+    // project-ref check and a redacted identity line.
+    //
+    // The refusal happens before a PrismaClient is constructed, which is why
+    // this needs no database: a local URL is supplied and never dialled.
+    const ambient = {
+        ...process.env,
+        DATABASE_URL: "postgresql://probuild:probuild@localhost:5432/probuild",
+    };
+    const attempt = (args: string[]) => {
+        try {
+            const stdout = execFileSync(
+                process.execPath,
+                ["--import=tsx", "scripts/backfill-expense-attribution.ts", ...args],
+                { cwd: ROOT, env: ambient, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+            );
+            return { code: 0, output: stdout };
+        } catch (error) {
+            const failure = error as { status?: number; stdout?: string; stderr?: string };
+            return { code: failure.status ?? -1, output: `${failure.stdout ?? ""}${failure.stderr ?? ""}` };
+        }
+    };
+
+    const noTarget = attempt(["--apply"]);
+    assert.notEqual(noTarget.code, 0, "it must not run");
+    assert.match(noTarget.output, /REFUSING: --target is required/);
+    assert.doesNotMatch(noTarget.output, /planned writes|applied \d/, "nothing was planned or written");
+
+    // ...and naming prod does not rescue it: that target reads
+    // .env.production.local, which is not checked in and is not on CI.
+    const asProd = attempt(["--target", "prod", "--apply"]);
+    assert.notEqual(asProd.code, 0);
+    assert.match(asProd.output, /REFUSING/);
+    assert.doesNotMatch(asProd.output, /planned writes|applied \d/);
+
+    // ...and a target WITHOUT the database/host assertions is refused too.
+    const noExpect = attempt(["--target", "ci", "--apply"]);
+    assert.notEqual(noExpect.code, 0);
+    assert.match(noExpect.output, /--expect-db and --expect-host/);
+});

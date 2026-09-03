@@ -101,6 +101,23 @@ jobs:
         env:
           PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # THE MIXED-VERSION DRAIN WINDOW. An old instance's INSERT is raw SQL that
+      # names neither new column -- a shape today's Prisma client cannot express --
+      # and the fix is a trigger that stamps it and takes the route's advisory lock.
+      # Neither half exists outside a real server.
+      - name: Receipt-ingest drain-window bridge against real Postgres
+        run: npx tsx --test tests/receipt-ingest-drain-window-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # The backfill's coverage headline against the report it claims to describe,
+      # on one seeded database. A hand-built fixture cannot catch the two readers
+      # drifting apart, because the fixture is written by whoever wrote the code.
+      - name: Backfill coverage parity with the variance report
+        run: npx tsx --test tests/backfill-coverage-parity-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # An index can EXIST and enforce nothing. A failed CREATE INDEX
       # CONCURRENTLY leaves the index behind with the right name and
       # `indisvalid = false`; the planner ignores it, a UNIQUE one guards

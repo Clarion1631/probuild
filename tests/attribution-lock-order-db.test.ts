@@ -46,7 +46,7 @@ import {
     type QboExpensePersistenceClient,
 } from "../src/lib/qbo-expense-sync";
 import { createParsedReceiptExpense } from "../src/lib/receipt-parse-expense";
-import { runBackfill, writeUnderAttributionLocks } from "../scripts/backfill-expense-attribution";
+import { planBackfill, runBackfill, writeUnderAttributionLocks } from "../scripts/backfill-expense-attribution";
 import {
     backfillStatements,
     DDL_STATEMENTS,
@@ -1993,5 +1993,149 @@ test("CONTROL: two batches taking the same rows in opposite orders deadlock", { 
         );
     } finally {
         await cleanupBatch();
+    }
+});
+
+/**
+ * THE LOCKED RE-READ MUST NOT FORGET WHO OWNS THE ITEM (round 48, item 4).
+ *
+ * `readItem` used to return an EMPTY map when the linked item had no cost
+ * code, or a retired one. `planBackfill` cannot tell that apart from "there is
+ * no such item", so the cross-job check it does FIRST never ran, and the row
+ * fell through to vendor-regex inference — the locked re-plan reintroducing,
+ * one transaction later, exactly the bug round 44 fixed in the snapshot.
+ *
+ * The interleaving that makes it bite: the item is on this job when the plan
+ * is made, and its estimate moves to another job before the write.
+ */
+const CODELESS_ITEM = `${PFX}-item-codeless`;
+/** A SECOND estimate of job A carrying the same code, so the phase survives the move. */
+const KEEPER_ESTIMATE = `${PFX}-estimate-keeper`;
+const KEEPER_ITEM = `${PFX}-item-keeper`;
+const REGEX_EXPENSE = `${PFX}-expense-regex`;
+
+async function seedCodelessCrossJob() {
+    await seedTwoJobs();
+    // The phase has to OUTLIVE the estimate move, or a later guard
+    // (provePhaseMembershipTx) refuses the write for its own good reason and
+    // this test proves nothing about the item read. A second committed
+    // estimate of job A carries the same code.
+    await writerDb!.estimate.create({
+        data: {
+            id: KEEPER_ESTIMATE, title: "Keeper", code: `EST-${PFX}-keeper`, projectId: PROJECT,
+            status: "Approved", totalAmount: 100, balanceDue: 100,
+        },
+    });
+    await writerDb!.estimateItem.create({
+        data: { id: KEEPER_ITEM, estimateId: KEEPER_ESTIMATE, name: "keeps the phase", costCodeId: CODE },
+    });
+    // A line item with NO cost code, on job A's estimate.
+    await writerDb!.estimateItem.create({
+        data: { id: CODELESS_ITEM, estimateId: ESTIMATE, name: "uncoded line", costCodeId: null },
+    });
+    // An expense the VENDOR RULE can code on its own ("Summit Plumbing" ->
+    // 03-PLUMB, the seeded cost code), linked to that uncoded item. This is
+    // the row the pre-fix read would machine-code.
+    await writerDb!.expense.create({
+        data: {
+            id: REGEX_EXPENSE, projectId: PROJECT, estimateId: ESTIMATE, itemId: CODELESS_ITEM,
+            costCodeId: null, amount: 250, vendor: "Summit Plumbing", status: "Pending",
+        },
+    });
+}
+
+async function cleanupCodelessCrossJob() {
+    await writerDb!.expense.deleteMany({ where: { id: REGEX_EXPENSE } });
+    await writerDb!.estimateItem.deleteMany({ where: { id: { in: [CODELESS_ITEM, KEEPER_ITEM] } } });
+    await writerDb!.estimate.deleteMany({ where: { id: KEEPER_ESTIMATE } });
+    await cleanupTwoJobs();
+}
+
+test("CONTROL: a codeless item read as MISSING gets machine-coded across jobs", { skip }, async () => {
+    // The pre-fix read, verbatim: an empty map. `planBackfill` is the single
+    // copy of the rules, so driving it with each map is the honest way to show
+    // what the two reads make it decide about the SAME row.
+    await seedCodelessCrossJob();
+    try {
+        const expense = {
+            id: REGEX_EXPENSE, projectId: PROJECT, estimateId: ESTIMATE, itemId: CODELESS_ITEM,
+            costCodeId: null, costCodeSource: null, vendor: "Summit Plumbing",
+            description: null, amount: 250, estimate: { projectId: TARGET_PROJECT },
+        };
+        const args = {
+            costCodeIdByCode: new Map([["03-PLUMB", CODE]]),
+            scopedProjectIds: [PROJECT],
+            allowedCodesByProject: new Map([[PROJECT, new Set([CODE])]]),
+        };
+
+        const preFix = planBackfill({ expenses: [expense], items: new Map(), ...args });
+        assert.equal(preFix.codeFills.length, 1, "the pre-fix read machine-codes it");
+        assert.equal(preFix.codeFills[0].costCodeId, CODE);
+        assert.equal(preFix.remainder.length, 0, "...and never reports the corrupt link");
+
+        // The SHIPPED read: ownership survives the missing code, so the
+        // cross-job check runs and the row is reported instead of guessed at.
+        const postFix = planBackfill({
+            expenses: [expense],
+            items: new Map([[CODELESS_ITEM, {
+                costCodeId: null, estimateId: ESTIMATE, projectId: TARGET_PROJECT,
+            }]]),
+            ...args,
+        });
+        assert.equal(postFix.codeFills.length, 0, "nothing is written");
+        assert.equal(postFix.remainder[0]?.reason, "item-outside-estimate");
+    } finally {
+        await cleanupCodelessCrossJob();
+    }
+});
+
+test("an estimate that moves between the plan and the write is REFUSED, not guessed", { skip }, async () => {
+    // End to end, through the real script. The move lands between the snapshot
+    // and the write transaction — the exact window the locked re-plan exists
+    // for — by intercepting the FIRST `$transaction` the write loop opens.
+    await seedCodelessCrossJob();
+    try {
+        let moved = false;
+        const client = writerDb as unknown as Record<string, unknown>;
+        const proxy = new Proxy(client, {
+            get(target, prop, receiver) {
+                if (prop === "$transaction") {
+                    return async (...args: unknown[]) => {
+                        if (!moved) {
+                            moved = true;
+                            await editorDb!.estimate.update({
+                                where: { id: ESTIMATE },
+                                data: { projectId: TARGET_PROJECT },
+                            });
+                        }
+                        return (target as { $transaction: (...a: unknown[]) => Promise<unknown> })
+                            .$transaction(...args);
+                    };
+                }
+                const value = Reflect.get(target, prop, receiver);
+                return typeof value === "function" ? value.bind(target) : value;
+            },
+        });
+
+        const outcome = await runBackfill({
+            db: proxy, apply: true, log: () => {}, overheadProjectId: "no-such-project",
+        });
+
+        assert.ok(moved, "the estimate really did move between the plan and the write");
+        // THIS row, not the run: the seed also holds an ordinary expense the
+        // vendor rule may legitimately code, and counting the whole run would
+        // make this test pass or fail for reasons that have nothing to do with
+        // the cross-job link.
+        assert.ok((outcome.skipped?.costCodes ?? 0) >= 1, "the planned write was skipped, not silently dropped");
+        const row = await editorDb!.expense.findUnique({
+            where: { id: REGEX_EXPENSE },
+            select: { costCodeId: true, costCodeSource: true },
+        });
+        assert.deepEqual(row, { costCodeId: null, costCodeSource: null },
+            "the row is left for a human, which is what item-outside-estimate means");
+    } finally {
+        await editorDb!.estimate.update({ where: { id: ESTIMATE }, data: { projectId: PROJECT } })
+            .catch(() => {});
+        await cleanupCodelessCrossJob();
     }
 });

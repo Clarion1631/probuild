@@ -82,7 +82,16 @@ const ALLOWED_CALLEES: Record<string, string[]> = {
 };
 const ALLOWED_GLOBAL_CALLEES = new Set(["process.argv.includes", "process.argv.indexOf"]);
 /** The only modules an apply script may import. Anything else (a `data:` URL, `dotenv/config`, a driver) runs code on import. */
-const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto"]);
+/**
+ * ...plus the repo's OWN shared guard helper, which is on this list only
+ * because it is held to a STRICTER rule than the scripts that import it: it
+ * has no entrypoint at all, and the test at the bottom of this file runs the
+ * same AST scan over it and imports it in a child process to prove it opens no
+ * connection (round 48, item 5). Adding a local module here without that proof
+ * would reopen exactly the hole this allowlist exists to close.
+ */
+const SHARED_GUARD_MODULE = "./lib/apply-target.mjs";
+const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto", SHARED_GUARD_MODULE]);
 /** Names a script may never declare itself (they would let a guard or helper be spoofed). */
 const RESERVED_NAMES = new Set(["process", "import", "pathToFileURL", "fileURLToPath", "dirname", "join", "resolve", "isMainModule"]);
 
@@ -619,3 +628,34 @@ for (const name of scripts) {
         );
     });
 }
+
+// ── the shared guard helper (round 48, item 5) ─────────────────────────────
+
+/**
+ * `scripts/lib/apply-target.mjs` is imported BY apply scripts, so it is inside
+ * the blast radius of every rule above. It is held to a stricter version of
+ * them: an apply script may have a `main()` behind a guard, this may not have
+ * an entrypoint at all.
+ */
+const SHARED_HELPER = path.join(scriptsDir, "lib", "apply-target.mjs");
+
+test("the shared target helper has no side effects and no entrypoint", () => {
+    const text = readFileSync(SHARED_HELPER, "utf8");
+    const report = analyse("lib/apply-target.mjs", text);
+    assert.deepEqual(report.violations, [], report.violations.join("; "));
+    assert.equal(report.hasMain, false, "a shared helper must not declare main()");
+    assert.equal(report.guardIfs, 0, "...and must not carry an entrypoint guard");
+    // The one import it is allowed is node:fs, for reading .env.production.local
+    // when a caller asks it to. Nothing that runs code on import.
+    assert.match(text, /^import fs from "node:fs";$/m);
+    assert.doesNotMatch(text, /^import .*@prisma\/client/m, "it must not construct a client");
+});
+
+test("runtime: importing the shared target helper opens no DB connection and exits 0", async () => {
+    const before = connections;
+    const result = await importInChild(pathToFileURL(SHARED_HELPER).href);
+    const seen = connections - before;
+    assert.equal(seen, 0, `import attempted ${seen} DB connection(s)`);
+    assert.equal(result.code, 0, `import did not exit cleanly: ${result.stderr}`);
+    assert.doesNotMatch(result.stdout + result.stderr, /applied|verified|Refusing|DATABASE_URL/i);
+});
