@@ -28,6 +28,7 @@
 //   node scripts/apply-review-evidence-columns.mjs [--with-indexes]
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 function resolveUrl(varName) {
   if (process.env[varName]) return process.env[varName];
@@ -51,6 +52,17 @@ const indexStatements = [
   `CREATE INDEX CONCURRENTLY IF NOT EXISTS "AutomationEvent_qbPurchaseId_idx" ON "AutomationEvent"("qbPurchaseId")`,
   `CREATE INDEX CONCURRENTLY IF NOT EXISTS "AutomationEvent_driveFileId_idx" ON "AutomationEvent"("driveFileId")`,
 ];
+
+async function main() {
+  await applyColumns();
+  if (withIndexes) {
+    await applyIndexes();
+  } else {
+    console.log(
+      "Indexes skipped — re-run with --with-indexes after the backfill catch-up pass completes (rollout step 5).",
+    );
+  }
+}
 
 async function applyColumns() {
   const url = resolveUrl("DATABASE_URL");
@@ -90,11 +102,7 @@ async function applyIndexes() {
   console.log("AutomationEvent qbPurchaseId / driveFileId indexes applied.");
 }
 
-await applyColumns();
-if (withIndexes) {
-  await applyIndexes();
-} else {
-  console.log(
-    "Indexes skipped — re-run with --with-indexes after the backfill catch-up pass completes (rollout step 5).",
-  );
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  await main();
 }

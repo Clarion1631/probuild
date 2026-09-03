@@ -120,6 +120,33 @@ export const statements = [
      END $$`,
 ];
 
+async function main() {
+    if (process.argv.includes("--dry-run")) {
+        console.log("DRY RUN — the following SQL would be applied (nothing executed):\n");
+        for (const sql of statements) console.log(sql.replace(/\n\s+/g, "\n  ") + ";\n");
+        console.log("Re-run with --yes --expect-db <name> --expect-host <host> to apply.");
+        return;
+    }
+
+    if (!process.argv.includes("--yes")) {
+        throw new Error("Refusing to run without --yes (and --expect-db / --expect-host). Use --dry-run to preview.");
+    }
+    const expectDb = readFlagValue("--expect-db") ?? process.env.BANK_LEDGER_EXPECT_DB;
+    const expectHost = readFlagValue("--expect-host") ?? process.env.BANK_LEDGER_EXPECT_HOST;
+    if (!expectDb || !expectHost) {
+        throw new Error("Both --expect-db and --expect-host are required (or BANK_LEDGER_EXPECT_DB / BANK_LEDGER_EXPECT_HOST).");
+    }
+
+    const { url, from } = resolveDatabaseUrl();
+    console.log(`DATABASE_URL from ${from}: ${maskUrl(url)}`);
+    const prisma = new PrismaClient({ datasources: { db: { url } } });
+    try {
+        await runPayerExtractionMigration({ prisma, expectDb, expectHost });
+    } finally {
+        await prisma.$disconnect();
+    }
+}
+
 export async function runPayerExtractionMigration({ prisma, expectDb, expectHost, write = console.log }) {
     const [actual] = await prisma.$queryRawUnsafe(
         `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
@@ -166,33 +193,6 @@ export async function runPayerExtractionMigration({ prisma, expectDb, expectHost
     }
     write(`verified ${NEW_COLUMNS.length} columns + 1 constraint`);
     write("\nCheck-payer extraction migration applied and verified.");
-}
-
-async function main() {
-    if (process.argv.includes("--dry-run")) {
-        console.log("DRY RUN — the following SQL would be applied (nothing executed):\n");
-        for (const sql of statements) console.log(sql.replace(/\n\s+/g, "\n  ") + ";\n");
-        console.log("Re-run with --yes --expect-db <name> --expect-host <host> to apply.");
-        return;
-    }
-
-    if (!process.argv.includes("--yes")) {
-        throw new Error("Refusing to run without --yes (and --expect-db / --expect-host). Use --dry-run to preview.");
-    }
-    const expectDb = readFlagValue("--expect-db") ?? process.env.BANK_LEDGER_EXPECT_DB;
-    const expectHost = readFlagValue("--expect-host") ?? process.env.BANK_LEDGER_EXPECT_HOST;
-    if (!expectDb || !expectHost) {
-        throw new Error("Both --expect-db and --expect-host are required (or BANK_LEDGER_EXPECT_DB / BANK_LEDGER_EXPECT_HOST).");
-    }
-
-    const { url, from } = resolveDatabaseUrl();
-    console.log(`DATABASE_URL from ${from}: ${maskUrl(url)}`);
-    const prisma = new PrismaClient({ datasources: { db: { url } } });
-    try {
-        await runPayerExtractionMigration({ prisma, expectDb, expectHost });
-    } finally {
-        await prisma.$disconnect();
-    }
 }
 
 const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
