@@ -241,6 +241,21 @@ jobs:
           PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # PUT/PATCH /api/users/[id], PATCH /api/users and PATCH
+      # /api/manager/employees/[id] all authorized against a User.role read
+      # taken BEFORE the write transaction opened, then wrote without checking
+      # again — an admin promotion committing in that gap let a manager's
+      # already-in-flight request act on the now-admin account. Two real
+      # connections: a promotion staged mid-transaction genuinely blocks the
+      # guarded write on the row lock, and once it commits the write is
+      # refused against the row it actually holds — for a status change, a
+      # delete and a permission grant, each with an ADMIN control and a
+      # pre-fix control reproducing the old vulnerable ordering verbatim.
+      - name: Prove an admin promotion cannot land mid-flight under a manager's user write
+        run: npx tsx --test tests/user-mutation-target-race-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

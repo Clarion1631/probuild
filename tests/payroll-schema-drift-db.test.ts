@@ -45,6 +45,52 @@ async function hasLockedSnapshotCheck(db: PrismaClient): Promise<boolean> {
     return rows.length > 0;
 }
 
+// ── normalizeCheckDef, as a pure function (round 12, finding 3) ────────────
+// No database needed — these run in every `npm run test:unit` / `test:payroll`
+// pass, not just the migrations job. The three below are the EXACT mutation
+// classes a substring check ("is every expected fragment somewhere in the
+// actual text") let through: A AND B AND C contains the words "A", "B" and
+// "C" just as much as A OR B OR C does, so a fragment check cannot tell them
+// apart. Values here are lifted verbatim from a real PostgreSQL 16
+// `pg_get_constraintdef()`, not guessed — see the function's own header.
+
+test("normalizeCheckDef treats Postgres's printed form and the hand-written migration SQL as equal", async () => {
+    const { normalizeCheckDef } = await import("../scripts/apply-payroll-phase5.mjs");
+    // A real pg_get_constraintdef() result for `"payType" IS NULL OR "payType" IN ('HOURLY', 'SALARY')`.
+    const actual = `CHECK ((("payType" IS NULL) OR ("payType" = ANY (ARRAY['HOURLY'::text, 'SALARY'::text]))))`;
+    const expected = `"payType" IS NULL OR "payType" IN ('HOURLY', 'SALARY')`;
+    assert.equal(normalizeCheckDef(actual), normalizeCheckDef(expected));
+});
+
+test("normalizeCheckDef distinguishes an AND->OR flip", async () => {
+    const { normalizeCheckDef } = await import("../scripts/apply-payroll-phase5.mjs");
+    const original = `"lockedAt" IS NULL OR ("summaryCsvSnapshot" IS NOT NULL AND "detailCsvSnapshot" IS NOT NULL AND "exportHash" IS NOT NULL)`;
+    // A real pg_get_constraintdef() result for the same expression with the
+    // trailing ANDs flipped to ORs.
+    const flipped = `CHECK ((("lockedAt" IS NULL) OR (("summaryCsvSnapshot" IS NOT NULL) OR ("detailCsvSnapshot" IS NOT NULL) OR ("exportHash" IS NOT NULL))))`;
+    assert.notEqual(
+        normalizeCheckDef(original),
+        normalizeCheckDef(flipped),
+        "AND->OR must change the normalized comparison — a substring check would have missed this"
+    );
+});
+
+test("normalizeCheckDef distinguishes IN from NOT IN", async () => {
+    const { normalizeCheckDef } = await import("../scripts/apply-payroll-phase5.mjs");
+    const original = `"payType" IS NULL OR "payType" IN ('HOURLY', 'SALARY')`;
+    // A real pg_get_constraintdef() result for the NOT IN form.
+    const negated = `CHECK ((("payType" IS NULL) OR ("payType" <> ALL (ARRAY['HOURLY'::text, 'SALARY'::text]))))`;
+    assert.notEqual(normalizeCheckDef(original), normalizeCheckDef(negated));
+});
+
+test("normalizeCheckDef distinguishes a dropped clause", async () => {
+    const { normalizeCheckDef } = await import("../scripts/apply-payroll-phase5.mjs");
+    const original = `"periodStartKey" IS NOT NULL AND "periodEndKey" IS NOT NULL`;
+    // A real pg_get_constraintdef() result with the second clause missing.
+    const dropped = `CHECK (("periodStartKey" IS NOT NULL))`;
+    assert.notEqual(normalizeCheckDef(original), normalizeCheckDef(dropped));
+});
+
 test("a clean database reports NO drift — the control", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     try {
@@ -137,7 +183,7 @@ test("a CHECK rewritten to something weaker is reported", { skip }, async () => 
         );
         const row = reported(await drift(db), "PayrollPeriod_discard_unlocked");
         assert.ok(row, "a weakened CHECK must be reported");
-        assert.match(row!.reason, /definition lost/);
+        assert.match(row!.reason, /definition drifted/);
     } finally {
         await db
             .$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_discard_unlocked"`)
@@ -427,8 +473,10 @@ test("the same CHECK WEAKENED to cover only one column is reported", { skip }, a
         );
         const row = reported(await drift(db), "PayrollPeriod_locked_snapshot_complete");
         assert.ok(row, "a weakened CHECK must be reported");
-        assert.match(row!.reason, /definition lost/);
-        assert.match(row!.reason, /detailCsvSnapshot|exportHash/, "and it names what went missing");
+        assert.match(row!.reason, /definition drifted/);
+        // normalizeCheckDef lowercases, so the reported expected/actual text
+        // does too — the reason names what went missing either way.
+        assert.match(row!.reason, /detailcsvsnapshot|exporthash/i, "and it names what went missing");
     } finally {
         await db
             .$executeRawUnsafe(
@@ -440,6 +488,135 @@ test("the same CHECK WEAKENED to cover only one column is reported", { skip }, a
                 `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_locked_snapshot_complete" ${LOCKED_SNAPSHOT_CHECK}`
             )
             .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+// ── the substring-check hole itself (round 12, finding 3) ──────────────────
+// findMissingObjects/findSchemaDrift used to ask only "does every expected
+// FRAGMENT appear somewhere in the actual definition" — so `A AND B AND C`
+// passed a check written for `A OR B OR C`, because every fragment is still
+// in there. These three recreate each constraint with exactly the mutation a
+// fragment check would have missed, against a REAL PostgreSQL 16 instance —
+// not the hand-derived strings in the pure normalizeCheckDef tests above.
+
+test("an AND->OR flip on the locked-snapshot CHECK is reported, and the dry run exits nonzero", { skip }, async () => {
+    const { driftVerdict } = await import("../scripts/apply-payroll-phase5.mjs");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        assert.equal(await hasLockedSnapshotCheck(db), true, "the constraint must exist before this test replaces it");
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" DROP CONSTRAINT "PayrollPeriod_locked_snapshot_complete"`
+        );
+        // Same name, still validated, still a CHECK, and it now accepts a
+        // locked period missing TWO of the three snapshot columns as long as
+        // ONE is present — a substring check ("summaryCsvSnapshot IS NOT
+        // NULL" still appears in the text) would have missed this entirely.
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_locked_snapshot_complete"
+             CHECK (
+                "lockedAt" IS NULL
+                OR ("summaryCsvSnapshot" IS NOT NULL OR "detailCsvSnapshot" IS NOT NULL OR "exportHash" IS NOT NULL)
+             )`
+        );
+        const rows = await drift(db);
+        const row = reported(rows, "PayrollPeriod_locked_snapshot_complete");
+        assert.ok(row, "AND->OR must be reported — a fragment check would have passed this");
+        assert.match(row!.reason, /definition drifted/);
+        assert.equal(driftVerdict(rows).exitCode, 1, "--dry-run must exit nonzero on this");
+    } finally {
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_locked_snapshot_complete"`
+            )
+            .catch(() => {});
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_locked_snapshot_complete" ${LOCKED_SNAPSHOT_CHECK}`
+            )
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+test("User_payType_check flipped IN->NOT IN is reported, and the dry run exits nonzero", { skip }, async () => {
+    const { driftVerdict } = await import("../scripts/apply-payroll-phase5.mjs");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(`ALTER TABLE "User" DROP CONSTRAINT "User_payType_check"`);
+        // Same name, still validated — and it now REJECTS exactly the two
+        // values the migration exists to allow, and accepts everything else.
+        // Both "HOURLY" and "SALARY" still appear in the definition text, so
+        // a fragment check would have passed this too.
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "User" ADD CONSTRAINT "User_payType_check"
+             CHECK ("payType" IS NULL OR "payType" NOT IN ('HOURLY', 'SALARY'))`
+        );
+        const rows = await drift(db);
+        const row = reported(rows, "User_payType_check");
+        assert.ok(row, "IN->NOT IN must be reported");
+        assert.match(row!.reason, /definition drifted/);
+        assert.equal(driftVerdict(rows).exitCode, 1, "--dry-run must exit nonzero on this");
+    } finally {
+        await db.$executeRawUnsafe(`ALTER TABLE "User" DROP CONSTRAINT IF EXISTS "User_payType_check"`).catch(() => {});
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "User" ADD CONSTRAINT "User_payType_check" CHECK ("payType" IS NULL OR "payType" IN ('HOURLY', 'SALARY'))`
+            )
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+test("PayrollPeriod_keys_present with a dropped clause is reported, and the dry run exits nonzero", { skip }, async () => {
+    const { driftVerdict } = await import("../scripts/apply-payroll-phase5.mjs");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" DROP CONSTRAINT "PayrollPeriod_keys_present"`);
+        // Same name, still validated — and it no longer requires periodEndKey
+        // at all. "periodStartKey" IS NOT NULL still appears in the text, so a
+        // fragment check would have reported this as healthy.
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_keys_present"
+             CHECK ("periodStartKey" IS NOT NULL)`
+        );
+        const rows = await drift(db);
+        const row = reported(rows, "PayrollPeriod_keys_present");
+        assert.ok(row, "a dropped clause must be reported");
+        assert.match(row!.reason, /definition drifted/);
+        assert.equal(driftVerdict(rows).exitCode, 1, "--dry-run must exit nonzero on this");
+    } finally {
+        await db
+            .$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_keys_present"`)
+            .catch(() => {});
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_keys_present"
+                 CHECK ("periodStartKey" IS NOT NULL AND "periodEndKey" IS NOT NULL) NOT VALID`
+            )
+            .catch(() => {});
+        await db
+            .$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_keys_present"`)
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+// ── the correct constraint, one more time — the control for the three above.
+// Without this, every assertion above could pass on a normalizer so eager it
+// reports drift on EVERYTHING, including the real thing.
+test("the correct locked-snapshot CHECK, keys-present CHECK and payType CHECK all report clean", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        const rows = await drift(db);
+        for (const name of [
+            "PayrollPeriod_locked_snapshot_complete",
+            "PayrollPeriod_keys_present",
+            "User_payType_check",
+        ]) {
+            assert.equal(reported(rows, name), undefined, `${name} must NOT be reported when it matches exactly`);
+        }
+    } finally {
         await db.$disconnect();
     }
 });

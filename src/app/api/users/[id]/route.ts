@@ -8,7 +8,12 @@ import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { deleteParentWithTimeEntries, isTimeEntriesExistError } from "@/lib/payroll-parent-delete";
 import { isPeriodLockedError, periodLockedResponse, withPayrollUserWrite } from "@/lib/payroll-period";
 import { toSafeUser } from "@/lib/user-serialization";
-import { ASSIGNABLE_PERMISSIONS, checkUserMutation } from "@/lib/user-mutation-guard";
+import {
+    ASSIGNABLE_PERMISSIONS,
+    isUserMutationRefusedError,
+    isUserMutationTargetNotFoundError,
+    withGuardedUserMutation,
+} from "@/lib/user-mutation-guard";
 
 // GET: get user details with permissions and project access
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -71,14 +76,12 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const body = await req.json();
         const { permissions, projectIds, userInfo, pinCode } = body;
 
-        // WHO MAY CHANGE WHAT. This route used to write `role`, `status` and an
-        // arbitrary permission set for any MANAGER, so a manager could promote
-        // themselves to ADMIN, grant themselves every permission, or disable the
-        // real admins - nullifying every boundary above it (round 9, finding 1).
-        // The target is RE-READ here: the rules are about the row as it stands,
-        // never about the values the request is asking for.
-        const target = await prisma.user.findUnique({ where: { id }, select: { id: true, role: true } });
-        if (!target) return NextResponse.json({ error: "User not found" }, { status: 404 });
+        // A cheap existence check, decoupled from authority: an unknown id is a
+        // 404 regardless of who is asking, so this is safe to answer before the
+        // guarded transaction below — it proves nothing about the ROLE the
+        // request is authorized against, only that the row is there at all.
+        const targetExists = await prisma.user.findUnique({ where: { id }, select: { id: true } });
+        if (!targetExists) return NextResponse.json({ error: "User not found" }, { status: 404 });
 
         // The permission patch is narrowed to its boolean entries BEFORE the
         // check, so an unknown key is a 400 from the guard rather than a silent
@@ -88,68 +91,107 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                   Object.entries(permissions).filter(([, value]) => typeof value === "boolean")
               )
             : null;
-
-        const verdict = checkUserMutation({
-            actor: { id: currentUser.id, role: currentUser.role },
-            target,
-            changes: {
-                role: userInfo?.role,
-                status: userInfo?.status,
-                permissions: requestedPermissions,
-            },
-        });
-        if (!verdict.ok) return NextResponse.json({ error: verdict.error }, { status: verdict.status });
-
-        // Profile fields and rates commit TOGETHER, in one transaction. They
-        // were two sequential writes: a rate refusal left the profile half
-        // already saved, so a manager without payroll access could rename
-        // somebody and get a 403 that made it look like nothing happened.
-        if (userInfo || pinCode !== undefined) {
-            const data: any = {};
-            if (userInfo) {
-                if (userInfo.name !== undefined) data.name = userInfo.name;
-                if (userInfo.role !== undefined) data.role = userInfo.role;
-                if (userInfo.status !== undefined) data.status = userInfo.status;
-                // Rates are NOT written here — applyRateChange below owns them
-                // (payroll permission, exact decimal, lastRateSyncAt stamp).
-                // FINANCE accounts must never be offered as dispatch-board crew —
-                // guard server-side even though the Team page hides the toggle.
-                if (userInfo.showOnDispatch !== undefined) {
-                    const targetRole = userInfo.role !== undefined ? userInfo.role : (await prisma.user.findUnique({ where: { id }, select: { role: true } }))?.role;
-                    data.showOnDispatch = targetRole === "FINANCE" ? false : Boolean(userInfo.showOnDispatch);
+        const sanitizedPermissions: Record<string, boolean> = {};
+        if (requestedPermissions) {
+            for (const key of ASSIGNABLE_PERMISSIONS) {
+                if (key in requestedPermissions && typeof requestedPermissions[key] === "boolean") {
+                    sanitizedPermissions[key] = requestedPermissions[key] as boolean;
                 }
             }
-            if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
+        }
 
+        // Profile fields, rates and permissions commit TOGETHER, in ONE
+        // guarded transaction. They used to be sequential writes authorized
+        // against a role read taken BEFORE any of them opened: an admin
+        // promotion committing in that gap let a manager's already-in-flight
+        // request act on the now-admin account, because the row it wrote was
+        // not the row it was authorized against (round 12, finding 2).
+        // withGuardedUserMutation re-reads the target under FOR UPDATE and
+        // re-runs the authority check against THAT row before any write below
+        // is allowed to run.
+        const data: any = {};
+        if (userInfo) {
+            if (userInfo.name !== undefined) data.name = userInfo.name;
+            if (userInfo.role !== undefined) data.role = userInfo.role;
+            if (userInfo.status !== undefined) data.status = userInfo.status;
+        }
+        if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
+
+        if (Object.keys(data).length > 0 || Object.keys(sanitizedPermissions).length > 0) {
             try {
                 await prisma.$transaction(async (tx) => {
-                    if (userInfo) {
-                        const rateResult = await applyRateChangeInTx(
-                            tx,
-                            currentUser,
-                            id,
-                            {
-                                hourlyRate: userInfo.hourlyRate,
-                                burdenRate: userInfo.burdenRate,
-                                payType: userInfo.payType,
+                    await withGuardedUserMutation(
+                        tx,
+                        {
+                            actor: { id: currentUser.id, role: currentUser.role },
+                            targetId: id,
+                            changes: {
+                                role: userInfo?.role,
+                                status: userInfo?.status,
+                                permissions: requestedPermissions,
+                            },
+                            data,
+                        },
+                        async (target) => {
+                            if (userInfo) {
+                                const rateResult = await applyRateChangeInTx(
+                                    tx,
+                                    currentUser,
+                                    id,
+                                    {
+                                        hourlyRate: userInfo.hourlyRate,
+                                        burdenRate: userInfo.burdenRate,
+                                        payType: userInfo.payType,
+                                    }
+                                );
+                                if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
+                                // Rates are NOT written here — applyRateChange
+                                // above owns them (payroll permission, exact
+                                // decimal, lastRateSyncAt stamp). FINANCE
+                                // accounts must never be offered as
+                                // dispatch-board crew — guard server-side even
+                                // though the Team page hides the toggle. `target`
+                                // is the row THIS transaction just locked, so
+                                // this no longer needs its own separate query.
+                                if (userInfo.showOnDispatch !== undefined) {
+                                    const targetRole = userInfo.role !== undefined ? userInfo.role : target.role;
+                                    data.showOnDispatch = targetRole === "FINANCE" ? false : Boolean(userInfo.showOnDispatch);
+                                }
                             }
-                        );
-                        if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
-                    }
-                    if (Object.keys(data).length > 0) {
-                        // `data` can carry status and name, both EXPORT INPUTS:
-                        // activating somebody ADDS a row to the Gusto roster,
-                        // and their name is printed in both CSVs. The payroll
-                        // advisory lock (tier 1, taken inside withPayrollUserWrite
-                        // before the row is touched) is what makes this write
-                        // wait for a period being locked instead of committing
-                        // between that lock's roster read and its COMMIT.
-                        await withPayrollUserWrite(tx, data, () => tx.user.update({ where: { id }, data }));
-                    }
+                            if (Object.keys(data).length > 0) {
+                                // `data` can carry status and name, both EXPORT
+                                // INPUTS: activating somebody ADDS a row to the
+                                // Gusto roster, and their name is printed in both
+                                // CSVs. The payroll advisory lock (tier 1, taken
+                                // inside withPayrollUserWrite before the row is
+                                // touched) is what makes this write wait for a
+                                // period being locked instead of committing
+                                // between that lock's roster read and its COMMIT.
+                                await withPayrollUserWrite(tx, data, () => tx.user.update({ where: { id }, data }));
+                            }
+                            // Permissions commit in the SAME transaction as the
+                            // authority check now — they used to be a separate
+                            // write after the guarded transaction had already
+                            // committed, which is exactly the gap this fix closes.
+                            if (Object.keys(sanitizedPermissions).length > 0) {
+                                await tx.userPermission.upsert({
+                                    where: { userId: id },
+                                    create: { userId: id, ...sanitizedPermissions },
+                                    update: sanitizedPermissions,
+                                });
+                            }
+                        }
+                    );
                 });
             } catch (error) {
                 if (error instanceof RateChangeError) {
                     return NextResponse.json({ error: error.message }, { status: error.status });
+                }
+                if (isUserMutationRefusedError(error)) {
+                    return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
+                }
+                if (isUserMutationTargetNotFoundError(error)) {
+                    return NextResponse.json({ error: "User not found" }, { status: 404 });
                 }
                 throw error;
             }
@@ -160,25 +202,6 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 // Runs only once the transaction has COMMITTED.
                 const { autoAssignProjectsOnUserChange } = await import("@/lib/crew-auto-assign-sync");
                 after(() => autoAssignProjectsOnUserChange(id, { role: data.role, status: data.status }));
-            }
-        }
-
-        // Update permissions if provided (allowlisted fields only). WHICH of
-        // them this caller may write was decided by checkUserMutation above; the
-        // key list itself now lives with that decision so the two cannot drift.
-        if (permissions) {
-            const sanitized: Record<string, boolean> = {};
-            for (const key of ASSIGNABLE_PERMISSIONS) {
-                if (key in permissions && typeof permissions[key] === "boolean") {
-                    sanitized[key] = permissions[key];
-                }
-            }
-            if (Object.keys(sanitized).length > 0) {
-                await prisma.userPermission.upsert({
-                    where: { userId: id },
-                    create: { userId: id, ...sanitized },
-                    update: sanitized,
-                });
             }
         }
 
@@ -257,27 +280,44 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
 
         const { id } = await params;
 
-        // Can't delete yourself
+        // Can't delete yourself. A pure comparison against the actor's own
+        // session identity — nothing about the TARGET's role, so there is no
+        // race to close here.
         if (id === currentUser.id) {
             return NextResponse.json({ error: "Cannot delete your own account" }, { status: 400 });
         }
 
-        // Only ADMIN can delete other ADMIN accounts
-        const targetUser = await prisma.user.findUnique({ where: { id }, select: { role: true } });
-        if (!targetUser) {
-            return NextResponse.json({ error: "User not found" }, { status: 404 });
-        }
-        if (targetUser.role === "ADMIN" && currentUser.role !== "ADMIN") {
-            return NextResponse.json({ error: "Only admins can delete admin accounts" }, { status: 403 });
-        }
+        // A cheap existence check, decoupled from authority — see the same
+        // check in PUT above for why this is safe outside the guarded
+        // transaction: it proves the row is there, not what it is allowed.
+        const targetExists = await prisma.user.findUnique({ where: { id }, select: { id: true } });
+        if (!targetExists) return NextResponse.json({ error: "User not found" }, { status: 404 });
 
         // A user with ANY time entries — locked or not — is refused outright,
         // checked under the payroll lock. The foreign key used to CASCADE, so
         // this endpoint quietly destroyed a former employee's whole payroll
         // history; a lock-only check would still do that for every entry that
         // predates PayrollPeriod, which is most of production's paid history.
+        //
+        // "Only ADMIN may delete an ADMIN" used to be authorized against a role
+        // read taken BEFORE this whole call — an admin promotion committing in
+        // that gap let a manager delete the now-admin account (round 12,
+        // finding 2). withGuardedUserMutation re-reads the target under FOR
+        // UPDATE, inside the SAME transaction deleteParentWithTimeEntries
+        // already opens, and refuses before the row is ever touched if the
+        // LOCKED role says a manager may not act on it.
         await deleteParentWithTimeEntries({ userId: id }, async (tx) => {
-            await (tx as unknown as typeof prisma).user.delete({ where: { id } });
+            await withGuardedUserMutation(
+                tx,
+                {
+                    actor: { id: currentUser.id, role: currentUser.role },
+                    targetId: id,
+                    changes: {},
+                },
+                async () => {
+                    await (tx as unknown as typeof prisma).user.delete({ where: { id } });
+                }
+            );
         });
         return NextResponse.json({ success: true });
     } catch (error: any) {
@@ -289,6 +329,12 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
         // request is well-formed and refused, not broken.
         if (isTimeEntriesExistError(error)) {
             return NextResponse.json({ error: error.message }, { status: 409 });
+        }
+        if (isUserMutationRefusedError(error)) {
+            return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
+        }
+        if (isUserMutationTargetNotFoundError(error)) {
+            return NextResponse.json({ error: "User not found" }, { status: 404 });
         }
         console.error("DELETE /api/users/[id] error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });

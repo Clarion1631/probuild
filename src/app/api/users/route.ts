@@ -6,7 +6,12 @@ import { prisma } from "@/lib/prisma";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { withPayrollUserWrite } from "@/lib/payroll-period";
 import { toSafeUser } from "@/lib/user-serialization";
-import { checkUserCreate, checkUserMutation } from "@/lib/user-mutation-guard";
+import {
+    checkUserCreate,
+    isUserMutationRefusedError,
+    isUserMutationTargetNotFoundError,
+    withGuardedUserMutation,
+} from "@/lib/user-mutation-guard";
 import { Resend } from "resend";
 import bcrypt from "bcryptjs";
 
@@ -195,17 +200,6 @@ export async function PATCH(req: Request) {
 
         if (!id) return NextResponse.json({ error: "User id required" }, { status: 400 });
 
-        // Same rules as PUT /api/users/[id] - this route wrote `role` and
-        // `status` straight from the body for any manager (round 9, finding 1).
-        const target = await prisma.user.findUnique({ where: { id }, select: { id: true, role: true } });
-        if (!target) return NextResponse.json({ error: "User not found" }, { status: 404 });
-        const verdict = checkUserMutation({
-            actor: { id: currentUser.id, role: currentUser.role },
-            target,
-            changes: { role, status },
-        });
-        if (!verdict.ok) return NextResponse.json({ error: verdict.error }, { status: verdict.status });
-
         const data: any = {};
         if (name !== undefined) data.name = name;
         if (role !== undefined) data.role = role;
@@ -215,34 +209,58 @@ export async function PATCH(req: Request) {
         // Rates through the one validated path, in the same transaction as the
         // rest of the patch — this route used to write them as raw JS numbers
         // with no permission check and no lastRateSyncAt stamp.
+        //
+        // The authority check used to run against a role read taken BEFORE
+        // this transaction opened - an admin promotion committing in that gap
+        // let a manager's already-in-flight request act on the now-admin
+        // account (round 12, finding 2). withGuardedUserMutation re-reads the
+        // target under FOR UPDATE and re-runs checkUserMutation against THAT
+        // row before the write below is allowed to run.
         let user;
         let _pin;
         try {
             const updated = await prisma.$transaction(async (tx) => {
-                const rateResult = await applyRateChangeInTx(
+                return withGuardedUserMutation(
                     tx,
-                    currentUser,
-                    id,
-                    { hourlyRate, burdenRate, payType: body.payType }
-                );
-                if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
-                // status and name are EXPORT INPUTS — activating somebody
-                // adds them to the Gusto roster, and their name is printed in
-                // both CSVs. withPayrollUserWrite takes the shared payroll
-                // advisory lock first, so this cannot land between a period
-                // lock's roster read and its COMMIT (see payroll-period.ts).
-                return withPayrollUserWrite(tx, data, () =>
-                    tx.user.update({
-                        where: { id },
+                    {
+                        actor: { id: currentUser.id, role: currentUser.role },
+                        targetId: id,
+                        changes: { role, status },
                         data,
-                        include: { permissions: true, projectAccess: { select: { projectId: true } } },
-                    })
+                    },
+                    async () => {
+                        const rateResult = await applyRateChangeInTx(
+                            tx,
+                            currentUser,
+                            id,
+                            { hourlyRate, burdenRate, payType: body.payType }
+                        );
+                        if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
+                        // status and name are EXPORT INPUTS — activating somebody
+                        // adds them to the Gusto roster, and their name is printed in
+                        // both CSVs. withPayrollUserWrite takes the shared payroll
+                        // advisory lock first, so this cannot land between a period
+                        // lock's roster read and its COMMIT (see payroll-period.ts).
+                        return withPayrollUserWrite(tx, data, () =>
+                            tx.user.update({
+                                where: { id },
+                                data,
+                                include: { permissions: true, projectAccess: { select: { projectId: true } } },
+                            })
+                        );
+                    }
                 );
             });
-            ({ pinCode: _pin, ...user } = updated);
+            ({ pinCode: _pin, ...user } = updated as Record<string, unknown>);
         } catch (error) {
             if (error instanceof RateChangeError) {
                 return NextResponse.json({ error: error.message }, { status: error.status });
+            }
+            if (isUserMutationRefusedError(error)) {
+                return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
+            }
+            if (isUserMutationTargetNotFoundError(error)) {
+                return NextResponse.json({ error: "User not found" }, { status: 404 });
             }
             throw error;
         }

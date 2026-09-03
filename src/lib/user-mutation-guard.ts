@@ -147,3 +147,110 @@ export function checkUserCreate(input: { actor: UserMutationActor; role: unknown
     }
     return { ok: true };
 }
+
+/**
+ * THE target-role race (round 12, finding 2).
+ *
+ * PUT/PATCH /api/users/[id], PATCH /api/users and PATCH
+ * /api/manager/employees/[id] all authorized against a `User.role` read taken
+ * BEFORE the write transaction opened, then updated/deleted without checking
+ * again. An admin promotion committing in the gap between that read and the
+ * write let a manager's already-in-flight request — authorized against a crew
+ * member — act on the now-admin account: the row it was authorized against was
+ * not the row it wrote.
+ *
+ * Minimal database surface — just enough to take a row lock: no PayrollTxClient
+ * import needed here to avoid a public dependency on that module's shape.
+ */
+export type GuardedUserMutationClient = {
+    $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
+    $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
+};
+
+/**
+ * Thrown when the LOCKED row fails checkUserMutation. Carries the verdict so a
+ * catch block can answer with the exact status/message checkUserMutation would
+ * have returned directly — the caller-facing contract does not change, only
+ * when the check runs.
+ */
+export class UserMutationRefusedError extends Error {
+    readonly verdict: Extract<UserMutationVerdict, { ok: false }>;
+    constructor(verdict: Extract<UserMutationVerdict, { ok: false }>) {
+        super(verdict.error);
+        this.name = "UserMutationRefusedError";
+        this.verdict = verdict;
+    }
+}
+
+export function isUserMutationRefusedError(error: unknown): error is UserMutationRefusedError {
+    return error instanceof Error && error.name === "UserMutationRefusedError";
+}
+
+/** Thrown when the target row does not exist under the lock. */
+export class UserMutationTargetNotFoundError extends Error {
+    readonly targetId: string;
+    constructor(targetId: string) {
+        super(`User not found: ${targetId}`);
+        this.name = "UserMutationTargetNotFoundError";
+        this.targetId = targetId;
+    }
+}
+
+export function isUserMutationTargetNotFoundError(error: unknown): error is UserMutationTargetNotFoundError {
+    return error instanceof Error && error.name === "UserMutationTargetNotFoundError";
+}
+
+/**
+ * THE entry point for every write that changes an EXISTING User's role,
+ * status, permissions, pinCode, or that deletes the row. Takes the row lock
+ * FIRST, re-derives `target` from what is ACTUALLY there, and only then hands
+ * control to `write` — so nothing downstream can act on a role this
+ * transaction never actually saw.
+ *
+ * Order, inside the caller's transaction:
+ *   1. If `data` names an export-affecting column (see touchesExportUserState
+ *      in payroll-period.ts), the tier-1 payroll advisory lock — same rule
+ *      withPayrollUserWrite already applies, kept here so a caller does not
+ *      have to remember to call both.
+ *   2. `SELECT "role" FROM "User" WHERE "id" = $1 FOR UPDATE` — unconditional.
+ *      Even a permissions-only write re-checks under this lock: the race here
+ *      is about AUTHORITY, not about payroll, so it applies regardless of
+ *      whether the payload happens to touch an export column.
+ *   3. checkUserMutation against the row this transaction is now holding.
+ *   4. `write(target)` — every affected column write (role/status/permissions/
+ *      pinCode/delete) belongs inside this closure, in the SAME transaction,
+ *      so nothing after the check can commit outside the lock's protection.
+ *
+ * `data` is the raw payload about to be written to the row, or omitted for a
+ * write with no column payload of its own (DELETE). It decides ONLY whether
+ * the payroll lock is taken first — never whether the row lock or the
+ * authority check run, both of which are unconditional.
+ */
+export async function withGuardedUserMutation<T>(
+    tx: GuardedUserMutationClient,
+    input: {
+        actor: UserMutationActor;
+        targetId: string;
+        changes: UserMutationChanges;
+        data?: unknown;
+    },
+    write: (target: UserMutationTarget) => Promise<T>
+): Promise<T> {
+    const { touchesExportUserState, acquirePayrollWriteLock } = await import("./payroll-period");
+    if (input.data !== undefined && touchesExportUserState(input.data)) {
+        await acquirePayrollWriteLock(tx);
+    }
+
+    const rows = (await tx.$queryRawUnsafe(
+        `SELECT "role" FROM "User" WHERE "id" = $1 FOR UPDATE`,
+        input.targetId
+    )) as Array<{ role: string }>;
+    const row = rows[0];
+    if (!row) throw new UserMutationTargetNotFoundError(input.targetId);
+
+    const target: UserMutationTarget = { id: input.targetId, role: row.role };
+    const verdict = checkUserMutation({ actor: input.actor, target, changes: input.changes });
+    if (!verdict.ok) throw new UserMutationRefusedError(verdict);
+
+    return write(target);
+}

@@ -153,9 +153,12 @@ export const EXPECTED_OBJECTS = [
         columns: ["lockedById"],
         refColumns: ["id"],
     },
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_range_check", contype: "c", def: ['"periodEnd" > "periodStart"'] },
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_keys_present", contype: "c", def: ['"periodStartKey" IS NOT NULL', '"periodEndKey" IS NOT NULL'] },
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_discard_unlocked", contype: "c", def: ['"discardedAt" IS NULL', '"lockedAt" IS NULL'] },
+    // Each `def` below is the constraint's WHOLE body, compared for exact
+    // equality after normalizeCheckDef — not a bag of fragments that merely
+    // have to appear somewhere in the actual text (round 12, finding 3).
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_range_check", contype: "c", def: '"periodEnd" > "periodStart"' },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_keys_present", contype: "c", def: '"periodStartKey" IS NOT NULL AND "periodEndKey" IS NOT NULL' },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_discard_unlocked", contype: "c", def: '"discardedAt" IS NULL OR "lockedAt" IS NULL' },
     // A LOCKED period carries its WHOLE frozen export, or it does not exist.
     // The export used to fall through to live data for a locked row with a null
     // snapshot; the loader now refuses, and this makes the row unrepresentable.
@@ -166,14 +169,15 @@ export const EXPECTED_OBJECTS = [
         table: "PayrollPeriod",
         name: "PayrollPeriod_locked_snapshot_complete",
         contype: "c",
-        def: [
-            '"lockedAt" IS NULL',
-            '"summaryCsvSnapshot" IS NOT NULL',
-            '"detailCsvSnapshot" IS NOT NULL',
-            '"exportHash" IS NOT NULL',
-        ],
+        def: '"lockedAt" IS NULL OR ("summaryCsvSnapshot" IS NOT NULL AND "detailCsvSnapshot" IS NOT NULL AND "exportHash" IS NOT NULL)',
     },
-    { kind: "constraint", table: "User", name: "User_payType_check", contype: "c", def: ["HOURLY", "SALARY"] },
+    {
+        kind: "constraint",
+        table: "User",
+        name: "User_payType_check",
+        contype: "c",
+        def: `"payType" IS NULL OR "payType" IN ('HOURLY', 'SALARY')`,
+    },
 
     { kind: "column", table: "HelpRequest", name: "submissionId", type: "text", nullable: true },
     { kind: "column", table: "HelpRequest", name: "providerIssueRef", type: "text", nullable: true },
@@ -268,6 +272,57 @@ export function normalizeDefault(text) {
     while (value.startsWith("(") && value.endsWith(")")) value = value.slice(1, -1).trim();
     if (value === "now()") return "current_timestamp";
     return value;
+}
+
+/**
+ * Compare a CHECK constraint's definition the way Postgres MEANS it, not by
+ * whether every expected FRAGMENT happens to appear somewhere in the actual
+ * text (round 12, finding 3).
+ *
+ * A substring check — "is every expected piece IN the actual definition" —
+ * passes an AND->OR flip, an IN->NOT IN flip, and a dropped clause, because
+ * every original word can still be found inside a different, WEAKER
+ * expression built from a superset of the same tokens: `A AND B AND C`
+ * contains the substrings "A", "B" and "C" just as much as `A OR B OR C`
+ * does. This compares the WHOLE normalized expression for exact equality
+ * instead, so any of those three mutations changes the compared string.
+ *
+ * Postgres's own printer (`pg_get_constraintdef`) does not print back what a
+ * human wrote:
+ *   - it wraps every operand of AND/OR in its own redundant parentheses.
+ *     Harmless to strip here — every constraint this script owns only mixes
+ *     AND/OR/comparisons, and AND already binds tighter than OR in standard
+ *     SQL precedence, so removing ALL parentheses changes no constraint's
+ *     actual meaning; it only removes the noise;
+ *   - it rewrites `x IN (a, b)` as `x = ANY (ARRAY[a, b])` and
+ *     `x NOT IN (a, b)` as `x <> ALL (ARRAY[a, b])`;
+ *   - it appends a `::text` cast to every string literal in that array.
+ *
+ * This function undoes all three, so EXPECTED_OBJECTS can keep reading like
+ * the migration SQL that created the constraint (`... IN ('HOURLY', 'SALARY')`)
+ * while still comparing, post-normalization, against what Postgres actually
+ * has stored — verified against a real PostgreSQL 16 instance, not guessed.
+ *
+ * Order matters: the IN/NOT IN rewrite has to run BEFORE parentheses are
+ * stripped — it needs them to find the list's boundary.
+ *
+ * Exported so tests/payroll-schema-drift-db.test.ts can assert the mutation
+ * cases directly, without a database.
+ */
+export function normalizeCheckDef(text) {
+    let value = String(text ?? "").trim();
+    // The leading keyword every pg_get_constraintdef() result starts with. A
+    // hand-written EXPECTED_OBJECTS entry never has it, so this is a no-op on
+    // that side — both inputs converge on the same normalized shape either way.
+    value = value.replace(/^check\s*/i, "");
+    value = value.replace(/("(?:[^"]+)")\s+NOT\s+IN\s*\(([^)]*)\)/gi, "$1 <> ALL (ARRAY[$2])");
+    value = value.replace(/("(?:[^"]+)")\s+IN\s*\(([^)]*)\)/gi, "$1 = ANY (ARRAY[$2])");
+    // The cast Postgres appends to every element of an ARRAY[...] literal.
+    value = value.replace(/::"?[A-Za-z_][A-Za-z0-9_]*"?/g, "");
+    // ALL parentheses — see the header comment for why this is safe here.
+    value = value.replace(/[()]/g, "");
+    value = value.toLowerCase();
+    return value.replace(/\s+/g, " ").trim();
 }
 
 /**
@@ -451,10 +506,18 @@ export async function findSchemaDrift(db, expected = EXPECTED_OBJECTS, schema = 
                 continue;
             }
             if (object.def) {
-                const def = squash(row.def);
-                const missingParts = object.def.filter((part) => !def.includes(part));
-                if (missingParts.length) {
-                    miss(object, `definition lost: ${missingParts.join(" / ")}`, def);
+                // EXACT equality on the whole normalized expression — not "does
+                // every expected fragment appear somewhere in the actual text".
+                // A substring check passes an AND->OR flip, an IN->NOT IN flip,
+                // and a dropped clause; see normalizeCheckDef's header for why.
+                const actualNorm = normalizeCheckDef(row.def);
+                const expectedNorm = normalizeCheckDef(object.def);
+                if (actualNorm !== expectedNorm) {
+                    miss(
+                        object,
+                        `definition drifted: actual "${actualNorm}" != expected "${expectedNorm}"`,
+                        row.def
+                    );
                 }
             }
             continue;

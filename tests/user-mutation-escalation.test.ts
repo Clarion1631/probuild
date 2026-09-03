@@ -217,8 +217,22 @@ function resetDb() {
                         return USERS[args.where.id];
                     },
                 },
+                userPermission: {
+                    upsert: async ({ create, update }: { create: Row; update: Row }) => {
+                        permissionWrites.push({ ...create, ...update });
+                        return update;
+                    },
+                },
                 $executeRawUnsafe: async () => 0,
-                $queryRawUnsafe: async () => [],
+                // withGuardedUserMutation re-reads the target's role under this
+                // query (FOR UPDATE) INSIDE the transaction — the fake has to
+                // answer from the same USERS store the pre-tx findUnique above
+                // reads, or every guarded write would see a phantom row.
+                $queryRawUnsafe: async (_query: string, ...values: unknown[]) => {
+                    const id = values[0] as string;
+                    const row = USERS[id];
+                    return row ? [{ role: row.role }] : [];
+                },
             }),
     };
 }
@@ -355,15 +369,35 @@ test("every user-mutating writer routes through the shared guard", () => {
     // The pure tests above prove the RULES; this proves they are the ones every
     // surface asks. A route that grows its own copy is how the four disagreed in
     // the first place.
+    //
+    // Since round 12 (finding 2), the existing-row writers no longer call
+    // checkUserMutation directly — they call withGuardedUserMutation, which is
+    // the only thing allowed to call checkUserMutation, and only against a row
+    // it has just locked FOR UPDATE inside the same transaction. A route that
+    // called checkUserMutation on its own again would be the exact hole this
+    // closed: authorizing on a read the write transaction never held.
     const SRC = path.join(__dirname, "..", "src");
     for (const [file, expected] of [
-        ["app/api/users/[id]/route.ts", "checkUserMutation("],
+        ["app/api/users/[id]/route.ts", "withGuardedUserMutation("],
         ["app/api/users/route.ts", "checkUserCreate("],
-        ["app/api/users/route.ts", "checkUserMutation("],
-        ["app/api/manager/employees/[id]/route.ts", "checkUserMutation("],
+        ["app/api/users/route.ts", "withGuardedUserMutation("],
+        ["app/api/manager/employees/[id]/route.ts", "withGuardedUserMutation("],
     ] as const) {
         const source = readFileSync(path.join(SRC, file), "utf8");
         assert.ok(source.includes(expected), `${file} must call ${expected}`);
+    }
+    // And no route re-implements the authority check itself — that call lives
+    // exactly once, inside withGuardedUserMutation.
+    for (const file of [
+        "app/api/users/[id]/route.ts",
+        "app/api/users/route.ts",
+        "app/api/manager/employees/[id]/route.ts",
+    ] as const) {
+        const source = readFileSync(path.join(SRC, file), "utf8");
+        assert.ok(
+            !/\bcheckUserMutation\(/.test(source),
+            `${file} must not call checkUserMutation directly — that authorizes on a read outside the write transaction`
+        );
     }
     // And the old hand-rolled copies are gone, so there is nothing left to drift.
     const manager = readFileSync(path.join(SRC, "app/api/manager/employees/[id]/route.ts"), "utf8");

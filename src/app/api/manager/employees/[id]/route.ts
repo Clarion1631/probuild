@@ -6,7 +6,11 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { withPayrollUserWrite } from "@/lib/payroll-period";
-import { checkUserMutation } from "@/lib/user-mutation-guard";
+import {
+    isUserMutationRefusedError,
+    isUserMutationTargetNotFoundError,
+    withGuardedUserMutation,
+} from "@/lib/user-mutation-guard";
 
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
     const auth = await authenticateMobileOrSession(req);
@@ -26,25 +30,6 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     } catch {
         return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
     }
-
-    const target = await prisma.user.findUnique({
-        where: { id },
-        select: { id: true, role: true },
-    });
-    if (!target) return NextResponse.json({ error: "User not found" }, { status: 404 });
-
-    // THE shared rules (src/lib/user-mutation-guard.ts). They were written HERE
-    // and nowhere else, which is how three browser routes ended up with none at
-    // all: a manager could promote themselves to ADMIN, grant themselves every
-    // permission, or disable the real admins through any of them (round 9,
-    // finding 1). Enum validation, the admin-only role change, and "a manager
-    // cannot touch an admin" now all come from one function.
-    const verdict = checkUserMutation({
-        actor: { id: user.id, role: user.role },
-        target,
-        changes: { role: body.role, status: body.status },
-    });
-    if (!verdict.ok) return NextResponse.json({ error: verdict.error }, { status: verdict.status });
 
     // applyRateChange asks whether this caller has financialReports, not just
     // whether they are a manager, so the permissions row has to be loaded.
@@ -66,43 +51,70 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // validated path (payroll permission, exact decimal, lastRateSyncAt); a
     // refusal rolls the profile half back rather than leaving a half-applied
     // update behind.
+    //
+    // THE shared rules (src/lib/user-mutation-guard.ts). They were written HERE
+    // and nowhere else, which is how three browser routes ended up with none at
+    // all: a manager could promote themselves to ADMIN, grant themselves every
+    // permission, or disable the real admins through any of them (round 9,
+    // finding 1). Enum validation, the admin-only role change, and "a manager
+    // cannot touch an admin" now all come from one function — and, since round
+    // 12, that function is re-run inside the transaction against the row
+    // withGuardedUserMutation just locked with FOR UPDATE, not against a role
+    // read taken before the transaction opened (round 12, finding 2).
     let updated;
     try {
         updated = await prisma.$transaction(async (tx) => {
-            const rateResult = await applyRateChangeInTx(
+            return withGuardedUserMutation(
                 tx,
-                rateActor,
-                id,
-                { hourlyRate: body.hourlyRate, burdenRate: body.burdenRate, payType: body.payType }
-            );
-            if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
-
-            if (Object.keys(data).length === 0) {
-                return tx.user.findUniqueOrThrow({
-                    where: { id },
-                    select: {
-                        id: true, email: true, name: true, role: true, status: true,
-                        hourlyRate: true, burdenRate: true,
-                    },
-                });
-            }
-            // The mobile manager screen can activate or disable somebody,
-            // and status is half of the Gusto roster predicate. Same tier-1
-            // payroll lock as every other export-input writer.
-            return withPayrollUserWrite(tx, data, () =>
-                tx.user.update({
-                    where: { id },
+                {
+                    actor: { id: user.id, role: user.role },
+                    targetId: id,
+                    changes: { role: body.role, status: body.status },
                     data,
-                    select: {
-                        id: true, email: true, name: true, role: true, status: true,
-                        hourlyRate: true, burdenRate: true,
-                    },
-                })
+                },
+                async () => {
+                    const rateResult = await applyRateChangeInTx(
+                        tx,
+                        rateActor,
+                        id,
+                        { hourlyRate: body.hourlyRate, burdenRate: body.burdenRate, payType: body.payType }
+                    );
+                    if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
+
+                    if (Object.keys(data).length === 0) {
+                        return tx.user.findUniqueOrThrow({
+                            where: { id },
+                            select: {
+                                id: true, email: true, name: true, role: true, status: true,
+                                hourlyRate: true, burdenRate: true,
+                            },
+                        });
+                    }
+                    // The mobile manager screen can activate or disable somebody,
+                    // and status is half of the Gusto roster predicate. Same tier-1
+                    // payroll lock as every other export-input writer.
+                    return withPayrollUserWrite(tx, data, () =>
+                        tx.user.update({
+                            where: { id },
+                            data,
+                            select: {
+                                id: true, email: true, name: true, role: true, status: true,
+                                hourlyRate: true, burdenRate: true,
+                            },
+                        })
+                    );
+                }
             );
         });
     } catch (error) {
         if (error instanceof RateChangeError) {
             return NextResponse.json({ error: error.message }, { status: error.status });
+        }
+        if (isUserMutationRefusedError(error)) {
+            return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
+        }
+        if (isUserMutationTargetNotFoundError(error)) {
+            return NextResponse.json({ error: "User not found" }, { status: 404 });
         }
         throw error;
     }
