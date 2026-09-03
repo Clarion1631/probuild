@@ -44,6 +44,7 @@ import {
     listProjectFiles,
     listPunchItems,
     moveFileWithConfirmation,
+    updateDailyLogWithConfirmation,
 } from "@/lib/mcp-pm-tools";
 import { listInspections, recordInspectionWithConfirmation } from "@/lib/mcp-inspection-tools";
 
@@ -172,7 +173,7 @@ const WRITE_TOOLS = new Set([
     "create_change_order", "update_change_order", "send_change_order", "bill_change_order",
     "create_lead", "log_time", "log_expense",
     "upload_file", "upload_files", "import_google_drive_file", "create_folder", "move_file",
-    "create_daily_log", "add_punch_items", "record_inspection",
+    "create_daily_log", "update_daily_log", "add_punch_items", "record_inspection",
     "create_contract", "update_contract", "send_contract",
     "plan_schedule", "update_task_dates", "set_task_status", "assign_task_crew",
     "set_project_start_date", "generate_project_schedule", "assign_project_crew",
@@ -195,7 +196,7 @@ const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
     plan_schedule: "task", update_task_dates: "task", set_task_status: "task", assign_task_crew: "task",
     upload_file: "file", upload_files: "file", import_google_drive_file: "file", read_file: "file", get_file_link: "file",
     create_folder: "folder", move_file: "file",
-    create_daily_log: "daily_log",
+    create_daily_log: "daily_log", update_daily_log: "daily_log",
     add_punch_items: "punch_item",
     record_inspection: "inspection",
 };
@@ -1946,6 +1947,38 @@ function createHandler(actor: RouteMcpActor) {
                     ));
                 } catch (error) {
                     return { ...textResult({ error: error instanceof Error ? error.message : "Failed to create daily log" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "update_daily_log",
+            {
+                title: "Update an existing project daily log",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Updates only editable internal text fields on an existing daily log. Photos, date, project, author, and portal sharing are deliberately not exposed. " +
+                    "TWO-STEP, SINGLE-USE: preview first, show the user, then repeat the exact arguments with confirmToken after approval.",
+                inputSchema: {
+                    dailyLogId: z.string().max(50),
+                    weather: z.string().max(300).nullable().optional(),
+                    crewOnSite: z.string().max(1000).nullable().optional(),
+                    workPerformed: z.string().trim().min(1).max(20_000).optional(),
+                    materialsDelivered: z.string().max(20_000).nullable().optional(),
+                    issues: z.string().max(20_000).nullable().optional(),
+                    nextSteps: z.string().max(20_000).nullable().optional(),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    const actorUserId = await actor.resolveActorUserId();
+                    return textResult(await updateDailyLogWithConfirmation(
+                        args,
+                        { actorLabel: actor.actorLabel, actorUserId },
+                    ));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to update daily log" }), isError: true };
                 }
             },
         );

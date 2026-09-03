@@ -125,6 +125,7 @@ async function main() {
         "move_file",
         "list_daily_logs",
         "create_daily_log",
+        "update_daily_log",
         "list_punch_items",
         "add_punch_items",
         "get_project_contacts",
@@ -162,6 +163,17 @@ async function main() {
     assert.match(fileCoreSource, /uploadProjectFileBufferCore/);
     assert.match(routeSource, /WRITE_TOOLS[\s\S]{0,600}"import_google_drive_file"/);
     assert.match(routeSource, /ENTITY_TYPE_BY_TOOL[\s\S]{0,1200}import_google_drive_file:\s*"file"/);
+    assert.match(routeSource, /WRITE_TOOLS[\s\S]{0,800}"update_daily_log"/);
+    assert.match(routeSource, /ENTITY_TYPE_BY_TOOL[\s\S]{0,1400}update_daily_log:\s*"daily_log"/);
+    assert.match(routeSource, /update_daily_log[\s\S]{0,1400}confirmToken/);
+    assert.match(pmCoreSource, /issueConfirmation\(\s*"update_daily_log"/);
+    assert.match(pmCoreSource, /executePmConfirmed\("update_daily_log"/);
+    assert.match(pmCoreSource, /action:\s*"updated_daily_log"/);
+    assert.match(pmCoreSource, /Editing work performed hides a portal-shared log until it is re-shared/);
+    assert.match(pmCoreSource, /sharedContentHash:\s*null/);
+    assert.match(pmCoreSource, /runDailyLogTaskMatch\(result\.dailyLogId\)/);
+    assert.match(pmCoreSource, /revalidatePath\(`\/projects\/\$\{result\.projectId\}\/dailylogs`\)/);
+    assert.match(pmCoreSource, /revalidatePath\(`\/portal\/projects\/\$\{result\.projectId\}`\)/);
     assert.match(routeSource, /import_google_drive_file[\s\S]{0,1800}bare Drive file ID/);
     assert.match(driveImportSource, /MAX_GOOGLE_DRIVE_IMPORT_BYTES\s*=\s*25\s*\*\s*1024\s*\*\s*1024/);
     assert.match(driveImportSource, /application\/vnd\.google-apps\./);
@@ -544,7 +556,51 @@ async function main() {
         assert.equal(log.createdById, actorUser.id);
         assert.equal(log.sharedToPortal, false);
         assert.equal(log.photos[0]?.url, photo.url);
-        console.log("PASS daily-log actor provenance, no portal-sharing input, and ProjectFile photo attachment");
+
+        // Updates are confirmation-gated, preserve portal/photos, permit clearing
+        // optional text, and return the committed fields for caller readback.
+        const updateArgs = {
+            dailyLogId: log.id,
+            weather: "Rain after noon",
+            issues: null,
+            nextSteps: "Return for final verification.",
+        };
+        const updatePreview = await pmModule.updateDailyLogWithConfirmation(updateArgs, richardActor);
+        const updateToken = confirmationToken(updatePreview);
+        collected.confirmationTokens.push(updateToken);
+        await rejectsWith(
+            () => pmModule.updateDailyLogWithConfirmation({ ...updateArgs, weather: "Different weather", confirmToken: updateToken }, richardActor),
+            /confirmation|token|match/i,
+        );
+        const updateResult = await pmModule.updateDailyLogWithConfirmation({ ...updateArgs, confirmToken: updateToken }, richardActor);
+        const updatedLog = await prisma.dailyLog.findUniqueOrThrow({
+            where: { id: log.id },
+            include: { photos: true },
+        });
+        assert.deepEqual(updateResult.changedFields, ["weather", "issues", "nextSteps"]);
+        assert.equal(updatedLog.weather, "Rain after noon");
+        assert.equal(updatedLog.issues, null);
+        assert.equal(updatedLog.nextSteps, "Return for final verification.");
+        assert.equal(updatedLog.sharedToPortal, false);
+        assert.equal(updatedLog.photos[0]?.url, photo.url);
+        await prisma.dailyLog.update({
+            where: { id: log.id },
+            data: { sharedToPortal: true, sharedContentHash: "approved-content-snapshot" },
+        });
+        const workUpdateArgs = { dailyLogId: log.id, workPerformed: "Verified the final repair work." };
+        const workUpdatePreview = await pmModule.updateDailyLogWithConfirmation(workUpdateArgs, richardActor);
+        const workUpdateToken = confirmationToken(workUpdatePreview);
+        collected.confirmationTokens.push(workUpdateToken);
+        await pmModule.updateDailyLogWithConfirmation({ ...workUpdateArgs, confirmToken: workUpdateToken }, richardActor);
+        const workUpdatedLog = await prisma.dailyLog.findUniqueOrThrow({ where: { id: log.id } });
+        assert.equal(workUpdatedLog.workPerformed, "Verified the final repair work.");
+        assert.equal(workUpdatedLog.sharedToPortal, true);
+        assert.equal(workUpdatedLog.sharedContentHash, null);
+        await rejectsWith(
+            () => pmModule.updateDailyLogWithConfirmation({ dailyLogId: log.id }, richardActor),
+            /at least one editable/i,
+        );
+        console.log("PASS daily-log create/update provenance, single-use confirmation, returned readback, and portal/photo preservation");
 
         // Punch additions preserve contiguous ordering and creator provenance.
         const task = await prisma.scheduleTask.create({

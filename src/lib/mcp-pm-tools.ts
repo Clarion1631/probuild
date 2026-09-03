@@ -1,4 +1,5 @@
 import type { Prisma } from "@prisma/client";
+import { revalidatePath } from "next/cache";
 
 import { runAfterRequest } from "./after-request";
 import { postDailyLogSummary } from "./chat-webhook";
@@ -587,6 +588,135 @@ export async function createDailyLogWithConfirmation(
             await runDailyLogTaskMatch(dailyLogId);
             await postDailyLogSummary(dailyLogId);
         });
+    }
+    return result;
+}
+
+type UpdateDailyLogInput = {
+    dailyLogId: string;
+    weather?: string | null;
+    crewOnSite?: string | null;
+    workPerformed?: string;
+    materialsDelivered?: string | null;
+    issues?: string | null;
+    nextSteps?: string | null;
+    confirmToken?: string;
+};
+
+function normalizeOptionalDailyLogText(value: string | null | undefined): string | null | undefined {
+    if (value === undefined) return undefined;
+    if (value === null) return null;
+    return value.trim() || null;
+}
+
+export async function updateDailyLogWithConfirmation(
+    input: UpdateDailyLogInput,
+    actor: McpActorContext,
+) {
+    if (!actor.actorUserId) {
+        throw new Error(`The ${actor.actorLabel} attribution user is not seeded yet, so a daily log cannot be updated safely.`);
+    }
+    const args = {
+        dailyLogId: input.dailyLogId,
+        weather: normalizeOptionalDailyLogText(input.weather),
+        crewOnSite: normalizeOptionalDailyLogText(input.crewOnSite),
+        workPerformed: input.workPerformed === undefined ? undefined : input.workPerformed.trim(),
+        materialsDelivered: normalizeOptionalDailyLogText(input.materialsDelivered),
+        issues: normalizeOptionalDailyLogText(input.issues),
+        nextSteps: normalizeOptionalDailyLogText(input.nextSteps),
+    };
+    const changedFields = Object.entries(args)
+        .filter(([field, value]) => field !== "dailyLogId" && value !== undefined)
+        .map(([field]) => field);
+    if (changedFields.length === 0) {
+        throw new Error("Provide at least one editable daily-log field.");
+    }
+    if (args.workPerformed === "") {
+        throw new Error("workPerformed cannot be blank.");
+    }
+    if (!input.confirmToken) {
+        const log = await prisma.dailyLog.findUnique({
+            where: { id: input.dailyLogId },
+            select: { id: true, date: true, project: { select: { name: true } } },
+        });
+        if (!log) throw new Error("Daily log not found");
+        const portalNote = args.workPerformed === undefined
+            ? "Portal sharing and photos will not change."
+            : "Photos and share selection will not change. Editing work performed hides a portal-shared log until it is re-shared.";
+        return issueConfirmation(
+            "update_daily_log",
+            args,
+            `Update the ${log.date.toISOString().slice(0, 10)} daily log on "${log.project.name}". Fields: ${changedFields.join(", ")}. ${portalNote}`,
+            actor.actorLabel,
+        );
+    }
+    const result = await executePmConfirmed("update_daily_log", args, input.confirmToken, actor, async tx => {
+        const existing = await tx.dailyLog.findUnique({
+            where: { id: input.dailyLogId },
+            select: { id: true, projectId: true, date: true, sharedToPortal: true, project: { select: { name: true } } },
+        });
+        if (!existing) throw new Error("Daily log not found");
+        const log = await tx.dailyLog.update({
+            where: { id: input.dailyLogId },
+            data: {
+                ...(args.weather !== undefined ? { weather: args.weather } : {}),
+                ...(args.crewOnSite !== undefined ? { crewOnSite: args.crewOnSite } : {}),
+                ...(args.workPerformed !== undefined ? { workPerformed: args.workPerformed, sharedContentHash: null } : {}),
+                ...(args.materialsDelivered !== undefined ? { materialsDelivered: args.materialsDelivered } : {}),
+                ...(args.issues !== undefined ? { issues: args.issues } : {}),
+                ...(args.nextSteps !== undefined ? { nextSteps: args.nextSteps } : {}),
+            },
+            select: {
+                id: true,
+                date: true,
+                weather: true,
+                crewOnSite: true,
+                workPerformed: true,
+                materialsDelivered: true,
+                issues: true,
+                nextSteps: true,
+                sharedToPortal: true,
+            },
+        });
+        await writeActivity(tx, actor, {
+            projectId: existing.projectId,
+            action: "updated_daily_log",
+            entityType: "daily_log",
+            entityId: log.id,
+            entityName: `${existing.project.name} daily log ${existing.date.toISOString().slice(0, 10)}`,
+            metadata: { changedFields },
+        });
+        return {
+            dailyLogId: log.id,
+            projectId: existing.projectId,
+            changedFields,
+            dailyLog: {
+                date: log.date.toISOString().slice(0, 10),
+                weather: log.weather,
+                crewOnSite: log.crewOnSite,
+                workPerformed: log.workPerformed,
+                materialsDelivered: log.materialsDelivered,
+                issues: log.issues,
+                nextSteps: log.nextSteps,
+                sharedToPortal: log.sharedToPortal,
+            },
+        };
+    });
+    const narrativeChanged = args.workPerformed !== undefined
+        || args.nextSteps !== undefined
+        || args.issues !== undefined;
+    runAfterRequest(async () => {
+        await runDailyLogTaskMatch(result.dailyLogId);
+        if (narrativeChanged) await postDailyLogSummary(result.dailyLogId);
+    });
+    // MCP tests and CLI callers have no Next static-generation store. Cache
+    // invalidation is best-effort there, but must never turn a committed edit
+    // into a failed response after its transaction has completed.
+    try {
+        revalidatePath(`/projects/${result.projectId}/dailylogs`);
+        revalidatePath(`/portal/projects/${result.projectId}`);
+    } catch (error) {
+        console.warn("[mcp] daily-log cache invalidation deferred", error);
     }
     return result;
 }
