@@ -296,6 +296,55 @@ function assertExecutedNothing(out: string) {
     assert.ok(!/seeded \d+ user/.test(out), `it reached the seed:\n${out}`);
 }
 
+test("the REAL production URL shape passes — hostname, not host", async () => {
+    // A `.pooler.supabase.com` suffix test against `new URL(u).host` can never
+    // match a transaction-pooler URL, because `host` INCLUDES the port:
+    // "aws-0-us-west-2.pooler.supabase.com:6543". The guard would then refuse
+    // the one URL it exists to accept, and CI would not notice — every CI path
+    // runs `--target ci`, which does not reach the prod branch at all.
+    //
+    // So this case is the exact shape from CLAUDE.md, port and query string and
+    // all, asserted BOTH ways: it passes with the matching project ref and is
+    // refused with a wrong one, so it cannot pass by being waved through.
+    const { verifyTarget, identityLine, redactUrl } = await script();
+    const REAL =
+        "postgresql://postgres.ghzdbzdnwjxazvmcefbh:not-a-real-password" +
+        "@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true";
+
+    // The distinction this pins, spelled out.
+    assert.equal(new URL(REAL).host, "aws-0-us-west-2.pooler.supabase.com:6543");
+    assert.equal(new URL(REAL).hostname, "aws-0-us-west-2.pooler.supabase.com");
+    assert.ok(!new URL(REAL).host.endsWith(".pooler.supabase.com"), "host would fail the suffix test");
+
+    assert.deepEqual(
+        verifyTarget({
+            target: "prod",
+            url: REAL,
+            database: "postgres",
+            hasBaseline: true,
+            env: { APPLY_EXPECT_PROJECT_REF: "ghzdbzdnwjxazvmcefbh" },
+        }),
+        { ok: true },
+        "the real production URL must pass its own guard"
+    );
+
+    const wrongRef = verifyTarget({
+        target: "prod",
+        url: REAL,
+        database: "postgres",
+        hasBaseline: true,
+        env: { APPLY_EXPECT_PROJECT_REF: "someotherproject" },
+    });
+    assert.equal(wrongRef.ok, false);
+    assert.match(String(wrongRef.error), /Supabase project "ghzdbzdnwjxazvmcefbh"/);
+
+    // ...and the query string does not leak into the printed identity, nor the
+    // password.
+    const line = identityLine({ target: "prod", url: REAL, database: "postgres", hasBaseline: true });
+    assert.equal(redactUrl(REAL), "aws-0-us-west-2.pooler.supabase.com:6543/postgres");
+    assert.ok(!line.includes("not-a-real-password"), line);
+    assert.match(line, /project_ref=ghzdbzdnwjxazvmcefbh/);
+});
 // ---------------------------------------------------------------------------
 // The DOCUMENTED invocation actually works (round 16, finding 1)
 // ---------------------------------------------------------------------------
