@@ -13,6 +13,7 @@
 //  path in this project; psql / prisma db push / migrate dev do not work here.)
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 function resolveDatabaseUrl() {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
@@ -23,8 +24,6 @@ function resolveDatabaseUrl() {
   }
   throw new Error("DATABASE_URL not found in env or .env files");
 }
-
-const prisma = new PrismaClient({ datasources: { db: { url: resolveDatabaseUrl() } } });
 
 // Note on locking: the CREATE INDEX below is deliberately NOT CONCURRENTLY.
 // It takes a SHARE lock that blocks writes to SelectionProposal while it
@@ -38,15 +37,24 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS "SelectionProposal_projectId_deletedAt_idx" ON "SelectionProposal"("projectId", "deletedAt");`,
 ];
 
-try {
-  for (const sql of statements) {
-    await prisma.$executeRawUnsafe(sql);
-    console.log("✔ applied:", sql.split("\n")[0].slice(0, 90));
+async function main() {
+  const prisma = new PrismaClient({ datasources: { db: { url: resolveDatabaseUrl() } } });
+
+  try {
+    for (const sql of statements) {
+      await prisma.$executeRawUnsafe(sql);
+      console.log("✔ applied:", sql.split("\n")[0].slice(0, 90));
+    }
+    console.log(`Done. ${statements.length} statements applied.`);
+  } catch (e) {
+    console.error("Migration failed:", e);
+    process.exitCode = 1;
+  } finally {
+    await prisma.$disconnect();
   }
-  console.log(`Done. ${statements.length} statements applied.`);
-} catch (e) {
-  console.error("Migration failed:", e);
-  process.exitCode = 1;
-} finally {
-  await prisma.$disconnect();
+}
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  await main();
 }
