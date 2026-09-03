@@ -106,31 +106,53 @@ export function pickCompanyTimeZone(rows) {
     return { timeZone: String(zone).trim(), from: "settings" };
 }
 
-/** Built per-run so the zone is the company's, not a hard-coded guess. */
-export function reanchorSql(timeZone) {
+/**
+ * The WHERE clause a row must satisfy before this script re-anchors it —
+ * shared by the UPDATE below and its own verification query in main(), so the
+ * two can never say different things about the same row.
+ *
+ * DATE SHAPE, NOT THE MARKER (round 31, item 3 — the gap this replaces).
+ *
+ * The predicate used to gate on `attributionAnchoredAt IS NULL`, on the
+ * reasoning that the marker and the row's shape can only disagree one way: a
+ * legacy row, never touched, sitting at UTC midnight. That is not the only
+ * way they disagree. An OLD app instance, still draining after this script's
+ * DDL half has run, writes `Expense.date` with no idea the company-zone
+ * anchor or the marker column exist at all — its Prisma client predates both.
+ * If that instance later UPDATEs a row this script had already anchored (any
+ * write that touches `date`, not only a create), the row lands back at UTC
+ * midnight while the marker stays non-null from the earlier pass. Gating on
+ * `attributionAnchoredAt IS NULL` excluded it forever — and the --post-deploy
+ * verification, whose whole job is to prove that live-write gap is closed,
+ * reported 0 while the row sat wrong.
+ *
+ * The fix asks the ROW instead of the marker: it needs re-anchoring exactly
+ * when it sits at UTC midnight AND applying the same transform the UPDATE
+ * uses would actually CHANGE its value. That is true for every legacy row
+ * regardless of what the marker says, and false for a row that is genuinely
+ * already anchored — including, for a company configured as UTC, one that is
+ * correctly anchored and still sits at UTC midnight (the transform is the
+ * identity there, so the diff is zero and the row is correctly left alone
+ * rather than rescanned every run — the same non-eligible-forever guarantee
+ * the marker existed to buy, derived from the row itself instead).
+ */
+export function needsReanchorPredicate(timeZone) {
     // The zone is interpolated, so it must be a real IANA name and nothing
     // else — this string reaches the database unparameterized.
     if (!/^[A-Za-z][A-Za-z0-9+_-]*(\/[A-Za-z0-9+_-]+)*$/.test(timeZone)) {
         throw new Error(`Refusing to interpolate a suspicious time zone: ${timeZone}`);
     }
-    // IDEMPOTENT BY MARKER, not by shape.
-    //
-    // The predicate on the time-of-day was the whole guard: re-anchoring moves
-    // a row off 00:00 UTC, so a second run "could not match it again". That is
-    // true only when the company zone has an offset. For a company configured
-    // as UTC the rewrite is the identity, so every row stayed at midnight and
-    // stayed eligible forever — and a row legitimately written at local
-    // midnight in such a company is indistinguishable from an un-anchored one.
-    //
-    // `attributionAnchoredAt` records the fact instead of inferring it. The
-    // time-of-day predicate stays, because it is what selects the LEGACY rows
-    // (everything time-expense-core wrote has always carried a real time).
+    return `"date" IS NOT NULL
+   AND "date"::time = TIME '00:00:00'
+   AND (("date"::date)::timestamp AT TIME ZONE '${timeZone}') AT TIME ZONE 'UTC' <> "date"`;
+}
+
+/** Built per-run so the zone is the company's, not a hard-coded guess. */
+export function reanchorSql(timeZone) {
     return `UPDATE "Expense"
    SET "date" = (("date"::date)::timestamp AT TIME ZONE '${timeZone}') AT TIME ZONE 'UTC',
        "attributionAnchoredAt" = now()
- WHERE "date" IS NOT NULL
-   AND "attributionAnchoredAt" IS NULL
-   AND "date"::time = TIME '00:00:00'`;
+ WHERE ${needsReanchorPredicate(timeZone)}`;
 }
 
 /**
@@ -157,8 +179,11 @@ export function reanchorSql(timeZone) {
  *
  *   * the projectId fill matches `"projectId" IS NULL`, which is exactly the
  *     set the old build was still producing, and
- *   * the date re-anchor matches `"attributionAnchoredAt" IS NULL` AND a
- *     time-of-day of 00:00, which is exactly the shape the old build wrote.
+ *   * the date re-anchor matches a row still sitting at UTC midnight whose
+ *     company-zone anchor would actually change it (needsReanchorPredicate) —
+ *     which is exactly the shape the old build wrote, AND the shape the old
+ *     build can leave behind on a row this script already anchored, since its
+ *     writes never touch `attributionAnchoredAt` at all.
  *
  * A re-run reporting 0 rows on both is the proof the gap is closed, and it is
  * the same check a second run of the whole script has always made.
@@ -554,15 +579,16 @@ async function main() {
         console.log("verified backfill: 0 expenses left unattributed against a known estimate project");
 
         // The re-anchor's own assertion, same reasoning as the one above: after
-        // this script, no row may still sit at UTC midnight unanchored. This is
-        // the number a --post-deploy pass exists to drive to zero — it is what
-        // proves the old build's live-write gap has actually closed, not just
-        // that the script ran without error.
+        // this script, no row may still need re-anchoring. This is the number a
+        // --post-deploy pass exists to drive to zero — it is what proves the
+        // old build's live-write gap has actually closed, not just that the
+        // script ran without error. SAME predicate the UPDATE used (by DATE
+        // SHAPE, not the `attributionAnchoredAt` marker — see
+        // needsReanchorPredicate) so an old instance that rewrote an
+        // already-marked row back to UTC midnight cannot hide behind a marker
+        // this query would otherwise trust.
         const [unanchored] = await prisma.$queryRawUnsafe(
-            `SELECT COUNT(*)::int AS n FROM "Expense"
-               WHERE "date" IS NOT NULL
-                 AND "attributionAnchoredAt" IS NULL
-                 AND "date"::time = TIME '00:00:00'`,
+            `SELECT COUNT(*)::int AS n FROM "Expense" WHERE ${needsReanchorPredicate(companyTimeZone)}`,
         );
         if (unanchored.n !== 0) {
             console.error(`VERIFY FAILED: ${unanchored.n} expense(s) still sitting at UTC midnight, unanchored`);

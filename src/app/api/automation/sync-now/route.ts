@@ -53,13 +53,17 @@ export async function POST() {
             imported: result.imported,
             updated: result.updated,
             deactivated: result.removed,
+            // Rows whose create never happened because the estimate moved
+            // mid-sync (round 31, item 2) — distinct from "skipped", which is
+            // decided before the write is even attempted.
+            attributionRaceSkipped: result.attributionRaceSkipped,
             skipped: result.skipped.length,
         };
         await logAutomationEvent({
             kind: "qbo-sync",
             status: "ok",
             source,
-            detail: { mode: "incremental", since: since.toISOString().slice(0, 10), imported: result.imported, updated: result.updated, deactivated: result.removed, by: user.name || user.email || undefined, ...skippedAuditSummary(result.skipped) },
+            detail: { mode: "incremental", since: since.toISOString().slice(0, 10), imported: result.imported, updated: result.updated, deactivated: result.removed, attributionRaceSkipped: result.attributionRaceSkipped, by: user.name || user.email || undefined, ...skippedAuditSummary(result.skipped) },
         });
         return NextResponse.json({ ok: true, ...counts });
     } catch (error) {

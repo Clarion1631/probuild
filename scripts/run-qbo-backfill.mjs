@@ -63,16 +63,22 @@ async function runChunk(chunk, attempt = 1) {
         }
         throw new Error(`Chunk ${chunk.since}..${chunk.until} failed twice: HTTP ${res.status} ${text.slice(0, 300)}`);
     }
-    console.log(`  ${chunk.since}..${chunk.until}: imported ${json.imported}, updated ${json.updated}, removed ${json.removed}, skipped ${json.skipped?.length ?? 0} (${seconds}s)`);
+    console.log(`  ${chunk.since}..${chunk.until}: imported ${json.imported}, updated ${json.updated}, removed ${json.removed}, attributionRaceSkipped ${json.attributionRaceSkipped ?? 0}, skipped ${json.skipped?.length ?? 0} (${seconds}s)`);
     return json;
 }
 
 function aggregate(results) {
-    const total = { imported: 0, updated: 0, removed: 0, skipped: [] };
+    const total = { imported: 0, updated: 0, removed: 0, attributionRaceSkipped: 0, skipped: [] };
     for (const r of results) {
         total.imported += r.imported;
         total.updated += r.updated;
         total.removed += r.removed;
+        // Rows whose create never happened because the estimate moved
+        // mid-sync (round 31, item 2) — NOT rolled into imported/updated/
+        // removed, and NOT the same as "unchanged". A nonzero count here
+        // means real rows are still missing, however clean the other three
+        // counters look.
+        total.attributionRaceSkipped += r.attributionRaceSkipped ?? 0;
         total.skipped.push(...(r.skipped ?? []));
     }
     return total;
@@ -102,10 +108,30 @@ fs.writeFileSync(
     JSON.stringify({ since, until, chunks, pass1, pass2 }, null, 2),
 );
 
-console.log(`\nPass 1 totals: imported ${total1.imported}, updated ${total1.updated}, removed ${total1.removed}, skipped ${total1.skipped.length}`);
+console.log(`\nPass 1 totals: imported ${total1.imported}, updated ${total1.updated}, removed ${total1.removed}, attributionRaceSkipped ${total1.attributionRaceSkipped}, skipped ${total1.skipped.length}`);
 if (total1.skipped.length) console.log("Pass 1 skips by reason:", summarizeSkips(total1.skipped));
-console.log(`Pass 2 totals: imported ${total2.imported}, updated ${total2.updated}, removed ${total2.removed}, skipped ${total2.skipped.length}`);
+console.log(`Pass 2 totals: imported ${total2.imported}, updated ${total2.updated}, removed ${total2.removed}, attributionRaceSkipped ${total2.attributionRaceSkipped}, skipped ${total2.skipped.length}`);
 
-const idempotent = total2.imported === 0 && total2.updated === 0 && total2.removed === 0;
-console.log(`Idempotency: ${idempotent ? "PASS (0/0/0 on rerun)" : "ATTENTION — rerun was not a no-op (QBO may have changed between passes)"}`);
+// A clean rerun is 0/0/0 on imported/updated/removed AND 0 on
+// attributionRaceSkipped. That fourth count is not folded into the others —
+// it means a row's CREATE never happened at all because an estimate moved
+// mid-sync (round 31, item 2), which the old 0/0/0 check could not see: a
+// persistent race skips the same purchases on every pass, so pass 2 reports
+// 0/0/0 on the counters that WOULD have caught it while real rows stay
+// permanently unimported. This window is not done while either pass hit one.
+const idempotent =
+    total2.imported === 0 && total2.updated === 0 && total2.removed === 0 &&
+    total2.attributionRaceSkipped === 0;
+if (idempotent) {
+    console.log("Idempotency: PASS (0/0/0 on rerun)");
+} else {
+    console.log("Idempotency: ATTENTION — rerun was not a no-op (QBO may have changed between passes)");
+}
+if (total1.attributionRaceSkipped > 0 || total2.attributionRaceSkipped > 0) {
+    console.log(
+        `INCOMPLETE — this window is NOT done: pass 1 hit ${total1.attributionRaceSkipped} attribution race(s), ` +
+        `pass 2 hit ${total2.attributionRaceSkipped}. Those rows were never created. Rerun this backfill for ` +
+        `${since}..${until} once the estimate moves have settled — do not treat this window as complete yet.`,
+    );
+}
 console.log("Full results: scripts/qbo-backfill-results.json");

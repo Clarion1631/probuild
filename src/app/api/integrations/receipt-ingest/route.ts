@@ -103,91 +103,132 @@ export async function POST(req: Request) {
         ? dateOnlyInTimeZone(body.date, companyTimeZone)
         : new Date();
 
-    const warnings: string[] = [];
+    // ONE TRANSACTION FOR THE WHOLE RECEIPT (round 31, item 1 — the failure
+    // mode this replaces).
+    //
+    // Each group used to commit through its own `prisma.$transaction`, so an
+    // attribution race on group 2 left group 1 already written: a receipt
+    // that arrived as one document ended up split, with `created > 0` telling
+    // the caller it succeeded and a retry then reporting `alreadyIngested`
+    // (the dedupe at the top keys on the whole file, not on which groups
+    // actually landed) — a permanently lost group with no path back.
+    //
+    // Every group's insert now runs inside ONE transaction: either the whole
+    // receipt lands or none of it does. A group that cannot be attributed
+    // ABORTS the transaction — it does not skip past its own group and leave
+    // the rest committed — and the caller gets a retryable failure, never a
+    // partial success.
+    class AttributionRaceError extends Error {}
+
+    type GroupResult = {
+        category: string;
+        phaseId: string | null;
+        costCode: { id: string; code: string; name: string } | null;
+    };
+
     let created = 0;
+    const warnings: string[] = [];
 
-    for (const group of body.groups) {
-        const amount = Math.round(Number(group.amount) * 100) / 100;
-        if (!Number.isFinite(amount) || amount === 0) continue;
-
-        const costCode = matchCostCode(group.category || "", costCodes);
-        if (!costCode) warnings.push(`No cost code matched "${group.category}" — expense created without a phase`);
-
-        const lineSummary = (group.lines || [])
-            .slice(0, 6)
-            .map(l => l.desc)
-            .filter(Boolean)
-            .join("; ");
-
-        // A MATCHED PHASE IS STILL A CLAIM ABOUT THIS JOB (round 18, item 4).
-        //
-        // `matchCostCode` is a string match over the company's codes; it knows
-        // nothing about which phases this job carries, and nothing here held
-        // the answer still. The invariant locks the four tables it rests on and
-        // answers on the transaction that inserts the row; a code that is not
-        // (or no longer) a phase of this job is dropped rather than posted,
-        // with the same warning an unmatched category already produces.
-        const ingested = await prisma.$transaction(async tx => {
+    try {
+        const results = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
-            // THE PAIR, RE-READ UNDER LOCK (round 21, item 1). `estimateId` was
-            // the project's latest estimate as of a query taken before the
-            // phase lookup, the date resolution and every earlier group in this
-            // loop. An estimate moved to another job in that window would be
-            // written next to the OLD project — one expense on two jobs, which
-            // no report can be right about. The group is skipped rather than
-            // guessed at; the Drive file stays unarchived and re-sends.
-            const pair = await lockEstimateAttribution(raw, estimateId);
-            if (!pair || pair.projectId !== project.id) return { moved: true as const };
-            let phaseId = costCode?.id ?? null;
-            if (phaseId) {
-                // Asked about the LOCKED job, like everything else past this
-                // point. It equals `project.id` by the check above; naming the
-                // locked value keeps that true if the check ever moves.
-                const verdict = await assertPhaseOfProjectTx(
-                    raw,
-                    pair.projectId,
-                    phaseId,
-                );
-                if (!verdict.ok) phaseId = null;
+            const outcomes: GroupResult[] = [];
+            for (const group of body.groups) {
+                const amount = Math.round(Number(group.amount) * 100) / 100;
+                if (!Number.isFinite(amount) || amount === 0) continue;
+
+                const costCode = matchCostCode(group.category || "", costCodes);
+                const lineSummary = (group.lines || [])
+                    .slice(0, 6)
+                    .map(l => l.desc)
+                    .filter(Boolean)
+                    .join("; ");
+
+                // THE PAIR, RE-READ UNDER LOCK (round 21, item 1). `estimateId`
+                // was the project's latest estimate as of a query taken before
+                // the phase lookup, the date resolution and every earlier
+                // group in this loop. An estimate moved to another job in that
+                // window would be written next to the OLD project — one
+                // expense on two jobs, which no report can be right about. A
+                // mismatch aborts the WHOLE transaction (round 31) rather than
+                // skipping just this group, since the groups sharing this
+                // window's outcome share the same receipt.
+                const pair = await lockEstimateAttribution(raw, estimateId);
+                if (!pair || pair.projectId !== project.id) {
+                    throw new AttributionRaceError(
+                        "This job's estimate moved to another job while the receipt was being imported",
+                    );
+                }
+
+                // A MATCHED PHASE IS STILL A CLAIM ABOUT THIS JOB (round 18,
+                // item 4). `matchCostCode` is a string match over the
+                // company's codes; it knows nothing about which phases this
+                // job carries. The invariant locks the four tables it rests on
+                // and answers on this same transaction; a code that is not (or
+                // no longer) a phase of this job is dropped rather than
+                // posted, with the same warning an unmatched category already
+                // produces.
+                let phaseId = costCode?.id ?? null;
+                if (phaseId) {
+                    // Asked about the LOCKED job, like everything else past
+                    // this point. It equals `project.id` by the check above;
+                    // naming the locked value keeps that true if the check
+                    // ever moves.
+                    const verdict = await assertPhaseOfProjectTx(raw, pair.projectId, phaseId);
+                    if (!verdict.ok) phaseId = null;
+                }
+                await tx.expense.create({
+                    data: {
+                        // ONE PAIR, from one locked read.
+                        estimateId: pair.estimateId,
+                        projectId: pair.projectId,
+                        costCodeId: phaseId,
+                        // The category came from the Apps Script's Gemini
+                        // read, not from a person — "ai", never "capture", so
+                        // nothing downstream treats it as a human's answer.
+                        // No confidence: matchCostCode is a string match and
+                        // has no score to report, and inventing one would be
+                        // a guess presented as a measurement.
+                        costCodeSource: phaseId ? "ai" : null,
+                        costCodeConfidence: null,
+                        amount,
+                        vendor: body.vendor || "Unknown",
+                        date,
+                        status: "Pending",
+                        receiptUrl,
+                        description:
+                            `[Drive import] ${docRef} · ${group.category}` +
+                            (lineSummary ? ` · ${lineSummary}` : "") +
+                            ` · pending bookkeeper review`,
+                    },
+                });
+                outcomes.push({ category: group.category, phaseId, costCode });
             }
-            await tx.expense.create({
-            data: {
-                // ONE PAIR, from one locked read.
-                estimateId: pair.estimateId,
-                projectId: pair.projectId,
-                costCodeId: phaseId,
-                // The category came from the Apps Script's Gemini read, not
-                // from a person — "ai", never "capture", so nothing downstream
-                // treats it as a human's answer. No confidence: matchCostCode
-                // is a string match and has no score to report, and inventing
-                // one would be a guess presented as a measurement.
-                costCodeSource: phaseId ? "ai" : null,
-                costCodeConfidence: null,
-                amount,
-                vendor: body.vendor || "Unknown",
-                date,
-                status: "Pending",
-                receiptUrl,
-                description:
-                    `[Drive import] ${docRef} · ${group.category}` +
-                    (lineSummary ? ` · ${lineSummary}` : "") +
-                    ` · pending bookkeeper review`,
-                },
-            });
-            return { moved: false as const, phaseId };
+            return outcomes;
         });
-        if (ingested.moved) {
-            warnings.push(
-                `This job's estimate moved to another job while the receipt was being imported — "${group.category}" was not created`,
-            );
-            continue;
+
+        for (const outcome of results) {
+            if (!outcome.costCode) {
+                warnings.push(`No cost code matched "${outcome.category}" — expense created without a phase`);
+            } else if (outcome.phaseId === null) {
+                warnings.push(
+                    `"${outcome.category}" matched ${outcome.costCode.code}, which is not a phase of this job — expense created without one`,
+                );
+            }
+            created++;
         }
-        if (costCode && ingested.phaseId === null) {
-            warnings.push(
-                `"${group.category}" matched ${costCode.code}, which is not a phase of this job — expense created without one`,
+    } catch (error) {
+        if (error instanceof AttributionRaceError) {
+            // Retryable, not a normal failure shape: the Apps Script's
+            // archive move must NOT happen on this response, so the same
+            // Drive file re-sends and re-attempts against the estimate's
+            // current project.
+            return NextResponse.json(
+                { ok: false, reason: "attribution-race", retryable: true },
+                { status: 409 },
             );
         }
-        created++;
+        throw error;
     }
 
     if (created === 0) {

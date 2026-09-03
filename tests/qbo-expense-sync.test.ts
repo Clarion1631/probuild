@@ -845,12 +845,14 @@ test("sync imports once, is a no-op on repeat, and applies a newer QBO sync toke
         imported: 1,
         updated: 0,
         removed: 0,
+        attributionRaceSkipped: 0,
         skipped: [],
     });
     assert.deepEqual(await syncQboExpenses({ since: new Date("2026-01-01") }, dependencies), {
         imported: 0,
         updated: 0,
         removed: 0,
+        attributionRaceSkipped: 0,
         skipped: [],
     });
 
@@ -863,6 +865,7 @@ test("sync imports once, is a no-op on repeat, and applies a newer QBO sync toke
         imported: 0,
         updated: 1,
         removed: 0,
+        attributionRaceSkipped: 0,
         skipped: [],
     });
     assert.equal(fake.rows.get("purchase-1")?.amount, 175);
@@ -1028,6 +1031,7 @@ test("sync reports and applies QBO removal signals", async () => {
             imported: 0,
             updated: 0,
             removed: 1,
+            attributionRaceSkipped: 0,
             skipped: [],
         },
     );
@@ -1064,6 +1068,7 @@ test("sync deactivates an imported Purchase that no longer maps to an eligible j
             imported: 0,
             updated: 0,
             removed: 1,
+            attributionRaceSkipped: 0,
             skipped: [{
                 qbPurchaseId: "purchase-1",
                 reason: "missing-customer",
@@ -1128,9 +1133,30 @@ test("backfill fixture imports only the active unambiguous job and stays idempot
         imported: 0,
         updated: 0,
         removed: 0,
+        attributionRaceSkipped: 0,
         skipped: first.skipped,
     });
     assert.equal(fake.rows.size, 1);
+});
+
+test("the sync LOOP counts an attribution-race skip separately from imported/updated (round 31, item 2)", async () => {
+    // The bug this replaces: a create-race returned "unchanged", and the loop
+    // that turns per-purchase outcomes into a sync summary only ever counted
+    // "imported"/"updated" — the row a backfill most needs to see (one that
+    // was NEVER created) fell into neither counter and vanished from the
+    // summary entirely.
+    const fake = createFakePrisma([], new Map([["estimate-1", "project-moved"]]));
+    const dependencies = createSyncDependencies(
+        [PURCHASE],
+        ACTIVE_PROJECTS,
+        (write) => upsertQboExpense(fake.client, write),
+    );
+
+    const result = await syncQboExpenses({ since: new Date("2026-01-01") }, dependencies);
+    assert.equal(result.imported, 0);
+    assert.equal(result.updated, 0);
+    assert.equal(result.attributionRaceSkipped, 1, "counted, not silently folded into unchanged");
+    assert.equal(fake.rows.size, 0, "nothing was actually created");
 });
 
 // ── Phase 3 attribution (docs/plans/PHASE-3-ATTRIBUTION-SPEC.md §3.1, §8) ──
@@ -1188,7 +1214,12 @@ test("an estimate MOVED mid-sync is refused, not silently imported onto its new 
     // write is refused instead: nothing is created, and the next sync
     // re-matches against the estimate's current project.
     const fake = createFakePrisma([], new Map([["estimate-1", "project-moved"]]));
-    assert.equal(await upsertQboExpense(fake.client, WRITE), "unchanged");
+    // Distinct from "unchanged" (round 31, item 2): "unchanged" means the row
+    // exists and there was nothing to change, which a backfill's own
+    // idempotency check treats as done. This row was never created at all —
+    // collapsing the two hid a permanently-unimported Purchase inside a count
+    // that looked like a clean no-op rerun.
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "skipped-attribution-race");
     assert.equal(fake.rows.get("purchase-1"), undefined, "nothing is created on a mismatch");
 });
 

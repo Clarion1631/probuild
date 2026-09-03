@@ -22,6 +22,7 @@ function createHandlers(options: { cronEnabled?: boolean; syncError?: Error } = 
                 imported: 2,
                 updated: 1,
                 removed: 0,
+                attributionRaceSkipped: 0,
                 skipped: [{ qbPurchaseId: "purchase-skipped", reason: "no-active-project" }],
             };
         },
@@ -90,6 +91,7 @@ test("POST runs an incremental sync over the configured rolling window", async (
         imported: 2,
         updated: 1,
         removed: 0,
+        attributionRaceSkipped: 0,
         skipped: [{ qbPurchaseId: "purchase-skipped", reason: "no-active-project" }],
     });
     assert.equal(calls.length, 1);

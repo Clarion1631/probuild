@@ -47,15 +47,49 @@ const PRISMA_SPECIFIERS = new Set([
     "../lib/prisma",
 ]);
 
-/** What the LOCKED estimate read answers. A test moves this to model a race. */
+/**
+ * What the LOCKED estimate read answers. A test sets `lockedEstimateProject`
+ * to model every group in the request seeing the same (post-move) answer, or
+ * loads `estimateProjectSequence` to model the project CHANGING partway
+ * through the loop — group 1 sees one answer, group 2 sees another, from the
+ * same request. The sequence is consumed in order and falls back to
+ * `lockedEstimateProject` once exhausted.
+ */
 let lockedEstimateProject: string | null;
+let estimateProjectSequence: (string | null)[];
 let created: Record<string, unknown>[];
 
+/**
+ * Real Postgres only keeps what a transaction actually COMMITS — a throw
+ * inside `prisma.$transaction` rolls back everything the callback wrote, not
+ * just the statement that threw. The fake models that instead of trusting the
+ * route: writes land in a per-call buffer and are merged into `created` only
+ * if the callback resolves; a throw discards the buffer, exactly as ROLLBACK
+ * would.
+ */
 const fakePrisma: any = {
-    $transaction: async (fn: any) => fn(fakePrisma),
+    $transaction: async (fn: any) => {
+        const buffer: Record<string, unknown>[] = [];
+        const txClient = {
+            ...fakePrisma,
+            expense: {
+                ...fakePrisma.expense,
+                create: async (args: { data: Record<string, unknown> }) => {
+                    buffer.push(args.data);
+                    return { id: `exp-${created.length + buffer.length}` };
+                },
+            },
+        };
+        const result = await fn(txClient);
+        created.push(...buffer);
+        return result;
+    },
     $queryRawUnsafe: async (query: string, ...args: any[]) => {
         if (/FROM "Estimate" WHERE id/.test(query) && /"projectId"/.test(query)) {
-            return [{ projectId: lockedEstimateProject }];
+            const projectId = estimateProjectSequence.length > 0
+                ? estimateProjectSequence.shift()!
+                : lockedEstimateProject;
+            return [{ projectId }];
         }
         // The phase invariant. It is not what these tests are about, so it
         // answers "yes, an active phase of this job" throughout.
@@ -126,6 +160,7 @@ before(async () => {
 
 beforeEach(() => {
     lockedEstimateProject = "job-1";
+    estimateProjectSequence = [];
     created = [];
 });
 
@@ -159,28 +194,34 @@ test("the pair is written from the LOCKED estimate, together", async () => {
     assert.equal(created[0].estimateId, "est-1");
 });
 
-test("an estimate MOVED between the match and the insert creates nothing", async () => {
+test("an estimate MOVED between the match and the insert writes nothing, and says so retryably", async () => {
     // Writing job-1 beside an estimate that is now on job-2 is the split. The
-    // group is skipped and the caller is told, so the Drive file stays
-    // unarchived and the next run re-sends it against the current truth.
+    // whole transaction aborts — not just this group — and the caller gets a
+    // distinct retryable failure, so the Drive file stays unarchived and the
+    // next run re-sends it against the current truth.
     lockedEstimateProject = "job-2";
     const res = await post(PAYLOAD);
     const body = await res.json();
     assert.equal(created.length, 0, "nothing was written on either job");
+    assert.equal(res.status, 409);
     assert.equal(body.ok, false);
-    assert.equal(body.reason, "no-valid-groups");
+    assert.equal(body.reason, "attribution-race");
+    assert.equal(body.retryable, true);
 });
 
 test("an estimate that lost its project is refused too, not written as half a pair", async () => {
     lockedEstimateProject = null;
     const res = await post(PAYLOAD);
+    const body = await res.json();
     assert.equal(created.length, 0);
-    assert.equal((await res.json()).ok, false);
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, "attribution-race");
+    assert.equal(body.retryable, true);
 });
 
-test("one moved group does not silently drop the others", async () => {
+test("one moved group aborts the whole receipt, not just itself", async () => {
     // Every group in a document shares the estimate, so a move refuses all of
-    // them — and each refusal is REPORTED rather than counted as a success.
+    // them atomically — nothing from either group lands half-written.
     lockedEstimateProject = "job-2";
     const res = await post({
         ...PAYLOAD,
@@ -191,5 +232,31 @@ test("one moved group does not silently drop the others", async () => {
     });
     const body = await res.json();
     assert.equal(created.length, 0);
-    assert.equal(body.ok, false, "zero valid groups is not a successful ingest");
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, "attribution-race");
+    assert.equal(body.retryable, true);
+});
+
+test("attribution changing BETWEEN group 1 and group 2 rolls back group 1 too", async () => {
+    // The bug this replaces: group 1 committed through its OWN transaction
+    // before the estimate moved, group 2's transaction then saw the new
+    // project and skipped itself — but group 1 was already written, and the
+    // response still said `created > 0`, so a retry reported `alreadyIngested`
+    // with group 2 permanently lost. Group 1's lock read answers "job-1" (a
+    // match), group 2's answers "job-2" (a move) — both from the SAME
+    // request, proving the transaction is one unit, not one per group.
+    estimateProjectSequence = ["job-1", "job-2"];
+    const res = await post({
+        ...PAYLOAD,
+        groups: [
+            { category: "Plumbing", amount: 120.5 },
+            { category: "Framing", amount: 80 },
+        ],
+    });
+    const body = await res.json();
+    assert.equal(created.length, 0, "group 1's write did not survive group 2's abort");
+    assert.equal(res.status, 409);
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, "attribution-race");
+    assert.equal(body.retryable, true);
 });

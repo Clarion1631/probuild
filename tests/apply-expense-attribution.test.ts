@@ -22,6 +22,7 @@ import {
     expectedColumns,
     expectedConstraints,
     expectedIndexes,
+    needsReanchorPredicate,
     pickCompanyTimeZone,
     postDeployStatements,
     PROJECT_ID_BACKFILL,
@@ -359,19 +360,121 @@ test("the script does not swallow the settings query error", () => {
     );
 });
 
-test("the re-anchor is idempotent by MARKER, not by shape", () => {
-    // The time-of-day predicate was the whole guard, and it is not one for a
-    // company configured as UTC: there the rewrite is the identity, so every
-    // row stayed at midnight and stayed eligible forever.
+test("the re-anchor is idempotent by DATE SHAPE, not by the marker (round 31, item 3)", () => {
+    // The marker used to be the gate (`attributionAnchoredAt IS NULL`), on the
+    // reasoning that only a legacy, never-touched row could sit at UTC
+    // midnight. An OLD app instance proves that wrong: its Prisma client
+    // predates the marker column, so it can UPDATE a row this script already
+    // anchored back to UTC midnight without ever touching
+    // `attributionAnchoredAt`. Gating on the marker made the post-deploy
+    // verification blind to exactly that row. The predicate no longer
+    // mentions the marker at all — it asks whether applying the SAME anchor
+    // transform the UPDATE uses would actually change the row's value.
     const sql = reanchorSql("America/Los_Angeles");
-    assert.match(sql, /"attributionAnchoredAt" IS NULL/, "already-anchored rows are skipped");
-    assert.match(sql, /SET[\s\S]*"attributionAnchoredAt" = now\(\)/, "and the fact is recorded");
+    assert.doesNotMatch(
+        sql,
+        /"attributionAnchoredAt" IS NULL/,
+        "the WHERE clause no longer gates on the marker",
+    );
+    assert.match(sql, /SET[\s\S]*"attributionAnchoredAt" = now\(\)/, "the marker is still stamped, as an audit trail");
     // The legacy selector stays: everything written by time-expense-core has
     // always carried a real time-of-day.
     assert.match(sql, /"date"::time = TIME '00:00:00'/);
-    // The marker column ships with the rest of the DDL, in both files.
+    // The self-limiting half: comparing the transform's result against the
+    // stored value is what stops a UTC-configured company from being
+    // rescanned forever (there the transform is the identity, so nothing
+    // ever matches) — the same non-eligible-forever guarantee the marker
+    // existed to buy, without needing the marker to buy it.
+    assert.match(
+        sql,
+        /AT TIME ZONE 'America\/Los_Angeles'\) AT TIME ZONE 'UTC' <> "date"/,
+    );
+    // The marker column still ships with the rest of the DDL, in both files —
+    // it is now pure provenance (when was this row last touched by the
+    // re-anchor), not a gate.
     assert.ok((statements as string[]).some(s => /"attributionAnchoredAt" TIMESTAMP\(3\)/.test(s)));
     assert.match(migrationSql, /"attributionAnchoredAt" TIMESTAMP\(3\)/);
+});
+
+test("the verification query uses the SAME predicate as the UPDATE, not a second copy", () => {
+    // Two independent copies of "does this row need re-anchoring" are two
+    // things that can drift — and the copy that drifts silently is the
+    // VERIFICATION, whose entire job is to be the thing nobody has to trust.
+    const update = reanchorSql("America/Los_Angeles");
+    const predicate = needsReanchorPredicate("America/Los_Angeles");
+    assert.ok(
+        update.includes(predicate),
+        "reanchorSql's WHERE clause must be built from needsReanchorPredicate",
+    );
+    const script = readFileSync(
+        path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
+        "utf8",
+    );
+    assert.match(
+        script,
+        /unanchored\] = await prisma\.\$queryRawUnsafe\(\s*`SELECT COUNT\(\*\)::int AS n FROM "Expense" WHERE \$\{needsReanchorPredicate\(companyTimeZone\)\}`/,
+        "the verification COUNT calls needsReanchorPredicate rather than re-stating the WHERE clause",
+    );
+});
+
+/**
+ * A pure-JS mirror of needsReanchorPredicate's arithmetic, narrowed to a
+ * FIXED-OFFSET zone: Etc/GMT+n never observes DST, so "local midnight is N
+ * hours ahead of UTC" is exact and needs no timezone library to verify by
+ * hand. This does not replace the SQL-text assertions above — it exists only
+ * to prove the PREDICATE'S LOGIC against constructed rows without a live
+ * Postgres to run the real SQL against.
+ */
+function needsReanchorFixedOffset(dateIso: string, utcHourOfLocalMidnight: number): boolean {
+    const date = new Date(dateIso);
+    const isUtcMidnight =
+        date.getUTCHours() === 0 && date.getUTCMinutes() === 0 &&
+        date.getUTCSeconds() === 0 && date.getUTCMilliseconds() === 0;
+    if (!isUtcMidnight) return false;
+    const day = date.toISOString().slice(0, 10);
+    const anchored = new Date(`${day}T${String(utcHourOfLocalMidnight).padStart(2, "0")}:00:00.000Z`);
+    return anchored.getTime() !== date.getTime();
+}
+
+test("pre-pass anchors a legacy row; an old client's later UTC-midnight rewrite is still caught post-pass (round 31, item 3)", () => {
+    // Etc/GMT+8 never observes DST, so local midnight there is always exactly
+    // 08:00 UTC — unlike a real IANA zone, that offset needs no library to
+    // verify.
+    const LOCAL_MIDNIGHT_UTC_HOUR = 8;
+    const day = "2026-07-01";
+
+    // PRE-PASS: a legacy row, never anchored, sitting at raw UTC midnight —
+    // exactly what the old (pre-Phase-3) writer produced.
+    assert.equal(
+        needsReanchorFixedOffset(`${day}T00:00:00.000Z`, LOCAL_MIDNIGHT_UTC_HOUR),
+        true,
+        "a legacy row at UTC midnight needs re-anchoring",
+    );
+
+    // The SAME row after the pre-pass corrects it: no longer at UTC midnight,
+    // so the shape condition alone already excludes it — nothing to catch.
+    const anchoredIso = `${day}T08:00:00.000Z`;
+    assert.equal(
+        needsReanchorFixedOffset(anchoredIso, LOCAL_MIDNIGHT_UTC_HOUR),
+        false,
+        "a correctly-anchored row is left alone",
+    );
+
+    // POST-PASS SCENARIO: an OLD app instance — its Prisma client predates
+    // both `attributionAnchoredAt` and the anchor logic — is still draining
+    // and UPDATEs this SAME row's `date` back to raw UTC midnight. It never
+    // touches the marker column, so `attributionAnchoredAt` stays set from
+    // the pre-pass. A marker-gated predicate would see that and skip the row
+    // forever, and the post-deploy verification would report 0 while the row
+    // sat wrong — the exact gap this fix closes. The shape-based predicate
+    // never consults the marker, so it catches this row exactly as it caught
+    // the untouched legacy one.
+    const corruptedByOldClient = `${day}T00:00:00.000Z`;
+    assert.equal(
+        needsReanchorFixedOffset(corruptedByOldClient, LOCAL_MIDNIGHT_UTC_HOUR),
+        true,
+        "the post-pass predicate catches the old-client rewrite even though the marker is already set",
+    );
 });
 
 test("ReceiptIntake.costCodeSource ships behind the same guard as the other two", () => {
@@ -395,12 +498,15 @@ test("the post-deploy set is a SUBSET of the main run, never a second copy", () 
 
 test("both post-deploy statements are idempotent BY PREDICATE", () => {
     // The whole reason a second pass is safe. The projectId fill only ever
-    // touches a NULL, and the date re-anchor only ever touches a row that has
-    // never been anchored AND is still sitting at UTC midnight — which is
-    // exactly the shape the OLD build writes while it drains.
+    // touches a NULL, and the date re-anchor only ever touches a row that is
+    // still sitting at UTC midnight AND whose company-zone anchor would
+    // actually change it — the shape the OLD build's writes leave behind,
+    // whether that row has ever been anchored before or not (round 31, item 3:
+    // it must NOT be gated on the marker, or an old client's rewrite of an
+    // already-anchored row is invisible to this exact pass).
     const [projectFill, reanchor] = postDeployStatements("America/Los_Angeles");
     assert.match(projectFill, /"projectId" IS NULL/);
-    assert.match(reanchor, /"attributionAnchoredAt" IS NULL/);
+    assert.doesNotMatch(reanchor, /"attributionAnchoredAt" IS NULL/);
     assert.match(reanchor, /"date"::time = TIME '00:00:00'/);
 });
 

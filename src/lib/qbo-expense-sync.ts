@@ -579,7 +579,14 @@ export interface QboExpensePersistenceClient {
     $transaction<T>(callback: (transaction: ExpenseTransaction) => Promise<T>): Promise<T>;
 }
 
-export type QboExpenseUpsertResult = "imported" | "updated" | "unchanged";
+// "skipped-attribution-race" is its OWN outcome, not "unchanged" (round 31,
+// item 2). It means the CREATE never happened at all — the estimate moved
+// between the matcher's read and this transaction's lock, so the row stays
+// permanently unimported until the next sync re-matches it. "unchanged" means
+// the row already exists and nothing about it needed to change, which is a
+// closed loop; a skipped create is an open one, and a backfill counting the
+// two together cannot tell "nothing to do" from "something is still missing".
+export type QboExpenseUpsertResult = "imported" | "updated" | "unchanged" | "skipped-attribution-race";
 
 function isIncomingQboSyncTokenCurrent(current: string | null, incoming: string): boolean {
     if (current === null) return true;
@@ -946,7 +953,12 @@ export async function upsertQboExpense(
                     write.qbPurchaseId,
                     write.estimateId,
                 );
-                return "unchanged";
+                // Distinct from "unchanged" — no row was created at all, and
+                // none will be until a later sync re-matches this Purchase
+                // against wherever its estimate has since landed. Counting it
+                // as "unchanged" made a backfill's own idempotency check blind
+                // to exactly the rows the race leaves permanently unimported.
+                return "skipped-attribution-race";
             }
             await transaction.expense.create({
                 data: { ...write, projectId: pair?.projectId ?? null },
@@ -1467,6 +1479,13 @@ export interface QboExpenseSyncResult {
     imported: number;
     updated: number;
     removed: number;
+    // Rows whose CREATE was skipped mid-sync because the estimate moved
+    // between the matcher's read and the write lock (round 31, item 2). Never
+    // rolled into `skipped` — that array is populated BEFORE the write
+    // attempt (missing customer, equity draw, etc.) and this is a write-time
+    // race, not a match-time decision. A backfill is not complete while this
+    // is nonzero: the row it belongs to was never created at all.
+    attributionRaceSkipped: number;
     skipped: Array<{ qbPurchaseId: string; reason: string }>;
 }
 
@@ -1671,6 +1690,7 @@ export async function syncQboExpenses(
         imported: 0,
         updated: 0,
         removed: 0,
+        attributionRaceSkipped: 0,
         skipped: [...purchaseRead.skipped],
     };
 
@@ -1790,6 +1810,7 @@ export async function syncQboExpenses(
                 });
                 if (outcome === "imported") result.imported += 1;
                 if (outcome === "updated") result.updated += 1;
+                if (outcome === "skipped-attribution-race") result.attributionRaceSkipped += 1;
                 // NO cost-code suggestion here. Overhead is not a job and does
                 // not get a job phase (same scope rule as
                 // scripts/suggest-expense-cost-codes.mjs).
@@ -1843,6 +1864,7 @@ export async function syncQboExpenses(
         });
         if (outcome === "imported") result.imported += 1;
         if (outcome === "updated") result.updated += 1;
+        if (outcome === "skipped-attribution-race") result.attributionRaceSkipped += 1;
 
         // Runs on "unchanged" too: a row imported before Phase 3 is unchanged
         // by definition and is exactly the row that still has no phase. The
