@@ -2,7 +2,6 @@ import { test, expect, type APIRequestContext } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
 import { createHash } from "node:crypto";
 import { saveQBSettings } from "../src/lib/integration-store";
-import { notSweepClaimedWhere, SWEEP_CLAIM_TTL_MS, SWEEP_TASK_CLAIM } from "../src/lib/deposit-sweep";
 
 /**
  * Deposit auto-apply pipeline (Phase B1) — hermetic e2e for
@@ -971,16 +970,6 @@ const B = {
     schedule: "di-e2e-bank-classgate-schedule", amount: 8737.77,
     qbInvoiceId: "di-mock-inv-bank-classgate", bankReference: "e2ebank0000008",
   },
-  // B8: the sweep's review-task claim vs a human taking the same task, on real
-  // rows. The deposit row is seeded already `unmatched` so the POST re-evaluates
-  // it, which is the only path that claims a task.
-  claimRace: {
-    project: "di-e2e-bank-claimrace-project", projectName: "Nnexo Bankclaimrace Project",
-    invoice: "di-e2e-bank-claimrace-invoice", invoiceCode: "INV-DI-BANK-CLAIMRACE",
-    schedule: "di-e2e-bank-claimrace-schedule", amount: 8837.88,
-    qbInvoiceId: "di-mock-inv-bank-claimrace", bankReference: "e2ebank0000009",
-    task: "di-e2e-bank-claimrace-task",
-  },
   bankFirst: {
     project: "di-e2e-bank-bankfirst-project", projectName: "Nnexo Bankbankfirst Project",
     invoice: "di-e2e-bank-bankfirst-invoice", invoiceCode: "INV-DI-BANK-BANKFIRST",
@@ -992,18 +981,18 @@ const B = {
 
 const BANK_PROJECT_IDS = [
   B.replay.project, B.collide.project, B.dry.project, B.prebooked.project,
-  B.photoFirst.project, B.bankFirst.project, B.classGate.project, B.claimRace.project,
+  B.photoFirst.project, B.bankFirst.project, B.classGate.project,
 ];
 const BANK_FILE_IDS = [
   `bank:${B.replay.bankReference}`, `bank:${B.collide.refA}`, `bank:${B.collide.refB}`,
   `bank:${B.dry.bankReference}`, `bank:${B.prebooked.bankReference}`,
   `bank:${B.photoFirst.bankReference}`, `bank:${B.bankFirst.bankReference}`,
-  `bank:${B.classGate.bankReference}`, `bank:${B.claimRace.bankReference}`,
+  `bank:${B.classGate.bankReference}`,
   B.photoFirst.fileId, B.bankFirst.fileId,
 ];
 const BANK_SCHEDULE_IDS = [
   B.replay.schedule, B.collide.schedule, B.dry.schedule, B.prebooked.schedule,
-  B.photoFirst.schedule, B.bankFirst.schedule, B.classGate.schedule, B.claimRace.schedule,
+  B.photoFirst.schedule, B.bankFirst.schedule, B.classGate.schedule,
 ];
 
 type BankCreditSpec = {
@@ -1072,7 +1061,7 @@ test.describe.serial("Deposit sweep — bank source", () => {
     // The QBO mock replaces the network, not the connection state.
     await saveQBSettings({ connected: true, accessToken: "e2e-mock", refreshToken: "e2e-mock", realmId: "e2e-mock-realm" });
 
-    for (const f of [B.replay, B.collide, B.dry, B.prebooked, B.bankFirst, B.classGate, B.claimRace]) {
+    for (const f of [B.replay, B.collide, B.dry, B.prebooked, B.bankFirst, B.classGate]) {
       await seedFixture({
         projectId: f.project, projectName: f.projectName,
         invoiceId: f.invoice, invoiceCode: f.invoiceCode,
@@ -1099,7 +1088,6 @@ test.describe.serial("Deposit sweep — bank source", () => {
       for (const fileId of BANK_FILE_IDS) {
         await prisma.officeTask.deleteMany({ where: { notes: { contains: fileId } } });
       }
-      await prisma.officeTask.deleteMany({ where: { id: B.claimRace.task } });
       await prisma.depositIngest.deleteMany({ where: { fileId: { in: BANK_FILE_IDS } } });
       await prisma.invoice.deleteMany({ where: { projectId: { in: BANK_PROJECT_IDS } } }); // cascades PaymentSchedule
       await prisma.project.deleteMany({ where: { id: { in: BANK_PROJECT_IDS } } });
@@ -1315,78 +1303,5 @@ test.describe.serial("Deposit sweep — bank source", () => {
     expect(noAuth.status()).toBe(401);
 
     expect(await prisma.depositIngest.count(), "a refused batch writes no rows at all").toBe(before);
-  });
-
-  // — B8: review-task mutual exclusion, on real Postgres rows —
-  test("B8: the sweep's task claim and a human's write exclude each other on real rows", async ({ request }) => {
-    await resetQboMock(request);
-    await seedQboInvoice(request, B.claimRace.qbInvoiceId, B.claimRace.amount, "di-mock-cust-bank-claimrace");
-
-    const fileId = `bank:${B.claimRace.bankReference}`;
-    const seedUnmatchedRow = async () => {
-      await prisma.officeTask.deleteMany({ where: { id: B.claimRace.task } });
-      await prisma.depositIngest.deleteMany({ where: { fileId } });
-      await prisma.officeTask.create({
-        data: {
-          id: B.claimRace.task, title: `Deposit needs review (unmatched): ${fileId}`,
-          columnId: "di-e2e-office-column", status: "To Do", position: 0,
-          notes: `Reason: seeded for B8\nExtraction: ${fileId}`,
-        },
-      });
-      await prisma.depositIngest.create({
-        data: {
-          fileId, status: "unmatched", source: "bank", bankReference: B.claimRace.bankReference,
-          extracted: JSON.stringify({ fileId, amount: B.claimRace.amount, projectName: "" }),
-          attempts: 1, amountCents: Math.round(B.claimRace.amount * 100),
-          postDate: new Date(`${B.postDate}T00:00:00.000Z`),
-          lastError: "no requested pending milestone matches", officeTaskId: B.claimRace.task,
-        },
-      });
-    };
-
-    // The exclusion predicate itself, against a REAL row and a real @updatedAt.
-    // This is the same fragment every human mutation in src/lib/actions.ts
-    // carries (assign, move, archive, delete) — asserted here on Postgres
-    // rather than on an in-memory fake.
-    const humanAssign = () => prisma.officeTask.updateMany({
-      where: { id: B.claimRace.task, ...notSweepClaimedWhere() },
-      data: { assigneeId: null, title: "TAKEN BY A HUMAN" },
-    });
-
-    await seedUnmatchedRow();
-
-    // 1. A LIVE claim refuses the human write.
-    await prisma.officeTask.update({
-      where: { id: B.claimRace.task },
-      data: { status: SWEEP_TASK_CLAIM },
-    });
-    expect((await humanAssign()).count, "a live sweep claim must refuse a human write").toBe(0);
-
-    // 2. A STALE claim (a sweep that crashed) does not block anybody.
-    await prisma.$executeRaw`UPDATE "OfficeTask" SET "updatedAt" = ${new Date(Date.now() - SWEEP_CLAIM_TTL_MS - 60_000)} WHERE id = ${B.claimRace.task}`;
-    expect((await humanAssign()).count, "a stale claim must not block a human forever").toBe(1);
-
-    // 3. The real race: the sweep's POST (which claims the task, then books)
-    //    against a human write, both against the same row, concurrently.
-    await seedUnmatchedRow();
-    const [sweep] = await Promise.all([
-      postBankBatch(request, { credits: [{ bankReference: B.claimRace.bankReference, amount: B.claimRace.amount }] }),
-      humanAssign(),
-    ]);
-
-    const credit = bankCredit(sweep.body, B.claimRace.bankReference);
-    const task = await prisma.officeTask.findUniqueOrThrow({ where: { id: B.claimRace.task } });
-    const schedule = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.claimRace.schedule } });
-    const humanWon = task.title === "TAKEN BY A HUMAN";
-
-    // EXACTLY ONE of them wins, and the loser must not have written money.
-    if (humanWon) {
-      expect(credit.status, "if the human took the task, the sweep must not have booked").not.toBe("applied");
-      expect(schedule.status).toBe("Pending");
-    } else {
-      expect(["applied", "reconcile", "unmatched", "proposed"]).toContain(credit.status);
-    }
-    // Whatever the order, there is never a payment AND a human owner.
-    expect(humanWon && schedule.status === "Paid", "both actors must never win").toBe(false);
   });
 });

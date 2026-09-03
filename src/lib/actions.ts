@@ -131,7 +131,6 @@ import {
     unreadThreadCommentCount,
 } from "./selection-item-thread-core";
 import { findThreadItem } from "./selection-item-thread-dependencies";
-import { SWEEP_CLAIM_BUSY_MESSAGE, notSweepClaimedWhere } from "./deposit-sweep";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -14584,25 +14583,6 @@ export async function createOfficeTask(data: {
     return task;
 }
 
-/**
- * MUTUAL EXCLUSION WITH THE DEPOSIT SWEEP (gate review H1).
- *
- * The sweep claims a deposit's review task before it re-evaluates the credit,
- * by writing SWEEP_TASK_CLAIM into OfficeTask.status, and re-asserts that claim
- * immediately before each QuickBooks write (see claimReviewTask /
- * sweepStillOwnsTask in src/app/api/payments/deposit-ingest/route.ts). Without
- * the other half of the rule here, a human assigning or moving the task a
- * microsecond after the sweep's assertion would "win" while the sweep went on
- * to create the invoice anyway %s both actors believing they owned it.
- *
- * So every mutation below carries this predicate IN ITS WHERE, as a CAS rather
- * than a read-then-write, and reports a lost race instead of silently doing
- * nothing. A claim older than SWEEP_CLAIM_TTL_MS belongs to a sweep that
- * crashed and may be overridden freely; the sweep treats such a claim as lost
- * on its own side, so the two rules cannot disagree.
- */
-const notSweepClaimed = () => notSweepClaimedWhere();
-
 export async function updateOfficeTask(id: string, data: {
     title?: string;
     notes?: string | null;
@@ -14621,19 +14601,9 @@ export async function updateOfficeTask(id: string, data: {
     if (data.aiPrompt !== undefined) updateData.aiPrompt = data.aiPrompt || null;
     if (data.automationGap !== undefined) updateData.automationGap = data.automationGap || null;
 
-    const claimed = await prisma.officeTask.updateMany({
-        where: { id, ...notSweepClaimed() },
-        data: updateData,
-    });
-    if (claimed.count === 0) {
-        // Either the task is gone or the sweep holds a live claim on it. Only
-        // the second is worth a special message; a missing task falls through
-        // to the same "not found" shape the read below produces.
-        const held = await prisma.officeTask.findUnique({ where: { id }, select: { id: true } });
-        throw new Error(held ? SWEEP_CLAIM_BUSY_MESSAGE : "Task not found");
-    }
-    const task = await prisma.officeTask.findUnique({
+    const task = await prisma.officeTask.update({
         where: { id },
+        data: updateData,
         include: { assignee: { select: { id: true, name: true, email: true } } },
     });
 
@@ -14668,13 +14638,10 @@ export async function moveOfficeTask(id: string, columnId: string, newIndex: num
         for (let i = 0; i < targetTasks.length; i++) {
             const t = targetTasks[i];
             if (t.id === id) {
-                // CAS: a live sweep claim refuses the move, and the throw rolls
-                // back the whole renumbering with it.
-                const moved = await tx.officeTask.updateMany({
-                    where: { id: t.id, ...notSweepClaimed() },
+                await tx.officeTask.update({
+                    where: { id: t.id },
                     data: { position: i, columnId, status: column.name }, // TRANSITIONAL COMPAT — see OfficeTask.status
                 });
-                if (moved.count === 0) throw new Error(SWEEP_CLAIM_BUSY_MESSAGE);
             } else {
                 await tx.officeTask.update({
                     where: { id: t.id },
@@ -14704,11 +14671,7 @@ export async function moveOfficeTask(id: string, columnId: string, newIndex: num
 export async function deleteOfficeTask(id: string) {
     await assertOfficeTaskAccess();
 
-    const removed = await prisma.officeTask.deleteMany({ where: { id, ...notSweepClaimed() } });
-    if (removed.count === 0) {
-        const held = await prisma.officeTask.findUnique({ where: { id }, select: { id: true } });
-        if (held) throw new Error(SWEEP_CLAIM_BUSY_MESSAGE);
-    }
+    await prisma.officeTask.delete({ where: { id } });
 
     revalidatePath("/tasks");
     return { success: true };
@@ -14717,14 +14680,7 @@ export async function deleteOfficeTask(id: string) {
 export async function archiveOfficeTask(id: string) {
     await assertOfficeTaskAccess();
 
-    const archived = await prisma.officeTask.updateMany({
-        where: { id, ...notSweepClaimed() },
-        data: { archivedAt: new Date() },
-    });
-    if (archived.count === 0) {
-        const held = await prisma.officeTask.findUnique({ where: { id }, select: { id: true } });
-        if (held) throw new Error(SWEEP_CLAIM_BUSY_MESSAGE);
-    }
+    await prisma.officeTask.update({ where: { id }, data: { archivedAt: new Date() } });
 
     revalidatePath("/tasks");
     return { success: true };
