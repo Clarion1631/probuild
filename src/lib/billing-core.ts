@@ -14,6 +14,54 @@ function revalidatePath(path: string) {
 }
 import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import {
+    isBlockedByAmbiguousCreate,
+    isQboInvoiceLinkedOrPending,
+    pendingCreateMarkerWhere,
+    QBResolveRequiredError, milestoneSendBlockedReason,
+} from "./qbo-create-markers";
+import {
+    createRouteDeadline,
+    isBudgetExhausted,
+    isQBBudgetExhaustedError,
+    isQboConnectionFailure,
+    isQBTimeoutError,
+    isQBTokenStrandedError,
+    type RouteDeadline,
+} from "./quickbooks";
+
+/**
+ * Whole-call budget for the QuickBooks-heavy billing paths, under the 60s
+ * server-action ceiling and leaving room to return a result.
+ *
+ * Each of these functions walks a LIST of milestones doing several serial QBO
+ * calls each. Bounding the individual calls is not enough: during the
+ * 2026-09-01 outage every row burned a fresh 20s deadline against the same
+ * wall, so the SUM still ran to the platform ceiling and the action was killed
+ * with nothing reported. One budget, created at the entry, threaded through
+ * every call — and the loops stop on a connection-level failure instead of
+ * proving it once per row.
+ */
+export const BILLING_QBO_BUDGET_MS = 45_000;
+
+/**
+ * Is this the shared wall — the failure the NEXT row would hit identically?
+ *
+ * A business refusal ("this milestone is already paid") is per row and the loop
+ * carries on past it. A timeout, a 429/5xx, a 401/403 or a stranded token is
+ * the connection, and every remaining row would spend its own full deadline
+ * rediscovering that.
+ */
+export function isSharedQboWall(error: unknown): boolean {
+    return isQBBudgetExhaustedError(error) || isQboConnectionFailure(error) || isQBTokenStrandedError(error);
+}
+
+/** What to tell the user about a row we never got to. */
+export function outageNote(error: unknown): string {
+    return isQBTimeoutError(error)
+        ? "QuickBooks stopped responding — not attempted. Try again in a few minutes."
+        : "QuickBooks is unavailable — not attempted. Try again in a few minutes.";
+}
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
@@ -586,7 +634,8 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
  * possible), then send the ProBuild invoice email with its always-current portal
  * link. QuickBooks being disconnected downgrades to a plain resend, not a failure.
  */
-export async function resendInvoiceCore(invoiceId: string, overrideEmail?: string) {
+export async function resendInvoiceCore(invoiceId: string, overrideEmail?: string, deadline?: RouteDeadline) {
+    const qbDeadline = deadline ?? createRouteDeadline(BILLING_QBO_BUDGET_MS);
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
         include: { payments: { select: { id: true, name: true, qbInvoiceId: true, status: true } } },
@@ -599,16 +648,22 @@ export async function resendInvoiceCore(invoiceId: string, overrideEmail?: strin
         try {
             const { getFreshQBTokens, pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
             const { getQBInvoicePaymentLink } = await import("./quickbooks");
-            const tokens = await getFreshQBTokens();
-            for (const m of qbMilestones) {
+            const tokens = await getFreshQBTokens(qbDeadline);
+            for (const [index, m] of qbMilestones.entries()) {
+                if (isBudgetExhausted(qbDeadline)) {
+                    for (const rest of qbMilestones.slice(index)) {
+                        linkRefresh.push({ milestone: rest.name, refreshed: false, error: "Out of time — link not refreshed (the portal link still works)." });
+                    }
+                    break;
+                }
                 try {
                     // pushMilestoneToQuickBooks repairs voided/notFound state but reuses a
                     // stored link when one exists — fetch the CURRENT link from QBO so a
                     // stale stored value can't be handed back as "refreshed".
-                    const res = await pushMilestoneToQuickBooks(m.id, tokens);
+                    const res = await pushMilestoneToQuickBooks(m.id, tokens, qbDeadline);
                     let payLink = res.payLink || undefined;
                     if (res.qbInvoiceId) {
-                        const liveLink = await getQBInvoicePaymentLink(tokens, res.qbInvoiceId);
+                        const liveLink = await getQBInvoicePaymentLink(tokens, res.qbInvoiceId, qbDeadline);
                         if (liveLink) {
                             if (liveLink !== payLink) {
                                 await prisma.paymentSchedule.update({ where: { id: m.id }, data: { qbInvoiceLink: liveLink } });
@@ -619,6 +674,14 @@ export async function resendInvoiceCore(invoiceId: string, overrideEmail?: strin
                     linkRefresh.push({ milestone: m.name, refreshed: true, payLink });
                 } catch (err: any) {
                     linkRefresh.push({ milestone: m.name, refreshed: false, error: err?.message || "refresh failed" });
+                    // The wall is shared: every remaining milestone would spend
+                    // another full deadline discovering the same thing.
+                    if (isSharedQboWall(err)) {
+                        for (const rest of qbMilestones.slice(index + 1)) {
+                            linkRefresh.push({ milestone: rest.name, refreshed: false, error: outageNote(err) });
+                        }
+                        break;
+                    }
                 }
             }
         } catch {
@@ -778,6 +841,7 @@ export async function sendMilestoneInvoicesCore(
     // optimistic-lock token (we only reconcile if the live QBO total still matches).
     opts: { reconcile?: Record<string, number> } | undefined,
     actorName: string,
+    deadline?: RouteDeadline,
 ): Promise<{
     success: boolean;
     sent: number;
@@ -810,9 +874,11 @@ export async function sendMilestoneInvoicesCore(
         const { getFreshQBTokens, pushMilestoneToQuickBooks, reconcileMilestoneToQbo } = await import("./quickbooks-payments");
         const { getQBInvoiceStatus, getQBInvoicePaymentLink } = await import("./quickbooks");
 
+        // ONE budget for the whole send, whatever it turns out to touch.
+        const sendDeadline = deadline ?? createRouteDeadline(BILLING_QBO_BUDGET_MS);
         let tokens;
         try {
-            tokens = await getFreshQBTokens();
+            tokens = await getFreshQBTokens(sendDeadline);
         } catch (qbErr: any) {
             return {
                 success: false,
@@ -839,10 +905,35 @@ export async function sendMilestoneInvoicesCore(
         // is the NEW amount, so the email never quotes the stale pre-reconcile one.
         const sendable: Array<{ schedule: (typeof selectedPayments)[number]; wasReconciled: boolean; effectiveAmount: number }> = [];
 
+        // Set when the loop hits the shared wall: every row after it is
+        // reported as not attempted rather than spending its own deadline.
+        let qboWall: unknown = null;
         for (const schedule of selectedPayments) {
+            if (qboWall) {
+                skippedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: outageNote(qboWall) });
+                continue;
+            }
+            if (isBudgetExhausted(sendDeadline)) {
+                skippedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: "Out of time — not attempted. Send the rest in a second batch." });
+                continue;
+            }
             if (schedule.status === "Paid" || schedule.status === "Canceled") {
                 skippedCount++;
                 results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: "Milestone is already paid or canceled" });
+                continue;
+            }
+            // The ONE send predicate (qbo-create-markers.ts). Status alone was not
+            // enough: an ALREADY-LINKED row never reaches pushMilestoneToQuickBooks,
+            // where the marker guards live, so a milestone whose QuickBooks invoice
+            // was queued for deletion — or parked by an unknown-outcome create, or
+            // settled outside QuickBooks — could still be emailed to the client
+            // with a pay link for a document about to vanish, or already paid.
+            const blocked = milestoneSendBlockedReason(schedule);
+            if (blocked) {
+                skippedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: `Not sent: ${blocked}` });
                 continue;
             }
 
@@ -858,10 +949,10 @@ export async function sendMilestoneInvoicesCore(
                 let qbTotal: number | undefined;
 
                 if (qbInvoiceId) {
-                    const status = await getQBInvoiceStatus(tokens, qbInvoiceId);
+                    const status = await getQBInvoiceStatus(tokens, qbInvoiceId, sendDeadline);
                     qbTotal = status?.total;
                 } else {
-                    const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens);
+                    const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens, sendDeadline);
                     qbInvoiceId = pushRes.qbInvoiceId;
                     qbTotal = pushRes.qbTotal;
                 }
@@ -953,6 +1044,9 @@ export async function sendMilestoneInvoicesCore(
             } catch (err: any) {
                 failedCount++;
                 results.push({ id: schedule.id, name: schedule.name, status: "failed", error: err?.message || "Unexpected error during send" });
+                // Connection-level: stop. Continuing spends a fresh deadline per
+                // row against the same wall — six of those was the whole outage.
+                if (isSharedQboWall(err)) qboWall = err;
             }
         }
 
@@ -968,12 +1062,17 @@ export async function sendMilestoneInvoicesCore(
             // still works when a link can't be fetched).
             for (const { schedule } of sendable) {
                 if (!schedule.qbInvoiceId) continue;
+                if (isBudgetExhausted(sendDeadline)) break;
                 try {
-                    const liveLink = await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId);
+                    const liveLink = await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId, sendDeadline);
                     if (liveLink && liveLink !== schedule.qbInvoiceLink) {
                         await prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceLink: liveLink } });
                     }
-                } catch { /* link refresh is best-effort */ }
+                } catch (err) {
+                    // Best-effort, but not blindly: on the shared wall the rest
+                    // of this loop is pure cost, and the email still goes out.
+                    if (isSharedQboWall(err)) break;
+                }
             }
 
             let emailFailed = false;
@@ -2249,8 +2348,12 @@ export type RebalanceMilestoneRow = { scheduleId: string; name: string; amount: 
 export async function updatePendingMilestoneAmountsCore(
     invoiceId: string,
     rows: RebalanceMilestoneRow[],
+    deadline?: RouteDeadline,
 ): Promise<{ success: true; warnings: string[] }> {
     if (!rows.length) throw new Error("At least one milestone row is required");
+    // ONE budget: the preflight probes and the post-commit re-stage are two
+    // loops of serial QBO calls in the same request.
+    const qbDeadline = deadline ?? createRouteDeadline(BILLING_QBO_BUDGET_MS);
 
     const parsed = rows.map((r) => ({
         scheduleId: r.scheduleId,
@@ -2297,7 +2400,7 @@ export async function updatePendingMilestoneAmountsCore(
         const { probeQBInvoice } = await import("./quickbooks");
         let tokens;
         try {
-            tokens = await getFreshQBTokens();
+            tokens = await getFreshQBTokens(qbDeadline);
         } catch (e) {
             throw new Error(
                 `QuickBooks is unreachable (${e instanceof Error ? e.message : "unknown error"}) and this rebalance changes milestones with staged QuickBooks invoices. ` +
@@ -2305,7 +2408,15 @@ export async function updatePendingMilestoneAmountsCore(
             );
         }
         for (const row of preflightChanged) {
-            const probe = await probeQBInvoice(tokens, row.qbInvoiceId!);
+            // The preflight is all-or-nothing anyway: running out of budget
+            // part-way means the remaining rows were never verified, so it
+            // aborts rather than committing on a partial check.
+            if (isBudgetExhausted(qbDeadline)) {
+                throw new Error(
+                    `Ran out of time verifying the staged QuickBooks invoices for this rebalance — nothing was changed. Try again in a moment.`
+                );
+            }
+            const probe = await probeQBInvoice(tokens, row.qbInvoiceId!, qbDeadline);
             if (probe.state === "error") {
                 throw new Error(`Couldn't verify "${row.name}"'s staged QuickBooks invoice — nothing was changed. Retry in a moment.`);
             }
@@ -2318,7 +2429,13 @@ export async function updatePendingMilestoneAmountsCore(
         }
     }
 
-    type QBAffected = { scheduleId: string; name: string; oldQbInvoiceId: string };
+    type QBAffected = {
+        scheduleId: string;
+        name: string;
+        oldQbInvoiceId: string;
+        /** The marker the row carried when the rebalance read it; pinned by the unlink. */
+        oldQbSyncError: string | null;
+    };
 
     const qbAffected = await withTxRetry(() => prisma.$transaction(async (tx) => {
         // Canonical lock order: Estimate → Invoice → schedules. The mirror sync
@@ -2336,6 +2453,14 @@ export async function updatePendingMilestoneAmountsCore(
             if (row.status !== "Pending") throw new Error(`"${row.name}" is not Pending — only pending milestones can be rebalanced`);
             if (row.stripeSessionId || row.stripePaymentIntentId) {
                 throw new Error(`A payment is in progress on "${row.name}". Wait for it to finish or void it before rebalancing.`);
+            }
+            // A parked row has no qbInvoiceId, so the QB preflight above never
+            // saw it — but an invoice for the OLD amount may be sitting in
+            // QuickBooks. Repricing it would leave the client paying one number
+            // while ProBuild settles another. Rebalances that leave this row's
+            // content alone are still fine.
+            if (isBlockedByAmbiguousCreate(row) && contentChanged(row, r)) {
+                throw new QBResolveRequiredError(row.name);
             }
         }
 
@@ -2385,7 +2510,10 @@ export async function updatePendingMilestoneAmountsCore(
             // confirmed still payment-free and actually deleted, so a payment that
             // landed in QBO can never be orphaned behind a cleared link.
             if (row.qbInvoiceId && contentChanged(row, r)) {
-                affected.push({ scheduleId: row.id, name: r.name, oldQbInvoiceId: row.qbInvoiceId });
+                affected.push({
+                    scheduleId: row.id, name: r.name, oldQbInvoiceId: row.qbInvoiceId,
+                    oldQbSyncError: row.qbSyncError ?? null,
+                });
             }
 
             await tx.paymentSchedule.update({
@@ -2428,10 +2556,19 @@ export async function updatePendingMilestoneAmountsCore(
         try {
             const { getFreshQBTokens, pushMilestoneToQuickBooks, claimQBInvoiceUnlink } = await import("./quickbooks-payments");
             const { deleteQBInvoice, probeQBInvoice } = await import("./quickbooks");
-            const tokens = await getFreshQBTokens();
+            const tokens = await getFreshQBTokens(qbDeadline);
+            let qboWall: unknown = null;
             for (const row of qbAffected) {
+                if (qboWall) {
+                    warnings.push(`"${row.name}": ${outageNote(qboWall)} Its QuickBooks invoice still shows the old details — re-stage it via "QuickBooks Link".`);
+                    continue;
+                }
+                if (isBudgetExhausted(qbDeadline)) {
+                    warnings.push(`"${row.name}": ran out of time before replacing its QuickBooks invoice — it still shows the old details. Re-stage it via "QuickBooks Link".`);
+                    continue;
+                }
                 try {
-                    const probe = await probeQBInvoice(tokens, row.oldQbInvoiceId);
+                    const probe = await probeQBInvoice(tokens, row.oldQbInvoiceId, qbDeadline);
                     if (probe.state === "error") {
                         warnings.push(`"${row.name}": couldn't reach QuickBooks to replace the staged invoice — it still shows the old details. Retry, or use "Break QB Link" and re-stage.`);
                         continue;
@@ -2445,19 +2582,33 @@ export async function updatePendingMilestoneAmountsCore(
                         continue;
                     }
                     const alreadyGone = probe.state === "voided" || probe.state === "notFound";
-                    if (!alreadyGone && !(await deleteQBInvoice(tokens, row.oldQbInvoiceId))) {
-                        warnings.push(`"${row.name}": couldn't delete the old QuickBooks invoice — it still shows the old details. Retry, or use "Break QB Link" and re-stage.`);
-                        continue;
+                    // A `false` return is CONFIRMED ABSENCE (see deleteQBInvoice),
+                    // which is the same end state as a successful delete and a
+                    // reason to go on to the unlink below. It used to be read as
+                    // "could not delete", so an invoice a human had already
+                    // removed in QuickBooks kept its stale link and warned about
+                    // details it no longer had. A REFUSAL throws, and the
+                    // surrounding catch turns that into this row's warning.
+                    if (!alreadyGone) {
+                        await deleteQBInvoice(tokens, row.oldQbInvoiceId, qbDeadline);
                     }
                     // Old QBO invoice is confirmed gone — now clear the link, atomically
                     // (a concurrent settle still wins the claim and we stop here).
-                    if (!(await claimQBInvoiceUnlink(prisma, row.scheduleId, row.oldQbInvoiceId))) {
+                    // Pinned to the marker this row carried when the rebalance read
+                    // it, so a create claim or a pending-deletion landing during the
+                    // probe/delete above loses this write instead of being erased.
+                    if (!(await claimQBInvoiceUnlink(
+                        prisma, row.scheduleId, row.oldQbInvoiceId, row.oldQbSyncError,
+                    ))) {
                         warnings.push(`"${row.name}": milestone changed while replacing its QuickBooks invoice — refresh and review before re-staging.`);
                         continue;
                     }
-                    await pushMilestoneToQuickBooks(row.scheduleId, tokens);
+                    await pushMilestoneToQuickBooks(row.scheduleId, tokens, qbDeadline);
                 } catch (e) {
                     warnings.push(`"${row.name}": QuickBooks re-stage failed (${e instanceof Error ? e.message : "unknown error"}) — re-stage it via "QuickBooks Link".`);
+                    // Shared wall: the remaining rows get the same warning
+                    // without spending another full deadline each.
+                    if (isSharedQboWall(e)) qboWall = e;
                 }
             }
         } catch (e) {
@@ -2499,11 +2650,41 @@ export async function deleteInvoiceMilestoneCore(
         if (locked.qbInvoiceId) {
             throw new Error(`This milestone has a QuickBooks invoice staged — break the QuickBooks link first, then delete.`);
         }
+        // A parked milestone has NO qbInvoiceId and may still have a real,
+        // collectible invoice in QuickBooks. Deleting it here would abandon that
+        // invoice with nothing in ProBuild pointing at it.
+        if (isQboInvoiceLinkedOrPending(locked)) {
+            throw new QBResolveRequiredError(locked.name);
+        }
         if (locked.stripeSessionId || locked.stripePaymentIntentId) {
             throw new Error("A payment is in progress on this milestone — wait for it to finish or void it before deleting");
         }
 
-        await tx.paymentSchedule.delete({ where: { id: scheduleId } });
+        // Re-assert every deletable-state predicate checked above IN the delete
+        // itself, not just at the read. The milestone-rail's in-flight claim
+        // (pushMilestoneToQuickBooksCore in quickbooks-payments.ts) writes its
+        // `qbSyncError` CAS with a bare `updateMany` outside this transaction —
+        // `lockMoneyParents` above does not serialize against it. A push that
+        // lands its claim in the gap between the read and the delete would
+        // otherwise get an unconditional delete-by-id anyway, wiping the row
+        // (and its in-flight claim) out from under a create that may already be
+        // landing at QuickBooks, leaving a real invoice with nothing in
+        // ProBuild pointing at it. `deleteMany` with the same predicates makes
+        // this a CAS: it deletes only if nothing changed since the read.
+        const deleted = await tx.paymentSchedule.deleteMany({
+            where: {
+                id: scheduleId,
+                status: "Pending",
+                sourceScheduleId: null,
+                qbInvoiceId: null,
+                qbSyncError: null,
+                stripeSessionId: null,
+                stripePaymentIntentId: null,
+            },
+        });
+        if (deleted.count !== 1) {
+            throw new Error("This milestone changed while being deleted — refresh and try again.");
+        }
 
         const invoice = await tx.invoice.findUnique({ where: { id: locked.invoiceId } });
         if (!invoice) throw new Error("Invoice not found");
@@ -2606,6 +2787,11 @@ export async function splitInvoiceMilestonesCore(
                     { stripeSessionId: { not: null } },
                     { stripePaymentIntentId: { not: null } },
                     { qbInvoiceId: { not: null } },
+                    // A create whose outcome is unknown counts as in flight: the
+                    // id is null but a collectible invoice may exist, and the
+                    // re-split below drops the row that would settle it. Prefix
+                    // matched, because a marker carries a per-issuance identity.
+                    ...pendingCreateMarkerWhere(),
                 ],
             },
             select: { name: true },

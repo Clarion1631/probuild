@@ -3,8 +3,10 @@
 import { prisma } from "./prisma";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
 import { createVendor, updateVendor, getVendors } from "./actions";
+import { assertActiveStaff } from "./permissions";
 
 export async function createVendorWithFiles(payload: any) {
+    await assertActiveStaff();
     const { filesToUpload, ...vendorData } = payload;
     
     const v = await createVendor(vendorData);
@@ -18,6 +20,7 @@ export async function createVendorWithFiles(payload: any) {
 }
 
 export async function updateVendorWithFiles(id: string, payload: any) {
+    await assertActiveStaff();
     const { filesToUpload, ...vendorData } = payload;
     
     await updateVendor(id, vendorData);

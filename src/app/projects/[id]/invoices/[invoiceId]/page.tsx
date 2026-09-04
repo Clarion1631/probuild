@@ -1,4 +1,5 @@
 import { getProject } from "@/lib/actions";
+import { currentStaffUserOrNull, canResolveAmbiguousCreate } from "@/lib/permissions";
 import { getInvoice } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import { fetchCheckEvidenceForPayments, type CheckEvidence } from "@/lib/check-evidence";
@@ -44,9 +45,23 @@ export default async function InvoicePage({ params }: { params: Promise<{ id: st
         console.error("check evidence fetch failed", error instanceof Error ? error.message : "UnknownError");
     }
 
+    // "Resolve in QuickBooks" is narrower than the `invoices` permission:
+    // the resolver core refuses anyone who is not ADMIN or FINANCE, so a
+    // MANAGER with full invoice access was being offered a button that could
+    // only ever answer "forbidden". Decided here with the SAME predicate the
+    // server enforces (canResolveAmbiguousCreate) rather than a second copy
+    // of the role list, so the two cannot drift.
+    const viewer = await currentStaffUserOrNull();
+    const canResolveQbCreate = !!viewer && canResolveAmbiguousCreate(viewer);
+
     return (
         <div className="h-full bg-slate-50 relative">
-            <InvoiceEditor project={project} initialInvoice={initialInvoice} checkEvidence={checkEvidence} />
+            <InvoiceEditor
+                project={project}
+                initialInvoice={initialInvoice}
+                checkEvidence={checkEvidence}
+                canResolveQbCreate={canResolveQbCreate}
+            />
         </div>
     );
 }

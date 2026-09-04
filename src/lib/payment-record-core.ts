@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum } from "./prisma-helpers";
+import { PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER, PENDING_DELETION_CLAIMED_PREFIX, isIrreversibleClaimHeld } from "./qbo-create-markers";
 
 /**
  * Manual (non-QuickBooks) milestone settlement core — the transaction body of
@@ -58,6 +59,17 @@ export async function recordPaymentCore(
         if (!payment) return { success: false as const, error: "Milestone not found" };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" };
         if (payment.invoiceId !== invoiceId) return { success: false as const, error: "Milestone/invoice mismatch" };
+        // FENCED (round 51). A compensation or deletion holding its claim is
+        // between its last check and an irreversible QuickBooks call for this
+        // row. Settling behind it destroyed the invoice of a milestone that had
+        // just been paid. The claim is short-lived and released on every path,
+        // so this is a RETRY, not a lost payment.
+        if (isIrreversibleClaimHeld(payment.qbSyncError)) {
+            return {
+                success: false as const,
+                error: "This milestone is mid-way through a QuickBooks change. Try again in a moment.",
+            };
+        }
 
         const claim = await t.paymentSchedule.updateMany({
             where: { id: paymentId, status: { not: "Paid" } },
@@ -71,6 +83,38 @@ export async function recordPaymentCore(
             },
         });
         if (claim.count === 0) return { success: false as const, error: "Milestone already paid" };
+
+        // A milestone whose QuickBooks invoice is queued for deletion has just
+        // been PAID. The intent is RECORDED, not cleared: Break-QB-Link writes the
+        // marker, performs the irreversible remote delete, and only then unlinks,
+        // so clearing it here left the post-delete CAS losing on both counts and
+        // the row Paid, still linked to a deleted invoice, carrying no marker at
+        // all — invisible to the sweep that exists to find exactly that.
+        //
+        // A separate write rather than a clause on the claim above: a settle must
+        // never be made conditional on a marker (see the INVARIANT on
+        // settleMilestonePaidInTx), and this is idempotent either way.
+        await t.paymentSchedule.updateMany({
+            where: { id: paymentId, qbSyncError: PENDING_DELETION_MARKER },
+            data: { qbSyncError: PENDING_DELETION_SETTLED_MARKER },
+        });
+        // ...and CANCEL a live deletion CLAIM the same way (round 49).
+        //
+        // The sweep claims a row before it calls QuickBooks, pinned to
+        // `status: Pending` under these same money locks, so a settle that gets
+        // there first makes the claim fail outright. This is the other order: the
+        // claim is already held and the settle arrives while the remote call is in
+        // flight. Cancelling it here is what the sweep re-checks immediately
+        // before the irreversible delete — it is the only thing that can take the
+        // claim away, and the check and this write serialize on the invoice lock.
+        //
+        // Still not conditional on a marker: the settle itself is unaffected: the
+        // money is recorded either way, and this only decides what the QuickBooks
+        // bookkeeping state says afterwards.
+        await t.paymentSchedule.updateMany({
+            where: { id: paymentId, qbSyncError: { startsWith: PENDING_DELETION_CLAIMED_PREFIX } },
+            data: { qbSyncError: PENDING_DELETION_SETTLED_MARKER },
+        });
 
         // Recalculate from scratch (matches Stripe webhook) to avoid drift.
         const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });

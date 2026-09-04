@@ -55,16 +55,84 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // bot) that self-authenticates with a Bearer secret (OFFICE_TASKS_INGEST_SECRET)
 // and must return a clean 401, not a redirect to /login. Exact-match only —
 // future descendants under /api/office-tasks/ must NOT inherit the bypass.
+// api/health/pipeline is the same shape: an ops/monitoring read that
+// self-authenticates INSIDE the route (Bearer CRON_SECRET, or a staff session
+// with financialReports). Without this bypass NextAuth intercepts it first and
+// a headless Bearer check gets redirected to /login instead of its JSON.
+// Exact-match only — nothing else under /api/health/ inherits it.
 // privacy / terms / account-deletion are static legal pages with no data access.
 // The app stores require them to be reachable by a logged-out reviewer, and Google
 // Play specifically requires a public account-deletion URL.
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
-// The legal pages are static server components that define no Server Actions.
-// Next's action IDs are global, so a bypassed path is a place an anonymous caller
-// could POST a `next-action` header for someone else's action; the portal routes
-// accept that tradeoff because they genuinely have anonymous actions, these don't.
-const LEGAL_PAGE_PATTERN = /^\/(?:privacy|terms|account-deletion|support)(?:\/|$)/;
+/**
+ * The cookie that has to be present before a bypassed tree may dispatch a
+ * Server Action at all.
+ *
+ * Round 48 narrowed the action exception to the two client-facing trees. Round
+ * 49 found that still far too wide: action ids are GLOBAL, so `/portal` being
+ * allowed to dispatch meant a caller with no session at all could POST any
+ * action id in the app to `/portal` and have it run — including staff
+ * mutations that authorize nothing themselves (`createCatalogItem` and 76
+ * others, now gated; see tests/server-action-gates.test.ts). An action id is
+ * not an authorization token: it is a public build artefact.
+ *
+ * So a dispatch through these trees now requires SESSION EVIDENCE. That is
+ * PRESENCE, not validity — the proxy runs on the edge and cannot verify a JWT
+ * without the signing secret, and it is not the authorization boundary:
+ * every action still authorizes itself (the portal ones through
+ * `resolveSessionClientId` / `getSubPortalSession`, which DO verify). What
+ * this closes is the anonymous vector: no session evidence at all, no
+ * dispatch, anywhere in the bypass.
+ *
+ * EITHER the tree's own token cookie OR a NextAuth session cookie counts,
+ * because `resolveSessionClientId` accepts both: path 1 is a NextAuth
+ * session (a client who signs in with Google, or staff previewing the
+ * portal) and path 2 is the `client_portal_token` magic-link cookie. An
+ * earlier version of this check demanded the magic-link cookie alone, which
+ * refused every Google-authenticated client — it broke estimate signing on
+ * the portal, which is a client-facing money path. A stale or disabled staff
+ * cookie is already rejected above, before this runs.
+ */
+const ANONYMOUS_ACTION_COOKIE: ReadonlyArray<{ pattern: RegExp; cookie: string }> = [
+    { pattern: /^\/portal(?:\/|$)/, cookie: "client_portal_token" },
+    { pattern: /^\/sub-portal(?:\/|$)/, cookie: "sub_portal_token" },
+];
+
+/**
+ * The ONLY bypassed paths allowed to dispatch an anonymous Server Action.
+ *
+ * Next's action IDs are GLOBAL: a `next-action` POST to any path that reaches
+ * the app can invoke any action in the app. The proxy bypass runs BEFORE the
+ * route handler, so a route that authenticates inside itself — the ops health
+ * reads with their Bearer/staff-session check, the machine-to-machine ingest
+ * endpoints — is not the boundary for an action dispatch: its handler never
+ * runs at all. This used to be scoped to the four legal pages, which left every
+ * other bypassed path (health included) as an open action dispatcher.
+ *
+ * `portal` and `sub-portal` are the two trees that genuinely serve anonymous
+ * actions (25 and 1 files importing actions respectively); those actions
+ * authorize through their own client/token checks. `share` imports none, and
+ * `login` is a client component that posts to NextAuth, so neither needs it.
+ *
+ * Kept as the list of trees that MAY dispatch; ANONYMOUS_ACTION_COOKIE above
+ * says what each of them must present first.
+ */
+export const ANONYMOUS_ACTION_PATTERN = /^\/(?:portal|sub-portal)(?:\/|$)/;
+
+/**
+ * Is this an action dispatch?
+ *
+ * The header is what Next actually routes on. The content-type is
+ * belt-and-braces: no legitimate client sends `text/x-component` on a REQUEST,
+ * so treating it as an action keeps a future dispatch shape from arriving
+ * through a path that only ever inspected the header.
+ */
+export function isServerActionRequest(req: any): boolean {
+    if (typeof req?.headers?.get?.("next-action") === "string") return true;
+    const contentType = req?.headers?.get?.("content-type");
+    return typeof contentType === "string" && contentType.toLowerCase().includes("text/x-component");
+}
 
 // Test-only action dispatchers that get the proxy bypass below. Explicit, not a
 // prefix match: the proxy checks only the environment gates, never the route's
@@ -83,6 +151,52 @@ export function isPublicProxyBypass(pathname: string) {
 /** True when the route handler at `pathname` verifies mobile Bearer tokens itself. */
 export function isMobileAuthenticatedRoute(pathname: string) {
     return MOBILE_AUTHENTICATED_ROUTE_PATTERNS.some((pattern) => pattern.test(pathname));
+}
+
+/**
+ * May this bypassed path dispatch a Server Action at all?
+ *
+ * Exported so it can be tested directly: reaching this branch through the
+ * whole proxy requires a real signed NextAuth JWT (the stale-staff-cookie check
+ * above decodes one), which a unit test cannot mint, so a test driven only
+ * through the front door could never exercise the NextAuth arm of this rule.
+ * The rule itself is the part worth pinning.
+ *
+ * EITHER the tree's own token cookie OR a NextAuth session cookie counts,
+ * because `resolveSessionClientId` accepts both: path 1 is a NextAuth session
+ * (a client who signs in with Google, or staff previewing the portal) and path
+ * 2 is the `client_portal_token` magic-link cookie. An earlier version demanded
+ * the magic-link cookie alone, which refused every Google-authenticated client
+ * and broke estimate SIGNING on the portal — a client-facing money path.
+ */
+/**
+ * The refusal a BLOCKED action dispatch gets, and why it is distinguishable.
+ *
+ * `e2e/financial-action-auth.spec.ts` proves that an unauthenticated caller
+ * cannot run privileged actions. That proof only means something if a DENIAL
+ * can be told apart from Next answering "I have never heard of that action id"
+ * — otherwise a typo in an action id would look exactly like a successful
+ * defence, and the whole block would pass while proving nothing.
+ *
+ * Next signals the unknown-id case itself (404, "Failed to find Server
+ * Action"). This refusal happens EARLIER, at the edge, before Next sees the id
+ * at all, so it says so explicitly rather than returning a bare 403 that could
+ * be mistaken for an action's own authorization error.
+ */
+export const SERVER_ACTION_BLOCKED_REASON = "server-action-blocked";
+
+function serverActionBlocked() {
+    return new NextResponse(SERVER_ACTION_BLOCKED_REASON, {
+        status: 403,
+        headers: { "x-probuild-refusal": SERVER_ACTION_BLOCKED_REASON },
+    });
+}
+
+export function mayDispatchAction(req: any, pathname: string): boolean {
+    const tree = ANONYMOUS_ACTION_COOKIE.find((t) => t.pattern.test(pathname));
+    if (!tree) return false;
+    if (req?.cookies?.get?.(tree.cookie)?.value) return true;
+    return hasNextAuthSessionCookie(req);
 }
 
 function hasNextAuthSessionCookie(req: any) {
@@ -104,7 +218,7 @@ export default async function proxy(req: any, event: any) {
     }
 
     const pathname = req.nextUrl?.pathname;
-    const isServerAction = typeof req.headers?.get?.("next-action") === "string";
+    const isServerAction = isServerActionRequest(req);
 
     // Public portal routes must remain reachable without a staff session, but a
     // stale staff cookie must never use those routes to bypass the production
@@ -155,9 +269,19 @@ export default async function proxy(req: any, event: any) {
         return NextResponse.next();
     }
 
-    // Legal pages are readable by anyone but are not an action endpoint.
-    if (isServerAction && typeof pathname === "string" && LEGAL_PAGE_PATTERN.test(pathname)) {
-        return new NextResponse("Forbidden", { status: 403 });
+    // A bypassed path is readable by anyone; that is not the same as being an
+    // action endpoint. Refused BEFORE the bypass below, for every bypassed path
+    // except the two trees that genuinely serve anonymous actions — otherwise
+    // the ops health reads, the webhook and ingest endpoints, the PDF routes and
+    // the static legal pages all double as anonymous dispatchers for every
+    // action in the app.
+    if (isServerAction && typeof pathname === "string" && isPublicProxyBypass(pathname)) {
+        // Which tree is this, and does the caller hold its session cookie? A
+        // path that is not one of the two client-facing trees can never
+        // dispatch; one that is still needs the cookie.
+        if (!mayDispatchAction(req, pathname)) {
+            return serverActionBlocked();
+        }
     }
 
     if (typeof pathname === "string" && isPublicProxyBypass(pathname)) {
@@ -232,6 +356,6 @@ export const config = {
          * - favicon.ico, public folder images, etc
          * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates(?:/|$)|api/pdf/invoices(?:/|$)|api/pdf/change-orders(?:/|$)|api/sub-portal|api/mobile|api/selections/item-comments|api/selections/ai-sort|api/selections/link-schedule|login|portal|sub-portal|share|privacy|terms|account-deletion|support|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
+        "/((?!api/health$|api/health/pipeline$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates(?:/|$)|api/pdf/invoices(?:/|$)|api/pdf/change-orders(?:/|$)|api/sub-portal|api/mobile|api/selections/item-comments|api/selections/ai-sort|api/selections/link-schedule|login|portal|sub-portal|share|privacy|terms|account-deletion|support|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };

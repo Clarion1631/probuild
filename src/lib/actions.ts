@@ -351,6 +351,7 @@ export const getLead = cache(async function getLead(id: string) {
 });
 
 export async function updateLeadStage(id: string, stage: string) {
+    await assertActiveStaff();
     await prisma.lead.update({
         where: { id },
         data: { stage }
@@ -372,7 +373,20 @@ async function findClientByName(name: string) {
     return candidates.find((c) => collapse(c.name) === collapse(name)) ?? null;
 }
 
-export async function createLead(data: { name: string; clientName: string; clientEmail?: string; clientPhone?: string; location?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; source?: string; projectType?: string; message?: string }) {
+export async function createLead(
+    data: { name: string; clientName: string; clientEmail?: string; clientPhone?: string; location?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; source?: string; projectType?: string; message?: string },
+    /**
+     * The MCP machine secret, when this is the `create_lead` tool rather than
+     * a person. Same shape as `sendEstimateToClient` — see
+     * assertDocumentSendPermission: ONLY `undefined` means omitted, so a
+     * supplied-but-wrong secret can never fall through to the session path.
+     */
+    mcpSecret?: string,
+) {
+    // Round 49: this authorized NOTHING. Server Action ids are public, so
+    // anyone who could name it could create leads and clients in the database.
+    // A staff session OR the machine secret — the MCP tool has no session.
+    await assertLeadCreatePermission(mcpSecret);
     // Find or create client
     const clientName = data.clientName.trim();
     if (!clientName) throw new Error("Client name is required.");
@@ -467,6 +481,7 @@ export async function createLead(data: { name: string; clientName: string; clien
 }
 
 export async function updateLeadMetadata(id: string, updates: { isUnread?: boolean; isArchived?: boolean; snoozedUntil?: Date | null; tags?: string; expectedProfit?: number; expectedStartDate?: Date | null; targetRevenue?: number }) {
+    await assertActiveStaff();
     await prisma.lead.update({
         where: { id },
         data: {
@@ -521,6 +536,7 @@ export async function deleteLead(id: string) {
 }
 
 export async function deleteLeads(ids: string[]): Promise<{ deleted: number; skipped: { id: string; reason: string }[] }> {
+    await assertActiveStaff();
     let deleted = 0;
     const skipped: { id: string; reason: string }[] = [];
     for (const id of ids) {
@@ -536,6 +552,7 @@ export async function deleteLeads(ids: string[]): Promise<{ deleted: number; ski
 }
 
 export async function copyLeads(ids: string[]): Promise<{ created: string[]; skipped: { id: string; reason: string }[] }> {
+    await assertActiveStaff();
     const created: string[] = [];
     const skipped: { id: string; reason: string }[] = [];
     for (const id of ids) {
@@ -599,6 +616,7 @@ export async function updateProjectManager(projectId: string, managerId: string 
 }
 
 export async function updateLeadInfo(id: string, data: any) {
+    await assertActiveStaff();
     // data contains all the EditLeadModal form data
     const lead = await prisma.lead.findUnique({ where: { id }});
     if (!lead) return;
@@ -696,6 +714,7 @@ export async function getClients() {
 }
 
 export async function getClient(id: string) {
+    await assertActiveStaff();
     return await prisma.client.findUnique({
         where: { id },
         include: {
@@ -708,6 +727,7 @@ export async function getClient(id: string) {
 
 export async function createClient(data: { name: string; email?: string; companyName?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; internalNotes?: string }) {
     "use server";
+    await assertActiveStaff();
     const name = data.name.trim();
     if (!name) throw new Error("Client name is required.");
     const initials = name
@@ -738,6 +758,7 @@ export async function createClient(data: { name: string; email?: string; company
 
 export async function updateClient(clientId: string, data: { name?: string; email?: string; additionalEmail?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string }) {
     "use server";
+    await assertActiveStaff();
     const name = data.name?.trim();
     if (data.name !== undefined && !name) throw new Error("Client name is required.");
     const client = await prisma.client.update({
@@ -805,6 +826,7 @@ async function revalidateClientCertSurfaces(clientId: string) {
  *  certificate is already on file (metadata-only edit); expiresAt is "YYYY-MM-DD" or "". */
 export async function saveClientTaxExemptCert(clientId: string, formData: FormData) {
     "use server";
+    await assertActiveStaff();
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Unauthorized");
 
@@ -865,6 +887,7 @@ export async function saveClientTaxExemptCert(clientId: string, formData: FormDa
 
 export async function removeClientTaxExemptCert(clientId: string) {
     "use server";
+    await assertActiveStaff();
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Unauthorized");
 
@@ -906,6 +929,7 @@ export async function removeClientTaxExemptCert(clientId: string) {
 
 export async function updateLead(leadId: string, data: { name?: string; source?: string; expectedStartDate?: string | null; targetRevenue?: number | null; location?: string; projectType?: string }) {
     "use server";
+    await assertActiveStaff();
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
     if (data.source !== undefined) updateData.source = data.source;
@@ -960,6 +984,7 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
 // =============================================
 
 export async function getLeadTasks(leadId: string) {
+    await assertActiveStaff();
     return await prisma.leadTask.findMany({
         where: { leadId },
         orderBy: { createdAt: "desc" },
@@ -974,6 +999,7 @@ export async function createLeadTask(leadId: string, data: {
     tags?: string | null;
     assigneeId?: string | null;
 }) {
+    await assertActiveStaff();
     const task = await prisma.leadTask.create({
         data: {
             leadId,
@@ -995,6 +1021,7 @@ export async function updateLeadTask(taskId: string, data: {
     tags?: string | null;
     assigneeId?: string | null;
 }) {
+    await assertActiveStaff();
     const updateData: any = {};
     if (data.title !== undefined) updateData.title = data.title;
     if (data.status !== undefined) updateData.status = data.status;
@@ -1011,6 +1038,7 @@ export async function updateLeadTask(taskId: string, data: {
 }
 
 export async function deleteLeadTask(taskId: string) {
+    await assertActiveStaff();
     const task = await prisma.leadTask.findUnique({ where: { id: taskId } });
     if (!task) return { success: false };
     await prisma.leadTask.delete({ where: { id: taskId } });
@@ -1023,6 +1051,7 @@ export async function deleteLeadTask(taskId: string) {
 // =============================================
 
 export async function getLeadMeetings(leadId: string) {
+    await assertActiveStaff();
     return await prisma.leadMeeting.findMany({
         where: { leadId },
         orderBy: { scheduledAt: "asc" },
@@ -1038,6 +1067,7 @@ export async function createLeadMeeting(leadId: string, data: {
     videoApp?: string | null;
     description?: string | null;
 }) {
+    await assertActiveStaff();
     const startDate = new Date(data.scheduledAt);
     const endDate = new Date(startDate.getTime() + data.duration * 60000);
 
@@ -1123,6 +1153,7 @@ export async function updateLeadMeeting(meetingId: string, data: {
     description?: string | null;
     status?: string;
 }) {
+    await assertActiveStaff();
     const updateData: any = {};
     if (data.title !== undefined) updateData.title = data.title;
     if (data.meetingType !== undefined) updateData.meetingType = data.meetingType;
@@ -1148,6 +1179,7 @@ export async function updateLeadMeeting(meetingId: string, data: {
 }
 
 export async function deleteLeadMeeting(meetingId: string) {
+    await assertActiveStaff();
     const meeting = await prisma.leadMeeting.findUnique({ where: { id: meetingId } });
     if (!meeting) return { success: false };
     await prisma.leadMeeting.delete({ where: { id: meetingId } });
@@ -1420,6 +1452,7 @@ export async function createDraftRoom(opts: {
     name?: string;
     roomType?: RoomType;
 }) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) throw new Error("Unauthorized");
 
@@ -1445,6 +1478,7 @@ export async function createDraftRoom(opts: {
 }
 
 export async function getRoom(id: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) return null;
 
@@ -1458,6 +1492,7 @@ export async function getRoom(id: string) {
 }
 
 export async function deleteRoom(id: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) throw new Error("Unauthorized");
 
@@ -1475,6 +1510,7 @@ export async function deleteRoom(id: string) {
 }
 
 export async function renameRoom(id: string, name: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) throw new Error("Unauthorized");
 
@@ -1499,6 +1535,7 @@ export async function renameRoom(id: string, name: string) {
 }
 
 export async function listRoomsForProject(projectId: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) return [];
     if (!(await callerCanAccessProject(caller, projectId))) return [];
@@ -1515,6 +1552,7 @@ export async function listRoomsForProject(projectId: string) {
 }
 
 export async function listRoomsForLead(leadId: string) {
+    await assertActiveStaff();
     const caller = await resolveCaller();
     if (!caller) return [];
     if (!(await callerCanAccessLead(caller, leadId))) return [];
@@ -1958,6 +1996,7 @@ export const getAllEstimates = cache(async function getAllEstimates() {
 // The partial unique index "MessageThread_projectId_client_unique" makes this safe under concurrency:
 // if two requests both see no thread and both call create, the second will get P2002 and re-read.
 export async function findOrCreateClientThread(projectId: string) {
+    await assertActiveStaff();
     let thread = await prisma.messageThread.findFirst({
         where: { projectId, subcontractorId: null },
         orderBy: { createdAt: "asc" },
@@ -1984,6 +2023,17 @@ export async function findOrCreateClientThread(projectId: string) {
 }
 
 export async function logPortalVisit(projectId: string, clientName: string) {
+    // Action ids are public, so this authorizes itself. Its one caller is
+    // PortalVisitTracker, which the portal project page renders only for a
+    // NON-staff viewer — so the gate is the same precondition that page already
+    // enforces before rendering: a client session that owns this project.
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) throw new Error("Unauthorized");
+    const owned = await prisma.project.findFirst({
+        where: { id: projectId, clientId: sessionClientId },
+        select: { id: true },
+    });
+    if (!owned) throw new Error("Unauthorized");
     // Dedup: skip if a portal visit was logged in the last 30 minutes
     const recent = await prisma.activityLog.findFirst({
         where: {
@@ -2419,8 +2469,9 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
     const deposit = pendingMilestones[0] || null;
     if (deposit) {
         try {
-            const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
-            const pushed = await pushMilestoneToQuickBooks(deposit.id);
+            const { pushMilestoneToQuickBooks, MILESTONE_PUSH_ROUTE_BUDGET_MS } = await import("./quickbooks-payments");
+            const { createRouteDeadline } = await import("./quickbooks");
+            const pushed = await pushMilestoneToQuickBooks(deposit.id, undefined, createRouteDeadline(MILESTONE_PUSH_ROUTE_BUDGET_MS));
             payLink = pushed.payLink;
         } catch (e) {
             // QuickBooks not connected or unreachable — Stripe portal payment and
@@ -2823,7 +2874,10 @@ export async function sendMilestoneInvoices(
 ) {
     // Permission gate stays here (remotely invokable server action); the send
     // logic lives in billing-core.ts, shared with the MCP connector.
-    const actor = await assertInvoicePermission();
+    //
+    // HORIZONTAL too: this stages QuickBooks invoices and emails a client, so
+    // the broad permission is not enough on its own.
+    const { user: actor } = await assertInvoiceAccess(invoiceId);
     const { sendMilestoneInvoicesCore } = await import("./billing-core");
     return sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, opts, actor.name || "");
 }
@@ -3679,7 +3733,11 @@ export async function recordPayment(
         notes?: string | null;
     },
 ) {
-    await assertInvoicePermission();
+    // Found by the same sweep: it makes no QuickBooks call, but it SETTLES a
+    // milestone from two bare ids and had only the broad permission. The
+    // milestone/invoice pairing is enforced inside the settle core below; this is
+    // the missing half, which project the invoice belongs to.
+    await assertInvoiceAccess(invoiceId);
 
     const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "quickbooks", "other"];
     const method = input.method;
@@ -3740,10 +3798,16 @@ export async function updateMonthlyOverhead(amount: number) {
 
 /** Create (or fetch) the QuickBooks invoice + hosted pay link for one milestone. */
 export async function createQBPaymentLink(paymentId: string) {
-    await assertInvoicePermission();
+    // Scoped to the milestone OWN project before a single QuickBooks call.
+    // The broad `invoices` permission says nothing about THIS job, and this
+    // action creates a real QBO invoice and hands back its hosted PAY LINK —
+    // a URL that collects money — so an unscoped id was a way to mint one for
+    // any project in the company. Same gate as breakQBInvoiceLink.
+    await assertMilestoneAccess(paymentId);
     try {
-        const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
-        const res = await pushMilestoneToQuickBooks(paymentId);
+        const { pushMilestoneToQuickBooks, MILESTONE_PUSH_ROUTE_BUDGET_MS } = await import("./quickbooks-payments");
+        const { createRouteDeadline } = await import("./quickbooks");
+        const res = await pushMilestoneToQuickBooks(paymentId, undefined, createRouteDeadline(MILESTONE_PUSH_ROUTE_BUDGET_MS));
         const schedule = await prisma.paymentSchedule.findUnique({
             where: { id: paymentId },
             select: { invoiceId: true, invoice: { select: { projectId: true } } },
@@ -3759,9 +3823,19 @@ export async function createQBPaymentLink(paymentId: string) {
 
 /** Pull settled QuickBooks payments for one invoice right now (on-view refresh). */
 export async function refreshQBPayments(invoiceId: string) {
-    await assertInvoicePermission();
-    const { syncQuickBooksPayments } = await import("./quickbooks-payments");
-    const result = await syncQuickBooksPayments({ invoiceId });
+    // Reconciliation is a money-path write (it settles milestones from QBO
+    // payments), so it is scoped to the invoice project before the sync runs.
+    await assertInvoiceAccess(invoiceId);
+    const { syncQuickBooksPayments, ON_VIEW_PAYMENTS_SYNC_BUDGET_MS } = await import("./quickbooks-payments");
+    const { createRouteDeadline } = await import("./quickbooks");
+    // Its OWN sub-ceiling, not the cron's. Passing no deadline inherited the
+    // 100s cron budget inside a 60s server-action ceiling, so a slow QuickBooks
+    // got this killed mid-run instead of returning a partial result the page
+    // can render.
+    const result = await syncQuickBooksPayments(
+        { invoiceId },
+        { deadline: createRouteDeadline(ON_VIEW_PAYMENTS_SYNC_BUDGET_MS) },
+    );
     if (result.settled > 0) {
         const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { projectId: true } });
         if (inv) {
@@ -3788,16 +3862,26 @@ export async function breakQBInvoiceLink(
     paymentId: string,
     opts?: { deleteInQBO?: boolean },
 ): Promise<{ success: true; warning?: string } | { success: false; error: string }> {
-    await assertInvoicePermission();
+    const user = await assertInvoicePermission();
 
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentId },
         select: {
-            id: true, status: true, qbInvoiceId: true, qbPaymentId: true,
+            id: true, status: true, qbInvoiceId: true, qbPaymentId: true, qbSyncError: true,
             invoiceId: true, invoice: { select: { projectId: true } },
         },
     });
     if (!schedule) return { success: false, error: "Milestone not found" };
+    // HORIZONTAL authorization. `assertInvoicePermission` proves this caller may
+    // work with invoices SOMEWHERE; it says nothing about THIS milestone project.
+    // Without this a FINANCE user scoped to one job could unlink — and, with
+    // deleteInQBO, destroy the QuickBooks invoice for — any milestone in the
+    // company by id alone. Same hole and same fix as the estimate IDOR (#333),
+    // and FINANCE is not exempt from it. Checked BEFORE any local or remote
+    // write, and before the ambiguous-create resolver below, which mutates too.
+    if (!canAccessProject(user, schedule.invoice.projectId)) {
+        return { success: false, error: "You do not have access to this project's invoices." };
+    }
     if (schedule.status === "Paid") {
         return { success: false, error: "This milestone is already paid — unlinking is blocked. Use Undo first if you need to reverse it." };
     }
@@ -3805,36 +3889,224 @@ export async function breakQBInvoiceLink(
         return { success: false, error: "A QuickBooks payment is recorded against this milestone. Refusing to unlink." };
     }
     if (!schedule.qbInvoiceId) {
+        // A milestone parked by an unknown-outcome create has NO qbInvoiceId, so
+        // this used to reject exactly the state the error message told the
+        // operator to clear here. Route it to the resolver instead: ask
+        // QuickBooks what really happened, and adopt the invoice if one is
+        // there. It writes nothing on any ambiguous answer.
+        const { isBlockedByAmbiguousCreate } = await import("./quickbooks-payments");
+        if (isBlockedByAmbiguousCreate(schedule)) {
+            const { resolveAmbiguousInvoiceCreateCore, ambiguousCreateFingerprint } = await import("./qbo-ambiguous-create");
+            const res = await resolveAmbiguousInvoiceCreateCore({
+                kind: "milestone",
+                id: schedule.id,
+                expectedState: ambiguousCreateFingerprint(schedule),
+                decision: "link-existing",
+                reason: "Break QB Link on a milestone whose create outcome was unknown",
+                actor: {
+                    id: user.id, email: user.email, role: user.role,
+                    permissions: user.permissions, projectAccess: user.projectAccess, assignedProjects: user.assignedProjects,
+                },
+            });
+            if (!res.ok) return { success: false, error: res.message };
+            revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+            revalidatePath(`/invoices`);
+            return { success: true, warning: res.message };
+        }
         return { success: false, error: "This milestone has no QuickBooks link to break." };
     }
 
-    // Claim the unlink atomically via the shared helper (also used by
-    // updatePendingMilestoneAmountsCore) — see its doc comment for the race it closes.
-    const { claimQBInvoiceUnlink } = await import("./quickbooks-payments");
-    const cleared = await claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId);
-    if (!cleared) {
-        return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
+    const {
+        claimQBInvoiceUnlink, getFreshQBTokens, BREAK_QB_LINK_BUDGET_MS, PENDING_DELETION_MARKER,
+        PAID_PENDING_DELETION_FLAG,
+        isPendingDeletion,
+    } = await import("./quickbooks-payments");
+
+    // ORDER MATTERS, and it used to be backwards.
+    //
+    // The local unlink was taken FIRST and the QuickBooks delete attempted
+    // afterwards, on an unbounded clock: a 45s token refresh followed by a 20s
+    // delete, which together cannot fit the 60s ceiling. So the platform could
+    // kill this action mid-delete, and by then the milestone was already
+    // unlinked and freely re-sendable — a re-send racing a delete that may or
+    // may not have landed is how a client ends up with two collectible
+    // invoices for one milestone.
+    //
+    // The link now survives until the delete is CONFIRMED. What goes in first
+    // is a durable `pending-deletion` marker: the row stays linked (so nothing
+    // can re-send it), the intent is recorded (so a crash here is visible),
+    // and the maintenance sweep can finish what this call could not.
+    if (opts?.deleteInQBO === true) {
+        const { createRouteDeadline } = await import("./quickbooks");
+        const { deleteQBInvoice } = await import("./quickbooks");
+        // ONE budget for both remote calls, started here, so the pair cannot
+        // overrun the ceiling however slow either half is.
+        const deadline = createRouteDeadline(BREAK_QB_LINK_BUDGET_MS);
+
+        // CAS the intent in, pinned to the link and marker we read.
+        const claimed = await prisma.paymentSchedule.updateMany({
+            where: {
+                id: schedule.id,
+                qbInvoiceId: schedule.qbInvoiceId,
+                qbSyncError: schedule.qbSyncError,
+                status: { not: "Paid" },
+                qbPaymentId: null,
+            },
+            data: { qbSyncError: PENDING_DELETION_MARKER },
+        });
+        if (claimed.count !== 1) {
+            return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
+        }
+
+        const stillLinked = (reason: string) => {
+            revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+            revalidatePath(`/invoices`);
+            return {
+                success: false as const,
+                error: `${reason} The milestone is still linked to QuickBooks invoice ${schedule.qbInvoiceId} and cannot be re-sent — ` +
+                    `the maintenance sweep will retry the delete, or you can delete it in QuickBooks and try again.`,
+            };
+        };
+
+        try {
+            const tokens = await getFreshQBTokens(deadline);
+            // The return value is CONFIRMED-GONE vs CONFIRMED-ABSENT, not
+            // success vs failure — see deleteQBInvoice. Reading `false` as a
+            // refusal meant an invoice somebody had already deleted by hand in
+            // QuickBooks left this milestone parked `pending-deletion` forever,
+            // un-re-sendable, with nothing able to clear it. A real refusal (a
+            // payment attached, say) THROWS, which is what the catch is for.
+            await deleteQBInvoice(tokens, schedule.qbInvoiceId, deadline);
+        } catch (e) {
+            return stillLinked(`QuickBooks did not confirm the invoice was deleted (${e instanceof Error ? e.message.slice(0, 160) : "unknown error"}).`);
+        }
+
+        // Confirmed gone. NOW the link may go — through the same shared claim
+        // the local-only path uses, so both unlinks obey one set of rules.
+        // Pinned to the marker THIS call wrote, so a row somebody else has
+        // since re-claimed keeps whatever replaced it.
+        const clearedAfterDelete = await claimQBInvoiceUnlink(
+            prisma, schedule.id, schedule.qbInvoiceId, PENDING_DELETION_MARKER,
+        );
+        // THE DELETE IS IRREVERSIBLE, so losing this CAS cannot end in a shrug.
+        // The commonest way to lose it is a settle landing between the delete and
+        // here: the row goes Paid and its marker is promoted, so the unlink refuses
+        // on both counts. Left there it is a Paid milestone linked to an invoice
+        // that no longer exists — precisely the state the sweep hunts for, so this
+        // path flags it ITSELF rather than hoping the sweep gets there. Re-read and
+        // CAS on what the row says NOW: the value it carries is exactly what we do
+        // not know at this point.
+        if (!clearedAfterDelete) {
+            const now = await prisma.paymentSchedule.findUnique({
+                where: { id: schedule.id },
+                select: { qbInvoiceId: true, qbSyncError: true },
+            });
+            // Only while the row still points at the invoice we just deleted. If it
+            // has moved on, somebody else already resolved this and the flag would
+            // be a lie.
+            if (now?.qbInvoiceId === schedule.qbInvoiceId) {
+                await prisma.paymentSchedule.updateMany({
+                    where: {
+                        id: schedule.id,
+                        qbInvoiceId: schedule.qbInvoiceId,
+                        qbSyncError: now.qbSyncError,
+                    },
+                    data: { qbSyncError: PAID_PENDING_DELETION_FLAG },
+                }).catch(() => ({ count: 0 }));
+            }
+        }
+        revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+        revalidatePath(`/invoices`);
+        revalidatePath(`/portal`);
+        return clearedAfterDelete
+            ? { success: true }
+            : {
+                success: true,
+                warning: `The QuickBooks invoice was deleted, but the link in ProBuild could not be cleared — ` +
+                    `the milestone was settled or changed while the delete was running. It is flagged for ` +
+                    `reconciliation; open it in QuickBooks and confirm what happened.`,
+            };
     }
 
-    // Only after we've claimed the local unlink do we (optionally) clean up QBO.
-    // Default OFF — we never issue a destructive QBO write unless asked.
-    let warning: string | undefined;
-    if (opts?.deleteInQBO === true) {
-        try {
-            const { getFreshQBTokens } = await import("./quickbooks-payments");
-            const { deleteQBInvoice } = await import("./quickbooks");
-            const tokens = await getFreshQBTokens();
-            const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
-            if (!deleted) warning = "Link cleared in ProBuild, but the QuickBooks invoice could not be deleted (it may already be gone, or has a linked payment — check QuickBooks).";
-        } catch {
-            warning = "Link cleared in ProBuild, but QuickBooks delete could not be attempted (QuickBooks unavailable).";
-        }
+    // Local-only unlink: no QuickBooks write of its own — which is exactly why
+    // it must not run while somebody ELSE has a remote delete in flight.
+    // Clearing the link there would leave a live QuickBooks invoice with nothing
+    // pointing at it and the milestone free to be sent again, so one milestone
+    // could be billed twice. Refuse, and name the thing that finishes it.
+    if (isPendingDeletion(schedule.qbSyncError)) {
+        return {
+            success: false,
+            error:
+                "A QuickBooks deletion is already in progress for this milestone, so its link cannot be cleared yet. " +
+                "Wait for the maintenance sweep to confirm the invoice is gone, or retry Break QB Link with the " +
+                "QuickBooks delete option.",
+        };
+    }
+    // Claimed atomically via the shared helper (also used by
+    // updatePendingMilestoneAmountsCore) — see its doc comment for the race it
+    // closes. Pinned to the marker READ above, so a pending-deletion (or any
+    // other claim) landing in the gap between that read and this write loses
+    // instead of being silently overwritten.
+    const cleared = await claimQBInvoiceUnlink(
+        prisma, schedule.id, schedule.qbInvoiceId, schedule.qbSyncError,
+    );
+    if (!cleared) {
+        return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
     }
 
     revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
     revalidatePath(`/invoices`);
     revalidatePath(`/portal`);
-    return { success: true, warning };
+    return { success: true };
+}
+
+/**
+ * Resolve a milestone or progress billing parked by an unknown-outcome
+ * QuickBooks create: ask QuickBooks what actually happened and either adopt the
+ * invoice it already made, or (only on an explicit human confirmation that
+ * there is none) release the row so it can be sent again.
+ *
+ * The decision itself — including the ADMIN/FINANCE rule — lives in
+ * `qbo-ambiguous-create.ts` so it can be tested end to end against a fake
+ * QuickBooks. This wrapper is the session half: identify the actor, then
+ * revalidate what the outcome changed.
+ */
+export async function resolveAmbiguousInvoiceCreate(input: {
+    kind: "milestone" | "progressBilling";
+    id: string;
+    expectedState: string;
+    decision: "link-existing" | "confirmed-none";
+    reason: string;
+}) {
+    const user = await assertInvoicePermission();
+    const { resolveAmbiguousInvoiceCreateCore } = await import("./qbo-ambiguous-create");
+    const res = await resolveAmbiguousInvoiceCreateCore({
+        kind: input.kind,
+        id: input.id,
+        expectedState: input.expectedState,
+        decision: input.decision,
+        reason: input.reason,
+        actor: {
+            id: user.id, email: user.email, role: user.role,
+            permissions: user.permissions, projectAccess: user.projectAccess, assignedProjects: user.assignedProjects,
+        },
+    });
+
+    if (res.ok) {
+        const link = input.kind === "milestone"
+            ? await prisma.paymentSchedule.findUnique({
+                where: { id: input.id },
+                select: { invoiceId: true, invoice: { select: { projectId: true } } },
+            })
+            : await prisma.progressBilling.findUnique({
+                where: { id: input.id },
+                select: { invoiceId: true, invoice: { select: { projectId: true } } },
+            });
+        if (link) revalidatePath(`/projects/${link.invoice.projectId}/invoices/${link.invoiceId}`);
+        revalidatePath(`/invoices`);
+        revalidatePath(`/portal`);
+    }
+    return res;
 }
 
 export async function recordEstimatePayment(
@@ -4187,6 +4459,18 @@ async function currentStaffUserOrNull(): Promise<any | null> {
     return currentStaffViewerOrNull();
 }
 
+/**
+ * The staff gate, PRIVATE to this module.
+ *
+ * Deliberately not exported and deliberately not imported from
+ * permissions.ts: this file begins with `"use server"`, so every export is a
+ * registered Server Action with a public id, and e2e/financial-action-auth.spec.ts
+ * pins this declaration HERE — it slices from `currentStaffUserOrNull` to this
+ * function to prove the resolver does not swallow infrastructure errors.
+ * The four-line twin in permissions.ts exists for the action modules that
+ * cannot reach a private helper; both call the same resolver and throw the
+ * same error.
+ */
 async function assertActiveStaff(): Promise<any> {
     const user = await currentStaffUserOrNull();
     if (!user) throw new Error("Unauthorized");
@@ -4359,6 +4643,38 @@ async function assertEstimateAccess(estimateId: string) {
     const estimate = await estimateOwnerOrThrow(estimateId);
     assertEstimateScope(user, estimate);
     return { user, projectId: estimate.projectId, leadId: estimate.leadId };
+}
+
+/**
+ * Horizontal-access check for an INVOICE, the mirror of assertEstimateAccess.
+ *
+ * `assertInvoicePermission()` answers "may this user touch invoices at all",
+ * never "may this user touch THIS invoice", and every action in this file is a
+ * remotely invokable Server Action taking a bare id. Without this a
+ * project-scoped user could hand in another job id and act on it — the estimate
+ * IDOR (#333) one table across.
+ */
+async function assertInvoiceAccess(invoiceId: string) {
+    const user = await assertInvoicePermission();
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        select: { id: true, projectId: true },
+    });
+    // Fail CLOSED on a missing row: "not found" and "not yours" answer alike, so
+    // the gate cannot be used to probe which ids exist.
+    if (!invoice || !canAccessProject(user, invoice.projectId)) throw new Error("Forbidden");
+    return { user, invoiceId: invoice.id, projectId: invoice.projectId };
+}
+
+/** The same gate reached through a milestone, for the schedule-id actions. */
+async function assertMilestoneAccess(paymentScheduleId: string) {
+    const user = await assertInvoicePermission();
+    const schedule = await prisma.paymentSchedule.findUnique({
+        where: { id: paymentScheduleId },
+        select: { id: true, invoiceId: true, invoice: { select: { projectId: true } } },
+    });
+    if (!schedule || !canAccessProject(user, schedule.invoice.projectId)) throw new Error("Forbidden");
+    return { user, invoiceId: schedule.invoiceId, projectId: schedule.invoice.projectId };
 }
 
 /**
@@ -4674,6 +4990,22 @@ async function assertEstimateSendPermission(mcpSecret?: string): Promise<SendPri
  */
 async function assertContractSendPermission(mcpSecret?: string): Promise<SendPrincipal> {
     return assertDocumentSendPermission(mcpSecret, "contracts");
+}
+
+/**
+ * Creating a lead: a staff session, or the MCP machine secret.
+ *
+ * `createLead` is reachable two ways — the leads UI, and the `create_lead`
+ * MCP tool, which authenticates with a secret in the request and carries no
+ * session at all. Gating it on a session alone would have broken the tool;
+ * leaving it ungated (round 49) meant anyone who could name the action id
+ * could write leads and clients.
+ *
+ * Reuses the estimates permission for the session path: a lead becomes an
+ * estimate, and the same people do both.
+ */
+async function assertLeadCreatePermission(mcpSecret?: string): Promise<SendPrincipal> {
+    return assertDocumentSendPermission(mcpSecret, "estimates");
 }
 
 export async function addInvoiceMilestone(
@@ -5281,6 +5613,7 @@ export async function duplicateEstimate(estimateId: string, targetProjectId?: st
 // =============================================
 
 export async function deleteEstimates(ids: string[]): Promise<{ deleted: number; skipped: { id: string; reason: string }[] }> {
+    await assertActiveStaff();
     let deleted = 0;
     const skipped: { id: string; reason: string }[] = [];
     for (const id of ids) {
@@ -5299,6 +5632,7 @@ export async function duplicateEstimates(
     ids: string[],
     targetProjectId?: string,
 ): Promise<{ createdIds: string[]; skipped: { id: string; reason: string }[] }> {
+    await assertActiveStaff();
     const createdIds: string[] = [];
     const skipped: { id: string; reason: string }[] = [];
     for (const id of ids) {
@@ -7475,6 +7809,12 @@ export async function getEstimateItemsForProject(projectId: string) {
 }
 
 export async function getScheduleTasksForSub(projectId: string, subcontractorId: string) {
+    // Action ids are public, so this authorizes itself. Its one caller is the
+    // sub-facing portal schedule page, where the viewer is a subcontractor and
+    // never a staff user — same session check addTaskCommentAsSub makes.
+    const { getSubPortalSession } = await import("@/lib/sub-portal-auth");
+    const session = await getSubPortalSession();
+    if (!session || session.id !== subcontractorId) throw new Error("Unauthorized");
     return prisma.scheduleTask.findMany({
         where: {
             projectId,
@@ -7738,6 +8078,7 @@ export async function addTaskComment(taskId: string, text: string, photoUrls?: s
 }
 
 export async function getTaskComments(taskId: string) {
+    await assertActiveStaff();
     return prisma.taskComment.findMany({
         where: { taskId },
         orderBy: { createdAt: "asc" },
@@ -7749,6 +8090,7 @@ export async function getTaskComments(taskId: string) {
 }
 
 export async function getTaskTimeEntries(taskId: string) {
+    await assertActiveStaff();
     const [entries, total] = await Promise.all([
         prisma.timeEntry.findMany({
             where: { scheduleTaskId: taskId },
@@ -8177,6 +8519,7 @@ Rules:
 // ========== MASTER SCHEDULE ==========
 
 export async function getAllScheduleTasks() {
+    await assertActiveStaff();
     return prisma.scheduleTask.findMany({
         orderBy: [{ projectId: "asc" }, { order: "asc" }],
         include: {
@@ -8190,6 +8533,7 @@ export async function getAllScheduleTasks() {
 }
 
 export async function getTeamMembers() {
+    await assertActiveStaff();
     return prisma.user.findMany({
         orderBy: { name: "asc" },
         select: { id: true, name: true, email: true, role: true },
@@ -8238,6 +8582,7 @@ export async function clearAllTasks(projectId: string) {
 }
 
 export async function getActiveSubcontractors() {
+    await assertActiveStaff();
     return prisma.subcontractor.findMany({
         where: { status: "ACTIVE" },
         orderBy: { companyName: "asc" },
@@ -8777,6 +9122,7 @@ export async function updateCompanyProjectStatuses(statuses: string) {
 // ────────────────────────────────────────────────
 
 export async function getProjectMessages(projectId: string) {
+    await assertActiveStaff();
     let thread = await prisma.messageThread.findFirst({
         where: { projectId, subcontractorId: null },
         include: {
@@ -8797,6 +9143,7 @@ export async function getProjectMessages(projectId: string) {
 }
 
 export async function getUnreadMessageCount(projectId: string, forSenderType: "CLIENT" | "TEAM") {
+    await assertActiveStaff();
     // Count unread inbound ClientMessages for this project.
     // "Inbound" from the team's perspective = messages sent by the CLIENT.
     // Uses readAt to determine unread status — badge clears when markClientMessagesRead is called.
@@ -8807,6 +9154,7 @@ export async function getUnreadMessageCount(projectId: string, forSenderType: "C
 }
 
 export async function markClientMessagesRead(entityId: string, entityType: "lead" | "project") {
+    await assertActiveStaff();
     const where = entityType === "lead"
         ? { leadId: entityId, direction: "INBOUND", readAt: null }
         : { projectId: entityId, direction: "INBOUND", readAt: null };
@@ -8935,6 +9283,7 @@ export async function setPaymentRemindersEnabled(projectId: string, enabled: boo
 // =============================================
 
 export async function emailPortalLinkToClient(projectId: string) {
+    await assertActiveStaff();
     const project = await prisma.project.findUnique({
         where: { id: projectId },
         include: { client: true }
@@ -9022,6 +9371,7 @@ export async function emailPortalLinkToClient(projectId: string) {
 }
 
 export async function checkPortalEmailStatus(projectId: string) {
+    await assertActiveStaff();
     const visibility = await prisma.portalVisibility.findUnique({ where: { projectId } });
     if (!visibility?.lastShareEmailId) return null;
     
@@ -9043,6 +9393,7 @@ export async function checkPortalEmailStatus(projectId: string) {
 // =============================================
 
 export async function getCompanySubcontractorTrades() {
+    await assertActiveStaff();
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     if (!settings?.subcontractorTrades) return [];
     try {
@@ -9067,6 +9418,7 @@ export async function saveCompanySubcontractorTrades(trades: string[]) {
 // =============================================
 
 export async function getSubcontractorExplicitProjects(subId: string) {
+    await assertActiveStaff();
     const accesses = await prisma.subcontractorProjectAccess.findMany({
         where: { subcontractorId: subId },
         select: { projectId: true },
@@ -9075,6 +9427,7 @@ export async function getSubcontractorExplicitProjects(subId: string) {
 }
 
 export async function saveSubcontractorExplicitProjects(subId: string, projectIds: string[]) {
+    await assertActiveStaff();
     await prisma.$transaction([
         prisma.subcontractorProjectAccess.deleteMany({ where: { subcontractorId: subId } }),
         prisma.subcontractorProjectAccess.createMany({
@@ -9504,6 +9857,7 @@ export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ 
 
 export async function uploadSubcontractorCOI(subcontractorId: string, formData: FormData) {
     "use server";
+    await assertActiveStaff();
     
     const file = formData.get("file") as File;
     if (!file) throw new Error("No file uploaded");
@@ -9661,6 +10015,7 @@ Respond ONLY with the single date translated into YYYY-MM-DD format.
 
 export async function deleteSubcontractorCOI(subcontractorId: string) {
     "use server";
+    await assertActiveStaff();
     
     await prisma.subcontractor.update({
         where: { id: subcontractorId },
@@ -9884,6 +10239,7 @@ export async function deleteVendorFile(id: string) {
 
 export async function getVendorTags() {
     "use server";
+    await assertActiveStaff();
     return prisma.vendorTag.findMany({ orderBy: { name: "asc" } });
 }
 
@@ -11975,30 +12331,37 @@ export async function createDecisionForSuggestion(
 // split selection-ai-sort-apply-core.ts/selection-item-thread-core.ts use.
 
 export async function createDecisionTemplate(input: DecisionTemplateInput) {
+    await assertActiveStaff();
     return createDecisionTemplateCore(input);
 }
 
 export async function updateDecisionTemplate(templateId: string, input: DecisionTemplateInput) {
+    await assertActiveStaff();
     return updateDecisionTemplateCore(templateId, input);
 }
 
 export async function archiveDecisionTemplate(templateId: string) {
+    await assertActiveStaff();
     return archiveDecisionTemplateCore(templateId);
 }
 
 export async function unarchiveDecisionTemplate(templateId: string) {
+    await assertActiveStaff();
     return unarchiveDecisionTemplateCore(templateId);
 }
 
 export async function listDecisionTemplates() {
+    await assertActiveStaff();
     return listDecisionTemplatesCore();
 }
 
 export async function listActiveDecisionTemplatesForApply() {
+    await assertActiveStaff();
     return listActiveDecisionTemplatesForApplyCore();
 }
 
 export async function applyDecisionTemplate(projectId: string, templateId: string) {
+    await assertActiveStaff();
     return applyDecisionTemplateCore(projectId, templateId);
 }
 
@@ -12007,14 +12370,17 @@ export async function linkDecisionToSchedule(
     scheduleTaskId: string | null,
     leadTimeDays: number | null,
 ) {
+    await assertActiveStaff();
     return linkDecisionToScheduleCore(decisionId, scheduleTaskId, leadTimeDays);
 }
 
 export async function setDecisionDueDateOverride(decisionId: string, dueDate: Date | null) {
+    await assertActiveStaff();
     return setDecisionDueDateOverrideCore(decisionId, dueDate);
 }
 
 export async function setDecisionOrderInfo(decisionId: string, input: DecisionOrderInput) {
+    await assertActiveStaff();
     return setDecisionOrderInfoCore(decisionId, input);
 }
 
@@ -13202,6 +13568,7 @@ export async function createCatalogItem(data: {
     costCodeId?: string;
 }) {
     "use server";
+    await assertActiveStaff();
     const item = await prisma.catalogItem.create({
         data: {
             name: data.name,
@@ -13226,6 +13593,7 @@ export async function updateCatalogItem(id: string, data: {
     isActive?: boolean;
 }) {
     "use server";
+    await assertActiveStaff();
     const item = await prisma.catalogItem.update({
         where: { id },
         data,
@@ -13238,6 +13606,7 @@ export async function updateCatalogItem(id: string, data: {
 
 export async function deleteCatalogItem(id: string) {
     "use server";
+    await assertActiveStaff();
     await prisma.catalogItem.delete({ where: { id } });
     revalidatePath("/company/my-items");
     return { success: true };
@@ -13751,6 +14120,7 @@ export async function addDocumentComment(
 }
 
 export async function deleteDocumentComment(commentId: string) {
+    await assertActiveStaff();
     // Only the comment's own author, or an ADMIN/MANAGER, may delete it.
     // Non-staff (portal) callers never satisfy either check today — there's
     // no portal mount for this component yet, so portal-authored comments
