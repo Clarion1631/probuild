@@ -968,6 +968,35 @@ async function storageRequest(baseUrl, key, path, init = {}) {
 }
 
 /**
+ * SUPABASE REPORTS A MISSING BUCKET AS 400, NOT 404.
+ *
+ * Measured against production on 2026-09-04: GET /bucket/receipt-intake for a
+ * bucket that does not exist answers HTTP 400 with the body
+ *
+ *   {"statusCode":"404","error":"Bucket not found",
+ *    "message":"Bucket not found","code":"NoSuchBucket"}
+ *
+ * The outer status describes the REQUEST; Storage's own verdict is in the body.
+ * So a check reading only `res.status === 404` called the absent bucket an
+ * error and refused to create the very thing this step exists to create:
+ *
+ *   Error: could not read bucket receipt-intake: 400 {"statusCode":"404",...}
+ *
+ * Every spelling of "absent" it is known to answer with, and NOTHING else. Any
+ * other non-2xx still throws, so a 500, a bad key or a permissions failure can
+ * never be read as "not there yet" and quietly answered by creating a bucket.
+ */
+export function bucketIsAbsent(response) {
+    if (!response || typeof response !== "object") return false;
+    if (response.ok) return false;
+    if (response.status === 404) return true;
+    const body = response.body;
+    if (!body || typeof body !== "object") return false;
+    if (body.statusCode === "404" || body.statusCode === 404) return true;
+    if (body.code === "NoSuchBucket") return true;
+    return body.error === "Bucket not found";
+}
+/**
  * Create or verify the bucket. Returns "created" | "verified"; THROWS when it
  * exists with a different policy, because that is a fact the operator has to
  * see rather than a state to overwrite.
@@ -975,7 +1004,7 @@ async function storageRequest(baseUrl, key, path, init = {}) {
 export async function ensureReceiptBucket(baseUrl, key, request = storageRequest) {
     const existing = await request(baseUrl, key, `/bucket/${RECEIPT_BUCKET}`, { method: "GET" });
 
-    if (existing.status === 404) {
+    if (bucketIsAbsent(existing)) {
         const created = await request(baseUrl, key, "/bucket", {
             method: "POST",
             body: JSON.stringify({

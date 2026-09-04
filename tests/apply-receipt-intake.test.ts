@@ -23,6 +23,7 @@ import {
     CONSTRAINT_LOOKUP_SQL,
     columnDefaultMatches,
     ensureReceiptBucket,
+    bucketIsAbsent,
     verifyColumnDefaults,
     expectedConstraints,
     foreignKeyDrift,
@@ -663,6 +664,81 @@ test("a missing bucket is CREATED private, with both limits", async () => {
     assert.equal(calls[1].body.public, false);
     assert.equal(calls[1].body.file_size_limit, RECEIPT_BUCKET_FILE_SIZE_LIMIT);
     assert.deepEqual(calls[1].body.allowed_mime_types, RECEIPT_BUCKET_MIME_TYPES);
+});
+
+/**
+ * THE SHAPE PRODUCTION ACTUALLY ANSWERS WITH, taken from a real run on
+ * 2026-09-04. Supabase Storage reports a missing bucket as HTTP 400 carrying a
+ * body that says 404, so the outer status alone is not the answer: the script
+ * threw "could not read bucket receipt-intake: 400 {...}" and never created it.
+ */
+const BUCKET_NOT_FOUND_BODY = {
+    statusCode: "404",
+    error: "Bucket not found",
+    message: "Bucket not found",
+    code: "NoSuchBucket",
+};
+
+test("a missing bucket answered as 400 + statusCode 404 is CREATED, not an error", async () => {
+    const calls: Array<{ path: string; method: string; body: any }> = [];
+    const outcome = await ensureReceiptBucket("https://x.supabase.co", "key", async (_u: string, _k: string, path: string, init: any = {}) => {
+        calls.push({ path, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+        // Verbatim: HTTP 400, and the 404 lives in the body.
+        if (init.method === "GET") return { status: 400, ok: false, body: BUCKET_NOT_FOUND_BODY };
+        return { status: 200, ok: true, body: { name: RECEIPT_BUCKET } };
+    });
+    assert.equal(outcome, "created");
+    assert.equal(calls.length, 2, "the create actually went out");
+    assert.equal(calls[1].method, "POST");
+    assert.equal(calls[1].path, "/bucket");
+    // ...with the limits that only the bucket can enforce.
+    assert.equal(calls[1].body.public, false);
+    assert.equal(calls[1].body.file_size_limit, RECEIPT_BUCKET_FILE_SIZE_LIMIT);
+    assert.deepEqual(calls[1].body.allowed_mime_types, RECEIPT_BUCKET_MIME_TYPES);
+});
+
+test("CONTROL: a genuine failure is never read as an absent bucket", async () => {
+    // Without this the fix above would be indistinguishable from "create the
+    // bucket whenever the read fails", which would paper over a bad key, a
+    // permissions change or an outage by provisioning over the top of it.
+    for (const failure of [
+        { status: 500, ok: false, body: { error: "Internal Server Error" } },
+        { status: 403, ok: false, body: { statusCode: "403", error: "Unauthorized", code: "InvalidJWT" } },
+        { status: 400, ok: false, body: { statusCode: "400", error: "Bad Request", code: "InvalidRequest" } },
+        { status: 502, ok: false, body: null },
+    ]) {
+        let writes = 0;
+        await assert.rejects(
+            () => ensureReceiptBucket("https://x.supabase.co", "key", async (_u: string, _k: string, _p: string, init: any = {}) => {
+                if (init.method !== "GET") { writes++; return { status: 200, ok: true, body: {} }; }
+                return failure;
+            }),
+            /could not read bucket/,
+            JSON.stringify(failure),
+        );
+        assert.equal(writes, 0, `nothing may be created after ${failure.status}`);
+    }
+});
+
+test("absence is recognised by ANY of the spellings, and by nothing else", () => {
+    // The outer 404 (what the API used to be assumed to answer), and the three
+    // fields the measured 400 carries. Each on its own is enough, because a
+    // future API version dropping one of them must not turn the step back into
+    // a hard failure.
+    assert.equal(bucketIsAbsent({ status: 404, ok: false, body: { error: "not found" } }), true);
+    assert.equal(bucketIsAbsent({ status: 400, ok: false, body: BUCKET_NOT_FOUND_BODY }), true);
+    assert.equal(bucketIsAbsent({ status: 400, ok: false, body: { statusCode: 404 } }), true);
+    assert.equal(bucketIsAbsent({ status: 400, ok: false, body: { code: "NoSuchBucket" } }), true);
+    assert.equal(bucketIsAbsent({ status: 400, ok: false, body: { error: "Bucket not found" } }), true);
+
+    // And nothing else is absence.
+    assert.equal(bucketIsAbsent({ status: 500, ok: false, body: { error: "Internal Server Error" } }), false);
+    assert.equal(bucketIsAbsent({ status: 400, ok: false, body: { statusCode: "400", code: "InvalidRequest" } }), false);
+    assert.equal(bucketIsAbsent({ status: 400, ok: false, body: null }), false);
+    assert.equal(bucketIsAbsent({ status: 400, ok: false, body: { raw: "Bucket not found" } }), false);
+    // A SUCCESSFUL read is never absence, whatever the body happens to say.
+    assert.equal(bucketIsAbsent({ status: 200, ok: true, body: BUCKET_NOT_FOUND_BODY }), false);
+    assert.equal(bucketIsAbsent(null), false);
 });
 
 test("an existing bucket with the right policy is VERIFIED, and nothing is written", async () => {
