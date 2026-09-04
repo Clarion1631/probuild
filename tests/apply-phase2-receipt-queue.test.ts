@@ -17,6 +17,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
     BANK_LINE_SOURCES_OF_RECORD,
+    directDbHostForUrl,
     PROD_BASELINE_MIGRATION,
     PROD_ENV_FILE,
     PROJECT_REF_ENV,
@@ -191,6 +192,12 @@ test("the target guard is exact on BOTH db and host — no degenerate substring 
  * production. Every case below injects its resolver, so no test touches DNS.
  */
 const POOLER_HOST = "aws-0-us-west-2.pooler.supabase.com";
+// The three A records aws-0-us-west-2.pooler.supabase.com published on
+// 2026-09-04, and the address production's inet_server_addr() actually reports
+// — which is the AAAA of db.ghzdbzdnwjxazvmcefbh.supabase.co, NOT of the
+// pooler. The pooler publishes no AAAA at all.
+const POOLER_A = ["54.70.143.232", "35.160.209.8", "44.238.118.41"];
+const PROJECT_DB_HOST = "db.ghzdbzdnwjxazvmcefbh.supabase.co";
 const POOLER_V6 = "2600:1f13:838:6e45:7ee0:268:15b9:d263";
 const neverResolves = async () => {
     throw new Error("the resolver must not be called for this case");
@@ -246,9 +253,62 @@ test("the host check resolves --expect-host and requires the connected address t
     });
 });
 
+/**
+ * THE PRODUCTION SHAPE, MEASURED RATHER THAN ASSUMED.
+ *
+ * Resolving --expect-host alone is NOT enough: the pooler name has no AAAA, and
+ * the address production reports belongs to the project's own database, because
+ * that is what answers behind Supavisor. The first case below is the exact
+ * production run, and the second is its control — without the project host the
+ * same connection is still refused, so this is a second name being checked, not
+ * a blanket accept.
+ */
+test("the pooler's own name is not enough — the project's database is what answers", async t => {
+    const zone: Record<string, string[]> = {
+        [POOLER_HOST]: POOLER_A,
+        [PROJECT_DB_HOST]: [POOLER_V6],
+    };
+    const resolve = async (hostname: string) => zone[hostname] ?? [];
+
+    await t.test("production: pooler name + project db host accepts the reported IPv6", async () => {
+        assert.equal(await targetHostMatches(POOLER_V6, POOLER_HOST, resolve, "", PROJECT_DB_HOST), "project-db");
+    });
+
+    await t.test("control: without the project host the same connection is REFUSED", async () => {
+        assert.equal(await targetHostMatches(POOLER_V6, POOLER_HOST, resolve, "", ""), null);
+    });
+
+    await t.test("another project's database does not rescue it", async () => {
+        const other = "db.someotherprojectref00.supabase.co";
+        assert.equal(await targetHostMatches(POOLER_V6, POOLER_HOST, resolve, "", other), null);
+    });
+
+    await t.test("an address behind neither name is refused", async () => {
+        assert.equal(await targetHostMatches("203.0.113.9", POOLER_HOST, resolve, "", PROJECT_DB_HOST), null);
+    });
+
+    await t.test("a pooler A record still matches on the --expect-host name itself", async () => {
+        assert.equal(await targetHostMatches(POOLER_A[1], POOLER_HOST, resolve, "", PROJECT_DB_HOST), "dns");
+    });
+});
+
+test("the project's database host is derived from the URL, and only for a pooler URL", () => {
+    const ref = "ghzdbzdnwjxazvmcefbh";
+    assert.equal(
+        directDbHostForUrl(`postgresql://postgres.${ref}:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`),
+        PROJECT_DB_HOST,
+    );
+    // Not a pooler URL: nothing to widen to, and nothing is widened.
+    assert.equal(directDbHostForUrl(`postgresql://postgres.${ref}:pw@localhost:5432/postgres`), "");
+    // No parseable project ref: refuse to guess one.
+    assert.equal(directDbHostForUrl("postgresql://postgres:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres"), "");
+    assert.equal(directDbHostForUrl("not a url"), "");
+});
+
 test("the live path uses the DNS-aware check and keeps the db name exact", () => {
     const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-phase2-receipt-queue.mjs"), "utf8");
-    assert.match(source, /await targetHostMatches\(actual\.host, expectHost, lookupAddresses, urlHostname\)/);
+    assert.match(source, /await targetHostMatches\(actual\.host, expectHost, lookupAddresses, urlHostname, directHost\)/);
+    assert.match(source, /const directHost = directDbHostForUrl\(url\);/);
     assert.match(source, /String\(actual\.db \?\? ""\) !== String\(expectDb \?\? ""\)/);
     // A falsy return is the refusal — the exit must not be conditional on a label.
     assert.match(source, /if \(!hostMatch\) \{[\s\S]{0,400}?process\.exit\(1\);/);
