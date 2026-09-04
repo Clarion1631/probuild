@@ -10,24 +10,35 @@
  * milestone Paid exactly like the Stripe webhook does. That keeps ProBuild,
  * QuickBooks, and the bank in sync, and keeps the sales-tax report truthful.
  */
+import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
-import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { withTxRetry, lockMoneyParents, lockClientRow } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { BANK_DEPOSIT_SOURCE, MONEY_IN_FLIGHT_STATUSES } from "./deposit-sweep";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
 import { logAutomationEvent } from "./automation-events";
+import { createHash } from "node:crypto";
 import {
     type QBTokens,
     refreshQBToken,
     isQBTimeoutError,
     isQBBudgetExhaustedError,
     createRouteDeadline,
+    remainingBudgetMs,
     isBudgetExhausted,
     type RouteDeadline,
     qbQuery,
+    escapeQBString,
     isQboConnectionFailure,
+    isRetryableQboError,
+    isQBAmbiguousDocumentCreateError,
+    isQboMalformedResponseError,
+    qboHttpStatus,
+    isQboReconnectRequired,
+    QBTokenStrandedError,
+    isQBTokenStrandedError,
     QboRetryableError,
     type QBInvoiceProbe,
     ensureQBCustomer,
@@ -38,8 +49,37 @@ import {
     probeQBInvoice,
     getQBPayment,
     deleteQBInvoice,
+    QB_DOC_NUMBER_MAX_LEN,
+    canonicalPrivateNote,
+    qboTxnDate,
 } from "./quickbooks";
+import {
+    AMBIGUOUS_CREATE_MARKER,
+    CREATE_IN_FLIGHT_MARKER,
+    PAYLINK_PENDING_MARKER,
+    isPayLinkPending,
+    nextPayLinkState,
+    payLinkPendingWhere,
+    composeCreateMarker,
+    isBlockedByAmbiguousCreate,
+} from "./qbo-create-markers";
+import { milestoneIssuanceHash, milestoneTaxSplit } from "./qbo-issuance";
+import {
+    isPendingDeletion,
+    PENDING_DELETION_MARKER,
+    PENDING_DELETION_SETTLED_MARKER,
+    deletionClaimMarker,
+    COMPENSATION_CLAIMED_PREFIX,
+    isIrreversibleClaimHeld,
+    compensationClaimMarker,
+    PENDING_DELETION_CLAIMED_PREFIX,
+} from "./qbo-create-markers";
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
+// One definition of the reconnect-QuickBooks reason string, shared with the
+// health probe that counts it. A second literal here is how the row loop and
+// the preflight drifted apart in the first place.
+import { QBO_AUTH_EVENT_REASON as QBO_AUTH_SYNC_REASON } from "./pipeline-health";
+import { documentMatchesClaim } from "./qbo-document-sync";
 import type { QBSyncIssue } from "./payment-notifications";
 
 /**
@@ -59,6 +99,14 @@ export class QBNotConnectedError extends Error {
         super("QuickBooks is not connected (Settings → Integrations → QuickBooks)");
         this.name = "QBNotConnectedError";
     }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQBNotConnectedError(error: unknown): error is QBNotConnectedError {
+    return (
+        error instanceof QBNotConnectedError ||
+        (error instanceof Error && error.name === "QBNotConnectedError")
+    );
 }
 
 /** Fresh tokens, persisting the rotated refresh token. Throws QBNotConnectedError. */
@@ -105,9 +153,33 @@ export async function refreshTokensOrFallBack(
         fresh = await refresh(qb.refreshToken);
     } catch (error) {
         if (isQBTimeoutError(error)) throw error;
-        // Refresh itself failed and Intuit rotated nothing, so the old access
-        // token may still be valid. This is the ONLY branch that may fall back.
+
+        // Falling back is only safe when Intuit EXPLICITLY rejected the
+        // exchange — a 400/401 (invalid_grant and friends) means it processed
+        // the request and refused, so nothing rotated and the stored access
+        // token may still be good.
+        //
+        // Everything else is ambiguous and must strand: a 5xx says Intuit
+        // broke somewhere in its own pipeline and may well have rotated before
+        // failing, and a reset socket, TLS failure, truncated or malformed body
+        // says we never learned the outcome at all. Treating those as "refused"
+        // hands back a pair that could already be spent, reporting a healthy
+        // connection sitting on a dead token.
+        const status = qboHttpStatus(error);
+        const explicitlyRejected = status === 400 || status === 401;
+        if (!explicitlyRejected) {
+            throw new QBTokenStrandedError(
+                status !== null ? `HTTP ${status}` : error instanceof Error ? error.name : "transport failure",
+            );
+        }
         return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
+    }
+
+    // A 200 that omits either token is the same ambiguity wearing a different
+    // hat: something rotated, and we did not receive what replaced it.
+    const usable = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+    if (!usable(fresh.accessToken) || !usable(fresh.refreshToken)) {
+        throw new QBTokenStrandedError("refresh response was missing a token");
     }
 
     // A SAVE failure is a different animal and must never share the catch
@@ -147,6 +219,24 @@ export async function claimQBInvoiceUnlink(
     client: Prisma.TransactionClient,
     scheduleId: string,
     expectedQbInvoiceId: string,
+    /**
+     * The `qbSyncError` this caller OBSERVED before it decided to unlink.
+     *
+     * Required, and `null` is a real value meaning "there was no marker": a
+     * Prisma `null` here compiles to `IS NULL`, so the two cases stay distinct
+     * rather than one of them matching everything.
+     *
+     * Without it this CAS pinned the LINK but not the STATE around it, and
+     * those are different questions. A `deleteInQBO` unlink writes
+     * `pending-deletion` and then spends seconds on a remote delete; a
+     * concurrent local-only unlink read the row before that marker landed, saw
+     * the same qbInvoiceId, and cleared the link anyway. If the remote delete
+     * then failed or timed out, the invoice was still live in QuickBooks and
+     * the milestone was unlinked and freely re-sendable — two collectible
+     * invoices for one milestone, which is the exact outcome the
+     * pending-deletion state exists to prevent.
+     */
+    expectedQbSyncError: string | null,
 ): Promise<boolean> {
     const cleared = await client.paymentSchedule.updateMany({
         where: {
@@ -154,6 +244,7 @@ export async function claimQBInvoiceUnlink(
             status: { not: "Paid" },
             qbPaymentId: null,
             qbInvoiceId: expectedQbInvoiceId,
+            qbSyncError: expectedQbSyncError,
         },
         data: {
             qbInvoiceId: null,
@@ -162,6 +253,9 @@ export async function claimQBInvoiceUnlink(
             // payment request was emailed (the portal's "due" marker), which stays
             // true even when the QBO invoice behind it is voided and re-staged.
             qbSyncedAt: null,
+            // Also clears the ambiguous-create marker: unlinking is the
+            // documented way to release a milestone parked by an unknown-outcome
+            // create, once a human has checked QuickBooks.
             qbSyncError: null,
         },
     });
@@ -170,22 +264,68 @@ export async function claimQBInvoiceUnlink(
 
 // Exported for stageProgressBillingToQuickBooksCore (src/lib/progress-billing.ts),
 // which needs the same customer/item resolution pushMilestoneToQuickBooks uses.
-export async function resolveCustomerAndItem(tokens: QBTokens, clientId: string): Promise<{ customerId: string; itemId: string }> {
+export async function resolveCustomerAndItem(
+    tokens: QBTokens,
+    clientId: string,
+    deadline?: RouteDeadline,
+): Promise<{ customerId: string; itemId: string }> {
     const client = await prisma.client.findUnique({
         where: { id: clientId },
         select: { id: true, name: true, email: true, qbCustomerId: true },
     });
     if (!client) throw new Error("Client not found");
 
-    const customerId = await ensureQBCustomer(tokens, client);
-    if (customerId !== client.qbCustomerId) {
-        await prisma.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
+    // What the mapping said BEFORE the QuickBooks round trip. Everything below
+    // is decided against this value, not against a re-read of `client`, because
+    // that is the state `ensureQBCustomer` actually answered about.
+    const qbCustomerIdBeforeRemote = client.qbCustomerId;
+    const customerId = await ensureQBCustomer(tokens, client, deadline);
+    if (customerId !== qbCustomerIdBeforeRemote) {
+        // Re-pointing a client at another QuickBooks customer is a money-path
+        // write: the ambiguous-create recovery decides whether to link or
+        // release a parked invoice against exactly this value. It therefore
+        // takes the canonical Client lock (see tx-retry.ts) so that decision
+        // either happens entirely before this remap or entirely after it,
+        // never straddling it. FOR UPDATE, not FOR SHARE — this is the writer.
+        //
+        // Only the lock-and-write is inside the transaction. `ensureQBCustomer`
+        // above is a QuickBooks round trip and must never be held across a row
+        // lock.
+        //
+        // The lock alone was NOT enough. It serialised this write against the
+        // resolver, but the write itself was unconditional: the row was read
+        // BEFORE the round trip, and whatever landed in that window — another
+        // push remapping the same client, an admin repointing it by hand — was
+        // silently overwritten with a decision made against state that no longer
+        // existed. So the mapping is RE-READ under the lock and the write only
+        // lands while it still says what it said before the round trip.
+        const verdict = await withTxRetry(() => prisma.$transaction(async (tx) => {
+            await lockClientRow(tx, client.id, "update");
+            const fresh = await tx.client.findUnique({
+                where: { id: client.id },
+                select: { qbCustomerId: true },
+            });
+            // Gone entirely: there is no row to remap and no safe value to write.
+            if (!fresh) return "conflict" as const;
+            // Somebody already wrote the SAME answer we were about to write.
+            // That is not a conflict — it is this exact remap, done once.
+            if (fresh.qbCustomerId === customerId) return "already" as const;
+            if (fresh.qbCustomerId !== qbCustomerIdBeforeRemote) return "conflict" as const;
+            await tx.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
+            return "written" as const;
+        }));
+        // Fail closed. A caller that went ahead here would build its invoice
+        // against a customer the database disagrees with, and the marker it
+        // writes would fingerprint a mapping nothing can reproduce — which is
+        // exactly the state the resolver has to refuse later, after a real
+        // invoice already exists in QuickBooks.
+        if (verdict === "conflict") throw new QBCustomerRemappedError(client.name || client.id);
     }
 
     const qb = await getQBSettings();
     let itemId = qb.serviceItemId;
     if (!itemId) {
-        itemId = await ensureQBServiceItem(tokens);
+        itemId = await ensureQBServiceItem(tokens, deadline);
         await saveQBSettings({ serviceItemId: itemId });
     }
     return { customerId, itemId };
@@ -201,7 +341,1534 @@ export interface MilestonePushResult {
  * Create (or reuse) the QBO invoice for one milestone and return its pay link.
  * Idempotent: a milestone that already has a QBO invoice just refreshes the link.
  */
-export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passedTokens?: QBTokens): Promise<MilestonePushResult> {
+// The marker vocabulary and the rules that read it live in a PURE module
+// (qbo-create-markers.ts) so money guards everywhere — and the invoice editor's
+// client bundle — share one definition instead of re-deriving it. Re-exported
+// here because this is where every existing caller imports them from.
+export {
+    AMBIGUOUS_CREATE_MARKER,
+    CREATE_IN_FLIGHT_MARKER,
+    CREATE_IN_FLIGHT_STALE_MS,
+    PAYLINK_PENDING_MARKER,
+    PAYLINK_MISSING_MARKER,
+    PAYLINK_MAX_ATTEMPTS,
+    PENDING_CREATE_MARKERS,
+    PENDING_DELETION_MARKER,
+    PENDING_DELETION_SETTLED_MARKER,
+    isPendingDeletion,
+    composeCreateMarker,
+    parseCreateMarker,
+    markerKind,
+    pendingCreateMarkerWhere,
+    isBlockedByAmbiguousCreate,
+    isStaleInFlight,
+    isQboInvoiceLinkedOrPending,
+    ambiguousCreateFingerprint,
+    QBResolveRequiredError,
+    QBIdentityUnknownError,
+} from "./qbo-create-markers";
+
+/**
+ * The QuickBooks DocNumber for one milestone: INV-00012-2, the milestone's
+ * position within its invoice's schedule. Truncated to Intuit's 21 characters.
+ *
+ * ONE definition, shared by the push that writes it and by the ambiguous-create
+ * resolver that has to look it up again. A second copy would drift and the
+ * resolver would quietly stop finding the invoices we create.
+ */
+export function milestoneDocNumber(invoiceCode: string, position: number): string {
+    const suffix = `-${position}`;
+    return `${invoiceCode.slice(0, Math.max(1, QB_DOC_NUMBER_MAX_LEN - suffix.length))}${suffix}`;
+}
+
+/** The PrivateNote every milestone invoice carries — what proves it is ours. */
+export function milestonePrivateNote(invoiceCode: string, scheduleName: string, projectName: string): string {
+    return `ProBuild ${invoiceCode} · ${scheduleName} · ${projectName}`;
+}
+
+/** The one write the compensation step needs; either rail's delegate satisfies it. */
+export interface CompensatableDelegate {
+    updateMany(args: any): Promise<{ count: number }>;
+    count?(args: any): Promise<number>;
+}
+
+/**
+ * What a compensation must still be true of before it deletes anything.
+ *
+ * The caller names the parent invoice (so the claim can take the same money
+ * locks a settle takes) and the columns that say THIS ROW HAS NOT SETTLED.
+ * They differ per rail: a milestone is `status: Pending` with a null
+ * `qbPaymentId`; a progress billing must not have reached Paid.
+ */
+export interface CompensationClaim {
+    /** The parent invoice, for `lockMoneyParents`. */
+    invoiceId: string | null;
+    /** Extra WHERE the claim AND the clear must both satisfy. */
+    unsettled: Record<string, unknown>;
+    /** Runs the claim in a transaction. Injectable so tests drive the real rule. */
+    transaction?: <T>(fn: (tx: any) => Promise<T>) => Promise<T>;
+}
+
+/**
+ * Delete a QuickBooks invoice we created but could not keep, then release the
+ * provisional link we wrote for it.
+ *
+ * Both rails now record `qbInvoiceId` BEFORE the pay-link fetch, so by the time
+ * compensation runs the row may already point at the invoice being deleted.
+ * Deleting without clearing left the row linked to a document that no longer
+ * exists: the payments poller would keep probing it, the portal would offer a
+ * dead pay link, and the next send would refuse because the row "already has"
+ * an invoice. The clear is CAS-pinned to the exact id we wrote, so a concurrent
+ * settle or re-stage that moved the row on wins instead of being trampled.
+ *
+ * A FAILED delete deliberately keeps the link: the invoice is still out there
+ * and collectible, and a row pointing at it is how a human finds it.
+ *
+ * The pre-link CAS can also lose BEFORE the row ever carried `qbInvoiceId` at
+ * all — the row still has it null, only `qbSyncError` holds our in-flight
+ * claim. Clearing by `qbInvoiceId` then matches nothing, and a confirmed
+ * delete would leave the claim parked forever with no invoice left to explain
+ * it. `ownedInFlightMarker`, when supplied, is the fallback: clear by the exact
+ * marker THIS caller wrote instead, so the claim is still released.
+ *
+ * `deleteInvoice()` returning `false` is not a failure: `deleteQBInvoice`
+ * (quickbooks.ts) returns `false` for an AUTHORITATIVE 404 — the invoice is
+ * already gone, which is exactly the state compensation wants. Only a THROWN
+ * error leaves the remote outcome unknown (the delete may or may not have
+ * landed), so only that case skips the unlink and reports failure.
+ */
+export async function compensateAndUnlink(
+    delegate: CompensatableDelegate,
+    rowId: string,
+    qbInvoiceId: string,
+    deleteInvoice: () => Promise<boolean>,
+    /** Extra columns to restore alongside the link (e.g. a progress billing's status). */
+    extraClearData: Record<string, unknown> = {},
+    /** The in-flight marker this caller wrote before the create, if any. */
+    ownedInFlightMarker?: string,
+    /**
+     * What must still be true for this compensation to be allowed to delete.
+     * Optional only so the seam stays testable; every production caller
+     * supplies it, and `tests/qbo-compensation-claim.test.ts` pins that.
+     */
+    claim?: CompensationClaim,
+): Promise<{ deleted: boolean; unlinked: boolean; alreadyAbsent?: boolean; refused?: boolean }> {
+    // CLAIM BEFORE THE IRREVERSIBLE CALL.
+    //
+    // Round 50 (P0): this used to delete first and then clear pinned only to
+    // `{ id, qbInvoiceId }`. A settlement committing after the finalize
+    // released its locks, but before that clear, meant the QuickBooks invoice
+    // of a milestone that had just been PAID was deleted — and the paid row
+    // was cleared anyway (a progress billing was additionally reset to Draft).
+    //
+    // The claim runs in its own short transaction under the same money locks a
+    // settle takes, pinned to the row's link, the marker this caller owns and
+    // the caller's own `unsettled` columns. A settle that got there first
+    // makes it fail, and then nothing is deleted at all.
+    let claimMarker: string | null = null;
+    if (claim) {
+        const marker = compensationClaimMarker(randomUUID().slice(0, 8));
+        const runTx = claim.transaction
+            ?? (<T,>(fn: (tx: any) => Promise<T>) => (prisma as any).$transaction(fn));
+        const won = await withTxRetry(() => runTx(async (tx: any) => {
+            // The lock is taken when there is a real transaction to take it in.
+            // An injected in-memory table has no `$queryRaw` and no locks at all
+            // — the same shape `finalizeProgressBillingLinkWithDb` already uses for
+            // its twin: the CAS below is the part those tests exercise, and the
+            // DB-gated tests are what prove the locking.
+            if (claim.invoiceId && typeof tx?.$queryRaw === "function") {
+                await lockMoneyParents(tx, { invoiceId: claim.invoiceId });
+            }
+            // Either shape the row can legitimately be in: already carrying our
+            // provisional link, or still unlinked and holding only our marker.
+            const claimed = await delegate.updateMany({
+                where: {
+                    id: rowId,
+                    ...claim.unsettled,
+                    ...(ownedInFlightMarker
+                        ? { OR: [{ qbInvoiceId }, { qbInvoiceId: null, qbSyncError: ownedInFlightMarker }] }
+                        : { qbInvoiceId }),
+                },
+                data: { qbSyncError: marker },
+            });
+            return claimed.count === 1;
+        })).catch(() => false);
+        if (!won) {
+            // The claim lost. TWO very different situations look identical here,
+            // and telling them apart is the whole job:
+            //
+            //   • the row still POINTS AT our invoice and could not be claimed
+            //     — it settled. Deleting would destroy the invoice behind a
+            //     payment, which is the P0 this claim exists for. Refuse.
+            //
+            //   • the row has MOVED ON — another owner took the marker, or it was
+            //     re-staged onto a different invoice. Ours is then an orphan that
+            //     nothing references and nothing ever will, and leaving it in
+            //     QuickBooks is the very litter compensation exists to sweep up.
+            //     Delete it, and touch no local row.
+            const stillOurs = delegate.count
+                ? await delegate.count({ where: { id: rowId, qbInvoiceId } }).catch(() => 1)
+                : 1;
+            if (stillOurs > 0) {
+                return { deleted: false, unlinked: false, refused: true };
+            }
+            try {
+                const result = await deleteInvoice();
+                // Deleted, but deliberately NOT unlinked: the row points somewhere
+                // else now, and this compensation has no business writing to it.
+                return { deleted: true, unlinked: false, alreadyAbsent: result === false };
+            } catch {
+                return { deleted: false, unlinked: false };
+            }
+        }
+        claimMarker = marker;
+        // NO re-count here, deliberately (round 51). A count is a READ, not a
+        // fence: a settlement committing between it and the network call below
+        // still won, and the delete destroyed a paid milestone's invoice.
+        //
+        // What fences the call is the CLAIM ITSELF: every settlement rail
+        // refuses a row whose marker is `compensating:*` (see
+        // isIrreversibleClaimHeld — payment-record-core.ts for the manual rail,
+        // settleMilestonePaidInTx for the QuickBooks and progress-billing ones).
+        // So once this CAS has committed, no settle can land until the claim is
+        // released, and the window the count was trying to cover does not exist.
+    }
+    let alreadyAbsent = false;
+    try {
+        const result = await deleteInvoice();
+        alreadyAbsent = result === false;
+    } catch {
+        // Thrown: the delete's outcome is genuinely unknown — the remote
+        // invoice may still exist. Do not touch the row, but give the claim
+        // back so the row is not left in a state only this path understands.
+        if (claimMarker) {
+            await delegate.updateMany({
+                where: { id: rowId, qbSyncError: claimMarker },
+                data: { qbSyncError: ownedInFlightMarker ?? null },
+            }).catch(() => ({ count: 0 }));
+        }
+        return { deleted: false, unlinked: false };
+    }
+    const cleared = await delegate.updateMany({
+        // The COMPLETE claimed state, not just the link: the claim token proves
+        // no settle cancelled it, and the caller's `unsettled` columns prove the
+        // row is still the unsettled row this compensation was decided for.
+        where: {
+            id: rowId,
+            qbInvoiceId,
+            ...(claimMarker ? { qbSyncError: claimMarker } : {}),
+            ...(claim?.unsettled ?? {}),
+        },
+        data: {
+            qbInvoiceId: null,
+            qbInvoiceLink: null,
+            qbSyncedAt: null,
+            // The paylink-pending marker goes with it: there is no invoice left
+            // for the sweep to fetch a link for.
+            qbSyncError: null,
+            ...extraClearData,
+        },
+    }).catch(() => ({ count: 0 }));
+    if (cleared.count === 1) return { deleted: true, unlinked: true, alreadyAbsent };
+    if (!ownedInFlightMarker) return { deleted: true, unlinked: false, alreadyAbsent };
+    // The row never got as far as carrying qbInvoiceId — clear by the marker we
+    // own instead, so a confirmed delete still releases the claim.
+    const clearedByMarker = await delegate.updateMany({
+        where: {
+            id: rowId,
+            qbInvoiceId: null,
+            // The claim if we took one, else the marker we own.
+            qbSyncError: claimMarker ?? ownedInFlightMarker,
+            ...(claim?.unsettled ?? {}),
+        },
+        data: {
+            qbInvoiceLink: null,
+            qbSyncedAt: null,
+            qbSyncError: null,
+            ...extraClearData,
+        },
+    }).catch(() => ({ count: 0 }));
+    return { deleted: true, unlinked: clearedByMarker.count === 1, alreadyAbsent };
+}
+
+/**
+ * Did somebody ELSE already finish the link for the very invoice we just
+ * created?
+ *
+ * The final link CAS in `pushMilestoneToQuickBooks` pins `qbSyncError` to the
+ * `paylink-pending` marker the pre-pay-link write left behind. That marker is
+ * deliberately transient: `sweepPendingPayLinks` fills the pay link and clears
+ * it, and so does a CONCURRENT resend taking the already-linked early-return
+ * branch at the top of the push (it fetches the link and clears the flag). Both
+ * of those finish the row correctly and, in the resend's case, have already
+ * returned success for this exact `qbInvoiceId` to their own caller.
+ *
+ * Before this guard the losing CAS was read as "the milestone was abandoned",
+ * and compensation DELETED a live, correct QuickBooks invoice out from under
+ * the caller that had just been told it existed. A marker that moved is not
+ * divergence; the invoice id is what identifies the outcome.
+ *
+ * Pure so the interleaving can be tested exactly. `true` means "this row is
+ * still the row we issued for, and it points at OUR invoice" — never
+ * compensate. Everything else (a different or absent id, a Canceled row, or
+ * content that no longer matches what the QBO invoice was built from) is
+ * genuine divergence and still compensates, unchanged.
+ *
+ * A **Paid** row needs EVIDENCE, not just a status. The old rule accepted any
+ * non-Canceled row on the reasoning that a row which went Paid "was settled
+ * against this invoice" — and that is only true of the QuickBooks rail.
+ * `recordPaymentCore` (payment-record-core.ts) settles a milestone from a
+ * MANUAL Record Payment: it writes status, paymentDate, method and reference,
+ * and leaves `qbPaymentId` null, because no QuickBooks payment exists. Land
+ * that between the provisional link and this finalization and the guard said
+ * "already finalized", the push returned success, and the QuickBooks invoice
+ * stayed open and collectible for money the client had already handed over.
+ *
+ * So a Paid row only counts as finalized when `qbPaymentId` is set — the
+ * column `settleMilestoneFromQBPayment` writes in the same transaction as the
+ * status, and the only thing that ties a settlement to THIS QuickBooks
+ * document. A Paid row WITHOUT it is neither finalized nor abandoned; the
+ * caller parks it (see the `settled-without-qb-payment` outcome) rather than
+ * deleting a document a human may still need to reconcile against.
+ */
+/**
+ * The specific shape the guard above now refuses: our invoice, our content,
+ * settled — but by something that is not a QuickBooks payment.
+ *
+ * Its own predicate because the CALLER has to tell it apart from ordinary
+ * divergence. Ordinary divergence compensates (the invoice is unreferenced, so
+ * delete it). This does NOT: the row still points at the invoice and is Paid,
+ * so deleting would strand a Paid milestone pointing at nothing, and the money
+ * may yet need reconciling in QuickBooks. It is a human decision, and the
+ * caller records it as one.
+ */
+export function isSettledWithoutQbPayment(
+    current: { qbInvoiceId: string | null; status: string; qbPaymentId?: string | null } | null,
+    qbInvoiceId: string,
+): boolean {
+    return !!current
+        && current.qbInvoiceId === qbInvoiceId
+        && current.status === "Paid"
+        && !current.qbPaymentId;
+}
+
+export function isConcurrentlyFinalizedMilestoneLink(
+    current: {
+        qbInvoiceId: string | null;
+        status: string;
+        amount: unknown;
+        name: string;
+        dueDate: Date | null;
+        /** Proof a QuickBooks payment settled this row. Null = settled elsewhere, or not at all. */
+        qbPaymentId?: string | null;
+    } | null,
+    qbInvoiceId: string,
+    issuedFrom: { amount: unknown; name: string; dueDate: Date | null },
+): boolean {
+    if (!current) return false;
+    if (current.qbInvoiceId !== qbInvoiceId) return false;
+    if (current.status === "Canceled") return false;
+    if (current.status === "Paid" && !current.qbPaymentId) return false;
+    if (current.name !== issuedFrom.name) return false;
+    // Decimal columns never compare with ===; go through the same numeric
+    // conversion the create used to build the invoice amount.
+    const a = toNum(current.amount as any);
+    const b = toNum(issuedFrom.amount as any);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || Math.abs(a - b) > 0.0001) return false;
+    const currentDue = current.dueDate ? new Date(current.dueDate).getTime() : null;
+    const issuedDue = issuedFrom.dueDate ? new Date(issuedFrom.dueDate).getTime() : null;
+    return currentDue === issuedDue;
+}
+
+/** One row waiting for its pay link, from either rail. */
+export interface PayLinkPendingRow {
+    id: string;
+    qbInvoiceId: string;
+    code: string;
+    /** The marker as READ, so the attempt count survives into the write. */
+    qbSyncError: string | null;
+}
+
+export interface PayLinkSweepDelegate {
+    findMany(args: any): Promise<any[]>;
+    updateMany(args: any): Promise<{ count: number }>;
+    /**
+     * How many rows currently match the pending-marker filter. Read twice per
+     * run — once before the loop, once after — because "the sweep returned" and
+     * "the sweep finished the work" are different claims, and only a count
+     * taken from the database can tell them apart.
+     */
+    count(args: any): Promise<number>;
+}
+
+/** Per-rail counters, plus the sum the caller actually gates on. */
+export interface PayLinkRailCounts {
+    milestone: number;
+    progressBilling: number;
+    total: number;
+}
+
+export interface PayLinkSweepDb {
+    paymentSchedule: PayLinkSweepDelegate;
+    progressBilling: PayLinkSweepDelegate;
+}
+
+export interface PayLinkSweepResult {
+    checked: number;
+    /** A link was fetched and written. */
+    repaired: number;
+    /** QuickBooks answered, but this invoice has no payment link to offer. */
+    noLink: number;
+    /** Rows that ran out of retries and are now durably `paylink-missing`. */
+    payLinkMissing: number;
+    /** Left for the next run — the sweep stopped, or the CAS lost. */
+    skipped: number;
+    /**
+     * A rail filled its page, so more pending rows may exist than this run
+     * looked at. The caller must not report a clean sweep on it.
+     */
+    truncated?: boolean;
+    reason?: string;
+    /**
+     * Rows that were eligible when this run started and that it never reached.
+     *
+     * The run's own bookkeeping — eligible-at-start minus rows it actually
+     * decided — so it counts everything the pages did not cover as well as
+     * everything the budget cut short. Nonzero means the sweep did NOT look at
+     * the whole set, whatever else it reports.
+     */
+    unvisited: PayLinkRailCounts;
+    /**
+     * Rows still carrying the pending marker when the run ended, counted from
+     * the database rather than inferred. Nonzero means there is a milestone or
+     * a progress billing whose client still has no pay link — the condition
+     * this sweep exists to remove, so a run that leaves any is not clean.
+     */
+    unresolved: PayLinkRailCounts;
+    /** Which rail this run processed first (alternates run to run). */
+    railFirst: "milestone" | "progressBilling";
+}
+
+/** How many pending rows one sweep will look at, per rail. */
+export const PAYLINK_SWEEP_LIMIT = 100;
+
+/**
+ * Where the last pay-link sweep stopped, per rail, so the next one CONTINUES.
+ *
+ * Both rail queries were an UNORDERED `take: 100`. A row whose pay-link read
+ * fails for a reason this sweep deliberately leaves alone (the invoice was
+ * deleted in QuickBooks, say — the invoice-probe sweep owns that, not this one)
+ * keeps its `paylink-pending` marker forever. Once 100 such rows existed, every
+ * run fetched the same stuck page and nothing behind it was ever looked at
+ * again. Ordering by id makes the page deterministic and the cursor makes the
+ * cap a rolling window over the whole set, wrapping to the top when it drains.
+ *
+ * Separate keys from PAYMENTS_CURSOR_KEYS on purpose: this sweep walks a
+ * different set (linked-but-linkless rows) than the payments sync does
+ * (unsettled rows), so sharing a cursor would make each skip the other's work.
+ */
+export const PAYLINK_CURSOR_KEYS = {
+    milestones: "qbo-paylink-sweep.cursor.milestones",
+    billings: "qbo-paylink-sweep.cursor.billings",
+} as const;
+
+/**
+ * Which rail this sweep works FIRST, flipped every run.
+ *
+ * Milestones used to be processed first, always. Under repeated budget
+ * exhaustion — the normal state of a backlog — the run died inside the
+ * milestone rail every time and progress billings were never reached at all:
+ * not a slow rail, a starved one. Alternating is the same fix, and the same
+ * key shape, as PAYMENTS_ORDER_KEY on the payments sync.
+ */
+export const PAYLINK_ORDER_KEY = "qbo-paylink-sweep.order";
+
+/**
+ * Finish the work a pay-link timeout left behind, on BOTH rails.
+ *
+ * `pushMilestoneToQuickBooks` and `stageProgressBillingToQuickBooksCore` link
+ * the QBO invoice before fetching its pay link, so a timeout on that second
+ * read leaves a correct, linked row whose only missing piece is the convenience
+ * link — marked `paylink-pending`. This is what finishes it.
+ *
+ * Runs under the caller's route budget and stops on any connection-level
+ * failure, same rule as every other QBO loop here: the next row would fail the
+ * same way at full cost.
+ */
+export interface PendingDeletionSweepResult {
+    checked: number;
+    /** Deleted in QuickBooks (or already gone) AND unlinked here. */
+    finished: number;
+    /** Still linked: QuickBooks refused, or the sweep ran out of budget. */
+    stillPending: number;
+    /** Rows eligible at the start that this run never reached. */
+    unvisited: number;
+    reason: string | null;
+}
+
+/** Where the pending-deletion sweep resumes, run to run. */
+export const PENDING_DELETION_CURSOR_KEY = "qbo-maintenance.pending-deletions.cursor";
+
+/** How many rows one run of the deletion sweep may look at. */
+export const PENDING_DELETION_PAGE_SIZE = 50;
+
+/** The two calls this sweep needs; injectable so a test can drive the real loop. */
+export interface PendingDeletionSweepDeps {
+    db?: {
+        paymentSchedule: {
+            findMany(args: any): Promise<any[]>;
+            count(args: any): Promise<number>;
+            updateMany(args: any): Promise<{ count: number }>;
+        };
+    };
+    /** Read-only remote state, for the Paid branch that must not delete. */
+    probeInvoice?: typeof probeQBInvoice;
+    deleteInvoice?: (tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) => Promise<boolean>;
+    unlink?: (scheduleId: string, qbInvoiceId: string, observedMarker: string) => Promise<boolean>;
+    /** Where this sweep resumes; defaults to the shared AutomationSetting store. */
+    cursorStore?: PaymentsSyncCursorStore;
+}
+
+/**
+ * Finish the deletes Break QB Link could not confirm.
+ *
+ * A row carrying PENDING_DELETION_MARKER is one a human asked to unlink WITH
+ * the QuickBooks invoice removed, where the remote delete did not come back
+ * confirmed — out of budget, QuickBooks unreachable, or the process killed.
+ * It is still LINKED on purpose: that is what stops a re-send creating a
+ * second collectible invoice while the first one may still exist.
+ *
+ * So the state is not self-healing and it cannot be left to a human to
+ * notice. This retries the delete under the sweep's own budget and unlinks
+ * only once QuickBooks confirms. Rows it could not finish are REPORTED, so
+ * they make the maintenance run ok:false rather than sitting silently.
+ *
+ * A delete that answers false is not necessarily an error — QuickBooks refuses
+ * to delete an invoice with a payment attached, and that row genuinely needs a
+ * human. It stays pending and is counted.
+ */
+export async function sweepPendingDeletions(
+    tokens: QBTokens,
+    deadline?: RouteDeadline,
+    deps?: PendingDeletionSweepDeps,
+): Promise<PendingDeletionSweepResult> {
+    const db = deps?.db ?? prisma;
+    const remove = deps?.deleteInvoice ?? deleteQBInvoice;
+    const unlink = deps?.unlink
+        ?? ((scheduleId: string, qbInvoiceId: string, observed: string) =>
+            // These rows are, by definition, the ones carrying the marker: it is
+            // what the sweep selected them by, so it is what the unlink pins.
+            claimQBInvoiceUnlink(prisma, scheduleId, qbInvoiceId, observed));
+    const probeRemote = deps?.probeInvoice ?? probeQBInvoice;
+    /**
+     * CAS the deletion intent to a terminal value, pinned to the intent state the
+     * row was actually observed in — either marker, never a fixed one, or a
+     * row settled mid-sweep would silently keep its intent.
+     */
+    const releaseIntent = async (id: string, observed: string, flag: string | null) => {
+        await db.paymentSchedule.updateMany({
+            where: { id, qbSyncError: observed },
+            data: { qbSyncError: flag },
+        }).catch(() => ({ count: 0 }));
+    };
+    /**
+     * CLAIM one row for deletion, or refuse.
+     *
+     * Round 49, P0. The page read `status` once and the delete decided from
+     * that snapshot, so a settlement committing in between meant this sweep
+     * deleted the QuickBooks invoice of a milestone that had just been PAID.
+     * The post-delete unlink then lost its compare-and-set, and the row was
+     * left Paid and still pointing at a destroyed invoice.
+     *
+     * This runs in its OWN short transaction, under the SAME canonical money
+     * locks a settle takes (`lockMoneyParents` on the parent invoice), and it
+     * pins BOTH `status: Pending` and the marker the row was observed
+     * carrying. A settle that got there first therefore makes the claim fail,
+     * and no remote call happens at all. No remote call is made inside the
+     * transaction — it exists only to make the decision and the marker one
+     * atomic step.
+     *
+     * Returns the claim marker on success, or null when the row moved.
+     */
+    const claim = async (row: { id: string; invoiceId: string | null; qbSyncError: string | null }) => {
+        const marker = deletionClaimMarker(randomUUID().slice(0, 8));
+        try {
+            const won = await withTxRetry(() => (db as typeof prisma).$transaction(async (tx) => {
+                if (row.invoiceId) await lockMoneyParents(tx, { invoiceId: row.invoiceId });
+                const claimed = await tx.paymentSchedule.updateMany({
+                    // Pinned to the state the DECISION was made from. Either half
+                    // moving means the decision is stale.
+                    where: { id: row.id, status: "Pending", qbSyncError: row.qbSyncError },
+                    data: { qbSyncError: marker },
+                });
+                return claimed.count === 1;
+            }));
+            return won ? marker : null;
+        } catch {
+            return null;
+        }
+    };
+    /**
+     * Is the claim STILL ours, immediately before the irreversible call?
+     *
+     * A settle arriving after the claim CANCELS it (payment-record-core.ts
+     * promotes a live claim to the settled marker under the same locks). This
+     * is the last look before the delete.
+     */
+    const claimStillHeld = async (id: string, marker: string) => {
+        const held = await db.paymentSchedule.count({
+            where: { id, qbSyncError: marker, status: "Pending" },
+        }).catch(() => 0);
+        return held === 1;
+    };
+    const cursorStore = deps?.cursorStore ?? automationSettingCursorStore;
+    const result: PendingDeletionSweepResult = {
+        checked: 0, finished: 0, stillPending: 0, unvisited: 0, reason: null,
+    };
+
+    // BOTH intent states. A settle promotes the marker rather than clearing it,
+    // so a row paid mid-delete stays visible to this sweep instead of dropping
+    // out of it Paid, still linked, and unmarked.
+    const where = {
+        OR: [
+            { qbSyncError: { in: [PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER] } },
+            // A CLAIM is still a deletion intent. Leaving claimed rows out of
+            // this filter would have been worse than the race it closes: a row
+            // whose delete failed after the claim, or whose process died
+            // holding one, would vanish from the sweep that exists to finish it
+            // AND from the count that reports outstanding work — silently, and
+            // permanently.
+            { qbSyncError: { startsWith: PENDING_DELETION_CLAIMED_PREFIX } },
+        ],
+        qbInvoiceId: { not: null },
+    };
+
+    // KEYSET CURSOR, not "the first 50 every time".
+    //
+    // A row this sweep cannot finish stays eligible: QuickBooks refuses to
+    // delete an invoice with a payment attached, and that row keeps its marker
+    // by design. Taking the first 50 by id meant such a row was re-probed at
+    // the head of every run forever and everything behind it was never reached
+    // — head-of-line starvation, in a queue whose entire purpose is to finish
+    // work nobody is watching. Same cursor/wrap shape as sweepPendingPayLinks.
+    const stored = await cursorStore.get(PENDING_DELETION_CURSOR_KEY);
+    // "" is how "start from the top" is stored; it is never a real id.
+    let cursor: string | null = stored && stored.length > 0 ? stored : null;
+    // Seeded with what this run INHERITED, never null: an abort before the
+    // first row completes must leave the cursor where it was, or the next run
+    // restarts from the top and the tail starves again.
+    let checkpoint: string | null = cursor;
+
+    const page = async (after: string | null, take: number) => db.paymentSchedule.findMany({
+        where: after ? { ...where, id: { gt: after } } : where,
+        // `status` because a PAID row must never be handed to the delete below:
+        // it takes the probe branch instead. `invoiceId` because the CLAIM below
+        // has to take the same money locks a settle takes, and those are keyed
+        // on the parent invoice.
+        select: { id: true, qbInvoiceId: true, status: true, qbSyncError: true, invoiceId: true },
+        orderBy: { id: "asc" },
+        take,
+    });
+
+    let rows = await page(cursor, PENDING_DELETION_PAGE_SIZE);
+    if (rows.length === 0 && cursor !== null) {
+        // Tail drained. Wrap ONCE back to the head so the rows before the
+        // cursor are not stranded until somebody resets it by hand.
+        rows = await page(null, PENDING_DELETION_PAGE_SIZE);
+        checkpoint = null;
+    }
+
+    for (const row of rows) {
+        // Checked before EVERY row: the delete is a real round trip, and this
+        // sweep runs after the options loop and the pay-link sweep have already
+        // spent most of the route.
+        if (isBudgetExhausted(deadline)) {
+            result.reason = "budget-exhausted";
+            break;
+        }
+        result.checked++;
+        // Where the cursor stood BEFORE this row. A shared failure puts it
+        // back: round 49 — the checkpoint used to advance before the QuickBooks
+        // call, so a row the connection prevented us from examining at all was
+        // stepped over and not retried until the next wrap.
+        const beforeRow = checkpoint;
+        // The claim this row is holding, if any. Every exit that does not
+        // finish the unlink gives it back, so a claimed row never sits in a
+        // state only this sweep understands.
+        let heldClaim: string | null = null;
+        try {
+            // A PAID row cannot go through the delete at all: settling cancels the
+            // intent (see PENDING_DELETION_MARKER), so this is a row that predates
+            // that rule or one whose settle raced the marker write. Deleting a
+            // paid QuickBooks invoice would destroy a real payment record, and the
+            // final unlink refuses a Paid row anyway — which is how this used to
+            // loop forever. Probe instead, and reach a terminal state either way.
+            if (row.status === "Paid") {
+                const probe = await probeRemote(tokens, row.qbInvoiceId as string, deadline);
+                if (probe.state === "ok") {
+                    // The invoice is there and the milestone is paid: the deletion
+                    // intent is simply wrong now. Cancel it.
+                    await releaseIntent(row.id, row.qbSyncError, null);
+                    result.finished++;
+                } else if (probe.state === "notFound" || probe.state === "voided") {
+                    // Gone remotely, Paid locally. Nothing automatic can reconcile
+                    // that — park it where an operator will see it, and take it out
+                    // of this sweep so it is not retried on every run.
+                    await releaseIntent(row.id, row.qbSyncError, PAID_PENDING_DELETION_FLAG);
+                    result.stillPending++;
+                }
+                // A transient probe answer is left for the next run.
+                continue;
+            }
+            // `false` is CONFIRMED ABSENCE, not a refusal — see deleteQBInvoice.
+            // Reading it as "still there" was what left a manually-deleted
+            // invoice parked forever: the sweep asked QuickBooks to remove a
+            // document that was already gone, got the honest answer, and
+            // concluded it had failed. Either value means the remote document is
+            // gone and the local link may be released; a real refusal arrives as
+            // a THROW and is handled below.
+            // CLAIM before the irreversible call. Losing it means a settle (or
+            // another sweep) got there first, so this row is not ours to
+            // delete: leave it exactly as it is for the next run.
+            const claimMarker = await claim(row);
+            heldClaim = claimMarker;
+            if (!claimMarker) {
+                result.stillPending++;
+                checkpoint = row.id;
+                continue;
+            }
+            // No re-check here either, and for the same reason as
+            // compensateAndUnlink: `pending-deletion:claimed:*` is refused by
+            // every settlement rail, so holding the claim IS the exclusion. A
+            // read here would only have narrowed the window, not closed it.
+            await remove(tokens, row.qbInvoiceId as string, deadline);
+            // Pinned to the CLAIM, not to the marker the page observed: the
+            // claim is what this sweep owns, and it is what a settle would have
+            // taken away from it.
+            if (await unlink(row.id, row.qbInvoiceId as string, claimMarker)) {
+                // Unlinked: the claim went with it.
+                heldClaim = null;
+                result.finished++;
+            } else {
+                result.stillPending++;
+            }
+        } catch (e) {
+            if (isQBBudgetExhaustedError(e)) {
+                result.reason = "budget-exhausted";
+                checkpoint = beforeRow;
+                result.checked--;
+                break;
+            }
+            if (isQboConnectionFailure(e)) {
+                // Shared connection: every remaining row fails the same way at
+                // full cost. Stop and say so.
+                //
+                // A 401/403 is NOT an outage: it is the credential, and only a
+                // human reconnecting fixes it. Filing it as `qbo-unavailable`
+                // meant pipeline-health never raised
+                // `quickbooks-reconnect-needed`, because that reason is
+                // deliberately excluded from QBO_RECONNECT_EVENT_REASONS.
+                result.reason = isQboReconnectRequired(e)
+                    ? QBO_AUTH_SYNC_REASON
+                    : isQBTimeoutError(e)
+                        ? "qbo-timeout"
+                        : "qbo-unavailable";
+                // The row was never examined, so the cursor stays before it.
+                checkpoint = beforeRow;
+                result.checked--;
+                break;
+            }
+            result.stillPending++;
+        } finally {
+            // Whatever happened, this row does not stay claimed. The delete may
+            // have landed or not; either way the NEXT run has to be able to see
+            // it, and `deleteQBInvoice` answering `false` for an already-gone
+            // invoice is exactly how it finishes.
+            if (heldClaim) await releaseIntent(row.id, heldClaim, row.qbSyncError);
+        }
+        // Examined. Only now may the cursor step past it.
+        checkpoint = row.id;
+    }
+
+    // Persist where to resume. A run that walked its whole page keeps its
+    // place; a wrap resets to the top. Never throws — a lost cursor costs one
+    // restart from the top, never correctness.
+    await cursorStore.set(PENDING_DELETION_CURSOR_KEY, checkpoint ?? "").catch(() => {});
+
+    // Counted from the database AFTER the loop, so it includes rows this run
+    // never reached as well as the ones it could not finish.
+    result.stillPending = await db.paymentSchedule.count({ where }).catch(() => result.stillPending);
+    // What is left over and above the ones this run actually failed on — i.e.
+    // rows it never got to. Reported so a permanently-blocked queue is visible
+    // rather than looking like a clean pass that simply had nothing to do.
+    result.unvisited = Math.max(0, result.stillPending - (result.checked - result.finished));
+    return result;
+}
+
+export async function sweepPendingPayLinks(
+    tokens: QBTokens,
+    deadline?: RouteDeadline,
+    deps?: {
+        db?: PayLinkSweepDb;
+        readPayLink?: (tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) => Promise<string | null>;
+        /** Where the per-rail resume cursors live; defaults to AutomationSetting. */
+        cursorStore?: PaymentsSyncCursorStore;
+    },
+): Promise<PayLinkSweepResult> {
+    const db: PayLinkSweepDb = deps?.db ?? prisma;
+    const readPayLink = deps?.readPayLink ?? getQBInvoicePaymentLink;
+    const cursorStore = deps?.cursorStore ?? automationSettingCursorStore;
+    const zero = (): PayLinkRailCounts => ({ milestone: 0, progressBilling: 0, total: 0 });
+    const result: PayLinkSweepResult = {
+        checked: 0, repaired: 0, noLink: 0, payLinkMissing: 0, skipped: 0,
+        unvisited: zero(), unresolved: zero(), railFirst: "milestone",
+    };
+
+    // Attempt-suffixed markers too: a row that has already come back empty once
+    // carries `paylink-pending:1`, and pinning the bare value would drop every
+    // retry out of the queue after its first miss.
+    const where = { OR: payLinkPendingWhere(), qbInvoiceId: { not: null } };
+
+    /**
+     * One rail's rows for this run: the tail after its cursor, and — only when
+     * that tail drained AND there is budget left in the page — a BOUNDED wrap
+     * back to the head.
+     *
+     * The wrap used to happen only when the post-cursor page came back EMPTY. A
+     * nonempty short tail was processed and then `saveCursors` reset the cursor
+     * to the top, reporting a clean run: the head of the collection had not
+     * been visited, and the next run started there only if nothing pushed the
+     * cursor forward again first. The wrap is now part of the SAME run, capped
+     * at `id < cursorId` so it can never re-walk the tail it just did, and the
+     * cursor is only reset when the head was genuinely reached (`covered`).
+     */
+    const fetchRail = async (
+        delegate: PayLinkSweepDelegate,
+        select: Record<string, unknown>,
+        key: string,
+    ): Promise<{ rows: any[]; cursorId: string | null; covered: boolean }> => {
+        const stored = await cursorStore.get(key);
+        const cursorId = stored && stored.length > 0 ? stored : null;
+        const page = async (rowWhere: any, take: number) => delegate.findMany({
+            where: rowWhere,
+            select,
+            // Stable key: without it Postgres may hand back the same first page
+            // every run and starve everything behind it.
+            orderBy: { id: "asc" },
+            take,
+        });
+        const tail = await page(
+            cursorId ? { ...where, id: { gt: cursorId } } : where,
+            PAYLINK_SWEEP_LIMIT,
+        );
+        if (!cursorId) {
+            // Started at the top: a short page IS the whole collection.
+            return { rows: tail, cursorId: null, covered: tail.length < PAYLINK_SWEEP_LIMIT };
+        }
+        if (tail.length >= PAYLINK_SWEEP_LIMIT) {
+            // The page is full of tail; the head waits for a later run.
+            return { rows: tail, cursorId, covered: false };
+        }
+        const room = PAYLINK_SWEEP_LIMIT - tail.length;
+        const head = await page({ ...where, id: { lt: cursorId } }, room);
+        // A short head means the wrap reached back to the cursor with nothing
+        // left in between: every eligible row is in this run's pages.
+        return { rows: [...tail, ...head], cursorId, covered: head.length < room };
+    };
+
+    // Which rail goes first, flipped every run so a budget that always dies
+    // inside the first rail cannot starve the second one forever.
+    // Unset reads as "milestone last time" is deliberately NOT the rule: an
+    // unset key means nothing has run, so the first run keeps the historical
+    // milestone-first order and every run after it alternates.
+    const lastOrder = await cursorStore.get(PAYLINK_ORDER_KEY);
+    const railFirst: "milestone" | "progressBilling" =
+        lastOrder === "milestone" ? "progressBilling" : "milestone";
+    result.railFirst = railFirst;
+
+    const [milestonePage, billingPage, milestonesEligible, billingsEligible] = await Promise.all([
+        fetchRail(
+            db.paymentSchedule,
+            { id: true, qbInvoiceId: true, qbSyncError: true, invoice: { select: { code: true } } },
+            PAYLINK_CURSOR_KEYS.milestones,
+        ),
+        fetchRail(
+            db.progressBilling,
+            { id: true, qbInvoiceId: true, qbSyncError: true, code: true },
+            PAYLINK_CURSOR_KEYS.billings,
+        ),
+        // Eligible-at-start, per rail. `unvisited` is measured against this, so
+        // it counts rows beyond the pages as well as rows the budget cut short.
+        db.paymentSchedule.count({ where }),
+        db.progressBilling.count({ where }),
+    ]);
+    const milestones = milestonePage.rows;
+    const billings = billingPage.rows;
+    const eligibleAtStart: Record<"milestone" | "progressBilling", number> = {
+        milestone: milestonesEligible,
+        progressBilling: billingsEligible,
+    };
+
+    /**
+     * The furthest each rail's cursor may move: the last row this run actually
+     * REACHED A DECISION ON. Jumping to the end of the page after an outage cut
+     * it short would step straight over every row the outage skipped, and they
+     * would not be looked at again until the cursor wrapped all the way round.
+     * A row we deliberately left pending (per-invoice refusal, lost CAS) still
+     * counts as decided — leaving the cursor behind it is what starves the tail.
+     */
+    const lastDecided: Record<"milestone" | "progressBilling", string | null> = {
+        milestone: null,
+        progressBilling: null,
+    };
+    /** How many rows on each rail this run reached a decision on. */
+    const visited: Record<"milestone" | "progressBilling", number> = {
+        milestone: 0,
+        progressBilling: 0,
+    };
+    const decided = (kind: "milestone" | "progressBilling", id: string) => {
+        lastDecided[kind] = id;
+        visited[kind]++;
+    };
+    const saveCursors = async () => {
+        const rails = [
+            { kind: "milestone" as const, key: PAYLINK_CURSOR_KEYS.milestones, page: milestonePage },
+            { kind: "progressBilling" as const, key: PAYLINK_CURSOR_KEYS.billings, page: billingPage },
+        ];
+        for (const rail of rails) {
+            const last = lastDecided[rail.kind];
+            const rows = rail.page.rows;
+            // Everything this run fetched was worked through.
+            const allWorked = rows.length === 0 || (last !== null && last === rows[rows.length - 1]?.id);
+            // Reset ONLY when the head was actually visited in this run — that
+            // is what `covered` means. A short tail alone is not enough: it says
+            // the tail ended, not that anything before the cursor was looked at.
+            if (rail.page.covered && allWorked) await cursorStore.set(rail.key, "");
+            // Otherwise persist the position reached. After a wrap this moves
+            // the cursor BACKWARDS, which is right: the run stopped part-way
+            // through the head, and the next one must resume there.
+            else if (last !== null) await cursorStore.set(rail.key, last);
+        }
+        await cursorStore.set(PAYLINK_ORDER_KEY, railFirst);
+    };
+
+    const milestoneEntries = milestones.map((m: any) => ({
+        kind: "milestone" as const,
+        row: {
+            id: m.id, qbInvoiceId: m.qbInvoiceId as string, code: m.invoice?.code ?? m.id,
+            qbSyncError: (m.qbSyncError ?? null) as string | null,
+        },
+    }));
+    const billingEntries = billings.map((b: any) => ({
+        kind: "progressBilling" as const,
+        row: {
+            id: b.id, qbInvoiceId: b.qbInvoiceId as string, code: b.code,
+            qbSyncError: (b.qbSyncError ?? null) as string | null,
+        },
+    }));
+    const rows: { kind: "milestone" | "progressBilling"; row: PayLinkPendingRow }[] =
+        railFirst === "milestone"
+            ? [...milestoneEntries, ...billingEntries]
+            : [...billingEntries, ...milestoneEntries];
+
+    // A rail whose pages did not cover its whole eligible set has more behind
+    // them. `covered` replaces the old "the page came back full" test, which
+    // could not tell a full tail from a tail plus a wrap that finished.
+    if (!milestonePage.covered || !billingPage.covered) {
+        result.truncated = true;
+    }
+
+    for (const [index, entry] of rows.entries()) {
+        if (isBudgetExhausted(deadline)) {
+            result.reason = "budget-exhausted";
+            result.skipped += rows.length - index;
+            break;
+        }
+        result.checked++;
+        let payLink: string | null;
+        try {
+            payLink = await readPayLink(tokens, entry.row.qbInvoiceId, deadline);
+        } catch (error) {
+            if (isQBBudgetExhaustedError(error)) {
+                result.reason = "budget-exhausted";
+                result.skipped += rows.length - index;
+                result.checked--;
+                break;
+            }
+            if (isQboConnectionFailure(error)) {
+                // Shared connection: the remaining rows would fail identically
+                // at a fresh 20s each. Stop and leave them pending. A 401/403
+                // is named as the credential failure it is — same family the
+                // digest's reconnect alert counts.
+                result.reason = isQboReconnectRequired(error)
+                    ? QBO_AUTH_SYNC_REASON
+                    : isQBTimeoutError(error)
+                        ? "qbo-timeout"
+                        : "qbo-unavailable";
+                result.skipped += rows.length - index;
+                result.checked--;
+                break;
+            }
+            // A per-invoice refusal (it was deleted in QuickBooks, say). Leave the
+            // marker: the row is still linked, and the invoice-probe sweep is what
+            // resolves a gone invoice, not this one.
+            //
+            // The cursor still advances past it. This is THE starvation case:
+            // the row keeps its marker, so a fixed page would refetch it (and
+            // its 99 friends) forever and never reach anything behind them.
+            decided(entry.kind, entry.row.id);
+            result.skipped++;
+            continue;
+        }
+
+        const delegate = entry.kind === "milestone" ? db.paymentSchedule : db.progressBilling;
+        // CAS: only clear a marker we still own, on a row still pointing at the
+        // invoice we just read. A concurrent unlink/re-stage must win.
+        // A NULL LINK IS NOT A REPAIR. Clearing the marker either way wrote
+        // `qbSyncError: null` on an invoice with no payable URL, counted it as
+        // "noLink", and dropped it out of this queue — so health went green while
+        // a client held a bill they could not pay. `nextPayLinkState` is the one
+        // decision: clear only on a real link, otherwise keep waiting (bounded)
+        // and finally park as `paylink-missing`, which health counts.
+        const next = nextPayLinkState(entry.row.qbSyncError, payLink);
+        const cleared = await delegate.updateMany({
+            where: {
+                id: entry.row.id,
+                qbInvoiceId: entry.row.qbInvoiceId,
+                // Pinned to the marker THIS row was read with, so a concurrent
+                // retry cannot double-count an attempt.
+                qbSyncError: entry.row.qbSyncError,
+            },
+            data: { qbSyncError: next.marker, ...(next.link ? { qbInvoiceLink: next.link } : {}) },
+        });
+        // Decided either way: a lost CAS means someone else moved this row on,
+        // so it is no longer this sweep's work.
+        decided(entry.kind, entry.row.id);
+        if (cleared.count !== 1) {
+            result.skipped++;
+            continue;
+        }
+        if (next.link) result.repaired++;
+        else {
+            // Still outstanding either way; `exhausted` only says whether a
+            // human now has to look at it.
+            result.noLink++;
+            if (next.exhausted) result.payLinkMissing++;
+        }
+    }
+
+    // Every exit above falls through to here, so the resume point is recorded
+    // whether the run finished its pages or stopped on an outage.
+    await saveCursors();
+
+    // What the run did NOT finish. Both are reported per rail and summed,
+    // because "the handler returned" is not "the work is done" — a refused head
+    // row that keeps its marker used to sit inside an `ok: true` maintenance
+    // response indefinitely, and nobody was told.
+    result.unvisited = {
+        milestone: Math.max(0, eligibleAtStart.milestone - visited.milestone),
+        progressBilling: Math.max(0, eligibleAtStart.progressBilling - visited.progressBilling),
+        total: 0,
+    };
+    result.unvisited.total = result.unvisited.milestone + result.unvisited.progressBilling;
+    // Counted from the database AFTER the loop: rows this run repaired no
+    // longer match, rows it refused (or never reached) still do.
+    const [milestoneLeft, billingLeft] = await Promise.all([
+        db.paymentSchedule.count({ where }),
+        db.progressBilling.count({ where }),
+    ]);
+    result.unresolved = {
+        milestone: milestoneLeft,
+        progressBilling: billingLeft,
+        total: milestoneLeft + billingLeft,
+    };
+    return result;
+}
+
+/**
+ * The client's QuickBooks customer mapping moved while we were asking
+ * QuickBooks about it.
+ *
+ * Raised instead of overwriting: `resolveCustomerAndItem` decided which
+ * customer to bill from a read taken BEFORE its round trip, and by the time it
+ * held the lock the row said something else. Every invoice built from this
+ * resolution — and every marker fingerprinting it — would describe a mapping
+ * the database disagrees with, so the send stops here, before anything reaches
+ * QuickBooks.
+ */
+export class QBCustomerRemappedError extends Error {
+    name = "QBCustomerRemappedError";
+    constructor(clientLabel: string) {
+        super(
+            `${clientLabel}'s QuickBooks customer changed while this was being prepared, so nothing was sent. ` +
+            `Open the client, confirm which QuickBooks customer it should bill, and try again.`,
+        );
+    }
+}
+
+/** Name-based, for the same Node-20 module-identity reason as the guards below. */
+export function isQBCustomerRemappedError(error: unknown): boolean {
+    return error instanceof Error && error.name === "QBCustomerRemappedError";
+}
+
+/** Raised when a send is refused because a previous attempt's outcome is unknown. */
+export class QBAmbiguousCreateError extends Error {
+    name = "QBAmbiguousCreateError";
+    constructor(docNumberOrCode: string) {
+        super(
+            `A previous QuickBooks send for ${docNumberOrCode} ended without a confirmed result, so it may already exist there. ` +
+            `Check QuickBooks: if an invoice was created, keep it; if not, clear the QuickBooks link in ProBuild and send again.`,
+        );
+    }
+}
+
+/**
+ * The milestone row moved out from under a repair that had already read it.
+ *
+ * Raised by the existing-invoice pay-link repair when its CAS finds the row is
+ * no longer the one it looked at — most importantly when a concurrent
+ * break-link cleared `qbInvoiceId`, or a fresh send claimed the row with a new
+ * create marker. Both are ordinary, legitimate concurrent operations; the only
+ * wrong answer is to write anyway, because a stale `paylink-pending` landing on
+ * an unlinked row (or over a live create claim) either invents work for the
+ * sweep against an invoice that is gone, or overwrites the claim that is the
+ * only record another sender's POST ever went out.
+ */
+export class QBMilestoneRowMovedError extends Error {
+    name = "QBMilestoneRowMovedError";
+    constructor(subject: string) {
+        super(
+            `${subject} changed while QuickBooks was being read (it was unlinked, or sent again, in the meantime), ` +
+            `so nothing was written. Refresh and try again.`,
+        );
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQBMilestoneRowMovedError(error: unknown): boolean {
+    return (
+        error instanceof QBMilestoneRowMovedError ||
+        (error instanceof Error && error.name === "QBMilestoneRowMovedError")
+    );
+}
+
+/** Did this failure leave the create's outcome genuinely unknown? */
+export function isAmbiguousCreateFailure(error: unknown): boolean {
+    // A timeout or a dead connection means the request may have landed. A
+    // business refusal (4xx WITH a QuickBooks Fault) means QuickBooks answered
+    // "no" and created nothing, so that is NOT ambiguous and must not park the
+    // row.
+    //
+    // QBAmbiguousDocumentCreateError is what the create boundary itself raises
+    // once it has decided an outcome is unknowable — a 4xx carrying no readable
+    // Fault, a body it could not read, a 2xx with no Id. It is neither a
+    // timeout nor a QboRetryableError, so without it here the callers would
+    // release their in-flight claim on exactly the states that must keep it.
+    return isQBTimeoutError(error) || isRetryableQboError(error) || isQBAmbiguousDocumentCreateError(error);
+}
+
+/** Reserved for the compensating delete, independent of the push's own budget. */
+export const MILESTONE_CLEANUP_BUDGET_MS = 10_000;
+/**
+ * The WORK half: how long the QuickBooks round trips themselves may take.
+ * Never handed to `pushMilestoneToQuickBooks` — it is what that function
+ * arrives at after carving the cleanup reserve off the route budget below.
+ *
+ * The two used to be one constant, `MILESTONE_PUSH_BUDGET_MS`, and its name did
+ * not say which half it was. The doc called it the work budget, the function
+ * treated its argument as the whole-route budget and subtracted the reserve
+ * from it, and both action callers passed the constant — so the reserve came
+ * out twice and the work budget was really 35s, not 45s. One name per half now,
+ * and the function has ONE contract: whatever it is given is the WHOLE ROUTE,
+ * and it carves the reserve itself.
+ */
+export const MILESTONE_PUSH_WORK_BUDGET_MS = 45_000;
+/**
+ * The WHOLE-ROUTE budget a caller hands in (or the default when it passes
+ * none): the work above plus the cleanup reserve, under a 60s route ceiling.
+ * An unbudgeted push was the remaining way to run to the platform's ceiling and
+ * be killed between the invoice create and the link.
+ */
+export const MILESTONE_PUSH_ROUTE_BUDGET_MS = MILESTONE_PUSH_WORK_BUDGET_MS + MILESTONE_CLEANUP_BUDGET_MS;
+/** Never spend the last slice of the route: leave the platform room to respond. */
+export const PLATFORM_RESERVE_MS = 2_000;
+/**
+ * Whole-route budget for Break QB Link when it also deletes in QuickBooks.
+ * Two serial calls — a token refresh and the delete — whose own defaults are
+ * 45s and 20s, which together overrun the 60s ceiling and got the action killed
+ * mid-delete. One shared budget is what keeps the pair inside it.
+ */
+export const BREAK_QB_LINK_BUDGET_MS = 50_000;
+
+/**
+ * A Paid milestone still carrying a deletion intent whose invoice is GONE.
+ *
+ * Both settle paths cancel the intent, so this only turns up on a row that
+ * predates that rule or a settle that raced the marker write. It cannot be
+ * resolved automatically: the milestone is Paid, so the unlink refuses, and the
+ * QuickBooks document it points at no longer exists. A plain flag, not a create
+ * marker — `markerKind` does not recognise it, so it blocks nothing; what it
+ * does is take the row OUT of the deletion sweep predicate, so a state a human
+ * must settle stops being retried on every run.
+ */
+export const PAID_PENDING_DELETION_FLAG = "paid-deletion-unresolvable";
+
+/**
+ * Diagnostic flag for a milestone settled OUTSIDE QuickBooks while its
+ * QuickBooks invoice was being created.
+ *
+ * A plain flag, deliberately not a create marker: `markerKind` does not
+ * recognise it, so it blocks no send path and needs no resolver — it sits in
+ * the same slot, and reads the same way, as the existing `voided` / `notFound`
+ * diagnostics the sync poller writes. What it does is make the state findable
+ * instead of invisible.
+ */
+export const SETTLED_WITHOUT_QB_PAYMENT_FLAG = "settled-without-qb-payment";
+
+/**
+ * How long compensation may take, measured when it BEGINS.
+ *
+ * Never additive: the old form added the cleanup window to whatever the route
+ * had left, which could push the total past the platform ceiling — the exact
+ * thing the budget exists to prevent. It is the SMALLER of the standard
+ * cleanup window and the route's real remaining headroom, minus a reserve so
+ * the function can still return a response.
+ */
+export function compensationWindowMs(routeRemainingMs: number): number {
+    if (!Number.isFinite(routeRemainingMs)) return MILESTONE_CLEANUP_BUDGET_MS;
+    const usable = Math.floor(routeRemainingMs) - PLATFORM_RESERVE_MS;
+    // Below the floor there is no useful window left; give the delete the
+    // minimum a call needs rather than a negative or absurd deadline.
+    if (usable <= 1_000) return 1_000;
+    return Math.min(MILESTONE_CLEANUP_BUDGET_MS, usable);
+}
+
+/**
+ * Claim a milestone's pre-create CAS UNDER the invoice lock, re-checking the
+ * "not already covered by a progress billing" relationship inside the SAME
+ * lock the claim write takes.
+ *
+ * `pushMilestoneToQuickBooks`'s earlier check of this relationship (before
+ * tokens are refreshed and the customer/item are resolved — both real QBO
+ * round trips) is a cheap fast-path, not the guard: a progress billing can
+ * still land on this milestone in the window between that check and the
+ * claim below, and `createProgressBillingCore` takes the SAME Invoice lock
+ * (see tx-retry.ts's canonical lock order) — so re-checking here, inside the
+ * lock, is what actually serializes the two paths instead of letting them
+ * interleave into two collectible invoices for one milestone.
+ *
+ * Split out so the interleaving it closes can be tested without a database —
+ * see tests/qbo-payments-outage.test.ts.
+ */
+export async function claimMilestonePreCreateUnderLock(
+    schedule: {
+        id: string;
+        invoiceId: string;
+        status: string;
+        amount: Prisma.Decimal | number;
+        qbPaymentId: string | null;
+        dueDate: Date | null;
+        name: string;
+    },
+    inFlightMarker: string,
+): Promise<{ count: number }> {
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
+        const claimedNow = await tx.progressBillingLine.findFirst({
+            where: { scheduleId: schedule.id, billing: { status: { not: "Void" } } },
+            select: { billing: { select: { code: true, status: true } } },
+        });
+        if (claimedNow) {
+            throw new Error(
+                `This milestone is already covered by progress invoice ${claimedNow.billing.code} (${claimedNow.billing.status}) — stage that instead of creating a separate QuickBooks invoice here.`
+            );
+        }
+        // Pinned to the same content snapshot the create is about to build the
+        // invoice from — not just qbInvoiceId/qbSyncError. Those two alone let a
+        // concurrent settle, cancel, or edit land between the pre-claim read and
+        // this write and still pass the CAS, so the claim would protect an
+        // amount/name/dueDate/status that no longer matches what gets pushed.
+        return tx.paymentSchedule.updateMany({
+            where: {
+                id: schedule.id,
+                qbInvoiceId: null,
+                qbSyncError: null,
+                status: schedule.status,
+                amount: schedule.amount,
+                qbPaymentId: schedule.qbPaymentId,
+                dueDate: schedule.dueDate,
+                name: schedule.name,
+            },
+            data: { qbSyncError: inFlightMarker },
+        });
+    }));
+}
+
+/** What the final link write settled on. */
+export interface MilestoneLinkOutcome {
+    /**
+     * `linked` — we wrote the link. `already-finalized` — somebody else already
+     * finished THIS invoice on this row, so there is nothing to write and
+     * nothing to compensate. `abandoned` — the row genuinely moved on and the
+     * QuickBooks invoice we created is now unreferenced. `mismatch` — the money
+     * state this invoice was ISSUED from no longer describes the row: the
+     * client was repointed at another QuickBooks customer, or the parent
+     * invoice tax rate moved and with it the milestone pre-tax/tax split. The
+     * document bills the wrong thing and must not be adopted.
+     *
+     * `mismatch` and `abandoned` both compensate; they are kept apart so the
+     * operator is told WHICH it was — "the row moved on" and "this invoice is
+     * now wrong" need different follow-up.
+     *
+     * `settled-without-qb-payment` — the row is Paid and still points at our
+     * invoice, but no QuickBooks payment settled it (a manual Record Payment).
+     * Neither finalized nor abandoned: the QuickBooks invoice is real and still
+     * open, so it must not be reported as done, and the row references it, so it
+     * must not be deleted either. Parked for a human.
+     */
+    outcome: "linked" | "already-finalized" | "abandoned" | "mismatch" | "settled-without-qb-payment";
+    /** The pay link the row carries, when someone else finished it. */
+    payLink: string | null;
+    /** For `mismatch`: what diverged, in words, for the error the caller raises. */
+    mismatchDetail?: string;
+}
+
+/**
+ * The final link write for a milestone push, and the verdict when it loses.
+ *
+ * Taken under the invoice lock and paired with a progress-billing re-check:
+ * createProgressBillingCore locks the same invoice row, so the two paths
+ * serialize instead of interleaving. Without this a progress billing could
+ * claim this milestone in the window between the guard at the top of
+ * `pushMilestoneToQuickBooks` and the write here (a full-milestone billing
+ * leaves the row Pending and unlinked, so every pinned column would still
+ * match) and the client would end up with two collectible QuickBooks invoices.
+ *
+ * All three outcomes are decided INSIDE the transaction, while the lock is
+ * still held — the progress-billing re-check and the re-read below have to
+ * agree with each other, and only the lock makes that true.
+ */
+export async function finalizeMilestoneLinkUnderLock(
+    schedule: {
+        id: string;
+        invoiceId: string;
+        amount: Prisma.Decimal | number;
+        dueDate: Date | null;
+        name: string;
+    },
+    args: {
+        qbId: string;
+        payLink: string | null;
+        /** Did the pre-pay-link provisional write land? It decides what the CAS pins. */
+        preLinked: boolean;
+        inFlightMarker: string;
+        /** The client this invoice bills — locked here, in Estimate → Invoice → Client order. */
+        clientId: string;
+        /**
+         * The issuance hash the marker carries: a fingerprint of the money state
+         * this QuickBooks invoice was actually built from. Recomputed under the
+         * locks below and compared, because the CAS alone cannot see it — the
+         * pinned columns all live on PaymentSchedule, while the customer mapping
+         * lives on Client and the tax rate on Invoice.
+         */
+        issuanceHash: string;
+    },
+): Promise<MilestoneLinkOutcome> {
+    const { qbId, payLink, preLinked, inFlightMarker, clientId, issuanceHash } = args;
+    return withTxRetry(() => prisma.$transaction(async (tx): Promise<MilestoneLinkOutcome> => {
+        // Estimate → Invoice → Client, the documented order (tx-retry.ts). The
+        // Client lock is FOR SHARE because this decision only READS the mapping,
+        // but it must not straddle the FOR UPDATE remap in resolveCustomerAndItem:
+        // the two serialise, so the value read below is the value that stands.
+        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId, clientId }, { clientLock: "share" });
+        const claimedNow = await tx.progressBillingLine.findFirst({
+            where: { scheduleId: schedule.id, billing: { status: { not: "Void" } } },
+            select: { id: true },
+        });
+        // ONE re-read, taken under the locks, serving BOTH decisions below: the
+        // issuance guard here, and the "did a concurrent writer already finalize
+        // this exact invoice" check after a lost CAS. Under the invoice lock
+        // nothing can commit between them, so a second read would return the
+        // same rows.
+        const current = await tx.paymentSchedule.findUnique({
+            where: { id: schedule.id },
+            select: {
+                qbInvoiceId: true, qbInvoiceLink: true, status: true, amount: true,
+                name: true, dueDate: true, qbPaymentId: true,
+                // The tax split derives from these two plus amount and the parent
+                // invoice rate — milestoneTaxSplit, the rule the create used.
+                pretaxAmount: true, taxAmount: true,
+                invoice: { select: { taxRate: true, client: { select: { qbCustomerId: true } } } },
+            },
+        });
+        // The invoice was issued against a specific QuickBooks customer and a
+        // specific tax split. Neither lives on this row, so neither is pinned by
+        // the CAS below: a client repointed at another customer, or a parent
+        // invoice tax rate edited mid-push, leaves every pinned column identical
+        // while the document already in QuickBooks bills the wrong party or the
+        // wrong liability. Recomputed from what was just read and compared to the
+        // marker hash. The pinned literals are the ones the CAS itself requires,
+        // so this asks only: did the PAYLOAD state move?
+        const currentIssuanceHash = current
+            ? milestoneIssuanceHash({
+                status: "Pending",
+                qbPaymentId: null,
+                amount: current.amount,
+                dueDate: current.dueDate,
+                tax: milestoneTaxSplit({
+                    pretaxAmount: current.pretaxAmount,
+                    taxAmount: current.taxAmount,
+                    amount: current.amount,
+                    invoiceTaxRate: current.invoice?.taxRate ?? null,
+                }),
+                customerId: current.invoice?.client?.qbCustomerId ?? null,
+            })
+            : null;
+        if (currentIssuanceHash !== issuanceHash) {
+            return {
+                outcome: "mismatch",
+                payLink: null,
+                mismatchDetail: current
+                    ? "the QuickBooks customer or the tax treatment behind it changed while it was being created"
+                    : "the milestone no longer exists",
+            };
+        }
+        // Conditional link write: the milestone was read as unlinked and unpaid
+        // at the top of the push, but several remote calls happen in between — a
+        // manual "Record Payment", a QB settle, a cancellation, a concurrent
+        // push, or a rebalance changing the row's content can all land in that
+        // window. The guards go in the WHERE — status pinned to Pending (a
+        // Canceled row must never get a fresh collectible invoice: the payment
+        // poller only watches Pending) and the content snapshot
+        // (amount/name/dueDate) pinned to what the QBO invoice was actually
+        // created from, so a mid-push edit can't leave QBO silently out of sync.
+        // One decision for every pay-link outcome on every rail — the sweep,
+        // the progress-billing stage and this finalizer all call it, so a null
+        // link cannot mean "repaired" in one place and "still queued" in
+        // another. Attempts start at zero here: this create's own read is the
+        // first one.
+        const payLinkState = nextPayLinkState(null, payLink);
+        const claimed = claimedNow ? { count: 0 } : await tx.paymentSchedule.updateMany({
+            where: {
+                id: schedule.id,
+                status: "Pending",
+                qbPaymentId: null,
+                // Pinned to the id WE just wrote, not to null: the pre-pay-link
+                // write already linked this row, and demanding null here would
+                // miss every time and compensate away a real invoice.
+                qbInvoiceId: preLinked ? qbId : null,
+                // Prove we still own the claim before writing. When the pre-link
+                // write already landed, this is the marker IT wrote; when that
+                // write lost the race, this is the SAME in-flight marker it
+                // required — never retry against a bare qbInvoiceId: null with no
+                // ownership check, or a row whose marker moved on for an
+                // unrelated reason (compensated, resolved, reclaimed) could get
+                // OUR invoice attached to it.
+                qbSyncError: preLinked ? PAYLINK_PENDING_MARKER : inFlightMarker,
+                amount: schedule.amount,
+                name: schedule.name,
+                dueDate: schedule.dueDate,
+            },
+            // The marker a fresh invoice ends on. Any prior voided/notFound flag
+            // is overwritten either way (self-heal); what decides between `null`
+            // and a retry marker is whether a payable URL was actually
+            // persisted. `payLink` reaches here as null from two places — the
+            // create path's `.catch(() => null)` and a QuickBooks answer of
+            // "no link" — and writing `qbSyncError: null` on either took an
+            // invoice the client cannot pay straight out of the repair queue.
+            data: {
+                qbInvoiceId: qbId,
+                qbInvoiceLink: payLinkState.link ?? null,
+                qbSyncedAt: new Date(),
+                qbSyncError: payLinkState.marker,
+            },
+        });
+        if (claimed.count === 1) return { outcome: "linked", payLink };
+        // The claim lost. Before treating this invoice as abandoned, ask what
+        // the row actually says NOW. The CAS pins `qbSyncError`, and the
+        // `paylink-pending` marker it requires is cleared as a matter of course
+        // by `sweepPendingPayLinks` and by a concurrent resend (which takes the
+        // already-linked branch at the top of the push, fetches the pay link and
+        // clears the flag) — both of which leave this row correctly linked to
+        // THIS invoice, and the resend has already returned success for it.
+        // Compensating on that deleted a live, correct QuickBooks invoice out
+        // from under the caller that had just been told it existed.
+        //
+        // A progress billing that claimed the milestone is NOT that case: its
+        // billing stages its own covering invoice, so ours really is the
+        // duplicate and must still be compensated away. Hence the `claimedNow`
+        // guard here — the row can carry our id and still be a double bill.
+        if (!claimedNow) {
+            // `current` is the read taken under the locks above: same transaction,
+            // same lock, so it is exactly what a fresh read here would return, and
+            // one read is one fewer thing to keep in step.
+            if (isConcurrentlyFinalizedMilestoneLink(current, qbId, schedule)) {
+                return { outcome: "already-finalized", payLink: current?.qbInvoiceLink ?? null };
+            }
+            // Checked BEFORE falling through to `abandoned`: this row is Paid and
+            // still points at our invoice, so compensation would delete a document
+            // a Paid milestone references. Neither success nor abandonment.
+            if (isSettledWithoutQbPayment(current, qbId)) {
+                return { outcome: "settled-without-qb-payment", payLink: current?.qbInvoiceLink ?? null };
+            }
+        }
+        return { outcome: "abandoned", payLink: null };
+    }));
+}
+
+/**
+ * Create (or repair) one milestone's QuickBooks invoice.
+ *
+ * WHAT STOPS A DUPLICATE, precisely — because the comment that used to sit here
+ * described a mechanism this function does not have. There is no stored
+ * idempotency key and no QBO `requestid` on this create (the Purchase rail has
+ * one, keyed off the Drive fileId; nothing on a milestone plays that role).
+ * What actually protects the client from a second bill is the marker:
+ *
+ *   • `claimMilestonePreCreateUnderLock` writes `create-in-flight` BEFORE the
+ *     POST, under the invoice lock, so a crash between the POST and the link
+ *     write leaves a trace and every other send path refuses the row;
+ *   • an outcome we never learned promotes that marker to `ambiguous-create`,
+ *     carrying the identity a human (or `resolveAmbiguousInvoiceCreateCore`)
+ *     needs to find the invoice in QuickBooks;
+ *   • only a QuickBooks refusal we can actually read — a 4xx with a parsed
+ *     Fault, see `isAmbiguousCreateFailure` — releases the claim.
+ *
+ * That is fail-closed rather than idempotent: it never re-sends into an unknown
+ * outcome, at the cost of needing a human to resolve one.
+ */
+export async function pushMilestoneToQuickBooks(
+    paymentScheduleId: string,
+    passedTokens?: QBTokens,
+    /**
+     * The WHOLE-ROUTE budget — everything this call may spend, cleanup
+     * included. This is six serial QBO calls on a bad day (refresh, customer,
+     * service item, invoice create, payment link, status) plus a compensating
+     * delete if the link write fails. Individually bounded is not enough;
+     * without a shared budget the SUM still runs past the caller's ceiling, and
+     * being killed between the invoice create and the DB write is exactly how an
+     * orphaned QBO invoice happens.
+     *
+     * Pass the route's real ceiling (or MILESTONE_PUSH_ROUTE_BUDGET_MS, or
+     * nothing at all for that default). Do NOT pass the work budget: this
+     * function carves MILESTONE_CLEANUP_BUDGET_MS off the front itself, so a
+     * caller that subtracts it too leaves the QuickBooks calls 10s short.
+     */
+    deadline?: RouteDeadline,
+): Promise<MilestonePushResult> {
+    // The ROUTE deadline is the platform ceiling this push — and its possible
+    // compensating delete — must fit inside. `pushDeadline` (the work budget)
+    // carves MILESTONE_CLEANUP_BUDGET_MS off the FRONT of it, sharing the same
+    // start time, so that reserve is still genuinely sitting on `routeDeadline`
+    // when compensation begins. Measuring the reserve off `pushDeadline` itself
+    // (the old form) handed cleanup whatever the work budget had left — which
+    // by the time compensation is needed is close to nothing, so the delete's
+    // own deadline was already-exhausted before it could even start.
+    const routeDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_ROUTE_BUDGET_MS);
+    const pushDeadline = createRouteDeadline(
+        Math.max(1_000, routeDeadline.budgetMs - MILESTONE_CLEANUP_BUDGET_MS),
+        routeDeadline.startedAt,
+    );
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentScheduleId },
         include: {
@@ -233,33 +1900,125 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         );
     }
 
-    const tokens = passedTokens ?? await getFreshQBTokens();
+    const tokens = passedTokens ?? await getFreshQBTokens(pushDeadline);
 
     if (schedule.qbInvoiceId) {
-        const payLink = schedule.qbInvoiceLink || (await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId));
-        const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId);
+        // CLAIM BEFORE THE REMOTE CALL, and CAS every write against the link we
+        // read.
+        //
+        // This repair used to read the row, spend two remote round trips, and
+        // then `update({ where: { id } })` — pinned to the row's identity and
+        // nothing else. A break-link landing during those round trips clears
+        // `qbInvoiceId`, and a fresh send replaces `qbSyncError` with its own
+        // create claim; either way the stale write went through, stamping
+        // `paylink-pending` onto a row that no longer has a QuickBooks invoice,
+        // or erasing the in-flight claim that is the only durable record that
+        // another sender's POST ever left the building.
+        //
+        // Both halves matter. The claim below is CAS-pinned to the exact
+        // `{ qbInvoiceId, qbSyncError }` pair that was read, so a row that has
+        // already moved is detected BEFORE any QuickBooks call is spent; and the
+        // finalising write is pinned again to the same link, so a row that moves
+        // DURING the remote calls is refused rather than overwritten.
+        const linkedQbInvoiceId = schedule.qbInvoiceId;
+        // The pay-link read now reports its failures instead of answering null.
+        // A transient one (408/429/5xx/our deadline) must not fail a milestone
+        // that is already correctly linked — it leaves PAYLINK_PENDING_MARKER so
+        // `sweepPendingPayLinks` finishes it. A 401/403 is a different animal:
+        // the credential is bad and only a human reconnect fixes it, so it
+        // surfaces.
+        let payLink = schedule.qbInvoiceLink;
+        let linkReadFailed = false;
+        /** Did the pay-link read actually ANSWER on this call (a link, or a definite none)? */
+        let payLinkAnswered = false;
+        /** What `qbSyncError` holds after the claim — what the final CAS pins. */
+        let markerNow = schedule.qbSyncError;
+        /** Did THIS call write a `paylink-pending` claim it now owes a retraction for? */
+        let claimedPending = false;
+        if (!payLink) {
+            // A row already flagged `voided`/`notFound` KEEPS that flag: the
+            // claim is then purely the CAS probe (it rewrites the same value),
+            // because replacing a real diagnosis with `paylink-pending` would
+            // lose it whenever the status read below cannot reach the invoice.
+            const claimMarker = schedule.qbSyncError ?? PAYLINK_PENDING_MARKER;
+            const claimed = await prisma.paymentSchedule.updateMany({
+                where: { id: schedule.id, qbInvoiceId: linkedQbInvoiceId, qbSyncError: schedule.qbSyncError },
+                data: { qbSyncError: claimMarker },
+            });
+            if (claimed.count !== 1) {
+                throw new QBMilestoneRowMovedError(`${schedule.invoice.code} / ${schedule.name}`);
+            }
+            markerNow = claimMarker;
+            claimedPending = claimMarker === PAYLINK_PENDING_MARKER;
+            try {
+                payLink = await getQBInvoicePaymentLink(tokens, linkedQbInvoiceId, pushDeadline);
+                payLinkAnswered = true;
+            } catch (error) {
+                if (!isAmbiguousCreateFailure(error)) throw error;
+                linkReadFailed = true;
+            }
+        }
+        const status = await getQBInvoiceStatus(tokens, linkedQbInvoiceId, pushDeadline);
         const linkChanged = !!payLink && payLink !== schedule.qbInvoiceLink;
-        // A reachable invoice (status read back) clears any stale voided/notFound flag.
-        const clearFlag = !!status && !!schedule.qbSyncError;
-        if (linkChanged || clearFlag) {
-            await prisma.paymentSchedule.update({
-                where: { id: schedule.id },
+        // Two different reasons to clear the marker, kept apart on purpose:
+        //   • a `paylink-pending` claim THIS call wrote is RETRACTED as soon as
+        //     the pay-link read answered at all (a link, or a definite "none")
+        //     — otherwise a row that had no marker before this call would be
+        //     left carrying one it never earned;
+        //   • a pre-existing `voided`/`notFound` flag (or a `paylink-pending`
+        //     this call did not write) is cleared only on the original
+        //     evidence, a reachable invoice.
+        // A failed link read clears nothing: the marker stays for the sweep.
+        //   • a `pending-deletion` flag is cleared by NEITHER. A reachable
+        //     invoice is the whole reason that row is still waiting: somebody
+        //     asked for it to be deleted and the delete has not been confirmed,
+        //     so "we could read it" is evidence the intent is UNFINISHED, not
+        //     evidence to forget it.
+        // A pay-link marker is not cleared by "QuickBooks answered" — only by a
+        // payable URL actually landing on the row. This branch used to clear it
+        // on a definite "no link", which is the same false repair the sweep and
+        // the progress-billing stage had: the invoice stays uncollectable and
+        // leaves the queue. Routed through the one helper, a null answer keeps
+        // the row queued with its attempt recorded, and eventually parks it on
+        // `paylink-missing` for a human.
+        const payLinkDecision = payLinkAnswered && isPayLinkPending(markerNow)
+            ? nextPayLinkState(markerNow, payLink)
+            : null;
+        // Unchanged for every OTHER marker: a `voided`/`notFound` flag is still
+        // cleared by the original evidence, a reachable invoice.
+        const clearFlag = !linkReadFailed && !isPendingDeletion(markerNow) && !payLinkDecision
+            && (claimedPending || (!!markerNow && !!status));
+        if (linkChanged || clearFlag || payLinkDecision) {
+            const written = await prisma.paymentSchedule.updateMany({
+                // Pinned to the link we read AND to the marker the claim left,
+                // so an unlink or a new create claim during the remote calls
+                // above loses this write instead of being overwritten by it.
+                where: { id: schedule.id, qbInvoiceId: linkedQbInvoiceId, qbSyncError: markerNow },
                 data: {
                     ...(linkChanged ? { qbInvoiceLink: payLink } : {}),
                     ...(clearFlag ? { qbSyncError: null } : {}),
+                    ...(payLinkDecision ? { qbSyncError: payLinkDecision.marker } : {}),
                 },
             });
+            if (written.count !== 1) {
+                throw new QBMilestoneRowMovedError(`${schedule.invoice.code} / ${schedule.name}`);
+            }
         }
-        return { qbInvoiceId: schedule.qbInvoiceId, payLink, qbTotal: status?.total };
+        return { qbInvoiceId: linkedQbInvoiceId, payLink, qbTotal: status?.total };
+    }
+
+    // Fail closed: a previous attempt may already have created the invoice, or
+    // another sender is mid-flight right now.
+    if (isBlockedByAmbiguousCreate(schedule)) {
+        throw new QBAmbiguousCreateError(schedule.invoice.code);
     }
 
     const invoice = schedule.invoice;
-    const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId);
+    const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId, pushDeadline);
 
     // Stable per-milestone doc number: INV-00012-2 (position within the invoice's schedule)
     const position = invoice.payments.findIndex(p => p.id === schedule.id) + 1 || 1;
-    const suffix = `-${position}`;
-    const docNumber = `${invoice.code.slice(0, Math.max(1, 21 - suffix.length))}${suffix}`;
+    const docNumber = milestoneDocNumber(invoice.code, position);
 
     const projectName = invoice.project?.name || "Project";
     const amount = toNum(schedule.amount);
@@ -267,86 +2026,371 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     // Carry the sales tax explicitly so Vanessa's QBO sales-tax reporting sees
     // the liability. The milestone amount is tax-inclusive; split it using the
     // invoice's rate (each milestone carries its proportional share of tax).
-    let tax: { preTaxAmount: number; taxAmount: number } | null = null;
-    if (schedule.pretaxAmount != null && schedule.taxAmount != null) {
-        tax = {
-            preTaxAmount: toNum(schedule.pretaxAmount),
-            taxAmount: toNum(schedule.taxAmount),
-        };
-    } else {
-        const taxRate = toNum(invoice.taxRate);
-        const preTaxAmount = Math.round((amount / (1 + taxRate / 100)) * 100) / 100;
-        const taxAmount = Math.round((amount - preTaxAmount) * 100) / 100;
-        if (taxRate > 0 && taxAmount > 0) tax = { preTaxAmount, taxAmount };
-    }
-
-    const { qbId, total } = await createQBMilestoneInvoice(tokens, {
-        docNumber,
-        customerId,
-        itemId,
-        description: `${projectName} — ${schedule.name}`,
-        amount,
-        tax,
-        dueDate: schedule.dueDate,
-        billEmail: invoice.client?.email || null,
-        privateNote: `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`,
+    //
+    // The rule itself lives in qbo-issuance.ts because the issuance hash below
+    // has to fingerprint EXACTLY what this sends — a second copy here would
+    // drift and the resolver would recompute a hash the create never wrote.
+    const tax = milestoneTaxSplit({
+        pretaxAmount: schedule.pretaxAmount,
+        taxAmount: schedule.taxAmount,
+        amount: schedule.amount,
+        invoiceTaxRate: invoice.taxRate,
     });
 
-    // QBO Automated Sales Tax can recalculate on top of what we send — verify the
-    // grand total still equals the milestone. A drift means the client would be
-    // asked for a different amount than ProBuild expects; flag it loudly.
-    if (Math.abs(total - amount) > 0.05) {
-        console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
+    const description = `${projectName} — ${schedule.name}`;
+    // Truncated to QBO's PrivateNote cap BEFORE it goes anywhere — see the
+    // matching comment in progress-billing.ts's stage function. QBO stores the
+    // truncated note; resolveAmbiguousInvoiceCreateCore matches the marker's
+    // identity against it by exact equality, so an untruncated identity here
+    // would never match and a `confirmed-none` clear on that false negative
+    // would let a real duplicate invoice through.
+    // canonicalPrivateNote, not a bare `.slice()`: it also collapses whitespace
+    // runs and trims the ends, and it is the SAME function createQBMilestoneInvoice
+    // applies to the payload. A raw slice here left the marker holding an
+    // untrimmed string while QuickBooks stored the trimmed one, so a project or
+    // milestone name with stray whitespace made our own invoice invisible to
+    // the resolver — "none found", operator clears, client billed twice.
+    const privateNote = canonicalPrivateNote(milestonePrivateNote(invoice.code, schedule.name, projectName));
+    // Claim the send BEFORE the request goes out. Losing this CAS means another
+    // sender got there first — refuse rather than race them into two invoices.
+    // A failure to WRITE the marker must abort: without it a crash mid-create
+    // is invisible, which is the whole failure this guards.
+    //
+    // The marker CARRIES the recovery identity (docNumber + PrivateNote),
+    // written in this same CAS. Both are derived from mutable state — the
+    // docNumber from this milestone's POSITION in the schedule, the note from
+    // the project and milestone names — so a recovery that recomputed them
+    // after an earlier milestone was deleted or the project renamed would look
+    // for a document we never created, find nothing, and offer to release a row
+    // whose real invoice is sitting in QuickBooks collectible.
+    //
+    // It also carries an ISSUANCE HASH of the money state this invoice is being
+    // built from. DocNumber and PrivateNote prove an invoice is ours; they do
+    // not prove it still describes the row. If this create lands, the CAS below
+    // loses (paid/canceled/repriced mid-flight) and the compensating delete
+    // then fails, a real invoice for the OLD amount is left in QuickBooks with
+    // a matching identity — and the resolver would link it. The hash is what
+    // lets the resolver see the row moved and refuse.
+    const issuanceHash = milestoneIssuanceHash({
+        // Pinned literals, not the loaded row: these are the values the CAS
+        // below requires, so they are what the invoice is genuinely issued
+        // against. Reading them off `schedule` would let a row that was already
+        // Paid at load time hash as Paid and then match itself at resolve time.
+        status: "Pending",
+        qbPaymentId: null,
+        amount: schedule.amount,
+        dueDate: schedule.dueDate,
+        // The rest of the PAYLOAD this create is about to send. `amount` alone
+        // does not describe the invoice: the same dollars split differently
+        // between pre-tax and tax, or billed to a different QuickBooks
+        // customer, is a different bill.
+        tax,
+        customerId,
+    });
+    // Fixed BEFORE the identity, because the identity records it and the
+    // payload sends it: the marker and the document must agree about which
+    // accounting period this books to, on a replay as much as a first attempt.
+    const claimedAt = new Date();
+    const identity = {
+        docNumber, privateNote, issuanceHash,
+        // The QBO invoice TOTAL this create expects to produce. DocNumber +
+        // PrivateNote prove a resolved match is OURS; they carry no dollar
+        // figure, so this is what lets the ambiguous-create resolver refuse a
+        // coincidental match whose total is wrong instead of linking it blind.
+        expectedTotal: amount,
+        // WHICH BOOK and WHICH CUSTOMER this POST is going to. Everything above
+        // identifies a document; none of it identifies the company the document
+        // lives in. A recovery run after a reconnect to a different realm would
+        // otherwise query the wrong books, find nothing, and offer to clear a
+        // row whose real invoice is collectible in the original company.
+        realmId: tokens.realmId,
+        customerId,
+        // ...and how that total is SPLIT, which ACCOUNTING PERIOD it books to,
+        // and which INCOME ACCOUNT the lines hit. Round 51: this rail recorded
+        // none of the three, so `documentMatchesClaim` silently skipped all
+        // three checks here while the document and progress-billing rails
+        // enforced them — the same QuickBooks response was accepted on one rail
+        // and refused on another.
+        expectedTax: tax ? tax.taxAmount : 0,
+        txnDate: qboTxnDate(claimedAt),
+        itemId,
+    };
+    // The marker carries the SAME claim time the identity was built from, not
+    // a fresh one taken after the request ends. See composeCreateMarker's `at`.
+    const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity, claimedAt);
+    // Claimed UNDER the invoice lock, re-checking the progress-billing
+    // relationship inside that same lock — see claimMilestonePreCreateUnderLock's
+    // doc comment for why the earlier check above is not enough on its own.
+    // The lock is released (the transaction ends) here, BEFORE the QBO create
+    // call below.
+    const claimedSend = await claimMilestonePreCreateUnderLock(schedule, inFlightMarker);
+    if (claimedSend.count !== 1) {
+        throw new QBAmbiguousCreateError(schedule.invoice.code);
     }
 
-    const payLink = await getQBInvoicePaymentLink(tokens, qbId);
-
-    // Conditional link write: the milestone was read as unlinked and unpaid at
-    // the top, but this function does several remote calls in between — a manual
-    // "Record Payment", a QB settle, a cancellation, a concurrent push, or a
-    // rebalance changing the row's content can all land in that window. The
-    // guards go in the WHERE — status pinned to Pending (a Canceled row must
-    // never get a fresh collectible invoice: the payment poller only watches
-    // Pending) and the content snapshot (amount/name/dueDate) pinned to what the
-    // QBO invoice was actually created from, so a mid-push edit can't leave QBO
-    // silently out of sync. If the claim misses, the just-created QBO invoice is
-    // deleted (compensation) instead of being attached to a row it no longer
-    // describes.
-    // Taken under the invoice lock and paired with a progress-billing re-check:
-    // createProgressBillingCore locks the same invoice row, so the two paths
-    // serialize instead of interleaving. Without this a progress billing could
-    // claim this milestone in the window between the guard at the top of this
-    // function and the write below (a full-milestone billing leaves the row
-    // Pending and unlinked, so every pinned column here would still match) and
-    // the client would end up with two collectible QuickBooks invoices.
-    const linked = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
-        const claimedNow = await tx.progressBillingLine.findFirst({
-            where: { scheduleId: schedule.id, billing: { status: { not: "Void" } } },
-            select: { id: true },
-        });
-        if (claimedNow) return { count: 0 };
-        return tx.paymentSchedule.updateMany({
-            where: {
-                id: schedule.id,
-                status: "Pending",
-                qbPaymentId: null,
-                qbInvoiceId: null,
-                amount: schedule.amount,
-                name: schedule.name,
-                dueDate: schedule.dueDate,
-            },
-            // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
-            data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
-        });
-    }));
-    if (linked.count !== 1) {
-        const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
-        if (!compensated) {
-            console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push and compensating delete of QBO invoice ${qbId} (${docNumber}) failed — delete it in QuickBooks manually`);
-            throw new Error(`This milestone changed while staging its QuickBooks invoice, and the abandoned QuickBooks invoice ${docNumber} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
+    let created: Awaited<ReturnType<typeof createQBMilestoneInvoice>>;
+    try {
+        created = await createQBMilestoneInvoice(tokens, {
+            docNumber,
+            customerId,
+            itemId,
+            description,
+            amount,
+            tax,
+            dueDate: schedule.dueDate,
+            billEmail: invoice.client?.email || null,
+            privateNote,
+            // FROM THE IDENTITY. `createQBMilestoneInvoice` used to compute the
+            // date itself from `new Date()`, so a replay of an unconfirmed
+            // create booked into whatever period today happened to be.
+            txnDate: identity.txnDate,
+        }, pushDeadline);
+    } catch (error) {
+        if (!isAmbiguousCreateFailure(error)) {
+            // QuickBooks answered "no" and created nothing, so this row is
+            // freely re-sendable: release the in-flight claim. Pinned to the
+            // exact marker we wrote — releasing someone else's claim would
+            // unblock a row whose outcome is genuinely unknown.
+            await prisma.paymentSchedule.updateMany({
+                where: { id: schedule.id, qbSyncError: inFlightMarker },
+                data: { qbSyncError: null },
+            }).catch(() => {});
+            throw error;
         }
-        throw new Error("This milestone changed while staging its QuickBooks invoice — refresh and try again.");
+        {
+            // The request went out and we never learned the outcome. Promote
+            // the in-flight claim to the durable ambiguous marker, carrying the
+            // SAME identity, so the next send refuses rather than risking a
+            // duplicate bill and the recovery knows what to look for. Pinned to
+            // our own claim; if it no longer matches, the row is still blocked
+            // by whatever marker replaced it.
+            await prisma.paymentSchedule.updateMany({
+                where: { id: schedule.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
+                data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, identity, claimedAt) },
+            });
+            await logAutomationEvent({
+                kind: "qbo-payments-sync",
+                status: "error",
+                reason: AMBIGUOUS_CREATE_MARKER,
+                source: "milestone-push",
+                docNumber,
+                detail: { paymentScheduleId: schedule.id, error: error instanceof Error ? error.name : "unknown" },
+            });
+            throw new QBAmbiguousCreateError(docNumber);
+        }
+    }
+
+    const { qbId, total } = created;
+
+    // JUDGE WHAT QUICKBOOKS ACTUALLY BOOKED, before linking anything.
+    //
+    // This used to WARN on a total more than five cents out and link the
+    // invoice anyway, and it never looked at the document at all: a different
+    // DocNumber, customer, accounting date, service item or tax split all
+    // became payable. `documentMatchesClaim` is the same predicate the
+    // recovery path applies to a candidate it finds by DocNumber, so the
+    // identical QuickBooks response can no longer be accepted here and refused
+    // there.
+    //
+    // Checked while the row is still UNLINKED, so compensation is available.
+    const verdict = created.document
+        ? documentMatchesClaim(created.document, identity)
+        : { ok: false as const, reason: "QuickBooks did not describe the document it created" };
+    if (!verdict.ok) {
+        const detail = `QuickBooks created ${docNumber} (id ${qbId}), but ${verdict.reason}`;
+        await logAutomationEvent({
+            kind: "qbo-payments-sync",
+            status: "error",
+            reason: "create-document-mismatch",
+            source: "milestone-push",
+            docNumber,
+            detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, reason: verdict.reason },
+        }).catch(() => {});
+        // Never link it. Delete it if we still can; if not, park on the
+        // durable marker carrying the QuickBooks id so the next send refuses
+        // and a human can find the document.
+        // Named for what it means HERE: the compensation's verdict, not
+        // deleteQBInvoice's `false`-means-confirmed-absence boolean. Branching on
+        // the latter is the bug tests/qbo-maintenance-sweep.test.ts guards; this
+        // one has to be branched on, exactly as the abandoned-case path does.
+        const { deleted: compensated } = await compensateAndUnlink(
+            prisma.paymentSchedule,
+            schedule.id,
+            qbId,
+            () => deleteQBInvoice(tokens, qbId, createRouteDeadline(MILESTONE_CLEANUP_BUDGET_MS)),
+            {},
+            inFlightMarker,
+            { invoiceId: schedule.invoiceId, unsettled: { status: "Pending", qbPaymentId: null } },
+        );
+        if (!compensated) {
+            await prisma.paymentSchedule.updateMany({
+                where: { id: schedule.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
+                data: {
+                    qbSyncError: composeCreateMarker(
+                        AMBIGUOUS_CREATE_MARKER,
+                        { ...identity, qbId },
+                        claimedAt,
+                    ),
+                },
+            }).catch(() => {});
+            throw new Error(`${detail}, and it could not be deleted — remove it in QuickBooks by hand, then retry.`);
+        }
+        throw new Error(`${detail}. The QuickBooks invoice was deleted; fix the tax or item setup, then re-send.`);
+    }
+
+    // Persist the link FIRST, before the pay-link fetch.
+    //
+    // The pay-link read is another remote call, and a timeout there used to
+    // abandon a real, created invoice: the row still said unlinked, so the next
+    // send made a second one. Recording the id immediately means the worst case
+    // is a linked row with no pay link yet, which the maintenance sweep can
+    // finish. CAS-guarded on the same content snapshot the final write uses.
+    const claimedLink = await prisma.paymentSchedule.updateMany({
+        where: {
+            id: schedule.id,
+            status: "Pending",
+            qbPaymentId: null,
+            qbInvoiceId: null,
+            // Our own in-flight claim, still ours.
+            qbSyncError: inFlightMarker,
+            amount: schedule.amount,
+            name: schedule.name,
+            dueDate: schedule.dueDate,
+        },
+        data: { qbInvoiceId: qbId, qbSyncedAt: new Date(), qbSyncError: PAYLINK_PENDING_MARKER },
+    });
+
+    let payLink: string | null = null;
+    if (claimedLink.count === 1) {
+        try {
+            payLink = await getQBInvoicePaymentLink(tokens, qbId, pushDeadline);
+        } catch (error) {
+            if (!isAmbiguousCreateFailure(error)) throw error;
+            // Linked but no pay link: leave PAYLINK_PENDING_MARKER for
+            // sweepPendingPayLinks (below, run by the qbo-maintenance
+            // sync-payment-options action) to finish. The invoice exists and is
+            // correct; only the convenience link is missing, so this is not an
+            // error the operator must fix.
+            console.warn(`[quickbooks-payments] pay link pending for ${docNumber} (QBO id ${qbId})`);
+            return { qbInvoiceId: qbId, payLink: null, qbTotal: total };
+        }
+    } else {
+        payLink = await getQBInvoicePaymentLink(tokens, qbId, pushDeadline).catch(() => null);
+    }
+
+    // Finish the link. The rules the write enforces (the content/status pins,
+    // the progress-billing re-check under the invoice lock) and the verdict
+    // when it loses live in `finalizeMilestoneLinkUnderLock` above; an
+    // `abandoned` verdict — and only that — compensates the QBO invoice away.
+    const linked = await finalizeMilestoneLinkUnderLock(schedule, {
+        qbId,
+        payLink,
+        preLinked: claimedLink.count === 1,
+        inFlightMarker,
+        // The Client this invoice bills, so the decision can lock and re-read
+        // the mapping it was issued against — the CAS cannot see that column.
+        clientId: invoice.clientId,
+        // The SAME hash the marker carries. Recomputed under the locks and
+        // compared, so a customer remap or a tax-rate edit that landed while
+        // this create was in flight refuses the link instead of adopting an
+        // invoice that now bills the wrong party or the wrong liability.
+        issuanceHash,
+    });
+    if (linked.outcome === "already-finalized") {
+        // Someone else finished this exact invoice. Nothing to write and
+        // nothing to delete — report the same success they did.
+        return { qbInvoiceId: qbId, payLink: linked.payLink ?? payLink, qbTotal: total };
+    }
+    if (linked.outcome === "settled-without-qb-payment") {
+        // NOT compensated. The row is Paid and carries this invoice id, so
+        // deleting the invoice would leave a Paid milestone pointing at nothing;
+        // and the invoice is genuinely open in QuickBooks, so reporting success
+        // would leave a client able to pay the same milestone twice. Both wrong
+        // answers, so this takes neither: it records the state where an operator
+        // will see it and says exactly what happened.
+        //
+        // The diagnostic goes on `qbSyncError` as a plain flag, NOT a create
+        // marker: `markerKind` does not recognise it, so it blocks nothing and
+        // reads like the existing `voided`/`notFound` diagnostics. CAS-pinned to
+        // the marker this push owns, so a row that moved again keeps whatever
+        // replaced it.
+        await prisma.paymentSchedule.updateMany({
+            where: { id: schedule.id, qbInvoiceId: qbId, qbSyncError: { in: [inFlightMarker, PAYLINK_PENDING_MARKER] } },
+            data: { qbSyncError: SETTLED_WITHOUT_QB_PAYMENT_FLAG },
+        }).catch(() => ({ count: 0 }));
+        await logAutomationEvent({
+            kind: "qbo-payments-sync",
+            status: "error",
+            reason: SETTLED_WITHOUT_QB_PAYMENT_FLAG,
+            source: "milestone-push",
+            docNumber,
+            detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, docNumber },
+        });
+        throw new Error(
+            `This milestone was recorded as paid in ProBuild while its QuickBooks invoice ${docNumber} was being created, ` +
+            `and no QuickBooks payment is attached to that invoice — so it is still open and collectible there. ` +
+            `Record the payment against ${docNumber} in QuickBooks, or void it, then refresh.`,
+        );
+    }
+    if (linked.outcome !== "linked") {
+        // The compensation clock starts HERE, when compensation begins — not at
+        // entry, where it would have been ticking down through every call that
+        // preceded it and could already be spent by the time it is needed. It
+        // is also capped by what the ROUTE has left, so cleanup cannot itself
+        // overrun the platform ceiling: reserve whichever is smaller. Measured
+        // off `routeDeadline`, not the (by now likely exhausted) work budget —
+        // that reserve was carved out of the route's front on entry, so it is
+        // still really there.
+        const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(routeDeadline)));
+        // Say WHICH failure this was. "Changed while staging" is true of a row
+        // that was paid or repriced mid-push; it is misleading for a milestone
+        // that never moved at all and whose CUSTOMER or TAX RATE did — the
+        // operator would go looking at the milestone and find nothing wrong.
+        const whatChanged = linked.outcome === "mismatch"
+            ? `This milestone could not be linked to its new QuickBooks invoice because ${linked.mismatchDetail ?? "the money state it was issued from changed"}`
+            : "This milestone changed while staging its QuickBooks invoice";
+        // Deleting is only half of it: this row may already carry the
+        // provisional link written before the pay-link fetch, and leaving it
+        // pointing at a deleted invoice would block the next send behind an
+        // invoice that no longer exists.
+        const { deleted: compensated, unlinked } = await compensateAndUnlink(
+            prisma.paymentSchedule,
+            schedule.id,
+            qbId,
+            () => deleteQBInvoice(tokens, qbId, cleanupDeadline),
+            {},
+            inFlightMarker,
+            {
+                invoiceId: schedule.invoiceId,
+                // NOT SETTLED, in the two columns that say so. A settle sets both,
+                // so a compensation racing one loses its claim and deletes nothing.
+                unsettled: { status: "Pending", qbPaymentId: null },
+            },
+        );
+        if (compensated && claimedLink.count === 1 && !unlinked) {
+            // The invoice is gone but the row still points at it. Say so rather
+            // than reporting a tidy "changed while staging" — the next send
+            // would otherwise refuse against a dead link.
+            console.error(`[quickbooks-payments] milestone ${schedule.id}: deleted QBO invoice ${qbId} but could not clear the local link`);
+            throw new Error(`${whatChanged}. The abandoned QuickBooks invoice ${docNumber} was deleted, but the link in ProBuild could not be cleared — use "Break QB Link" before re-sending.`);
+        }
+        if (!compensated) {
+            // Even the reserved budget is gone (or the delete was refused).
+            // Record the orphan durably so the maintenance sweep can resolve
+            // it; a console line is not a work queue.
+            await logAutomationEvent({
+                kind: "qbo-payments-sync",
+                status: "error",
+                reason: "invoice-orphan-check",
+                source: "milestone-push",
+                docNumber,
+                detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, docNumber },
+            });
+            console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push and compensating delete of QBO invoice ${qbId} (${docNumber}) failed — delete it in QuickBooks manually`);
+
+            throw new Error(`${whatChanged}, and the abandoned QuickBooks invoice ${docNumber} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
+        }
+        throw new Error(`${whatChanged} — refresh and try again.`);
     }
 
     return { qbInvoiceId: qbId, payLink, qbTotal: total };
@@ -378,8 +2422,38 @@ async function settleMilestonePaidInTx(
     // would drop a genuinely-received payment (the row would be excluded from the next
     // sync's `pending` query forever → client could be double-billed). The settle
     // wins; qbPaymentId below preserves the QBO audit link even if the id was cleared.
+    // FENCED. While a compensation or a deletion holds its claim on this row,
+    // some code is between its last check and an irreversible QuickBooks call
+    // for this very invoice. Settling behind it is what destroyed a paid
+    // milestone's invoice (round 51): the delete went through and this settle's
+    // own link was then pointing at nothing.
+    //
+    // This does NOT pin a marker the way the INVARIANT below forbids — it
+    // refuses ONLY the two short-lived claims that fence a network call, and
+    // the caller retries. A settle is never dropped, only deferred.
+    // Read the marker and decide in JS, NOT with a `NOT ... LIKE` in the WHERE.
+    //
+    // SQL three-valued logic: `NOT (qbSyncError LIKE 'compensating:%')` is NULL,
+    // not TRUE, when qbSyncError IS NULL — so expressing the fence that way
+    // excluded every CLEAN row and stopped ordinary settlement dead. This
+    // transaction is caller-locked (see the doc comment), so a read followed by
+    // the pinned CAS below is atomic with respect to any other settle.
+    const current = await t.paymentSchedule.findUnique({
+        where: { id: paymentScheduleId },
+        select: { qbSyncError: true },
+    });
+    if (isIrreversibleClaimHeld(current?.qbSyncError)) {
+        // A compensation or a deletion is between its claim and an irreversible
+        // QuickBooks call for this row. Settling behind it destroyed the invoice
+        // of a milestone that had just been paid. The claim is short-lived and
+        // released on every path, so the caller retries and nothing is lost.
+        return false;
+    }
     const claim = await t.paymentSchedule.updateMany({
-        where: { id: paymentScheduleId, status: { not: "Paid" } },
+        where: {
+            id: paymentScheduleId,
+            status: { not: "Paid" },
+        },
         data: {
             status: "Paid",
             paymentMethod: "quickbooks",
@@ -391,6 +2465,15 @@ async function settleMilestonePaidInTx(
         },
     });
     if (claim.count === 0) return false;
+
+    // Same rule as the manual path: the deletion intent is RECORDED as settled,
+    // never cleared. The row stays selectable by sweepPendingDeletions, whose
+    // Paid branch probes rather than deletes and reaches a terminal state either
+    // way — which is what a row that has been paid mid-delete needs.
+    await t.paymentSchedule.updateMany({
+        where: { id: paymentScheduleId, qbSyncError: PENDING_DELETION_MARKER },
+        data: { qbSyncError: PENDING_DELETION_SETTLED_MARKER },
+    });
 
     const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
     if (!invoice) return false;
@@ -778,50 +2861,82 @@ export interface QBPaymentSyncResult {
  * per-row failures (a business error, a DB conflict) are recorded and the loop
  * carries on.
  */
-export async function runQboRowLoop<T>(
+export async function runQboRowLoop<T extends { id: string }>(
     rows: T[],
     result: QBPaymentSyncResult,
     handleRow: (row: T) => Promise<void>,
     onRowError: (row: T, error: unknown) => void,
     skippedLabel: string,
     deadline?: RouteDeadline,
-): Promise<void> {
+    /**
+     * When paginating, the caller counts what is left straight from the
+     * database AFTER this page's cursor — which already includes this page's
+     * unprocessed tail. Adding it here too counted those rows twice. Standalone
+     * callers keep the tally; `forEachPendingPage` opts out and owns the count.
+     */
+    countSkipped: boolean = true,
+): Promise<{ lastCompletedId: string | null; skippedInPage: number }> {
+    // The id of the last row this loop actually finished with. The cursor may
+    // only advance to HERE: jumping to the end of the page after a mid-page
+    // outage would step straight over every row the outage cut short, and they
+    // would not be looked at again until the cursor wrapped all the way round.
+    let lastCompletedId: string | null = null;
+    let skippedInPage = 0;
+    const skip = (count: number) => {
+        skippedInPage += count;
+        if (countSkipped) result.skipped += count;
+    };
+
     for (const [index, row] of rows.entries()) {
         // A previous pass already hit the wall — the connection is shared, so
         // there is nothing to gain by trying again here.
         if (result.abortedOnQboOutage) {
-            result.skipped += rows.length - index;
-            return;
+            skip(rows.length - index);
+            return { lastCompletedId, skippedInPage };
         }
         // Checked before EVERY row: a row costs several serial QBO calls, so
         // starting one with seconds left is how a run gets killed mid-write
         // instead of returning a result someone can act on.
         if (isBudgetExhausted(deadline)) {
-            result.skipped += rows.length - index;
-            return;
+            skip(rows.length - index);
+            return { lastCompletedId, skippedInPage };
         }
         try {
             await handleRow(row);
+            lastCompletedId = row.id;
         } catch (error) {
             // Out of time is not a QBO fault: stop cleanly, count the rest as
             // skipped (making the run partial), and let the next run continue.
             if (isQBBudgetExhaustedError(error)) {
-                result.skipped += rows.length - index;
-                return;
+                skip(rows.length - index);
+                return { lastCompletedId, skippedInPage };
             }
             if (isQboConnectionFailure(error)) {
                 result.abortedOnQboOutage = true;
                 result.runFailed = true;
-                result.failureReason = "qbo-unavailable";
+                // A 401/403 mid-loop is the CREDENTIAL, not an outage, and it
+                // arrives here wrapped as QboRetryableError(status) by the row
+                // handler — so a plain `qboHttpStatus` check could not see it
+                // and every such run was filed as "qbo-unavailable". The digest
+                // counts only the reconnect family toward its
+                // reconnect-QuickBooks alert, so a broken connection discovered
+                // mid-sweep (rather than in preflight) was invisible to it.
+                // Same verdict as classifyPreflightFailure, one definition.
+                result.failureReason = isQboReconnectRequired(error) ? QBO_AUTH_SYNC_REASON : "qbo-unavailable";
                 result.errors.push(
                     `QuickBooks stopped responding (${isQBTimeoutError(error) ? "timeout" : "unavailable"}) — remaining ${skippedLabel} skipped, will retry next run`,
                 );
-                result.skipped += rows.length - index - 1;
-                return;
+                skip(rows.length - index - 1);
+                return { lastCompletedId, skippedInPage };
             }
+            // A row-level failure is recorded and the run continues, so this
+            // row IS finished as far as the cursor is concerned — leaving the
+            // cursor behind it would retry the same bad row forever.
             onRowError(row, error);
+            lastCompletedId = row.id;
         }
     }
+    return { lastCompletedId, skippedInPage };
 }
 
 /**
@@ -849,6 +2964,18 @@ export interface PaymentsSyncQboClient {
  */
 export const PAYMENTS_SYNC_BUDGET_MS = 100_000;
 
+/**
+ * The budget for an ON-VIEW refresh (`refreshQBPayments`), which runs as a
+ * server ACTION under a 60s ceiling — not as the cron under 120s.
+ *
+ * Passing no deadline inherited PAYMENTS_SYNC_BUDGET_MS, so a slow QuickBooks
+ * could keep a page's refresh going for 100s inside a 60s ceiling: the action
+ * is killed with nothing returned and the user sees a hung page rather than
+ * "QuickBooks is slow, nothing changed". 30s leaves room for the revalidate
+ * work after the sync and still fits one probe plus a settle comfortably.
+ */
+export const ON_VIEW_PAYMENTS_SYNC_BUDGET_MS = 30_000;
+
 export interface SyncQuickBooksPaymentsOptions {
     /**
      * Who triggered this run. Only "cron" counts as the hourly heartbeat the
@@ -860,6 +2987,84 @@ export interface SyncQuickBooksPaymentsOptions {
     qboClient?: PaymentsSyncQboClient;
     /** Whole-run time budget; defaults to PAYMENTS_SYNC_BUDGET_MS. */
     deadline?: RouteDeadline;
+    /** Where the resume cursors live; defaults to the AutomationSetting table. */
+    cursorStore?: PaymentsSyncCursorStore;
+}
+
+/**
+ * Where the last run stopped, per collection, so the next one CONTINUES rather
+ * than restarting.
+ *
+ * Ordering by id made each run deterministic, but every run still began at the
+ * same end: with more pending rows than one run's budget, the rows past the cap
+ * were re-skipped forever and never verified. Persisting the cursor turns the
+ * cap into a rolling window over the whole set. Wrapping to the start on
+ * exhaustion keeps it a cycle rather than a dead end.
+ */
+export const PAYMENTS_CURSOR_KEYS = {
+    milestones: "qbo-payments-sync.cursor.milestones",
+    billings: "qbo-payments-sync.cursor.billings",
+} as const;
+/** Which collection goes first; flipped each run so neither can starve the other. */
+export const PAYMENTS_ORDER_KEY = "qbo-payments-sync.order";
+
+export interface PaymentsSyncCursorStore {
+    get(key: string): Promise<string | null>;
+    set(key: string, value: string): Promise<void>;
+}
+
+/** AutomationSetting-backed cursor store. Never throws: a cursor is an optimisation. */
+export const automationSettingCursorStore: PaymentsSyncCursorStore = {
+    async get(key) {
+        try {
+            const row = await prisma.automationSetting.findUnique({ where: { key }, select: { value: true } });
+            return row?.value ?? null;
+        } catch {
+            return null;
+        }
+    },
+    async set(key, value) {
+        try {
+            await prisma.automationSetting.upsert({
+                where: { key },
+                create: { key, value },
+                update: { value },
+            });
+        } catch {
+            // A lost cursor costs one restart from the top, never correctness.
+        }
+    },
+};
+
+/**
+ * Rows this run has not looked at, given where it started, where it stopped,
+ * and whether it wrapped.
+ *
+ * Counting only `id > cursor` under-reported every capped run that resumed
+ * mid-collection: with the cursor at row 100 and the cap reached at row 199,
+ * rows 0-99 are equally unverified but sat before the cursor, so the run
+ * reported them as nothing left to do and called itself clean.
+ */
+export async function countUnvisited(
+    count: (where: Record<string, unknown>) => Promise<number>,
+    state: { cursorId: string | null; originalCursor: string | null; wrapped: boolean },
+): Promise<number> {
+    const { cursorId, originalCursor, wrapped } = state;
+
+    if (wrapped) {
+        // Walking the head segment: the tail past the original cursor is done.
+        if (!originalCursor) return 0;
+        return count({
+            id: { ...(cursorId ? { gt: cursorId } : {}), lte: originalCursor },
+        });
+    }
+
+    // Still in the tail. Everything after where we stopped, PLUS the head
+    // segment we resumed past and never came back to.
+    const tail = await count(cursorId ? { id: { gt: cursorId } } : {});
+    if (!originalCursor) return tail;
+    const head = await count({ id: { lte: originalCursor } });
+    return tail + head;
 }
 
 /** One database page. Small enough to stay responsive, big enough to be cheap. */
@@ -876,31 +3081,117 @@ const PAYMENTS_SYNC_MAX_ROWS = 500;
  * Ordering by id makes the walk deterministic, and anything we do not reach is
  * counted as skipped so the run is honestly reported as partial.
  */
-async function forEachPendingPage<T extends { id: string }>(
+export async function forEachPendingPage<T extends { id: string }>(
     result: QBPaymentSyncResult,
     deadline: RouteDeadline,
-    fetchPage: (cursorId: string | null, take: number) => Promise<T[]>,
-    countRemaining: (cursorId: string | null) => Promise<number>,
-    handlePage: (rows: T[]) => Promise<void>,
+    /**
+     * `stopAfterId` bounds the WRAPPED pass: rows with an id greater than it
+     * were already visited earlier in this same run, so re-fetching them would
+     * process them twice (and could loop). Null means "no upper bound".
+     */
+    fetchPage: (cursorId: string | null, take: number, stopAfterId: string | null) => Promise<T[]>,
+    /**
+     * How many rows this run has NOT visited. Takes the whole traversal state,
+     * not just the cursor: a run that resumed at C and stopped at D has left
+     * both (> D) AND (<= C) unvisited, and the head segment is invisible to a
+     * plain "after the cursor" count. After a wrap it is the reverse — the tail
+     * past C was already done, so only (> D and <= C) is left.
+     */
+    countRemaining: (state: {
+        cursorId: string | null;
+        originalCursor: string | null;
+        wrapped: boolean;
+    }) => Promise<number>,
+    /** Returns the last row it actually completed — the furthest the cursor may move. */
+    handlePage: (rows: T[]) => Promise<{ lastCompletedId: string | null }>,
+    cursor?: { store: PaymentsSyncCursorStore; key: string },
+    maxRows: number = PAYMENTS_SYNC_MAX_ROWS,
 ): Promise<void> {
-    let cursorId: string | null = null;
+    // Resume where the last run stopped. A run that finishes the tail wraps
+    // back to the start, so the window rolls over the whole collection instead
+    // of stalling at whichever rows happen to sort last.
+    const storedCursor = cursor ? await cursor.store.get(cursor.key) : null;
+    // "" is how "start from the top" is stored; it is never a real id.
+    let cursorId: string | null = storedCursor && storedCursor.length > 0 ? storedCursor : null;
+    // Wrapping exists to reach the rows BEFORE a resume point. A run that
+    // already started at the top has no such rows, so wrapping there would
+    // just re-walk everything it had only now finished — the guard has to be
+    // "did this run resume?", not "is the cursor non-null?" (which is true of
+    // any run that processed a page).
+    const startedFromCursor = cursorId !== null;
     let processed = 0;
+    let wrapped = false;
+
+    const saveCursor = async (value: string | null) => {
+        if (cursor) await cursor.store.set(cursor.key, value ?? "");
+    };
 
     while (true) {
         if (result.abortedOnQboOutage) break;
-        if (processed >= PAYMENTS_SYNC_MAX_ROWS) break;
+        if (processed >= maxRows) break;
         if (isBudgetExhausted(deadline)) break;
 
-        const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, PAYMENTS_SYNC_MAX_ROWS - processed);
-        const page = await fetchPage(cursorId, take);
-        if (page.length === 0) return; // exhausted — nothing was missed
+        const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, maxRows - processed);
+        // After wrapping, the run is walking the rows BEFORE where it started;
+        // it must stop at that point or it would revisit the ones it has
+        // already done this run.
+        const page = await fetchPage(cursorId, take, wrapped ? storedCursor : null);
 
-        await handlePage(page);
+        if (page.length === 0) {
+            // End of the collection. If we started mid-way, wrap once and keep
+            // going with whatever budget is left; the rows before the old
+            // cursor are exactly the ones a fixed start would never reach.
+            if (startedFromCursor && !wrapped) {
+                wrapped = true;
+                cursorId = null;
+                await saveCursor(null);
+                continue;
+            }
+            await saveCursor(null); // fully drained: next run starts at the top
+            return;
+        }
+
+        const { lastCompletedId } = await handlePage(page);
         processed += page.length;
-        cursorId = page[page.length - 1].id;
+        // Only past what finished. On a clean page this is the page tail; on a
+        // page an outage cut short it is wherever the loop actually got to, so
+        // the next run resumes at the first unverified row rather than after it.
+        if (lastCompletedId !== null) {
+            cursorId = lastCompletedId;
+            await saveCursor(cursorId);
+        }
+
+        // DID THE HANDLER ACTUALLY FINISH THIS PAGE?
+        //
+        // `lastCompletedId` is the furthest row it verified, and on a page cut
+        // short by a deadline or a QBO outage that is somewhere in the middle.
+        // The short-page branch below reads "fewer rows than we asked for" as
+        // "end of the collection" and RESETS the cursor to the top — so a
+        // 40-row final page that stopped after row 10 threw rows 11-40 away
+        // AND returned before `countRemaining`, so they were never counted as
+        // skipped either. The run reported a clean drain and thirty payments
+        // silently went unverified until the window happened to roll back over
+        // them.
+        const finishedPage = lastCompletedId !== null
+            && lastCompletedId === page[page.length - 1].id;
+        // Stopped mid-page: keep the cursor exactly where the handler got to
+        // and fall through to the counting path, which measures the unvisited
+        // tail (everything after `cursorId`) rather than assuming there is
+        // none. A full page that stopped early needs no special case — the
+        // outage and budget guards at the top of the loop catch it there.
+        if (!finishedPage) break;
 
         // A short page means we reached the end of the collection.
-        if (page.length < take) return;
+        if (page.length < take) {
+            if (startedFromCursor && !wrapped) {
+                wrapped = true;
+                cursorId = null;
+                await saveCursor(null);
+                continue;
+            }
+            await saveCursor(null);
+            return;
+        }
     }
 
     // Stopped early. Count what is genuinely left AFTER the cursor rather than
@@ -912,7 +3203,7 @@ async function forEachPendingPage<T extends { id: string }>(
     // and an unknown amount of unverified payment work vanished from the
     // record. Not knowing is a failed run.
     try {
-        const remaining = await countRemaining(cursorId);
+        const remaining = await countRemaining({ cursorId, originalCursor: storedCursor, wrapped });
         if (remaining > 0) result.skipped += remaining;
     } catch (error) {
         result.runFailed = true;
@@ -1052,26 +3343,51 @@ async function runPaymentsSync(
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
 
+    // A SCOPED run (the on-view refresh for one invoice or project) is not a
+    // sweep: it looks at a handful of rows the user is staring at. Letting it
+    // read the shared cursor would make it skip the very row it was asked
+    // about, and letting it WRITE one would move the cron's resume point to
+    // wherever that user happened to be looking — silently starving everything
+    // after it. Only the unscoped cron sweep carries cursors.
+    const isSweep = !scope?.invoiceId && !scope?.projectId;
+    const cursorStore = options?.cursorStore ?? automationSettingCursorStore;
+    const milestoneCursor = isSweep
+        ? { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.milestones }
+        : undefined;
+    const billingCursor = isSweep
+        ? { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.billings }
+        : undefined;
+
     const milestoneSelect = {
         id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
         invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
     } as const;
 
-    await forEachPendingPage(
+    const runMilestonePass = () => forEachPendingPage(
         result,
         routeDeadline,
-        (cursorId, take) => prisma.paymentSchedule.findMany({
-            where: pendingWhere,
+        (cursorId, take, stopAfterId) => prisma.paymentSchedule.findMany({
+            where: {
+                ...pendingWhere,
+                ...(cursorId || stopAfterId
+                    ? {
+                        id: {
+                            ...(cursorId ? { gt: cursorId } : {}),
+                            ...(stopAfterId ? { lte: stopAfterId } : {}),
+                        },
+                    }
+                    : {}),
+            },
             select: milestoneSelect,
             // Stable key: without it Postgres may return the same first page
             // every run and starve everything behind it.
             orderBy: { id: "asc" },
             take,
-            ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
         }),
-        (cursorId) => prisma.paymentSchedule.count({
-            where: cursorId ? { ...pendingWhere, id: { gt: cursorId } } : pendingWhere,
-        }),
+        ({ cursorId, originalCursor, wrapped }) => countUnvisited(
+            (where) => prisma.paymentSchedule.count({ where: { ...pendingWhere, ...where } }),
+            { cursorId, originalCursor, wrapped },
+        ),
         (page) => runQboRowLoop(page, result, async (schedule) => {
         result.checked++;
         {
@@ -1154,7 +3470,8 @@ async function runPaymentsSync(
         }
     }, (schedule, e) => {
             result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
-        }, "milestones", routeDeadline),
+        }, "milestones", routeDeadline, false),
+        milestoneCursor,
     );
 
     // ── Progress billings ───────────────────────────────────────────────────
@@ -1170,20 +3487,37 @@ async function runPaymentsSync(
         invoice: { select: { code: true, estimateId: true } },
     } as const;
 
-    await forEachPendingPage(
+    const runBillingPass = () => forEachPendingPage(
         result,
         routeDeadline,
-        (cursorId, take) => prisma.progressBilling.findMany({
-            where: billingWhere,
+        (cursorId, take, stopAfterId) => prisma.progressBilling.findMany({
+            where: {
+                ...billingWhere,
+                ...(cursorId || stopAfterId
+                    ? {
+                        id: {
+                            ...(cursorId ? { gt: cursorId } : {}),
+                            ...(stopAfterId ? { lte: stopAfterId } : {}),
+                        },
+                    }
+                    : {}),
+            },
             select: billingSelect,
             orderBy: { id: "asc" },
             take,
-            ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
         }),
-        (cursorId) => prisma.progressBilling.count({
-            where: cursorId ? { ...billingWhere, id: { gt: cursorId } } : billingWhere,
-        }),
+        ({ cursorId, originalCursor, wrapped }) => countUnvisited(
+            (where) => prisma.progressBilling.count({ where: { ...billingWhere, ...where } }),
+            { cursorId, originalCursor, wrapped },
+        ),
         (page) => runQboRowLoop(page, result, async (billing) => {
+        // Counted exactly where the milestone pass counts it — BEFORE the
+        // probe, so a row that was looked at and then failed still shows up as
+        // looked at. Omitting it here made `checked` the milestone count alone:
+        // a run that verified nothing but progress billings reported
+        // "checked: 0" beside a real settle, and any coverage number computed
+        // off it under-reported the billing rail entirely.
+        result.checked++;
         {
             const probe = await qbo.probeInvoice(billing.qbInvoiceId!);
             if (probe.state === "error") {
@@ -1212,8 +3546,32 @@ async function runPaymentsSync(
         }
     }, (billing, e) => {
             result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
-        }, "progress billings", routeDeadline),
-    )
+        }, "progress billings", routeDeadline, false),
+        billingCursor,
+    );
+
+    // Alternate which collection goes first. Whichever runs second only gets
+    // the budget the first one left, so a fixed order lets a busy milestone
+    // queue starve progress billings indefinitely (and vice versa). Flipping
+    // each run guarantees both sides get to go first half the time.
+    //
+    // Sweep-only, for the same reason as the cursors: an on-view refresh must
+    // not rotate the cron's order, or a burst of them could pin the sweep to
+    // one collection.
+    let billingsFirst = false;
+    if (isSweep) {
+        const lastOrder = await cursorStore.get(PAYMENTS_ORDER_KEY);
+        billingsFirst = lastOrder !== "billings-first";
+        await cursorStore.set(PAYMENTS_ORDER_KEY, billingsFirst ? "billings-first" : "milestones-first");
+    }
+
+    if (billingsFirst) {
+        await runBillingPass();
+        await runMilestonePass();
+    } else {
+        await runMilestonePass();
+        await runBillingPass();
+    }
 
     if (newlyFlagged.length > 0) {
         const { notifyQBSyncIssues } = await import("./payment-notifications");
@@ -1268,6 +3626,14 @@ export async function resolveSettlementDate(
  */
 export function classifyPreflightFailure(error: unknown): { reason: string; abortedOnQboOutage: boolean } {
     if (isQboConnectionFailure(error)) {
+        // 401/403 is the credential, not an outage — pipeline-health's digest
+        // only counts events reasoned "qbo-auth" toward reconnect-QuickBooks
+        // alerting (QBO_AUTH_EVENT_REASON), so folding it into the generic
+        // "qbo-unavailable" bucket here made a broken connection invisible to
+        // that alert and read like ordinary transient QBO flakiness instead.
+        if (isQboReconnectRequired(error)) {
+            return { reason: QBO_AUTH_SYNC_REASON, abortedOnQboOutage: true };
+        }
         return { reason: "qbo-unavailable", abortedOnQboOutage: true };
     }
     if (error instanceof QBNotConnectedError || (error instanceof Error && error.name === "QBNotConnectedError")) {
@@ -1275,6 +3641,9 @@ export function classifyPreflightFailure(error: unknown): { reason: string; abor
     }
     if (error instanceof QBTokenPersistenceError || (error instanceof Error && error.name === "QBTokenPersistenceError")) {
         return { reason: "token-not-persisted", abortedOnQboOutage: false };
+    }
+    if (isQBTokenStrandedError(error)) {
+        return { reason: "token-rotation-ambiguous", abortedOnQboOutage: false };
     }
     // Settings-store read failures, a rejected refresh, anything else.
     return { reason: "token-fetch-failed", abortedOnQboOutage: false };

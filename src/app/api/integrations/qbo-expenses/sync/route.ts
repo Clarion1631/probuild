@@ -3,11 +3,32 @@ import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments
 import {
     skippedAuditSummary,
     syncQboExpenses,
+    QBO_EXPENSE_SYNC_BUDGET_MS,
     type QboExpenseSyncResult,
 } from "@/lib/qbo-expense-sync";
-import type { QBTokens } from "@/lib/quickbooks";
+import {
+    createRouteDeadline, isQBTokenStrandedError, qboHttpStatus,
+    type QBTokens, type RouteDeadline,
+} from "@/lib/quickbooks";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
+import { QBO_AUTH_EVENT_REASON } from "@/lib/pipeline-health";
+
+/**
+ * Did QuickBooks reject who we are, rather than what this sync asked for?
+ *
+ * Same rule as qbo-receipts/create/route.ts's isQboAuthFailure, narrowed to
+ * the failures this route's own calls (token refresh, the CDC purchase read)
+ * can actually throw. Name-based, for the same cross-module-identity reason
+ * as isQBNotConnectedError: a bare `instanceof` can miss the SAME error class
+ * loaded from a second module instance.
+ */
+function isQboAuthFailure(error: unknown): boolean {
+    if (isQBTokenStrandedError(error)) return true;
+    if (error instanceof Error && error.name === "QBTokenPersistenceError") return true;
+    const status = qboHttpStatus(error);
+    return status === 401 || status === 403;
+}
 
 export const dynamic = "force-dynamic";
 // 300s: the first historical backfill reads every QBO Purchase page since the
@@ -22,10 +43,10 @@ export interface QboExpenseSyncHandlerDependencies {
     getIngestSecret(): string | undefined;
     getCronSecret(): string | undefined;
     isCronEnabled(): boolean;
-    getFreshTokens(): Promise<QBTokens>;
+    getFreshTokens(deadline?: RouteDeadline): Promise<QBTokens>;
     syncExpenses(
         options: { since: Date; until?: Date; mode: SyncMode },
-        runtime: { tokens: QBTokens },
+        runtime: { tokens: QBTokens; deadline?: RouteDeadline },
     ): Promise<QboExpenseSyncResult>;
     now(): Date;
     isSyncPaused?: () => Promise<boolean>;
@@ -70,15 +91,31 @@ export function createQboExpenseSyncHandlers(
                 console.error("sync audit log failed", error instanceof Error ? error.name : "UnknownError");
             }
         };
+        // Started at handler ENTRY so ONE budget covers the whole request:
+        // the token refresh and the purchase reads are both QBO round trips on
+        // the same 300s ceiling, and a budget that began after the refresh let
+        // it run free.
+        const deadline = createRouteDeadline(QBO_EXPENSE_SYNC_BUDGET_MS);
         try {
-            const tokens = await dependencies.getFreshTokens();
-            const result = await dependencies.syncExpenses({ since, until, mode }, { tokens });
+            const tokens = await dependencies.getFreshTokens(deadline);
+            const result = await dependencies.syncExpenses({ since, until, mode }, { tokens, deadline });
+            // A run that gave up on attachment work did NOT finish. Recording
+            // it as "ok" would refresh the health check on the strength of work
+            // that never happened.
+            const incomplete = result.attachmentsIncomplete === true;
             await logEvent({
                 kind: "qbo-sync",
-                status: "ok",
+                status: incomplete ? "partial" : "ok",
+                reason: incomplete ? "attachments-incomplete" : undefined,
                 source,
                 detail: {
                     mode,
+                    ...(incomplete
+                        ? {
+                            attachmentsIncomplete: true,
+                            attachmentsSkipped: result.attachmentsSkipped ?? 0,
+                        }
+                        : {}),
                     since: since.toISOString().slice(0, 10),
                     ...(until ? { until: until.toISOString().slice(0, 10) } : {}),
                     imported: result.imported,
@@ -91,7 +128,7 @@ export function createQboExpenseSyncHandlers(
                 },
             });
             return NextResponse.json({
-                ok: true,
+                ok: !incomplete,
                 mode,
                 since: since.toISOString().slice(0, 10),
                 ...(until ? { until: until.toISOString().slice(0, 10) } : {}),
@@ -109,6 +146,18 @@ export function createQboExpenseSyncHandlers(
                 "QBO expense sync failed",
                 error instanceof Error ? error.name : "UnknownError",
             );
+            // A credential rejection (401/403 on the CDC purchase read, or a
+            // stranded refresh) is self-healing only once a human reconnects —
+            // pipeline-health.ts's reconnect alert watches for exactly this
+            // reason string. Recording the raw error name here instead buried
+            // it in the generic error bucket and the digest never flagged it.
+            if (isQboAuthFailure(error)) {
+                await logEvent({ kind: "qbo-sync", status: "error", reason: QBO_AUTH_EVENT_REASON, source });
+                return NextResponse.json(
+                    { ok: false, retry: true, reason: QBO_AUTH_EVENT_REASON },
+                    { status: 503 },
+                );
+            }
             await logEvent({ kind: "qbo-sync", status: "error", reason: error instanceof Error ? error.name : "UnknownError", source });
             return NextResponse.json(
                 { ok: false, reason: "sync-failed" },

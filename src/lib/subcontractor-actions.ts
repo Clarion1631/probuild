@@ -5,6 +5,7 @@ import { revalidatePath } from "next/cache";
 import { sendNotification } from "./email";
 import { sendSMS } from "./sms";
 import { SignJWT } from "jose";
+import { assertActiveStaff } from "./permissions";
 
 function getJwtSecret(): Uint8Array {
     const secret = process.env.SUB_PORTAL_SECRET;
@@ -15,6 +16,7 @@ function getJwtSecret(): Uint8Array {
 }
 
 export async function getProjectSubcontractors(projectId: string) {
+    await assertActiveStaff();
     const allSubs = await prisma.subcontractor.findMany({
         orderBy: { companyName: "asc" }
     });
@@ -33,6 +35,7 @@ export async function getProjectSubcontractors(projectId: string) {
 }
 
 export async function toggleSubcontractorProjectAccess(projectId: string, subcontractorId: string, assign: boolean) {
+    await assertActiveStaff();
     if (assign) {
         await prisma.subcontractorProjectAccess.upsert({
             where: {
@@ -63,6 +66,7 @@ export async function inviteNewSubcontractor(projectId: string, data: {
     sendEmail: boolean;
     sendText: boolean;
 }) {
+    await assertActiveStaff();
     // Check if email already exists
     const existing = await prisma.subcontractor.findFirst({
         where: { email: data.email }
@@ -146,6 +150,12 @@ export async function inviteNewSubcontractor(projectId: string, data: {
 }
 
 export async function markSubcontractorProjectViewed(projectId: string, subcontractorId: string) {
+    // Action ids are public, so this authorizes itself. Its one caller is
+    // ProjectViewTracker on the sub portal, where the viewer is a subcontractor
+    // and never a staff user — same session check addTaskCommentAsSub makes.
+    const { getSubPortalSession } = await import("@/lib/sub-portal-auth");
+    const session = await getSubPortalSession();
+    if (!session || session.id !== subcontractorId) throw new Error("Unauthorized");
     const access = await prisma.subcontractorProjectAccess.findUnique({
         where: { subcontractorId_projectId: { subcontractorId, projectId } },
         include: { subcontractor: true, project: { include: { client: true } } }
@@ -190,6 +200,7 @@ export async function markSubcontractorProjectViewed(projectId: string, subcontr
 }
 
 export async function resendSubcontractorInvite(projectId: string, subcontractorId: string) {
+    await assertActiveStaff();
     const sub = await prisma.subcontractor.findUnique({
         where: { id: subcontractorId }
     });

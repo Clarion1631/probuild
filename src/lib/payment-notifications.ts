@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { milestoneSendBlockedReason } from "./qbo-create-markers";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
 import { isBackdatedPayment, formatMoneyDate } from "@/lib/payment-date";
@@ -426,6 +427,13 @@ export async function sendInvoicePaymentReceiptOnly(paymentScheduleId: string) {
     });
     if (!schedule || schedule.status !== "Paid") {
         return { success: false, error: "Milestone is not paid" as const };
+    }
+    // Same predicate the send path uses. A receipt for a milestone whose
+    // QuickBooks side is mid-deletion or unreconciled tells the client the
+    // matter is closed when it demonstrably is not.
+    const blocked = milestoneSendBlockedReason(schedule);
+    if (blocked) {
+        return { success: false, error: `Not sent: ${blocked}` as const };
     }
     const invoice = schedule.invoice;
     const clientEmail = invoice.client?.email;

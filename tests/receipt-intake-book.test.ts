@@ -21,9 +21,20 @@ import {
     driveFileIdOf,
     expenseAmountCents,
     MIN_BOOKING_BUDGET_MS,
+    reconcileExistingExpense,
     type BookableRow,
     type BookDependencies,
 } from "../src/lib/receipt-intake/book";
+// The ONE vendor comparison — the same function the identity check uses.
+import { normalizeVendorName } from "../src/lib/qbo-receipt-push";
+import {
+    phaseConfidenceMin,
+    phaseSuggestionIsConfident,
+    RECEIPT_PHASE_CONFIDENCE_MIN,
+} from "../src/lib/receipt-intake/intake-core";
+import { QBO_PURCHASE_MISMATCH_PREFIX } from "../src/lib/receipt-intake/book";
+import { finalizeDisposition, RECOVERABLE_PARK_REASONS } from "../src/lib/receipt-intake/stored-object";
+import { startOfDateInTimeZone } from "../src/lib/tz-date";
 import { QBTimeoutError } from "../src/lib/quickbooks";
 import {
     QboAccountConfigError,
@@ -70,6 +81,32 @@ function atExisting<T>(fn: (...args: any[]) => Promise<T>) {
     };
 }
 
+/**
+ * "QuickBooks holds this Purchase and it says what this document says."
+ *
+ * Every already-exists stub carries one, because the real
+ * createQBReceiptPurchase always does — and the difference between `match` and
+ * anything else decides whether an Expense is written from the read at all.
+ */
+const BOOKS_AGREE = {
+    verdict: "match" as const,
+    differences: [] as string[],
+    booked: {
+        totalAmount: 364.98,
+        txnDate: "2026-08-03",
+        vendor: "Lowes",
+        projectNames: ["Berg ADU"],
+        taxAmount: 29.2,
+    },
+};
+
+/** The same shape, disagreeing however a test needs it to. */
+const booksSay = (
+    verdict: "derive" | "review",
+    differences: string[],
+    booked: Partial<typeof BOOKS_AGREE.booked> = {},
+) => ({ verdict, differences, booked: { ...BOOKS_AGREE.booked, ...booked } });
+
 const NOW = new Date("2026-09-01T12:00:00.000Z");
 
 function row(overrides: Partial<BookableRow> = {}): BookableRow {
@@ -107,24 +144,33 @@ interface Recorder {
     sendMarks: string[];
     purchaseCalls: any[];
     expenses: any[];
+    expenseUpdates: any[];
     intakeUpdates: any[];
     lockCalls: string[];
     epochBumps: string[];
     events: any[];
+    /** Every qbPurchaseId the shared advisory lock was taken on. */
+    locks: string[];
 }
 
 function recorder(
     overrides: Partial<BookDependencies> = {},
-    opts: { estimates?: { id: string }[]; intakeStillBooking?: boolean } = {},
+    opts: {
+        estimates?: { id: string }[];
+        intakeStillBooking?: boolean;
+        existingExpense?: Record<string, unknown> | null;
+    } = {},
 ): Recorder {
     const intakeStillBooking = opts.intakeStillBooking !== false;
     const purchaseCalls: any[] = [];
     const sendMarks: string[] = [];
     const expenses: any[] = [];
+    const expenseUpdates: any[] = [];
     const intakeUpdates: any[] = [];
     const events: any[] = [];
     const lockCalls: string[] = [];
     const epochBumps: string[] = [];
+    const locks: string[] = [];
 
     const tx = {
         project: {
@@ -135,8 +181,9 @@ function recorder(
             }),
         },
         expense: {
-            findUnique: async () => null,
+            findUnique: async () => (opts.existingExpense ?? null),
             create: async (args: any) => { expenses.push(args.data); return { id: `exp-${expenses.length}` }; },
+            update: async (args: any) => { expenseUpdates.push(args.data); return {}; },
         },
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
@@ -166,6 +213,13 @@ function recorder(
             epochBumps.push(`${query.join("?")}|${values.join(",")}`);
             return [{ value: "1" }];
         },
+        // The shared per-qbPurchaseId advisory lock. Recorded rather than
+        // ignored: taking it is the whole point of the fix, so a version that
+        // stopped taking it must fail a test.
+        $queryRawUnsafe: async (_sql: string, ...values: unknown[]) => {
+            locks.push(String(values[0]));
+            return [];
+        },
         $transaction: async (fn: any) => fn(tx),
     };
 
@@ -187,7 +241,7 @@ function recorder(
         markSendAttempted: async id => { sendMarks.push(id); return true; },
         ...overrides,
     };
-    return { deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events, lockCalls, epochBumps };
+    return { deps, sendMarks, purchaseCalls, expenses, expenseUpdates, intakeUpdates, events, lockCalls, epochBumps, locks };
 }
 
 test("a taxed receipt splits into a pre-tax line and a sales-tax line that reconstruct the total", () => {
@@ -560,7 +614,7 @@ test("an EXISTING purchase is held to the SAME attachment standard", async () =>
     // books without its image. It was the one path exempt from the check.
     const failing = recorder({
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500", existing: BOOKS_AGREE,
         })) as any,
     });
     const failed = await bookReceipt(row(), failing.deps);
@@ -569,7 +623,7 @@ test("an EXISTING purchase is held to the SAME attachment standard", async () =>
 
     const skipped = recorder({
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "skipped",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "skipped", existing: BOOKS_AGREE,
         })) as any,
     });
     const skippedResult = await bookReceipt(row(), skipped.deps);
@@ -586,7 +640,7 @@ test("a previous attachment failure does NOT block the recovery attempt", async 
     const r = recorder({
         createPurchase: atExisting(async (_t: any, input: any) => {
             r.purchaseCalls.push(input);
-            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached" } as any;
+            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached", existing: BOOKS_AGREE } as any;
         }) as any,
     });
     const result = await bookReceipt(row({ lastError: "attachment-failed:failed:500" }), r.deps);
@@ -652,7 +706,7 @@ test("alreadyExists books identically — the lost-response retry", async () => 
     const r = recorder({
         createPurchase: atExisting(async (_t: any, input: any) => ({
             ok: true, qbPurchaseId: "QB-7", docNumber: input.fileId.slice(0, 21),
-            alreadyExists: true, attachment: "already-attached",
+            alreadyExists: true, attachment: "already-attached", existing: BOOKS_AGREE,
         })) as any,
     });
     const result = await bookReceipt(row(), r.deps);
@@ -662,13 +716,190 @@ test("alreadyExists books identically — the lost-response retry", async () => 
     assert.equal(r.events[0].status, "already-exists");
 });
 
+
+// ── Never link an Expense blindly (Codex round-12 item 2) ──────────────────
+//
+// The row under this `qbPurchaseId` is not necessarily one we wrote. The
+// expected race: the worker creates the QBO Purchase, dies before its commit,
+// and QBO expense sync imports that Purchase before the retry comes round. The
+// imported row is right about the money and knows nothing about this receipt —
+// `QboExpenseWrite` carries neither `costCodeId` nor `receiptUrl`. Legacy and
+// human-edited rows can disagree about more than that.
+//
+// Selecting `{ id: true }` and taking `existing ?? create` marked the intake
+// row BOOKED against whatever was there.
+
+/**
+ * What the QBO importer writes for this Purchase: right about the money,
+ * silent about the receipt. NOTE the date anchor — qboTransactionDate() writes
+ * `${txnDate}T00:00:00.000Z`, UTC midnight, while this file writes the
+ * company's LOCAL midnight for the same calendar day. The two differ by hours
+ * and mean the same day; a reconcile that compared instants would call every
+ * imported row a conflict.
+ */
+function importedExpense(over: Record<string, unknown> = {}) {
+    return {
+        id: "exp-existing",
+        estimateId: "est-1",
+        amount: 364.98,
+        vendor: "Lowes",
+        date: new Date("2026-08-03T00:00:00.000Z"),
+        costCodeId: null,
+        receiptUrl: null,
+        ...over,
+    };
+}
+
+/** The row a crash-gap retry finds of its OWN making: fully attributed. */
+function matchingExpense(over: Record<string, unknown> = {}) {
+    return importedExpense({
+        // Local midnight Pacific for the same day — the other anchor.
+        date: new Date("2026-08-03T07:00:00.000Z"),
+        costCodeId: "cc-plumb",
+        receiptUrl: "https://drive.google.com/file/d/FILE123/view",
+        ...over,
+    });
+}
+
 test("an existing Expense for the same Purchase is reused, never duplicated", async () => {
-    const r = recorder();
-    (r.deps.db as any).expense.findUnique = async () => ({ id: "exp-existing" });
+    // The crash-gap retry finding its OWN row: everything agrees, so it links.
+    const r = recorder({}, { existingExpense: matchingExpense() });
     const result = await bookReceipt(row(), r.deps);
     assert.equal((result as any).expenseId, "exp-existing");
     assert.equal(r.expenses.length, 0, "no second Expense row");
+    assert.deepEqual(r.locks, ["QB-1"], "and the shared per-Purchase lock was taken first");
 });
+
+test("IMPORTER WINS: the receipt fills the attribution the sync could not know", async () => {
+    // The expected race. The importer's row carries no cost code and no
+    // receiptUrl — it cannot, those columns are not in QboExpenseWrite — so the
+    // retry fills them rather than linking a job-cost row that points at
+    // nothing and sits on no phase.
+    const r = recorder({}, { existingExpense: importedExpense() });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal((result as any).expenseId, "exp-existing");
+    assert.equal(r.expenses.length, 0, "still no duplicate");
+    assert.equal(r.expenseUpdates.length, 1, "the existing row was completed, not replaced");
+    assert.equal(r.expenseUpdates[0].costCodeId, "cc-plumb");
+    assert.match(String(r.expenseUpdates[0].receiptUrl), /FILE123/);
+    // Money and identity agreed, so nothing there was touched.
+    for (const field of ["estimateId", "amount", "vendor", "date"]) {
+        assert.ok(!(field in r.expenseUpdates[0]), `${field} is not rewritten`);
+    }
+});
+
+test("the two date ANCHORS are not a conflict — same day, different midnight", async () => {
+    // The trap this test exists for: the importer stamps UTC midnight and this
+    // file stamps local midnight, so `existing.date.getTime() !== receipt.date`
+    // for EVERY imported row. Comparing instants would park the whole queue.
+    const utcAnchored = reconcileExistingExpense(importedExpense() as never, receiptValues());
+    const localAnchored = reconcileExistingExpense(matchingExpense() as never, receiptValues());
+    assert.deepEqual(utcAnchored.conflicts, [], "UTC-midnight marker, from the importer");
+    assert.deepEqual(localAnchored.conflicts, [], "local midnight, from this file");
+    // CONTROL: a genuinely different DAY is still a conflict.
+    const wrongDay = reconcileExistingExpense(
+        importedExpense({ date: new Date("2026-08-04T00:00:00.000Z") }) as never,
+        receiptValues(),
+    );
+    assert.deepEqual(wrongDay.conflicts, ["date"]);
+});
+
+test("a human's cost code is never overwritten by the receipt's suggestion", async () => {
+    // costCodeId and receiptUrl are fill-only. The importer cannot write either
+    // column, so a value there came from a person or an earlier receipt — and
+    // theirs is the answer that stands. There is no provenance column and no
+    // `notHumanCodedExpenseWhere` helper in this codebase; "the importer could
+    // not have written this" is the honest predicate.
+    const r = recorder({}, { existingExpense: importedExpense({ costCodeId: "cc-electrical" }) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    const patch = r.expenseUpdates[0] ?? {};
+    assert.ok(!("costCodeId" in patch), "the human's phase stands");
+    assert.match(String(patch.receiptUrl), /FILE123/, "but the missing receipt link is still filled");
+});
+
+test("a CONFLICTING amount parks for a human instead of linking", async () => {
+    // Two views of one Purchase that disagree about real money. Nothing here
+    // can pick a winner, and linking would mark the intake row BOOKED against
+    // a job-cost figure the books do not have.
+    const r = recorder({}, { existingExpense: importedExpense({ amount: 401.11 }) });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "needs-review");
+    assert.match((result as any).reason, /^expense-conflict:/);
+    assert.match((result as any).reason, /amount/);
+    // THE KEY IS RETAINED. A Purchase provably exists in QuickBooks, so
+    // releasing it would let a resubmission of this receipt book a second one.
+    assert.equal((result as any).releaseStrongKey, false);
+    assert.equal(r.expenses.length, 0, "nothing written");
+    assert.equal(r.expenseUpdates.length, 0);
+    assert.ok(
+        !r.intakeUpdates.some(u => u.state === "BOOKED"),
+        "and the intake row was never marked BOOKED",
+    );
+});
+
+test("a CONFLICTING job parks too, and names the field", async () => {
+    const r = recorder({}, { existingExpense: importedExpense({ estimateId: "est-other" }) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "needs-review");
+    assert.match((result as any).reason, /estimate/);
+    assert.equal((result as any).releaseStrongKey, false);
+});
+
+test("reconcile: the truth table, field by field", () => {
+    const base = () => reconcileExistingExpense(importedExpense() as never, receiptValues());
+    assert.deepEqual(base().conflicts, [], "the expected importer row is not a conflict");
+    assert.deepEqual(
+        Object.keys(base().fill).sort(),
+        ["costCodeId", "receiptUrl"],
+        "only what the importer could not know",
+    );
+
+    // Nullable columns: absent means missing attribution, not disagreement.
+    const noVendor = reconcileExistingExpense(importedExpense({ vendor: null }) as never, receiptValues());
+    assert.deepEqual(noVendor.conflicts, []);
+    assert.equal(noVendor.fill.vendor, "Lowes");
+    const noDate = reconcileExistingExpense(importedExpense({ date: null }) as never, receiptValues());
+    assert.deepEqual(noDate.conflicts, []);
+    assert.ok(noDate.fill.date instanceof Date);
+
+    // Populated and different: a real contradiction.
+    assert.deepEqual(
+        reconcileExistingExpense(importedExpense({ vendor: "Home Depot" }) as never, receiptValues()).conflicts,
+        ["vendor"],
+    );
+    // Several at once are all reported, so a reviewer sees the whole picture.
+    assert.deepEqual(
+        reconcileExistingExpense(
+            importedExpense({ estimateId: "est-9", amount: 1, vendor: "X" }) as never,
+            receiptValues(),
+        ).conflicts,
+        ["estimate", "amount", "vendor"],
+    );
+    // A receipt with no phase to offer fills nothing rather than nulling one.
+    const noSuggestion = reconcileExistingExpense(
+        importedExpense() as never,
+        { ...receiptValues(), costCodeId: null },
+    );
+    assert.ok(!("costCodeId" in noSuggestion.fill));
+});
+
+/** The receipt's canonical values, as bookReceipt computes them for row(). */
+function receiptValues() {
+    return {
+        estimateId: "est-1",
+        amountCents: 36498,
+        vendor: "Lowes",
+        date: new Date("2026-08-03T07:00:00.000Z"),
+        calendarDay: "2026-08-03",
+        timeZone: "America/Los_Angeles",
+        costCodeId: "cc-plumb",
+        receiptUrl: "https://drive.google.com/file/d/FILE123/view",
+    };
+}
 
 test("a DB failure AFTER the Purchase exists retries — the create is idempotent", async () => {
     const r = recorder();
@@ -913,10 +1144,75 @@ test("unassigned during READ, assigned before BOOKING: the phase is re-checked",
 
 test("the phase-suggestion confidence is recorded when the suggestion is used", async () => {
     const r = recorder();
-    await bookReceipt(row({ costCodeId: null, suggestedConfidence: 0.42 }), r.deps);
+    await bookReceipt(row({ costCodeId: null, suggestedConfidence: 0.82 }), r.deps);
     assert.equal(r.expenses[0].costCodeId, "cc-plumb");
-    assert.match(r.expenses[0].description, /phase suggested \(confidence 0\.42\)/);
-    assert.equal(r.events[0].detail.suggestedConfidence, 0.42);
+    assert.match(r.expenses[0].description, /phase suggested \(confidence 0\.82\)/);
+    assert.equal(r.events[0].detail.suggestedConfidence, 0.82);
+});
+
+// ── The confidence the prompt asks for is the confidence that decides ──────
+
+test("a LOW-confidence suggestion books UNCODED and is flagged for a human", async () => {
+    // read.ts tells the model "a low number sends the receipt to a human", and
+    // then nothing read the number: the suggestion was applied whatever it
+    // said, including when the model itself reported it was guessing. A phase
+    // the document never pointed at then rode into the Expense and every
+    // variance report counted it as spend on a line nobody budgeted — silently,
+    // because the audit note said "phase suggested" either way.
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: null, suggestedConfidence: 0.42 }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, null, "the Expense books UNCODED");
+    assert.match(r.expenses[0].description, /phase suggestion withheld \(confidence 0\.42 < 0\.6\)/);
+    assert.match(r.expenses[0].description, /assign one/, "and says what a human must do");
+    assert.equal(r.events[0].detail.phaseRejected, "cc-plumb", "the discarded suggestion is auditable");
+    assert.equal(r.events[0].detail.suggestedConfidence, undefined);
+});
+
+test("NO confidence at all is not 'sure' — it books UNCODED too", async () => {
+    // null is an ABSENT answer (an older prompt, a truncated response, a phase
+    // list that was never sent). Letting it clear the bar would apply exactly
+    // the suggestions we know least about.
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: null, suggestedConfidence: null }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, null);
+    assert.match(r.expenses[0].description, /phase suggestion withheld \(confidence none stated < 0\.6\)/);
+    assert.equal(r.events[0].detail.phaseRejected, "cc-plumb");
+});
+
+test("exactly AT the threshold is confident enough — the boundary is inclusive", async () => {
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: null, suggestedConfidence: 0.6 }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, "cc-plumb");
+    assert.match(r.expenses[0].description, /phase suggested \(confidence 0\.60\)/);
+});
+
+test("a HUMAN's explicit pick is never subject to the threshold", async () => {
+    // It is not a suggestion. A bookkeeper who codes a receipt by hand must not
+    // have it withheld because the model was unsure about a phase nobody asked
+    // it about.
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: "cc-chosen", suggestedConfidence: 0.01 }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, "cc-chosen");
+    assert.ok(!/withheld/.test(r.expenses[0].description));
+});
+
+test("the threshold is env-overridable, and a junk override is ignored", () => {
+    assert.equal(phaseConfidenceMin(undefined), RECEIPT_PHASE_CONFIDENCE_MIN);
+    assert.equal(phaseConfidenceMin(""), RECEIPT_PHASE_CONFIDENCE_MIN);
+    assert.equal(phaseConfidenceMin("0.8"), 0.8);
+    assert.equal(phaseConfidenceMin("0"), 0, "zero is a real choice: apply every suggestion");
+    assert.equal(phaseConfidenceMin("1"), 1);
+    for (const junk of ["banana", "-0.1", "1.5", "NaN", "Infinity"]) {
+        assert.equal(phaseConfidenceMin(junk), RECEIPT_PHASE_CONFIDENCE_MIN, junk);
+    }
+});
+
+test("null confidence never clears the bar, whatever the bar is", () => {
+    assert.equal(phaseSuggestionIsConfident(null, 0), false, "not even at zero");
+    assert.equal(phaseSuggestionIsConfident(undefined, 0), false);
+    assert.equal(phaseSuggestionIsConfident(0, 0), true, "but a stated zero does");
+    assert.equal(phaseSuggestionIsConfident(0.59, 0.6), false);
+    assert.equal(phaseSuggestionIsConfident(0.6, 0.6), true);
 });
 
 test("a human's explicit pick is not labelled a suggestion", async () => {
@@ -1170,7 +1466,7 @@ test("the already-exists branch does NOT go through onBeforeCreate", async () =>
             seen.push("create-called");
             await onExisting?.();
             void onBeforeCreate;
-            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached" } as any;
+            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached", existing: BOOKS_AGREE } as any;
         },
     });
     const result = await bookReceipt(row(), r.deps);
@@ -1186,7 +1482,7 @@ test("attempt 20 on an ALREADY-EXISTING purchase retains the strong key", async 
     // same receipt would then book it a second time.
     const r = recorder({
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500", existing: BOOKS_AGREE,
         })) as any,
     });
     const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
@@ -1198,7 +1494,7 @@ test("attempt 20 on an ALREADY-EXISTING purchase retains the strong key", async 
 test("a terminal attachment refusal on an existing purchase also retains the key", async () => {
     const r = recorder({
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:415",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:415", existing: BOOKS_AGREE,
         })) as any,
     });
     const result = await bookReceipt(row(), r.deps);
@@ -1210,7 +1506,7 @@ test("a STALE claim on the existing-purchase hook aborts, exactly like the creat
     const r = recorder({
         markSendAttempted: async () => false,
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached", existing: BOOKS_AGREE,
         })) as any,
     });
     assert.deepEqual(await bookReceipt(row(), r.deps), { outcome: "stale" });
@@ -1233,4 +1529,469 @@ test("the QBO core fires onExistingPurchase before it touches the attachment", (
     );
     // And the create hook is NOT fired on this path.
     assert.ok(!body.includes("onBeforeCreate"), "onBeforeCreate belongs to the create path only");
+});
+
+// -- An EXISTING QBO Purchase decides the Expense (round-34 item 2) ----------
+
+/**
+ * `alreadyExists` is not only the lost-response retry. It is every v1-cutover
+ * document (the Apps Script posted the Purchase from its OWN read of the file)
+ * and every Drive revision that kept its fileId. The Expense used to be written
+ * from THIS pass's OCR values regardless, so ProBuild's job cost could carry a
+ * total, a date or a job QuickBooks does not have — under a `qbPurchaseId` that
+ * says the two are the same document.
+ */
+function existingPurchase(existing: unknown) {
+    return atExisting(async () => ({
+        ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true,
+        attachment: "already-attached", existing,
+    })) as any;
+}
+
+test("a matching Purchase books exactly as it always did", async () => {
+    // The control. Without it every assertion below would pass on a code path
+    // that had simply stopped booking.
+    const r = recorder({ createPurchase: existingPurchase(BOOKS_AGREE) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.expenses.length, 1);
+    assert.equal(r.expenses[0].amount, 364.98);
+    assert.equal(r.expenses[0].vendor, "Lowes");
+    assert.ok(!/existing QuickBooks Purchase/.test(r.expenses[0].description));
+    assert.equal(r.events[0].detail.qboDerivedFields, undefined);
+});
+
+test("AMOUNT: the Expense is DERIVED from the books, not from the read", async () => {
+    // Real money posted against QBO's number, and the Expense is linked to that
+    // very Purchase. Writing 364.98 next to a Purchase the books say is 372.10
+    // is a variance report that can never tie out.
+    const r = recorder({ createPurchase: existingPurchase(booksSay("derive", ["amount"], { totalAmount: 372.1 })) });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.expenses.length, 1);
+    assert.equal(r.expenses[0].amount, 372.1, "the books' total, not the OCR one");
+    assert.match(
+        r.expenses[0].description,
+        /amount taken from the existing QuickBooks Purchase/,
+        "and it says so, so a bookkeeper reading the Expense knows why",
+    );
+    assert.equal(r.events[0].amountCents, 37210, "the audit row records what was booked");
+    assert.deepEqual(r.events[0].detail.qboDerivedFields, ["amount"]);
+});
+
+test("DATE and VENDOR are derived the same way", async () => {
+    const r = recorder({
+        createPurchase: existingPurchase(booksSay("derive", ["date", "vendor"], {
+            txnDate: "2026-08-01",
+            vendor: "Lowe's Home Improvement #1234",
+        })),
+    });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.expenses[0].vendor, "Lowe's Home Improvement #1234");
+    // Re-anchored to the company's calendar day, exactly as the normal path
+    // does — the derived day goes through the same conversion, not around it.
+    assert.equal(
+        (r.expenses[0].date as Date).toISOString(),
+        startOfDateInTimeZone("2026-08-01", "America/Los_Angeles").toISOString(),
+    );
+});
+
+test("PROJECT: a disagreement parks the row and writes NO Expense", async () => {
+    // Which job carries the cost is an attribution decision. Deriving it would
+    // move money between jobs on QuickBooks' say-so; using the read would file
+    // it under a job the books disagree with. Neither is ours to choose.
+    const r = recorder({ createPurchase: existingPurchase(booksSay("review", ["project"], { projectNames: ["Mesplay Kitchen"] })) });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "needs-review");
+    assert.equal((result as any).reason, "qbo-purchase-mismatch:project");
+    assert.equal(
+        (result as any).releaseStrongKey,
+        false,
+        "a Purchase provably exists, so the dedup key must NOT go back",
+    );
+    assert.equal(r.expenses.length, 0, "nothing is written from the read");
+    assert.equal(r.intakeUpdates.length, 0, "and the row is not marked BOOKED");
+});
+
+test("TAX: a split the books do not have parks too, naming every difference", async () => {
+    const r = recorder({ createPurchase: existingPurchase(booksSay("review", ["project", "tax"])) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal((result as any).reason, "qbo-purchase-mismatch:project,tax");
+    assert.equal(r.expenses.length, 0);
+});
+
+test("the mismatch park is NOT recoverable by a re-upload", async () => {
+    // A re-upload of the same bytes changes nothing about the books, and
+    // dragging the row back to RECEIVED would re-read it into the same
+    // disagreement. It is a human's decision, like every other non-sweeper park.
+    assert.ok(!RECOVERABLE_PARK_REASONS.some(reason => QBO_PURCHASE_MISMATCH_PREFIX.startsWith(reason)));
+    assert.equal(
+        finalizeDisposition({
+            state: "NEEDS_REVIEW",
+            stateReason: `${QBO_PURCHASE_MISMATCH_PREFIX}project`,
+        }),
+        "not-recoverable",
+    );
+});
+
+test("a FRESHLY created Purchase never consults the books — there is nothing to consult", async () => {
+    // alreadyExists:false carries no comparison at all: this call wrote the
+    // Purchase from these very values, so they agree by construction.
+    const r = recorder();
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.expenses[0].amount, 364.98);
+    assert.equal(r.events[0].detail.qboDerivedFields, undefined);
+});
+
+// ── Tolerance is for IDENTITY, not for VALUES (Codex round-13 items 1 & 2) ──
+//
+// `compareExistingPurchase` calls a Purchase the SAME purchase when it is
+// within two cents on the amount or the tax, and when the vendor differs only
+// in case or spacing. That tolerance exists so a rounding split or a
+// capitalisation difference does not send an ordinary receipt to a human. It
+// says nothing about which numbers to STORE.
+//
+// Adopting QBO's values only on `derive` meant a verdict of `match`:
+//   - wrote the OCR total into job cost while QuickBooks held a figure a cent
+//     away, under a qbPurchaseId asserting the two are one document;
+//   - logged the OCR tax to the audit register as "what posted", so the
+//     sales-tax filing report reconciled against a number no Purchase carried;
+//   - and, on the importer-won crash gap, met the importer's QBO-sourced
+//     Expense at the exact comparison in reconcileExistingExpense and parked a
+//     receipt nothing was wrong with.
+
+/** A Purchase QBO posted a hair away from the OCR read — still ONE purchase. */
+const booksWithin = (booked: Partial<typeof BOOKS_AGREE.booked>) => ({
+    verdict: "match" as const,
+    differences: [] as string[],
+    booked: { ...BOOKS_AGREE.booked, ...booked },
+});
+
+/** The deps override for a Purchase already in the books. */
+const fromBooks = (existing: unknown) => ({ createPurchase: existingPurchase(existing) });
+
+for (const [label, deltaCents] of [["+1c", 1], ["-1c", -1], ["+2c", 2], ["-2c", -2]] as const) {
+    test(`MATCHED ${label} on the AMOUNT: the Expense carries QBO's number, not the OCR one`, async () => {
+        // row() reads 364.98; QBO posted a cent or two away and the identity
+        // check still says "same purchase".
+        const postedCents = 36498 + deltaCents;
+        const r = recorder(fromBooks(booksWithin({ totalAmount: postedCents / 100 })));
+
+        const result = await bookReceipt(row(), r.deps);
+
+        assert.equal(result.outcome, "booked", label);
+        assert.equal(r.expenses.length, 1);
+        assert.equal(
+            Math.round(Number(r.expenses[0].amount) * 100),
+            postedCents,
+            `${label}: job cost records what QuickBooks actually posted`,
+        );
+        // THE PRE-FIX CONTROL: the OCR figure is a DIFFERENT number, so this
+        // assertion cannot pass for code that simply kept the read.
+        assert.notEqual(postedCents, 36498, "the two really do differ");
+        assert.equal(r.events[0].amountCents, postedCents, "and the audit reports the same");
+    });
+}
+
+for (const [label, deltaCents] of [["+1c", 1], ["-2c", -2]] as const) {
+    test(`MATCHED ${label} on the TAX: the audit reports QBO's tax, not the read's`, async () => {
+        const postedTaxCents = 2920 + deltaCents;
+        const r = recorder(fromBooks(booksWithin({ taxAmount: postedTaxCents / 100 })));
+
+        const result = await bookReceipt(row(), r.deps);
+
+        assert.equal(result.outcome, "booked", label);
+        assert.equal(
+            r.events[0].taxCents,
+            postedTaxCents,
+            `${label}: the filing register reconciles against the Purchase`,
+        );
+        assert.notEqual(postedTaxCents, 2920, "the OCR tax is a different number");
+    });
+}
+
+test("CONTROL: a fresh create still reports the read's own numbers", async () => {
+    // Nothing was in the books, so there is no posted figure to adopt and the
+    // groups this pass actually sent are the truth. Without this control, code
+    // that always reached for `booked` would pass every test above.
+    const r = recorder();
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(Math.round(Number(r.expenses[0].amount) * 100), 36498);
+    assert.equal(r.events[0].taxCents, 2920);
+});
+
+test("a DERIVE verdict adopts exactly as a MATCH does, and still names the fields", async () => {
+    // The two verdicts must not disagree about what gets stored — only about
+    // what gets REPORTED as a difference.
+    const r = recorder(fromBooks(
+        booksSay("derive", ["amount"], { totalAmount: 401.11 }),
+    ));
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(Math.round(Number(r.expenses[0].amount) * 100), 40111);
+    assert.deepEqual(r.events[0].detail.qboDerivedFields, ["amount"]);
+});
+
+test("a MATCH adopts silently — no derived-fields noise for a within-tolerance cent", async () => {
+    // `differences` is the beyond-tolerance list. A one-cent adoption is not a
+    // disagreement anyone needs to review, so it must not fill the register
+    // with derived-field rows.
+    const r = recorder(fromBooks(booksWithin({ totalAmount: 364.99 })));
+    await bookReceipt(row(), r.deps);
+    assert.equal(r.events[0].detail.qboDerivedFields, undefined);
+});
+
+test("IMPORTER WINS at ±1c: the retry reconciles against QBO's number, not the read's", async () => {
+    // The whole failure, end to end. QBO posted 364.99; the importer wrote that
+    // into the Expense; the OCR read says 364.98. Before the fix the worker
+    // compared its OCR cents to the importer's QBO cents and parked
+    // `expense-conflict:amount` — a receipt that was never wrong about anything.
+    const r = recorder(
+        fromBooks(booksWithin({ totalAmount: 364.99 })),
+        { existingExpense: importedExpense({ amount: 364.99 }) },
+    );
+
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "booked", "it recovers instead of parking");
+    assert.equal((result as any).expenseId, "exp-existing");
+    assert.equal(r.expenses.length, 0, "no duplicate Expense");
+    // CONTROL: the same importer row against the OCR figure IS a conflict, so
+    // this is not passing because the reconcile stopped comparing amounts.
+    const wouldPark = reconcileExistingExpense(
+        importedExpense({ amount: 364.99 }) as never,
+        { ...receiptValues(), amountCents: 36498 },
+    );
+    assert.deepEqual(wouldPark.conflicts, ["amount"], "the OCR comparison would have parked");
+});
+
+test("IMPORTER WINS on VENDOR SPELLING: canonical vs OCR recovers, not parks", async () => {
+    // `compareExistingPurchase` normalizes case and whitespace, so QBO's
+    // canonical "Home Depot" and the receipt's "  home   depot " are ONE vendor
+    // to the identity check. The importer wrote QBO's spelling; the reconcile
+    // compared byte-for-byte and parked `expense-conflict:vendor`.
+    const r = recorder(
+        fromBooks(booksWithin({ vendor: "Home Depot" })),
+        { existingExpense: importedExpense({ vendor: "Home Depot" }) },
+    );
+
+    const result = await bookReceipt(row({ vendor: "  home   depot " }), r.deps);
+
+    assert.equal(result.outcome, "booked", "it recovers instead of parking");
+    assert.equal((result as any).expenseId, "exp-existing");
+    // The persisted vendor is QBO's canonical display name on every path that
+    // identified an existing Purchase — nothing rewrites the books, but job
+    // cost must not carry a spelling QuickBooks does not use.
+    assert.ok(
+        !r.expenseUpdates.some(u => "vendor" in u),
+        "the importer's canonical spelling stands",
+    );
+});
+
+test("ONE vendor normalizer, and it is the identity check's", async () => {
+    // The two comparisons must never be able to disagree again. Asserted on
+    // the shared function directly, and on the reconcile that now calls it.
+    assert.equal(normalizeVendorName("  home   depot "), normalizeVendorName("Home Depot"));
+    const spelled = reconcileExistingExpense(
+        importedExpense({ vendor: "Home Depot" }) as never,
+        { ...receiptValues(), vendor: "  home   depot " },
+    );
+    assert.deepEqual(spelled.conflicts, [], "case and spacing are not a contradiction");
+    // CONTROL: a genuinely different vendor still is.
+    const different = reconcileExistingExpense(
+        importedExpense({ vendor: "Home Depot" }) as never,
+        { ...receiptValues(), vendor: "Lowes" },
+    );
+    assert.deepEqual(different.conflicts, ["vendor"]);
+});
+
+test("a fresh create on an alreadyExists purchase stores QBO's vendor spelling", async () => {
+    // No importer row this time: the Expense is created here, so the value
+    // written is the one this file chose. It must still be QBO's.
+    const r = recorder(fromBooks(booksWithin({ vendor: "Home Depot" })));
+    await bookReceipt(row({ vendor: "  home   depot " }), r.deps);
+    assert.equal(r.expenses[0].vendor, "Home Depot");
+});
+
+// ── The audit must report the phase that was PERSISTED (round-13 item 3) ───
+
+test("a preserved human phase is what the booking event reports", async () => {
+    // The worker picks cc-plumb; the row already carries a human's
+    // cc-electrical, which the reconcile keeps. The event used to log the
+    // worker's pick regardless — asserting a cost code never applied to
+    // anything, and attaching the model's confidence score to it.
+    const r = recorder(
+        fromBooks(BOOKS_AGREE),
+        { existingExpense: importedExpense({ costCodeId: "cc-electrical" }) },
+    );
+
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    const detail = r.events[0].detail;
+    assert.equal(detail.costCodeId, "cc-electrical", "the persisted phase, not the worker's");
+    assert.equal(detail.costCodeSource, "existing");
+    assert.equal(detail.phasePreserved, true, "and it says so explicitly");
+    // CONTROL: the worker really did pick something else, so this cannot pass
+    // for an event that simply echoed whatever the row already had.
+    assert.equal(row().suggestedCostCodeId, "cc-plumb");
+    assert.equal(
+        detail.suggestedConfidence,
+        undefined,
+        "a confidence score for a suggestion that lost describes nothing",
+    );
+});
+
+test("an unclaimed phase is FILLED, and reported as the receipt's", async () => {
+    const r = recorder(fromBooks(BOOKS_AGREE), { existingExpense: importedExpense() });
+    await bookReceipt(row(), r.deps);
+    const detail = r.events[0].detail;
+    assert.equal(detail.costCodeId, "cc-plumb");
+    assert.equal(detail.costCodeSource, "receipt");
+    assert.equal(detail.phasePreserved, undefined, "nothing was displaced");
+    assert.equal(detail.suggestedConfidence, 0.82, "and the confidence still rides along");
+});
+
+test("a phase the row already agrees with is not 'preserved'", async () => {
+    // Only a CONTEST counts. Marking every existing value as preserved would
+    // make the flag useless for finding the cases a human should look at.
+    const r = recorder(
+        fromBooks(BOOKS_AGREE),
+        { existingExpense: importedExpense({ costCodeId: "cc-plumb" }) },
+    );
+    await bookReceipt(row(), r.deps);
+    assert.equal(r.events[0].detail.phasePreserved, undefined);
+    assert.equal(r.events[0].detail.costCodeId, "cc-plumb");
+});
+
+test("reconcile reports the effective attribution, three ways", () => {
+    const withHuman = reconcileExistingExpense(
+        importedExpense({ costCodeId: "cc-electrical" }) as never,
+        receiptValues(),
+    );
+    assert.deepEqual(withHuman.attribution, {
+        costCodeId: "cc-electrical", costCodeSource: "existing", preserved: true,
+    });
+    // No contest: the receipt had nothing to offer.
+    const noSuggestion = reconcileExistingExpense(
+        importedExpense({ costCodeId: "cc-electrical" }) as never,
+        { ...receiptValues(), costCodeId: null },
+    );
+    assert.equal(noSuggestion.attribution.preserved, false);
+    // Filled from the receipt.
+    const filled = reconcileExistingExpense(importedExpense() as never, receiptValues());
+    assert.deepEqual(filled.attribution, {
+        costCodeId: "cc-plumb", costCodeSource: "receipt", preserved: false,
+    });
+    // Neither side has one.
+    const neither = reconcileExistingExpense(
+        importedExpense() as never,
+        { ...receiptValues(), costCodeId: null },
+    );
+    assert.deepEqual(neither.attribution, {
+        costCodeId: null, costCodeSource: "none", preserved: false,
+    });
+});
+
+// ── The intake row records what POSTED (Codex round-16 item 3) ─────────────
+//
+// "QuickBooks is authoritative for an existing Purchase" was only half true:
+// booking derived the total, vendor, date and tax from QBO and wrote them to
+// the Expense, but left the intake row carrying the OCR read. So `taxCents` —
+// the column Phase 3's sales-tax reporting is specified to read — kept a
+// figure no Purchase ever posted, and the row disagreed with its own Expense
+// under a qbPurchaseId asserting the two are one document. The audit event
+// reported `row.vendor` (the OCR spelling) while the Expense carried QBO's.
+
+test("BOOKED persists QBO's tax, vendor, total and date on the intake row", async () => {
+    // The read says Lowes / 364.98 / 29.20; QuickBooks posted Home Depot /
+    // 372.10 / 31.00 on a different day, and identified the same purchase.
+    const r = recorder(fromBooks(booksSay("derive", ["amount", "vendor", "date"], {
+        totalAmount: 372.10,
+        vendor: "Home Depot",
+        txnDate: "2026-08-04",
+        taxAmount: 31.0,
+    })));
+
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+
+    const booked = r.intakeUpdates.find(u => u.state === "BOOKED");
+    assert.ok(booked, "the row reached BOOKED");
+    assert.equal(booked.vendor, "Home Depot", "QBO's vendor, not the read's");
+    assert.equal(booked.totalCents, 37210);
+    assert.equal(booked.taxCents, 3100, "the column Phase 3 reads");
+    assert.equal(
+        (booked.txnDate as Date).toISOString().slice(0, 10),
+        "2026-08-04",
+        "and QBO's calendar day",
+    );
+
+    // PRE-FIX CONTROL: every one of those is a DIFFERENT value from the OCR
+    // read, so these assertions cannot pass for code that left the row alone.
+    assert.equal(row().vendor, "Lowes");
+    assert.equal(row().totalCents, 36498);
+    assert.equal(row().taxCents, 2920);
+});
+
+test("the audit event reports exactly what the Expense got", async () => {
+    const r = recorder(fromBooks(booksSay("derive", ["amount", "vendor"], {
+        totalAmount: 372.10,
+        vendor: "Home Depot",
+        taxAmount: 31.0,
+    })));
+    await bookReceipt(row(), r.deps);
+
+    const event = r.events[0];
+    const expense = r.expenses[0];
+    assert.equal(event.vendor, "Home Depot", "not row.vendor");
+    assert.equal(event.vendor, expense.vendor, "the event and the Expense agree");
+    assert.equal(event.amountCents, 37210);
+    assert.equal(Math.round(Number(expense.amount) * 100), event.amountCents);
+    assert.equal(event.taxCents, 3100);
+});
+
+test("the row, the Expense and the audit are ONE object — asserted together", async () => {
+    // The property that keeps them from drifting again: all three writes read
+    // the same `booked`, so any disagreement is a code change, not a
+    // maintenance slip in one of three places.
+    const r = recorder(fromBooks(booksWithin({ totalAmount: 364.99, taxAmount: 29.25 })));
+    await bookReceipt(row(), r.deps);
+
+    const rowUpdate = r.intakeUpdates.find(u => u.state === "BOOKED")!;
+    const expense = r.expenses[0];
+    const event = r.events[0];
+    assert.equal(rowUpdate.totalCents, 36499);
+    assert.equal(Math.round(Number(expense.amount) * 100), 36499);
+    assert.equal(event.amountCents, 36499);
+    assert.equal(rowUpdate.taxCents, 2925);
+    assert.equal(event.taxCents, 2925);
+    assert.equal(rowUpdate.vendor, expense.vendor);
+});
+
+test("a FRESH create still records the read's own values", async () => {
+    // Nothing was in the books, so there is no posted figure to adopt — the
+    // control that stops the fix from reaching for `booked` unconditionally.
+    const r = recorder();
+    await bookReceipt(row(), r.deps);
+    const rowUpdate = r.intakeUpdates.find(u => u.state === "BOOKED")!;
+    assert.equal(rowUpdate.vendor, "Lowes");
+    assert.equal(rowUpdate.totalCents, 36498);
+    assert.equal(rowUpdate.taxCents, 2920);
+});
+
+test("readJson is NEVER rewritten, so the OCR original stays auditable", async () => {
+    // BOOKED overwrites the extracted values on purpose; this is what makes
+    // that safe. There is no `extracted*` column pair on the model and none is
+    // needed while the raw model response survives verbatim.
+    const r = recorder(fromBooks(booksSay("derive", ["vendor"], { vendor: "Home Depot" })));
+    await bookReceipt(row(), r.deps);
+    for (const update of r.intakeUpdates) {
+        assert.ok(!("readJson" in update), "no booking write touches the raw read");
+    }
 });

@@ -57,6 +57,10 @@
       "schedule": "*/5 * * * *"
     },
     {
+      "path": "/api/cron/qbo-maintenance",
+      "schedule": "45 * * * *"
+    },
+    {
       "path": "/api/cron/bank-register-pull",
       "schedule": "0 2 * * *"
     },

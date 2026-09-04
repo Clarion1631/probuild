@@ -151,6 +151,13 @@ export function buildReadPrompt(projectPhases: ProjectPhase[]): string {
     // The ONE appended section. A suggestion only — a human or the cost-code
     // matcher still owns the final phase, so an empty answer is always allowed
     // and an off-list answer is discarded by the caller.
+    //
+    // The confidence promise below ("a low number sends the receipt to a
+    // human") is KEPT, and kept in one place: RECEIPT_PHASE_CONFIDENCE_MIN in
+    // intake-core.ts is the threshold, and book.ts's resolvePhase is what
+    // withholds the suggestion. The number is deliberately NOT stated to the
+    // model — telling it the bar invites answers calibrated to clear the bar
+    // rather than to the document.
     if (projectPhases.length === 0) return promptText;
     const phaseList = projectPhases.map(p => `${p.code} — ${p.name}`).join("\n");
     return (

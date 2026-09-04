@@ -6,14 +6,27 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME } from "@/lib/receipt-intake/file-type";
 import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
-import { uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
+import { cleanupNotBefore, uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
-import { finalizeDisposition, publishFence, uploadPathFor } from "@/lib/receipt-intake/stored-object";
-import { createReceiptUploadUrl, receiptObjectSize } from "@/lib/receipt-intake/bucket";
-import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
+import {
+    finalizeDisposition,
+    leaseFence,
+    type ObservedRow,
+    uploadPathFor,
+    verifyStoredCopy,
+} from "@/lib/receipt-intake/stored-object";
+import {
+    discardUnresumedLease,
+    issuedLeaseIsCurrent,
+    newLeaseNonce,
+    reuseLiveLease,
+} from "@/lib/receipt-intake/upload-lease";
+import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
+import { queueObjectCleanup } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
-import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 
 /**
  * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
@@ -27,13 +40,79 @@ import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
  */
 const evidenceCreate = <T>(args: Prisma.ReceiptIntakeCreateArgs): Promise<T> =>
     withReceiptEvidenceLock<T>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.create(args) as unknown as Promise<T>);
-const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
-    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
-const evidenceDelete = (args: Prisma.ReceiptIntakeDeleteArgs) =>
-    withReceiptEvidenceLock(fn => prisma.$transaction(fn), tx => tx.receiptIntake.delete(args));
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
+
+/**
+ * THE ROUTE'S ONE ABSOLUTE DEADLINE, created at entry.
+ *
+ * `maxDuration = 30` is the whole request's budget, and every storage call now
+ * takes this rather than a fresh fifteen seconds of its own — three sequential
+ * calls with independent allowances could spend 45 seconds inside a handler
+ * the platform kills at 30.
+ */
+const ROUTE_BUDGET_MS = 27_000;
+
+/**
+ * THE /start SUCCESS RESPONSE IS A UNION, and `kind` is what tells them apart.
+ *
+ * The spec said every success carries an upload URL. It does not, and never
+ * did: a sourceRef whose document is already held and verified has nothing to
+ * upload, so that branch answers `alreadyReceived` with no `uploadUrl` and no
+ * `uploadLease`. A mobile client that assumed the URL was always there read
+ * `undefined` and had no way to tell that apart from a malformed response.
+ *
+ * Naming the two members, in the route and in the spec, is the fix: a client
+ * switches on `kind` and the compiler (theirs and ours) enumerates the cases.
+ * `ok: true` alone never implies there is somewhere to PUT bytes.
+ */
+const UPLOAD = "upload" as const;
+const SETTLED = "settled" as const;
+
+/** There is somewhere to PUT the bytes, and a lease to echo back at /finalize. */
+export interface StartUploadResponse {
+    ok: true;
+    kind: typeof UPLOAD;
+    id: string;
+    /** Where to PUT. Scoped to ONE path, derived here and bound to the row. */
+    uploadUrl: string;
+    token: string;
+    storagePath: string;
+    /**
+     * The generation this URL was issued under. /finalize REQUIRES it back and
+     * answers 409 `lease-stale` to anything else -- see the finalize route.
+     */
+    uploadLease: string;
+    maxBytes: number;
+    sourceRef?: string;
+    state?: string;
+    /** True when this row already existed and its lease was reused or renewed. */
+    resumed?: boolean;
+    /** True when a recoverable park was re-armed rather than freshly created. */
+    recovered?: boolean;
+}
+
+/** Nothing to upload: the document is already held, and verified byte-for-byte. */
+export interface StartSettledResponse {
+    ok: true;
+    kind: typeof SETTLED;
+    alreadyReceived: true;
+    id: string;
+    state: string;
+}
+
+export type StartResponse = StartUploadResponse | StartSettledResponse;
+
+/**
+ * EVERY /start SUCCESS GOES THROUGH HERE.
+ *
+ * The union is only worth declaring if it is checked. Routed through this
+ * helper, a branch that forgets `kind`, or returns an upload response with no
+ * `uploadLease`, is a compile error rather than a contract the mobile app
+ * discovers at runtime.
+ */
+const startOk = (body: StartResponse) => NextResponse.json(body);
 
 /**
  * Step 1 of the two-step upload: reserve the row, hand back a signed URL.
@@ -53,6 +132,9 @@ export const maxDuration = 30;
  * /finalize is what publishes it.
  */
 export async function POST(req: Request) {
+    // ONE deadline for the whole request — see ROUTE_BUDGET_MS.
+    const deadline = createRouteDeadline(ROUTE_BUDGET_MS);
+
     const auth = await authenticateIntake(req, "ingest");
     if (!auth.ok) return auth.response;
 
@@ -155,6 +237,15 @@ export async function POST(req: Request) {
     // Lease 1 from the outset: the version is part of the path, so there is no
     // "version 0" object to confuse with a resumed upload later.
     const storagePath = uploadPathFor(id, 1, ext);
+    // Held in a const, not re-derived: it is the value written to the row AND
+    // the value the discard below CASes on. Calling uploadLeaseExpiry() twice
+    // would compare a fresh instant against the stored one and never match.
+    const leaseExpiresAt = uploadLeaseExpiry();
+    // The generation THIS request stamps on the lease. The expiry alone could
+    // not identify it — a concurrent retry's reuse writes "now + 2h" too, and
+    // the two can be the same millisecond — so the discard CAS pins this
+    // instead. See discardUnresumedLease.
+    const leaseNonce = newLeaseNonce();
 
     let created: { id: string; sourceRef: string; state: string };
     try {
@@ -183,8 +274,9 @@ export async function POST(req: Request) {
                 // The promise this response makes: until then the client's URL
                 // works, so nothing may declare the object missing or reject
                 // the row for what is at that path.
-                uploadUrlExpiresAt: uploadLeaseExpiry(),
+                uploadUrlExpiresAt: leaseExpiresAt,
                 uploadLeaseVersion: 1,
+                uploadLeaseNonce: leaseNonce,
             },
             select: { id: true, sourceRef: true, state: true },
         });
@@ -198,6 +290,11 @@ export async function POST(req: Request) {
                     id: true, sourceRef: true, state: true, stateReason: true, storagePath: true,
                     createdById: true, expectedSha256: true, fileSha256: true,
                     uploadLeaseVersion: true, uploadUrlExpiresAt: true,
+                    // The generation the fences pin — see leaseFence.
+                    uploadLeaseNonce: true,
+                    // Only for cleanupNotBefore: an inline row has no expiry,
+                    // and its capability window is measured from createdAt.
+                    createdAt: true,
                 },
             });
             if (!existing) return NextResponse.json({ ok: false, reason: "conflict-retry" }, { status: 409 });
@@ -263,6 +360,58 @@ export async function POST(req: Request) {
                         { status: 409 },
                     );
                 }
+                // A LIVE LEASE IS NOT INVALIDATED BY A RETRY HERE EITHER.
+                //
+                // The re-arm below is destructive by design — new version, new
+                // path, the old object deleted — and it used to run on EVERY
+                // /start for a recoverable row, including one whose signed URL
+                // was still live. Two retries for the same parked sourceRef (a
+                // forwarder's own retry policy, a double-tap) therefore raced:
+                // the second deleted the object the first was about to PUT its
+                // bytes to, and the first request's URL pointed at nothing.
+                // Same failure the STAGING path was fixed for; the rule is one
+                // rule now (see reuseLiveLease).
+                //
+                // The re-arm's identity writes still happen, because a recovery
+                // may legitimately arrive with a CORRECTED expected hash — they
+                // just land on the SAME path and the SAME lease version.
+                // THE IDENTITY WRITES NO LONGER RIDE ALONG. `expectedSha256`
+                // and `mimeType` are part of a LIVE lease's identity, and
+                // passing them here is how a second caller came to overwrite
+                // the announced hash while keeping the same generation: two
+                // callers, one lease, two documents, and only the last hash
+                // could finalize. They are now compared instead (a
+                // disagreement is a 409), and only the recovery's own state
+                // writes are extended through.
+                const keptRecovery = await reuseLiveLease(existing, ext, leaseDepsFor(deadline), {
+                    fileSha256: "",
+                    fileSize: 0,
+                    nextRetryAt: null,
+                }, expectedSha256);
+                if (keptRecovery) {
+                    if (keptRecovery.kind === "storage-unavailable") {
+                        return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                    }
+                    if (keptRecovery.kind === "identity-conflict") {
+                        return leaseIdentityConflict(
+                            existing.id,
+                            keptRecovery.field,
+                            keptRecovery.expiresAt,
+                        );
+                    }
+                    if (keptRecovery.kind === "conflict") return leaseConflict(existing.id);
+                    return startOk({
+                        ok: true,
+                        kind: UPLOAD,
+                        resumed: true,
+                        recovered: true,
+                        id: existing.id,
+                        state: existing.state,
+                        maxBytes: MAX_STORED_BYTES,
+                        ...keptRecovery.signed,
+                    });
+                }
+
                 // THE ROW MOVES FIRST, THEN THE URL IS SIGNED.
                 //
                 // The claim on the lease is made in ONE checked update: the
@@ -273,13 +422,28 @@ export async function POST(req: Request) {
                 // already in the client's hands.
                 const nextLease = existing.uploadLeaseVersion + 1;
                 const retryPath = uploadPathFor(existing.id, nextLease, ext);
-                const { count } = await evidenceUpdateMany({
-                    where: { id: existing.id, ...publishFence(existing) },
-                    data: {
+                // ONE TRANSACTION: the repath and the OLD path's cleanup entry.
+                //
+                // The move orphans the previous object, and the queue entry is
+                // the only thing that will remember it. Writing them separately
+                // meant a transient database failure on the second left bytes
+                // no row referenced and no sweep would ever look at — silently,
+                // because the failure was swallowed. Now they commit together
+                // or the row never moves.
+                // Hoisted so the response can echo it: /finalize requires the
+                // generation its URL was issued under.
+                const rearmedLease = newLeaseNonce();
+                const repathed = await repathWithCleanup(
+                    existing,
+                    {
                         storagePath: retryPath,
                         expectedSha256,
                         uploadUrlExpiresAt: uploadLeaseExpiry(),
                         uploadLeaseVersion: nextLease,
+                        // Same generation stamp every adoption writes, so a
+                        // concurrent discard can never mistake this row for
+                        // the lease it created.
+                        uploadLeaseNonce: rearmedLease,
                         // The stored hash is what /finalize verifies against.
                         // Whatever was recorded describes bytes that are gone
                         // or were never right.
@@ -288,35 +452,58 @@ export async function POST(req: Request) {
                         fileSize: 0,
                         nextRetryAt: null,
                     },
-                });
-                if (count === 0) {
-                    return NextResponse.json(
-                        {
-                            ok: false,
-                            error: "publish-conflict",
-                            reason: "this row changed while a new upload URL was being issued; retry",
-                            retryable: true,
-                            existingId: existing.id,
-                        },
-                        { status: 409 },
-                    );
-                }
-                const rearmed = await signUpload(retryPath);
-                if (!rearmed) {
+                    retryPath,
+                    "start-rearmed-repath",
+                );
+                if (repathed === "unavailable") {
                     return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
                 }
-                // The previous lease's object (if any) is unreferenced now.
-                if (retryPath !== existing.storagePath) {
-                    await deleteObjectOrRecord(existing.storagePath, "start-rearmed-repath");
+                if (repathed === "conflict") {
+                    return leaseConflict(existing.id);
                 }
-                return NextResponse.json({
+                // THE OLD OBJECT IS UNREFERENCED THE INSTANT THE CAS LANDS —
+                // so it is cleaned up here, BEFORE the signing that may fail,
+                // rather than after it.
+                //
+                // The row moves first on purpose (see above), which means the
+                // previous path is orphaned whether or not a URL is ever
+                // issued for the new one. Doing the cleanup only on the happy
+                // path left every 503 below leaking an object nothing
+                // referenced and nothing remembered: not the row (it points
+                // elsewhere now), not the stale-STAGING sweep (it looks at
+                // rows), not the cleanup queue (nobody had recorded it).
+                // deleteObjectOrRecord is exactly the guarded path for this —
+                // it deletes, and records a pending cleanup when the delete
+                // fails.
+                const rearmed = await signUpload(retryPath, { deadline });
+                if (!rearmed) {
+                    // The row keeps the NEW path and a live expiry, so the
+                    // caller's retry lands in reuseLiveLease and is handed a
+                    // URL over that same path. Nothing is orphaned by the
+                    // failure itself.
+                    return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                }
+                // THE LEASE IS RE-READ BEFORE IT IS RETURNED. The CAS above
+                // proved this generation was ours when we wrote it; the sign
+                // is a network round trip, and a concurrent /start can adopt
+                // or repath the row while it is in flight. Returning the nonce
+                // we simply happened to generate would hand back a lease
+                // /finalize refuses -- see issuedLeaseIsCurrent.
+                if (!await issuedLeaseIsCurrent(
+                    existing.id,
+                    { storagePath: retryPath, uploadLease: rearmedLease },
+                    reloadLeaseRow,
+                )) return leaseConflict(existing.id);
+                return startOk({
                     ok: true,
+                    kind: UPLOAD,
                     resumed: true,
                     recovered: true,
                     id: existing.id,
                     state: existing.state,
                     maxBytes: MAX_STORED_BYTES,
                     ...rearmed,
+                    uploadLease: rearmedLease,
                 });
             }
 
@@ -345,16 +532,52 @@ export async function POST(req: Request) {
 
             if (existing.state !== "STAGING") {
                 // "We already have it" has to be TRUE: the forwarder deletes its
-                // only copy on this answer. Metadata only, and bounded — one
-                // small list call whatever the object weighs.
-                const present = await receiptObjectSize(existing.storagePath);
-                if (!present.ok && present.kind === "transient") {
+                // only copy on this answer.
+                //
+                // PRESENCE WAS NOT TRUTH. This branch used to ask storage for a
+                // SIZE and answer alreadyReceived on anything that came back, so
+                // the sender was authorised to destroy its copy on the strength
+                // of bytes nobody had looked at since they were sealed. An
+                // object replaced or corrupted after publication — the upload
+                // URL is `upsert: true`, a restore can put back a different
+                // version, storage can fault — was laundered into "we hold your
+                // receipt" and the last good copy went with it. The row's
+                // `fileSha256` is the only hash this system has ever verified;
+                // the stored bytes must still hash to it.
+                //
+                // ONE rule, shared with the other two replay paths (POST
+                // /intake and /intake/{id}/finalize, see stored-object.ts), so
+                // the three cannot come to disagree about what "we already have
+                // it" means. The cheap metadata probe still runs first inside
+                // it, so the common orphan case never pays for a download.
+                const held = await verifyStoredCopy(existing.storagePath, existing.fileSha256, deadline);
+                if (!held.ok && held.kind === "transient") {
+                    // Storage could not answer. That is never evidence about the
+                    // bytes, so it is never a verdict: the sender retries with
+                    // its copy intact.
                     return NextResponse.json(
-                        { ok: false, reason: "storage-unavailable", retryable: true },
+                        { ok: false, reason: "verify-unavailable", retryable: true },
                         { status: 503 },
                     );
                 }
-                if (!present.ok) {
+                if (!held.ok && held.kind === "content-mismatch") {
+                    // NOT healed, and never a 2xx. A re-upload is exactly how
+                    // bytes get replaced, so healing here would let a replay
+                    // launder the swap. The row is left exactly as it is for the
+                    // worker's `content-changed` park and the sweeper to act on.
+                    return NextResponse.json(
+                        {
+                            ok: false,
+                            error: "content-mismatch",
+                            reason: "the stored document is not the one this row was published with; keep your copy and escalate",
+                            retryable: false,
+                            existingId: existing.id,
+                            state: existing.state,
+                        },
+                        { status: 409 },
+                    );
+                }
+                if (!held.ok) {
                     // A settled row with no object. Recovering it is not this
                     // endpoint's job — /start hands out an upload URL for rows
                     // that are still STAGING or recoverably parked, and dragging
@@ -372,54 +595,41 @@ export async function POST(req: Request) {
                         { status: 409 },
                     );
                 }
-                return NextResponse.json(
-                    { ok: true, alreadyReceived: true, id: existing.id, state: existing.state },
-                );
-            }
-            // A LIVE LEASE IS NOT INVALIDATED BY A RETRY.
-            //
-            // Every matching /start used to bump uploadLeaseVersion and repoint
-            // storagePath UNCONDITIONALLY, even when the existing lease had not
-            // expired. That invalidated the ORIGINAL caller's upload URL out
-            // from under it: two /start calls for the same sourceRef (a network
-            // retry, a double-tap, a forwarder's own retry policy) racing here
-            // meant whichever one finished second deleted the object the first
-            // was about to PUT its bytes to (`start-resumed-repath` below) —
-            // and the first request's signed URL now pointed at nothing.
-            //
-            // `createSignedUploadUrl` does not revoke a previously issued token
-            // when called again for the SAME path, so an unexpired lease can
-            // safely be served a fresh signed URL for its EXISTING path: same
-            // object identity, no repath, no delete of anything. This makes a
-            // retry against a live lease idempotent instead of destructive.
-            if (existing.uploadUrlExpiresAt && existing.uploadUrlExpiresAt.getTime() > Date.now()) {
-                const resigned = await signUpload(existing.storagePath);
-                if (!resigned) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-                // The DB lease must move with the URL it reissues. A resigned
-                // URL is good for a fresh ~2h window, but leaving
-                // uploadUrlExpiresAt untouched meant the row still recorded the
-                // ORIGINAL, older expiry — so the sweeper could judge the lease
-                // dead and reclaim the row while the client was still holding a
-                // perfectly live URL. CAS'd on the identity this retry already
-                // proved (id, state, storagePath, uploadLeaseVersion): if the
-                // row moved under us between the read and here, this loses the
-                // race and falls through to the resume-with-a-new-lease path
-                // below rather than handing out a URL for a lease we could not
-                // actually extend.
-                const { count } = await evidenceUpdateMany({
-                    where: {
-                        id: existing.id,
-                        state: "STAGING",
-                        storagePath: existing.storagePath,
-                        uploadLeaseVersion: existing.uploadLeaseVersion,
-                    },
-                    data: { uploadUrlExpiresAt: uploadLeaseExpiry() },
+                // THE OTHER MEMBER OF THE RESPONSE UNION. There is nothing to
+                // upload -- the document is already held and verified -- so
+                // this branch deliberately carries no uploadUrl and no
+                // uploadLease, and says so in `kind`. A client that keys off
+                // `kind` cannot mistake it for an upload response and go
+                // looking for a URL that was never going to be there.
+                return startOk({
+                    ok: true,
+                    kind: SETTLED,
+                    alreadyReceived: true,
+                    id: existing.id,
+                    state: existing.state,
                 });
-                if (count > 0) {
-                    return NextResponse.json({
-                        ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resigned,
-                    });
+            }
+            // A LIVE LEASE IS NOT INVALIDATED BY A RETRY. Same rule, same
+            // helper, as the recoverable re-arm above.
+            const kept = await reuseLiveLease(
+                existing,
+                ext,
+                leaseDepsFor(deadline),
+                {},
+                expectedSha256,
+            );
+            if (kept) {
+                if (kept.kind === "storage-unavailable") {
+                    return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
                 }
+                if (kept.kind === "identity-conflict") {
+                    return leaseIdentityConflict(existing.id, kept.field, kept.expiresAt);
+                }
+                if (kept.kind === "conflict") return leaseConflict(existing.id);
+                return startOk({
+                    ok: true, kind: UPLOAD, resumed: true, id: existing.id,
+                    maxBytes: MAX_STORED_BYTES, ...kept.signed,
+                });
             }
 
             // A RESUME IS A NEW LEASE, taken BEFORE the URL is signed and in one
@@ -431,37 +641,59 @@ export async function POST(req: Request) {
             // game to invalidate, since nothing live can still be relying on it.
             const nextLease = existing.uploadLeaseVersion + 1;
             const resumePath = uploadPathFor(existing.id, nextLease, ext);
-            const { count } = await evidenceUpdateMany({
-                where: {
-                    id: existing.id,
-                    state: "STAGING",
-                    uploadLeaseVersion: existing.uploadLeaseVersion,
-                },
-                data: {
+            // ONE TRANSACTION, same rule as the re-arm above: the repath
+            // orphans the previous object and the queue entry is all that will
+            // remember it, so the two commit together or neither does. Also
+            // BEFORE the signing — the CAS re-points the row whatever the
+            // signer does next, so cleaning up only on the happy path left
+            // every 503 below leaking an object nothing referenced.
+            //
+            // THE COMPLETE LEASE IDENTITY, not state + version.
+            //
+            // `reuseLiveLease` extends a lease over the SAME path at the SAME
+            // version, writing only the nonce and the expiry — so a fence of
+            // {state, version} still matched a row another request had just
+            // refreshed. Around the expiry boundary that is a live race: A
+            // reads the lease a millisecond before it lapses and extends it; B
+            // reads it a millisecond after, finds it dead, and falls through to
+            // here — where its CAS matched anyway, overwrote A's refresh,
+            // repathed the row and queued A's path for deletion. A had already
+            // returned a working-looking URL to a path nothing now references.
+            // `state` is provably "STAGING" here (the guard at :410 returned
+            // for everything else), so this is strictly stronger, never
+            // different. A lost CAS answers the same retryable 409 the re-arm
+            // branch does, and the retry re-reads and re-decides rather than
+            // orphaning anything — repathWithCleanup rolls back as one.
+            // Hoisted for the same reason as the re-arm's: the response echoes it.
+            const resumedLease = newLeaseNonce();
+            const resumedRepath = await repathWithCleanup(
+                existing,
+                {
                     storagePath: resumePath,
                     uploadLeaseVersion: nextLease,
                     uploadUrlExpiresAt: uploadLeaseExpiry(),
+                    uploadLeaseNonce: resumedLease,
                 },
-            });
-            if (count === 0) {
-                return NextResponse.json(
-                    {
-                        ok: false,
-                        error: "publish-conflict",
-                        reason: "this row changed while a new upload URL was being issued; retry",
-                        retryable: true,
-                        existingId: existing.id,
-                    },
-                    { status: 409 },
-                );
+                resumePath,
+                "start-resumed-repath",
+            );
+            if (resumedRepath === "unavailable") {
+                return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
             }
-            const resumed = await signUpload(resumePath);
+            if (resumedRepath === "conflict") return leaseConflict(existing.id);
+            const resumed = await signUpload(resumePath, { deadline });
+            // The row is on the new path with a live expiry, so a retry resumes
+            // through reuseLiveLease over that same path.
             if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-            if (resumePath !== existing.storagePath) {
-                await deleteObjectOrRecord(existing.storagePath, "start-resumed-repath");
-            }
-            return NextResponse.json({
-                ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resumed,
+            // Re-read before returning, for the same reason the re-arm does.
+            if (!await issuedLeaseIsCurrent(
+                existing.id,
+                { storagePath: resumePath, uploadLease: resumedLease },
+                reloadLeaseRow,
+            )) return leaseConflict(existing.id);
+            return startOk({
+                ok: true, kind: UPLOAD, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES,
+                ...resumed, uploadLease: resumedLease,
             });
         }
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2003") {
@@ -470,26 +702,225 @@ export async function POST(req: Request) {
         throw error;
     }
 
-    const signed = await signUpload(storagePath);
+    const signed = await signUpload(storagePath, { deadline });
     if (!signed) {
-        await evidenceDelete({ where: { id } }).catch(() => { /* best effort */ });
+        // THE ROW ONLY GOES IF NOBODY ELSE ADOPTED IT.
+        //
+        // Creating the row and signing its URL are two steps, and a concurrent
+        // /start for the same sourceRef can complete BOTH of its own steps in
+        // the gap: it hits the unique violation, finds this row with a live
+        // lease, and reuseLiveLease hands it a working URL over this very path.
+        // The unconditional delete this replaces then removed the row that
+        // retry had just adopted — its bytes landed at a path no row pointed
+        // at, /finalize 404d on an id that no longer existed, and the
+        // sourceRef stopped protecting anything. See discardUnresumedLease for
+        // the columns the CAS reads and why the expiry alone could NOT see the
+        // reuse: an adoption writes "now + 2h" exactly as this request did, so
+        // the two can be the same millisecond. `leaseNonce` is what actually
+        // identifies this request's lease.
+        //
+        // Still best effort, exactly as before: a cleanup that could not run at
+        // all leaves a STAGING row with no object, which the stale-STAGING
+        // sweep already knows how to park. It never leaves a row deleted.
+        const discarded = await discardUnresumedLease(
+            {
+                id,
+                storagePath,
+                uploadLeaseVersion: 1,
+                uploadUrlExpiresAt: leaseExpiresAt,
+                uploadLeaseNonce: leaseNonce,
+            },
+            prisma.receiptIntake,
+        ).catch(() => null);
+        if (discarded === "resumed") {
+            // Somebody else owns this row and their URL works. Reporting our
+            // own signer failure would tell a client to retry a row that is
+            // alive and in good hands; the idempotent conflict says who to ask.
+            return leaseConflict(id);
+        }
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
 
-    return NextResponse.json({
+    // AND THE CREATOR RE-READS TOO. It writes the row, then signs, then
+    // answers -- and a concurrent /start for the same sourceRef can adopt or
+    // repath this row inside that gap. It was returning the nonce it had
+    // generated, never re-checked.
+    if (!await issuedLeaseIsCurrent(
+        created.id,
+        { storagePath, uploadLease: leaseNonce },
+        reloadLeaseRow,
+    )) return leaseConflict(created.id);
+    return startOk({
         ok: true,
+        kind: UPLOAD,
         id: created.id,
         sourceRef: created.sourceRef,
         state: created.state,
         maxBytes: MAX_STORED_BYTES,
         ...signed,
+        uploadLease: leaseNonce,
     });
 }
 
 /**
- * The URL is `upsert: true` (see bucket.ts) so a resumed /start for the SAME
- * row can replace its own partial upload — without that the second attempt
- * fails "already exists" and the row can never be finalized. The sha checks
- * above are what stop it from overwriting a DIFFERENT document.
+ * REPOINT A ROW AND REMEMBER THE OBJECT IT LEAVES BEHIND, ATOMICALLY.
+ *
+ * Both destructive /start branches do the same two writes: a fenced CAS that
+ * moves `storagePath` to a freshly-versioned path, and a cleanup entry for the
+ * path it just abandoned. They were separate statements, and the second one's
+ * failure was swallowed — so a transient database error left bytes in a
+ * private bucket that no row referenced, no event remembered and no sweep
+ * would ever look at. Permanently, and silently.
+ *
+ * In one transaction they are all-or-nothing: either the row moves AND the
+ * orphan is queued, or the row does not move and the object is still reachable
+ * through it. `unavailable` is the caller's 503 — the honest answer when we
+ * could not do both.
+ *
+ * The cleanup is SCHEDULED, not immediate. Normally the previous lease is
+ * already dead here (reuseLiveLease declined it), and `cleanupNotBefore`
+ * returns null so the sweep deletes at once. The exception is a caller that
+ * changed its declared extension: liveLeasePath then refuses to reuse the
+ * path even though the URL still works, and deleting under that live
+ * capability would let its holder PUT the object straight back.
  */
-const signUpload = createReceiptUploadUrl;
+async function repathWithCleanup(
+    /**
+     * The row AS OBSERVED. The fence is built from it here rather than handed
+     * in: a `fence: Record<string, unknown>` parameter let a caller pass half
+     * the lease identity, and one did — the resume branch pinned state and
+     * version while `reuseLiveLease` moves only the nonce and the expiry. It
+     * also put the fence somewhere no source check could see it, because the
+     * Prisma call in this function names an opaque parameter rather than a
+     * builder. Taking the row closes both.
+     */
+    existing: ObservedRow & { id: string; storagePath: string; uploadUrlExpiresAt: Date | null; createdAt: Date },
+    data: Record<string, unknown>,
+    nextPath: string,
+    reason: string,
+): Promise<"moved" | "conflict" | "unavailable"> {
+    try {
+        return await prisma.$transaction(async tx => {
+            // FIRST statement of the transaction, as the evidence lock requires
+            // (round-42 gate, finding 1): a repath is a write the
+            // missing-receipt sweep reads, and it used to go through this
+            // route's own evidenceUpdateMany helper before the two writes were
+            // made atomic here.
+            await lockReceiptEvidence(tx);
+            const { count } = await tx.receiptIntake.updateMany({
+                where: { id: existing.id, ...leaseFence(existing) },
+                data,
+            });
+            if (count === 0) return "conflict" as const;
+            // Only when the path actually MOVED. Queueing the path the row was
+            // just re-pointed AT would mark the live upload target for deletion.
+            if (nextPath !== existing.storagePath) {
+                await queueObjectCleanup(
+                    tx,
+                    existing.storagePath,
+                    reason,
+                    cleanupNotBefore(existing),
+                );
+            }
+            return "moved" as const;
+        });
+    } catch (error) {
+        // The row did NOT move: the transaction rolled back, so it still points
+        // at its old object and nothing is orphaned. A retryable answer.
+        console.error(
+            "[receipts/intake] repath transaction failed",
+            reason,
+            error instanceof Error ? error.name : "error",
+        );
+        return "unavailable";
+    }
+}
+
+/**
+ * A LIVE LEASE THIS REQUEST DISAGREES WITH.
+ *
+ * Distinct from `leaseConflict` on purpose: that one means "the row moved
+ * while your URL was being issued, try again" and a retry usually works.
+ * This one means "somebody else holds a live lease for a DIFFERENT document
+ * or a different file type", and retrying changes nothing until that lease
+ * lapses -- so the expiry is in the body, and the caller can wait for it or
+ * start a separate intake under its own sourceRef.
+ */
+function leaseIdentityConflict(existingId: string, field: string, expiresAt: Date) {
+    return NextResponse.json(
+        {
+            ok: false,
+            error: "lease-conflict",
+            reason: field === "sha256"
+                ? "a live upload lease for this row was issued for different bytes; wait for it to expire or start a separate intake"
+                : "a live upload lease for this row was issued for a different file type; wait for it to expire or start a separate intake",
+            field,
+            retryable: true,
+            leaseExpiresAt: expiresAt.toISOString(),
+            existingId,
+        },
+        { status: 409 },
+    );
+}
+
+function leaseConflict(existingId: string) {
+    return NextResponse.json(
+        {
+            ok: false,
+            error: "publish-conflict",
+            reason: "this row changed while a new upload URL was being issued; retry",
+            retryable: true,
+            existingId,
+        },
+        { status: 409 },
+    );
+}
+
+/**
+ * THE ROW, RE-READ, in exactly the shape the lease rule fences on.
+ *
+ * Every column leaseFence pins is selected here. A partial select would hand
+ * the rule an `undefined` where the row has a value, and a CAS built from that
+ * matches nothing — a silent, permanent conflict rather than a lost race.
+ */
+async function reloadLeaseRow(id: string) {
+    return prisma.receiptIntake.findUnique({
+        where: { id },
+        select: {
+            id: true, state: true, stateReason: true, storagePath: true,
+            uploadLeaseVersion: true, uploadLeaseNonce: true, uploadUrlExpiresAt: true,
+            // Part of a LIVE lease's identity, so the re-read has to carry it:
+            // an undefined here would let a retry ADOPT a hash the row already
+            // announced, which is the disagreement the guard exists to catch.
+            expectedSha256: true,
+        },
+    });
+}
+
+/** The live wiring for the shared lease rule (src/lib/receipt-intake/upload-lease.ts). */
+const leaseDepsFor = (leaseDeadline: RouteDeadline | undefined) => ({
+    db: prisma.receiptIntake,
+    // The adoption CAS is exclusive, and every issued lease is re-read after
+    // signing, so the rule needs its own way back to the row.
+    reload: reloadLeaseRow,
+    sign: (storagePath: string, opts: { upsert: boolean }) =>
+        // The reuse rule runs inside a request, so it gets that request's
+        // remaining budget rather than a fresh allowance of its own.
+        signUpload(storagePath, { ...opts, deadline: leaseDeadline }),
+    expiresAt: uploadLeaseExpiry,
+});
+
+/**
+ * CREATE-ONLY BY DEFAULT.
+ *
+ * Every call in this file except the shared lease-reuse rule signs a path that
+ * a version bump has just made new, so nothing can be there and an overwrite
+ * capability would be handed out for no reason — and it would outlive the row
+ * it was issued for, which is what makes it worth withholding. Only
+ * `reuseLiveLease` asks for `upsert`, because replacing a partial upload at
+ * the SAME path is the whole point of the reuse (see bucket.ts). The sha
+ * checks above are what stop even that token from overwriting a DIFFERENT
+ * document.
+ */
+const signUpload = (storagePath: string, opts: { upsert?: boolean; deadline: RouteDeadline | undefined }) =>
+    createReceiptUploadUrl(storagePath, opts);

@@ -422,6 +422,7 @@ test("a rejected queued card is reported, not silently dropped", () => {
     const input = {
         intuit: { status: "ok" as const, indicator: "none" },
         lastPurchaseSync: { status: "ok" as const, at: new Date().toISOString() },
+        purchaseSyncRun: { status: "ok" as const, at: new Date().toISOString(), runStatus: "ok" as const },
         lastReceiptPush: { status: "ok" as const, at: new Date().toISOString() },
         lastPaymentsSync: { status: "ok" as const, at: new Date().toISOString() },
         receipts24h: { status: "ok" as const, counts: { created: 1 } },
@@ -435,6 +436,8 @@ test("a rejected queued card is reported, not silently dropped", () => {
         driveCredentials: { status: "ok" as const, configured: true, source: "company-settings" },
         chaser: { status: "ok" as const, phase: "done", completedAt: new Date().toISOString() },
         bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
+        // Required since the Phase 0/5 probes landed on main.
+        payLinksPending: { status: "ok" as const, count: 0 },
         now: Date.now(),
     } as unknown as Parameters<typeof evaluatePipelineHealth>[0];
 

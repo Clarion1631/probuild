@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getQBPurchaseChangesSince } from "../src/lib/quickbooks";
+import { getQBPurchaseChangesSince, qboHttpStatus, isQboConnectionFailure } from "../src/lib/quickbooks";
 
 const TOKENS = {
     accessToken: "test-access",
@@ -70,6 +70,42 @@ test("QBO CDC refuses a truncated change set instead of silently drifting", asyn
             () => getQBPurchaseChangesSince(TOKENS, new Date("2026-07-22T12:00:00.000Z")),
             /truncated/i,
         );
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+// --- Round 33 gate: a non-2xx must go through the shared classifier ---
+
+test("round 33 gate: a 401 is a typed, classifiable auth failure, not a bare Error", async () => {
+    // Codex gate: `new Error(...)` here left every caller unable to tell a
+    // credential rejection apart from an ordinary transient outage — the
+    // expense-sync route recorded the raw error name and pipeline-health.ts's
+    // reconnect alert (which only fires on the reason string "qbo-auth") never
+    // saw it.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ Fault: {} }), { status: 401 });
+
+    try {
+        const error = await getQBPurchaseChangesSince(TOKENS, new Date("2026-07-22T12:00:00.000Z"))
+            .then(() => null, (e: unknown) => e as Error);
+        assert.ok(error, "must throw, not resolve");
+        assert.equal(qboHttpStatus(error), 401);
+        assert.equal(isQboConnectionFailure(error), true, "401 must be recognised as a shared, credential-level failure");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("round 33 gate: a 503 stays a retryable outage, not a business refusal", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ Fault: {} }), { status: 503 });
+
+    try {
+        const error = await getQBPurchaseChangesSince(TOKENS, new Date("2026-07-22T12:00:00.000Z"))
+            .then(() => null, (e: unknown) => e as Error);
+        assert.ok(error);
+        assert.equal(error?.name, "QboRetryableError");
     } finally {
         globalThis.fetch = originalFetch;
     }

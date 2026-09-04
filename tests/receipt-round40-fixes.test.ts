@@ -315,6 +315,7 @@ test("a stale queued card is reported, a fresh one is not", () => {
     const input = {
         intuit: { status: "ok" as const, indicator: "none" },
         lastPurchaseSync: { status: "ok" as const, at: iso(2 * 3_600_000) },
+        purchaseSyncRun: { status: "ok" as const, at: iso(2 * 3_600_000), runStatus: "ok" as const },
         lastReceiptPush: { status: "ok" as const, at: iso(3 * 3_600_000) },
         lastPaymentsSync: { status: "ok" as const, at: iso(3_600_000) },
         receipts24h: { status: "ok" as const, counts: { created: 4 } },
@@ -327,6 +328,8 @@ test("a stale queued card is reported, a fresh one is not", () => {
         driveCredentials: { status: "ok" as const, configured: true, source: "company-settings" },
         chaser: { status: "ok" as const, phase: "done", completedAt: iso(3_600_000) },
         bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
+        // Required since the Phase 0/5 probes landed on main.
+        payLinksPending: { status: "ok" as const, count: 0 },
         now,
     } as unknown as Parameters<typeof evaluatePipelineHealth>[0];
 
@@ -360,6 +363,7 @@ test("the digest prints the queued-resend line", () => {
         intuit: { status: "ok", indicator: "none", description: "All Systems Operational" },
         qbo: {
             lastPurchaseSync: { status: "ok", at: "2026-09-03T10:00:00.000Z" },
+            purchaseSyncRun: { status: "ok", at: "2026-09-03T10:05:00.000Z", runStatus: "ok" },
             lastReceiptPush: { status: "ok", at: "2026-09-03T12:00:00.000Z" },
             lastPaymentsSync: { status: "ok", at: "2026-09-03T13:00:00.000Z" },
         },

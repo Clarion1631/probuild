@@ -19,8 +19,15 @@
  */
 import { matchCostCode } from "@/lib/project-match";
 import { receiptUrlRef } from "./receipt-url";
-import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
-import { startOfDateInTimeZone } from "@/lib/tz-date";
+import {
+    phaseConfidenceMin,
+    phaseSuggestionIsConfident,
+    QBO_ATTACHMENT_MAX_BYTES,
+} from "./intake-core";
+import { dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
+// The SAME per-Purchase advisory lock the QBO importer takes — shared, not
+// copied, so the two writers of one Purchase id cannot drift apart.
+import { lockQboExpense } from "@/lib/qbo-expense-sync";
 import {
     QBTimeoutError,
     remainingBudgetMs,
@@ -31,6 +38,8 @@ import {
     QboAccountConfigError,
     QboPurchaseFaultError,
     QboVendorDuplicateError,
+    // ONE vendor comparison for the whole pipeline — see normalizeVendorName.
+    normalizeVendorName,
     type CreateQBReceiptPurchaseInput,
     type CreateQBReceiptPurchaseResult,
     type QboReceiptGroup,
@@ -78,6 +87,12 @@ export interface BookableRow {
      * preservedTaxWarning in route-state.ts).
      */
     stateReason: string | null;
+    /**
+     * The durable dropped-tax-reading marker, written once by routing.
+     * `stateReason` cannot carry it: every deferred booking overwrites that
+     * column with its own reason. See preservedTaxWarning.
+     */
+    taxWarning?: string | null;
     /**
      * True once a QBO create has been ATTEMPTED for this row. It is the only
      * honest answer to "could a Purchase exist?", and it is what decides whether
@@ -171,6 +186,21 @@ export type BookResult =
     | { outcome: "retry"; attempts: number; nextRetryAt: Date; reason: string };
 
 /** Structural subset of PrismaClient this module uses. */
+/**
+ * The Expense a crash-gap retry can find already sitting under this Purchase
+ * id — and every field the receipt has an opinion about. Selecting only `id`
+ * (which is what this used to do) is what made the blind link possible.
+ */
+export interface ExistingExpense {
+    id: string;
+    estimateId: string;
+    amount: unknown;
+    vendor: string | null;
+    date: Date | null;
+    costCodeId: string | null;
+    receiptUrl: string | null;
+}
+
 export interface BookPrismaClient {
     /**
      * The receipt-evidence lock runs through here (round-42 gate, finding 1):
@@ -190,9 +220,12 @@ export interface BookPrismaClient {
         } | null>;
     };
     expense: {
-        findUnique(args: any): Promise<{ id: string } | null>;
+        findUnique(args: any): Promise<ExistingExpense | null>;
         create(args: any): Promise<{ id: string }>;
+        update(args: any): Promise<unknown>;
     };
+    /** For the shared per-qbPurchaseId advisory lock — see lockQboExpense. */
+    $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
     receiptIntake: {
         update(args: any): Promise<unknown>;
         updateMany(args: any): Promise<{ count: number }>;
@@ -616,12 +649,89 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         return retry(row, deps, now, `${ATTACHMENT_FAILED_PREFIX}${result.attachment}`, purchaseMayExist(sent));
     }
 
+    // WHEN THE PURCHASE WAS ALREADY IN THE BOOKS, THE BOOKS DECIDE.
+    //
+    // `alreadyExists` is not only the lost-response retry. It is also every
+    // v1-cutover document (the Apps Script posted the Purchase from its OWN
+    // read of the file) and every Drive revision that kept its fileId — and in
+    // both, QuickBooks may hold a total, a date, a vendor or a job that this
+    // pipeline's OCR pass does not agree with. Writing the Expense from the OCR
+    // read regardless left ProBuild's job cost carrying a number the books do
+    // not have, under a `qbPurchaseId` that says the two are the same document.
+    //
+    // The split is deliberate (see ExistingPurchaseCheck in qbo-receipt-push):
+    // amount/date/vendor are OCR noise on our side and QuickBooks is the booked
+    // truth for them; project and tax are ATTRIBUTION, so a mismatch parks with
+    // no Expense written at all. Nothing here rewrites QuickBooks either way —
+    // the Purchase is left exactly as it is.
+    //
+    // TOLERANCE IS FOR IDENTITY, NOT FOR VALUES — and conflating the two is the
+    // bug this block used to have.
+    //
+    // `compareExistingPurchase` allows a Purchase to differ by up to two cents
+    // on the amount or the tax, and to spell the vendor with different case and
+    // spacing, and still call it the SAME purchase. That tolerance exists so a
+    // rounding split or a capitalisation difference does not send a perfectly
+    // ordinary receipt to a human. It says nothing about which numbers to
+    // STORE. Adopting only on `derive` meant a verdict of `match` wrote the OCR
+    // total into job cost while QuickBooks held a figure one cent away, logged
+    // the OCR tax to the audit register as "what posted", and — on the
+    // importer-won crash gap — met the importer's QBO-sourced row at the exact
+    // comparison in reconcileExistingExpense and parked a receipt that was
+    // never wrong about anything.
+    //
+    // So: once the Purchase is IDENTIFIED, every value persisted or reported
+    // comes from what QuickBooks actually posted. `match` and `derive` adopt
+    // identically; only `differences` (the beyond-tolerance fields) is a
+    // reporting distinction.
+    let expenseTotalCents = row.totalCents;
+    let expenseCalendarDay = calendarDay;
+    let expenseVendor = row.vendor;
+    /** QBO's posted tax, in cents. Null until a Purchase is identified. */
+    let bookedTaxCents: number | null = null;
+    let derivedNote = "";
+    let derivedFields: string[] | undefined;
+    if (result.alreadyExists) {
+        const existing = result.existing;
+        if (existing.verdict === "review") {
+            // The key is RETAINED unconditionally: a Purchase provably exists.
+            return {
+                outcome: "needs-review",
+                reason: `${QBO_PURCHASE_MISMATCH_PREFIX}${existing.differences.join(",")}`,
+                releaseStrongKey: false,
+            };
+        }
+        // Both surviving verdicts mean "this is the same purchase". A null here
+        // is unreachable for `derive` (a field it names was readable by
+        // definition) and possible for `match` only if QBO omitted the ref's
+        // display name — in which case the OCR value is all there is.
+        const booked = existing.booked;
+        if (booked.totalAmount !== null) expenseTotalCents = Math.round(booked.totalAmount * 100);
+        if (booked.txnDate !== null) expenseCalendarDay = booked.txnDate;
+        if (booked.vendor !== null) expenseVendor = booked.vendor;
+        // Never null: a tax reading QBO did not give would have been `review`.
+        bookedTaxCents = Math.round(booked.taxAmount * 100);
+        if (existing.differences.length > 0) {
+            derivedFields = existing.differences;
+            derivedNote = ` · ${existing.differences.join(", ")} taken from the existing QuickBooks Purchase`;
+            console.warn(
+                "[receipt-intake] expense derived from the existing QBO Purchase",
+                JSON.stringify({ rowId: row.id, qbPurchaseId: result.qbPurchaseId, differences: existing.differences }),
+            );
+        }
+    }
+
     // 5. One transaction: the Expense and the row's BOOKED state land together
     //    or not at all. alreadyExists:true books the same way — that is the
     //    lost-response retry, and QBO's idempotency has already guaranteed
     //    there is exactly one Purchase.
-    const amountCents = expenseAmountCents(groups, row.totalCents);
-    const taxApplied = appliedTaxCents(groups);
+    const amountCents = expenseAmountCents(groups, expenseTotalCents);
+    // WHAT POSTED, and for an already-existing Purchase that is QBO's figure,
+    // not the one this pass built from the OCR read. `appliedTaxCents` reads
+    // back the groups WE were about to send; on the alreadyExists path those
+    // groups were never sent, so reporting them as "what posted" put a number
+    // in the sales-tax filing register that no Purchase ever carried.
+    const taxApplied = bookedTaxCents ?? appliedTaxCents(groups);
     // RE-VALIDATE THE PHASE AGAINST THE FINAL PROJECT.
     //
     // Both the captured code and the model's suggestion were resolved while the
@@ -667,10 +777,42 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // we could mint here (ten minutes later it is dead), and every reader
             // mints its own from this — see resolveReceiptUrl.
             : receiptUrlRef(row.storagePath);
+        // Hoisted: the reconcile compares against exactly what the create would
+        // have written, so the two must be the same expression.
+        const expenseDate = startOfDateInTimeZone(expenseCalendarDay, timeZone);
+
+        // ONE OBJECT, THREE WRITES.
+        //
+        // The Expense, the intake row's BOOKED update and the audit event all
+        // have to say the same thing about the same money. They were three
+        // separate expressions reaching for three different variables, and
+        // they drifted exactly where it mattered: the audit reported
+        // `row.vendor` (the OCR spelling) while the Expense carried QBO's, and
+        // the intake row kept the OCR tax while both of the others recorded
+        // what actually posted. Building it once makes agreement structural
+        // rather than something three call sites have to remember.
+        const booked = {
+            vendor: expenseVendor || "Unknown",
+            // The same instant `dateOnly` would produce for this calendar day —
+            // written from `expenseDate` rather than importing that helper,
+            // because it lives in worker.ts and worker.ts imports this file.
+            // `ReceiptIntake.txnDate` is `@db.Date`, so the day is what lands.
+            txnDate: expenseDate,
+            date: expenseDate,
+            totalCents: amountCents,
+            taxCents: taxApplied,
+        };
         const docRef = isCheck
             ? `Check #${(row.refNumber ?? "").replace(/^Check/, "") || "?"}${row.memo ? ` — "${row.memo}"` : ""}`
             : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
 
+        // The attribution the Expense ACTUALLY ends up carrying. Decided inside
+        // the transaction (only the reconcile knows whether the row already had
+        // a phase) and carried out here, because the audit event has to report
+        // what was persisted rather than what this pass proposed.
+        let effective: EffectiveAttribution = costCodeId
+            ? { costCodeId, costCodeSource: "receipt", preserved: false }
+            : { costCodeId: null, costCodeSource: "none", preserved: false };
         const expenseId = await deps.db.$transaction(async tx => {
             // The evidence lock, before anything is read or written here: this
             // transaction moves a row to BOOKED and attaches its Expense, which
@@ -683,14 +825,78 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // done has to be done here — a sweep certifying a cycle needs to
             // see that evidence moved under it.
             await bumpReceiptEvidenceEpoch(tx);
-            // THE FENCE COMES FIRST, and that ordering is the whole point.
+            // THE SAME LOCK THE QBO IMPORTER TAKES, before this Purchase id is
+            // read or written at all.
+            //
+            // `qbo-expense-sync` serializes every writer of one Purchase id on
+            // this key before it reads or writes the Expense. This path writes
+            // an Expense under the same key and was not taking it, so the
+            // importer could create the row in the gap between the lookup
+            // below and the link — and the two ended up disagreeing about the
+            // same money. Shared as a function, not a copied string.
+            //
+            // AFTER the evidence lock, never before: that one is the outermost
+            // (see receipt-evidence-lock.ts), so every transaction that needs
+            // both takes them in this order.
+            await lockQboExpense(tx, result.qbPurchaseId);
+
+            // A retry after a crash between the Purchase and this commit finds
+            // its own Expense here (qbPurchaseId is @unique) — create it twice
+            // and the insert would fail on that constraint anyway. It is ALSO
+            // where the importer's row turns up: QBO expense sync imports the
+            // Purchase on its own schedule, so a worker retry after a crash
+            // routinely finds an Expense that this receipt never wrote.
+            const existing = await tx.expense.findUnique({
+                where: { qbPurchaseId: result.qbPurchaseId },
+                select: {
+                    id: true, estimateId: true, amount: true, vendor: true,
+                    date: true, costCodeId: true, receiptUrl: true,
+                },
+            });
+            let fill: ReturnType<typeof reconcileExistingExpense>["fill"] | null = null;
+            if (existing) {
+                // NEVER a blind link. See reconcileExistingExpense.
+                // From the SAME `booked` object the writes use: the reconcile
+                // has to compare against the values that will actually be
+                // persisted, or it is judging a row against numbers nobody
+                // ever stores.
+                const verdict = reconcileExistingExpense(existing, {
+                    estimateId,
+                    amountCents: booked.totalCents,
+                    vendor: booked.vendor,
+                    date: booked.date,
+                    calendarDay: expenseCalendarDay,
+                    timeZone,
+                    costCodeId,
+                    receiptUrl,
+                });
+                if (verdict.conflicts.length > 0) {
+                    throw new ExpenseConflictError(verdict.conflicts);
+                }
+                effective = verdict.attribution;
+                // Fill what the importer could not know. `costCodeId` and
+                // `receiptUrl` are not in QboExpenseWrite at all, so a
+                // non-null value on an imported row can only have been put
+                // there by a person (or an earlier receipt) — which is why the
+                // rule is fill-when-null and never overwrite.
+                //
+                // Held until after the void fence below, so a row somebody
+                // voided mid-flight cannot leave its receipt on an Expense.
+                fill = Object.keys(verdict.fill).length > 0 ? verdict.fill : null;
+            }
+            // THE VOID FENCE, BEFORE ANY WRITE THIS TRANSACTION MAKES.
             //
             // It used to run after the Expense was created, which meant a void
             // landing during the QBO round trip still committed an Expense —
             // polluting job costs with a purchase somebody had explicitly
-            // cancelled. The intake CAS is now the transaction's first write,
-            // and the Expense is created ONLY if it succeeded, in the same
-            // transaction. Losing the CAS creates nothing.
+            // cancelled. The Expense (and the reconcile's fill) happen ONLY if
+            // this CAS succeeded, in the same transaction. Losing it writes
+            // nothing.
+            //
+            // It sits AFTER the reconcile READ above and before its write: a
+            // conflicting imported Expense must park the row for a human, and
+            // marking it BOOKED on the way to that verdict would be the very
+            // thing the conflict check exists to prevent.
             const claimed = await tx.receiptIntake.updateMany({
                 where: { id: row.id, state: "BOOKING" },
                 data: {
@@ -703,11 +909,33 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // This CAS *is* the BOOKED write (the void fence), so the
                     // preservation belongs here, not on the claim-confirm
                     // update below.
-                    stateReason: preservedTaxWarning(row.stateReason),
+                    stateReason: preservedTaxWarning(row),
                     qbPurchaseId: result.qbPurchaseId,
                     bookedAt: now,
                     lastError: null,
                     nextRetryAt: null,
+                    // THE BOOKED VALUES, PERSISTED — the same object the
+                    // Expense and the audit event are built from, on the same
+                    // write that says BOOKED.
+                    //
+                    // "QuickBooks is authoritative for an existing Purchase"
+                    // was only half true: booking DERIVED the total, vendor,
+                    // date and tax from QBO and wrote them to the Expense, but
+                    // left this row carrying the OCR read. So `taxCents` — the
+                    // column Phase 3's sales-tax reporting is specified to
+                    // read — kept a figure no Purchase ever posted, and the
+                    // row and its own Expense disagreed under a qbPurchaseId
+                    // asserting they are one document.
+                    //
+                    // BOOKED OVERWRITES THE EXTRACTED VALUES, deliberately.
+                    // There is no `extracted*` column pair on this model, and
+                    // none is needed: `readJson` holds the raw model response
+                    // verbatim and is never rewritten, so the OCR original
+                    // remains auditable after the row records what posted.
+                    vendor: booked.vendor,
+                    txnDate: booked.txnDate,
+                    totalCents: booked.totalCents,
+                    taxCents: booked.taxCents,
                 },
             });
             if (claimed.count === 0) {
@@ -732,20 +960,15 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 });
                 return null;
             }
-
-            // A retry after a crash between the Purchase and this commit finds
-            // its own Expense here (qbPurchaseId is @unique) — create it twice
-            // and the insert would fail on that constraint anyway.
-            const existing = await tx.expense.findUnique({
-                where: { qbPurchaseId: result.qbPurchaseId },
-                select: { id: true },
-            });
+            if (fill && existing) {
+                await tx.expense.update({ where: { id: existing.id }, data: fill });
+            }
             const expense = existing ?? await tx.expense.create({
                 data: {
                     estimateId,
                     costCodeId,
-                    amount: amountCents / 100,
-                    vendor: row.vendor || "Unknown",
+                    amount: booked.totalCents / 100,
+                    vendor: booked.vendor,
                     // RE-ANCHORED at write time. `txnDate` is a @db.Date column
                     // and round-trips as UTC midnight, so writing it straight
                     // into Expense.date (a full timestamp) records 5pm the
@@ -753,7 +976,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // report that bounds by local midnight then counts the
                     // expense in the wrong period. The intake row keeps the
                     // calendar day; this makes the instant match it.
-                    date: startOfDateInTimeZone(calendarDay, timeZone),
+                    date: booked.date,
                     // Booked with a qbPurchaseId already set — the Purchase is
                     // live in QuickBooks by the time this row commits, so this
                     // Expense is QBO-managed from birth, exactly like a QBO
@@ -774,6 +997,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                         `[Receipt intake] ${docRef}` +
                         phaseCheck.note +
                         (taxApplied > 0 ? ` · incl. $${(taxApplied / 100).toFixed(2)} sales tax` : "") +
+                        derivedNote +
                         ` · booked to QuickBooks`,
                 },
                 select: { id: true },
@@ -827,15 +1051,17 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             kind: "receipt-push",
             status: result.alreadyExists ? "already-exists" : "created",
             source: "intake-worker",
-            vendor: row.vendor ?? undefined,
+            // WHAT THE EXPENSE GOT, not what the read said. The audit used
+            // to report the OCR spelling while the Expense carried QBO's.
+            vendor: booked.vendor,
             projectName: project.name,
             docNumber: result.docNumber,
             fileName: row.fileName ?? undefined,
-            amountCents,
+            amountCents: booked.totalCents,
             // What POSTED, not what was requested — buildGroups rejects a tax
             // read on a check or when tax >= total, and the filing report has
             // to reconcile against the Purchase.
-            taxCents: taxApplied,
+            taxCents: booked.taxCents,
             detail: {
                 // `fileId` means a DRIVE file id — logAutomationEvent copies it
                 // into the typed `driveFileId` column, which the cutover reads
@@ -849,11 +1075,24 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 intakeId: row.id,
                 expenseId,
                 sourceRef: row.sourceRef,
-                costCodeId,
+                // THE PERSISTED value, not the one this pass picked. When a
+                // human's phase was already on the row it stands, and an audit
+                // row naming the worker's choice would assert a cost code that
+                // was never applied to anything.
+                costCodeId: effective.costCodeId,
+                costCodeSource: effective.costCodeSource,
+                // Explicit, so "the worker's pick lost" is greppable rather
+                // than something a reader has to infer from two ids.
+                phasePreserved: effective.preserved || undefined,
+                // Which fields (if any) this Expense took from the books rather
+                // than from the read. Absent on the normal path.
+                qboDerivedFields: derivedFields,
                 // Carried through so the Command Center can show HOW confident
                 // the phase pick was, and so a low-confidence run is auditable
-                // after the fact rather than only at review time.
-                suggestedConfidence: costCodeId && costCodeId === row.suggestedCostCodeId
+                // after the fact rather than only at review time. Against the
+                // EFFECTIVE code: a confidence score attached to a suggestion
+                // that was not the one persisted describes nothing.
+                suggestedConfidence: effective.costCodeId && effective.costCodeId === row.suggestedCostCodeId
                     ? row.suggestedConfidence
                     : undefined,
                 phaseRejected: phaseCheck.rejected || undefined,
@@ -870,6 +1109,20 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // A lost CAS is not a fault: the successor owns this row and will book
         // it. Say so rather than spending an attempt on it.
         if (error instanceof StaleClaimError) return { outcome: "stale" };
+        // The Expense already under this Purchase id says something different
+        // about the money. Retrying cannot resolve that — the next pass finds
+        // the same row and the same disagreement — so it goes to a person.
+        //
+        // The key is RETAINED: the Purchase provably exists (we either created
+        // it or the idempotency query found it), and releasing it would let a
+        // resubmission of the same receipt book a second one.
+        if (error instanceof ExpenseConflictError) {
+            return {
+                outcome: "needs-review",
+                reason: `${EXPENSE_CONFLICT_PREFIX}${error.fields.join(",")}`,
+                releaseStrongKey: false,
+            };
+        }
         // The Purchase EXISTS at this point. Retrying is correct and safe: the
         // DocNumber lookup will find it and return alreadyExists:true — and the
         // key must be RETAINED, which is why this attempt's send flag is passed
@@ -912,6 +1165,181 @@ function describe(error: unknown): string {
     return "UnknownError";
 }
 
+/**
+ * RECONCILE A RECEIPT AGAINST AN EXPENSE THAT IS ALREADY THERE.
+ *
+ * The row under this `qbPurchaseId` is not necessarily one we wrote. The
+ * expected case is a crash-gap race: the worker creates the QBO Purchase, dies
+ * before its commit, and QBO expense sync imports that Purchase before the
+ * retry comes round. The imported row is correct about the money (it came from
+ * the same Purchase) and knows nothing about this receipt — no cost code, no
+ * receiptUrl, because `QboExpenseWrite` carries neither column. Legacy rows,
+ * and rows a person has edited, can disagree about more.
+ *
+ * Blindly linking it — which is what selecting `{ id: true }` and taking the
+ * `existing ?? create` branch amounted to — marked the intake row BOOKED
+ * against a job-cost row that might name a different job, a different amount,
+ * or no phase at all, under an id that asserts the two are the same document.
+ *
+ * So the fields split by what a disagreement MEANS:
+ *
+ *   MONEY AND IDENTITY (estimate, amount, vendor, date) — the receipt and the
+ *   Expense are supposed to be two views of one Purchase, and by the time this
+ *   runs the receipt's own values have already been derived FROM QuickBooks
+ *   whenever the Purchase pre-existed (see the `alreadyExists` block above).
+ *   A populated field that still disagrees is a real contradiction about real
+ *   money, and nothing here can safely pick a winner: it parks for a human.
+ *   A NULL one (vendor and date are nullable) is missing attribution and is
+ *   filled from the receipt.
+ *
+ *   ATTRIBUTION (costCodeId, receiptUrl) — filled when null, never overwritten.
+ *   The importer cannot write either column, so a value there came from a
+ *   person or from an earlier receipt, and theirs is the answer that stands.
+ *   That IS the human-source predicate for this schema; there is no provenance
+ *   column to consult and no `notHumanCodedExpenseWhere` helper in this
+ *   codebase (checked: the name appears nowhere), so "the importer could not
+ *   have written this" is the honest test.
+ *
+ * Pure, so the whole truth table is a unit test rather than a race.
+ */
+export interface ReceiptExpenseValues {
+    estimateId: string;
+    amountCents: number;
+    vendor: string;
+    date: Date;
+    /** The company calendar day the receipt is filed under, e.g. "2026-09-01". */
+    calendarDay: string;
+    timeZone: string;
+    costCodeId: string | null;
+    receiptUrl: string;
+}
+
+/**
+ * What the Expense will ACTUALLY carry once this reconcile is applied.
+ *
+ * Returned rather than re-derived at the audit site, because the caller cannot
+ * work it out: the reconcile is the only thing that knows whether the row
+ * already had a phase. The booking event used to log the value the WORKER
+ * picked whatever happened, so a receipt whose phase was preserved from a
+ * human's earlier choice produced an audit row asserting a cost code that was
+ * never applied to anything.
+ */
+export interface EffectiveAttribution {
+    costCodeId: string | null;
+    /** Where the persisted value came from. */
+    costCodeSource: "receipt" | "existing" | "none";
+    /** True when a value already on the row displaced the one this pass chose. */
+    preserved: boolean;
+}
+
+export interface ExpenseReconcile {
+    conflicts: string[];
+    fill: Record<string, unknown>;
+    attribution: EffectiveAttribution;
+}
+
+export function reconcileExistingExpense(
+    existing: ExistingExpense,
+    receipt: ReceiptExpenseValues,
+): ExpenseReconcile {
+    const conflicts: string[] = [];
+    const fill: Record<string, unknown> = {};
+
+    if (existing.estimateId !== receipt.estimateId) conflicts.push("estimate");
+    if (Math.round(Number(existing.amount) * 100) !== receipt.amountCents) conflicts.push("amount");
+
+    // Nullable, so an absence is missing attribution rather than a contradiction.
+    //
+    // THE SAME NORMALIZER the identity check uses. Comparing byte-for-byte here
+    // while `compareExistingPurchase` compared case- and whitespace-insensitively
+    // meant QBO's canonical "Home Depot" and the receipt's "  home   depot "
+    // were one vendor to the check that decided these are the same purchase and
+    // two vendors to the check that decided whether to link them — so the
+    // importer-won crash gap parked a receipt nothing was wrong with. (The
+    // receipt's own vendor is now QBO's display name on that path anyway; this
+    // is what keeps the two answers consistent for every other path, and for a
+    // legacy row the importer never touched.)
+    if (!existing.vendor) fill.vendor = receipt.vendor;
+    else if (normalizeVendorName(existing.vendor) !== normalizeVendorName(receipt.vendor)) {
+        conflicts.push("vendor");
+    }
+
+    if (!existing.date) fill.date = receipt.date;
+    else if (!sameCalendarDay(existing.date, receipt)) conflicts.push("date");
+
+    // FILL-ONLY. Never a conflict: a phase somebody chose is an answer, not a
+    // contradiction about money, and overwriting it is the one outcome that
+    // loses information nobody can recover.
+    if (!existing.costCodeId && receipt.costCodeId) fill.costCodeId = receipt.costCodeId;
+    if (!existing.receiptUrl) fill.receiptUrl = receipt.receiptUrl;
+
+    return { conflicts, fill, attribution: effectiveAttribution(existing, receipt) };
+}
+
+function effectiveAttribution(
+    existing: ExistingExpense,
+    receipt: ReceiptExpenseValues,
+): EffectiveAttribution {
+    if (existing.costCodeId) {
+        return {
+            costCodeId: existing.costCodeId,
+            costCodeSource: "existing",
+            // Only a CONTEST counts as preserved: a receipt with no phase to
+            // offer, or one offering the same phase, displaced nothing.
+            preserved: !!receipt.costCodeId && receipt.costCodeId !== existing.costCodeId,
+        };
+    }
+    return receipt.costCodeId
+        ? { costCodeId: receipt.costCodeId, costCodeSource: "receipt", preserved: false }
+        : { costCodeId: null, costCodeSource: "none", preserved: false };
+}
+
+/**
+ * THE TWO WRITERS ANCHOR A CALENDAR DAY DIFFERENTLY, and comparing instants
+ * would call every imported row a conflict.
+ *
+ * `qbo-expense-sync` writes `new Date(`${txnDate}T00:00:00.000Z`)` — UTC
+ * midnight, a bare marker for the QBO calendar day. This file writes
+ * `startOfDateInTimeZone(day, timeZone)` — the company's local midnight, which
+ * is 07:00 or 08:00Z for Pacific. Both mean "the 3rd"; their `getTime()`s
+ * differ by hours.
+ *
+ * So the ANCHOR IS DETECTED rather than guessed at, and accepting "either
+ * reading matches" would be wrong: UTC midnight on the 4th reads as the 3rd in
+ * Pacific, so an off-by-one-day row would sail through. A value that is
+ * exactly UTC midnight is the importer's marker and means that UTC date;
+ * anything else is a real instant and means the day it falls on locally.
+ * (In a UTC company both readings coincide anyway.)
+ */
+function sameCalendarDay(stored: Date, receipt: ReceiptExpenseValues): boolean {
+    const isUtcMidnightMarker = stored.getTime() % 86_400_000 === 0;
+    const storedDay = isUtcMidnightMarker
+        ? stored.toISOString().slice(0, 10)
+        : dayKeyInTimeZone(stored, receipt.timeZone);
+    return storedDay === receipt.calendarDay;
+}
+
+/**
+ * The existing Expense contradicts this receipt about money or attribution.
+ *
+ * Terminal for the pass and the strong key is RETAINED: a Purchase provably
+ * exists in QuickBooks, so releasing the key would let a resubmission book it
+ * a second time. A person compares the two and decides.
+ */
+/**
+ * The park reason a reviewer sees, and the prefix the queue filters on.
+ * Distinct from QBO_PURCHASE_MISMATCH_PREFIX: that one is "QuickBooks and the
+ * read disagree", this one is "our own job-cost row and the read disagree".
+ */
+export const EXPENSE_CONFLICT_PREFIX = "expense-conflict:";
+
+class ExpenseConflictError extends Error {
+    constructor(readonly fields: string[]) {
+        super(`existing expense disagrees on ${fields.join(",")}`);
+        this.name = "ExpenseConflictError";
+    }
+}
+
 /** Thrown inside the commit transaction when the claim token no longer matches. */
 class StaleClaimError extends Error {
     constructor() {
@@ -922,6 +1350,18 @@ class StaleClaimError extends Error {
 
 /** Marks a retry as "the Purchase exists but its receipt did not attach". */
 export const ATTACHMENT_FAILED_PREFIX = "attachment-failed:";
+
+/**
+ * Marks a park as "QuickBooks already holds this Purchase and it does not say
+ * what this document says". Its own reason, not folded into `qbo-fault:`,
+ * because nothing is wrong with QuickBooks: the books and the read disagree
+ * about the job or the tax split, and only a human may choose between them.
+ *
+ * Deliberately NOT in RECOVERABLE_PARK_REASONS — a re-upload of the same bytes
+ * changes nothing, and dragging the row back would re-read it into the same
+ * disagreement.
+ */
+export const QBO_PURCHASE_MISMATCH_PREFIX = "qbo-purchase-mismatch:";
 
 /**
  * Is this attachment failure QBO refusing the file, rather than a blip?
@@ -948,8 +1388,29 @@ async function resolvePhase(
 ): Promise<{ costCodeId: string | null; note: string; rejected: string | null }> {
     // A human's explicit pick outranks the model's suggestion, but neither is
     // trusted without the project check.
-    const candidate = row.costCodeId ?? row.suggestedCostCodeId ?? null;
+    const explicit = row.costCodeId ?? null;
+    const candidate = explicit ?? row.suggestedCostCodeId ?? null;
     if (!candidate) return { costCodeId: null, note: "", rejected: null };
+
+    // THE CONFIDENCE THE PROMPT ASKS FOR IS NOW THE CONFIDENCE THAT DECIDES.
+    //
+    // read.ts tells the model a low number "sends the receipt to a human"; this
+    // is where that becomes true. Below the threshold (or with no number at
+    // all) the Expense books UNCODED and the suggestion is recorded as
+    // REJECTED — the same signal the wrong-job branch below raises, so it
+    // reaches the queue and the audit event through one path rather than two.
+    // Checked before the project round trip: a suggestion we will not apply is
+    // not worth a database call.
+    if (!explicit && !phaseSuggestionIsConfident(row.suggestedConfidence)) {
+        const stated = typeof row.suggestedConfidence === "number"
+            ? row.suggestedConfidence.toFixed(2)
+            : "none stated";
+        return {
+            costCodeId: null,
+            note: ` · phase suggestion withheld (confidence ${stated} < ${phaseConfidenceMin()}) — assign one`,
+            rejected: candidate,
+        };
+    }
 
     const allowed = await deps.isCostCodeAllowed(projectId, candidate);
     if (allowed) {

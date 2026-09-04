@@ -16,7 +16,15 @@
 import { Prisma } from "@prisma/client";
 import { canonicalVendor, dedupKeys } from "./keys";
 import { dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
-import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS, routeState, type DedupHits, type ReceiptIntakeState } from "./route-state";
+import {
+    backoffMs,
+    MAX_BOOK_ATTEMPTS,
+    NO_ARTIFACT_PARK_REASONS,
+    routeState,
+    TAX_IMPLAUSIBLE_REASON,
+    type DedupHits,
+    type ReceiptIntakeState,
+} from "./route-state";
 import { duplicateChainReason } from "./duplicate-guard";
 import {
     appliedTaxCents,
@@ -33,6 +41,7 @@ import {
 } from "@/lib/qbo-receipt-push";
 import { READ_BUDGET_MS, type ProjectPhase, type ReadOutcome } from "./read";
 import type { VerifiedBytes } from "./stored-object";
+import { STORAGE_TIMEOUT_MESSAGE } from "./bucket";
 
 /**
  * ONE global constant, deliberately not derived from anything per-row or
@@ -46,6 +55,73 @@ export const CLAIM_LOCK_KEY = "receipt-intake-worker";
 export const BATCH_SIZE = 10;
 /** How long a claimed row is hidden from the next run. */
 export const CLAIM_LEASE_MINUTES = 10;
+
+/**
+ * The states whose ONLY remaining step is a QuickBooks write.
+ *
+ * A row here has already been read, deduped and routed. Nothing else happens
+ * to it in a pass: READ waits to be promoted to BOOKING, and BOOKING waits to
+ * be booked. Both are exactly what the dry-run switch forbids.
+ */
+export const QBO_WRITING_STATES = ["READ", "BOOKING"] as const;
+
+/**
+ * ELIGIBILITY IS A FUNCTION OF THE CURRENT GLOBAL SWITCH, not of the row alone.
+ *
+ * `row.dryRun` is written once at intake and never re-read, so it cannot
+ * express a ROLLBACK: flip `RECEIPT_INTAKE_DRYRUN` back on and every row that
+ * was claimed while the switch was off keeps `dryRun:false`. The worker loop
+ * already refuses to book those (the switch outranks the flag), but refusing
+ * INSIDE the loop is not enough when the batch is ten rows and the order is
+ * oldest-first: a few hundred old live rows are claimed, skipped, claimed
+ * again five minutes later, and no NEW receipt is ever read. The queue looks
+ * busy and processes nothing — the same starvation the dry-run park exclusion
+ * was written to prevent, arriving through the other door.
+ *
+ * So while the global switch says dry-run, a QBO-writing state is not
+ * claimable at all, whatever the row's own flag says. RECEIVED rows still are:
+ * reading and routing is precisely what the shadow week is for.
+ */
+export function claimableStates(dryRunGlobal: boolean): ReceiptIntakeState[] {
+    return dryRunGlobal ? ["RECEIVED"] : ["RECEIVED", ...QBO_WRITING_STATES];
+}
+
+/**
+ * The claim's whole eligibility predicate, in ONE place.
+ *
+ * Exported (rather than living inline in the cron route) so both the pure
+ * worker tests and the real-Postgres claim test assert against the same
+ * object the route actually claims with. A second copy of this predicate is
+ * how the loop and the claim came to disagree in the first place.
+ *
+ * STAGING is absent on purpose: the row exists but its object does not, so
+ * claiming it would park a good receipt as "file-missing". sweepStaleStaging
+ * is what watches those.
+ */
+export function eligibleClaimWhere(now: Date, dryRunGlobal: boolean): Prisma.ReceiptIntakeWhereInput {
+    return {
+        state: { in: claimableStates(dryRunGlobal) },
+        OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+        /**
+         * A row parked by the shadow week (dryRun=true, sitting at READ or
+         * BOOKING) is DONE until the cutover, and must be excluded rather than
+         * merely skipped inside the loop — for the same batch-starvation
+         * reason as above. runIntakeWorker's cutover is what brings them back,
+         * once, on the first live pass. Redundant while `dryRunGlobal` is true
+         * (those states are already off the list) and load-bearing when it is
+         * false.
+         */
+        NOT: { AND: [{ dryRun: true }, { state: { in: [...QBO_WRITING_STATES] } }] },
+    };
+}
+
+/**
+ * How long a row skipped by the global dry-run switch waits before it is
+ * looked at again. Same hour as book.ts's "a switch is off" deferral: nothing
+ * is wrong with the document, and hammering it every five minutes only costs
+ * batch slots that new receipts need.
+ */
+export const DRYRUN_PARK_RETRY_MS = 60 * 60_000;
 /**
  * Stop taking on NEW rows once this much of the 60s function budget is gone.
  * One 25s read plus a QBO round trip can straddle the ceiling, and a row cut
@@ -141,8 +217,55 @@ export function uploadLeaseActive(
     row: { uploadUrlExpiresAt?: Date | null; createdAt: Date },
     now: Date = new Date(),
 ): boolean {
-    if (row.uploadUrlExpiresAt) return row.uploadUrlExpiresAt.getTime() > now.getTime();
-    return row.createdAt.getTime() > now.getTime() - STAGING_SWEEP_MINUTES * 60_000;
+    return leaseDeadline(row).getTime() > now.getTime();
+}
+
+/**
+ * The instant this row's upload capability dies. `uploadLeaseActive` is
+ * literally "is that instant still ahead of us", so the two can never
+ * disagree about a row.
+ */
+function leaseDeadline(row: { uploadUrlExpiresAt?: Date | null; createdAt: Date }): Date {
+    if (row.uploadUrlExpiresAt) return row.uploadUrlExpiresAt;
+    return new Date(row.createdAt.getTime() + STAGING_SWEEP_MINUTES * 60_000);
+}
+
+/**
+ * How long after a signed upload URL expires an object it could still have
+ * written may be deleted.
+ *
+ * A PUT that started one millisecond before the expiry is still in flight
+ * after it — Supabase validates the token when the request arrives, not when
+ * it completes — so deleting at the expiry itself can still race a write that
+ * was authorised. Five minutes is comfortably longer than an 8 MB upload.
+ */
+export const CLEANUP_GRACE_MS = 5 * 60_000;
+
+/**
+ * WHEN AN OBJECT AT THIS ROW'S PATH MAY BE DELETED — null meaning "now".
+ *
+ * A signed upload URL is a WRITE CAPABILITY, and it does not stop working
+ * because the row that requested it was rejected, published elsewhere, or
+ * re-pathed. Deleting the object while the URL is live only opens a window:
+ * the holder's delayed PUT recreates it (the URL is `upsert`-capable on the
+ * resume path), and nothing then references it, nothing remembers it, and no
+ * sweep is looking for it. The delete has to happen AFTER the capability
+ * dies, not before.
+ *
+ * This is the exact inverse of `uploadLeaseActive` — the same rule the
+ * stale-STAGING sweep already applies before it parks or rejects anything —
+ * so rejected-row cleanup and the sweep agree by construction rather than by
+ * two authors remembering the same thing.
+ *
+ * Null when the capability is ALREADY dead: there is nothing left to wait for
+ * and an immediate delete is correct.
+ */
+export function cleanupNotBefore(
+    row: { uploadUrlExpiresAt?: Date | null; createdAt: Date },
+    now: Date = new Date(),
+): Date | null {
+    if (!uploadLeaseActive(row, now)) return null;
+    return new Date(leaseDeadline(row).getTime() + CLEANUP_GRACE_MS);
 }
 /**
  * Consecutive AI-unavailable passes before a row is parked for a human. Ported
@@ -182,6 +305,12 @@ export interface WorkerDependencies {
      * backlog and both un-park it, and the second one's UPDATE would race the
      * first one's claim.
      */
+    /**
+     * Take the whole-invocation lease, or null when another invocation holds a
+     * live one. Injected so the overlap rule is a unit test rather than a
+     * property only a production race could ever demonstrate.
+     */
+    acquireLease: () => Promise<{ release: () => Promise<void> } | null>;
     claim: (opts: CutoverRequest) => Promise<ClaimResult | null>;
     /** RECEIPT_INTAKE_DRYRUN is not "false". Injected so the cutover is testable. */
     isDryRunEnabled: () => boolean;
@@ -298,6 +427,39 @@ export interface WorkerDependencies {
     applyBookResult: (rowId: string, result: BookResult, claimToken: string | null) => Promise<void>;
     /** AI unavailable: park for a later pass WITHOUT spending an attempt. */
     deferRead: (rowId: string, busyPasses: number, reason: string, ownership: Ownership) => Promise<boolean>;
+    /**
+     * HAND THE ROW BACK, unchanged except for when to look at it again.
+     *
+     * A claim is what makes a row invisible to the next pass, so any path that
+     * finishes with a row WITHOUT completing, deferring or parking it still has
+     * to release ownership — otherwise the row is owned by a pass that has
+     * ended, every fenced write misses it, and it sits until its lease lapses.
+     * Used by the dry-run skip: nothing about the document is wrong, so it
+     * costs no `attempts` and changes no state; it just stops occupying a batch
+     * slot that a new receipt needs.
+     */
+    releaseClaim: (rowId: string, nextRetryAt: Date, ownership: Ownership) => Promise<boolean>;
+    /**
+     * HAND BACK EVERY ROW THIS PASS CLAIMED AND NEVER LOOKED AT.
+     *
+     * The claim takes BATCH_SIZE rows in one transaction and stamps them all
+     * with a lease (`nextRetryAt = now + LEASE_MS`, ten minutes). The loop then
+     * stops at the soft deadline — and the rows it never reached kept that
+     * lease AND their claim token, so the next cron five minutes later could
+     * not see them at all: `eligibleClaimWhere` skips a row whose `nextRetryAt`
+     * is in the future, and every fenced write misses a token no live pass
+     * holds. A batch that deadlocked on its first row sat idle for the rest of
+     * the ten minutes with nine untouched receipts behind it.
+     *
+     * Token-fenced, like every other write here: a row whose token changed is
+     * owned by somebody else now and must not be handed back by this pass.
+     * `nextRetryAt` is cleared rather than set, so the next pass sees them as
+     * due immediately — they were never worked on, so there is nothing to
+     * back off from.
+     *
+     * Returns how many rows were actually released.
+     */
+    releaseUnprocessed: (rows: { id: string; claimToken: string | null }[]) => Promise<number>;
     /** A transient fault anywhere else: spend an attempt and back off. */
     retryRow: (
         rowId: string,
@@ -317,7 +479,13 @@ export interface WorkerDependencies {
      * cannot express that, because the zombie and the live worker hold
      * identical row ids.
      */
-    finishRouting: (rowId: string, claimToken: string | null, stateReason: string | null) => Promise<void>;
+    finishRouting: (
+        rowId: string,
+        claimToken: string | null,
+        stateReason: string | null,
+        /** The durable tax marker. READ is reached with no patch of its own. */
+        taxWarning: string | null,
+    ) => Promise<void>;
     now: () => Date;
     /** Elapsed-time source for the soft deadline. */
     monotonicMs: () => number;
@@ -348,6 +516,12 @@ export interface StrongOwner {
 export interface ReadPatch {
     state: ReceiptIntakeState;
     stateReason: string | null;
+    /**
+     * The dropped-tax-reading marker, in its DURABLE column. `stateReason`
+     * carries a copy for the queue to display, but every deferred booking
+     * and every park overwrites that column -- see preservedTaxWarning.
+     */
+    taxWarning: string | null;
     vendor: string | null;
     txnDate: Date | null;
     totalCents: number | null;
@@ -367,15 +541,34 @@ export interface ReadPatch {
 export interface WorkerRunSummary {
     processed: number;
     byState: Record<string, number>;
-    skipped?: "already-running";
-    /** Rows left unprocessed because the soft deadline hit. They keep their lease. */
+    /**
+     * "lease-held": another invocation is mid-pass, so this one did nothing.
+     * "already-running": the claim's own advisory lock was taken — only
+     * reachable when a lease has expired under a still-running pass.
+     */
+    skipped?: "already-running" | "lease-held";
+    /** Rows left unprocessed because the soft deadline hit. */
     deferredToNextRun?: number;
+    /**
+     * How many of those `deferredToNextRun` rows were successfully handed back.
+     * A shortfall means some rows stayed claimed — either a successor had
+     * already taken them, or the release write failed — and those wait out
+     * their lease.
+     */
+    releasedUnprocessed?: number;
     /** Rows v1 already booked, retired as SHADOW_DONE by the first live pass. */
     shadowRetired?: number;
     /** Rows received AFTER v1 stopped: nobody booked these, so they are handed to v2. */
     requeued?: number;
     /** Held for a human: no v1 evidence AND no Drive identity to make v2 idempotent. */
     shadowQuarantined?: number;
+    /**
+     * Cutover rows whose fenced write matched nothing: they changed between the
+     * select that triaged them and the update that would have moved them, so
+     * the verdict was DROPPED rather than applied to a row it was not computed
+     * for. They come back round on the next pass.
+     */
+    shadowSkippedMoved?: number;
     /** The cutover could not run because no boundary is recorded. */
     cutoverBlocked?: "cutover-boundary-missing";
     /** STAGING rows whose upload never landed, parked for a human. */
@@ -466,13 +659,20 @@ export function toDateStr(date: Date): string {
 
 /** One pass. Never throws for a single bad row — one poison document must not stall the queue. */
 export interface CutoverRequest {
-    /** Run the cutover this pass (i.e. dry-run is off). */
-    run: boolean;
+    /**
+     * The CURRENT global switch, read ONCE per pass and handed down.
+     *
+     * ONE field, not a `run` flag beside it: the cutover runs exactly when the
+     * pass is live, and claim eligibility depends on the very same answer. Two
+     * fields that must always be each other's negation is how they drift, and
+     * a claim that disagreed with the loop about the switch is finding #1.
+     */
+    dryRunGlobal: boolean;
     /**
      * The instant v1 stopped booking. Only rows received before it are even
      * CANDIDATES for retirement — and each still needs its own evidence that v1
-     * booked it. Never null when `run` is true: the pass halts before claiming
-     * rather than proceed without it.
+     * booked it. Never null when `dryRunGlobal` is false: the pass halts before
+     * claiming rather than proceed without it.
      */
     boundary: Date | null;
 }
@@ -483,9 +683,35 @@ export interface ClaimResult {
     requeued: number;
     /** Pre-boundary, no evidence, and no Drive identity — a human decides. */
     shadowQuarantined: number;
+    /** Rows that moved under the triage, so no cutover verdict was applied. */
+    shadowSkippedMoved: number;
 }
 
 export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerRunSummary> {
+    // MUTUAL EXCLUSION FOR THE WHOLE PASS, taken before anything is read,
+    // claimed or booked.
+    //
+    // The claim transaction's advisory lock is transaction scoped: it is gone
+    // the moment that transaction commits, which is BEFORE the first Gemini
+    // read and long before any QuickBooks write. So it never made the worker
+    // non-overlapping — it only made the claim itself atomic. A second
+    // invocation could (and, at five-minute cron spacing against 60-second
+    // passes, eventually would) claim a different batch and run alongside.
+    // This lease is what the "one worker at a time" property actually rests
+    // on; the per-row claim token is the layer under it that keeps an overlap
+    // harmless rather than merely unlikely.
+    const lease = await deps.acquireLease();
+    if (!lease) return { processed: 0, byState: {}, skipped: "lease-held" };
+    try {
+        return await runIntakePass(deps);
+    } finally {
+        // In a `finally`, so a throw out of the pass releases it too. Without
+        // that, one crash wedges the queue for a whole lease TTL.
+        await lease.release();
+    }
+}
+
+async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary> {
     // THE DEADLINE STARTS HERE, at invocation entry — not after the claim and
     // the sweep. The sweep downloads objects, so timing it out of the budget
     // meant it could consume the whole platform timeout and the worker would
@@ -507,7 +733,14 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
     // those receipts are silently dropped. Nothing in the database can infer
     // that instant, so with no boundary recorded the pass refuses to touch
     // either side and says so.
-    const runCutover = !deps.isDryRunEnabled();
+    //
+    // READ ONCE, USE EVERYWHERE. The switch decides three things in this pass —
+    // whether the cutover runs, which states are even claimable, and whether a
+    // claimed row may book — and they have to be the same answer. Calling
+    // isDryRunEnabled() separately at each of those points is what let the
+    // claim hand out rows the loop then refused, forever.
+    const dryRunGlobal = deps.isDryRunEnabled();
+    const runCutover = !dryRunGlobal;
     const boundary = runCutover ? await deps.cutoverBoundary() : null;
 
     // HALT THE WHOLE PASS, before anything is claimed.
@@ -523,11 +756,11 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
         return { processed: 0, byState: {}, cutoverBlocked: "cutover-boundary-missing" };
     }
 
-    const claimed = await deps.claim({ run: runCutover, boundary });
+    const claimed = await deps.claim({ dryRunGlobal, boundary });
     if (claimed === null) {
         return { processed: 0, byState: {}, skipped: "already-running" };
     }
-    const { rows, shadowRetired, requeued, shadowQuarantined } = claimed;
+    const { rows, shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved } = claimed;
 
     // Rows whose upload never landed are invisible to the claim by design, so
     // this is the only thing that will ever notice them.
@@ -544,13 +777,31 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
     for (const row of rows) {
         // A row started at 41s can still be reading at 66s, past the function
         // ceiling — the invocation dies mid-book and the row's state is
-        // whatever it happened to be. Stop TAKING rows instead; the claim
-        // lease already keeps them ours, and the next run picks them up.
+        // whatever it happened to be. Stop TAKING rows instead, and RELEASE the
+        // ones we never reached (below): keeping them would leave rows this
+        // pass never looked at holding a ten-minute lease under a token nobody
+        // owns, invisible to the next cron five minutes later.
         if (outOfTime()) {
             deferredToNextRun = rows.length - processed;
             break;
         }
         processed++;
+        // THE ROW AS THE DATABASE NOW HOLDS IT, not as the claim handed it over.
+        //
+        // Every recovery write below (retryRow, applyState, releaseClaim) is
+        // CAS'd on `ownershipOf(...)`, i.e. on {state, claimToken}. The loop
+        // MOVES the state mid-row — READ -> BOOKING, committed by
+        // promoteToBooking — so a throw after that promotion was handed the
+        // ORIGINAL row and its CAS pinned state "READ", which no longer
+        // existed. It matched zero rows, `retryRow` reported false, the error
+        // was bumped as STALE, and `attempts` never moved: a persistent
+        // pre-send failure (a QBO auth outage, a poisoned vendor lookup)
+        // cycled the same row forever, never backing off and never reaching
+        // the max-retries park that exists to put it in front of a person.
+        //
+        // So the promotion's result is carried forward, and it is THIS value
+        // every error path is given.
+        let current = row;
         try {
             if (row.state === "RECEIVED") {
                 bump(await processReceived(row, deps));
@@ -562,8 +813,14 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                 // never rechecked, so a row claimed while RECEIPT_INTAKE_DRYRUN
                 // was off keeps dryRun=false even after the switch is reverted
                 // to stop live QBO writes.
-                const live = !row.dryRun && !deps.isDryRunEnabled();
-                if (!live) { bump("READ"); continue; }
+                //
+                // `dryRunGlobal` is this pass's ONE reading of the switch, the
+                // same one the claim used, so a row can no longer be handed out
+                // as claimable and then refused here. Belt and braces all the
+                // same — and the release is what makes the belt safe: a skip
+                // that kept the claim left the row owned by a finished pass.
+                const live = !row.dryRun && !dryRunGlobal;
+                if (!live) { bump(await parkForDryRun(row, deps)); continue; }
                 const promotion = await deps.promoteToBooking(row.id, row.dedupWeakKey, row.claimToken);
                 if (promotion.stale) {
                     // Superseded between the claim and the promotion. The
@@ -581,30 +838,75 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                     bump("NEEDS_REVIEW");
                     continue;
                 }
-                const result = await deps.book({ ...row, dryRun: false });
-                await deps.applyBookResult(row.id, result, row.claimToken);
+                // THE PROMOTION COMMITTED, so the row's state is BOOKING from
+                // here on and every CAS below must pin that, not the claimed
+                // "READ". The claim token is unchanged — promoteToBooking is
+                // fenced on it and does not reissue it — so the rest of the
+                // ownership tuple still holds.
+                current = { ...row, state: "BOOKING", dryRun: false };
+                const result = await deps.book(current);
+                await deps.applyBookResult(current.id, result, current.claimToken);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
-                if (row.dryRun || deps.isDryRunEnabled()) { bump("BOOKING"); continue; }
+                if (row.dryRun || dryRunGlobal) { bump(await parkForDryRun(row, deps)); continue; }
                 const result = await deps.book(row);
                 await deps.applyBookResult(row.id, result, row.claimToken);
                 bump(stateForBookResult(result));
             }
         } catch (error) {
-            bump(await handleRowError(row, deps, error));
+            bump(await handleRowError(current, deps, error));
         }
+    }
+
+    // THE ROWS THE DEADLINE CUT OFF ARE HANDED BACK, not left leased.
+    //
+    // `processed` is incremented BEFORE a row is worked on, so `rows.slice`
+    // from it is exactly the set nothing was ever attempted against — a row
+    // that threw is `processed` and was already routed through handleRowError,
+    // which releases it. Best-effort: a release that fails leaves the row
+    // exactly as the old code did, waiting out its lease, which is strictly no
+    // worse than not trying.
+    let releasedUnprocessed = 0;
+    if (deferredToNextRun > 0) {
+        releasedUnprocessed = await deps
+            .releaseUnprocessed(rows.slice(processed).map(r => ({ id: r.id, claimToken: r.claimToken })))
+            .catch(() => 0);
     }
 
     return {
         processed,
         byState,
         ...(deferredToNextRun ? { deferredToNextRun } : {}),
+        ...(releasedUnprocessed ? { releasedUnprocessed } : {}),
         ...(shadowRetired ? { shadowRetired } : {}),
         ...(requeued ? { requeued } : {}),
         ...(shadowQuarantined ? { shadowQuarantined } : {}),
+        ...(shadowSkippedMoved ? { shadowSkippedMoved } : {}),
         ...(staged ? { staleStagingSwept: staged } : {}),
         ...(cleaned ? { orphansCleaned: cleaned } : {}),
     };
+}
+
+/**
+ * A row the dry-run switch will not let this pass advance.
+ *
+ * It keeps its state — nothing about it is decided, and the moment the switch
+ * goes live again it is claimable and bookable exactly as it was. What it does
+ * NOT keep is the claim: a skipped row that stayed owned by a finished pass is
+ * invisible to every fenced write until its lease lapses, and (before the
+ * eligibility fix above) came straight back into the next batch to be skipped
+ * again, crowding out the new receipts the shadow week exists to read.
+ *
+ * A release that FAILS means the row was already taken from us — report STALE
+ * rather than pretending the pass parked it.
+ */
+async function parkForDryRun(row: WorkerRow, deps: WorkerDependencies): Promise<string> {
+    const released = await deps.releaseClaim(
+        row.id,
+        new Date(deps.now().getTime() + DRYRUN_PARK_RETRY_MS),
+        ownershipOf(row),
+    ).catch(() => false);
+    return released ? row.state : "STALE";
 }
 
 /**
@@ -720,7 +1022,15 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         if (download.kind === "sha-mismatch") {
             return parkTerminal(row, deps, NO_ARTIFACT_PARK_REASONS.contentChanged);
         }
-        return retryTransient(row, deps, `storage:${download.message}`);
+        // A TIMEOUT is tagged apart from every other transient storage fault,
+        // because only this one is self-inflicted enough to bound separately.
+        return retryTransient(
+            row,
+            deps,
+            download.message?.startsWith(STORAGE_TIMEOUT_MESSAGE)
+                ? `${STORAGE_TIMEOUT_PREFIX}1`
+                : `storage:${download.message}`,
+        );
     }
     const bytes = download.bytes;
 
@@ -786,6 +1096,11 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     const taxImplausible = tax.implausible || (tax.taxCents !== null && taxCents === null);
 
     const base = {
+        // WRITTEN ONCE, HERE, and never touched again. The copy `note()`
+        // appends to `stateReason` is for the queue to show; this is the
+        // one the BOOKED transition reads, because stateReason is
+        // overwritten by every deferred booking and every park.
+        taxWarning: taxImplausible ? TAX_IMPLAUSIBLE_REASON : null,
         vendor: read.vendor || null,
         txnDate: dateOnly(keys.dateStr, timeZone),
         totalCents,
@@ -804,7 +1119,34 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
 
     // Re-read RIGHT BEFORE routing. Everything above — the download, a 25s
     // model call — is time in which a late job assignment can have landed.
-    const projectId = await deps.refreshProjectId(row.id).catch(() => row.projectId);
+    //
+    // A FAILED RE-READ IS NOT AN ANSWER ABOUT THE JOB.
+    //
+    // Swallowing the throw and falling back to the CLAIMED snapshot turned a
+    // pool timeout into a routing decision: the snapshot is by definition the
+    // row as it looked BEFORE the read, so when it carried no project and a
+    // person assigned one during those seconds, the fallback parked a receipt
+    // NEEDS_JOB for a job it already had. The person sees their own assignment
+    // ignored, and the row waits for a human that nothing will summon.
+    //
+    // So the two cases are split by what the fallback would actually assert:
+    //   - snapshot has NO project: the fallback claims "still unassigned",
+    //     which is exactly the fact the failed call was supposed to establish.
+    //     Transient — normal backoff, attempt spent, claim handed back.
+    //   - snapshot HAS a project: the fallback claims "this job", which the
+    //     row itself already recorded and which a late assignment can only
+    //     have refined, never removed (the column is SetNull on delete, and a
+    //     deleted project is not a reason to re-read Gemini). The routing gate
+    //     only asks whether a job exists at all, so the stale answer and the
+    //     fresh one agree. It may stand.
+    const refreshed = await deps.refreshProjectId(row.id).then(
+        value => ({ ok: true, value } as const),
+        () => ({ ok: false, value: null } as const),
+    );
+    if (!refreshed.ok && !row.projectId) {
+        return retryTransient(row, deps, "project-refresh-unavailable");
+    }
+    const projectId = refreshed.ok ? refreshed.value : row.projectId;
     const hasProject = !!projectId;
 
     const routeInput = {
@@ -925,7 +1267,12 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
 
     // Routing is complete. This is the ONLY path to READ, and the only place
     // the claim lease is released.
-    await deps.finishRouting(row.id, row.claimToken, note(null));
+    await deps.finishRouting(
+        row.id,
+        row.claimToken,
+        note(null),
+        taxImplausible ? TAX_IMPLAUSIBLE_REASON : null,
+    );
     return "READ";
 }
 
@@ -969,12 +1316,56 @@ export function ownershipOf(row: WorkerRow): Ownership {
 }
 
 /** A transport-class fault during a row's processing: spend an attempt, back off. */
+/**
+ * How many storage calls in a row may time out on ONE object before it stops
+ * heading the queue.
+ *
+ * A hung object is not a transient fault after the third go: it is a document
+ * that costs the pass its whole storage budget every time it is claimed, and
+ * because the claim is oldest-first it is claimed FIRST every time. Three is
+ * enough to ride out a Supabase blip and few enough that a genuinely stuck
+ * object stops crowding out the receipts behind it.
+ */
+export const MAX_STORAGE_TIMEOUTS = 3;
+
+/** The marker `lastError` carries so the run length survives between passes. */
+export const STORAGE_TIMEOUT_PREFIX = "storage-timeout:";
+
+/**
+ * How many CONSECUTIVE storage timeouts this row has now seen.
+ *
+ * The count lives in `lastError` rather than in a column of its own: it is a
+ * property of an unbroken run, it needs no migration, and `lastError` is
+ * already the column that records why the last pass gave up. Any other failure
+ * writes a different reason there, which is exactly what resets the run — so
+ * "consecutive" is enforced by the storage of the counter rather than by
+ * remembering to clear it.
+ */
+export function storageTimeoutRun(lastError: string | null | undefined): number {
+    const match = /^storage-timeout:(\d+)\b/.exec(lastError ?? "");
+    return match ? Number(match[1]) : 0;
+}
+
+/** A transport-class fault during a row's processing: spend an attempt, back off. */
 async function retryTransient(row: WorkerRow, deps: WorkerDependencies, reason: string): Promise<string> {
     const attempts = row.attempts + 1;
     if (attempts >= MAX_BOOK_ATTEMPTS) {
         // Through parkTerminal like every other terminal park, so the
         // strong-key release is decided in exactly one place.
         return parkTerminal(row, deps, "max-retries");
+    }
+    // A STALLED OBJECT STOPS HEADING THE QUEUE.
+    //
+    // Every other transient fault is worth twenty attempts because it costs
+    // almost nothing to retry. A storage timeout is different: it burns the
+    // pass's whole storage budget, and the claim is oldest-first, so the same
+    // object hangs the next run and the one after that. Bounded separately,
+    // and parked with its own reason so a human sees WHY rather than a generic
+    // "max-retries" twenty passes later.
+    if (reason.startsWith(STORAGE_TIMEOUT_PREFIX)) {
+        const run = storageTimeoutRun(row.lastError) + 1;
+        if (run >= MAX_STORAGE_TIMEOUTS) return parkTerminal(row, deps, "storage-timeout");
+        reason = `${STORAGE_TIMEOUT_PREFIX}${run}`;
     }
     const owned = await deps.retryRow(
         row.id,

@@ -4,14 +4,26 @@ import { isCronAuthorized } from "@/lib/cron-auth";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
+import { acquireCronLease } from "@/lib/cron-lease";
 import { logAutomationEvent } from "@/lib/automation-events";
-import { downloadVerified, inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
+import {
+    downloadVerified,
+    inspectStoredObject,
+    // THE one builder for a lease-bearing CAS. See leaseFence.
+    leaseFence,
+    sealAndPublish,
+} from "@/lib/receipt-intake/stored-object";
 import {
     deleteObjectOrRecord,
+    queueObjectCleanup,
+    claimObjectPath,
+    resolveCanonicalIntent,
     rejectRowAndQueueCleanup,
+    liveSweepDepsFor,
     retryPendingCleanups,
     sealObject,
     settleQueuedCleanup,
+    inShortTx,
 } from "@/lib/receipt-intake/storage-cleanup";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
@@ -21,8 +33,9 @@ import { duplicateChainReason, withEvidenceAndChainLocks } from "@/lib/receipt-i
 import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import {
+    applyCutoverVerdict,
     driveFileIdOf,
-    triageCutoverRows, resolveCutoverBoundary } from "@/lib/receipt-intake/cutover";
+    triageCutoverRows, resolveCutoverBoundary, type CutoverRow } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -32,11 +45,13 @@ import {
     BATCH_SIZE,
     CLAIM_LEASE_MINUTES,
     CLAIM_LOCK_KEY,
+    cleanupNotBefore,
     RUN_HARD_BUDGET_MS,
     STAGING_SWEEP_BATCH,
     STAGING_SWEEP_MINUTES,
     type ClaimResult,
     type CutoverRequest,
+    eligibleClaimWhere,
     isUniqueViolation,
     readBudgetFor,
     runIntakeWorker,
@@ -70,15 +85,28 @@ export const maxDuration = 60;
  * Every 5 minutes: claim at most 10 due rows, read/dedup/route the new ones,
  * and book the ones that are cleared to book.
  *
- * OVERLAP SAFETY. pgbouncer forbids SESSION advisory locks (a pooled
- * connection is not the same connection twice — see review-alert-rollout.ts:8),
- * so the claim runs `pg_try_advisory_xact_lock` inside ONE SHORT transaction
- * and the work happens outside it. Two defences behind that, because a lock is
- * not a correctness argument on its own:
- *   - the claim bumps every taken row's `nextRetryAt`, so even interleaved runs
- *     never hand the same row to two workers, and
- *   - QBO's DocNumber/requestid idempotency means a double booking creates one
- *     Purchase, not two.
+ * OVERLAP SAFETY, in three layers — and it is worth being exact about what
+ * each one actually buys, because the first two were once described as though
+ * they did the third one's job:
+ *
+ *   1. A DURABLE INVOCATION LEASE (lib/cron-lease.ts), taken before anything is
+ *      read, claimed or booked and released in a `finally`. THIS is what makes
+ *      the worker non-overlapping. Its TTL outlives `maxDuration`, so the
+ *      platform kills a pass before its lease can lapse.
+ *   2. `pg_try_advisory_xact_lock` around the CLAIM TRANSACTION. It is
+ *      transaction scoped and is gone the moment that transaction commits — it
+ *      makes the cutover triage and the claim atomic with respect to each
+ *      other, and NOTHING about the Gemini read and QuickBooks write that
+ *      follow. It is retained because a lease that expires under a still-live
+ *      pass (or a stray manual invocation) must still not corrupt a claim.
+ *   3. Per-row ownership. The claim bumps every taken row's `nextRetryAt` and
+ *      stamps a `claimToken` that every completing write is fenced on, so even
+ *      two interleaved passes never hand the same row to two workers — and
+ *      QBO's DocNumber/requestid idempotency means a double booking creates
+ *      one Purchase, not two.
+ *
+ * pgbouncer is why (2) cannot simply be a SESSION advisory lock: a pooled
+ * connection is not the same connection twice (see review-alert-rollout.ts:8).
  *
  * Auth is isCronAuthorized() from lib/cron-auth: constant-time Bearer compare,
  * required EVERYWHERE except an explicit NODE_ENV === "development", and a
@@ -95,6 +123,7 @@ const WORKER_ROW_SELECT = {
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
     suggestedConfidence: true, sendAttempted: true, claimToken: true, fileSha256: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true, stateReason: true,
+    taxWarning: true,
 } as const;
 
 /**
@@ -111,17 +140,18 @@ const WORKER_ROW_SELECT = {
 const RELEASE_CLAIM = { claimToken: null, claimedAt: null } as const;
 
 /**
- * A row parked by the shadow week (dryRun=true, sitting at READ or BOOKING) is
- * DONE until the cutover. It is excluded from the claim rather than merely
- * skipped inside the loop, because the batch is only ten rows: after a couple
- * of shadow days the oldest ten rows are all parked ones, they get re-claimed
- * every five minutes, and no NEW receipt is ever reached. The queue looks
- * healthy and processes nothing. runIntakeWorker's requeueDryRunParked is what
- * brings them back, once, on the first live pass.
+ * How long the invocation lease is held for.
+ *
+ * Longer than the route's own `maxDuration = 60`, deliberately: a lease that
+ * could expire while its pass was still running would let a second invocation
+ * in on exactly the run it exists to exclude, and the only alternative is
+ * heartbeating from inside a loop that spends its time blocked on Gemini and
+ * QuickBooks. The platform kills the pass first, and the next cron is five
+ * minutes out, so a crashed invocation's lease is always stale before anyone
+ * needs it.
  */
-const NOT_DRY_RUN_PARKED: Prisma.ReceiptIntakeWhereInput = {
-    NOT: { AND: [{ dryRun: true }, { state: { in: ["READ", "BOOKING"] } }] },
-};
+const WORKER_LEASE_MS = 90_000;
+const WORKER_LEASE_KEY = "receiptIntakeWorkerLease";
 
 async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
     const now = new Date();
@@ -148,7 +178,9 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
         let shadowRetired = 0;
         let shadowQuarantined = 0;
         let requeued = 0;
-        if (opts.run) {
+        /** Rows that moved between the select and the write, so no verdict landed. */
+        let shadowSkippedMoved = 0;
+        if (!opts.dryRunGlobal) {
             // runIntakeWorker halts before ever calling claim() without one, so
             // this is belt-and-braces rather than the real gate.
             if (!opts.boundary) {
@@ -193,6 +225,14 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                     select: {
                         id: true, source: true, sourceRef: true,
                         archivedByV1: true, createdAt: true,
+                        // The evidence each write fences on, read here so the
+                        // verdict and the row it was reached about travel
+                        // together instead of the write re-deriving a predicate.
+                        // claimToken is PINNED at what was observed rather than
+                        // required null — see CutoverRow for why demanding null
+                        // would hide a stale-claimed row from the cutover for
+                        // good.
+                        state: true, stateReason: true, dryRun: true, claimToken: true,
                     },
                 });
 
@@ -236,18 +276,30 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 const { evidenced, unevidenced, quarantined } =
                     triageCutoverRows(candidates, opts.boundary, bookedByV1);
 
+                // EVERY cutover write is a CAS over the row the verdict was
+                // reached about — see applyCutoverVerdict. Constraining only
+                // `id` let a concurrent transition (an admin review, a late
+                // completion) be overwritten with a terminal SHADOW_* state or
+                // silently handed to v2, in a transaction that had read the row
+                // before any of that happened.
+                const byId = new Map<string, CutoverRow>(candidates.map(row => [row.id, row]));
+                const rowsFor = (ids: string[]) =>
+                    ids.map(id => byId.get(id)).filter((row): row is CutoverRow => !!row);
+
                 if (evidenced.length) {
-                    const retired = await tx.receiptIntake.updateMany({
-                        where: { id: { in: evidenced } },
-                        data: { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
-                    });
-                    shadowRetired = retired.count;
+                    const retired = await applyCutoverVerdict(
+                        rowsFor(evidenced),
+                        { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
+                        tx.receiptIntake,
+                    );
+                    shadowRetired = retired.moved;
+                    shadowSkippedMoved += retired.skippedMoved;
                 }
 
                 if (quarantined.length) {
-                    const held = await tx.receiptIntake.updateMany({
-                        where: { id: { in: quarantined } },
-                        data: {
+                    const held = await applyCutoverVerdict(
+                        rowsFor(quarantined),
+                        {
                             state: "SHADOW_QUARANTINE",
                             stateReason: "no-v1-evidence",
                             // Terminal: it must never come back round on a
@@ -255,8 +307,10 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                             nextRetryAt: null,
                             dryRun: false,
                         },
-                    });
-                    shadowQuarantined = held.count;
+                        tx.receiptIntake,
+                    );
+                    shadowQuarantined = held.moved;
+                    shadowSkippedMoved += held.skippedMoved;
                 }
 
                 // Everything else is v2's to book. The list is built row by
@@ -264,35 +318,29 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 // here, so the two can never disagree about which rows the
                 // evidence check already claimed.
                 if (unevidenced.length) {
-                    const handed = await tx.receiptIntake.updateMany({
-                        where: { id: { in: unevidenced } },
-                        data: { dryRun: false, nextRetryAt: null },
-                    });
-                    requeued = handed.count;
+                    const handed = await applyCutoverVerdict(
+                        rowsFor(unevidenced),
+                        { dryRun: false, nextRetryAt: null },
+                        tx.receiptIntake,
+                    );
+                    requeued = handed.moved;
+                    shadowSkippedMoved += handed.skippedMoved;
                 }
 
-                if (shadowRetired > 0 || requeued > 0 || shadowQuarantined > 0) {
+                if (shadowRetired > 0 || requeued > 0 || shadowQuarantined > 0 || shadowSkippedMoved > 0) {
                     console.log("[cron/receipt-intake-worker] cutover", JSON.stringify({
                         boundary: opts.boundary.toISOString(),
-                        shadowRetired, requeued, shadowQuarantined,
+                        shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved,
                     }));
                 }
             }
         }
 
-        const claimCutoff = new Date(now.getTime() - LEASE_MS);
-        const ELIGIBLE: Prisma.ReceiptIntakeWhereInput = {
-            // STAGING is absent on purpose: the row exists but its object
-            // does not, so claiming it would park a good receipt as
-            // "file-missing". sweepStaleStaging is what watches those.
-            state: { in: ["RECEIVED", "READ", "BOOKING"] },
-            // DUE (scheduling) and UNOWNED (or the owner's lease expired).
-            // Two separate questions, asked separately — and both are part of
-            // ELIGIBLE so the atomic re-check below asks them again.
-            OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
-            AND: [{ OR: [{ claimedAt: null }, { claimedAt: { lt: claimCutoff } }] }],
-            ...NOT_DRY_RUN_PARKED,
-        };
+        // ONE predicate, shared with the worker lib and with the real-Postgres
+        // claim test, and a FUNCTION of the current global switch — see
+        // eligibleClaimWhere. A second copy of it here is how the claim and the
+        // processing loop came to disagree about which rows were workable.
+        const ELIGIBLE = eligibleClaimWhere(now, opts.dryRunGlobal);
 
         const due = await tx.receiptIntake.findMany({
             where: ELIGIBLE,
@@ -300,7 +348,7 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             take: BATCH_SIZE,
             select: { id: true },
         });
-        if (due.length === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined };
+        if (due.length === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved };
 
         // THE claim is ATOMIC with the select it followed: the UPDATE re-checks
         // the SAME eligibility predicate rather than blindly writing every id
@@ -317,7 +365,7 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             where: { id: { in: ids }, ...ELIGIBLE },
             data: { nextRetryAt: new Date(now.getTime() + LEASE_MS), claimToken, claimedAt: now },
         });
-        if (claimed.count === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined };
+        if (claimed.count === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved };
 
         // Re-read by id AND the fresh token — never by the original id list —
         // so only the rows this UPDATE actually touched are handed to the pass.
@@ -332,12 +380,15 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             shadowRetired,
             requeued,
             shadowQuarantined,
+            shadowSkippedMoved,
         };
     });
 }
 
 function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
     return {
+        acquireLease: () => acquireCronLease(WORKER_LEASE_KEY, WORKER_LEASE_MS),
+
         claim,
 
         isDryRunEnabled: () => process.env.RECEIPT_INTAKE_DRYRUN !== "false",
@@ -368,9 +419,13 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     ],
                 },
                 select: {
-                    id: true, storagePath: true, mimeType: true, stateReason: true,
+                    // `state` is read rather than assumed from the WHERE above:
+                    // every mutation below fences on the row as OBSERVED, and a
+                    // hard-coded "STAGING" in the fence would be a second copy
+                    // of that fact that could drift from the query.
+                    id: true, state: true, storagePath: true, mimeType: true, stateReason: true,
                     createdAt: true, expectedSha256: true, uploadUrlExpiresAt: true,
-                    uploadLeaseVersion: true,
+                    uploadLeaseVersion: true, uploadLeaseNonce: true,
                 },
                 // Rows that never had a signed URL first (an inline upload that
                 // died mid-request is an orphan NOW, and nothing is coming for
@@ -412,7 +467,14 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // or a truncated upload that /finalize would have refused — and
                 // those rows then go to Gemini and, if they read at all, to
                 // QuickBooks. One implementation, so the two cannot diverge.
-                const check = await inspectStoredObject(row.storagePath, row.mimeType);
+                // The INVOCATION's deadline, not a fresh allowance per call: a
+                // pass that has already spent 50 of its 60 seconds must not
+                // hand the next storage call a full fifteen.
+                const check = await inspectStoredObject(
+                    row.storagePath,
+                    row.mimeType,
+                    invocationDeadline,
+                );
 
                 if (check.ok) {
                     // The bytes that landed must be the document /start was told
@@ -428,19 +490,33 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         // correct bytes arriving a minute later would find the
                         // row already gone from STAGING.
                         if (leaseLive) { leaseActive++; continue; }
-                        await evidenceUpdateMany({
-                            // Fenced on the lease this verdict was reached
-                            // about: a resumed /start bumps it, and the bytes
-                            // that mismatched belong to an upload nobody is
-                            // waiting for any more.
-                            where: {
-                                id: row.id,
-                                state: "STAGING",
-                                uploadLeaseVersion: row.uploadLeaseVersion,
-                            },
+                        // THE COMPLETE LEASE IDENTITY the verdict was reached
+                        // about — not state + version.
+                        //
+                        // `leaseLive` was computed from the SELECT at the top
+                        // of this sweep, and everything since (a storage round
+                        // trip per row) is time in which a /start retry can
+                        // extend the lease over the same path at the same
+                        // version, moving only the nonce and the expiry. A
+                        // fence of {state, version} still matched, so the sweep
+                        // parked a row whose upload URL had just been renewed
+                        // and whose client was still uploading to it. The
+                        // reject branch below already pinned the whole identity;
+                        // this is the same rule, applied to the writes that
+                        // forgot it.
+                        //
+                        // Still through `evidenceUpdateMany`: a park is a
+                        // state transition the missing-receipt sweep reads, so
+                        // it takes the evidence lock like every other one.
+                        const { count: mismatchParked } = await evidenceUpdateMany({
+                            where: { id: row.id, ...leaseFence(row) },
                             data: { state: "NEEDS_REVIEW", stateReason: "sha-mismatch", nextRetryAt: null },
                         });
-                        parked++;
+                        // COUNTED ONLY WHEN THE CAS LANDED. A losing write
+                        // reported a park that never happened, so the sweep's
+                        // own log said it had cleared rows it had not touched.
+                        if (mismatchParked > 0) parked++;
+                        else leaseActive++;
                         continue;
                     }
 
@@ -449,15 +525,27 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // that path stays writable by whoever holds the signed URL,
                     // so a swept row's "verified" bytes would remain replaceable
                     // afterwards.
-                    const outcome = await sealAndPublish(row.storagePath, row.id, check, {
+                    const outcome = await sealAndPublish(row.storagePath, row.id, row.uploadLeaseVersion, check, {
+                        inShortTx,
                         seal: sealObject,
-                        commit: async (canonicalPath, values) => {
-                            const { count } = await evidenceUpdateMany({
-                                where: {
-                                    id: row.id,
-                                    state: "STAGING",
-                                    uploadLeaseVersion: row.uploadLeaseVersion,
-                                },
+                        commit: async (tx, canonicalPath, values) => {
+                            // The settle transaction's FIRST statement, which
+                            // is where the evidence lock has to be taken: this
+                            // publish moves a STAGING row to RECEIVED, and the
+                            // sweep reads exactly that.
+                            await lockReceiptEvidence(tx);
+                            const { count } = await tx.receiptIntake.updateMany({
+                                // Same complete identity as the parks. This one
+                                // publishes rather than parks, but a lease
+                                // refreshed since the inspection means the
+                                // client is mid-upload of something else — and
+                                // publishing that row would seal bytes it is
+                                // about to replace, then schedule the upload
+                                // path's cleanup against an expiry the live URL
+                                // outlives. The schedule below reads the SAME
+                                // snapshot this CAS pins, so the two agree by
+                                // construction.
+                                where: { id: row.id, ...leaseFence(row) },
                                 data: {
                                     state: "RECEIVED",
                                     nextRetryAt: null,
@@ -469,22 +557,31 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                             });
                             return count;
                         },
-                        dropUpload: uploadPath =>
-                            deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
-                        currentStoragePath: async rowId => {
-                            const r = await prisma.receiptIntake.findUnique({
-                                where: { id: rowId },
-                                select: { storagePath: true },
-                            });
-                            return r?.storagePath ?? null;
-                        },
-                        // A lost CAS here means /finalize (or a resumed
-                        // /start's re-armed lease) already moved this row
-                        // while the sweep was mid-inspection — best-effort,
-                        // same retry queue as every other orphan.
-                        dropOrphanedCanonical: canonicalPath =>
-                            deleteObjectOrRecord(canonicalPath, "orphaned-lost-publish-cas").then(() => undefined),
-                    });
+                        // PUBLISHING is allowed while the lease is live (a
+                        // complete, correct object is one whether or not the
+                        // URL has expired), so unlike the park and reject
+                        // branches below this one CAN run with a live upload
+                        // URL — and the upload path's delete has to wait for
+                        // it, or the holder's late PUT recreates an object the
+                        // published row no longer points at.
+                        //
+                        // Enqueued INSIDE the commit transaction, same rule as
+                        // /finalize: the queue entry outlives the pointer, so
+                        // the two have to commit together.
+                        queueUploadCleanup: (tx, uploadPath) =>
+                            queueObjectCleanup(tx, uploadPath, "sealed", cleanupNotBefore(row)),
+                        // PHASE A, same as the /finalize publisher: the seal is
+                        // an external write ahead of the CAS either way, so the
+                        // path is claimed with a lease before anything is
+                        // written and the lease is what keeps this sweep's own
+                        // cleanup pass off it in the meantime.
+                        claimCanonicalPath: canonicalPath =>
+                            claimObjectPath(canonicalPath, cleanupNotBefore(row)),
+                        resolveCanonicalIntent,
+                        settleUploadCleanup: (eventId, uploadPath) =>
+                            settleQueuedCleanup(eventId, uploadPath, cleanupNotBefore(row))
+                                .then(() => undefined),
+                    }, invocationDeadline);
                     if (outcome?.published) published++;
                     continue;
                 }
@@ -496,15 +593,15 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // connection came back to find its row already in the review
                     // queue. Wait until the URL cannot possibly land any more.
                     if (leaseLive) { leaseActive++; continue; }
-                    await evidenceUpdateMany({
-                        where: {
-                            id: row.id,
-                            state: "STAGING",
-                            uploadLeaseVersion: row.uploadLeaseVersion,
-                        },
+                    // The complete identity again: `leaseLive` is a fact about
+                    // the SELECT, and a /start retry between it and here
+                    // renews the very URL this park says can no longer land.
+                    const { count: missingParked } = await evidenceUpdateMany({
+                        where: { id: row.id, ...leaseFence(row) },
                         data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
                     });
-                    parked++;
+                    if (missingParked > 0) parked++;
+                    else leaseActive++;
                     continue;
                 }
                 // Rejected: the object exists and is not acceptable.
@@ -522,10 +619,25 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 const dropped = await rejectRowAndQueueCleanup(
                     {
                         id: row.id,
-                        state: "STAGING",
+                        // The OBSERVED state, like every other field here — a
+                        // literal would be a second copy of the SELECT's own
+                        // predicate, free to drift from it.
+                        state: row.state,
                         stateReason: row.stateReason,
                         storagePath: row.storagePath,
                         uploadLeaseVersion: row.uploadLeaseVersion,
+                        // The generation too: the version alone cannot see a
+                        // same-path lease refresh (see leaseFence). The
+                        // `verify` callback below still re-reads the row, and
+                        // the two are complementary — this one fails the CAS,
+                        // that one aborts the transaction.
+                        uploadLeaseNonce: row.uploadLeaseNonce,
+                        uploadUrlExpiresAt: row.uploadUrlExpiresAt,
+                        // Always null here — `leaseLive` above already refused
+                        // to reject a row whose URL still works. Passed anyway
+                        // so both rejecters state the rule the same way rather
+                        // than one of them relying on a guard several lines up.
+                        cleanupNotBefore: cleanupNotBefore(row),
                     },
                     check.reason,
                     undefined,
@@ -544,7 +656,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // FENCE LOST: somebody else owns this row now. Touch NOTHING —
                 // above all not the object, which the winner may be using.
                 if (!dropped.ok) continue;
-                await settleQueuedCleanup(dropped.eventId, row.storagePath);
+                await settleQueuedCleanup(dropped.eventId, row.storagePath, cleanupNotBefore(row));
                 rejected++;
             }
             if (published || parked || rejected || leaseActive) {
@@ -573,7 +685,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             return phases.map(phase => ({ id: phase.id, code: phase.code, name: phase.name }));
         },
 
-        downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
+        downloadBytes: (storagePath, expectedSha256) =>
+            // THE INVOCATION deadline, threaded into storage exactly as it is
+            // into QuickBooks: a hung download must return control in time for
+            // the pass to release the rows it claimed.
+            downloadVerified(storagePath, expectedSha256, invocationDeadline),
 
         // The invocation's ONE deadline, not a fresh 25s per row (see
         // readBudgetFor). A row reached late in the batch gets whatever
@@ -704,7 +820,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
         }),
 
         // RECEIVED -> READ, and the ONLY place the routing lease is released.
-        finishRouting: async (rowId, claimToken, stateReason) => {
+        finishRouting: async (rowId, claimToken, stateReason, taxWarning) => {
             // FENCED on state AND token, and it clears both claim fields.
             //
             // The state alone is not enough: a worker whose invocation was
@@ -718,6 +834,9 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 data: {
                     state: "READ",
                     stateReason,
+                    // The DURABLE copy. Nothing downstream writes this column,
+                    // so it is still there when the row reaches BOOKED.
+                    taxWarning,
                     nextRetryAt: null,
                     claimToken: null,
                     claimedAt: null,
@@ -730,7 +849,14 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
 
         companyTimeZone: resolveCompanyTimeZone,
 
-        retryStorageCleanups: shouldStop => retryPendingCleanups(STAGING_SWEEP_BATCH, shouldStop),
+        // WITH THE INVOCATION'S DEADLINE. The default dependency passes none,
+        // so every delete took a fresh fifteen seconds -- long enough to
+        // outlive the claim it was running under, whatever the pass had left.
+        retryStorageCleanups: shouldStop => retryPendingCleanups(
+            STAGING_SWEEP_BATCH,
+            shouldStop,
+            liveSweepDepsFor(invocationDeadline),
+        ),
 
         promoteToBooking: async (rowId, weakKey, claimToken) => prisma.$transaction(async tx => {
             // LAST weak-dedup check, taken INSIDE the transition. The check at
@@ -850,7 +976,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             getTokens: deadline => getFreshQBTokens(deadline),
             createPurchase: (tokens, input, deadline, onBeforeCreate, onExistingPurchase) =>
                 createQBReceiptPurchase(tokens, input, { onBeforeCreate, onExistingPurchase }, deadline),
-            downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
+            downloadBytes: (storagePath, expectedSha256) =>
+            // THE INVOCATION deadline, threaded into storage exactly as it is
+            // into QuickBooks: a hung download must return control in time for
+            // the pass to release the rows it claimed.
+            downloadVerified(storagePath, expectedSha256, invocationDeadline),
             logEvent: logAutomationEvent,
             now: () => new Date(),
         }),
@@ -940,6 +1070,47 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 },
             });
             return count > 0;
+        },
+
+        // Hand the row back untouched except for when to look at it again. No
+        // state change, no attempt spent, no lastError: the dry-run switch is
+        // not a verdict on the document. Fenced like every other write, so a
+        // superseded pass releases nothing.
+        releaseClaim: async (rowId, nextRetryAt, ownership) => {
+            const { count } = await evidenceUpdateMany({
+                where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
+                data: { nextRetryAt, ...RELEASE_CLAIM },
+            });
+            return count > 0;
+        },
+
+        // Every row the soft deadline cut off, in one token-fenced write per
+        // claim token. `nextRetryAt: null` puts them back at the front of the
+        // queue: they were never worked on, so there is nothing to back off
+        // from, and the ten-minute claim lease they are carrying was written
+        // for a pass that has ended.
+        releaseUnprocessed: async rows => {
+            const byToken = new Map<string, string[]>();
+            for (const row of rows) {
+                // A row with no token was never really claimed; there is
+                // nothing to fence a release on and nothing to release.
+                if (!row.claimToken) continue;
+                const ids = byToken.get(row.claimToken);
+                if (ids) ids.push(row.id);
+                else byToken.set(row.claimToken, [row.id]);
+            }
+            let released = 0;
+            for (const [claimToken, ids] of byToken) {
+                const { count } = await evidenceUpdateMany({
+                    // FENCED ON THE TOKEN THIS PASS CLAIMED WITH. A row whose
+                    // token changed belongs to a successor, and clearing its
+                    // claim here would hand a live pass's row to a third one.
+                    where: { id: { in: ids }, claimToken },
+                    data: { nextRetryAt: null, ...RELEASE_CLAIM },
+                });
+                released += count;
+            }
+            return released;
         },
 
         retryRow: async (rowId, attempts, nextRetryAt, reason, ownership) => {

@@ -3,6 +3,13 @@ import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
 import { assertExpenseMutableOutsideQbo } from "./qbo-expense-guard";
+import {
+    appendZeroRateReview,
+    readOwnerRatesForUpdate,
+    zeroLaborBlocks,
+    zeroRateManagerMessage,
+} from "./pay-rate-guard";
+import { withPayrollWrite, withPayrollWriteTx } from "./payroll-period";
 import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 
 const cents = (value: number) => Math.round(value * 100);
@@ -35,8 +42,30 @@ function requiredPositive(value: number, label: string) {
     if (!Number.isFinite(value) || value <= 0) throw new Error(`${label} must be greater than zero`);
 }
 
-async function resolveChangeOrder(changeOrderId: string, projectId?: string) {
-    const changeOrder = await prisma.changeOrder.findUnique({
+/**
+ * Thrown when the rows a tag was authorized against are no longer the rows
+ * being written — a logistics reroute or a billing stamp landed between the
+ * pre-check and the row locks. A route should answer 409: the request was
+ * valid when it was made and is simply stale now.
+ */
+export class TimeEntryTagConflictError extends Error {
+    readonly status = 409;
+    constructor(message: string) {
+        super(message);
+        this.name = "TimeEntryTagConflictError";
+    }
+}
+
+/** Name-based, so two copies of this module under one process still agree. */
+export function isTimeEntryTagConflictError(error: unknown): error is TimeEntryTagConflictError {
+    return error instanceof Error && error.name === "TimeEntryTagConflictError";
+}
+
+const TAG_CONFLICT_MESSAGE =
+    "These time entries changed while they were being tagged (moved to another job, or billed) — refresh and try again";
+
+async function resolveChangeOrder(changeOrderId: string, projectId?: string, db: typeof prisma = prisma) {
+    const changeOrder = await db.changeOrder.findUnique({
         where: { id: changeOrderId },
         select: { id: true, projectId: true, estimateId: true, pricingType: true, status: true, code: true },
     });
@@ -50,13 +79,35 @@ async function resolveChangeOrder(changeOrderId: string, projectId?: string) {
 }
 
 export type CreateTimeEntryCoreInput = {
+    /** Set by callers that detected something payroll must look at (e.g. a $0 rate). */
+    needsReview?: boolean;
+    reviewReason?: string | null;
+    /**
+     * Price this entry from the member's STORED rates, read FOR UPDATE inside
+     * the write transaction, applying the $0-rate policy. When set, laborCost
+     * and burdenCost on this input are ignored.
+     */
+    priceFromStoredRates?: boolean;
+    /** Deliberate "book it at $0 and flag it for payroll" — never the default. */
+    acknowledgeZeroRate?: boolean;
     projectId?: string;
     userId: string;
     costCodeId?: string | null;
     date: string;
     durationHours: number;
-    laborCost: number;
+    /** Ignored when priceFromStoredRates is set — the core prices it instead. */
+    laborCost?: number;
     burdenCost?: number;
+    /**
+     * Total burden for this entry, overriding hours × the stored burden rate.
+     * Honoured on the stored-rates path — burden is a real per-entry number a
+     * caller can know better than the rate table does.
+     *
+     * There is deliberately no labor equivalent. Labor cost is the number the
+     * $0-rate policy is about, so it is always derived from the row-locked
+     * rate; a caller that could name it could name zero.
+     */
+    burdenCostOverride?: number;
     changeOrderId?: string | null;
     isBillable?: boolean;
     notes?: string | null;
@@ -65,7 +116,9 @@ export type CreateTimeEntryCoreInput = {
 export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor: string) {
     void actor;
     requiredPositive(data.durationHours, "Hours");
-    if (!Number.isFinite(data.laborCost) || data.laborCost < 0) throw new Error("Labor cost cannot be negative");
+    if (!data.priceFromStoredRates && (!Number.isFinite(data.laborCost) || (data.laborCost ?? 0) < 0)) {
+        throw new Error("Labor cost cannot be negative");
+    }
     if (data.burdenCost != null && (!Number.isFinite(data.burdenCost) || data.burdenCost < 0)) {
         throw new Error("Burden cost cannot be negative");
     }
@@ -95,33 +148,80 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
         estimateItemId: null,
     });
 
-    return prisma.timeEntry.create({
-        data: {
-            projectId,
-            scheduleTaskId,
-            userId: data.userId,
-            costCodeId: data.costCodeId || null,
-            startTime,
-            durationHours: data.durationHours,
-            laborCost: dollars(data.laborCost),
-            burdenCost: dollars(data.burdenCost ?? 0),
-            changeOrderId: changeOrder?.id ?? null,
-            isBillable: data.isBillable ?? false,
-            notes: data.notes?.trim() || null,
-        },
+    // The canonical manual-create. Creating hours AT a date puts them in that
+    // period, so gating HERE covers every caller instead of each server action
+    // separately. Check + write in one transaction under the shared advisory
+    // lock (src/lib/payroll-period.ts).
+    return withPayrollWriteTx({ instants: [startTime] }, async (tx) => {
+        // Rates, the $0-rate decision and both costs, all from a row-locked read
+        // in THIS transaction (src/lib/pay-rate-guard.ts). It is always an
+        // office action — there is no worker-side manual create — so it follows
+        // the manager branch: refused unless explicitly acknowledged, and then
+        // flagged so the payroll export will not run past it.
+        //
+        // THE READ IS UNCONDITIONAL, and so is the policy it feeds. It used to
+        // run only when the caller asked to be priced from stored rates, which
+        // made the guard OPT-IN: any caller that did its own arithmetic —
+        // the MCP `log_time` tool did exactly that — could book a completed
+        // entry at $0 labor for an hourly crew member, with neither the block
+        // nor the review flag. A silent $0 shift is the same mistake whichever
+        // door it arrives through, so the decision is taken here, from what the
+        // row is ABOUT TO HOLD, rather than from who computed it.
+        const member = await readOwnerRatesForUpdate(tx, data.userId, (value) => Number(value));
+        if (!member) throw new Error("Crew member not found");
+
+        const priced = data.priceFromStoredRates
+            ? calculateCrewTimeCosts(data.durationHours, member.hourlyRate, member.burdenRate, data.burdenCostOverride)
+            : { laborCost: dollars(data.laborCost ?? 0), burdenCost: dollars(data.burdenCost ?? 0) };
+
+        // $0 labor on somebody paid by the hour is exactly what the guard
+        // exists to stop. On the stored-rates path this is zeroRateBlocks()
+        // restated: durationHours is > 0, so a $0 cost means a $0 rate. On a
+        // caller-supplied cost it catches the same shift arriving another way.
+        const zeroRate = zeroLaborBlocks(member, priced.laborCost);
+        if (zeroRate && data.acknowledgeZeroRate !== true) {
+            throw new Error(zeroRateManagerMessage(member.name));
+        }
+        const zeroRateReview = zeroRate ? appendZeroRateReview(null) : null;
+
+        return (tx as unknown as typeof prisma).timeEntry.create({
+            data: {
+                projectId,
+                scheduleTaskId,
+                userId: data.userId,
+                costCodeId: data.costCodeId || null,
+                startTime,
+                // endTime stays NULL on a manual entry. durationHours IS the
+                // paid time a human entered; synthesising a span would make WA
+                // meal settlement read it as raw worked time, deduct a meal it
+                // never owed, and reprice it at the current rate. Readers treat
+                // "open" as endTime null AND durationHours null.
+                durationHours: data.durationHours,
+                laborCost: priced.laborCost,
+                burdenCost: priced.burdenCost,
+                changeOrderId: changeOrder?.id ?? null,
+                isBillable: data.isBillable ?? false,
+                notes: data.notes?.trim() || null,
+                ...(zeroRateReview || data.needsReview
+                    ? {
+                          needsReview: true,
+                          reviewReason: zeroRateReview?.reviewReason ?? data.reviewReason ?? null,
+                      }
+                    : {}),
+            },
+        });
     });
 }
 
 export type CreateTimeEntryFromStoredRatesInput = Omit<CreateTimeEntryCoreInput, "laborCost" | "burdenCost">;
 
 export async function createTimeEntryFromStoredRatesCore(data: CreateTimeEntryFromStoredRatesInput, actor: string) {
-    const member = await prisma.user.findUnique({
-        where: { id: data.userId },
-        select: { id: true, hourlyRate: true, burdenRate: true },
-    });
-    if (!member) throw new Error("Crew member not found");
-    const costs = calculateCrewTimeCosts(data.durationHours, Number(member.hourlyRate), Number(member.burdenRate));
-    return createTimeEntryCore({ ...data, ...costs }, actor);
+    // Nothing is read here. The rates, the $0-rate decision and both costs are
+    // all resolved INSIDE createTimeEntryCore's payroll write transaction, from
+    // a row-locked read — reading them out here left a window in which a rate
+    // import could land between the read and the insert, and the entry was then
+    // created at a rate that was no longer true.
+    return createTimeEntryCore({ ...data, priceFromStoredRates: true }, actor);
 }
 
 export type CreateExpenseCoreInput = {
@@ -209,17 +309,64 @@ export async function tagTimeEntriesToChangeOrderCore(
 ) {
     void actor;
     if (!input.ids.length) return { updated: 0 };
-    const changeOrder = await resolveChangeOrder(input.changeOrderId);
+    const ids = [...new Set(input.ids)];
+    // Fail fast, before taking the payroll advisory lock — a request that is
+    // wrong on its face should not queue behind payroll to be told so. It
+    // proves NOTHING about the write: every one of these is asked again below,
+    // under the row locks, and the answer there is the one that counts.
+    const preflight = await resolveChangeOrder(input.changeOrderId);
     const rows = await prisma.timeEntry.findMany({
-        where: { id: { in: input.ids } },
+        where: { id: { in: ids } },
         select: { id: true, projectId: true, invoiceId: true, invoicedAt: true },
     });
-    if (rows.length !== new Set(input.ids).size) throw new Error("One or more time entries were not found");
-    if (rows.some((row) => row.projectId !== changeOrder.projectId)) throw new Error("All time entries must belong to the change order project");
+    if (rows.length !== ids.length) throw new Error("One or more time entries were not found");
+    if (rows.some((row) => row.projectId !== preflight.projectId)) throw new Error("All time entries must belong to the change order project");
     if (rows.some((row) => row.invoiceId || row.invoicedAt)) throw new Error("Billed time entries cannot be retagged");
-    const result = await prisma.timeEntry.updateMany({
-        where: { id: { in: input.ids }, invoiceId: null, invoicedAt: null },
-        data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
+    // Re-tagging changes which change order the hours are billed against, and
+    // runs against rows a locked period may own — advisory-lock protocol.
+    const result = await withPayrollWrite({ entryIds: ids }, async (tx) => {
+        const db = tx as unknown as typeof prisma;
+        // The rows are FOR UPDATE now (acquirePayrollLocks). Everything above
+        // was decided from a copy read BEFORE that lock existed, and one of the
+        // writers this raced against moves an entry between jobs: the logistics
+        // reroute (PATCH /api/time-entries/[id]/logistics and
+        // rerouteLogisticsEntry) rewrites projectId. The old WHERE named only
+        // the ids and the billing columns, so a rerouted row was still updated
+        // and came out carrying a change order belonging to a DIFFERENT
+        // project — cost-plus billing then invoiced one job's hours against
+        // another job's change order.
+        //
+        // So the whole decision is retaken here: the change order re-read (its
+        // project, pricing type and status may all have moved), then the rows,
+        // then the write itself pins projectId so the database has the last
+        // word even if something slips between this read and this update.
+        const changeOrder = await resolveChangeOrder(input.changeOrderId, undefined, db);
+        const locked = await db.timeEntry.findMany({
+            where: { id: { in: ids } },
+            select: { id: true, projectId: true, invoiceId: true, invoicedAt: true },
+        });
+        if (locked.length !== ids.length) throw new TimeEntryTagConflictError(TAG_CONFLICT_MESSAGE);
+        if (locked.some((row) => row.projectId !== changeOrder.projectId)) {
+            throw new TimeEntryTagConflictError(TAG_CONFLICT_MESSAGE);
+        }
+        if (locked.some((row) => row.invoiceId || row.invoicedAt)) {
+            throw new TimeEntryTagConflictError(TAG_CONFLICT_MESSAGE);
+        }
+        const updated = await db.timeEntry.updateMany({
+            where: {
+                id: { in: ids },
+                // Pinned: a row that moved jobs is not one of "these" any more.
+                projectId: changeOrder.projectId,
+                invoiceId: null,
+                invoicedAt: null,
+            },
+            data: { changeOrderId: changeOrder.id, isBillable: input.isBillable ?? true },
+        });
+        // All or nothing. A short count means a row moved or was billed between
+        // the re-read and the update; rolling back is what makes "409, nothing
+        // tagged" true rather than "some of them, silently".
+        if (updated.count !== ids.length) throw new TimeEntryTagConflictError(TAG_CONFLICT_MESSAGE);
+        return updated;
     });
     return { updated: result.count };
 }

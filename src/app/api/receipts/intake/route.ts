@@ -6,10 +6,17 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
-import { receiptObjectSize, uploadReceiptObject } from "@/lib/receipt-intake/bucket";
+import { uploadReceiptObject } from "@/lib/receipt-intake/bucket";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
-import { deleteObjectOrRecord, recordPendingCleanup } from "@/lib/receipt-intake/storage-cleanup";
+import {
+    claimObjectPath,
+    deleteObjectOrRecord,
+    inShortTx,
+    recordPendingCleanup,
+    resolveCanonicalIntent,
+} from "@/lib/receipt-intake/storage-cleanup";
+import { cleanupNotBefore } from "@/lib/receipt-intake/worker";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME, sniffMime } from "@/lib/receipt-intake/file-type";
 import {
     decideSource,
@@ -18,14 +25,15 @@ import {
     MAX_INLINE_UPLOAD_BYTES,
     MAX_STORED_BYTES,
 } from "@/lib/receipt-intake/intake-core";
-import { finalizeDisposition, publishFence } from "@/lib/receipt-intake/stored-object";
+import { finalizeDisposition, leaseFence, verifyStoredCopy } from "@/lib/receipt-intake/stored-object";
+import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 import {
     ARCHIVE_READABLE_STATES,
     listReceiptIntakes,
     serializeReceiptIntake,
     withArchiveDownloadUrls,
 } from "@/lib/receipt-intake/queries";
-import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 
 /**
  * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
@@ -52,6 +60,16 @@ const evidenceDelete = (args: Prisma.ReceiptIntakeDeleteArgs) =>
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
+
+/**
+ * THE ROUTE'S ONE ABSOLUTE DEADLINE, created at entry.
+ *
+ * `maxDuration = 30` is the whole request's budget, and every storage call now
+ * takes this rather than a fresh fifteen seconds of its own — three sequential
+ * calls with independent allowances could spend 45 seconds inside a handler
+ * the platform kills at 30.
+ */
+const ROUTE_BUDGET_MS = 27_000;
 
 /**
  * Receipt Pipeline v2 intake — the ONE front door for every inbound receipt or
@@ -201,6 +219,9 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
 }
 
 export async function POST(req: Request) {
+    // ONE deadline for the whole request — see ROUTE_BUDGET_MS.
+    const deadline = createRouteDeadline(ROUTE_BUDGET_MS);
+
     const auth = await authenticateIntake(req, "ingest");
     if (!auth.ok) return auth.response;
 
@@ -319,7 +340,7 @@ export async function POST(req: Request) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
             return respondToSourceRefConflict(auth, source, sourceRef, fileSha256, {
                 bytes: parsed.bytes, mimeType, storagePath,
-            });
+            }, deadline);
         }
         // A projectId/costCodeId that doesn't exist is the CALLER's mistake, so
         // it must be a deterministic 400 — a 500 would make a forwarder retry a
@@ -341,7 +362,7 @@ export async function POST(req: Request) {
     // then a clean insert rather than a conflict against a half-written row.
     let uploadFailed: string | null = null;
     try {
-        const stored = await uploadReceiptObject(storagePath, parsed.bytes, mimeType);
+        const stored = await uploadReceiptObject(storagePath, parsed.bytes, mimeType, { deadline });
         if (!stored) uploadFailed = "upload-failed";
     } catch (error) {
         uploadFailed = error instanceof Error ? `${error.name}: ${error.message}` : "upload-threw";
@@ -436,8 +457,12 @@ export async function POST(req: Request) {
  * finishes the job.
  */
 /** Upload bytes to the receipts bucket. Returns false on any failure. */
-const storeObject = (storagePath: string, bytes: Buffer, mimeType: string) =>
-    uploadReceiptObject(storagePath, bytes, mimeType, { upsert: true });
+const storeObject = (
+    storagePath: string,
+    bytes: Buffer,
+    mimeType: string,
+    deadline: RouteDeadline | undefined,
+) => uploadReceiptObject(storagePath, bytes, mimeType, { upsert: true, deadline });
 
 async function publishStagedRow(id: string, expectStoragePath: string, expectState = "STAGING"): Promise<NextResponse> {
     try {
@@ -467,8 +492,25 @@ async function publishStagedRow(id: string, expectStoragePath: string, expectSta
             // path (see /start), so nothing else will ever find this one to
             // clean it up. Do it now, before reporting the idempotent outcome
             // the loser is about to return.
+            //
+            // AND THE FAILURE IS NOT SWALLOWED. deleteObjectOrRecord throws
+            // when it can neither delete the object nor record it, and this
+            // caller has no transaction to roll back — so the throw has to
+            // reach the client as a retryable 503 rather than be discarded on
+            // the way to a cheerful `alreadyPublished`. A forwarder deletes
+            // its only copy on that answer, and the bytes we just orphaned
+            // would be the ones nobody can find.
             if (current?.storagePath && current.storagePath !== expectStoragePath) {
-                await deleteObjectOrRecord(expectStoragePath, "orphaned-by-concurrent-publish");
+                const remembered = await deleteObjectOrRecord(
+                    expectStoragePath,
+                    "orphaned-by-concurrent-publish",
+                ).then(() => true, () => false);
+                if (!remembered) {
+                    return NextResponse.json(
+                        { ok: false, reason: "storage-unavailable", retryable: true },
+                        { status: 503 },
+                    );
+                }
             }
             // Somebody else published it; that is the outcome the caller wanted.
             if (current?.state === "RECEIVED") {
@@ -513,13 +555,20 @@ async function respondToSourceRefConflict(
     fileSha256: string,
     /** The bytes this replay carried — used to HEAL a row whose object is gone. */
     payload: { bytes: Buffer; mimeType: string; storagePath: string },
+    /** The REQUEST's deadline. A heal's upload draws on the same budget. */
+    deadline: RouteDeadline,
 ): Promise<NextResponse> {
     const existing = await prisma.receiptIntake.findUnique({
         where: { sourceRef },
         select: {
             id: true, state: true, source: true, sourceRef: true, projectId: true,
             dryRun: true, fileSha256: true, createdById: true, storagePath: true, stateReason: true,
-            uploadLeaseVersion: true,
+            // The whole lease identity, because the heal's CAS pins it — see
+            // leaseFence. A refresh moves only the nonce and the expiry.
+            uploadLeaseVersion: true, uploadLeaseNonce: true, uploadUrlExpiresAt: true,
+            // Only for cleanupNotBefore: an inline row has no expiry, so its
+            // capability window is measured from createdAt.
+            createdAt: true,
         },
     });
     // The row vanished between the failed insert and this read (a delete
@@ -562,15 +611,45 @@ async function respondToSourceRefConflict(
     // and the forwarder could delete its only copy of a receipt we did not
     // have. The state a row happens to be parked in says nothing about whether
     // its bytes exist.
-    // Metadata, not a download: this runs on every replay, and the object may
-    // be 8 MiB. A TRANSIENT answer is not evidence of absence — healing on it
+    // AND PRESENCE IS NOT THE SAME QUESTION AS CORRECTNESS.
+    //
+    // Existence alone still authorised the delete, on the strength of bytes
+    // nobody had looked at since they were sealed — so an object REPLACED after
+    // publication (an upsert URL reused, a restore that put back a different
+    // version, a storage-side fault) was laundered into "we have your receipt",
+    // and the last good copy went with it. `existing.fileSha256` is the hash
+    // this row was published with, and on this branch it provably equals the
+    // hash of the payload in this very request; the stored bytes must still
+    // hash to it. ONE rule, shared with /finalize (stored-object.ts), so the two
+    // replay paths cannot come to disagree about what "we already have it" means.
+    //
+    // A cheap metadata probe still runs first inside it: this path runs on every
+    // replay and the object may be 8 MiB, so an orphan never pays for a
+    // download. A TRANSIENT answer is not evidence of absence — healing on it
     // would overwrite a document that is really there — so it is answered 503
     // and the forwarder retries with its copy intact.
-    const present = await receiptObjectSize(existing.storagePath);
-    if (!present.ok && present.kind === "transient") {
+    const held = await verifyStoredCopy(existing.storagePath, existing.fileSha256, deadline);
+    if (!held.ok && held.kind === "transient") {
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
-    if (!present.ok) {
+    if (!held.ok && held.kind === "content-mismatch") {
+        // NOT healed. A re-upload is exactly how bytes get replaced, so
+        // overwriting on a mismatch would let a replay launder the swap. Never a
+        // 2xx either: the sender keeps its copy. The row is left as it is for
+        // the worker's `content-changed` park and the sweeper to act on.
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "content-mismatch",
+                reason: "the stored document is not the one this row was published with; keep your copy and escalate",
+                retryable: false,
+                id: existing.id,
+                state: existing.state,
+            },
+            { status: 409 },
+        );
+    }
+    if (!held.ok) {
         // The caller just handed us the bytes again, so the orphan is fixable:
         // store them and republish. This is the retry HEALING the row rather
         // than merely reporting on it.
@@ -584,21 +663,77 @@ async function respondToSourceRefConflict(
         // disagree about whether a human's decision can be overwritten.
         const healable = finalizeDisposition(existing) === "publish";
         if (healable) {
-            const healed = await storeObject(payload.storagePath, payload.bytes, payload.mimeType);
+            // CLAIMED BEFORE IT IS WRITTEN — the same phase-A rule the publish
+            // uses, for the same reason.
+            //
+            // `uploadReceiptObject` returns false for a refusal AND for an
+            // ambiguous outcome: a write storage may well have accepted before
+            // the response was lost. Returning 503 on that without recording
+            // anything left those bytes in a private bucket with no row
+            // pointing at them, no event remembering them and no sweep looking
+            // for them — the row still points at its OLD path, so the
+            // stale-STAGING sweep never sees this one.
+            //
+            // The intent is committed first, in its own short transaction, and
+            // carries a lease so the sweeper leaves the path alone while this
+            // request is still using it. A heal that succeeds cancels it in the
+            // transaction that repoints the row; a heal that fails, ambiguously
+            // or otherwise, simply leaves it for the sweeper.
+            let healIntentId: string;
+            try {
+                healIntentId = await claimObjectPath(payload.storagePath, cleanupNotBefore(existing));
+            } catch {
+                // Writing an object we could not first promise to clean up IS
+                // the leak. Nothing is uploaded.
+                return NextResponse.json(
+                    { ok: false, reason: "storage-unavailable", retryable: true },
+                    { status: 503 },
+                );
+            }
+            const healed = await storeObject(payload.storagePath, payload.bytes, payload.mimeType, deadline);
             if (!healed) {
+                // AMBIGUOUS: storage may hold the bytes. The intent stands and
+                // the sweeper collects them once its lease lapses, rechecking
+                // live references first.
                 return NextResponse.json({ ok: false, error: "storage-failed" }, { status: 503 });
             }
             // The SAME fence /finalize publishes under: exact state, exact
             // reason, unclaimed. Losing this race means somebody moved the row
             // while we were uploading, so the object we just wrote is
             // unreferenced — clean it up rather than orphan it.
-            const { count } = await evidenceUpdateMany({
-                where: { id: existing.id, ...publishFence(existing) },
-                data: { storagePath: payload.storagePath, state: "RECEIVED", stateReason: null, nextRetryAt: null },
+            // ONE SHORT TRANSACTION, with the upload already done: the repoint
+            // and the cancellation of its intent land together or neither does.
+            const { count } = await inShortTx(async tx => {
+                // First statement, as the evidence lock requires: this heal
+                // publishes a row the missing-receipt sweep reads.
+                await lockReceiptEvidence(tx);
+                const moved = await tx.receiptIntake.updateMany({
+                    // leaseFence: the heal REPOINTS the row at bytes this request
+                    // uploaded, and a /start that reissued the client's URL in the
+                    // meantime moves neither the state, the reason nor the version.
+                    where: { id: existing.id, ...leaseFence(existing) },
+                    data: { storagePath: payload.storagePath, state: "RECEIVED", stateReason: null, nextRetryAt: null },
+                });
+                // Referenced from this instant, so the intent goes with it.
+                if (moved.count > 0) await resolveCanonicalIntent(tx, healIntentId);
+                return moved;
             });
             if (count === 0) {
+                // Same rule as the publish-race drop above: this branch has no
+                // transaction of its own, so a cleanup that could neither
+                // delete nor record must surface as a retryable 503 instead of
+                // being lost inside a 409.
                 if (payload.storagePath !== existing.storagePath) {
-                    await deleteObjectOrRecord(payload.storagePath, "heal-lost-race");
+                    const remembered = await deleteObjectOrRecord(
+                        payload.storagePath,
+                        "heal-lost-race",
+                    ).then(() => true, () => false);
+                    if (!remembered) {
+                        return NextResponse.json(
+                            { ok: false, reason: "storage-unavailable", retryable: true },
+                            { status: 503 },
+                        );
+                    }
                 }
                 return NextResponse.json(
                     { ok: false, error: "publish-conflict", id: existing.id },
@@ -624,8 +759,9 @@ async function respondToSourceRefConflict(
         );
     }
 
-    // The object is there. A STAGING row means the previous request uploaded
-    // successfully and only its publish UPDATE failed — finish it.
+    // The object is there AND it is this document. A STAGING row means the
+    // previous request uploaded successfully and only its publish UPDATE
+    // failed — finish it.
     if (existing.state === "STAGING") return publishStagedRow(existing.id, existing.storagePath);
 
     return NextResponse.json({

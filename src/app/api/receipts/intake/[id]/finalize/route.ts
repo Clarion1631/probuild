@@ -6,12 +6,13 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
-import { receiptObjectSize } from "@/lib/receipt-intake/bucket";
 import {
+    declaredShaConflict,
     finalizeDisposition,
     inspectStoredObject,
-    publishFence,
+    leaseFence,
     sealAndPublish,
+    verifyStoredCopy,
 } from "@/lib/receipt-intake/stored-object";
 import {
     authorizeEffectiveProject,
@@ -23,11 +24,17 @@ import {
 } from "@/lib/receipt-intake/late-fields";
 import {
     deleteObjectOrRecord,
+    queueObjectCleanup,
+    claimObjectPath,
+    resolveCanonicalIntent,
     rejectRowAndQueueCleanup,
     sealObject,
     settleQueuedCleanup,
+    inShortTx,
 } from "@/lib/receipt-intake/storage-cleanup";
-import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+import { cleanupNotBefore } from "@/lib/receipt-intake/worker";
+import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 
 /**
  * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
@@ -45,23 +52,51 @@ const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{
 export const dynamic = "force-dynamic";
 
 /**
- * A "we already have it" answer has to be TRUE.
+ * A "we already have it" answer has to be TRUE — and "it" means THIS DOCUMENT.
  *
  * Both replay paths used to return success from the row alone. The forwarders
  * treat that as permission to delete their only copy — so a row whose object had
  * gone missing (a bad publish, a cleanup that ran on the wrong path, a bucket
  * incident) got a cheerful 200 and the receipt ceased to exist anywhere.
  *
- * Metadata only, and bounded: one small `list` regardless of the object's size.
- * The three answers are deliberately different — an absence is a 409 the sender
- * can act on by re-uploading, a storage fault is a 503 it should simply retry,
- * and only a confirmed presence is success.
+ * PRESENCE WAS NOT ENOUGH EITHER. Confirming that SOMETHING sits at the path
+ * authorised the sender to delete its source copy on the strength of bytes
+ * nobody had looked at since they were sealed — so an object replaced or
+ * corrupted after publication (an upsert URL reused, a restore that put back a
+ * different version, a storage-side fault) was laundered into "we have your
+ * receipt" and the only good copy was then deleted by the sender. The row's
+ * `fileSha256` is the one hash this system ever verified; the stored bytes must
+ * still hash to it.
+ *
+ * Cheap probe first — one small `list` regardless of the object's size — so the
+ * common orphan case never pays for a download at all. The answers are
+ * deliberately different: an absence is a 409 the sender can act on by
+ * re-uploading, a storage fault is a 503 it should simply retry, a CONTENT
+ * mismatch is a 409 that must never look like success (the row is left exactly
+ * as it is, for the worker and the sweeper to act on), and only verified bytes
+ * are success.
  */
-async function confirmStoredCopy(storagePath: string): Promise<NextResponse | null> {
-    const present = await receiptObjectSize(storagePath);
-    if (present.ok) return null;
-    if (present.kind === "transient") {
+async function confirmStoredCopy(
+    storagePath: string,
+    fileSha256: string,
+    /** The REQUEST's deadline, not a fresh allowance for this probe. */
+    deadline: RouteDeadline | undefined,
+): Promise<NextResponse | null> {
+    const held = await verifyStoredCopy(storagePath, fileSha256, deadline);
+    if (held.ok) return null;
+    if (held.kind === "transient") {
         return NextResponse.json({ ok: false, reason: "storage-unavailable", retryable: true }, { status: 503 });
+    }
+    if (held.kind === "content-mismatch") {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "content-mismatch",
+                reason: "the stored document is not the one this row was published with; keep your copy and escalate",
+                retryable: false,
+            },
+            { status: 409 },
+        );
     }
     return NextResponse.json(
         {
@@ -146,6 +181,16 @@ async function authorizeFinalization(
 export const maxDuration = 30;
 
 /**
+ * THE ROUTE'S ONE ABSOLUTE DEADLINE, created at entry.
+ *
+ * This handler makes up to four storage calls -- the size probe, the
+ * download, the seal upload and, on a reject, the delete -- and it made
+ * every one of them with no deadline at all, so each took a fresh fifteen
+ * seconds inside a request the platform kills at thirty.
+ */
+const ROUTE_BUDGET_MS = 27_000;
+
+/**
  * Step 2 of the two-step upload: verify what actually landed, then publish.
  *
  * Everything here is checked against the STORED OBJECT, never against what the
@@ -158,6 +203,8 @@ export const maxDuration = 30;
  * row visible to the worker.
  */
 export async function POST(req: Request, context: { params: Promise<{ id: string }> }) {
+    // ONE deadline for the whole request -- see ROUTE_BUDGET_MS.
+    const deadline = createRouteDeadline(ROUTE_BUDGET_MS);
     const auth = await authenticateIntake(req, "ingest");
     if (!auth.ok) return auth.response;
 
@@ -170,7 +217,12 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // bug never surfaced as an error the caller could see or retry against.
     // Reading the raw text first is what makes the difference legible: only a
     // body that is empty (or whitespace) after trimming may mean "no fields".
-    let body: { sha256?: unknown; costCodeId?: unknown; projectId?: unknown } = {};
+    let body: {
+        sha256?: unknown;
+        uploadLease?: unknown;
+        costCodeId?: unknown;
+        projectId?: unknown;
+    } = {};
     const rawBody = await req.text();
     if (rawBody.trim()) {
         let parsed: unknown;
@@ -191,6 +243,10 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         body = parsed as typeof body;
     }
     const declaredSha = typeof body.sha256 === "string" ? body.sha256.trim().toLowerCase() : null;
+    // THE LEASE THIS CALLER'S URL WAS ISSUED UNDER. Required — see the gate below.
+    const declaredLease = typeof body.uploadLease === "string" && body.uploadLease.trim()
+        ? body.uploadLease.trim()
+        : null;
 
     // LATE FIELDS. A client that learned the job only after starting the upload
     // sends them here. They are applied WHERE NULL and refused where they
@@ -213,9 +269,28 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             id: true, source: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
             mimeType: true, projectId: true, costCodeId: true, dryRun: true, createdById: true,
             fileSha256: true, expectedSha256: true, uploadLeaseVersion: true,
+            // Read for ONE reason: the signed upload URL this row was given is
+            // a write capability that outlives every decision below, so every
+            // object deletion on this path has to be scheduled for after it
+            // dies rather than taken now. See cleanupNotBefore.
+            uploadUrlExpiresAt: true, createdAt: true,
+            // The lease GENERATION. Read so leaseFence can pin it: a /start
+            // refresh moves nothing else on this row, so without it an
+            // in-flight finalizer publishes (or rejects) over a lease that has
+            // already been reissued to a client still holding a working URL.
+            uploadLeaseNonce: true,
         },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
+
+
+
+    // WHEN THIS ROW'S OBJECT MAY BE DELETED, computed ONCE from the row as
+    // read, so the reject path and the seal path cannot disagree about it.
+    // Null means the upload lease is already dead and an immediate delete is
+    // correct — which is the case the stale-STAGING sweep is always in, since
+    // it refuses to do anything destructive while a lease is live.
+    const cleanupAfter = cleanupNotBefore(row);
 
     // A SECRET OWNS SOURCES, NOT ROWS.
     //
@@ -247,6 +322,87 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         row.createdById === auth.user.id ||
         STAFF_READ_ROLES.includes(auth.user.role);
     if (!maySee) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
+
+    // ── BOUND TO THE LEASE THAT ISSUED THIS CALLER'S URL ───────────────────
+    //
+    // /start rotates `uploadLeaseNonce` on every issue and every adoption, and
+    // it now RETURNS that value. This gate is what makes returning it mean
+    // something: a finalizer must present the generation its own signed URL was
+    // issued under, and one that does not match the row's current lease is
+    // refused before it reads a single byte.
+    //
+    // Reading the row's CURRENT nonce (which is all this used to do, implicitly)
+    // meant a delayed finalizer silently ADOPTED whichever lease had been
+    // issued since. Both /start calls hand out URLs for the SAME path, so:
+    // client A starts an upload, client B's retry refreshes the lease and gets
+    // a working URL, A's finalize finally arrives, inspects B's half-written
+    // object, finds it unacceptable and DELETES the row — while B is still
+    // uploading to a URL that works. The row, and the only record of an inbound
+    // receipt, are gone.
+    //
+    // BEFORE the storage inspection and before every mutation, deliberately:
+    // this must cost nothing and touch nothing. 409, and `retryable` is false —
+    // the caller cannot fix a stale lease by retrying the same request; it has
+    // to call /start again and use the URL that comes back.
+    //
+    // A row with a NULL nonce was never issued a signed URL at all (the
+    // single-shot inline path writes its bytes through the server), so no
+    // caller can hold a valid generation for it and the comparison correctly
+    // refuses every two-step finalize against one.
+    if (!declaredLease || declaredLease !== row.uploadLeaseNonce) {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "lease-stale",
+                reason: declaredLease
+                    ? "this upload lease has been superseded; call /start again for a fresh URL"
+                    : "uploadLease is required — send the value /start returned with your URL",
+                retryable: false,
+            },
+            { status: 409 },
+        );
+    }
+
+    // THE ROW, PINNED TO THE LEASE THE CALLER PROVED IT HOLDS.
+    //
+    // Equal to `row` by the gate immediately above — and written this way on
+    // purpose. Every fence below is built from the value the CLIENT echoed
+    // rather than from whatever the freshly-read row happened to say, so a
+    // future edit that moved or weakened the gate would leave these CASes
+    // pinning a generation nobody proved, which is the whole bug.
+    const leased = { ...row, uploadLeaseNonce: declaredLease };
+
+    // THE DECLARED HASH IS ENFORCED HERE, ONCE, AHEAD OF EVERY OUTCOME.
+    //
+    // It used to be checked on the publish path alone — against the STORED
+    // BYTES, further down — which meant a finalize against an already-settled
+    // row (RECEIVED, READ, BOOKED) verified storage against the ROW's hash,
+    // never looked at the hash the REQUEST carried, and answered 200
+    // alreadyFinalized. A forwarder holding a stale or wrong row id was
+    // therefore told we had ITS receipt while we had a different one, and it
+    // deletes its only copy on that answer.
+    //
+    // Placed above the disposition split rather than inside the settled branch
+    // so that no success response in this handler can be added later that
+    // bypasses it. The publish path still re-checks the declared hash against
+    // the bytes it just read, which is the stronger question and the only one
+    // a STAGING row (`fileSha256` is "") can be asked at all.
+    //
+    // Same rule /start already applies to its own settled replay: a recorded
+    // `fileSha256` that disagrees with the caller's hash is a 409, never a
+    // rebinding of this identity to different bytes.
+    if (declaredShaConflict(row.fileSha256, declaredSha)) {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "sha-mismatch",
+                reason: "this row holds a different document than the sha256 you declared",
+                recordedSha256: row.fileSha256,
+                state: row.state,
+            },
+            { status: 409 },
+        );
+    }
 
     // Authorize the late fields BEFORE anything is written or published.
     const denied = await authorizeFinalization(auth, row.projectId, lateFields);
@@ -286,8 +442,8 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     if (!recoverable) {
         // The object first: `alreadyFinalized` is what makes a forwarder drop
         // its copy, so it must not be said about a row whose bytes are gone.
-        const missing = await confirmStoredCopy(row.storagePath);
-        if (missing) return missing;
+        const unusable = await confirmStoredCopy(row.storagePath, row.fileSha256, deadline);
+        if (unusable) return unusable;
         const conflict = await applyLateFields(id, lateFields, auth);
         if (conflict) return conflict;
         // PERSISTED values, re-read after the reconcile — the caller must be
@@ -305,7 +461,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // ONE validator, shared with the worker's stale-STAGING sweep — see
     // stored-object.ts. If the two disagreed, whichever ran first would decide
     // whether a 40 MB video became a receipt.
-    const check = await inspectStoredObject(row.storagePath, row.mimeType);
+    const check = await inspectStoredObject(row.storagePath, row.mimeType, deadline);
     if (!check.ok) {
         if (check.kind === "missing") {
             // The upload never landed. Retryable, and NEVER a 2xx: the
@@ -322,6 +478,13 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // are ONE transaction. A best-effort delete followed by a best-effort
         // cleanup could drop the row and lose the object with nothing left
         // referencing or remembering it.
+        //
+        // THE OBJECT DOES NOT GO YET, THOUGH. Unlike the sweeper, this path
+        // rejects a row whose signed upload URL is typically still live —
+        // /finalize is what a client calls minutes after /start — and deleting
+        // under a live write capability just invites the holder's delayed PUT
+        // to put the bytes back with the row already gone. The queue entry
+        // carries the schedule and IS the tombstone until then.
         const rejected = await rejectRowAndQueueCleanup(
             {
                 id,
@@ -329,6 +492,13 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 stateReason: row.stateReason,
                 storagePath: row.storagePath,
                 uploadLeaseVersion: row.uploadLeaseVersion,
+                // The lease GENERATION, so a /start that reissued this
+                // client's URL while we were inspecting the object makes this
+                // delete match zero rows instead of destroying a row whose
+                // upload link works again.
+                uploadLeaseNonce: leased.uploadLeaseNonce,
+                uploadUrlExpiresAt: row.uploadUrlExpiresAt,
+                cleanupNotBefore: cleanupAfter,
             },
             check.reason,
         );
@@ -348,7 +518,9 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 { status: 409 },
             );
         }
-        await settleQueuedCleanup(rejected.eventId, row.storagePath);
+        // A no-op while the upload URL is still live; the sweep picks the
+        // event up once it is due.
+        await settleQueuedCleanup(rejected.eventId, row.storagePath, cleanupAfter);
         const status = check.reason.startsWith("file-too-large") ? 413 : 400;
         return NextResponse.json(
             { ok: false, reason: check.reason, maxBytes: MAX_STORED_BYTES },
@@ -427,17 +599,22 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     // ONE shared seal-and-publish, also used by the worker's stale-STAGING
     // sweep, so the two publishers cannot diverge on ordering or fencing.
-    const outcome = await sealAndPublish(row.storagePath, id, check, {
+    const outcome = await sealAndPublish(row.storagePath, id, row.uploadLeaseVersion, check, {
+        inShortTx,
         seal: sealObject,
-        commit: async (canonicalPath, values) => {
-            const { count } = await evidenceUpdateMany({
+        commit: async (tx, canonicalPath, values) => {
+            // The settle transaction's FIRST statement: this publish is a
+            // state transition the missing-receipt sweep reads, so it takes
+            // the evidence lock like every other evidence write here.
+            await lockReceiptEvidence(tx);
+            const { count } = await tx.receiptIntake.updateMany({
                 // Fenced on the EXACT state and reason observed, on the row
                 // being unclaimed, and on every captured value this publish was
                 // validated against. Anything that moved between the read and
                 // this write — a re-park under a different reason, a worker
                 // claim, a job filled in — invalidates what was checked above,
                 // so the publish must lose rather than overwrite it.
-                where: { id, ...publishFence(row), ...merged.guard },
+                where: { id, ...leaseFence(leased), ...merged.guard },
                 data: {
                     state: "RECEIVED",
                     stateReason: null,
@@ -453,18 +630,24 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             });
             return count;
         },
-        dropUpload: uploadPath => deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
-        currentStoragePath: async rowId => {
-            const r = await prisma.receiptIntake.findUnique({ where: { id: rowId }, select: { storagePath: true } });
-            return r?.storagePath ?? null;
-        },
-        // A lost CAS here means another /finalize (or the worker's
-        // stale-STAGING sweep) already published this row while we were
-        // mid-request — best-effort so a slow deleteObjectOrRecord failure
-        // still lands on the same retry queue as every other orphan.
-        dropOrphanedCanonical: canonicalPath =>
-            deleteObjectOrRecord(canonicalPath, "orphaned-lost-publish-cas").then(() => undefined),
-    });
+        // The UPLOAD path, whose signed URL is exactly the one the client just
+        // used — so this delete waits for that URL to die. Deleting the moment
+        // the pointer moved to the canonical path left the holder able to PUT
+        // the upload path back into existence, unreferenced and unremembered.
+        //
+        // ENQUEUED IN THE COMMIT TRANSACTION: the queue entry is the only thing
+        // that remembers this object once the row points elsewhere, so it must
+        // commit with the pointer or not at all.
+        queueUploadCleanup: (tx, uploadPath) =>
+            queueObjectCleanup(tx, uploadPath, "sealed", cleanupAfter),
+        // The canonical copy is written before the pointer commit, so it is
+        // promised to the cleanup queue before it exists — same schedule, so a
+        // client still holding a live URL is never racing a sweep.
+        claimCanonicalPath: canonicalPath => claimObjectPath(canonicalPath, cleanupAfter),
+        resolveCanonicalIntent,
+        settleUploadCleanup: (eventId, uploadPath) =>
+            settleQueuedCleanup(eventId, uploadPath, cleanupAfter).then(() => undefined),
+    }, deadline);
 
     if (!outcome) {
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
@@ -510,8 +693,11 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // Same outcome for the caller — but the late fields still have to be
         // reconciled against what that publisher wrote, and the same "do we
         // actually hold it" rule applies.
-        const missing = await confirmStoredCopy(current.storagePath);
-        if (missing) return missing;
+        // Against `current.fileSha256`, not this call's `fileSha256`: the two
+        // were just proven equal by `positivelyPublished`, and the row's own
+        // value is what every later reader verifies against.
+        const unusable = await confirmStoredCopy(current.storagePath, current.fileSha256, deadline);
+        if (unusable) return unusable;
         const reconciled = await applyLateFields(id, lateFields, auth);
         if (reconciled) return reconciled;
         return NextResponse.json({ ok: true, alreadyFinalized: true, id, state: current.state });

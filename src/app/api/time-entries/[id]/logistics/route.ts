@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { withPayrollWrite, withPeriodLockedRoute } from "@/lib/payroll-period";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { PROJECT_STATUS_IN_PROGRESS } from "@/lib/project-status";
 import { z } from "zod";
@@ -26,7 +27,12 @@ const BodySchema = z.object({
 //   - MANAGER/ADMIN: any time (the manager page is the canonical re-route)
 //   - routeToProjectId null = keep (or return to) overhead
 
-export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function PATCH(req: Request, context: { params: Promise<{ id: string }> }) {
+    // A payroll write inside: a locked period is a 423, never a 500.
+    return withPeriodLockedRoute(() => PATCHHandler(req, context));
+}
+
+async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: string }> }): Promise<NextResponse> {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
@@ -37,6 +43,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         select: {
             id: true, userId: true, projectId: true, routedFromProjectId: true, rawNote: true, notes: true,
             invoiceId: true, invoicedAt: true, endTime: true, routedAt: true, routedById: true,
+            changeOrderId: true,
             project: { select: { isLogistics: true } },
         },
     });
@@ -78,6 +85,19 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         // and the job-cost "unbilled" filter would both be wrong.
         if (entry.invoiceId != null || entry.invoicedAt != null) {
             return NextResponse.json({ error: "This time was already invoiced and cannot be re-routed", code: "ALREADY_INVOICED" }, { status: 409 });
+        }
+        // A change-order tag belongs to the job the entry is ON. Moving the
+        // entry and leaving the tag behind would bill this job's hours against
+        // another job's change order — the same wrong outcome the tagging
+        // path's own race guard refuses (tagTimeEntriesToChangeOrderCore).
+        // REFUSED rather than cleared: dropping somebody's cost-plus tag as a
+        // silent side effect of a re-route is not a decision this route gets to
+        // make. Untag on /time-expenses first, then re-route.
+        if (entry.changeOrderId != null) {
+            return NextResponse.json(
+                { error: "This time is tagged to a change order — remove the change-order tag before re-routing it", code: "CHANGE_ORDER_TAGGED" },
+                { status: 409 }
+            );
         }
         // A worker's routing is the clock-out decision, not a standing power to
         // re-cost history: open or freshly closed entries only, and never after
@@ -133,14 +153,21 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // cannot both win. A lost-response retry that finds its own routing already
     // applied gets a 200, not a false failure.
     const routing = body.routeToProjectId !== undefined;
-    const claim = await prisma.timeEntry.updateMany({
+    // Payroll write: goes through the advisory-lock protocol so a locked
+    // period refuses it (src/lib/payroll-period.ts).
+    const claim = await withPayrollWrite({ entryIds: [id] }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.updateMany({
         where: {
             id,
-            ...(routing ? { invoiceId: null, invoicedAt: null } : {}),
+            // changeOrderId pinned for the same reason invoiceId is: a tag
+            // landing between the read above and this write must win, or the
+            // entry leaves the job its change order belongs to.
+            ...(routing ? { invoiceId: null, invoicedAt: null, changeOrderId: null } : {}),
             ...(routing && !isPrivileged ? { OR: [{ routedById: null }, { routedById: user.id }] } : {}),
         },
         data,
-    });
+        })
+    );
     const current = await prisma.timeEntry.findUnique({ where: { id }, select: resultSelect });
     if (!current) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
     if (claim.count === 0) {

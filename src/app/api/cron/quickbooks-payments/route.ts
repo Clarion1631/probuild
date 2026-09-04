@@ -24,5 +24,14 @@ export async function GET(request: Request) {
     if (result.settled > 0 || result.errors.length > 0) {
         console.log("[cron/quickbooks-payments]", JSON.stringify(result));
     }
+    // A run that failed outright must not answer 200. Vercel's cron log, the
+    // monitoring on top of it, and anyone re-running this by hand all read the
+    // STATUS first — a 200 carrying runFailed:true in the body meant an outage
+    // that skipped every row reported as a clean hourly sync. 503 because it is
+    // retryable by definition (the next hourly run continues from the cursor);
+    // the body is unchanged so nothing parsing it has to move.
+    if (result.runFailed) {
+        return NextResponse.json({ ...result, retry: true }, { status: 503 });
+    }
     return NextResponse.json(result);
 }

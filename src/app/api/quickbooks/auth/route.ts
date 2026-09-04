@@ -1,9 +1,16 @@
 import { NextResponse } from "next/server";
+import { requireIntegrationAccess } from "@/lib/integration-access";
 
 const QB_AUTH_URL = "https://appcenter.intuit.com/connect/oauth2";
 const SCOPES = "com.intuit.quickbooks.accounting";
 
 export async function GET() {
+    // Starting an OAuth flow is a settings change in progress: it mints the
+    // CSRF state the callback below trusts, and the callback writes access
+    // tokens. Both were open to any signed-in account (review round 10).
+    const gate = await requireIntegrationAccess();
+    if ("response" in gate) return gate.response;
+
     const clientId = process.env.QB_CLIENT_ID;
     if (!clientId) {
         return NextResponse.json({ error: "QB_CLIENT_ID not configured in Vercel" }, { status: 500 });

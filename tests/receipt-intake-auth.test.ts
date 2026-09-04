@@ -556,10 +556,16 @@ test("ANONYMOUS action dispatch: allowlisted paths pass, everything else is 403"
     const prod = env.NODE_ENV;
     env.NODE_ENV = "production";
 
-    const dispatch = (p: string) =>
+    // A dispatch may carry the tree's own session cookie. Round 49 (main) made
+    // that PRESENCE the condition for dispatching through a bypassed tree: an
+    // action id is a public build artefact, not an authorization token, so
+    // `/portal` being reachable must not mean anybody may run any action there.
+    const dispatch = (p: string, cookie?: string) =>
         proxy(new NextRequest(`https://probuild.test${p}`, {
             method: "POST",
-            headers: { "next-action": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+            headers: cookie
+                ? { "next-action": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", cookie }
+                : { "next-action": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
         }), event);
 
     try {
@@ -615,15 +621,25 @@ test("ANONYMOUS action dispatch: allowlisted paths pass, everything else is 403"
             "/sub-portal/login",
             "/sub-portal/projects/abc123",
         ]) {
-            const res = await dispatch(path);
+            const cookie = path.startsWith("/sub-portal")
+                ? "sub_portal_token=t"
+                : "client_portal_token=t";
+            const res = await dispatch(path, cookie);
             assert.equal(res!.headers.get("x-middleware-next"), "1", `${path} must still dispatch`);
+            // ...and the SAME path with no session evidence is refused.
+            assert.equal((await dispatch(path))!.status, 403, `${path} must refuse an anonymous dispatch`);
         }
 
         // The allowlist is a PREFIX of path segments, not a substring: a route
-        // that merely starts with the same letters is not the portal.
+        // that merely starts with the same letters is not the portal. None of
+        // these is a public bypass, so the staff auth matcher answers instead of
+        // the action check  a 307 to /login rather than a 403. Either way the
+        // proxy KEEPS CONTROL, which is the property that matters: the dispatch
+        // must never be waved through to the action.
         for (const path of ["/portalx", "/sub-portalx", "/api/portal-ish"]) {
             const res = await dispatch(path);
-            assert.equal(res!.status, 403, path);
+            assert.equal(res!.headers.get("x-middleware-next"), null, path);
+            assert.notEqual(res!.status, 200, path);
         }
 
         // And an ordinary request — no next-action header — is untouched on

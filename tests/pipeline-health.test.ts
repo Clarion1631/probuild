@@ -18,14 +18,27 @@ import {
     evaluatePipelineHealth,
     formatPipelineDigest,
     runProbe,
+    createLimiter,
+    statementTimeoutRunner,
+    PROBE_CONCURRENCY,
     BOOKED_PUSH_STATUSES,
     type PipelineHealth,
     INTAKE_STUCK_HOURS,
     CHASER_STALE_HOURS,
     INTAKE_STAGING_STUCK_MINUTES,
+    type ProbeRunner,
 } from "../src/lib/pipeline-health";
 
 const NOW = Date.parse("2026-09-01T14:00:00.000Z");
+
+/**
+ * The probe runner, without a database.
+ *
+ * Production hands each probe a transaction client carrying a server-side
+ * statement timeout; these tests are about the DEADLINE and the CONCURRENCY,
+ * so they inject a pass-through rather than a Postgres.
+ */
+const passThrough: ProbeRunner = <T,>(_ms: number, fn: (db: any) => Promise<T>) => fn({} as any);
 const HOUR = 3_600_000;
 
 function iso(msAgo: number): string {
@@ -36,6 +49,7 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
     return {
         intuit: { status: "ok" as const, indicator: "none" },
         lastPurchaseSync: { status: "ok" as const, at: iso(2 * HOUR) },
+        purchaseSyncRun: { status: "ok" as const, at: iso(2 * HOUR), runStatus: "ok" as string | null },
         lastReceiptPush: { status: "ok" as const, at: iso(3 * HOUR) },
         lastPaymentsSync: { status: "ok" as const, at: iso(1 * HOUR) },
         receipts24h: { status: "ok" as const, counts: { created: 4 } },
@@ -51,6 +65,8 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         chaser: { status: "ok" as const, phase: "done", completedAt: iso(1 * HOUR) },
         // The nightly QBO pull is OFF by default, so it contributes no reason.
         bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
+        intakeQuarantined: { status: "ok" as const, count: 0 },
+        payLinksPending: { status: "ok" as const, count: 0 },
         now: NOW,
         ...overrides,
     };
@@ -63,7 +79,7 @@ test("a healthy snapshot is ok with no reasons", () => {
 // ─── False green from a failed probe ────────────────────────────────────────
 
 test("ANY failed probe forces ok:false with probe-failed:<name>", () => {
-    const names = ["lastPurchaseSync", "lastReceiptPush", "lastPaymentsSync", "receipts24h", "bank", "stuck"] as const;
+    const names = ["lastPurchaseSync", "purchaseSyncRun", "lastReceiptPush", "lastPaymentsSync", "receipts24h", "bank", "stuck", "payLinksPending"] as const;
     for (const name of names) {
         const base = snapshot();
         const broken = {
@@ -179,6 +195,29 @@ test("multiple independent failures all appear", () => {
     ]);
 });
 
+// ─── Pay links that were never written ─────────────────────────────────────
+
+test("a milestone linked in QuickBooks with no pay link makes health red", () => {
+    // The maintenance sweep can report `ok: true` and still leave one of these
+    // behind — a bill the client cannot pay. Health measures it directly rather
+    // than taking that sweep's word for it, so a maintenance run that never
+    // happened cannot read as health either.
+    const v = evaluatePipelineHealth(snapshot({ payLinksPending: { status: "ok", count: 2 } }));
+    assert.equal(v.ok, false);
+    assert.ok(v.reasons.includes("pay-links-pending:2"), v.reasons.join(","));
+});
+
+test("no pending pay links adds no reason", () => {
+    const v = evaluatePipelineHealth(snapshot({ payLinksPending: { status: "ok", count: 0 } }));
+    assert.deepEqual(v, { ok: true, reasons: [] });
+});
+
+test("a FAILED pay-link probe reports the probe, not a count of zero", () => {
+    const v = evaluatePipelineHealth(snapshot({ payLinksPending: { status: "error", count: 0 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["probe-failed:payLinksPending"], "the 0 fallback is not evidence");
+});
+
 // ─── Digest formatting ─────────────────────────────────────────────────────
 
 function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
@@ -189,6 +228,7 @@ function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
         intuit: { status: "ok", indicator: "none", description: "All Systems Operational" },
         qbo: {
             lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            purchaseSyncRun: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
             lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
             lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
         },
@@ -199,7 +239,9 @@ function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
             stuck: { status: "ok", count: 0 },
             needsReview: { status: "ok", count: 0 },
             unassigned: { status: "ok", count: 0 },
+            quarantined: { status: "ok", count: 0 },
         },
+        payLinksPending: { status: "ok" as const, count: 0 },
         ...overrides,
     };
 }
@@ -232,6 +274,7 @@ test("digest says how long the silence has been, so a human can judge it", () =>
             reasons: ["no-receipts-72h"],
             qbo: {
                 lastPurchaseSync: { status: "ok", at: "2026-08-20T14:00:00.000Z" },
+                purchaseSyncRun: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
                 lastReceiptPush: { status: "ok", at: "2026-08-20T14:00:00.000Z" },
                 lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
             },
@@ -269,12 +312,14 @@ test("digest renders missing timestamps as 'never' rather than a bogus date", ()
         sampleHealth({
             qbo: {
                 lastPurchaseSync: { status: "ok", at: null },
+                purchaseSyncRun: { status: "ok", at: null },
                 lastReceiptPush: { status: "ok", at: null },
                 lastPaymentsSync: { status: "ok", at: null },
             },
         }),
     );
-    assert.match(text, /Last QBO purchase sync: never/);
+    assert.match(text, /Last QBO purchase booked: never/);
+    assert.match(text, /Last purchase sync run: never/);
     assert.match(text, /Last receipt booked: never/);
 });
 
@@ -291,23 +336,23 @@ test("a probe that never settles is reported as a timeout, not left hanging", as
     // the whole health check until the platform killed it — for a cron that
     // means a silent morning with no digest at all.
     const started = Date.now();
-    const result = await runProbe("wedged", () => new Promise<number>(() => {}), -1, 50);
+    const result = await runProbe("wedged", () => new Promise<number>(() => {}), -1, 50, { withDb: passThrough });
     assert.deepEqual(result, { status: "error", reason: "timeout", value: -1 });
     assert.ok(Date.now() - started < 2_000, "must return on its own deadline");
 });
 
 test("a probe that resolves in time reports ok with its value", async () => {
-    const result = await runProbe("fast", async () => 42, -1, 1_000);
+    const result = await runProbe("fast", async () => 42, -1, 1_000, { withDb: passThrough });
     assert.deepEqual(result, { status: "ok", value: 42 });
 });
 
 test("a throwing probe is an error with reason 'error', distinct from a timeout", async () => {
-    const result = await runProbe("boom", async () => { throw new Error("db down"); }, -1, 1_000);
+    const result = await runProbe("boom", async () => { throw new Error("db down"); }, -1, 1_000, { withDb: passThrough });
     assert.deepEqual(result, { status: "error", reason: "error", value: -1 });
 });
 
 test("a timed-out probe still forces ok:false through the verdict", async () => {
-    const timedOut = await runProbe("stuck", () => new Promise<number>(() => {}), 0, 20);
+    const timedOut = await runProbe("stuck", () => new Promise<number>(() => {}), 0, 20, { withDb: passThrough });
     const v = evaluatePipelineHealth(snapshot({ stuck: { status: timedOut.status, reason: timedOut.reason, count: timedOut.value } }));
     assert.equal(v.ok, false);
     assert.ok(v.reasons.includes("probe-failed:stuck"));
@@ -455,6 +500,7 @@ test("the digest flags an incomplete payments run in the body", () => {
         reasons: ["payments-sync-partial"],
         qbo: {
             lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            purchaseSyncRun: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
             lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
             lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z", runStatus: "partial" },
         },
@@ -498,6 +544,7 @@ test("the digest marks a failed last payments run", () => {
         reasons: ["payments-sync-error"],
         qbo: {
             lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            purchaseSyncRun: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
             lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
             lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z", runStatus: "error" },
         },
@@ -609,8 +656,37 @@ test("stuck and unassigned are reported separately", () => {
     assert.ok(v.reasons.includes("intake-unassigned:3"));
 });
 
+test("QUARANTINED cutover rows are counted, and get their own reason", () => {
+    // SHADOW_QUARANTINE is terminal, never auto-requeued, and NOBODY has
+    // booked it: v1 stopped, and v2 refused because there is no shared QBO
+    // identity to make a second booking idempotent. It is neither NEEDS_REVIEW
+    // nor NEEDS_JOB, so before this it was invisible to every probe here and a
+    // pile of unbooked expenses read as a healthy pipeline.
+    const v = evaluatePipelineHealth(snapshot({ intakeQuarantined: { status: "ok", count: 3 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["receipt-quarantine:3"]);
+});
+
+test("the quarantine reason is separate from review and unassigned", () => {
+    // Three different actions: check QuickBooks and decide, clear a review
+    // item, assign a job. Folding them into one number hides two of them.
+    const v = evaluatePipelineHealth(snapshot({
+        intakeUnassigned: { status: "ok", count: 2 },
+        intakeQuarantined: { status: "ok", count: 4 },
+    }));
+    assert.ok(v.reasons.includes("intake-unassigned:2"));
+    assert.ok(v.reasons.includes("receipt-quarantine:4"));
+});
+
+test("CONTROL: a NEEDS_REVIEW backlog does not produce a quarantine reason", () => {
+    // Without this, a count that accidentally selected every parked state
+    // would still pass the test above.
+    const v = evaluatePipelineHealth(snapshot({ intakeNeedsReview: { status: "ok", count: 40 } }));
+    assert.deepEqual(v.reasons, []);
+});
+
 test("an intake probe that FAILED is not an intake probe that found nothing", () => {
-    for (const name of ["intakeStuck", "intakeNeedsReview", "intakeUnassigned"] as const) {
+    for (const name of ["intakeStuck", "intakeNeedsReview", "intakeUnassigned", "intakeQuarantined"] as const) {
         const v = evaluatePipelineHealth(snapshot({ [name]: { status: "error", reason: "timeout", count: 0 } }));
         assert.equal(v.ok, false, name);
         assert.ok(v.reasons.includes(`probe-failed:${name}`), name);
@@ -657,17 +733,42 @@ test("a STAGING row is not counted as stuck while its own upload lease is still 
     );
 });
 
-test("the digest prints all three intake numbers", () => {
+test("the quarantine PROBE actually counts SHADOW_QUARANTINE, with no age gate", () => {
+    // Same source-level pin as the STAGING test above, for the same reason:
+    // count() talks to real Prisma. Two properties, and both matter — the
+    // state it selects, and that it does NOT carry a createdAt threshold. A
+    // quarantined row is terminal the instant the cutover writes it, so an
+    // age gate copied from the NEEDS_JOB probe next door would hide every one
+    // of them for six hours for no reason.
+    const root = path.resolve(__dirname, "..");
+    const src = readFileSync(path.join(root, "src/lib/pipeline-health.ts"), "utf8");
+    // Anchored on the probe DECLARATION, not on the name — the name also
+    // appears in namedProbes above, and slicing from there would read the
+    // whole evaluator and pass on any mention of the state anywhere.
+    const declared = /probe<number>\(\r?\n\s*"intakeQuarantined",([\s\S]*?)\r?\n\s*\),/.exec(src);
+    assert.ok(declared, "the probe exists");
+    const branch = declared[1];
+    assert.match(branch, /state: "SHADOW_QUARANTINE"/);
+    assert.ok(!branch.includes("createdAt"), "no age threshold on a terminal state");
+    // And it is a REASON, not just a printed number.
+    assert.match(src, /receipt-quarantine:\$\{input\.intakeQuarantined\.count\}/);
+});
+
+test("the digest prints all four intake numbers", () => {
     const { text } = formatPipelineDigest(sampleHealth({
         intake: {
             stuck: { status: "ok", count: 3 },
             needsReview: { status: "ok", count: 7 },
             unassigned: { status: "ok", count: 2 },
+            quarantined: { status: "ok", count: 5 },
         },
     }));
     assert.match(text, /Receipt intake stuck >6h: 3/);
     assert.match(text, /Receipt intake awaiting review: 7/);
     assert.match(text, /Receipt intake awaiting a job \(>6h\): 2/);
+    // SHADOW_QUARANTINE rows are terminal and unbooked, and no other line here
+    // can see them: before this they were invisible to the whole digest.
+    assert.match(text, /Receipt intake quarantined \(cutover, needs a decision\): 5/);
 });
 
 test("the digest says a failed intake probe is unavailable, never zero", () => {
@@ -676,10 +777,430 @@ test("the digest says a failed intake probe is unavailable, never zero", () => {
             stuck: { status: "error", reason: "timeout", count: 0 },
             needsReview: { status: "error", reason: "timeout", count: 0 },
             unassigned: { status: "error", reason: "timeout", count: 0 },
+            quarantined: { status: "error", reason: "timeout", count: 0 },
         },
     }));
     assert.match(text, /Receipt intake stuck >6h: unavailable \(probe failed\)/);
     assert.match(text, /Receipt intake awaiting review: unavailable \(probe failed\)/);
+    assert.match(text, /Receipt intake quarantined \(cutover, needs a decision\): unavailable \(probe failed\)/);
+});
+
+// ─── A refused credential names its own fix ─────────────────────────────────
+
+test("a QuickBooks auth refusal reads as reconnect-needed, not a generic error", () => {
+    // "Automation errors (24h): 3" does not tell anyone to reconnect
+    // QuickBooks, and nothing in this pipeline fixes itself less on its own.
+    const verdict = evaluatePipelineHealth(snapshot({ qboAuth: { status: "ok", count: 2 } }));
+    assert.equal(verdict.ok, false);
+    assert.ok(verdict.reasons.includes("quickbooks-reconnect-needed"), verdict.reasons.join(","));
+
+    // Zero is silent, and an absent probe (older snapshot) changes nothing.
+    assert.deepEqual(evaluatePipelineHealth(snapshot({ qboAuth: { status: "ok", count: 0 } })), { ok: true, reasons: [] });
+    assert.deepEqual(evaluatePipelineHealth(snapshot()), { ok: true, reasons: [] });
+
+    // And a probe that could not run must not read as "no auth failures".
+    const failed = evaluatePipelineHealth(snapshot({ qboAuth: { status: "error", reason: "error", count: 0 } }));
+    assert.equal(failed.ok, false);
+    assert.ok(failed.reasons.includes("probe-failed:qboAuth"), failed.reasons.join(","));
+});
+
+// ─── The purchase sync's own heartbeat ─────────────────────────────────────
+//
+// Round 36 gate: `lastPurchaseSync` is a DATA timestamp — the newest Expense
+// row QBO imported — so it legitimately stands still on a quiet week and could
+// never be read as "the job is alive". Nothing else watched the scheduled
+// qbo-sync at all, so health went green while purchases had not been imported
+// for weeks, or ever.
+
+test("purchase sync that has NEVER completed a cron run is red, with its own reason", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: null, runStatus: null },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["purchase-sync-never-ran"]);
+});
+
+test("purchase sync older than the staleness window is red", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(20 * HOUR), runStatus: "ok" },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["purchase-sync-stale"]);
+});
+
+test("a purchase sync inside the window with an ok run is green", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(5 * HOUR), runStatus: "ok" },
+    }));
+    assert.deepEqual(v, { ok: true, reasons: [] });
+});
+
+test("the LATEST purchase-sync cron run failing is red at any age", () => {
+    // Same rule as the payments heartbeat: freshness comes from the last run
+    // that actually ran, but the reported status is the latest event whatever
+    // it was — otherwise an error right after a success is invisible.
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(1 * HOUR), runStatus: "error" },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["purchase-sync-error"]);
+});
+
+test("a partial purchase-sync run counts for freshness and is still flagged", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(1 * HOUR), runStatus: "partial" },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["purchase-sync-partial"]);
+});
+
+test("staleness and a failed latest run are reported together, not one instead of the other", () => {
+    // They are separately actionable: "nothing has run in days" and "the last
+    // thing that did run failed" send a human to different places.
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(40 * HOUR), runStatus: "error" },
+    }));
+    assert.deepEqual(v.reasons, ["purchase-sync-stale", "purchase-sync-error"]);
+});
+
+test("QBO_PURCHASE_SYNC_STALE_HOURS overrides the window, and a junk value falls back", async () => {
+    const { DEFAULT_PURCHASE_SYNC_STALE_HOURS, purchaseSyncStaleHours } = await import("../src/lib/pipeline-health");
+    const previous = process.env.QBO_PURCHASE_SYNC_STALE_HOURS;
+    try {
+        process.env.QBO_PURCHASE_SYNC_STALE_HOURS = "48";
+        assert.equal(purchaseSyncStaleHours(), 48);
+        // 20h ago is stale at the 9h default and fresh at 48h.
+        assert.deepEqual(
+            evaluatePipelineHealth(snapshot({
+                purchaseSyncRun: { status: "ok", at: iso(20 * HOUR), runStatus: "ok" },
+            })),
+            { ok: true, reasons: [] },
+        );
+        // A value that parses to NaN must NOT make every comparison false —
+        // that is the fail-OPEN direction this heartbeat exists to close.
+        for (const junk of ["", "soon", "0", "-3"]) {
+            process.env.QBO_PURCHASE_SYNC_STALE_HOURS = junk;
+            assert.equal(purchaseSyncStaleHours(), DEFAULT_PURCHASE_SYNC_STALE_HOURS, `junk value ${JSON.stringify(junk)}`);
+        }
+        process.env.QBO_PURCHASE_SYNC_STALE_HOURS = "soon";
+        const v = evaluatePipelineHealth(snapshot({
+            purchaseSyncRun: { status: "ok", at: iso(20 * HOUR), runStatus: "ok" },
+        }));
+        assert.deepEqual(v.reasons, ["purchase-sync-stale"]);
+    } finally {
+        if (previous === undefined) delete process.env.QBO_PURCHASE_SYNC_STALE_HOURS;
+        else process.env.QBO_PURCHASE_SYNC_STALE_HOURS = previous;
+    }
+});
+
+test("the sync route logs the exact kind/source the heartbeat queries for", async () => {
+    // A heartbeat that watches a kind nothing writes is worse than none: it is
+    // permanently red, or (as here, before the fix) permanently absent.
+    const { PURCHASE_SYNC_EVENT_KIND, PURCHASE_SYNC_CRON_SOURCE } = await import("../src/lib/pipeline-health");
+    const logged: any[] = [];
+    const { createQboExpenseSyncHandlers } = await import("../src/app/api/integrations/qbo-expenses/sync/route");
+    const handlers = createQboExpenseSyncHandlers({
+        getIngestSecret: () => "ingest",
+        getCronSecret: () => "cron-secret",
+        isCronEnabled: () => true,
+        getFreshTokens: async () => ({ accessToken: "a", refreshToken: "r", realmId: "realm-1" }),
+        syncExpenses: async () => ({ imported: 1, updated: 0, removed: 0, skipped: [] }) as any,
+        now: () => new Date("2026-09-01T14:00:00.000Z"),
+        isSyncPaused: async () => false,
+        logEvent: (event) => { logged.push(event); },
+        incrementalLookbackDays: 7,
+    });
+    await handlers.GET(new Request("https://example.test/api/integrations/qbo-expenses/sync", {
+        headers: { authorization: "Bearer cron-secret" },
+    }));
+
+    assert.equal(logged.length, 1);
+    assert.equal(logged[0].kind, PURCHASE_SYNC_EVENT_KIND);
+    assert.equal(logged[0].source, PURCHASE_SYNC_CRON_SOURCE);
+    assert.equal(logged[0].status, "ok");
+});
+
+test("the digest prints the purchase-sync heartbeat on its own line", () => {
+    const { text } = formatPipelineDigest(sampleHealth({
+        ok: false,
+        reasons: ["purchase-sync-stale"],
+        qbo: {
+            lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            purchaseSyncRun: { status: "ok", at: "2026-08-20T14:00:00.000Z", runStatus: "partial" },
+            lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
+            lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
+        },
+    }));
+    assert.match(text, /Last purchase sync run: .* \(12d ago\) \[incomplete run\]/);
+    assert.match(text, /Needs attention: purchase-sync-stale/);
+    // The data timestamp is still there, separately — the two answer different
+    // questions and neither can stand in for the other.
+    assert.match(text, /Last QBO purchase booked: /);
+});
+
+// ─── Round 38 gate: a timed-out probe must not keep a pool connection ─────
+
+/**
+ * The JS race answers the CALLER. It does not stop the QUERY: an abandoned
+ * promise is still a statement Postgres is running, on a connection nobody can
+ * use. With a pool of five and nine probes, a wedged database meant the health
+ * check stalled the application it was meant to report on.
+ *
+ * So the timeout is now set SERVER-side, and this asserts the statement really
+ * carries it — not merely that the probe returned in time, which the old race
+ * already did while leaking.
+ */
+test("round 38: each probe runs in a transaction carrying a server-side statement timeout", async () => {
+    const statements: string[] = [];
+    const fakeClient = {
+        async $transaction(fn: (tx: any) => Promise<unknown>) {
+            return fn({
+                async $executeRawUnsafe(sql: string) { statements.push(sql); return 0; },
+            });
+        },
+    };
+    const runner = statementTimeoutRunner(fakeClient as any);
+    const res = await runProbe("timed", async () => 7, -1, 250, { withDb: runner });
+
+    assert.deepEqual(res, { status: "ok", value: 7 });
+    assert.deepEqual(statements, ["SET LOCAL statement_timeout = 250"],
+        "the probe budget goes to Postgres, which is the only thing that can cancel the query");
+});
+
+test("round 38: a statement Postgres cancels is reported as a failed probe", async () => {
+    // What a server-side cancellation actually looks like to Prisma: the query
+    // REJECTS. That must read as a failed probe (forcing ok:false), not as a
+    // silent zero.
+    const runner = statementTimeoutRunner({
+        async $transaction(fn: (tx: any) => Promise<unknown>) {
+            return fn({ async $executeRawUnsafe() { return 0; } });
+        },
+    } as any);
+    const res = await runProbe(
+        "cancelled",
+        async () => { throw new Error("canceling statement due to statement timeout"); },
+        -1,
+        250,
+        { withDb: runner },
+    );
+    assert.deepEqual(res, { status: "error", reason: "error", value: -1 });
+});
+
+test("round 38: probes never exceed the concurrency cap, and none is failed for queueing", async () => {
+    const limiter = createLimiter(PROBE_CONCURRENCY);
+    let inFlight = 0;
+    let peak = 0;
+    const runner: ProbeRunner = async <T,>(_ms: number, fn: (db: any) => Promise<T>) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        try {
+            await new Promise((r) => setTimeout(r, 30));
+            return await fn({} as any);
+        } finally {
+            inFlight--;
+        }
+    };
+
+    // Nine probes, the real number getPipelineHealth fires, each slower than
+    // the others can start. A short per-probe budget is deliberate: a probe
+    // that WAITED for a slot must not be marked timed out for it, which is why
+    // the slot is taken before the timer starts.
+    const results = await Promise.all(
+        Array.from({ length: 9 }, (_, i) =>
+            runProbe(`p${i}`, async () => i, -1, 120, { withDb: runner, limiter })),
+    );
+
+    assert.ok(peak <= PROBE_CONCURRENCY, `at most ${PROBE_CONCURRENCY} at once, saw ${peak}`);
+    assert.ok(peak > 1, "and it really did run them in parallel, or this proves nothing");
+    assert.deepEqual(results.map((r) => r.status), Array(9).fill("ok"));
+    assert.deepEqual(results.map((r) => r.value), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+});
+
+test("round 43: a timed-out probe KEEPS its slot until the query settles", async () => {
+    // The release used to sit in a `finally` on the race, so it fired the moment
+    // the JS timeout won — while the Prisma operation was still running and
+    // still holding a pool connection. A queued probe then started against a
+    // pool that was already full: the cap was counting callers, not work.
+    const limiter = createLimiter(1);
+    let finishFirst: (v: unknown) => void = () => {};
+    // Tracked so the test can settle it before returning. Node 20 fails a test
+    // that leaves a promise pending at exit, and "still running after the caller
+    // gave up" is precisely the state being asserted here.
+    let wedgedWork: Promise<unknown> = Promise.resolve();
+    const held: ProbeRunner = <T,>() => {
+        const p = new Promise<T>((resolve) => { finishFirst = resolve as (v: unknown) => void; });
+        wedgedWork = p;
+        return p;
+    };
+
+    const wedged = await runProbe("wedged", async () => 1, -1, 20, { withDb: held, limiter });
+    assert.equal(wedged.reason, "timeout", "the caller is answered immediately");
+
+    // The slot is STILL held, so the next probe cannot start — that is the whole
+    // point. It gives up rather than queueing forever.
+    const blocked = await runProbe("blocked", async () => 2, -1, 500,
+        { withDb: passThrough, limiter, acquireTimeoutMs: 30 });
+    assert.equal(blocked.reason, "skipped", "reported as skipped, not silently piled on");
+    assert.equal(blocked.status, "error", "and it still forces ok:false");
+
+    // Once the database actually lets go, the gate reopens.
+    finishFirst(1);
+    await wedgedWork;
+    await new Promise((r) => setTimeout(r, 10));
+    const after = await runProbe("after", async () => 1, -1, 500,
+        { withDb: passThrough, limiter, acquireTimeoutMs: 200 });
+    assert.deepEqual(after, { status: "ok", value: 1 }, "the gate reopened");
+});
+
+test("round 43: concurrency never exceeds the cap, even when callers have timed out", async () => {
+    // The control for the above: with the release on the race, all nine of these
+    // would be in flight against a five-slot gate at once.
+    const limiter = createLimiter(PROBE_CONCURRENCY);
+    let inFlight = 0;
+    let peak = 0;
+    const finishers: Array<() => void> = [];
+    // Every query this test starts, so it can be settled before returning.
+    const started: Array<Promise<unknown>> = [];
+    const held: ProbeRunner = <T,>() => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        const p = new Promise<T>((resolve) => {
+            finishers.push(() => { inFlight--; resolve(undefined as T); });
+        });
+        started.push(p);
+        return p;
+    };
+
+    // Nine probes, each timing out well before its query settles.
+    const results = await Promise.all(
+        Array.from({ length: 9 }, (_, i) =>
+            runProbe(`p${i}`, async () => i, -1, 15, { withDb: held, limiter, acquireTimeoutMs: 40 })),
+    );
+    assert.ok(peak <= PROBE_CONCURRENCY, `at most ${PROBE_CONCURRENCY} queries at once, saw ${peak}`);
+    assert.ok(
+        results.some((r) => r.reason === "skipped"),
+        "the ones behind are reported as skipped rather than started anyway",
+    );
+    // Let the abandoned queries finish. Node 20 fails a test that exits with a
+    // promise still pending, and every one of these is deliberately still
+    // running after its caller gave up.
+    for (const f of finishers) f();
+    await Promise.all(started);
+    await new Promise((r) => setTimeout(r, 0));
+});
+
+// ─── Round 44: standing queues, the heartbeat, and the slot handoff ───
+
+/**
+ * Everything the health check measured was whether something RAN. None of it
+ * measured what was sitting PARKED, so it could report green with a client
+ * mid-billed: an unknown-outcome create, a deletion queued and never
+ * confirmed, a milestone paid outside QuickBooks with its invoice still open.
+ */
+test("round 44: each parked money-path queue alone turns health non-green", () => {
+    const green = snapshot();
+    assert.equal(evaluatePipelineHealth(green).ok, true, "the control really is green");
+
+    const queues: Array<[string, string]> = [
+        ["payLinksMissing", "pay-links-missing:1"],
+        ["parkedCreates", "parked-creates:1"],
+        ["parkedDocumentSyncs", "parked-document-syncs:1"],
+        ["pendingDeletions", "pending-deletions:1"],
+        ["unreconciledMoney", "unreconciled-money:1"],
+    ];
+    for (const [field, reason] of queues) {
+        const v = evaluatePipelineHealth(snapshot({ [field]: { status: "ok", count: 1 } } as any));
+        assert.equal(v.ok, false, `${field} > 0 must not read as healthy`);
+        assert.ok(v.reasons.includes(reason), `${field} must report ${reason}, got ${v.reasons.join(",")}`);
+    }
+});
+
+test("round 44: a queue we could not READ is reported, never assumed empty", () => {
+    const v = evaluatePipelineHealth(snapshot({ pendingDeletions: { status: "error", reason: "timeout", count: 0 } } as any));
+    assert.equal(v.ok, false);
+    assert.ok(v.reasons.includes("probe-failed:pending-deletions"));
+});
+
+test("round 44: a stale maintenance heartbeat turns health non-green", () => {
+    // An empty queue because nothing sweeps it looks exactly like an empty
+    // queue because the work is done. Only this tells them apart.
+    const fresh = evaluatePipelineHealth(snapshot({
+        maintenanceRun: { status: "ok", at: iso(30 * 60_000) },
+    } as any));
+    assert.equal(fresh.ok, true, "a recent run is fine");
+
+    const stale = evaluatePipelineHealth(snapshot({
+        maintenanceRun: { status: "ok", at: iso(3 * HOUR) },
+    } as any));
+    assert.equal(stale.ok, false);
+    assert.ok(stale.reasons.includes("qbo-maintenance-stale"));
+
+    const never = evaluatePipelineHealth(snapshot({
+        maintenanceRun: { status: "ok", at: null },
+    } as any));
+    assert.equal(never.ok, false, "never having run is not healthy either");
+});
+
+test("round 44: the limiter never exceeds its cap when a slot is handed over", async () => {
+    // release() used to decrement inFlight and THEN wake a waiter, which
+    // increments in a LATER microtask. The window between those two is the bug:
+    // a caller arriving in it sees a free slot and takes it, and then the woken
+    // waiter increments too — two holders against a cap of one.
+    //
+    // So the intruder has to arrive in that exact window: synchronously after
+    // the release, before any await lets the waiter resume. A test that only
+    // used already-queued waiters passes against the racy version.
+    const limiter = createLimiter(1);
+    const held = await limiter.acquire();
+    assert.ok(held, "the first caller holds the only slot");
+
+    const queued = limiter.acquire(60);   // waiting behind it
+    await new Promise((r) => setTimeout(r, 5));
+
+    held!();                              // hands the slot over...
+    const intruder = limiter.acquire(60); // ...and this arrives in the window
+
+    const [a, b] = await Promise.all([queued, intruder]);
+    const granted = [a, b].filter(Boolean);
+    assert.equal(granted.length, 1, "exactly ONE holder at a cap of one, never two");
+    assert.ok(a, "and it is the caller that was already waiting, not the one that jumped in");
+
+    for (const release of granted) release!();
+});
+
+// --- Round 45: a missing pay link is its own standing queue ---
+
+/**
+ * `paylink-pending` clears itself, one way or another, once QuickBooks
+ * answers. `paylink-missing` does not: the retries are spent and the invoice
+ * still has no payable URL, so somebody has to open it in QuickBooks. Counting
+ * it with the pending rows would hide it behind a number that drains on its
+ * own; not counting it at all is what let the row vanish from health entirely.
+ */
+test("round 45: a missing pay link is counted and named separately from a pending one", () => {
+    const missing = evaluatePipelineHealth(snapshot({ payLinksMissing: { status: "ok", count: 2 } } as any));
+    assert.equal(missing.ok, false);
+    assert.ok(missing.reasons.includes("pay-links-missing:2"), missing.reasons.join(","));
+    assert.ok(
+        !missing.reasons.some((r) => r.startsWith("pay-links-pending")),
+        "the two queues are not the same queue",
+    );
+});
+
+test("round 45: a pay-link-missing probe that FAILED is reported, not read as zero", () => {
+    const v = evaluatePipelineHealth(snapshot({ payLinksMissing: { status: "error", reason: "timeout", count: 0 } } as any));
+    assert.equal(v.ok, false);
+    assert.ok(v.reasons.includes("probe-failed:pay-links-missing"), v.reasons.join(","));
+});
+
+test("round 45: the digest tells the operator what to DO about a missing pay link", () => {
+    const digest = formatPipelineDigest(sampleHealth({
+        ok: false,
+        reasons: ["pay-links-missing:1"],
+        payLinksMissing: { status: "ok", count: 1 },
+    } as any));
+    assert.match(digest.text, /NO payable link/);
+    assert.match(digest.text, /QuickBooks/);
 });
 
 
@@ -866,6 +1387,9 @@ test("a bank-pull probe that cannot answer says so, instead of reading as 'switc
         () => new Promise(() => { /* never resolves */ }),
         { enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
         20,
+        // The pass-through runner main's probe tests use: runProbe now opens a
+        // real transaction to set a statement timeout, which needs a database.
+        { withDb: passThrough },
     );
     assert.equal(hung.status, "error", "the deadline fires");
     assert.equal(hung.reason, "timeout");

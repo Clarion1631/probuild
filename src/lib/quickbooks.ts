@@ -15,6 +15,63 @@ export const QB_API_BASE = process.env.QB_SANDBOX === "true"
     ? "https://sandbox-quickbooks.api.intuit.com/v3/company"
     : "https://quickbooks.api.intuit.com/v3/company";
 
+/**
+ * Intuit's PrivateNote field length cap. `createQBMilestoneInvoice` truncates
+ * to this before sending — and a caller building a create-marker's recovery
+ * identity (see qbo-create-markers.ts) MUST truncate to the SAME length before
+ * composing it. The resolver matches the marker's `privateNote` against what
+ * QuickBooks actually stored via exact equality (qbo-ambiguous-create.ts); an
+ * untruncated identity next to a truncated stored note never matches, the
+ * resolver reports "none found", and a `confirmed-none` clear on that false
+ * negative releases the row to create a real duplicate invoice.
+ */
+export const QB_PRIVATE_NOTE_MAX_LEN = 4000;
+
+/**
+ * The ONE normalization of a PrivateNote, applied at every point the string is
+ * written OR read back.
+ *
+ * The bug this closes was an ASYMMETRY, not a missing trim. The resolver
+ * trimmed the value QuickBooks returned and compared it against the RAW marker
+ * value, so any note whose composed form carried whitespace — a project name
+ * ending in a space, a milestone name pasted with a trailing newline, a
+ * double space between words — compared unequal to itself. The real invoice
+ * became invisible to the lookup, the resolver reported "none found", the
+ * operator confirmed none, the marker was cleared, and the next send billed the
+ * client a second time.
+ *
+ * So: collapse every run of whitespace to a single space, trim the ends, and
+ * truncate to Intuit's cap. Applied to the POST payload, to the identity
+ * recorded in the create marker on BOTH rails, and to whatever QuickBooks hands
+ * back — three places that must agree byte for byte, which is only reliable if
+ * they all go through this function.
+ *
+ * Truncation is LAST, and it is why the two sides still agree past 4000
+ * characters: canonicalizing first means the string QuickBooks stored and the
+ * string in the marker were cut at the same index of the same text.
+ */
+export function canonicalPrivateNote(value: string | null | undefined): string {
+    if (!value) return "";
+    // The marker's field separator is stripped, not escaped. The note is the
+    // LAST field of a create marker, so a `|` inside it is indistinguishable
+    // from a field boundary: corrupt one prefix character in the middle of a
+    // marker and that field's value becomes the document number while the real
+    // one slides into the note, which the parser can only detect if a genuine
+    // note never contains a separator. Ours never do in practice (project and
+    // milestone names), and a space reads identically in QuickBooks.
+    return value.replace(/\|/g, " ").replace(/\s+/g, " ").trim().slice(0, QB_PRIVATE_NOTE_MAX_LEN);
+}
+
+/**
+ * Intuit's DocNumber field length cap. Every create path truncates to this
+ * before sending — and, same reasoning as QB_PRIVATE_NOTE_MAX_LEN above, a
+ * caller composing a create-marker's recovery identity (qbo-create-markers.ts)
+ * MUST truncate to the SAME length first. QuickBooks stores the truncated
+ * DocNumber; the resolver looks it up by that exact value, so an untruncated
+ * identity next to a truncated stored one never matches.
+ */
+export const QB_DOC_NUMBER_MAX_LEN = 21;
+
 const TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 
 export interface QBTokens {
@@ -30,6 +87,31 @@ export interface QBTokens {
  */
 export class QBTimeoutError extends Error {
     name = "QBTimeoutError";
+}
+
+/**
+ * The stranded-token error: we cannot tell whether Intuit rotated the refresh
+ * token.
+ *
+ * Raised whenever a refresh ends ambiguously — a reset or TLS failure, a
+ * truncated or malformed body, a 200 that omits the tokens, or a save that
+ * did not stick. In every one of those the old refresh token may ALREADY be
+ * spent on Intuit's side, so returning the stored pair reports a healthy
+ * connection that cannot actually refresh again. There is no safe fallback:
+ * surface it and let a human reconnect if the next refresh also fails.
+ */
+export class QBTokenStrandedError extends Error {
+    name = "QBTokenStrandedError";
+    constructor(detail: string) {
+        super(`QuickBooks token refresh ended ambiguously (${detail}); reconnect QuickBooks if the next refresh fails`);
+    }
+}
+
+export function isQBTokenStrandedError(error: unknown): boolean {
+    return (
+        error instanceof QBTokenStrandedError ||
+        (error instanceof Error && error.name === "QBTokenStrandedError")
+    );
 }
 
 /**
@@ -66,6 +148,31 @@ export class QboRetryableError extends Error {
  * next call will fail too. Collapsing them made a single malformed payload
  * look like an outage and abort a whole run.
  */
+/**
+ * QuickBooks answered with a non-2xx status.
+ *
+ * The status is the whole point: `new Error("QB query failed: ...")` forced
+ * every caller to guess, so a 404 (this thing does not exist — terminal) and a
+ * 503 (come back later — retryable) were indistinguishable and got the same
+ * treatment. Carry it.
+ */
+export class QboHttpError extends Error {
+    name = "QboHttpError";
+    constructor(message: string, readonly status: number, readonly body?: string) {
+        super(message);
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function qboHttpStatus(error: unknown): number | null {
+    if (error instanceof QboHttpError) return error.status;
+    if (error instanceof Error && error.name === "QboHttpError") {
+        const status = (error as { status?: unknown }).status;
+        return typeof status === "number" ? status : null;
+    }
+    return null;
+}
+
 export class QboMalformedResponseError extends Error {
     name = "QboMalformedResponseError";
 }
@@ -75,6 +182,155 @@ export function isQboMalformedResponseError(error: unknown): boolean {
         error instanceof QboMalformedResponseError ||
         (error instanceof Error && error.name === "QboMalformedResponseError")
     );
+}
+
+/**
+ * A document create (`/estimate` or `/invoice` POST) whose outcome we never
+ * learned — a timeout or transport failure AFTER the request was dispatched,
+ * or a 2xx response that omitted the created document's id. QuickBooks may
+ * already have made the document, so this must never be treated as a plain
+ * retryable outage: the caller has to check QuickBooks before trying again.
+ *
+ * Distinct from a definite refusal (QboHttpError from a 4xx/401/403, or a
+ * pre-dispatch failure like a token refresh): QuickBooks answered "no" there,
+ * or the request never went out, so nothing was created and a retry is safe.
+ */
+export class QBAmbiguousDocumentCreateError extends Error {
+    name = "QBAmbiguousDocumentCreateError";
+    constructor(label: string) {
+        super(`${label}: QuickBooks did not confirm the outcome of this create — check QuickBooks for the document before retrying.`);
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQBAmbiguousDocumentCreateError(error: unknown): boolean {
+    return (
+        error instanceof QBAmbiguousDocumentCreateError ||
+        (error instanceof Error && error.name === "QBAmbiguousDocumentCreateError")
+    );
+}
+
+/**
+ * The ONLY HTTP statuses that can PROVE a document create made nothing.
+ *
+ * QuickBooks rejected the request on its own terms: the credential (401/403),
+ * the target (404) or the payload (400/422). All of them are decided before the
+ * transaction is written, so nothing exists to find afterwards and a retry is
+ * safe. Every other status — 429, any 5xx, anything unexpected — is QuickBooks
+ * failing to ANSWER, which says nothing about whether it also failed to act.
+ */
+export const DEFINITIVE_CREATE_REJECTION_STATUSES: readonly number[] = [400, 401, 403, 404, 422];
+
+/**
+ * The QBO `Fault` envelope, or `null` when the body does not carry one.
+ *
+ * This is the evidence half of "QuickBooks said no": a status on its own is a
+ * property of the HTTP hop (a gateway, a WAF, a proxy in front of Intuit can
+ * all produce a 4xx that Intuit itself never saw), whereas a parsed Fault is
+ * QuickBooks' own verdict on the document. Only a status AND a Fault together
+ * prove nothing was created.
+ */
+export function parseQboFault(body: string | null | undefined): { type: string | null; codes: string[] } | null {
+    if (!body) return null;
+    let data: unknown;
+    try {
+        data = JSON.parse(body);
+    } catch {
+        return null;
+    }
+    if (!data || typeof data !== "object") return null;
+    const record = data as Record<string, unknown>;
+    const fault = (record.Fault ?? record.fault) as Record<string, unknown> | undefined;
+    if (!fault || typeof fault !== "object") return null;
+    const rawErrors = (fault.Error ?? fault.error) as unknown;
+    const errors = Array.isArray(rawErrors) ? rawErrors : [];
+    return {
+        type: typeof fault.type === "string" ? fault.type : null,
+        codes: errors
+            .map((entry) => {
+                const code = entry && typeof entry === "object" ? (entry as Record<string, unknown>).code : null;
+                return code != null ? String(code) : "";
+            })
+            .filter(Boolean),
+    };
+}
+
+/**
+ * What a document create actually came back with, in the only terms the
+ * classification below cares about.
+ */
+export interface DocumentCreateOutcome {
+    /** The status QuickBooks answered with, or `null` when it never answered. */
+    status?: number | null;
+    /** The response body, when it could be read. */
+    body?: string;
+    /** The body could not be read at all, so no Fault could be parsed. */
+    bodyUnreadable?: boolean;
+    /** A 2xx that carried no document Id. */
+    missingId?: boolean;
+}
+
+/**
+ * ONE rule for every failure of a document create POST, shared by the estimate
+ * and invoice paths so the two cannot drift apart again.
+ *
+ * The invariant: **once the POST has been dispatched, every non-definitive
+ * outcome is ambiguous.** The old code classified non-2xx responses through
+ * `qboResponseError`, which sits OUTSIDE that boundary and only knows about
+ * transport semantics — so a 500 or a 503 arriving after QuickBooks had already
+ * processed the POST came back as `QboRetryableError`, and
+ * `/api/quickbooks/sync` answered `retry: true` for a document that may well
+ * exist. Retrying then bills the client twice, which is the exact failure the
+ * ambiguous-create machinery exists to prevent.
+ *
+ * Terminal (nothing was created, safe to retry after fixing the cause): a
+ * status in `DEFINITIVE_CREATE_REJECTION_STATUSES` whose body carries a parsed
+ * QBO Fault. A 4xx with no readable Fault deliberately does NOT qualify — an
+ * edge device in front of Intuit can produce one without Intuit ever seeing the
+ * request, and "we could not read the refusal" is not a refusal.
+ *
+ * Ambiguous (check QuickBooks before retrying): everything else — 429, 5xx, an
+ * unexpected status, a body that could not be read, and a 2xx with no Id.
+ *
+ * NOT this function's business: failures BEFORE dispatch (a token refresh, a
+ * customer or item lookup) and a caller's own abort. Those never reach here;
+ * their callers keep reporting them as retryable/cancelled.
+ */
+export function classifyDocumentCreateFailure(outcome: DocumentCreateOutcome, label: string): Error {
+    const status = outcome.status ?? null;
+    if (
+        status !== null
+        && !outcome.missingId
+        && DEFINITIVE_CREATE_REJECTION_STATUSES.includes(status)
+        && !outcome.bodyUnreadable
+        && parseQboFault(outcome.body) !== null
+    ) {
+        // Status preserved, so the route still reports a 401/403 as the
+        // reconnect it is rather than a generic failure.
+        return qboErrorFromStatus(status, outcome.body ?? "", label);
+    }
+    return new QBAmbiguousDocumentCreateError(label);
+}
+
+/**
+ * `classifyDocumentCreateFailure` for a live non-2xx `Response`.
+ *
+ * Deliberately NOT `qboResponseError`: that helper rethrows a body-read timeout
+ * or transport failure as itself, which is right for a read but wrong here — on
+ * a create, failing to read the refusal means we never learned the outcome, so
+ * it is ambiguous. Only a CALLER's own abort still propagates unchanged, so a
+ * cancellation stays distinguishable from an outage.
+ */
+export async function documentCreateResponseError(res: Response, label: string): Promise<Error> {
+    let body = "";
+    let bodyUnreadable = false;
+    try {
+        body = await res.text();
+    } catch (error) {
+        if (isAbortError(error)) throw error;
+        bodyUnreadable = true;
+    }
+    return classifyDocumentCreateFailure({ status: res.status, body, bodyUnreadable }, label);
 }
 
 /** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
@@ -88,6 +344,64 @@ export function isRetryableQboError(error: unknown): boolean {
 /** A QBO HTTP status we should come back to rather than give up on. */
 export function isRetryableQboStatus(status: number): boolean {
     return status === 429 || status >= 500;
+}
+
+/**
+ * The statuses that mean "QuickBooks could not serve this right now" —
+ * 408 (its edge timed out), 429 (rate limited), 5xx (broken).
+ */
+export function isTransientQboStatus(status: number): boolean {
+    return status === 408 || isRetryableQboStatus(status);
+}
+
+/**
+ * Turn a non-2xx QuickBooks response into the right error class, once, at the
+ * boundary every caller shares.
+ *
+ * Each create path used to classify for itself, and none of them knew about
+ * transient statuses: a 503 on a vendor, customer or purchase create came back
+ * as a bare `Error`, which the receipt route read as an unknown failure (500)
+ * instead of the retryable outage it plainly was. Same wall, three different
+ * verdicts depending on which call hit it. Now they all get QboRetryableError
+ * for 408/429/5xx and a typed QboHttpError (status preserved) for everything
+ * else, so downstream classification is identical wherever it happens.
+ */
+export async function qboResponseError(res: Response, label: string): Promise<Error> {
+    // Reading the ERROR body is itself a body read, and it can time out or die
+    // on a reset socket. `.catch(() => "")` swallowed exactly that, turning an
+    // outage into a tidy "failed (400): " — the status was preserved but the
+    // real failure was not. Let those out; only a genuine parse/decode problem
+    // degrades to an empty body.
+    let body = "";
+    try {
+        body = await res.text();
+    } catch (error) {
+        // A caller-originated abort must propagate as itself — converting it
+        // into an HTTP-status error here would hide the cancellation from a
+        // caller that needs to tell "I gave up" apart from "QBO answered N".
+        if (isAbortError(error) || isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+    }
+    return qboErrorFromStatus(res.status, body, label);
+}
+
+/**
+ * The same classification as `qboResponseError`, for a caller that has ALREADY
+ * consumed the response body.
+ *
+ * A `Response` body can only be read once, so the create paths that sniff the
+ * text for a QBO Fault code (vendor duplicate 6240, purchase business rules)
+ * cannot hand the response back to `qboResponseError` afterwards. Without this
+ * they fell back to `new Error(...)`, which drops the status: a 401 on a vendor
+ * or purchase create then reached the receipt route as an unknown failure (a
+ * retried-forever 500) instead of the `qbo-auth` reconnect it is. Same rules,
+ * same two classes, one definition.
+ */
+export function qboErrorFromStatus(status: number, body: string, label: string): Error {
+    const detail = `${label} failed (${status}): ${body}`.slice(0, 500);
+    if (isTransientQboStatus(status)) {
+        return new QboRetryableError(detail, status);
+    }
+    return new QboHttpError(detail, status, body);
 }
 
 /**
@@ -111,8 +425,48 @@ export function isSharedQboFailureStatus(status: number): boolean {
  * burns its own full deadline against the same wall, which is how a handful of
  * 20s timeouts added up to the payments cron's entire 120s ceiling.
  */
+/**
+ * The HTTP status QuickBooks answered with, from EITHER typed error class.
+ *
+ * `qboHttpStatus` deliberately reads only `QboHttpError` — a retryable error is
+ * not a plain HTTP error, and callers branch on that distinction. But
+ * `QboRetryableError` DOES carry a status, and a caller that only wants to know
+ * "was this 401/403?" has to see it: a row loop wraps a failed invoice probe as
+ * `QboRetryableError(msg, 401)`, so classifying the abort off `qboHttpStatus`
+ * alone reported a broken credential as an ordinary outage and the digest's
+ * reconnect alert never fired.
+ */
+export function qboFailureStatus(error: unknown): number | null {
+    const plain = qboHttpStatus(error);
+    if (plain !== null) return plain;
+    if (isRetryableQboError(error)) {
+        const status = (error as { status?: unknown }).status;
+        return typeof status === "number" ? status : null;
+    }
+    return null;
+}
+
+/**
+ * Is this failure one that only a human RECONNECTING QuickBooks can fix?
+ *
+ * 401/403 is the credential, not an outage: every retry against the same token
+ * fails identically, and waiting does not help. It must be reported under its
+ * own reason so the digest can say "reconnect QuickBooks" instead of burying it
+ * in the generic transient bucket.
+ */
+export function isQboReconnectRequired(error: unknown): boolean {
+    const status = qboFailureStatus(error);
+    return status === 401 || status === 403;
+}
+
 export function isQboConnectionFailure(error: unknown): boolean {
-    return isQBTimeoutError(error) || isRetryableQboError(error);
+    if (isQBTimeoutError(error) || isRetryableQboError(error)) return true;
+    // A 401/403 is the SAME credential failing, so every remaining record in a
+    // sweep will fail identically at full cost. Only the transient statuses
+    // were recognised here, so an expired token let a loop grind through
+    // hundreds of rows proving the same thing.
+    const status = qboHttpStatus(error);
+    return status === 401 || status === 403;
 }
 
 export function isQBTimeoutError(error: unknown): error is QBTimeoutError {
@@ -120,6 +474,19 @@ export function isQBTimeoutError(error: unknown): error is QBTimeoutError {
         error instanceof QBTimeoutError ||
         (error instanceof Error && error.name === "QBTimeoutError")
     );
+}
+
+/**
+ * A CALLER's own abort — never our deadline (that is QBTimeoutError) and never
+ * a QBO transport failure (that is QboRetryableError). `asQboBoundaryError`
+ * above deliberately leaves a caller-originated abort as a raw AbortError, name
+ * this checks for. A body-read helper that does not recognise it (only
+ * checking isQBTimeoutError/isRetryableQboError) swallows it into an
+ * HTTP-status or malformed-body error instead of letting the cancellation
+ * propagate — see qboResponseError and parseJsonOrNull.
+ */
+export function isAbortError(error: unknown): boolean {
+    return error instanceof Error && error.name === "AbortError";
 }
 
 const QB_DEFAULT_TIMEOUT_MS = 20_000;
@@ -524,7 +891,11 @@ export async function refreshQBToken(
             refreshTimeoutMs(),
         );
 
-        if (!res.ok) throw new Error("QB token refresh failed");
+        // The status decides whether falling back to the stored pair is safe,
+        // so it must survive: a bare Error made a 500 (Intuit may well have
+        // rotated) indistinguishable from a 400 invalid_grant (it definitely
+        // did not).
+        if (!res.ok) throw await qboResponseError(res, "QB token refresh");
         const data = await res.json();
         return { accessToken: data.access_token, refreshToken: data.refresh_token };
     } catch (error) {
@@ -573,10 +944,7 @@ export async function qbQuery<T = any>(tokens: QBTokens, query: string, deadline
             Accept: "application/json",
         },
     });
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`QB query failed: ${err}`);
-    }
+    if (!res.ok) throw await qboResponseError(res, "QB query");
     const data = await res.json();
     const response = data.QueryResponse || {};
     const key = Object.keys(response).find(k => Array.isArray(response[k]));
@@ -601,9 +969,11 @@ export async function parseJsonOrNull<T = any>(res: Response): Promise<T | null>
         return (await res.json()) as T;
     } catch (error) {
         // A timeout or a dead connection is not "QBO sent no body" — those must
-        // reach the caller so a loop can stop. Only a genuine parse failure
+        // reach the caller so a loop can stop. Neither is a caller's own abort:
+        // that must propagate as itself, not degrade into a fabricated "no
+        // body" success/failure. Only a genuine parse failure
         // (QboMalformedResponseError) degrades to null.
-        if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+        if (isAbortError(error) || isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
         return null;
     }
 }
@@ -628,12 +998,14 @@ export interface QBAttachable {
 export async function getQBPurchaseAttachables(
     tokens: QBTokens,
     purchaseId: string,
+    deadline?: RouteDeadline,
 ): Promise<QBAttachable[]> {
     // QBO transaction ids are numeric; refuse anything else rather than escape it.
     if (!/^\d+$/.test(purchaseId)) return [];
     const rows = await qbQuery<QBAttachable>(
         tokens,
         `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`,
+        deadline,
     );
     // Entity ids are only unique per entity type, so the value-only query can
     // surface attachments from other transaction types — keep Purchase links.
@@ -654,13 +1026,13 @@ export async function ensureQBCustomer(
 ): Promise<string> {
     // Trust a previously stored id if it still exists
     if (client.qbCustomerId) {
-        const existing = await qbQuery(tokens, `SELECT Id FROM Customer WHERE Id = '${escapeQBString(client.qbCustomerId)}'`);
+        const existing = await qbQuery(tokens, `SELECT Id FROM Customer WHERE Id = '${escapeQBString(client.qbCustomerId)}'`, deadline);
         if (existing.length > 0) return client.qbCustomerId;
     }
 
     const name = client.name.trim();
     if (!name) throw new Error("Client name is empty — cannot sync customer to QuickBooks.");
-    const byName = await qbQuery(tokens, `SELECT Id FROM Customer WHERE DisplayName = '${escapeQBString(name)}'`);
+    const byName = await qbQuery(tokens, `SELECT Id FROM Customer WHERE DisplayName = '${escapeQBString(name)}'`, deadline);
     if (byName.length > 0) return byName[0].Id;
 
     // QBO normalizes whitespace when enforcing DisplayName uniqueness, so an
@@ -670,7 +1042,8 @@ export async function ensureQBCustomer(
     const prefix = name.split(/\s+/)[0];
     const candidates = await qbQuery<{ Id: string; DisplayName?: string }>(
         tokens,
-        `SELECT Id, DisplayName FROM Customer WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`
+        `SELECT Id, DisplayName FROM Customer WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`,
+        deadline,
     );
     const matches = candidates.filter(c => normalize(c.DisplayName ?? "") === normalize(name));
     if (matches.length > 1) {
@@ -679,16 +1052,14 @@ export async function ensureQBCustomer(
     if (matches.length === 1) return matches[0].Id;
 
     const res = await qbFetch("/customer", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({
             DisplayName: name,
             ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {}),
         }),
     });
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`QB customer create failed: ${err}`);
-    }
+    if (!res.ok) throw await qboResponseError(res, "QB customer create");
     const data = await res.json();
     return data.Customer.Id;
 }
@@ -696,25 +1067,27 @@ export async function ensureQBCustomer(
 const QB_SERVICE_ITEM_NAME = "Construction Services";
 
 /** Find or create the Service item used for all ProBuild invoice lines. */
-export async function ensureQBServiceItem(tokens: QBTokens): Promise<string> {
-    const items = await qbQuery(tokens, `SELECT Id FROM Item WHERE Name = '${escapeQBString(QB_SERVICE_ITEM_NAME)}'`);
+export async function ensureQBServiceItem(tokens: QBTokens, deadline?: RouteDeadline): Promise<string> {
+    const items = await qbQuery(tokens, `SELECT Id FROM Item WHERE Name = '${escapeQBString(QB_SERVICE_ITEM_NAME)}'`, deadline);
     if (items.length > 0) return items[0].Id;
 
     // Need an income account to hang the item on — prefer an existing Income account.
-    const accounts = await qbQuery(tokens, `SELECT Id, Name FROM Account WHERE AccountType = 'Income' MAXRESULTS 1`);
+    const accounts = await qbQuery(tokens, `SELECT Id, Name FROM Account WHERE AccountType = 'Income' MAXRESULTS 1`, deadline);
     let incomeAccountId: string;
     if (accounts.length > 0) {
         incomeAccountId = accounts[0].Id;
     } else {
         const created = await qbFetch("/account", tokens, {
+            qbDeadline: deadline,
             method: "POST",
             body: JSON.stringify({ Name: "Construction Income", AccountType: "Income", AccountSubType: "ServiceFeeIncome" }),
         });
-        if (!created.ok) throw new Error(`QB income account create failed: ${await created.text()}`);
+        if (!created.ok) throw await qboResponseError(created, "QB income account create");
         incomeAccountId = (await created.json()).Account.Id;
     }
 
     const res = await qbFetch("/item", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({
             Name: QB_SERVICE_ITEM_NAME,
@@ -722,7 +1095,7 @@ export async function ensureQBServiceItem(tokens: QBTokens): Promise<string> {
             IncomeAccountRef: { value: incomeAccountId },
         }),
     });
-    if (!res.ok) throw new Error(`QB service item create failed: ${await res.text()}`);
+    if (!res.ok) throw await qboResponseError(res, "QB service item create");
     return (await res.json()).Item.Id;
 }
 
@@ -745,14 +1118,26 @@ export async function createQBMilestoneInvoice(
         dueDate?: Date | null;
         billEmail?: string | null;
         privateNote?: string;
-    }
-): Promise<{ qbId: string; qbUrl: string; total: number }> {
+        /**
+         * The `TxnDate` to send — the ACCOUNTING PERIOD this books to.
+         *
+         * Round 51: this contract did not have the field, so the milestone rail's
+         * `txnDate: identity.txnDate` was an excess property on a typed object
+         * literal and TypeScript said nothing — the caller believed it was sending
+         * the date its marker recorded while the payload below used today's. A
+         * replay of an unconfirmed create therefore booked into whatever period
+         * it happened to run in.
+         */
+        txnDate?: string;
+    },
+    deadline?: RouteDeadline,
+): Promise<{ qbId: string; qbUrl: string; total: number; document: RemoteDocumentFacts | null }> {
     const withTax = !!input.tax && input.tax.taxAmount > 0;
     const lineAmount = withTax ? input.tax!.preTaxAmount : input.amount;
 
     const payload: Record<string, unknown> = {
-        DocNumber: input.docNumber.slice(0, 21),
-        TxnDate: new Date().toISOString().split("T")[0],
+        DocNumber: input.docNumber.slice(0, QB_DOC_NUMBER_MAX_LEN),
+        TxnDate: input.txnDate ?? qboTxnDate(),
         CustomerRef: { value: input.customerId },
         // QuickBooks Payments is the ONLY payment rail (Stripe is disabled until
         // their 180-day hold clears) — the hosted page takes card, debit, AND bank.
@@ -761,7 +1146,11 @@ export async function createQBMilestoneInvoice(
         AllowOnlineACHPayment: true,
         ...(input.billEmail ? { BillEmail: { Address: input.billEmail } } : {}),
         ...(input.dueDate ? { DueDate: input.dueDate.toISOString().split("T")[0] } : {}),
-        ...(input.privateNote ? { PrivateNote: input.privateNote.slice(0, 4000) } : {}),
+        // Canonicalized, not merely truncated — the create marker's recovery
+        // identity is composed from the SAME function, so what QuickBooks
+        // stores and what the resolver looks for cannot disagree. See
+        // canonicalPrivateNote.
+        ...(canonicalPrivateNote(input.privateNote) ? { PrivateNote: canonicalPrivateNote(input.privateNote) } : {}),
         Line: [
             {
                 LineNum: 1,
@@ -779,23 +1168,343 @@ export async function createQBMilestoneInvoice(
         ...(withTax ? { TxnTaxDetail: { TotalTax: input.tax!.taxAmount } } : {}),
     };
 
-    const res = await qbFetch("/invoice", tokens, { method: "POST", body: JSON.stringify(payload) });
-    if (!res.ok) throw new Error(`QB milestone invoice create failed: ${await res.text()}`);
-    const data = await res.json();
-    const qbId = data.Invoice?.Id;
-    const total = Number(data.Invoice?.TotalAmt ?? 0);
-    return { qbId, qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`, total };
+    const res = await qbFetch("/invoice", tokens, {
+        method: "POST",
+        body: JSON.stringify(payload),
+        qbDeadline: deadline,
+    });
+    // The SAME create-boundary rule the estimate/invoice pushes use: a 4xx only
+    // ends this create when QuickBooks itself refused it (a parsed Fault), and
+    // every other non-2xx is an outcome we never learned. Routed through
+    // `qboResponseError` this used to hand a Fault-less 4xx back as a plain
+    // QboHttpError, which `isAmbiguousCreateFailure` reads as "QuickBooks said
+    // no" — so the caller RELEASED its in-flight claim and the row became
+    // freely re-sendable while an invoice may have existed.
+    if (!res.ok) throw await documentCreateResponseError(res, "QB milestone invoice create");
+    const data = await parseJsonOrNull(res);
+    const invoice = data?.Invoice;
+    const qbId = invoice?.Id ? String(invoice.Id) : "";
+    const total = Number(invoice?.TotalAmt);
+    // A 200 with no usable invoice is NOT a success. Returning an empty id and
+    // a NaN-coerced 0 let the caller link a milestone to nothing, or "verify" a
+    // total against a fabricated zero. We cannot tell whether QBO created
+    // something, so it is ambiguous — the row stays parked on its marker and a
+    // human resolves it against QuickBooks. (This create carries no `requestid`
+    // idempotency key; an earlier comment here claimed one, and none was ever
+    // sent on this path.)
+    if (!qbId || !Number.isFinite(total)) {
+        throw classifyDocumentCreateFailure({ status: res.status, missingId: true }, "QB milestone invoice create");
+    }
+    // The WHOLE document, not just its grand total. Every fact a caller needs
+    // to judge this create — DocNumber, PrivateNote, customer, total, TAX, date,
+    // line items — comes back through the SAME reducer a recovery's DocNumber
+    // lookup uses, so the direct path and the recovery path judge the identical
+    // shape. Returning only `total` is what let the direct path accept a
+    // document a recovery would have refused: Automated Sales Tax can re-split
+    // the same grand total into a different pre-tax/tax pair, and the tax was
+    // the one thing this path never looked at.
+    return {
+        qbId,
+        qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`,
+        total,
+        document: remoteDocumentFacts(invoice),
+    };
 }
 
-/** Fetch the customer-facing payment link for a QBO invoice (requires QB Payments enabled). */
-export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string): Promise<string | null> {
+/**
+ * Fetch the customer-facing payment link for a QBO invoice (requires QB
+ * Payments enabled).
+ *
+ * `null` means one thing only: QuickBooks answered with an Invoice, and that
+ * Invoice has no payment link. Every FAILURE is typed and thrown — 401/403 as a
+ * QboHttpError (the credential is bad; a human has to reconnect), 408/429/5xx
+ * and our own deadline as retryable (come back later), and a body that is not
+ * parseable JSON or carries no Invoice as retryable too: a truncated or
+ * proxy-mangled response says nothing about whether a link exists, and the
+ * paylink-pending sweep would clear the marker on it.
+ *
+ * It used to return null for all of those too, which quietly cost real money in
+ * two ways. The create paths could not tell "no link exists" from "we never
+ * asked", so a 503 left a linked row with no link and no marker and nothing
+ * ever retried it. And the paylink-pending sweep would have read a 503 storm —
+ * exactly the 2026-09-01 shape — as "none of these invoices has a link" and
+ * cleared every pending marker in one pass.
+ *
+ * Callers that genuinely only want a link if one is going spare catch it
+ * explicitly at the call site (search: `getQBInvoicePaymentLink(...).catch`).
+ */
+export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<string | null> {
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}?include=invoiceLink&minorversion=73`;
     const res = await qbTimedFetch(url, {
+        qbDeadline: deadline,
         headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json" },
     });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.Invoice?.InvoiceLink || null;
+    if (!res.ok) throw await qboResponseError(res, "QB invoice payment link");
+    const data = await parseJsonOrNull(res);
+    // parseJsonOrNull returns null for a genuine parse failure (it rethrows a
+    // timeout). Either that or a 200 with no Invoice in it is an answer we
+    // cannot read — retryable, never "there is no link".
+    if (!data || typeof data !== "object" || !data.Invoice || typeof data.Invoice !== "object") {
+        throw new QboRetryableError("QB invoice payment link returned no usable Invoice");
+    }
+    const link = (data.Invoice as { InvoiceLink?: unknown }).InvoiceLink;
+    return typeof link === "string" && link ? link : null;
+}
+
+/** One QuickBooks invoice as the ambiguous-create resolver needs to see it. */
+/**
+ * The accounting-significant fields of a QuickBooks document, however we came
+ * to be holding it: parsed straight off a CREATE response, or read back by a
+ * DocNumber lookup during recovery.
+ *
+ * One shape, because the direct-success path and the recovery path have to
+ * answer the SAME question about the SAME document. They used not to: recovery
+ * verified the total (and now the date and the item), while a create whose
+ * response arrived was linked on its Id alone. The identical QuickBooks result
+ * was accepted or refused purely on whether the first response came back.
+ */
+export interface RemoteDocumentFacts {
+    id: string;
+    docNumber: string | null;
+    privateNote: string | null;
+    /** `TotalAmt`. Null when QuickBooks did not give a readable one — never 0. */
+    total: number | null;
+    customerId: string | null;
+    /** `TxnDate`, the accounting period this document lands in. */
+    txnDate: string | null;
+    /**
+     * `TxnTaxDetail.TotalTax` — the sales-tax liability QuickBooks booked.
+     *
+     * Equal grand totals do NOT mean equal documents: Automated Sales Tax can
+     * re-split the same total into a different pre-tax/tax pair, and the split
+     * is what the sales-tax return reads. `null` when QuickBooks gave no
+     * readable value — never 0, because "we could not read it" and "there is
+     * none" are different answers and only one of them may be accepted.
+     */
+    totalTax: number | null;
+    /**
+     * Every line's `ItemRef`, in payload order. The item decides the INCOME
+     * ACCOUNT the money books to, so a document built from a different item is
+     * a different document however well its note and total match.
+     */
+    itemIds: string[];
+}
+
+/**
+ * A raw QuickBooks Estimate/Invoice object — from a create response or a
+ * query row — reduced to the facts above.
+ *
+ * Absent values stay `null`/empty rather than being coerced: `Number(null)` is
+ * 0 and `String(undefined)` is "undefined", and both would compare by luck
+ * instead of by rule.
+ */
+/**
+ * What `itemIds` carries for a sales line whose `ItemRef` could not be read.
+ *
+ * A real QuickBooks item id is a positive integer as a string, so this can
+ * never collide with one. It exists so an unverifiable line stays COUNTED:
+ * every acceptance rule compares each entry against the item the claim
+ * recorded, and this one matches nothing.
+ */
+export const UNREADABLE_ITEM_REF = "?unreadable";
+
+export function remoteDocumentFacts(raw: any): RemoteDocumentFacts | null {
+    if (!raw?.Id) return null;
+    const lines: any[] = Array.isArray(raw.Line) ? raw.Line : [];
+    return {
+        id: String(raw.Id),
+        docNumber: raw.DocNumber != null ? String(raw.DocNumber) : null,
+        privateNote: raw.PrivateNote != null ? String(raw.PrivateNote) : null,
+        total: raw.TotalAmt != null && Number.isFinite(Number(raw.TotalAmt)) ? Number(raw.TotalAmt) : null,
+        customerId: raw.CustomerRef?.value != null && String(raw.CustomerRef.value) !== ""
+            ? String(raw.CustomerRef.value)
+            : null,
+        txnDate: raw.TxnDate != null && String(raw.TxnDate) !== "" ? String(raw.TxnDate) : null,
+        // A missing TxnTaxDetail is NOT a $0 tax answer. The null check comes
+        // FIRST because `Number(null)` is 0, so an explicit `"TotalTax": null`
+        // would otherwise read as a confident "no tax on this document" — the
+        // same rule findQBInvoicesByDocNumber has always applied.
+        totalTax: raw.TxnTaxDetail?.TotalTax != null && Number.isFinite(Number(raw.TxnTaxDetail.TotalTax))
+            ? Number(raw.TxnTaxDetail.TotalTax)
+            : null,
+        // ONE ENTRY PER SALES LINE, including the ones whose ItemRef cannot be
+        // read. Dropping those was fail-open: a document with one correct line
+        // and one line whose item is missing or unreadable collapsed to a
+        // one-element array that then validated as "every line is correct". An
+        // unreadable item is not an absent line — it is a line booking money to an
+        // account nobody can name.
+        //
+        // Only SalesItemLineDetail lines count: a SubTotalLine or DiscountLine
+        // legitimately carries no ItemRef, and requiring one of those would
+        // refuse documents QuickBooks built correctly.
+        itemIds: lines
+            .filter((l) => l?.DetailType === "SalesItemLineDetail" || l?.SalesItemLineDetail != null)
+            .map((l) => {
+                const value = l?.SalesItemLineDetail?.ItemRef?.value;
+                return value != null && String(value) !== "" ? String(value) : UNREADABLE_ITEM_REF;
+            }),
+    };
+}
+
+export interface QBInvoiceMatch extends RemoteDocumentFacts {
+    id: string;
+    docNumber: string | null;
+    /** ProBuild writes its own marker here on create; this is what proves it is ours. */
+    privateNote: string | null;
+    total: number | null;
+    balance: number;
+    /**
+     * `CustomerRef.value` — WHO QuickBooks is actually billing for this
+     * document.
+     *
+     * The resolver used to check the customer only against ProBuild's own
+     * `Client.qbCustomerId`, which proves that LOCAL state has not moved since
+     * the create and says nothing at all about the invoice it is about to
+     * adopt. A DocNumber is unique to neither the company nor the customer, and
+     * the CustomerRef of a real QuickBooks invoice can be edited in QuickBooks
+     * after we created it — either way the row would be linked to a bill
+     * addressed to somebody else. `null` when the payload carried no readable
+     * CustomerRef, which the resolver treats as unverifiable (refused), not as
+     * a match.
+     */
+    customerId: string | null;
+    /**
+     * `TxnTaxDetail.TotalTax` — the sales-tax liability QuickBooks is actually
+     * carrying on this document.
+     *
+     * The grand total alone cannot distinguish the invoice we sent from one
+     * QuickBooks re-computed under Automated Sales Tax into a different
+     * pre-tax/tax split, and the split is what Vanessa's sales-tax reporting
+     * reads. `null` when the payload carried no readable TotalTax.
+     */
+    totalTax: number | null;
+}
+
+/** The page size findQBInvoicesByDocNumber queries. Kept as a constant so the
+ * truncation check below can never drift from the `maxresults` it is checking
+ * for. */
+const FIND_INVOICES_BY_DOC_NUMBER_LIMIT = 20;
+
+/**
+ * The query hit its page cap, so there may be MORE invoices under this
+ * DocNumber than were returned. Distinct from "zero matches" or "one match" —
+ * an automated resolver cannot tell whether the real invoice (or a second,
+ * duplicate one) is sitting on a page it never saw, so it must refuse rather
+ * than silently reasoning from a partial list.
+ */
+export class QBResultSetTruncatedError extends Error {
+    name = "QBResultSetTruncatedError";
+    constructor(docNumber: string, limit: number) {
+        super(`QuickBooks returned ${limit} invoices for DocNumber "${docNumber}" — that is this query's page cap, so more may exist unseen.`);
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQBResultSetTruncatedError(error: unknown): error is QBResultSetTruncatedError {
+    return (
+        error instanceof QBResultSetTruncatedError ||
+        (error instanceof Error && error.name === "QBResultSetTruncatedError")
+    );
+}
+
+/**
+ * Every invoice QuickBooks holds under this DocNumber.
+ *
+ * Plural on purpose. DocNumber is not unique in QuickBooks (duplicate document
+ * numbers can be allowed, and ours is truncated to 21 characters), so the
+ * caller must decide what more than one means rather than being handed a
+ * confident single answer. A query failure THROWS — "I could not ask" must
+ * never read as "there is none". Hitting the page cap also throws
+ * (QBResultSetTruncatedError) for the same reason: a result set that might be
+ * incomplete must never be read as "these are all of them".
+ */
+/**
+ * The Estimate half of the DocNumber lookup.
+ *
+ * Deliberately thinner than QBInvoiceMatch: the document-sync recovery
+ * (qbo-document-sync.ts) only has to answer "did the create we may have
+ * dispatched actually land, and is this it?". The estimate rail writes
+ * DocNumber = the ProBuild estimate code, which is ProBuild own sequential
+ * identifier for exactly one record, so that plus the PrivateNote is the whole
+ * identity there is to check.
+ */
+export interface QBEstimateMatch extends RemoteDocumentFacts {
+    id: string;
+    docNumber: string | null;
+    privateNote: string | null;
+    total: number | null;
+    /**
+     * WHO QuickBooks is billing. The recovery compares it against the claim,
+     * so an absent or blank value must read as `null` (unverifiable) and never
+     * as a match: `String(undefined)` would produce the literal "undefined"
+     * and compare unequal by luck rather than by rule.
+     */
+    customerId: string | null;
+}
+
+export async function findQBEstimatesByDocNumber(
+    tokens: QBTokens,
+    docNumber: string,
+    deadline?: RouteDeadline,
+): Promise<QBEstimateMatch[]> {
+    const rows = await qbQuery<any>(
+        tokens,
+        `select * from Estimate where DocNumber = '${escapeQBString(docNumber)}' maxresults ${FIND_INVOICES_BY_DOC_NUMBER_LIMIT}`,
+        deadline,
+    );
+    // Same rule as the invoice lookup: a FULL page is not an answer, it is a
+    // truncated one. Treating it as "these are all of them" would let a
+    // recovery conclude "absent" from a result set that simply ran out of room.
+    if (rows.length === FIND_INVOICES_BY_DOC_NUMBER_LIMIT) {
+        throw new QBResultSetTruncatedError(docNumber, FIND_INVOICES_BY_DOC_NUMBER_LIMIT);
+    }
+    // Mapped through the SAME reducer the create path uses, so the candidate a
+    // recovery judges and the document a create just made are described
+    // identically — including the TxnDate and the line items, which this lookup
+    // used to drop on the floor.
+    return rows
+        .map((e) => remoteDocumentFacts(e))
+        .filter((e): e is RemoteDocumentFacts => e !== null);
+}
+
+export async function findQBInvoicesByDocNumber(
+    tokens: QBTokens,
+    docNumber: string,
+    deadline?: RouteDeadline,
+): Promise<QBInvoiceMatch[]> {
+    // `select *` already returns CustomerRef and TxnTaxDetail; both are mapped
+    // out below because the resolver has to verify WHO the invoice bills and
+    // WHAT TAX it carries, not just that its DocNumber and PrivateNote match.
+    const rows = await qbQuery<any>(
+        tokens,
+        `select * from Invoice where DocNumber = '${escapeQBString(docNumber)}' maxresults ${FIND_INVOICES_BY_DOC_NUMBER_LIMIT}`,
+        deadline,
+    );
+    if (rows.length === FIND_INVOICES_BY_DOC_NUMBER_LIMIT) {
+        throw new QBResultSetTruncatedError(docNumber, FIND_INVOICES_BY_DOC_NUMBER_LIMIT);
+    }
+    return rows
+        .filter((inv) => inv?.Id)
+        .map((inv) => ({
+            // Same reducer as the create path and the estimate lookup; the
+            // invoice-only fields are added on top of it.
+            ...(remoteDocumentFacts(inv) as RemoteDocumentFacts),
+            balance: Number(inv.Balance ?? 0),
+            // Absent/blank reads as `null` (unverifiable), never as a match:
+            // `String(undefined)` would have produced the literal "undefined"
+            // and compared unequal by luck rather than by rule.
+            customerId: inv.CustomerRef?.value != null && String(inv.CustomerRef.value) !== ""
+                ? String(inv.CustomerRef.value)
+                : null,
+            // A missing TxnTaxDetail is NOT a $0 tax answer — the resolver has
+            // to be able to tell "QuickBooks says no tax" from "QuickBooks did
+            // not tell us", so an absent or unreadable value stays null.
+            // `Number(null)` is 0, so the null check comes FIRST — otherwise an
+            // explicit `"TotalTax": null` would read as a confident $0.
+            totalTax: inv.TxnTaxDetail?.TotalTax != null && Number.isFinite(Number(inv.TxnTaxDetail.TotalTax))
+                ? Number(inv.TxnTaxDetail.TotalTax)
+                : null,
+        }));
 }
 
 export interface QBInvoiceStatus {
@@ -804,10 +1513,23 @@ export interface QBInvoiceStatus {
     paymentTxnIds: string[];
 }
 
-/** Read a QBO invoice's balance + linked payment transactions. */
-export async function getQBInvoiceStatus(tokens: QBTokens, qbInvoiceId: string): Promise<QBInvoiceStatus | null> {
-    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
-    if (!res.ok) return null;
+/**
+ * Read a QBO invoice's balance + linked payment transactions.
+ *
+ * 404 is the only authoritative "gone" — everything else (a bad credential,
+ * a rate limit, QBO itself down) says nothing about THIS invoice. Collapsing
+ * every failure into null let a caller looping over many rows (e.g.
+ * sendMilestoneInvoicesCore) read a shared connection/credential failure as
+ * "this one row's total is unreadable" and keep spending a fresh deadline
+ * rediscovering the same wall on every remaining row, instead of stopping
+ * (see isSharedQboFailureStatus / isQboConnectionFailure).
+ */
+export async function getQBInvoiceStatus(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<QBInvoiceStatus | null> {
+    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
+    if (!res.ok) {
+        if (res.status === 404) return null;
+        throw await qboResponseError(res, "QB invoice status");
+    }
     const data = await res.json();
     const inv = data.Invoice;
     if (!inv) return null;
@@ -936,9 +1658,11 @@ export async function getQBPayment(
 }
 
 /** Read core invoice fields needed for payments/deletes. */
-export async function readQBInvoice(tokens: QBTokens, qbInvoiceId: string) {
-    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
-    if (!res.ok) return null;
+export async function readQBInvoice(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) {
+    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
+    // 404 stays null ("gone"); a transient status must not read the same way.
+    if (res.status === 404) return null;
+    if (!res.ok) throw await qboResponseError(res, `QB invoice ${qbInvoiceId} read`);
     const inv = (await res.json()).Invoice;
     if (!inv) return null;
     return {
@@ -951,10 +1675,11 @@ export async function readQBInvoice(tokens: QBTokens, qbInvoiceId: string) {
 }
 
 /** Receive a payment against an invoice (full open balance). TEST/admin tooling. */
-export async function createQBPaymentForInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<{ paymentId: string; amount: number } | null> {
-    const inv = await readQBInvoice(tokens, qbInvoiceId);
+export async function createQBPaymentForInvoice(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<{ paymentId: string; amount: number } | null> {
+    const inv = await readQBInvoice(tokens, qbInvoiceId, deadline);
     if (!inv || inv.balance <= 0 || !inv.customerId) return null;
     const res = await qbFetch("/payment", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({
             TotalAmt: inv.balance,
@@ -992,6 +1717,7 @@ export async function buildQBPaymentRequest(
     tokens: QBTokens,
     qbInvoiceId: string,
     opts: { amount: number; txnDate: string; paymentRefNum: string; depositToAccountId?: string },
+    deadline?: RouteDeadline,
 ): Promise<{ ok: true; requestBody: string } | QBPaymentBuildFailure> {
     // E2E_QBO_MOCK (deposit-ingest hermeticity, gated in quickbooks-mock.ts):
     // skip the real readQBInvoice() network call entirely — the caller seeds
@@ -1014,7 +1740,7 @@ export async function buildQBPaymentRequest(
         };
         return { ok: true, requestBody: JSON.stringify(mockPayload) };
     }
-    const inv = await readQBInvoice(tokens, qbInvoiceId);
+    const inv = await readQBInvoice(tokens, qbInvoiceId, deadline);
     if (!inv) return { ok: false, reason: "invoice-not-found" };
     if (!inv.customerId) return { ok: false, reason: "missing-customer" };
     if (Math.round(inv.balance * 100) !== Math.round(opts.amount * 100)) {
@@ -1044,6 +1770,7 @@ export async function sendQBPaymentCreateRequest(
     tokens: QBTokens,
     requestBody: string,
     requestId: string,
+    deadline?: RouteDeadline,
 ): Promise<{ paymentId: string; amount: number }> {
     // E2E_QBO_MOCK: no network I/O — see quickbooks-mock.ts's doc comment.
     // mockSendQBPaymentCreate replicates QBO's requestid dedupe (the SAME
@@ -1055,8 +1782,9 @@ export async function sendQBPaymentCreateRequest(
     const res = await qbFetch(`/payment?requestid=${encodeURIComponent(requestId)}`, tokens, {
         method: "POST",
         body: requestBody,
+        qbDeadline: deadline,
     });
-    if (!res.ok) throw new Error(`QB payment create failed: ${await res.text()}`);
+    if (!res.ok) throw await qboResponseError(res, "QB payment create");
     const data = await parseJsonOrNull(res);
     const p = data?.Payment;
     if (!p?.Id) throw new Error("QB payment create returned no Payment body");
@@ -1081,41 +1809,92 @@ export async function createQBPaymentForInvoiceWithDetails(
     return { ok: true, paymentId: sent.paymentId, amount: sent.amount, requestBody: built.requestBody };
 }
 
-/** Hard-delete a payment (test cleanup). */
-export async function deleteQBPayment(tokens: QBTokens, paymentId: string): Promise<boolean> {
-    const get = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
-    if (!get.ok) return false;
+/**
+ * Hard-delete a payment (test cleanup, and the rebalance loop's invoice
+ * replacement in billing-core.ts).
+ *
+ * 404 is authoritative — the payment is already gone — and stays `false`, same
+ * as `readQBInvoice`'s rule. Every OTHER failure (401/403/429/5xx) is the
+ * SAME wall the next call in a loop would hit identically; collapsing it into
+ * `false` read as an ordinary per-row "couldn't delete" refusal, so a caller
+ * looping over rows (see isSharedQboWall) never saw the outage and kept
+ * spending its deadline proving the same wall on every remaining row. Thrown
+ * instead, via the shared classifier, so it propagates like any other QBO
+ * failure.
+ */
+export async function deleteQBPayment(tokens: QBTokens, paymentId: string, deadline?: RouteDeadline): Promise<boolean> {
+    const get = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET", qbDeadline: deadline });
+    if (get.status === 404) return false;
+    if (!get.ok) throw await qboResponseError(get, `QB payment ${paymentId} read`);
     const syncToken = String((await get.json()).Payment?.SyncToken ?? "0");
     const res = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/payment?operation=delete&minorversion=73`,
         {
+            qbDeadline: deadline,
             method: "POST",
             headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json", "Content-Type": "application/json" },
             body: JSON.stringify({ Id: paymentId, SyncToken: syncToken }),
         }
     );
-    return res.ok;
+    if (res.status === 404) return false;
+    if (!res.ok) throw await qboResponseError(res, `QB payment ${paymentId} delete`);
+    return true;
 }
 
-/** Hard-delete an invoice (test cleanup). Fails in QBO if payments are still linked. */
-export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<boolean> {
-    const inv = await readQBInvoice(tokens, qbInvoiceId);
+/**
+ * Hard-delete an invoice (test cleanup, and the rebalance loop's invoice
+ * replacement in billing-core.ts). Fails in QBO if payments are still linked.
+ *
+ * Same authoritative-vs-shared split as `deleteQBPayment`: `readQBInvoice`
+ * already throws for a non-404 read failure, so only the delete POST needed
+ * the same treatment here. See its doc comment for why a shared failure must
+ * be thrown rather than collapsed into `false`.
+ */
+/**
+ * Delete a QuickBooks invoice.
+ *
+ * THE RETURN VALUE IS NOT "did it work". Three call sites read it that way and
+ * were all wrong in the same direction:
+ *
+ *   • `true`  — QuickBooks deleted it just now;
+ *   • `false` — the invoice IS NOT THERE. Either the pre-read missed it or the
+ *             delete itself answered 404. Both are CONFIRMED ABSENCE, which is
+ *             the same end state as `true` for every caller: the remote
+ *             document is gone and the local link may be released;
+ *   • throws  — the outcome is unknown, or QuickBooks refused. A real refusal
+ *             is a non-2xx that is not 404 (an invoice with a payment attached,
+ *             say). Only this means "it may still exist".
+ *
+ * So the guard is `catch`, never `if (!deleted)`. Reading `false` as "still
+ * there" left manually-deleted invoices linked and parked forever — exactly
+ * the state those callers existed to clear.
+ */
+export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<boolean> {
+    const inv = await readQBInvoice(tokens, qbInvoiceId, deadline);
     if (!inv) return false;
     const res = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/invoice?operation=delete&minorversion=73`,
         {
+            qbDeadline: deadline,
             method: "POST",
             headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json", "Content-Type": "application/json" },
             body: JSON.stringify({ Id: qbInvoiceId, SyncToken: inv.syncToken }),
         }
     );
-    return res.ok;
+    if (res.status === 404) return false;
+    if (!res.ok) throw await qboResponseError(res, `QB invoice ${qbInvoiceId} delete`);
+    return true;
 }
 
 /** Read an invoice's online-payment toggles + sync token (for sparse updates). */
-export async function getQBInvoicePaymentOptions(tokens: QBTokens, qbInvoiceId: string) {
-    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
-    if (!res.ok) return null;
+export async function getQBInvoicePaymentOptions(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) {
+    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
+    // 404 is a real answer — this invoice is gone from QBO — and stays null.
+    // Everything else used to collapse into that same null, so a 503 read as
+    // "not in QuickBooks" and the sweep cheerfully carried on through an
+    // outage. Preserve the status so callers can tell the two apart.
+    if (res.status === 404) return null;
+    if (!res.ok) throw await qboResponseError(res, `QB invoice ${qbInvoiceId} read`);
     const inv = (await res.json()).Invoice;
     if (!inv) return null;
     return {
@@ -1131,9 +1910,11 @@ export async function setQBInvoicePaymentOptions(
     tokens: QBTokens,
     qbInvoiceId: string,
     syncToken: string,
-    opts: { card: boolean; ach: boolean }
+    opts: { card: boolean; ach: boolean },
+    deadline?: RouteDeadline,
 ): Promise<boolean> {
     const res = await qbFetch("/invoice", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({
             Id: qbInvoiceId,
@@ -1143,7 +1924,11 @@ export async function setQBInvoicePaymentOptions(
             AllowOnlineACHPayment: opts.ach,
         }),
     });
-    return res.ok;
+    // `return res.ok` flattened a 503 into the same "update-failed" as a
+    // business rejection, so a shared outage looked like 200 individually
+    // unlucky invoices. Raise with the status instead.
+    if (!res.ok) throw await qboResponseError(res, `QB invoice ${qbInvoiceId} payment-options update`);
+    return true;
 }
 
 /** Add customer-facing text before QBO sends its invoice email. */
@@ -1151,8 +1936,10 @@ export async function appendQBInvoiceCustomerMemo(
     tokens: QBTokens,
     qbInvoiceId: string,
     line: string,
+    deadline?: RouteDeadline,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-    const read = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+    // Two serial calls (read then sparse update) under one budget.
+    const read = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
     if (!read.ok) return { ok: false, error: `Could not read QuickBooks invoice (${read.status})` };
     const invoice = (await parseJsonOrNull(read))?.Invoice;
     if (!invoice?.SyncToken) return { ok: false, error: "QuickBooks invoice response was incomplete" };
@@ -1160,6 +1947,7 @@ export async function appendQBInvoiceCustomerMemo(
     const current = String(invoice.CustomerMemo?.value ?? "").trim();
     if (current.includes(line)) return { ok: true };
     const update = await qbFetch("/invoice", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({
             Id: qbInvoiceId,
@@ -1173,9 +1961,9 @@ export async function appendQBInvoiceCustomerMemo(
 }
 
 /** Posted money-out transactions (expenses/checks/card charges) from the books. */
-export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: number) {
+export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: number, deadline?: RouteDeadline) {
     const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
-    const rows = await getQBPurchasesSince(tokens, new Date(`${since}T00:00:00.000Z`));
+    const rows = await getQBPurchasesSince(tokens, new Date(`${since}T00:00:00.000Z`), undefined, deadline);
     return rows.map(p => ({
         qbId: String(p.Id),
         date: p.TxnDate ?? null,
@@ -1193,7 +1981,12 @@ export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: numbe
  * Pagination matters for the initial historical backfill; a single QBO query
  * page would silently stop after its MAXRESULTS boundary.
  */
-export async function getQBPurchasesSince(tokens: QBTokens, since: Date, until?: Date): Promise<any[]> {
+export async function getQBPurchasesSince(
+    tokens: QBTokens,
+    since: Date,
+    until?: Date,
+    deadline?: RouteDeadline,
+): Promise<any[]> {
     if (!Number.isFinite(since.getTime())) {
         throw new Error("QBO purchase query requires a valid since date");
     }
@@ -1212,6 +2005,7 @@ export async function getQBPurchasesSince(tokens: QBTokens, since: Date, until?:
         const page = await qbQuery<any>(
             tokens,
             `SELECT * FROM Purchase WHERE TxnDate >= '${sinceDate}'${untilClause} ORDERBY TxnDate ASC STARTPOSITION ${startPosition} MAXRESULTS ${pageSize}`,
+            deadline,
         );
         purchases.push(...page);
         if (page.length < pageSize) break;
@@ -1230,6 +2024,7 @@ export async function getQBPurchasesSince(tokens: QBTokens, since: Date, until?:
 export async function getQBPurchaseChangesSince(
     tokens: QBTokens,
     since: Date,
+    deadline?: RouteDeadline,
 ): Promise<any[]> {
     if (!Number.isFinite(since.getTime())) {
         throw new Error("QBO Purchase CDC requires a valid since date");
@@ -1243,6 +2038,7 @@ export async function getQBPurchaseChangesSince(
     const response = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/cdc?${params.toString()}`,
         {
+            qbDeadline: deadline,
             headers: {
                 Authorization: `Bearer ${tokens.accessToken}`,
                 Accept: "application/json",
@@ -1250,7 +2046,11 @@ export async function getQBPurchaseChangesSince(
         },
     );
     if (!response.ok) {
-        throw new Error(`QBO Purchase CDC failed with status ${response.status}`);
+        // Through the shared classifier, not a bare Error: a 401/403 here is
+        // the credential, not this fetch, and a caller must be able to tell
+        // it apart from an ordinary transient outage (see
+        // /api/integrations/qbo-expenses/sync's classification).
+        throw await qboResponseError(response, "QBO Purchase CDC");
     }
 
     const payload = await response.json();
@@ -1287,9 +2087,9 @@ export async function getQBPurchaseChangesSince(
 }
 
 /** Posted customer payments (money in) from the books. */
-export async function getRecentQBPaymentsList(tokens: QBTokens, sinceDaysAgo: number) {
+export async function getRecentQBPaymentsList(tokens: QBTokens, sinceDaysAgo: number, deadline?: RouteDeadline) {
     const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
-    const rows = await qbQuery<any>(tokens, `SELECT * FROM Payment WHERE TxnDate >= '${since}' ORDERBY TxnDate DESC MAXRESULTS 500`);
+    const rows = await qbQuery<any>(tokens, `SELECT * FROM Payment WHERE TxnDate >= '${since}' ORDERBY TxnDate DESC MAXRESULTS 500`, deadline);
     return rows.map(p => ({
         qbId: String(p.Id),
         date: p.TxnDate ?? null,
@@ -1348,6 +2148,31 @@ export function buildQBEstimateLines(items: readonly QBEstimateItem[], itemId: s
 }
 
 /** Push an estimate to QB. Returns the QB estimate ID. */
+/**
+ * Append QuickBooks own idempotency key to a create path.
+ *
+ * Intuit dedupes on ?requestid=: the same value re-POSTed returns the ORIGINAL
+ * response rather than creating a second document. Omitted when no key is
+ * supplied, so callers that have nothing durable to key off are unchanged.
+ */
+/**
+ * The `TxnDate` a create sends, as QuickBooks wants it.
+ *
+ * One definition because the value is now RECORDED in the create marker and
+ * REUSED on a replay: an unconfirmed create that is re-sent must send the same
+ * date it sent the first time, or the replay books the document into a
+ * different accounting period than the one the claim describes. Both payload
+ * builders used to compute this inline from `new Date()` at send time, so
+ * every replay across midnight silently produced a different document.
+ */
+export function qboTxnDate(at: Date = new Date()): string {
+    return at.toISOString().split("T")[0];
+}
+
+function qboCreatePath(path: string, requestId?: string): string {
+    return requestId ? path + "?requestid=" + encodeURIComponent(requestId) : path;
+}
+
 export async function syncEstimateToQB(
     tokens: QBTokens,
     estimate: {
@@ -1359,9 +2184,31 @@ export async function syncEstimateToQB(
         customerId: string;
         itemId: string;
         project: { name: string } | null;
+        /**
+         * The PrivateNote to write. Defaults to the bare title for callers that
+         * predate the document-sync marker note, but every current caller passes
+         * the canonical one: it is what proves the document is ours at recovery
+         * time, and a title alone is something any document could carry.
+         */
+        privateNote?: string;
+        /**
+         * The `TxnDate` to send. Defaults to today for callers with nothing
+         * durable to reuse; the document-sync rail passes the value its create
+         * marker recorded, so a replay re-sends the same accounting date.
+         */
+        txnDate?: string;
     },
-    glMappings: Record<string, string> = {}
-): Promise<{ qbId: string; qbUrl: string }> {
+    glMappings: Record<string, string> = {},
+    deadline?: RouteDeadline,
+    /**
+     * QuickBooks server-side idempotency key on the create (?requestid=...).
+     * The SAME value re-sent returns Intuit ORIGINAL response instead of
+     * creating a second document, which is what makes a replay of an
+     * unconfirmed create safe. Same mechanism the Payment create and the
+     * receipt push already use.
+     */
+    requestId?: string,
+): Promise<{ qbId: string; qbUrl: string; document: RemoteDocumentFacts | null }> {
     const lines = buildQBEstimateLines(estimate.items, estimate.itemId);
 
     // QBO rejects a transaction with no lines (error 2020, "Required param missing"). An
@@ -1372,29 +2219,75 @@ export async function syncEstimateToQB(
     }
 
     const payload = {
-        TxnDate: new Date().toISOString().split("T")[0],
-        DocNumber: estimate.code.slice(0, 21),
-        PrivateNote: estimate.title,
+        TxnDate: estimate.txnDate ?? qboTxnDate(),
+        DocNumber: estimate.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
+        PrivateNote: canonicalPrivateNote(estimate.privateNote ?? estimate.title),
         CustomerRef: { value: estimate.customerId },
         Line: lines,
     };
 
-    const res = await qbFetch("/estimate", tokens, {
-        method: "POST",
-        body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`QB estimate sync failed: ${err}`);
+    let res: Response;
+    try {
+        res = await qbFetch(qboCreatePath("/estimate", requestId), tokens, {
+            method: "POST",
+            body: JSON.stringify(payload),
+            qbDeadline: deadline,
+        });
+    } catch (error) {
+        // Two failures here happened BEFORE the request went out, and only
+        // those two: the route budget was already gone (`qbTimedFetch` checks
+        // it before calling `fetch`), or the CALLER cancelled. Nothing was
+        // created in either case, so they propagate as themselves and stay
+        // retryable.
+        if (isQBBudgetExhaustedError(error) || isAbortError(error)) throw error;
+        // Everything else means the POST was dispatched and we never learned
+        // the outcome — a timeout, a dead socket, a transport error. QuickBooks
+        // may already hold the estimate; the caller must not retry as though
+        // this were an ordinary outage (see /api/quickbooks/sync).
+        throw new QBAmbiguousDocumentCreateError("QB estimate sync");
     }
 
-    const data = await res.json();
-    const qbId = data.Estimate?.Id;
-    const realmId = tokens.realmId;
+    // Every non-2xx goes through the CREATE classifier, which is not the same
+    // thing as the general one. `qboResponseError` sits outside the ambiguity
+    // boundary: it turned a 429/5xx into QboRetryableError, and the route then
+    // advertised `retry: true` for an estimate QuickBooks may already hold. A
+    // status only ends this create when QuickBooks itself refused it — see
+    // classifyDocumentCreateFailure.
+    if (!res.ok) throw await documentCreateResponseError(res, "QB estimate sync");
+
+    // A 2xx header only proves QuickBooks accepted the request, not that we
+    // ever learned what it did with it. The old boundary ended above this
+    // line, so a stalled/truncated/malformed body here fell through to a
+    // plain QBTimeoutError/QboRetryableError — indistinguishable from a
+    // dispatch-time failure to the route's classifier, which advertised
+    // retry:true for what may already be a created estimate. Everything from
+    // here on is the same "outcome unknown" case as the dispatch catch above.
+    let qbId: string | undefined;
+    let document: RemoteDocumentFacts | null = null;
+    try {
+        const data = await res.json();
+        qbId = data.Estimate?.Id;
+        // QuickBooks returns the document it actually booked. Reduced to the
+        // shared facts so the caller can hold it to the SAME rule a recovery
+        // holds a candidate to — it used to be thrown away and the id linked on
+        // its own.
+        document = remoteDocumentFacts(data.Estimate);
+    } catch (error) {
+        // A caller-originated abort must propagate as itself, same rule as
+        // qboResponseError/parseJsonOrNull — everything else (a timeout mid
+        // read, a dead connection, a truncated/malformed body) is ambiguous.
+        if (isAbortError(error)) throw error;
+        throw new QBAmbiguousDocumentCreateError("QB estimate sync");
+    }
+    if (!qbId) {
+        // A 2xx with no Estimate.Id is not a success — returning it as one
+        // left every caller building URLs and persisting `txnId: undefined`.
+        // Treat it the same as an unconfirmed outcome.
+        throw new QBAmbiguousDocumentCreateError("QB estimate sync");
+    }
     const qbUrl = `https://app.qbo.intuit.com/app/estimate?txnId=${qbId}`;
 
-    return { qbId, qbUrl };
+    return { qbId, qbUrl, document };
 }
 
 /** Push an invoice to QB. Returns the QB invoice ID. */
@@ -1408,8 +2301,15 @@ export async function syncInvoiceToQB(
         itemId: string;
         project: { name: string } | null;
         items?: Array<{ description: string; amount: number }>;
-    }
-): Promise<{ qbId: string; qbUrl: string }> {
+        /** See syncEstimateToQB. The invoice rail used to send none at all. */
+        privateNote?: string;
+        /** See syncEstimateToQB. */
+        txnDate?: string;
+    },
+    deadline?: RouteDeadline,
+    /** See syncEstimateToQB requestId. */
+    requestId?: string,
+): Promise<{ qbId: string; qbUrl: string; document: RemoteDocumentFacts | null }> {
     const lines: object[] = (invoice.items || []).map((item, i) => ({
         LineNum: i + 1,
         Description: item.description,
@@ -1429,34 +2329,63 @@ export async function syncInvoiceToQB(
     }
 
     const payload = {
-        DocNumber: invoice.code.slice(0, 21),
-        TxnDate: new Date().toISOString().split("T")[0],
+        DocNumber: invoice.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
+        TxnDate: invoice.txnDate ?? qboTxnDate(),
         CustomerRef: { value: invoice.customerId },
+        // Omitted when absent, so a caller that passes none is unchanged.
+        ...(canonicalPrivateNote(invoice.privateNote)
+            ? { PrivateNote: canonicalPrivateNote(invoice.privateNote) }
+            : {}),
         Line: lines,
     };
 
-    const res = await qbFetch("/invoice", tokens, {
-        method: "POST",
-        body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`QB invoice sync failed: ${err}`);
+    let res: Response;
+    try {
+        res = await qbFetch(qboCreatePath("/invoice", requestId), tokens, {
+            method: "POST",
+            body: JSON.stringify(payload),
+            qbDeadline: deadline,
+        });
+    } catch (error) {
+        // Same "dispatched, outcome unknown" handling as the estimate push above.
+        if (isQBBudgetExhaustedError(error) || isAbortError(error)) throw error;
+        throw new QBAmbiguousDocumentCreateError("QB invoice sync");
     }
 
-    const data = await res.json();
-    const qbId = data.Invoice?.Id;
+    // Same create-boundary classification as the estimate push above.
+    if (!res.ok) throw await documentCreateResponseError(res, "QB invoice sync");
+
+    // See the matching comment on syncEstimateToQB above: a 2xx only proves
+    // QuickBooks accepted the request, so a body-read/parse failure here is
+    // the same "outcome unknown" case as a dispatch-time timeout, not a plain
+    // retryable error.
+    let qbId: string | undefined;
+    let document: RemoteDocumentFacts | null = null;
+    try {
+        const data = await res.json();
+        qbId = data.Invoice?.Id;
+        // Same as the estimate create above.
+        document = remoteDocumentFacts(data.Invoice);
+    } catch (error) {
+        if (isAbortError(error)) throw error;
+        throw new QBAmbiguousDocumentCreateError("QB invoice sync");
+    }
+    if (!qbId) {
+        // A 2xx with no Invoice.Id is not a success — see the matching comment
+        // on syncEstimateToQB above.
+        throw new QBAmbiguousDocumentCreateError("QB invoice sync");
+    }
     const qbUrl = `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`;
-    return { qbId, qbUrl };
+    return { qbId, qbUrl, document };
 }
 
 /** Send a QBO invoice email to a client. */
-export async function sendQBInvoice(tokens: QBTokens, qbInvoiceId: string, sendTo?: string | null) {
+export async function sendQBInvoice(tokens: QBTokens, qbInvoiceId: string, sendTo?: string | null, deadline?: RouteDeadline) {
     const qs = new URLSearchParams({ minorversion: "73" });
     if (sendTo) qs.set("sendTo", sendTo);
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}/send?${qs}`;
     const res = await qbTimedFetch(url, {
+        qbDeadline: deadline,
         method: "POST",
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,

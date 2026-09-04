@@ -149,10 +149,30 @@ test.describe.serial("Mobile API contract", () => {
         expect(putRes.ok(), await putRes.text()).toBeTruthy();
         const updated = await putRes.json();
 
-        // laborCost/burdenCost are Prisma Decimal — JSON-serialized as strings.
+        // Hours come back to the worker; MONEY DOES NOT. A clock-out response is
+        // projected for its audience (src/lib/time-entry-projection.ts), and a
+        // FIELD_CREW audience has no laborCost, burdenCost, invoice linkage or
+        // QuickBooks id in it — this token is the crew member's own.
         expect(Number(updated.durationHours)).toBeCloseTo(2, 1);
-        expect(Number(updated.laborCost)).toBeCloseTo(100, 1); // field-crew hourlyRate 50 * 2h
-        expect(Number(updated.burdenCost)).toBeCloseTo(20, 1); // field-crew burdenRate 10 * 2h
+        expect(updated).not.toHaveProperty("laborCost");
+        expect(updated).not.toHaveProperty("burdenCost");
+
+        // The COSTING is still asserted, from where it actually lives. Reading it
+        // out of the crew response was only ever incidental: the response is what
+        // a phone is told, and the row is what payroll is paid from.
+        const stored = await prisma.timeEntry.findUniqueOrThrow({ where: { id: created.id } });
+        expect(Number(stored.laborCost)).toBeCloseTo(100, 1); // field-crew hourlyRate 50 * 2h
+        expect(Number(stored.burdenCost)).toBeCloseTo(20, 1); // field-crew burdenRate 10 * 2h
+
+        // ...and a MANAGER asking for the same entry does get the money, so the
+        // absence above is the projection and not an unpriced row.
+        const asManager = await api.get(`/api/time-entries?projectId=${PROJECT_ID}`, {
+            headers: { authorization: `Bearer ${managerToken}` },
+        });
+        expect(asManager.ok(), await asManager.text()).toBeTruthy();
+        const managerView = (await asManager.json()).find((e: any) => e.id === created.id);
+        expect(managerView, "the manager sees the entry").toBeTruthy();
+        expect(Number(managerView.laborCost)).toBeCloseTo(100, 1);
 
         await prisma.timeEntry.delete({ where: { id: created.id } });
         createdEntryIds.delete(created.id);
