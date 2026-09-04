@@ -239,7 +239,21 @@ async function getDefaultSalesTaxRate(): Promise<number> {
     }
 }
 
-export async function createInvoiceFromEstimateCore(estimateId: string) {
+// Actor context for created_invoice / deleted_invoice audit entries. Every
+// invoice.create / invoice.delete call site must supply one so the activity
+// feed can always answer "who did this" — the gap that let a duplicate
+// invoice (INV-00321) get created, sent, and deleted with nobody able to say
+// who did either (2026-08-20/24).
+export type InvoiceAuditActor = {
+    source: "ui" | "mcp" | "signing";
+    actorType: "TEAM" | "CLIENT" | "SYSTEM";
+    actorName: string;
+    actorUserId?: string | null;
+};
+
+const DEFAULT_INVOICE_ACTOR: InvoiceAuditActor = { source: "ui", actorType: "TEAM", actorName: "Team" };
+
+export async function createInvoiceFromEstimateCore(estimateId: string, actor: InvoiceAuditActor = DEFAULT_INVOICE_ACTOR) {
     const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
     if (!estimate) throw new Error("Estimate not found");
 
@@ -275,6 +289,8 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
     // pre-existing; this keeps it no worse than it was.
     const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
     await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
+
+    let milestoneCount = 0;
 
     // Clone the estimate's milestones into invoice-side PaymentSchedules. The
     // source read, the clone inserts AND the resulting balance/status write run
@@ -325,6 +341,7 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
             where: { estimateId },
             orderBy: { order: "asc" },
         });
+        milestoneCount = schedules.length > 0 ? schedules.length : 1;
 
         let paidAmount = 0;
         if (schedules.length > 0) {
@@ -380,11 +397,32 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
         return paidAmount;
     }));
 
+    // Best-effort: the invoice is already committed — a logging hiccup must
+    // never make the caller believe creation failed.
+    try {
+        await logActivityLazy({
+            projectId: estimate.projectId,
+            actorType: actor.actorType,
+            actorName: actor.actorName,
+            actorUserId: actor.actorUserId ?? null,
+            action: "created_invoice",
+            entityType: "invoice",
+            entityId: invoice.id,
+            entityName: `Invoice ${invoiceCode}`,
+            metadata: { code: invoiceCode, total, estimateCode: estimate.code, estimateId: estimate.id, milestoneCount, source: actor.source },
+        });
+    } catch (e) {
+        console.error("[createInvoiceFromEstimateCore] activity log failed:", e);
+    }
+
     revalidatePath(`/projects/${estimate.projectId}/invoices`);
     return { id: invoice.id, projectId: estimate.projectId };
 }
 
-export async function createInvoiceFromEstimateGuarded(estimateId: string) {
+export async function createInvoiceFromEstimateGuarded(estimateId: string, mcpActor?: { actorName: string; actorUserId?: string | null }) {
+    const actor: InvoiceAuditActor = mcpActor
+        ? { source: "mcp", actorType: "SYSTEM", actorName: mcpActor.actorName, actorUserId: mcpActor.actorUserId ?? null }
+        : { source: "mcp", actorType: "SYSTEM", actorName: "SYSTEM:mcp" };
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: { id: true, code: true, title: true, projectId: true, totalAmount: true },
@@ -414,7 +452,7 @@ export async function createInvoiceFromEstimateGuarded(estimateId: string) {
     // concurrent call created an invoice first, delete ours (untouched, seconds
     // old, milestones cascade) and return the winner. Deterministic: earliest
     // createdAt wins, id breaks ties.
-    const created = await createInvoiceFromEstimateCore(estimateId);
+    const created = await createInvoiceFromEstimateCore(estimateId, actor);
 
     const all = await prisma.invoice.findMany({
         where: { estimateId },
@@ -423,6 +461,13 @@ export async function createInvoiceFromEstimateGuarded(estimateId: string) {
     });
     const winner = all[0];
     if (winner && winner.id !== created.id) {
+        // Snapshot before the conditional delete below — deleted_invoice needs
+        // this even though the where clause below already guarantees Draft +
+        // never-sent (hadBeenSent is always false on this path).
+        const dup = await prisma.invoice.findUnique({
+            where: { id: created.id },
+            include: { payments: true },
+        });
         // Conditional delete: only remove OUR seconds-old invoice if it's still an
         // untouched draft. If anything already interacted with it, keep both and
         // let the duplicate surface for human review rather than destroy state.
@@ -430,6 +475,38 @@ export async function createInvoiceFromEstimateGuarded(estimateId: string) {
             where: { id: created.id, estimateId, status: "Draft", sentAt: null },
         });
         if (removed.count === 1) {
+            if (dup) {
+                try {
+                    await logActivityLazy({
+                        projectId: dup.projectId,
+                        actorType: actor.actorType,
+                        actorName: actor.actorName,
+                        actorUserId: actor.actorUserId ?? null,
+                        action: "deleted_invoice",
+                        entityType: "invoice",
+                        entityId: dup.id,
+                        entityName: `Invoice ${dup.code}`,
+                        metadata: {
+                            code: dup.code,
+                            total: toNum(dup.totalAmount),
+                            balanceDue: toNum(dup.balanceDue),
+                            status: dup.status,
+                            hadBeenSent: false,
+                            milestones: dup.payments.map((p) => ({
+                                name: p.name,
+                                amount: toNum(p.amount),
+                                status: p.status,
+                                lastEmailedAt: p.qbInvoiceSentAt ? p.qbInvoiceSentAt.toISOString() : null,
+                                qbInvoiceId: p.qbInvoiceId,
+                            })),
+                            source: actor.source,
+                            reason: "concurrent-duplicate-cleanup",
+                        },
+                    });
+                } catch (e) {
+                    console.error("[createInvoiceFromEstimateGuarded] activity log failed:", e);
+                }
+            }
             return {
                 ok: true as const,
                 alreadyExisted: true,
