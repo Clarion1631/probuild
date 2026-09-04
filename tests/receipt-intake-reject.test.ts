@@ -20,6 +20,10 @@ import {
     type RejectTxClient,
 } from "../src/lib/receipt-intake/storage-cleanup";
 
+/** How many times the reject transaction took the receipt-evidence lock. */
+let lockCalls = 0;
+/** How many times this transaction moved the receipt-evidence epoch. */
+let epochBumps = 0;
 const ROOT = path.resolve(__dirname, "..");
 const intake = readFileSync(path.join(ROOT, "src/app/api/receipts/intake/route.ts"), "utf8");
 const finalize = readFileSync(
@@ -65,7 +69,18 @@ function client(rows: Row[], onTx?: (store: Store) => void): { db: RejectClient;
             let staged = store.rows.map(r => ({ ...r }));
             const stagedEvents: Store["events"] = [];
             let seq = 0;
+            lockCalls = 0;
+            epochBumps = 0;
             const tx: RejectTxClient = {
+                // The receipt-evidence lock this transaction now takes
+                // (round-42 gate, finding 1). Recorded, because taking it is
+                // the invariant: a reject that skipped it could delete a row
+                // the sweep was mid-decision on.
+                $executeRaw: async () => { lockCalls++; return 0; },
+                // And the evidence-epoch bump (round-43 gate, finding 4):
+                // deleting a row is exactly the movement a sweep certifying a
+                // cycle must not stamp over.
+                $queryRaw: (async () => { epochBumps++; return [{ value: "1" }]; }) as RejectTxClient["$queryRaw"],
                 automationEvent: {
                     create: async ({ data }) => {
                         const id = `ev-${++seq}`;
@@ -165,7 +180,9 @@ test("a lost reject fence answers 409 publish-conflict and keeps the object", ()
 test("publishing STAGING -> RECEIVED is fenced on the exact state", () => {
     const fn = intake.slice(intake.indexOf("async function publishStagedRow"));
     const body = fn.slice(0, fn.indexOf("\n/**"));
-    assert.match(body, /updateMany/, "not a bare update by id");
+    // `evidenceUpdateMany` since round 42 (finding 1): still a fenced
+    // updateMany, now inside the transaction that holds the evidence lock.
+    assert.match(body, /evidenceUpdateMany/i, "not a bare update by id");
     assert.match(
         body,
         /where: \{ id, state: expectState, storagePath: expectStoragePath \}/,

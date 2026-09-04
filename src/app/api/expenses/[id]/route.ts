@@ -26,6 +26,7 @@ import {
     taxIsAtSource,
 } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
@@ -74,6 +75,16 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
         // this delete. The row would then be destroyed under a permission that
         // was granted for a job it is no longer on.
         const removed = await prisma.$transaction(async tx => {
+            // EVIDENCE (PR #443 gate rounds 42/45). Any Expense write can change
+            // what the missing-receipt sweep reads, so it goes behind the shared
+            // fence: the advisory lock, and the epoch bump that stops a cycle
+            // certifying over it. THE OUTERMOST LOCK — taken before the
+            // attribution parents and the per-expense lock, per
+            // receipt-evidence-lock.ts. Taken here rather than through
+            // `withReceiptEvidenceLock` because this handler owns its
+            // transaction; the wrapper is for a bare single write.
+            await lockReceiptEvidence(tx);
+            await bumpReceiptEvidenceEpoch(tx);
             const locked = await resolveExpenseProjectUnderLock(
                 tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
                 expense,
@@ -425,6 +436,16 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // and this route stamps "manual", which no automated pass may correct.
         const legacyWrite = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // EVIDENCE (PR #443 gate rounds 42/45). Any Expense write can change
+            // what the missing-receipt sweep reads, so it goes behind the shared
+            // fence: the advisory lock, and the epoch bump that stops a cycle
+            // certifying over it. THE OUTERMOST LOCK — taken before the
+            // attribution parents and the per-expense lock, per
+            // receipt-evidence-lock.ts. Taken here rather than through
+            // `withReceiptEvidenceLock` because this handler owns its
+            // transaction; the wrapper is for a bare single write.
+            await lockReceiptEvidence(tx);
+            await bumpReceiptEvidenceEpoch(tx);
             // THE ATTRIBUTION PARENTS, IN THE CANONICAL ORDER, BEFORE ANYTHING
             // ELSE (round 37, item 3): Project -> Estimate -> EstimateItem ->
             // CostCode -> Expense.
@@ -1462,6 +1483,16 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // does not.
         const written = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // EVIDENCE (PR #443 gate rounds 42/45). Any Expense write can change
+            // what the missing-receipt sweep reads, so it goes behind the shared
+            // fence: the advisory lock, and the epoch bump that stops a cycle
+            // certifying over it. THE OUTERMOST LOCK — taken before the
+            // attribution parents and the per-expense lock, per
+            // receipt-evidence-lock.ts. Taken here rather than through
+            // `withReceiptEvidenceLock` because this handler owns its
+            // transaction; the wrapper is for a bare single write.
+            await lockReceiptEvidence(tx);
+            await bumpReceiptEvidenceEpoch(tx);
             // THE ATTRIBUTION PARENTS FIRST, IN THE CANONICAL ORDER (round 37,
             // item 3): Project -> Estimate -> EstimateItem -> CostCode ->
             // Expense. Same reason as the PUT handler above — the two calls

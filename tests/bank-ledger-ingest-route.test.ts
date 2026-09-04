@@ -25,6 +25,8 @@ function makeHandlers(overrides: Partial<BankLedgerIngestHandlerDependencies> = 
             return { statementImportId: "stmt-1", inserted: (input as { lines: unknown[] }).lines.length };
         },
         findExistingQboObservations: async () => new Map(),
+        refreshQboDescriptors: async () => 0,
+        refreshQboClearedStatus: async () => 0,
         createQboObservations: async rows => {
             createQboObservationsCalls.push(...rows);
             return rows.length;
@@ -138,7 +140,10 @@ test("bank-ledger ingest: happy path", async t => {
             ],
         }));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, statementImportId: "stmt-1", inserted: 2, existing: 0 });
+        // `adopted` (Phase 2): how many lines attached to a canonical row the QBO
+        // pull had already minted, instead of minting a twin. 0 here — this fake
+        // has no QBO-minted lines to adopt.
+        assert.deepEqual(await res.json(), { ok: true, statementImportId: "stmt-1", inserted: 2, existing: 0, adopted: 0 });
         assert.equal(createStatementImportCalls.length, 1);
         const call = createStatementImportCalls[0] as { account: string; lines: Array<{ normalizedPayee: string }> };
         assert.equal(call.account, "WTB-0723");
@@ -229,7 +234,10 @@ test("bank-ledger ingest: happy path", async t => {
                 { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" },
             ],
         }));
-        assert.deepEqual(await res.json(), { ok: true, statementImportId: "stmt-1", inserted: 2, existing: 0 });
+        // `adopted` (Phase 2): how many lines attached to a canonical row the QBO
+        // pull had already minted, instead of minting a twin. 0 here — this fake
+        // has no QBO-minted lines to adopt.
+        assert.deepEqual(await res.json(), { ok: true, statementImportId: "stmt-1", inserted: 2, existing: 0, adopted: 0 });
         const call = createStatementImportCalls[0] as { lines: Array<{ sequence: number }> };
         assert.equal(call.lines.length, 2);
         assert.notEqual(call.lines[0].sequence, call.lines[1].sequence);
@@ -290,7 +298,7 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
             { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
         ])));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 0 });
+        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 0, descriptorsRefreshed: 0, clearedRefreshed: 0 });
         assert.equal(createQboObservationsCalls.length, 1);
     });
 
@@ -340,7 +348,72 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
             { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
         ])));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, inserted: 0, existing: 1 });
+        assert.deepEqual(await res.json(), { ok: true, inserted: 0, existing: 1, descriptorsRefreshed: 0, clearedRefreshed: 0 });
+        assert.equal(createQboObservationsCalls.length, 0);
+    });
+
+    await t.test("a row that CLEARS since last night is refreshed, never a restatement conflict", async () => {
+        // Codex PR #443 gate, finding 1. Clearance is mutable state: every
+        // uncleared row is expected to clear eventually. If it were part of the
+        // content hash that ordinary transition would answer 409 and stall the
+        // nightly pull on rows that had not changed at all.
+        const refreshed: Array<{ qbTxnId: string; clearedStatus: string }> = [];
+        const { handlers, createQboObservationsCalls } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null, clearedStatus: "Uncleared" }],
+            ]),
+            refreshQboClearedStatus: async (_account, rows) => { refreshed.push(...rows); return rows.length; },
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1", clearedStatus: "Reconciled" },
+        ])));
+        assert.equal(res.status, 200, "a clearance change is not a restatement");
+        assert.deepEqual(await res.json(), { ok: true, inserted: 0, existing: 1, descriptorsRefreshed: 0, clearedRefreshed: 1 });
+        assert.deepEqual(refreshed, [{ qbTxnId: "qb-1", clearedStatus: "Reconciled" }]);
+        assert.equal(createQboObservationsCalls.length, 0, "and no second observation is minted for it");
+    });
+
+    await t.test("\"Unknown\" never overwrites a stored clearance", async () => {
+        // "Unknown" is what a FAILED clearance probe produces. Letting it land
+        // would wipe every stored answer on the first bad night, after which
+        // nothing could mint until QuickBooks was asked again.
+        const refreshed: unknown[] = [];
+        const { handlers } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null, clearedStatus: "Reconciled" }],
+            ]),
+            refreshQboClearedStatus: async (_account, rows) => { refreshed.push(...rows); return rows.length; },
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1", clearedStatus: "Unknown" },
+        ])));
+        assert.equal(res.status, 200);
+        assert.equal((await res.json()).clearedRefreshed, 0);
+        assert.deepEqual(refreshed, [], "absence of evidence does not erase evidence");
+    });
+
+    await t.test("a new observation stores the clearance it came with, and an absent one is Unknown", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1", clearedStatus: "Cleared" },
+            { postedDate: "2026-07-17", amountCents: -100, rawDescriptor: "ARCO", qbTxnId: "qb-2" },
+        ])));
+        assert.equal(res.status, 200);
+        assert.deepEqual(
+            (createQboObservationsCalls as Array<{ qbTxnId: string; clearedStatus: string }>).map(r => [r.qbTxnId, r.clearedStatus]),
+            [["qb-1", "Cleared"], ["qb-2", "Unknown"]],
+        );
+    });
+
+    await t.test("400 invalid-line when clearedStatus is present but not a value QuickBooks uses", async () => {
+        // A typo must never read as a clearance — the closed set is enforced at
+        // the boundary, which is why the column carries no CHECK constraint.
+        const { handlers, createQboObservationsCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1", clearedStatus: "reconciled" },
+        ])));
+        assert.equal(res.status, 400);
+        assert.deepEqual(await res.json(), { ok: false, reason: "invalid-line", index: 0, field: "clearedStatus" });
         assert.equal(createQboObservationsCalls.length, 0);
     });
 
@@ -362,7 +435,7 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
             { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
         ])));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 1 });
+        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 1, descriptorsRefreshed: 0, clearedRefreshed: 0 });
         assert.equal(createQboObservationsCalls.length, 1);
     });
 

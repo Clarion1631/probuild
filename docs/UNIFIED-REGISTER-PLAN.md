@@ -12,7 +12,8 @@ specified more reliably by typed code + tests than by markdown.
 ## Framing
 > **QuickBooks WTB account register** — posted QuickBooks entries affecting account 154, fetched
 > at [time]. This view cannot see bank transactions that are pending, excluded, or missing from
-> QuickBooks. Bank-side completeness requires the monthly WTB CSV compare.
+> QuickBooks. Bank-side completeness requires the daily WTB CSV compare (decision 3 as amended
+> 2026-09-02 — the export runs daily, and is also the money-IN trigger for the deposit sweep).
 
 Spine = information architecture, not completeness. No "true north", no "no dollar can hide".
 

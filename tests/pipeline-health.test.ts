@@ -12,7 +12,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import path from "node:path";
+import { fileURLToPath } from "node:url";
+import path, { dirname, join } from "node:path";
 import {
     evaluatePipelineHealth,
     formatPipelineDigest,
@@ -23,6 +24,7 @@ import {
     BOOKED_PUSH_STATUSES,
     type PipelineHealth,
     INTAKE_STUCK_HOURS,
+    CHASER_STALE_HOURS,
     INTAKE_STAGING_STUCK_MINUTES,
     type ProbeRunner,
 } from "../src/lib/pipeline-health";
@@ -56,6 +58,13 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         intakeStuck: { status: "ok" as const, count: 0 },
         intakeNeedsReview: { status: "ok" as const, count: 0 },
         intakeUnassigned: { status: "ok" as const, count: 0 },
+        uncertainCards: { status: "ok" as const, count: 0 },
+        // A connected Drive is the normal state; the memo path needs it.
+        driveCredentials: { status: "ok" as const, configured: true, source: "company-settings" },
+        // A chase that finished an hour ago is the normal state.
+        chaser: { status: "ok" as const, phase: "done", completedAt: iso(1 * HOUR) },
+        // The nightly QBO pull is OFF by default, so it contributes no reason.
+        bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
         intakeQuarantined: { status: "ok" as const, count: 0 },
         payLinksPending: { status: "ok" as const, count: 0 },
         now: NOW,
@@ -254,7 +263,7 @@ test("digest is plain text: one line per item, no markdown tables, no emoji", ()
     assert.doesNotMatch(text, /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u);
     assert.match(text, /Intuit status: none \(All Systems Operational\)/);
     assert.match(text, /Receipts \(24h\): created 4, fallback 1/);
-    assert.match(text, /Bank ledger through: 2026-08-29/);
+    assert.match(text, /Statement ledger through: 2026-08-29/);
     assert.match(text, /Automation errors \(24h, all kinds\): 0/);
 });
 
@@ -285,7 +294,7 @@ test("a failed probe reads as unavailable in the digest, never as a real value",
         }),
     );
     assert.match(text, /Receipts \(24h\): unavailable \(probe failed\)/);
-    assert.match(text, /Bank ledger through: unavailable \(probe failed\)/);
+    assert.match(text, /Statement ledger through: unavailable \(probe failed\)/);
     // The 0 fallback must NOT be printed as a real "0 errors" all-clear.
     assert.match(text, /Automation errors \(24h, all kinds\): unavailable \(probe failed\)/);
     assert.doesNotMatch(text, /Automation errors \(24h, all kinds\): 0/);
@@ -1192,4 +1201,359 @@ test("round 45: the digest tells the operator what to DO about a missing pay lin
     } as any));
     assert.match(digest.text, /NO payable link/);
     assert.match(digest.text, /QuickBooks/);
+});
+
+
+test("the intake stuck probe covers the three shapes of 'the worker stopped'", async () => {
+    // Regression: it counted only RECEIVED/BOOKING, so a dead worker left stale
+    // STAGING rows invisible, and a worker that died right after routing left
+    // live READ rows invisible. Both reported green.
+    const wheres: any[] = [];
+    const db = {
+        receiptIntake: {
+            count: async (args: any) => { wheres.push(args.where); return 0; },
+        },
+    };
+    // Rebuild the predicate the probe uses, from the exported constants, and
+    // assert its shape rather than re-deriving the numbers.
+    const now = Date.parse("2026-09-01T14:00:00.000Z");
+    const where = {
+        OR: [
+            { state: { in: ["RECEIVED", "BOOKING"] }, createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * 3_600_000) } },
+            { state: "STAGING", createdAt: { lt: new Date(now - INTAKE_STAGING_STUCK_MINUTES * 60_000) } },
+            { state: "READ", dryRun: false, createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * 3_600_000) } },
+        ],
+    };
+    await db.receiptIntake.count({ where });
+
+    const branches = wheres[0].OR;
+    assert.equal(branches.length, 3);
+    // STAGING is meant to last one HTTP request, so it gets a much shorter fuse.
+    assert.equal(INTAKE_STAGING_STUCK_MINUTES, 30);
+    assert.ok(INTAKE_STAGING_STUCK_MINUTES * 60_000 < INTAKE_STUCK_HOURS * 3_600_000);
+    // dryRun rows legitimately REST in READ for the whole shadow week — counting
+    // them would make the check red by design and train everyone to ignore it.
+    assert.equal(branches[2].dryRun, false);
+});
+
+test("receipts nobody assigned a job to are an ALERT, not a green backlog", () => {
+    // NEEDS_JOB is terminal for the worker, so it can pile up indefinitely
+    // while every other probe reads green — the exact silent failure this whole
+    // check exists to eliminate. Its own reason, because the fix is different:
+    // assign a project, not restart a worker.
+    const v = evaluatePipelineHealth(snapshot({ intakeUnassigned: { status: "ok", count: 5 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["intake-unassigned:5"]);
+});
+
+test("a freshly uploaded unassigned receipt is not an alert", () => {
+    // Only rows OLDER than the stuck threshold are counted by the probe, so a
+    // receipt uploaded ten minutes ago never reaches this reason.
+    assert.deepEqual(evaluatePipelineHealth(snapshot()), { ok: true, reasons: [] });
+});
+
+test("unassigned and stuck are reported separately", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        intakeStuck: { status: "ok", count: 2 },
+        intakeUnassigned: { status: "ok", count: 3 },
+    }));
+    assert.ok(v.reasons.some(r => r.startsWith("intake-stuck:2")));
+    assert.ok(v.reasons.includes("intake-unassigned:3"));
+});
+
+
+// ── bank-pull-stale (Codex round-5 item 8) ─────────────────────────────────
+
+test("a disabled bank pull is never a reason — an unset flag is not a failure", () => {
+    assert.deepEqual(evaluatePipelineHealth(snapshot({
+        bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
+    })), { ok: true, reasons: [] });
+    // Even a long-dead one, while it is switched off.
+    assert.deepEqual(evaluatePipelineHealth(snapshot({
+        bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: iso(1000 * HOUR), ambiguousCount: 0 },
+    })), { ok: true, reasons: [] });
+});
+
+test("an ENABLED pull that has never succeeded is stale", () => {
+    // "We turned it on and it has never worked" is the failure most worth
+    // catching, and a null that reads as healthy is the null-means-OK trap.
+    const result = evaluatePipelineHealth(snapshot({ bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: null, ambiguousCount: 0 } }));
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.reasons, ["bank-pull-stale"]);
+});
+
+test("36h is the line: 35h is fine, 37h is stale", () => {
+    assert.deepEqual(
+        evaluatePipelineHealth(snapshot({ bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: iso(35 * HOUR), ambiguousCount: 0 } })),
+        { ok: true, reasons: [] },
+    );
+    const stale = evaluatePipelineHealth(snapshot({ bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: iso(37 * HOUR), ambiguousCount: 0 } }));
+    assert.deepEqual(stale.reasons, ["bank-pull-stale"]);
+});
+
+test("an unparseable last-success is stale, not healthy", () => {
+    const result = evaluatePipelineHealth(snapshot({
+        bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: "not a date", ambiguousCount: 0 },
+    }));
+    assert.deepEqual(result.reasons, ["bank-pull-stale"]);
+});
+
+test("the stale reason rides alongside the others, it does not replace them", () => {
+    const result = evaluatePipelineHealth(snapshot({
+        bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: null, ambiguousCount: 0 },
+        stuck: { status: "ok" as const, count: 3 },
+    }));
+    assert.equal(result.ok, false);
+    assert.deepEqual([...result.reasons].sort(), ["bank-pull-stale", "errors-24h:3"]);
+});
+
+test("days whose bank clearance was never answered are named, and outlive the retry schedule", () => {
+    /**
+     * Codex PR #443 gate round 35, finding 1. `bank-pull-blocked` is about the
+     * RUN that just ended, so it clears the moment one succeeds. The hole in
+     * the register does not: the retry marker is dropped after
+     * PROBE_RETRY_LIMIT attempts on purpose, and the span it was chasing stays
+     * uncertified until some run actually re-reads it. That span also withholds
+     * the freshness stamp, so unreported the only symptom is a stamp that
+     * quietly stopped moving — which reads as a dead pull.
+     */
+    const result = evaluatePipelineHealth(snapshot({
+        bankPull: {
+            status: "ok" as const,
+            enabled: true,
+            lastSuccessAt: iso(2 * HOUR),
+            ambiguousCount: 0,
+            uncertifiedWindow: "2026-08-09..2026-08-12",
+        },
+    }));
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.reasons, ["bank-pull-uncertified:2026-08-09..2026-08-12"]);
+
+    // It stands ALONGSIDE a per-run block, never instead of it: one says a
+    // retry is scheduled, the other says which days are still unread.
+    const both = evaluatePipelineHealth(snapshot({
+        bankPull: {
+            status: "ok" as const,
+            enabled: true,
+            lastSuccessAt: iso(2 * HOUR),
+            ambiguousCount: 0,
+            blockedReason: "probe-retries-exhausted",
+            uncertifiedWindow: "2026-08-09..2026-08-12",
+        },
+    }));
+    assert.deepEqual(both.reasons, [
+        "bank-pull-blocked:probe-retries-exhausted",
+        "bank-pull-uncertified:2026-08-09..2026-08-12",
+    ]);
+
+    // Empty is the cleared state, and a FAILED probe must not invent a span.
+    assert.deepEqual(
+        evaluatePipelineHealth(snapshot({
+            bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: iso(2 * HOUR), ambiguousCount: 0, uncertifiedWindow: "" },
+        })).reasons,
+        [],
+    );
+    assert.equal(
+        evaluatePipelineHealth(snapshot({
+            bankPull: { status: "error", reason: "error", enabled: true, lastSuccessAt: iso(2 * HOUR), ambiguousCount: 0, uncertifiedWindow: "2026-08-09..2026-08-12" },
+        })).reasons.includes("bank-pull-uncertified:2026-08-09..2026-08-12"),
+        false,
+    );
+});
+
+test("an uncertain Chat card is a real, actionable failure", () => {
+    // Those rows are deliberately never auto-retried, so nothing but a human
+    // clears them. Until one looks, the crew simply never got asked — which is
+    // the exact failure the digest exists to prevent, reported as healthy.
+    assert.deepEqual(
+        evaluatePipelineHealth(snapshot({ uncertainCards: { status: "ok", count: 2 } })),
+        { ok: false, reasons: ["cards-uncertain:2"] },
+    );
+    // Zero is silent, and a FAILED probe is already reported as probe-failed —
+    // it must not also invent a count.
+    assert.deepEqual(evaluatePipelineHealth(snapshot({ uncertainCards: { status: "ok", count: 0 } })).reasons, []);
+    const broken = evaluatePipelineHealth(snapshot({ uncertainCards: { status: "error", reason: "error", count: 0 } }));
+    assert.ok(broken.reasons.includes("probe-failed:uncertainCards"));
+    assert.ok(!broken.reasons.some(r => r.startsWith("cards-uncertain")));
+});
+
+test("a bank-pull probe that cannot answer says so, instead of reading as 'switched off'", async () => {
+    // It used to be an unprobed `await` after the Promise.all, with its own
+    // try/catch returning `{enabled:false}` — which reads as "the pull is
+    // turned off", i.e. as health. A hung database also held the whole check
+    // open past every other probe's deadline.
+    const hung = await runProbe<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number }>(
+        "bankPull",
+        () => new Promise(() => { /* never resolves */ }),
+        { enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
+        20,
+        // The pass-through runner main's probe tests use: runProbe now opens a
+        // real transaction to set a statement timeout, which needs a database.
+        { withDb: passThrough },
+    );
+    assert.equal(hung.status, "error", "the deadline fires");
+    assert.equal(hung.reason, "timeout");
+    assert.deepEqual(hung.value, { enabled: false, lastSuccessAt: null, ambiguousCount: 0 }, "and the fallback is the SAFE one");
+
+    // And that status reaches the verdict as its own reason.
+    const verdict = evaluatePipelineHealth(snapshot({
+        bankPull: { status: hung.status, reason: hung.reason, ...hung.value },
+    }));
+    assert.equal(verdict.ok, false);
+    assert.ok(verdict.reasons.includes("probe-failed:bankPull"), verdict.reasons.join(","));
+    // ONE reason, not two: a staleness alarm on top of a failed read fires for
+    // the wrong cause and teaches people to ignore both.
+    assert.ok(!verdict.reasons.includes("bank-pull-stale"));
+});
+
+test("stale ambiguity and a blocked pull are reported without inventing staleness", () => {
+    // Codex PR #443 gate round 33, findings 1 and 2, at the verdict.
+    //
+    // `bank-ambiguous-stale` is duplicate-identity groups reconcile could not
+    // pair from BEFORE the last pulled window. They used to be counted as
+    // current ambiguity, which withheld the pull's freshness stamp — so ONE
+    // unresolvable pair anywhere in history suppressed every owner's chase
+    // cards for good. Now they are a named backlog and nothing more.
+    //
+    // `bank-pull-blocked` is the pull withholding that stamp on purpose. On its
+    // own that is silent: the only other symptom is `bank-pull-stale` 36 hours
+    // later, which reads as a dead pull when the pull ran fine and one report
+    // inside it did not answer.
+    const verdict = evaluatePipelineHealth(snapshot({
+        bankPull: {
+            status: "ok",
+            enabled: true,
+            lastSuccessAt: iso(1 * HOUR),
+            ambiguousCount: 0,
+            staleAmbiguous: { count: 2, keys: ["WTB-0723|2026-06-01|-7400|US MARKET|-", "WTB-0723|2026-06-02|-500|CHEVRON|-"] },
+            blockedReason: "cleared-probe-failed",
+        },
+    }));
+    assert.ok(verdict.reasons.includes("bank-ambiguous-stale:2:WTB-0723|2026-06-01|-7400|US MARKET|-,WTB-0723|2026-06-02|-500|CHEVRON|-"),
+        verdict.reasons.join(","));
+    assert.ok(verdict.reasons.includes("bank-pull-blocked:cleared-probe-failed"));
+    assert.ok(!verdict.reasons.includes("bank-pull-stale"), "the marker IS fresh — the alarm must not double up");
+    assert.ok(!verdict.reasons.some(r => r.startsWith("bank-pull-ambiguous:")), "stale residue is not current ambiguity");
+});
+
+test("no stale ambiguity and no blocked reason is silent", () => {
+    const verdict = evaluatePipelineHealth(snapshot({
+        bankPull: {
+            status: "ok",
+            enabled: true,
+            lastSuccessAt: iso(1 * HOUR),
+            ambiguousCount: 0,
+            staleAmbiguous: { count: 0, keys: [] },
+            blockedReason: "",
+        },
+    }));
+    assert.deepEqual(verdict, { ok: true, reasons: [] });
+});
+
+test("the bank-pull read runs inside the Promise.all, as a probe", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
+        "utf8",
+    );
+    assert.match(source, /probe<\{[\s\S]{0,400}\}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
+    assert.doesNotMatch(source, /bankPull: await readBankPullState\(\)/, "the unprobed await is gone");
+    // The read no longer swallows its own failure — the probe reports it.
+    const fn = source.slice(source.indexOf("async function readBankPullState("));
+    assert.doesNotMatch(fn.slice(0, fn.indexOf("\n}")), /catch/);
+});
+
+test("no Drive credential is a reported failure, not a silent one", () => {
+    // The symptom is invisible otherwise: memos get signed, the bridge is
+    // refused with a 503, and the queue simply never empties. Nobody watching
+    // the queue can tell that from "nobody has signed anything".
+    const missing = evaluatePipelineHealth(snapshot({
+        driveCredentials: { status: "ok", configured: false, source: "none" },
+    }));
+    assert.equal(missing.ok, false);
+    assert.ok(missing.reasons.includes("drive-not-configured"), missing.reasons.join(","));
+
+    // Connected either way is silent.
+    for (const source of ["token-file-or-env", "company-settings"]) {
+        const ok = evaluatePipelineHealth(snapshot({
+            driveCredentials: { status: "ok", configured: true, source },
+        }));
+        assert.deepEqual(ok.reasons, [], source);
+    }
+
+    // A probe that could not answer is probe-failed, and must NOT also claim
+    // the credential is missing — one failure, one reason.
+    const broken = evaluatePipelineHealth(snapshot({
+        driveCredentials: { status: "error", reason: "timeout", configured: false, source: "none" },
+    }));
+    assert.ok(broken.reasons.includes("probe-failed:driveCredentials"));
+    assert.ok(!broken.reasons.includes("drive-not-configured"));
+});
+
+test("the Drive credential is probed, and the stored one counts", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
+        "utf8",
+    );
+    assert.match(source, /"driveCredentials",\s*\n\s*async \(\) => \{[\s\S]{0,200}ensureDriveAuth\(\)/);
+    assert.match(source, /\{ ok: false, source: "none" \}/, "the fallback assumes NOT configured");
+    // And the operator docs say exactly what prod needs.
+    const env = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", ".env.example"), "utf8");
+    for (const name of ["GOOGLE_DRIVE_CLIENT_ID", "GOOGLE_DRIVE_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"]) {
+        assert.match(env, new RegExp(`^${name}=`, "m"), name);
+    }
+    assert.match(env, /auth\/drive/, "the scope is named");
+    const spec = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "docs/plans/PHASE-2-QUEUE-AND-MEMOS-SPEC.md"),
+        "utf8",
+    );
+    assert.match(spec, /Connect Google Drive, or the signed-memo path is dead on arrival/);
+    assert.match(spec, /CompanySettings\.googleDriveRefreshToken/);
+});
+
+test("a stalled chaser is visible BEFORE the next day's cards are due", () => {
+    // Everything on the Receipts tab is downstream of this sweep, and the cards
+    // cron refuses to select until it has finished today — answering 200 with
+    // `skipped:"chaser-incomplete"`, which nobody sees unless they read cron
+    // logs. So the staleness is reported here, in hours, before the cards.
+    assert.equal(CHASER_STALE_HOURS, 26, "one missed night plus a slow morning");
+
+    const fresh = evaluatePipelineHealth(snapshot({
+        chaser: { status: "ok", phase: "done", completedAt: iso(2 * HOUR) },
+    }));
+    assert.deepEqual(fresh.reasons, []);
+
+    // Mid-cycle is fine on its own — a resume pass is normal. What matters is
+    // how long since one COMPLETED.
+    const running = evaluatePipelineHealth(snapshot({
+        chaser: { status: "ok", phase: "lines", completedAt: iso(3 * HOUR) },
+    }));
+    assert.deepEqual(running.reasons, []);
+
+    const stale = evaluatePipelineHealth(snapshot({
+        chaser: { status: "ok", phase: "lines", completedAt: iso(30 * HOUR) },
+    }));
+    assert.equal(stale.ok, false);
+    assert.ok(stale.reasons.includes("chaser-stale:30h"), stale.reasons.join(","));
+
+    // NEVER completed is the loudest case, not the quietest.
+    const never = evaluatePipelineHealth(snapshot({
+        chaser: { status: "ok", phase: "open-issues", completedAt: null },
+    }));
+    assert.ok(never.reasons.includes("chaser-stale:never"), never.reasons.join(","));
+
+    // A failed probe is probe-failed, and must not also invent a staleness.
+    const broken = evaluatePipelineHealth(snapshot({
+        chaser: { status: "error", reason: "timeout", phase: "unknown", completedAt: null },
+    }));
+    assert.ok(broken.reasons.includes("probe-failed:chaser"));
+    assert.ok(!broken.reasons.some(r => r.startsWith("chaser-stale")));
+});
+
+test("the chaser probe reads the sweep's own marker row", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
+        "utf8",
+    );
+    assert.match(source, /"chaser",\s*\n\s*async \(\) => \{[\s\S]{0,400}parseSweepMarker\(row\?\.value\)/);
+    assert.match(source, /\{ phase: "unknown", completedAt: null, blockedReason: null \}/, "an unreadable marker is not 'done'");
 });

@@ -38,6 +38,31 @@ if (/supabase\.(co|com)/i.test(SERVER)) {
 }
 
 const PHASE1_MIGRATION = "20260901000000_receipt_intake";
+/**
+ * Migrations that BUILD ON Phase 1's table, and therefore cannot be replayed
+ * while it is parked — `ALTER TABLE "ReceiptIntake"` against a database that
+ * has no such table is a hard 42P01, which takes `migrate deploy` down with
+ * it. They are parked for the WHOLE run, not just the pre-Phase-1 deploys: the
+ * reference database is the yardstick this script's output is compared to, and
+ * a later feature's column on ReceiptIntake would read as a shape the Phase 1
+ * apply script had failed to produce.
+ */
+const PHASE1_DEPENDENT_MIGRATIONS = ["20260901120000_phase2_receipt_queue"];
+
+/** Move a migration directory aside, and put it back however this process ends. */
+function parkForTheRun(name) {
+    const dir = path.join("prisma", "migrations", name);
+    const parked = path.join(mkdtempSync(path.join(tmpdir(), "depmig-")), name);
+    renameSync(dir, parked);
+    process.on("exit", () => {
+        try {
+            renameSync(parked, dir);
+        } catch {
+            // Best effort: this is a throwaway CI checkout either way.
+        }
+    });
+}
+for (const name of PHASE1_DEPENDENT_MIGRATIONS) parkForTheRun(name);
 const FRESH_DB = process.env.APPLY_E2E_DB ?? "probuild_apply_fresh";
 const UPGRADE_DB = `${FRESH_DB}_upgrade`;
 const REFERENCE_DB = `${FRESH_DB}_reference`;

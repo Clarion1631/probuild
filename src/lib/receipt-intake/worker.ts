@@ -19,11 +19,13 @@ import { dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
 import {
     backoffMs,
     MAX_BOOK_ATTEMPTS,
+    NO_ARTIFACT_PARK_REASONS,
     routeState,
     TAX_IMPLAUSIBLE_REASON,
     type DedupHits,
     type ReceiptIntakeState,
 } from "./route-state";
+import { duplicateChainReason } from "./duplicate-guard";
 import {
     appliedTaxCents,
     buildGroups,
@@ -379,6 +381,27 @@ export interface WorkerDependencies {
         ownership: Ownership,
     ) => Promise<{ strongOwner: StrongOwner | null; owned: boolean }>;
     findWeakHit: (rowId: string, weakKey: string) => Promise<{ id: string } | null>;
+    /**
+     * Park a routed DUPLICATE — or refuse to, if rows are already filed behind
+     * this one (round-39 gate finding 2; made transactional by round-40 gate
+     * finding 1).
+     *
+     * ONE call, because the check and the transition have to be ONE
+     * transaction: the version that read the references and then wrote in a
+     * separate statement let an admin commit A→B in between, which is the exact
+     * chain being guarded against. The implementation takes the shared
+     * `withEvidenceAndChainLocks`, so this path and the admin actions cannot
+     * diverge. Returns the state it actually wrote.
+     *
+     * Optional so a caller that predates it keeps the old behaviour rather than
+     * crashing; the cron wires it.
+     */
+    applyDuplicateTransition?: (
+        rowId: string,
+        decision: { state: ReceiptIntakeState; stateReason: string | null; duplicateOfId: string | null },
+        patch: Partial<ReadPatch>,
+        ownership: Ownership,
+    ) => Promise<{ owned: boolean; state: ReceiptIntakeState }>;
     /** Marks a row NEEDS_REVIEW / NON_RECEIPT / whatever routing decided, with no keys claimed. */
     applyState: (
         rowId: string,
@@ -927,6 +950,37 @@ export async function handleRowError(
     return ownedRetry ? "RETRY" : "STALE";
 }
 
+/**
+ * A row other rows are already filed behind may not itself become a
+ * DUPLICATE (Codex PR #443 gate round 39, finding 2).
+ *
+ * Routing can reach DUPLICATE for such a row: the strong-key owner it
+ * matches was claimed while this row was still being routed, so nothing had
+ * published it as an original yet — and parking it there leaves every row
+ * pointing at it filed behind a copy, the exact chain the manual path
+ * refuses to build.
+ *
+ * NEEDS_REVIEW rather than a throw: this is a background pass over a batch,
+ * and one row that needs a human is not a reason to abandon the rest. The
+ * reason names the referencing rows so the human can see what to unmark, and
+ * `duplicateOfId` is kept because it is the evidence for the decision they
+ * are being asked to make (route-state.ts already pairs the two this way).
+ */
+async function applyRoutedState(
+    deps: Pick<WorkerDependencies, "applyState" | "applyDuplicateTransition">,
+    rowId: string,
+    decision: { state: ReceiptIntakeState; stateReason: string | null; duplicateOfId: string | null },
+    patch: Partial<ReadPatch>,
+    ownership: Ownership,
+    note: (reason: string | null) => string | null,
+): Promise<{ owned: boolean; state: ReceiptIntakeState }> {
+    if (decision.state === "DUPLICATE" && deps.applyDuplicateTransition) {
+        return deps.applyDuplicateTransition(rowId, decision, patch, ownership);
+    }
+    const owned = await deps.applyState(rowId, decision.state, note(decision.stateReason), patch, ownership);
+    return { owned, state: decision.state };
+}
+
 /** QBTimeoutError is deliberately NOT here — a timeout is transport, not a verdict. */
 export function isTerminalQboFault(error: unknown): boolean {
     // NAME-BASED (round 40, item 4): Node 20 + tsx can load quickbooks.ts
@@ -948,6 +1002,13 @@ function stateForBookResult(result: BookResult): string {
         case "deferred": return "BOOKING";
         case "retry": return "BOOKING";
         case "stale": return "STALE";
+        // Nothing was sent and nothing is written back: the row is already
+        // whatever the human made it (VOID, DUPLICATE, ...). Reporting the
+        // state it USED to be in would overwrite their decision.
+        case "aborted": return "ABORTED";
+        // book.ts already recorded the orphaned Purchase on the row; the state
+        // is whatever the human set (VOID/DUPLICATE) and must not be moved.
+        case "booked-after-void": return "BOOKED_AFTER_VOID";
     }
 }
 
@@ -965,7 +1026,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         // Terminal, and loud: it means the object was replaced after
         // verification, which is the exact thing sealing exists to prevent.
         if (download.kind === "sha-mismatch") {
-            return parkTerminal(row, deps, "content-changed");
+            return parkTerminal(row, deps, NO_ARTIFACT_PARK_REASONS.contentChanged);
         }
         // A TIMEOUT is tagged apart from every other transient storage fault,
         // because only this one is self-inflicted enough to bound separately.
@@ -1146,13 +1207,13 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         //
         // Safe to swap: the unique-violation path applyRead exists for cannot
         // fire here, because a gated row claims no strong key at all.
-        const owned = await deps.applyState(row.id, gate.state, note(gate.stateReason), {
+        const gated = await applyRoutedState(deps, row.id, gate, {
             ...base,
             state: gate.state,
             dedupStrongKey: null,
             duplicateOfId: gate.duplicateOfId,
-        }, ownershipOf(row));
-        return owned ? gate.state : "STALE";
+        }, ownershipOf(row), note);
+        return gated.owned ? gated.state : "STALE";
     }
 
     // The strong claim IS the partial unique index: a rejection is the hit.
@@ -1181,12 +1242,12 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
 
     if (applied.strongOwner) {
         const second = routeState(routeInput, { strong: applied.strongOwner, weak: null }, hasProject);
-        const owned = await deps.applyState(row.id, second.state, note(second.stateReason), {
+        const applied2 = await applyRoutedState(deps, row.id, second, {
             ...base,
             dedupStrongKey: null,
             duplicateOfId: second.duplicateOfId,
-        }, ownershipOf(row));
-        return owned ? second.state : "STALE";
+        }, ownershipOf(row), note);
+        return applied2.owned ? applied2.state : "STALE";
     }
 
     // No strong hit (or no strong key at all — a placeholder ref). The weak net
@@ -1207,12 +1268,12 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         // collide with a row that was never booked — the review queue then had
         // two rows and neither could proceed. The weak pair is still visible to
         // a human through duplicateOfId and the reason.
-        const owned = await deps.applyState(row.id, third.state, note(third.stateReason), {
+        const applied3 = await applyRoutedState(deps, row.id, third, {
             ...base,
             dedupStrongKey: null,
             duplicateOfId: third.duplicateOfId,
-        }, ownershipOf(row));
-        return owned ? third.state : "STALE";
+        }, ownershipOf(row), note);
+        return applied3.owned ? applied3.state : "STALE";
     }
 
     // Routing is complete. This is the ONLY path to READ, and the only place

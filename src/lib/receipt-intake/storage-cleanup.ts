@@ -17,6 +17,7 @@ import type { Prisma } from "@prisma/client";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { prisma } from "@/lib/prisma";
 import { removeReceiptObject, STORAGE_CALL_MAX_MS, uploadReceiptObject } from "./bucket";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 import { leaseFence } from "./stored-object";
 import type { RouteDeadline } from "@/lib/quickbooks";
 
@@ -660,6 +661,16 @@ export function claimsConflict(
  */
 /** The two writes the reject transaction needs — injectable so it is testable. */
 export interface RejectTxClient {
+    /**
+     * The receipt-evidence lock runs through here (round-42 gate, finding 1):
+     * this transaction changes what the sweep reads, so it queues behind it.
+     */
+    $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>;
+    /**
+     * And the evidence EPOCH is bumped through here (round-43 gate, finding 4),
+     * so a sweep certifying a whole cycle can tell that evidence moved under it.
+     */
+    $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>;
     automationEvent: { create(args: { data: Record<string, unknown>; select: { id: true } }): Promise<{ id: string }> };
     receiptIntake: {
         deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }>;
@@ -721,6 +732,15 @@ export async function rejectRowAndQueueCleanup(
 ): Promise<{ ok: true; eventId: string } | { ok: false }> {
     try {
         const eventId = await db.$transaction(async tx => {
+            // Deleting a row removes evidence, so it queues behind the sweep
+            // like every other writer (round-42 gate, finding 1).
+            await lockReceiptEvidence(tx);
+            // AND MOVE THE EVIDENCE EPOCH (round-43 gate, finding 4). This
+            // transaction owns the lock directly rather than going through
+            // `withReceiptEvidenceLock`, so the bump the wrapper would have
+            // done has to be done here — a sweep certifying a cycle needs to
+            // see that evidence moved under it.
+            await bumpReceiptEvidenceEpoch(tx);
             const event = await tx.automationEvent.create({
                 data: {
                     kind: STORAGE_CLEANUP_KIND,

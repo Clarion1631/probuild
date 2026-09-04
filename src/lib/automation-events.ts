@@ -31,7 +31,14 @@ export interface AutomationEventInput {
          * bytes sit in a private bucket forever, unreferenced. The receipt
          * worker's sweep retries the deletion and resolves the event.
          */
-        | "storage-cleanup-pending";
+        | "storage-cleanup-pending"
+        /**
+         * A human's decision about an orphaned QuickBooks Purchase: either they
+         * located it (verified by amount) or they checked and there is none.
+         * Both free things the system will not free on its own — a dedup key, a
+         * quarantined re-send — so both record WHO said so and WHY.
+         */
+        | "receipt-orphan-resolution";
     stage?: string;
     status: string;
     reason?: string;

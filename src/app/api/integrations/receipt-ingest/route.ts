@@ -6,6 +6,7 @@ import { resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { matchProjectByName, matchCostCode } from "@/lib/project-match";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -298,6 +299,14 @@ export async function POST(req: Request) {
 
     try {
         const outcome = await prisma.$transaction(async tx => {
+            // EVIDENCE (PR #443 gate round 42, finding 1). Every Expense here
+            // lands WITH its receipt, which is what the missing-receipt sweep
+            // reads as "this charge is answered". THE OUTERMOST LOCK, taken
+            // before the attribution parents below (receipt-evidence-lock.ts)
+            // and directly rather than through `withReceiptEvidenceLock`,
+            // because this route owns the whole-document transaction.
+            await lockReceiptEvidence(tx);
+            await bumpReceiptEvidenceEpoch(tx);
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
 
             // ONE DELIVERY AT A TIME, PER DRIVE FILE (round 33, item 1 — the

@@ -46,6 +46,11 @@ let costCodes: { id: string; code: string; isActive: boolean }[];
 let phaseItems: { projectId: string; costCodeId: string }[];
 
 const fakePrisma: any = {
+    // The receipt-evidence lock and its epoch bump (PR #443 gate rounds
+    // 42/45): every Expense writer takes them, and nothing in this suite
+    // depends on their result — only that they are answerable.
+    $executeRaw: async () => 1,
+    $queryRaw: async () => [{ value: "1" }],
     // The tax PATCH writes inside a transaction that first takes the shared
     // per-expense advisory lock.
     $transaction: async (fn: any) => fn(fakePrisma),

@@ -10,11 +10,15 @@
  */
 import { lockEstimateAttribution } from "@/lib/expense-attribution";
 import { lockAttributionParents } from "@/lib/phase-invariant";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 /** The transaction client subset the write below needs. */
 interface ParsedReceiptDb {
     $transaction<T>(fn: (tx: {
         $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown>;
+        /** The receipt-evidence lock and its epoch run through these two. */
+        $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<unknown>;
+        $queryRaw<T2 = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T2>;
         expense: { create(args: { data: Record<string, unknown> }): Promise<{ id: string }> };
     }) => Promise<T>): Promise<T>;
 }
@@ -55,6 +59,12 @@ export async function createParsedReceiptExpense(
 ): Promise<{ id: string } | null> {
     return db.$transaction(async tx => {
         const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        // EVIDENCE (PR #443 gate round 42, finding 1). This row lands with its
+        // receipt attached, which is what the missing-receipt sweep reads as
+        // "this charge is answered". THE OUTERMOST LOCK, so it comes before
+        // the attribution parents below (receipt-evidence-lock.ts).
+        await lockReceiptEvidence(tx);
+        await bumpReceiptEvidenceEpoch(tx);
         await lockAttributionParents(raw, {
             projectId: input.projectId,
             estimateId: input.estimateId,

@@ -6,6 +6,7 @@ import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 import {
     COST_CODE_ID_INVALID_MESSAGE,
     itemBelongsToEstimateTx,
@@ -207,6 +208,15 @@ export async function POST(req: NextRequest) {
         // and the insert would still be stamped onto a brand new row — as
         // "capture", which no automated pass may then correct.
         const created = await prisma.$transaction(async tx => {
+            // EVIDENCE (PR #443 gate rounds 42/45). An Expense created WITH a
+            // receiptUrl is exactly what the missing-receipt sweep reads as "this
+            // charge is answered", so this write queues behind the sweep and moves
+            // the evidence epoch. THE OUTERMOST LOCK — before the attribution
+            // parents and the per-expense lock (receipt-evidence-lock.ts). Taken
+            // here rather than through `withReceiptEvidenceLock` because this
+            // handler owns its transaction; the wrapper is for a bare single write.
+            await lockReceiptEvidence(tx);
+            await bumpReceiptEvidenceEpoch(tx);
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
             // THE WHOLE LOCK SET, IN THE CANONICAL ORDER, FIRST (round 37,
             // item 3): Project -> Estimate -> EstimateItem -> CostCode.

@@ -35,6 +35,30 @@ import {
     serializeReceiptIntake,
     withArchiveDownloadUrls,
 } from "@/lib/receipt-intake/queries";
+import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+
+/**
+ * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
+ * #443 gate round 42, finding 1).
+ *
+ * The missing-receipt sweep decides from the evidence it READ, and holds the
+ * same advisory lock across those reads and its verdicts — so every writer of
+ * that evidence takes it too, inside its own transaction, before writing. A
+ * bare `prisma.*` call is its own implicit transaction and cannot hold an
+ * xact-scoped lock, which is why these wrappers exist.
+ *
+ * Held for one write. Never across a Drive download or a QuickBooks call.
+ */
+const evidenceCreate = <T = { id: string; state: string; sourceRef: string; projectId: string | null; dryRun: boolean }>(
+    args: Prisma.ReceiptIntakeCreateArgs,
+): Promise<T> =>
+    withReceiptEvidenceLock<T>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.create(args) as unknown as Promise<T>);
+const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
+const evidenceDeleteMany = (args: Prisma.ReceiptIntakeDeleteManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.deleteMany(args));
+const evidenceDelete = (args: Prisma.ReceiptIntakeDeleteArgs) =>
+    withReceiptEvidenceLock(fn => prisma.$transaction(fn), tx => tx.receiptIntake.delete(args));
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -245,6 +269,18 @@ export async function POST(req: Request) {
     // A session/Bearer caller may only file against a project they can reach.
     // The secret caller is a trusted forwarder resolving the project from the
     // Drive folder, and has no user to scope by.
+    // A cost code must be a PHASE OF THE JOB it is filed against — "the code
+    // exists" is not a permission, and the FK check alone would happily accept
+    // a code from an unrelated job, which books the expense somewhere nobody
+    // looks. Deterministic 400: a forwarder must not retry this forever.
+    if (parsed.costCodeId) {
+        if (!parsed.projectId) return bad("cost-code-without-project");
+        const allowed = await isCostCodeAllowedForProject(
+            prismaPhaseDataSource, parsed.projectId, parsed.costCodeId,
+        );
+        if (!allowed) return bad("cost-code-not-a-phase-of-project");
+    }
+
     if (auth.via === "session" && parsed.projectId) {
         const allowed = await userCanAccessProject(auth.user, parsed.projectId);
         if (!allowed) return NextResponse.json({ ok: false, reason: "forbidden" }, { status: 403 });
@@ -277,7 +313,7 @@ export async function POST(req: Request) {
     // case storage is never touched at all.
     let created: { id: string; state: string; sourceRef: string; projectId: string | null; dryRun: boolean };
     try {
-        created = await prisma.receiptIntake.create({
+        created = await evidenceCreate({
             data: {
                 id,
                 source,
@@ -332,7 +368,7 @@ export async function POST(req: Request) {
 
     const supabase = getSupabase();
     if (!supabase) {
-        await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
+        await evidenceDelete({ where: { id } }).catch(() => { /* best effort */ });
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
     // A THROW here is not the same as an error result — the SDK can reject
@@ -386,7 +422,7 @@ export async function POST(req: Request) {
         // told did not exist.
         let deletedCount: number;
         try {
-            const result = await prisma.receiptIntake.deleteMany({
+            const result = await evidenceDeleteMany({
                 where: { id, state: "STAGING", storagePath },
             });
             deletedCount = result.count;
@@ -455,7 +491,7 @@ async function publishStagedRow(id: string, expectStoragePath: string, expectSta
         // publisher onto the same state with two different ideas of which
         // object is now canonical. Pinning storagePath makes that update
         // match zero rows instead.
-        const { count } = await prisma.receiptIntake.updateMany({
+        const { count } = await evidenceUpdateMany({
             where: { id, state: expectState, storagePath: expectStoragePath },
             data: { state: "RECEIVED" },
         });
@@ -683,6 +719,9 @@ async function respondToSourceRefConflict(
             // ONE SHORT TRANSACTION, with the upload already done: the repoint
             // and the cancellation of its intent land together or neither does.
             const { count } = await inShortTx(async tx => {
+                // First statement, as the evidence lock requires: this heal
+                // publishes a row the missing-receipt sweep reads.
+                await lockReceiptEvidence(tx);
                 const moved = await tx.receiptIntake.updateMany({
                     // leaseFence: the heal REPOINTS the row at bytes this request
                     // uploaded, and a /start that reissued the client's URL in the

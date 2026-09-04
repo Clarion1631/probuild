@@ -22,6 +22,7 @@ import {
     zeroRateManagerMessage,
 } from "./pay-rate-guard";
 import { withPayrollWrite, withPayrollWriteTx } from "./payroll-period";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -340,6 +341,14 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
     // locks the four tables it rests on and reads them on the transaction that
     // inserts the row.
     return prisma.$transaction(async tx => {
+        // EVIDENCE (PR #443 gate rounds 42/45). An Expense write changes what
+        // the missing-receipt sweep reads, so it queues behind the sweep and
+        // moves the evidence epoch. THE OUTERMOST LOCK, before the attribution
+        // parents below (receipt-evidence-lock.ts); taken directly rather than
+        // through `withReceiptEvidenceLock` because this path owns a
+        // transaction of its own.
+        await lockReceiptEvidence(tx);
+        await bumpReceiptEvidenceEpoch(tx);
         const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
         // THE WHOLE LOCK SET, IN THE CANONICAL ORDER, FIRST (round 37, item 3):
         // Project -> Estimate -> EstimateItem -> CostCode. Same reason as the
@@ -511,6 +520,14 @@ export async function tagExpensesToChangeOrderCore(
     // A row that moved is skipped, not fatal: the count tells the caller.
     let updated = 0;
     await prisma.$transaction(async tx => {
+        // EVIDENCE (PR #443 gate rounds 42/45). An Expense write changes what
+        // the missing-receipt sweep reads, so it queues behind the sweep and
+        // moves the evidence epoch. THE OUTERMOST LOCK, before the attribution
+        // parents below (receipt-evidence-lock.ts); taken directly rather than
+        // through `withReceiptEvidenceLock` because this path owns a
+        // transaction of its own.
+        await lockReceiptEvidence(tx);
+        await bumpReceiptEvidenceEpoch(tx);
         const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
         // EVERY PARENT FIRST, THEN THE ROWS (round 46, item 3). The loop below
         // locked row 1's parents, updated row 1 — taking that Expense

@@ -35,6 +35,11 @@ let batchRows: Record<string, unknown>[] = [];
 let findManyArgs: any = null;
 
 const fakePrisma: any = {
+    // The receipt-evidence lock and its epoch bump (PR #443 gate rounds
+    // 42/45): every Expense writer takes them, and nothing in this suite
+    // depends on their result — only that they are answerable.
+    $executeRaw: async () => 1,
+    $queryRaw: async () => [{ value: "1" }],
     // The delete now runs in a transaction that re-resolves a fallback-
     // attributed row's job from the LOCKED estimate (round 20, item 4).
     $transaction: async (fn: any) => fn(fakePrisma),

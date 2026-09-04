@@ -287,6 +287,60 @@ test("a strong-key claim that loses re-routes against the owner and keeps no key
     assert.equal(h.states[0].state, "DUPLICATE");
 });
 
+test("a row OTHER rows are filed behind is never reclassified DUPLICATE", async () => {
+    /**
+     * Codex PR #443 gate round 39, finding 2. The strong-key owner was claimed
+     * while this row was still routing, so routing reaches DUPLICATE — but
+     * another row is already filed as a duplicate OF this one, and parking it
+     * here leaves that row pointing at a copy. The manual path refuses to build
+     * that chain; the worker must not build it either.
+     */
+    const h = harness([workerRow()], {
+        applyRead: async () => ({ owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } }),
+        // The cron's own shape (round-40 gate, finding 1): ONE call that takes
+        // the lock, decides, and writes — never a fact the worker acts on later.
+        applyDuplicateTransition: async (rowId, decision, patch) => {
+            const inbound = rowId === "row-1" ? ["row-9"] : [];
+            const state = inbound.length === 0 ? decision.state : "NEEDS_REVIEW";
+            h.states.push({
+                id: rowId,
+                state,
+                reason: inbound.length === 0 ? decision.stateReason : `duplicate-chain:${inbound.join(",")}`,
+                patch,
+                ownership: { state: "RECEIVED", claimToken: "claim-1" },
+            });
+            return { owned: true, state };
+        },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 }, "a human decides which receipt is the original");
+    assert.equal(h.states[0].state, "NEEDS_REVIEW");
+    assert.match(String(h.states[0].reason), /duplicate-chain:row-9/, "and the reason names what to unmark");
+    assert.equal(
+        h.states[0].patch?.duplicateOfId, "row-owner",
+        "the match it found is kept as the evidence for that decision",
+    );
+});
+
+test("PRE-FIX CONTROL: with nothing filed behind it, the same row still routes to DUPLICATE", async () => {
+    // The guard narrows nothing else: this is the identical setup with no
+    // inbound reference, and it is the behaviour the test above changed.
+    const h = harness([workerRow()], {
+        applyRead: async () => ({ owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } }),
+        applyDuplicateTransition: async (_rowId, decision) => ({ owned: true, state: decision.state }),
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { DUPLICATE: 1 });
+
+    // And a caller that does not wire the dependency at all keeps the old
+    // behaviour rather than crashing — the cron wires it.
+    const legacy = harness([workerRow()], {
+        applyRead: async () => ({ owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } }),
+    });
+    assert.deepEqual((await runIntakeWorker(legacy.deps)).byState, { DUPLICATE: 1 });
+});
+
 test("a strong-key loss at a DIFFERENT total goes to a human, not to DUPLICATE", async () => {
     const h = harness([workerRow()], {
         applyRead: async () => ({ owned: true, strongOwner: { id: "row-owner", totalCents: 999, canonicalVendor: "lowes" } }),

@@ -21,6 +21,23 @@ import { parsePaymentDateInput } from "./payment-date";
 import { rowFingerprint, type RowFingerprintInput } from "./rate-import";
 import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
+import { retryTargetFor } from "./receipt-intake/route-state";
+import { POSSIBLE_ORPHAN_REASON, UNKNOWN_ORPHAN_STATES, planParkWrites, type ParkPlan } from "./receipt-intake/park";
+import { duplicateChainRefusal, withEvidenceAndChainLocks } from "./receipt-intake/duplicate-guard";
+import { driveFileIdOf } from "./receipt-intake/book";
+import { CARD_RESEND_QUEUED_REASON, parseChatDelivery, requestIdFor, type CardItem } from "./receipt-request-cards";
+import { recordCardOnIssues } from "./receipt-card-history";
+import {
+    ORPHAN_AUDIT_KIND,
+    ORPHAN_RESOLUTIONS,
+    isQboPurchaseId,
+    verifyOrphanClaim,
+    type QboPurchaseFacts,
+} from "./receipt-intake/orphan-purchase";
+import { logAutomationEvent } from "./automation-events";
+import { RECEIPT_OWNER_CHOICES, RECEIPT_REQUEST_TARGET_TYPE } from "./receipt-requests";
+import { isCostCodeAllowedForProject } from "./project-phases";
+import { prismaPhaseDataSource } from "./project-phases-db";
 import { PROJECT_STATUS_IN_PROGRESS } from "./project-status";
 import { normalizePercentCompleteInput } from "./percent-complete";
 // normalizeEstimateItemForSave is no longer imported here — the item projection moved into
@@ -136,6 +153,7 @@ import {
     unreadThreadCommentCount,
 } from "./selection-item-thread-core";
 import { findThreadItem } from "./selection-item-thread-dependencies";
+import { lockReceiptEvidence, withReceiptEvidenceLock } from "./receipt-evidence-lock";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -5486,7 +5504,13 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
     // Delete related items, schedules, expenses, and the estimate itself
     await prisma.estimateItem.deleteMany({ where: { estimateId } });
     await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
-    await prisma.expense.deleteMany({ where: { estimateId } });
+    // EVIDENCE (round-45 gate, finding 3). Deleting an estimate cascades to its
+    // Expenses, and every one of those is a row the missing-receipt sweep may
+    // have read as "this charge has its receipt". Unfenced, a sweep mid-cycle
+    // could close a chase on evidence this statement was in the middle of
+    // destroying — and certify it, because nothing moved the epoch.
+    await withReceiptEvidenceLock(fn => prisma.$transaction(fn),
+        tx => tx.expense.deleteMany({ where: { estimateId } }));
     await prisma.estimate.delete({ where: { id: estimateId } });
 
     if (estimate.projectId) {
@@ -15729,6 +15753,821 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
     }
     revalidatePath("/manager/logistics");
     revalidatePath("/manager/time-entries");
+    return { success: true };
+}
+
+// ── Receipt intake queue (the /automation Receipts tab, Phase 2 §2) ──────────
+
+/**
+ * Every action below is guarded twice, and both guards matter:
+ *
+ *   1. The SAME permission the register is gated by (`financialReports`) — a
+ *      "use server" export is a live POST endpoint whether or not any UI links
+ *      to it (the dead-server-actions lesson), so the gate lives in the action,
+ *      not in the page that renders the button.
+ *   2. A compare-and-swap on `state`. The 5-minute intake worker is moving
+ *      these same rows; an unguarded update would silently overwrite whatever
+ *      it just decided. `updateMany({ where: { id, state: expected } })`
+ *      returning 0 means the view was stale — that is surfaced as an error the
+ *      UI toasts, NEVER as a silent no-op that looks like it worked.
+ *
+ * None of these calls QuickBooks inline. The queue's only job is to change what
+ * the worker will do on its next pass.
+ */
+async function assertReceiptQueueAccess() {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Not authenticated");
+    if (!hasPermission(user, "financialReports")) throw new Error("Forbidden");
+    return user;
+}
+
+class StaleReceiptIntakeError extends Error {
+    constructor(message = "This receipt changed underneath you — refresh and try again.") {
+        super(message);
+        this.name = "StaleReceiptIntakeError";
+    }
+}
+
+/**
+ * The worker's OWNERSHIP, expressed as a where-clause.
+ *
+ * The 5-minute worker claims a row by writing `claimToken` + `claimedAt`. That
+ * is ownership. `nextRetryAt` is SCHEDULING — when the worker should next look
+ * at the row — and fencing on it (the previous shape) conflated the two: a row
+ * merely waiting out its retry backoff could not be voided, while a row
+ * genuinely mid-send looked free the instant its backoff elapsed.
+ *
+ * A claim older than the lease belongs to a run that died and is not honoured.
+ */
+const WORKER_CLAIM_LEASE_MS = 10 * 60_000;
+
+function notClaimedByWorker(now: Date): Prisma.ReceiptIntakeWhereInput {
+    return {
+        OR: [
+            { claimedAt: null },
+            { claimedAt: { lt: new Date(now.getTime() - WORKER_CLAIM_LEASE_MS) } },
+        ],
+    };
+}
+
+const WORKER_BUSY_MESSAGE = "The pipeline is working on this receipt right now — try again in a minute.";
+
+/**
+ * Distinguish "you were looking at stale state" from "the worker holds it".
+ * A guarded update returning 0 cannot tell them apart, and the two need
+ * different words: one says refresh, the other says wait.
+ */
+async function receiptIntakeWriteFailure(id: string, allowedStates: readonly string[], now: Date): Promise<never> {
+    const current = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { state: true, claimedAt: true },
+    });
+    if (!current) throw new StaleReceiptIntakeError("That receipt no longer exists — refresh.");
+    const claimLive = current.claimedAt !== null
+        && current.claimedAt.getTime() > now.getTime() - WORKER_CLAIM_LEASE_MS;
+    if (allowedStates.includes(current.state) && claimLive) {
+        throw new StaleReceiptIntakeError(WORKER_BUSY_MESSAGE);
+    }
+    throw new StaleReceiptIntakeError();
+}
+
+/**
+ * Run a park plan: try the key-releasing write, and if it matched nothing try
+ * the key-KEEPING one. Both losing means the row moved under the human (or the
+ * worker holds it), which is a refusal they can act on.
+ *
+ * The order matters and is not an optimisation: the release branch is the
+ * narrower CAS (`sendAttempted: false`), so trying it first means the common,
+ * clean case takes exactly one write, and the fallback only runs for a row
+ * whose send had already started.
+ */
+/**
+ * INTAKE WRITES FROM THE QUEUE UI, EACH IN ITS OWN LOCKED TRANSACTION (Codex
+ * PR #443 gate round 42, finding 1). Unmarking a duplicate, parking an orphan
+ * or re-routing a row all change what the missing-receipt sweep reads, so they
+ * queue behind it exactly like the worker's writes do.
+ */
+const evidenceIntakeUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
+
+async function runParkWrites(
+    plan: ParkPlan,
+    id: string,
+    expected: string,
+    now: Date,
+    // Defaults to the global client; mark-duplicate passes its transaction so
+    // the writes land under the same row locks its validation was done with.
+    client: Pick<typeof prisma, "receiptIntake"> = prisma,
+): Promise<void> {
+    const released = await client.receiptIntake.updateMany(plan.release);
+    if (released.count === 1) return;
+    const kept = await client.receiptIntake.updateMany(plan.keep);
+    if (kept.count === 1) return;
+    await receiptIntakeWriteFailure(id, [expected], now);
+}
+
+/**
+ * The row version the submitted view was rendering, as a Date.
+ *
+ * WHY THE STATE IS NOT ENOUGH (the ABA problem). A row can be NEEDS_REVIEW when
+ * the page renders, get routed, booked, and parked in NEEDS_REVIEW again a
+ * minute later — same state, different row. A state-only CAS happily applies a
+ * decision somebody made about the FIRST one to the second. `updatedAt` moves
+ * on every write, so pinning it means "the row I was looking at", not "a row
+ * that looks like the one I was looking at".
+ */
+function assertExpectedUpdatedAt(value: unknown): Date {
+    const at = typeof value === "string" || value instanceof Date ? new Date(value) : new Date(NaN);
+    if (Number.isNaN(at.getTime())) {
+        throw new Error("Refresh the page and try again — that view is out of date.");
+    }
+    return at;
+}
+
+/** Every state a manual write may legally act on (never BOOKED/ARCHIVED). */
+const HUMAN_WRITABLE_STATES = ["STAGING", "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING", "DUPLICATE", "VOID", "NON_RECEIPT"];
+
+/**
+ * The state the user's page was showing when they clicked.
+ *
+ * Every queue action CASes on THIS, not on a set of "states this action is
+ * allowed from". The difference matters: a row can legally be in NEEDS_REVIEW
+ * when the page renders and legally be in NEEDS_REVIEW again a minute later
+ * having been routed, booked and parked in between — an allowed-set check
+ * happily applies a decision made about a row that no longer exists. Matching
+ * the exact state the human SAW turns that into a refusal they can act on.
+ */
+function assertExpectedState(expectedState: string): string {
+    if (typeof expectedState !== "string" || !HUMAN_WRITABLE_STATES.includes(expectedState)) {
+        throw new Error("Refresh the page and try again — that view is out of date.");
+    }
+    return expectedState;
+}
+
+function revalidateReceiptQueue() {
+    revalidatePath("/automation");
+}
+
+/**
+ * Assign a job (and optionally a cost code) and hand the row back to the
+ * worker at `READ`. Deliberately NOT `BOOKING`: routing owns dedup, and
+ * jumping the row straight to booking would skip the weak/strong duplicate
+ * checks that stand between a re-uploaded receipt and a double purchase.
+ */
+export async function setReceiptIntakeJob(id: string, projectId: string, expectedState: string, expectedUpdatedAt: string, costCodeId?: string | null) {
+    const user = await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+    if (typeof projectId !== "string" || !projectId) throw new Error("projectId is required");
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+
+    const project = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
+    if (!project) throw new Error("That job no longer exists");
+
+    // "The cost code exists" is not a permission — it has to be a phase of THIS
+    // job. The same rule the clock-in validator applies.
+    if (costCodeId && !(await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId))) {
+        throw new Error("That cost code isn't a phase on this job");
+    }
+
+    // MOVING A RECEIPT MOVES ITS JOB, so a code carried over from the old job is
+    // almost certainly wrong for the new one — and a wrong code is a wrong job
+    // cost, which is worse than no code at all. Clear it and let the worker
+    // re-suggest against the new project's phases.
+    const existing = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { costCodeId: true },
+    });
+    const keepExisting = !costCodeId
+        && existing?.costCodeId
+        && await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, existing.costCodeId);
+
+    const now = new Date();
+    const expected = assertExpectedState(expectedState);
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+    if (!["NEEDS_JOB", "NEEDS_REVIEW"].includes(expected)) {
+        throw new Error("A job can only be set on a receipt waiting for one");
+    }
+    const result = await evidenceIntakeUpdateMany({
+        where: { id, state: expected, updatedAt: seenAt, ...notClaimedByWorker(now) },
+        data: {
+            projectId,
+            // Explicit code wins; otherwise keep one still valid here, else null.
+            costCodeId: costCodeId ?? (keepExisting ? existing!.costCodeId : null),
+            // A stale suggestion is re-derived against the new job's phases.
+            suggestedCostCodeId: null,
+            suggestedConfidence: null,
+            state: "READ",
+            stateReason: null,
+            lastError: null,
+            nextRetryAt: null,
+        },
+    });
+    if (result.count === 0) await receiptIntakeWriteFailure(id, [expected], now);
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/** Park a row as a duplicate of another. `duplicateOfId` must be a real, different row. */
+export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: string, expectedState: string, expectedUpdatedAt: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+    if (typeof duplicateOfId !== "string" || !duplicateOfId) throw new Error("duplicateOfId is required");
+    if (id === duplicateOfId) throw new Error("A receipt can't be a duplicate of itself");
+
+    const now = new Date();
+    const expected = assertExpectedState(expectedState);
+    if (["BOOKED", "ARCHIVED", "VOID"].includes(expected)) {
+        // A BOOKED row is money history — it is never reclassified from here.
+        throw new Error("That receipt can't be marked a duplicate");
+    }
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+
+    /**
+     * ONE TRANSACTION, BOTH ROWS LOCKED, VALIDATED AFTER THE LOCK.
+     *
+     * The check that the target is a real original has to happen while holding
+     * it, or the classic pair race gets through: Marge marks A→B while Richard
+     * marks B→A. Both validations pass (neither row is a duplicate YET), both
+     * writes land, and the two rows now point at each other — a cycle nothing
+     * downstream can resolve, and neither receipt has an original.
+     *
+     * LOCKED IN ID ORDER, which is the whole reason this cannot deadlock: two
+     * transactions wanting the same pair ask for it in the same sequence, so
+     * one waits rather than both holding half of what the other needs. Postgres
+     * would detect a deadlock and abort one, but "we designed for an abort" is
+     * not the same as "this cannot happen".
+     *
+     * `FOR UPDATE` on a plain SELECT of both ids, ordered — one statement, so
+     * there is no window between taking the first lock and the second.
+     */
+    /**
+     * BOTH ROWS AND EVERY ROW THAT POINTS AT EITHER (round-39 gate, finding 2),
+     * through the shared guard so this path and the worker cannot diverge
+     * (round-40 gate, finding 1). One statement, ordered by id, so the lock
+     * order is the same for every transaction and this cannot deadlock — and so
+     * the inbound references cannot change between the read and the write.
+     */
+    // The evidence lock is the OUTERMOST lock, and the wrapper is what makes
+    // that true rather than remembered (round-43 gate, finding 3): taking it
+    // inside this body meant the row locks came first, which is the opposite of
+    // the order the sweep uses.
+    await withEvidenceAndChainLocks(fn => prisma.$transaction(fn), [id, duplicateOfId], async (tx, inbound) => {
+        // RE-READ INSIDE THE LOCK. Everything below was read a moment ago on
+        // the page; under the lock it is read again because that is the only
+        // version that can still be true when the write lands.
+        const original = await tx.receiptIntake.findUnique({
+            where: { id: duplicateOfId },
+            select: { id: true, state: true, duplicateOfId: true },
+        });
+        if (!original) throw new Error("That original receipt no longer exists");
+        // THE TARGET MUST BE A REAL ORIGINAL. Pointing at a row that is itself
+        // DUPLICATE builds a chain nobody can follow ("a duplicate of a
+        // duplicate of..."), and pointing at a VOID row files this receipt
+        // behind something that was cancelled — in both cases the original it
+        // claims to duplicate does not exist as far as the pipeline is
+        // concerned.
+        if (original.state === "DUPLICATE") throw new Error("That receipt is itself a duplicate — point at the original instead");
+        if (original.state === "VOID") throw new Error("That receipt was voided — it can't be the original");
+        // NO CYCLES. A points at B while B points at A is unresolvable, and the
+        // chain check above does not catch it on its own.
+        if (original.duplicateOfId === id) throw new Error("Those two receipts already point at each other");
+        /**
+         * AND THIS ROW MUST NOT ALREADY BE SOMEBODY ELSE'S ORIGINAL.
+         *
+         * The target check above stops A→B when B is a duplicate; this stops
+         * the same chain built from the other end — A→B already exists and B is
+         * now being marked a duplicate of C, leaving A pointing at a copy.
+         * Refused rather than retargeted: which receipt is the real original is
+         * a human's call, and unmarking A is how they make it.
+         */
+        const inboundToSource = inbound.get(id) ?? [];
+        if (inboundToSource.length > 0) throw duplicateChainRefusal("duplicate", inboundToSource);
+
+        // CAS on the exact state the view saw. The lease fence matters most on
+        // this path: BOOKING is a legal source state, and BOOKING is where the
+        // worker is mid-send. The strong key goes back ONLY if the send had not
+        // started — see planParkWrites.
+        await runParkWrites(planParkWrites({
+            id,
+            expectedState: expected,
+            targetState: "DUPLICATE",
+            stateReason: `manual-dup:${duplicateOfId}`,
+            extraData: { duplicateOfId },
+            claimFence: { updatedAt: seenAt, ...notClaimedByWorker(now) },
+        }), id, expected, now, tx);
+    });
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/** "Not a duplicate" — back to READ so routing and dedup run again from scratch. */
+export async function unmarkReceiptIntakeDuplicate(id: string, expectedUpdatedAt: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+
+    const now = new Date();
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+    const result = await evidenceIntakeUpdateMany({
+        // DUPLICATE twice over is the ABA case exactly: unmarked, re-marked
+        // against a different original, and this click would undo the new one.
+        where: { id, state: "DUPLICATE", updatedAt: seenAt, ...notClaimedByWorker(now) },
+        data: { state: "READ", duplicateOfId: null, stateReason: null, lastError: null, nextRetryAt: null },
+    });
+    if (result.count === 0) await receiptIntakeWriteFailure(id, ["DUPLICATE"], now);
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/** Void anything that hasn't booked. A BOOKED/ARCHIVED row is refused outright. */
+export async function voidReceiptIntake(id: string, expectedState: string, expectedUpdatedAt: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+
+    const now = new Date();
+    const expected = assertExpectedState(expectedState);
+    if (["BOOKED", "ARCHIVED"].includes(expected)) throw new Error("A booked receipt can't be voided");
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+    /**
+     * VOIDING AN ORIGINAL LEAVES ITS DUPLICATES POINTING AT A CANCELLED ROW
+     * (round-39 gate, finding 2) — the same broken relation the mark path
+     * refuses to create when it checks the target for VOID, arriving a
+     * different way. Locked and checked in ONE transaction with the write, or
+     * a duplicate marked a moment later slips through the gap.
+     */
+    // Same rule for a void: the row stops being evidence, so the wrapper takes
+    // the evidence lock before the chain's row locks (round-43 gate, finding 3).
+    await withEvidenceAndChainLocks(fn => prisma.$transaction(fn), [id], async (tx, inboundById) => {
+        const inbound = inboundById.get(id) ?? [];
+        if (inbound.length > 0) throw duplicateChainRefusal("void", inbound);
+        await runParkWrites(planParkWrites({
+            id,
+            expectedState: expected,
+            targetState: "VOID",
+            stateReason: "voided-by-user",
+            claimFence: { updatedAt: seenAt, ...notClaimedByWorker(now) },
+        }), id, expected, now, tx);
+    });
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/**
+ * "Retry now": clear the error and make the row due. The 5-minute worker picks
+ * it up on its next pass — this never calls QuickBooks inline, so a stuck QBO
+ * can't turn a button click into a 30-second page hang.
+ *
+ * `attempts` is deliberately NOT reset: the retry ceiling exists so a
+ * permanently-broken document stops hammering QBO, and a human clicking retry
+ * shouldn't silently remove that ceiling.
+ */
+export async function retryReceiptIntake(id: string, expectedUpdatedAt: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+
+    const now = new Date();
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+    const current = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { state: true, stateReason: true, nextRetryAt: true },
+    });
+    if (!current) throw new StaleReceiptIntakeError("That receipt no longer exists — refresh.");
+
+    // A CLOSED list of retryable reasons, and each one resumes where it failed.
+    // Retrying a document VERDICT (multi-doc, no-estimate, a dup) just parks it
+    // again with the same reason, having spent an attempt and a QBO round trip.
+    const target = retryTargetFor(current.state, current.stateReason);
+    if (!target) {
+        throw new StaleReceiptIntakeError(
+            "This one can't be retried — it needs a decision, not another attempt.",
+        );
+    }
+
+    const result = await evidenceIntakeUpdateMany({
+        // The row version the human SAW, not merely the state and reason the
+        // re-read found: those two can be identical across a whole failed
+        // attempt in between.
+        where: { id, state: current.state, stateReason: current.stateReason, updatedAt: seenAt, ...notClaimedByWorker(now) },
+        data: {
+            // RECEIVED re-reads the document; BOOKING resumes at the send.
+            state: target,
+            // Scheduling only. Ownership is claimToken/claimedAt and belongs to
+            // the worker; clearing a live claim here would let two runs process
+            // the same row.
+            nextRetryAt: now,
+            // The reason described a failure that is now being retried; leaving
+            // it would make the row look parked while it is actually in flight.
+            stateReason: null,
+            lastError: null,
+        },
+    });
+    if (result.count === 0) await receiptIntakeWriteFailure(id, [current.state], now);
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/**
+ * "Resolved" on an orphaned QuickBooks purchase (Codex round-4 item 1).
+ *
+ * A row whose send went out and was then voided carries `postVoidQbPurchaseId`
+ * — a real Purchase in QuickBooks that only a human can remove. This does NOT
+ * touch QuickBooks: it records that somebody went and voided it there, so the
+ * Exceptions queue empties as the work is actually done rather than by anyone
+ * clicking it away. The id is kept in `stateReason` so the audit trail survives.
+ */
+export async function resolveOrphanedQbPurchase(id: string, expectedUpdatedAt: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+
+    const row = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { state: true, stateReason: true, postVoidQbPurchaseId: true },
+    });
+    if (!row?.postVoidQbPurchaseId) {
+        return { success: false, stale: true as const, reason: "Nothing to resolve on this receipt — refresh." };
+    }
+
+    // APPENDED, never overwritten. `stateReason` already carries why the row is
+    // where it is ("booked-after-void", a dup reference, a QBO fault); replacing
+    // it to record the cleanup would destroy the only note saying how the row
+    // got into this state in the first place.
+    const note = `orphan-purchase-resolved:${row.postVoidQbPurchaseId}`;
+    const stateReason = row.stateReason && !row.stateReason.includes(note)
+        ? `${row.stateReason}; ${note}`.slice(0, 400)
+        : (row.stateReason ?? note);
+
+    // CAS on BOTH the state and the purchase id: the worker can move the state
+    // and a second tab can resolve the same row, and either means the view this
+    // click came from is stale.
+    const result = await evidenceIntakeUpdateMany({
+        where: { id, state: row.state, updatedAt: seenAt, postVoidQbPurchaseId: row.postVoidQbPurchaseId },
+        data: { postVoidQbPurchaseId: null, stateReason },
+    });
+    if (result.count === 0) {
+        return { success: false, stale: true as const, reason: "This receipt changed underneath you — refresh and try again." };
+    }
+    revalidateReceiptQueue();
+    return { success: true, stale: false as const };
+}
+
+/**
+ * Read ONE QuickBooks Purchase by id. Read-only, and the only QBO call any
+ * receipts-queue action makes.
+ *
+ * Imported lazily for the same reason the payments actions do it: pulling the
+ * QuickBooks client into this module's top-level graph costs every unrelated
+ * server action that imports actions.ts.
+ */
+async function readQboPurchase(purchaseId: string): Promise<QboPurchaseFacts | null> {
+    const { getFreshQBTokens } = await import("./quickbooks-payments");
+    const { qbFetch, parseJsonOrNull } = await import("./quickbooks");
+    const tokens = await getFreshQBTokens();
+    const response = await qbFetch(`/purchase/${encodeURIComponent(purchaseId)}`, tokens);
+    // 404 is an ANSWER — that id is not a purchase in this realm — and it is
+    // the answer an operator's typo produces, so it must not read as an outage.
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`QuickBooks returned ${response.status}`);
+    const body = await parseJsonOrNull<{ Purchase?: { Id?: string; TotalAmt?: number; PrivateNote?: string } }>(response);
+    const purchase = body?.Purchase;
+    if (!purchase?.Id) return null;
+    // TotalAmt is dollars as a float; cents is what everything here compares in.
+    const totalCents = typeof purchase.TotalAmt === "number" && Number.isFinite(purchase.TotalAmt)
+        ? Math.round(purchase.TotalAmt * 100)
+        : null;
+    // PrivateNote carries `[gtr-file:<fileId>]` on everything this pipeline
+    // creates — the only field that ties a Purchase to one document.
+    return {
+        id: String(purchase.Id),
+        totalCents,
+        privateNote: typeof purchase.PrivateNote === "string" ? purchase.PrivateNote : null,
+    };
+}
+
+/**
+ * Resolve an orphaned Purchase whose ID WE NEVER LEARNED (round-14 item 3).
+ *
+ * The row's send went out and no answer came back, so `sendAttempted` is true,
+ * the strong dedup key is still held, and nobody knows whether QuickBooks
+ * created anything. Before this the row was a dead end: the key stayed held
+ * forever, and a corrected re-send of the same receipt bounced as a duplicate
+ * with nothing on screen saying why.
+ *
+ * Two honest answers, both from a human who went and looked, both AUDITED with
+ * who said so:
+ *
+ *   "located"     — they found the Purchase and typed its id. We READ IT BACK
+ *                   from QuickBooks and require the amount to match this
+ *                   receipt to the cent. A transposed digit lands on somebody
+ *                   else's purchase, and accepting it would attach this
+ *                   receipt's history to theirs. The id is recorded exactly
+ *                   where the known-id case records it, so the same "mark
+ *                   resolved" flow finishes the job.
+ *   "no-purchase" — they checked and there is none. THIS is what frees the
+ *                   dedup key, because now we know the re-send is safe.
+ *
+ * QuickBooks is READ-ONLY here, as everywhere in this pipeline: this never
+ * voids, edits or creates anything. It reads one purchase by id.
+ */
+export async function resolveUnknownOrphan(
+    id: string,
+    decision: "located" | "no-purchase",
+    expectedUpdatedAt: string,
+    input?: { purchaseId?: string; note?: string },
+) {
+    const user = await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+    if (decision !== "located" && decision !== "no-purchase") {
+        throw new Error("decision must be located or no-purchase");
+    }
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+    const note = typeof input?.note === "string" ? input.note.trim().slice(0, 200) : "";
+
+    const row = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: {
+            state: true, stateReason: true, totalCents: true, vendor: true,
+            source: true, sourceRef: true,
+            sendAttempted: true, dedupStrongKey: true, postVoidQbPurchaseId: true,
+        },
+    });
+    if (!row) throw new StaleReceiptIntakeError("That receipt no longer exists — refresh.");
+
+    /**
+     * THE WHOLE ORPHAN PREDICATE, IN THE WHERE CLAUSE.
+     *
+     * Read-then-write is not enough here and the gap is not theoretical: every
+     * one of these conditions can change between the page render and the click
+     * (the worker re-claims the row, a re-send books it, another operator
+     * resolves it). Re-checking them in JavaScript proves what was true a
+     * moment ago; putting them in the UPDATE proves what is true at the write.
+     *
+     * A BOOKED or ARCHIVED row is not in the permitted set at all — it booked,
+     * it has its Purchase id, and the orphan path must not be able to rewrite
+     * money history even when called directly.
+     */
+    const orphanWhere = {
+        id,
+        state: { in: [...UNKNOWN_ORPHAN_STATES] },
+        stateReason: { endsWith: `:${POSSIBLE_ORPHAN_REASON}` },
+        sendAttempted: true,
+        // An UNKNOWN-id orphan by definition has no id recorded. A row that has
+        // one is the other kind, and "mark resolved" is its path.
+        postVoidQbPurchaseId: null,
+        // The worker must not be mid-anything with this row.
+        claimToken: null,
+        updatedAt: seenAt,
+    };
+
+    let purchaseId: string | null = null;
+    if (decision === "located") {
+        if (!isQboPurchaseId(input?.purchaseId)) {
+            return { success: false, stale: false as const, reason: "That is not a QuickBooks purchase id." };
+        }
+        const claimed = (input!.purchaseId as string).trim();
+        let facts: QboPurchaseFacts | null;
+        try {
+            facts = await readQboPurchase(claimed);
+        } catch (error) {
+            // An outage is not a verdict. Refuse and let them try later rather
+            // than record an unverified id.
+            return {
+                success: false,
+                stale: false as const,
+                reason: `QuickBooks did not answer, so that id is unverified: ${error instanceof Error ? error.message : "unknown error"}`,
+            };
+        }
+        // The SAME fileId book.ts stamps into the Purchase's PrivateNote.
+        const expectedFileId = driveFileIdOf({ source: row.source, sourceRef: row.sourceRef }) ?? id;
+        const verdict = verifyOrphanClaim(facts, row.totalCents, expectedFileId);
+        if (!verdict.ok) {
+            return { success: false, stale: false as const, reason: verdict.detail ?? `That purchase ${verdict.reason.replace("-", " ")}.` };
+        }
+        purchaseId = verdict.purchaseId;
+    }
+
+    // ONE CAS, on the row version the operator was looking at.
+    const data = purchaseId !== null
+        ? {
+            // Recorded where the known-id case records it, so the existing
+            // "mark resolved" flow takes it from here. The key stays HELD: a
+            // Purchase exists, so a re-send would double-book.
+            postVoidQbPurchaseId: purchaseId,
+            stateReason: `${row.stateReason ?? "possible-orphan"}; ${ORPHAN_RESOLUTIONS.located}:${purchaseId}`.slice(0, 400),
+        }
+        : {
+            // No Purchase exists, so the quarantine has nothing to protect.
+            dedupStrongKey: null,
+            stateReason: `${row.stateReason ?? "possible-orphan"}; ${ORPHAN_RESOLUTIONS.noPurchase}`.slice(0, 400),
+        };
+    const result = await evidenceIntakeUpdateMany({ where: orphanWhere, data });
+    if (result.count === 0) {
+        // TYPED, so the caller can tell "somebody else got here first" from
+        // "this row was never an unknown-id orphan" — the second one is a bug
+        // or a direct call, not a race.
+        return {
+            success: false,
+            stale: true as const,
+            code: "not-an-unknown-orphan" as const,
+            reason: "This receipt is not an unresolved unknown-id orphan any more — refresh and look again.",
+        };
+    }
+
+    // AUDITED, and after the write: an event describing a decision that did not
+    // commit is worse than no event. Never fails the action — the decision is
+    // already recorded on the row itself.
+    await logAutomationEvent({
+        kind: ORPHAN_AUDIT_KIND,
+        status: purchaseId !== null ? ORPHAN_RESOLUTIONS.located : ORPHAN_RESOLUTIONS.noPurchase,
+        source: "receipts-tab",
+        vendor: row.vendor ?? undefined,
+        amountCents: row.totalCents ?? undefined,
+        reason: note || undefined,
+        detail: {
+            intakeId: id,
+            qbPurchaseId: purchaseId,
+            // WHO said so. That is the whole point of auditing a judgement call.
+            decidedBy: user.email ?? user.id,
+            decidedAt: new Date().toISOString(),
+            dedupStrongKeyReleased: purchaseId === null && row.dedupStrongKey !== null,
+        },
+    }).catch(() => { /* audit only — the row already carries the decision */ });
+
+    revalidateReceiptQueue();
+    return { success: true, stale: false as const };
+}
+
+/** The stored card snapshot, back into items. A malformed one records nothing. */
+function parseCardItems(itemsJson: string): CardItem[] {
+    try {
+        const parsed: unknown = JSON.parse(itemsJson);
+        return Array.isArray(parsed) ? (parsed as CardItem[]) : [];
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Resolve a Chat card whose delivery was never confirmed (round-13 item 6).
+ *
+ * An UNCERTAIN row means we called the webhook and did not get an answer we
+ * could believe: the card may be sitting in the crew's space right now, or it
+ * may never have arrived. The cron will NEVER decide that for itself — an
+ * automatic resend risks a duplicate chase card, and a duplicate teaches people
+ * the list is noise. So a human looks in the space and says which it was:
+ *
+ *   "delivered" — it is there, AND the operator pastes the thread and message
+ *     names off it. Without those the row stays UNCERTAIN: a card marked POSTED
+ *     with no thread identity is the worst of both worlds — closed, possibly
+ *     never seen, and with nothing for a reply to resolve against. The row is
+ *     POSTED, the day is closed, and the bridge can find the thread.
+ *   "resend"    — it is not there. The row goes back to PENDING with its claim
+ *     released, so the retry pass sends it — and that pass re-verifies the
+ *     snapshot first, so anything answered in the meantime is dropped.
+ *
+ * CASed on `updatedAt` as well as `status`: two people looking at the same
+ * queue must not both decide, and the cron may have moved the row since the
+ * page rendered.
+ */
+export async function resolveUncertainCard(
+    cardId: string,
+    decision: "delivered" | "resend",
+    expectedUpdatedAt: string,
+    delivery?: { threadName?: string; messageName?: string },
+) {
+    await assertReceiptQueueAccess();
+    if (typeof cardId !== "string" || !cardId) throw new Error("cardId is required");
+    if (decision !== "delivered" && decision !== "resend") throw new Error("decision must be delivered or resend");
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+
+    // NO THREAD IDENTITY, NO "DELIVERED". Both names, well-formed, same space.
+    // "resend" is always available as the other answer, so refusing here never
+    // leaves an operator stuck — it leaves the row where it was.
+    const confirmed = decision === "delivered"
+        ? parseChatDelivery(delivery?.threadName, delivery?.messageName)
+        : null;
+    if (decision === "delivered" && !confirmed) {
+        return {
+            success: false,
+            stale: false as const,
+            reason: "Paste the thread and message names from the card (spaces/…/threads/… and spaces/…/messages/…), or choose Resend.",
+        };
+    }
+
+    const card = await prisma.receiptRequestCard.findUnique({
+        where: { id: cardId },
+        select: { itemsJson: true, pacificDate: true, owner: true },
+    });
+    const result = await prisma.$transaction(async tx => {
+        const written = await tx.receiptRequestCard.updateMany({
+            where: { id: cardId, status: "UNCERTAIN", updatedAt: seenAt },
+            data: confirmed
+                ? {
+                    status: "POSTED",
+                    // The card IS out; `postedAt` is what stops any later run
+                    // re-posting the day.
+                    postedAt: new Date(),
+                    // The bridge identities, so a reply in that thread resolves
+                    // like any other card's.
+                    threadName: confirmed.threadName,
+                    messageName: confirmed.messageName,
+                    lastError: null,
+                    claimedAt: null,
+                    claimToken: null,
+                }
+                : {
+                    status: "PENDING",
+                    // THE QUEUE STATE, in its own column (round-41 gate, finding
+                    // 3). `lastError` is diagnostic text and every later write
+                    // replaces it — a rejection wrote `rejected:*` straight over
+                    // the marker, and the drain and the health probe both lost
+                    // the row. `resendQueuedAt` is what they query now; the text
+                    // stays for a human reading the queue.
+                    resendQueuedAt: new Date(),
+                    lastError: CARD_RESEND_QUEUED_REASON,
+                    // Ownership released, so the retry pass can claim it.
+                    claimedAt: null,
+                    claimToken: null,
+                },
+        });
+
+        /**
+         * AND THE THREAD RECORD, in the same transaction.
+         *
+         * A card the cron posts writes one; a card an operator marks delivered
+         * used to write none — so the sweep and the bridge had nothing to
+         * resolve a reply against, and worse, the items still counted as NEVER
+         * CARDED. Never-carded-first ordering then put them at the front of
+         * tomorrow's card, and the crew was asked again for receipts they had
+         * already been asked for. Same claim, same trace, one writer.
+         */
+        if (written.count === 1 && confirmed && card) {
+            await recordCardOnIssues(
+                { items: parseCardItems(card.itemsJson), date: card.pacificDate, requestId: requestIdFor(card.owner, card.pacificDate) },
+                confirmed.threadName,
+                confirmed.messageName,
+                new Date(),
+                tx,
+            );
+        }
+        return written;
+    });
+    if (result.count === 0) {
+        return { success: false, stale: true as const, reason: "That card changed underneath you — refresh." };
+    }
+    revalidateReceiptQueue();
+    return { success: true, stale: false as const };
+}
+
+/**
+ * Assign the owner of an unattributed bank charge (Codex round-4 item 7).
+ *
+ * A QBO-minted line whose descriptor carries no card tail lands in the
+ * `unattributed` bucket. Marge picks the owner here, it is written to
+ * `displayDetails.ownerOverride` — a key the nightly matcher PRESERVES, so the
+ * next recompute cannot undo it — and the morning card picks the item up.
+ */
+export async function setMissingReceiptOwner(issueId: string, owner: string, expectedVersion: number) {
+    await assertReceiptQueueAccess();
+    if (typeof issueId !== "string" || !issueId) throw new Error("issueId is required");
+    if (!RECEIPT_OWNER_CHOICES.includes(owner)) throw new Error("That isn't an owner we recognise");
+    // THE VERSION THE PAGE RENDERED, not the one this click happens to find.
+    //
+    // Reading the current version here and then guarding on it guards against
+    // nothing an operator cares about: the row can be cleared, reopened and
+    // rewritten between the render and the click, and the read would simply
+    // pick up whatever it had become — so an assignment aimed at the charge
+    // somebody was LOOKING at lands on a different question with the same id.
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+        throw new Error("Refresh the page and try again — that view is out of date.");
+    }
+
+    const issue = await prisma.reviewIssue.findUnique({
+        where: { id: issueId },
+        select: { id: true, version: true, targetType: true, displayDetails: true, clearedAt: true },
+    });
+    if (!issue || issue.targetType !== RECEIPT_REQUEST_TARGET_TYPE) throw new Error("Not a missing-receipt item");
+    if (issue.clearedAt !== null) throw new Error("That item is already answered — refresh.");
+    if (issue.version !== expectedVersion) {
+        throw new Error("That item changed underneath you — refresh and try again.");
+    }
+
+    let details: Record<string, unknown> = {};
+    try {
+        const parsed: unknown = JSON.parse(issue.displayDetails ?? "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) details = parsed as Record<string, unknown>;
+    } catch { /* a corrupt blob still gets an owner */ }
+    details.ownerOverride = owner;
+
+    // Version-guarded: the nightly sweep writes this same column, and losing
+    // that race silently would drop the assignment on the floor.
+    const result = await prisma.reviewIssue.updateMany({
+        // The RENDERED version, so the write is refused atomically even if the
+        // row moved between the read above and this statement.
+        where: { id: issue.id, version: expectedVersion, clearedAt: null },
+        data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
+    });
+    if (result.count === 0) throw new Error("That item changed underneath you — refresh and try again.");
+    revalidateReceiptQueue();
     return { success: true };
 }
 

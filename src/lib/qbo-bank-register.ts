@@ -1,7 +1,7 @@
 import { qbFetch, type QBTokens } from "@/lib/quickbooks";
 import { prisma } from "@/lib/prisma";
 import { resolveExpenseProjectLabel } from "@/lib/expense-attribution";
-import { isPurchaseType, isMoneyInType } from "@/lib/register-types";
+import { isPurchaseType, isMoneyInType, type ClearedStatus } from "@/lib/register-types";
 
 /**
  * QuickBooks bank-account REGISTER for the Command Center's Bank page.
@@ -15,8 +15,44 @@ import { isPurchaseType, isMoneyInType } from "@/lib/register-types";
  *
  * HONESTY CONTRACT (from Codex plan review): this is a register of what
  * QuickBooks has POSTED to the account. It cannot see WTB transactions that
- * are pending, excluded, unmatched, or absent from QuickBooks, and it does
- * not prove bank clearance. The UI must say so — no "true north" claims.
+ * are pending, excluded, unmatched, or absent from QuickBooks. The UI must say
+ * so — no "true north" claims.
+ *
+ * AND NEITHER CAN ANYTHING BUILT ON IT (Codex PR #443 gate round 37, finding
+ * 1). There is no QBO endpoint that returns bank-feed items — the "For Review"
+ * queue is not exposed by the API at all — so this module cannot be extended
+ * to cover them, and the nightly pull, the mint and the missing-receipt chaser
+ * all inherit the limit: a cleared-but-unposted feed charge is invisible to
+ * every one of them and is chased only after the statement import brings it in.
+ * Say "narrows the statement-import gap to unposted feed lines", never "closes
+ * the freshness gap".
+ *
+ * BANK CLEARANCE, AND HOW IT IS ACTUALLY OBTAINED (Codex PR #443, raised three
+ * rounds running). The GL report does not prove clearance, and QuickBooks will
+ * not put clearance on it: `cleared` is a FILTER, never a returnable column,
+ * and only the TransactionList report accepts it. So it is asked for the only
+ * way it can be — three filtered TransactionList calls over the same account
+ * and window, whose transaction ids are joined back onto the GL rows.
+ * Verified against the live realm on 2026-09-02:
+ *
+ *   window 2026-07-01..2026-07-10, account 154
+ *     GL rows 78 (76 distinct txn ids)
+ *     cleared=Reconciled 85 rows, cleared=Cleared 0, cleared=Uncleared 5
+ *     GL rows in NEITHER bucket: 1 — id 6557, a Journal Entry
+ *   window 2026-08-20..2026-09-02 (not yet reconciled)
+ *     cleared=Reconciled 0, cleared=Uncleared 55
+ *
+ * Two things that matters for. The id spaces MATCH — TransactionList carries
+ * the transaction id on the same `txn_type` cell the GL does — so the join is
+ * an identity join, not a heuristic. And a manually entered Journal Entry is
+ * classified by NEITHER filter, so it comes back "Unknown": the honest answer,
+ * and the one that keeps exactly the reviewer's fake-bank-truth case out of the
+ * canonical ledger.
+ *
+ * A failed clearance probe is NOT a failed fetch: the rows still render, every
+ * one of them reads "Unknown", and `clearedProbeOk` says why. Minting is
+ * positive-evidence-only (`isClearedForMint`), so an outage stops new canonical
+ * lines instead of inventing them.
  */
 
 export interface BankRegisterRow {
@@ -28,8 +64,16 @@ export interface BankRegisterRow {
     qbTxnId: string | null;
     docNum: string | null;
     name: string | null;
+    /** GL memo/description — usually the original POS descriptor, card tail included. */
+    memo: string | null;
     /** Signed integer cents: deposits +, money out −. */
     amountCents: number;
+    /**
+     * What QuickBooks says about this row's bank clearance. "Unknown" whenever
+     * the row carries no txn id, QuickBooks classified it as neither, or the
+     * clearance probe could not run — see `clearedProbeOk`.
+     */
+    clearedStatus: ClearedStatus;
 }
 
 export interface BankRegisterResult {
@@ -37,6 +81,13 @@ export interface BankRegisterResult {
     fetchedAt: string;
     /** True when QBO errored and this is the previous successful fetch. */
     stale: boolean;
+    /**
+     * False when the clearance probe failed, so every `clearedStatus` on these
+     * rows is "Unknown" because we could not ask — never because QuickBooks
+     * answered. Anything gating a write on clearance must read this: absence of
+     * a cleared flag only means something when the question was actually put.
+     */
+    clearedProbeOk: boolean;
     accountId: string;
     startDate: string;
     endDate: string;
@@ -95,12 +146,80 @@ function walkGlRows(rows: GlRow[], idx: Map<string, number>, out: BankRegisterRo
                     qbTxnId: str(typeCell?.id),
                     docNum: str(at("doc_num")?.value),
                     name: str(at("name")?.value),
+                    memo: str(at("memo")?.value),
                     amountCents: Math.round(amountRaw * 100),
+                    // Filled in by the clearance join below; "Unknown" until
+                    // QuickBooks positively says otherwise.
+                    clearedStatus: "Unknown",
                 });
             }
         }
         if (row.Rows?.Row) walkGlRows(row.Rows.Row, idx, out);
     }
+}
+
+/**
+ * Collect the transaction ids QuickBooks puts in one `cleared` bucket.
+ *
+ * TransactionList, not GeneralLedger, because `cleared` is only accepted
+ * there; and one call per bucket, because it is a filter and cannot be
+ * projected as a column. The id sits on the `txn_type` cell exactly as it does
+ * on the GL report, which is what lets the caller join the two by identity.
+ */
+async function fetchClearedBucket(
+    tokens: QBTokens,
+    accountId: string,
+    startDate: string,
+    endDate: string,
+    bucket: Exclude<ClearedStatus, "Unknown">,
+): Promise<Set<string>> {
+    const params = new URLSearchParams({
+        start_date: startDate,
+        end_date: endDate,
+        account: accountId,
+        cleared: bucket,
+    });
+    const res = await qbFetch(`/reports/TransactionList?${params}`, tokens);
+    if (!res.ok) throw new Error(`TransactionList(${bucket}) ${res.status}`);
+    const report = (await res.json()) as GlReport;
+    const idx = columnIndexMap(report);
+    const typeCol = idx.get("txn_type");
+    // Without that column there are no ids to read, and an empty set would read
+    // as "nothing is cleared" — which silently stops every mint. That is a
+    // probe FAILURE, not an answer.
+    if (typeCol === undefined) throw new Error(`TransactionList(${bucket}) missing txn_type column`);
+    const ids = new Set<string>();
+    const walk = (rows: GlRow[]): void => {
+        for (const row of rows) {
+            const id = str((row.ColData?.[typeCol] as GlColData | undefined)?.id);
+            if (id) ids.add(id);
+            if (row.Rows?.Row) walk(row.Rows.Row);
+        }
+    };
+    walk(report.Rows?.Row ?? []);
+    return ids;
+}
+
+/**
+ * The clearance answer for one window, as txn id -> status.
+ *
+ * ALL THREE buckets are asked for, not just the cleared ones, so a row
+ * QuickBooks classifies as neither (a manually entered journal) stays
+ * "Unknown" rather than being mislabelled "Uncleared". Applied in ascending
+ * order of authority, so Reconciled outranks Cleared outranks Uncleared if a
+ * row ever comes back in two.
+ */
+async function fetchClearedStatuses(
+    tokens: QBTokens,
+    accountId: string,
+    startDate: string,
+    endDate: string,
+): Promise<Map<string, ClearedStatus>> {
+    const order: Array<Exclude<ClearedStatus, "Unknown">> = ["Uncleared", "Cleared", "Reconciled"];
+    const buckets = await Promise.all(order.map(bucket => fetchClearedBucket(tokens, accountId, startDate, endDate, bucket)));
+    const map = new Map<string, ClearedStatus>();
+    order.forEach((bucket, i) => { for (const id of buckets[i]) map.set(id, bucket); });
+    return map;
 }
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -159,7 +278,7 @@ export async function fetchBankRegister(
                 start_date: startDate,
                 end_date: endDate,
                 account: accountId,
-                columns: "tx_date,txn_type,doc_num,name,subt_nat_amount",
+                columns: "tx_date,txn_type,doc_num,name,memo,subt_nat_amount",
             });
             const res = await qbFetch(`/reports/GeneralLedger?${params}`, tokens);
             if (!res.ok) throw new Error(`GL report ${res.status}`);
@@ -173,10 +292,29 @@ export async function fetchBankRegister(
             const rows: BankRegisterRow[] = [];
             walkGlRows(report.Rows?.Row ?? [], idx, rows);
             rows.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+
+            // THE CLEARANCE JOIN, allowed to fail on its own. The register is
+            // still the register without it; what changes is that nothing may
+            // be minted from these rows, which `clearedProbeOk: false` is what
+            // says. Folding this into the outer catch would have thrown the
+            // whole fetch away over a secondary question.
+            let clearedProbeOk = true;
+            try {
+                const statuses = await fetchClearedStatuses(tokens, accountId, startDate, endDate);
+                for (const row of rows) {
+                    const status = row.qbTxnId ? statuses.get(row.qbTxnId) : undefined;
+                    if (status) row.clearedStatus = status;
+                }
+            } catch (error) {
+                clearedProbeOk = false;
+                console.error("bank register clearance probe failed", error instanceof Error ? error.message : "UnknownError");
+            }
+
             const result: BankRegisterResult = {
                 rows,
                 fetchedAt: new Date().toISOString(),
                 stale: false,
+                clearedProbeOk,
                 accountId,
                 startDate,
                 endDate,

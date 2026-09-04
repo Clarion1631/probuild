@@ -9,6 +9,7 @@ import {
     resolveExpenseProjectId,
     resolveExpenseProjectUnderLock,
 } from "@/lib/expense-attribution";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "./receipt-evidence-lock";
 import { lockAttributionParents } from "@/lib/phase-invariant";
 import { revalidatePath } from "next/cache";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
@@ -368,6 +369,14 @@ export async function deleteExpense(id: string, projectId: string) {
     // somebody can move that estimate between the check above and this delete,
     // destroying the row under a permission granted for a job it has left.
     const deleted = await prisma.$transaction(async tx => {
+        // EVIDENCE (PR #443 gate rounds 42/45). An Expense write changes what
+        // the missing-receipt sweep reads, so it queues behind the sweep and
+        // moves the evidence epoch. THE OUTERMOST LOCK, before the attribution
+        // parents below (receipt-evidence-lock.ts); taken directly rather than
+        // through `withReceiptEvidenceLock` because this path owns a
+        // transaction of its own.
+        await lockReceiptEvidence(tx);
+        await bumpReceiptEvidenceEpoch(tx);
         const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
         const locked = await resolveExpenseProjectUnderLock(raw, {
             projectId: expense.projectId,
@@ -447,6 +456,14 @@ export async function deleteExpenses(
     // legitimate request, and the returned count says what actually happened.
     let deletedCount = 0;
     await prisma.$transaction(async tx => {
+        // EVIDENCE (PR #443 gate rounds 42/45). An Expense write changes what
+        // the missing-receipt sweep reads, so it queues behind the sweep and
+        // moves the evidence epoch. THE OUTERMOST LOCK, before the attribution
+        // parents below (receipt-evidence-lock.ts); taken directly rather than
+        // through `withReceiptEvidenceLock` because this path owns a
+        // transaction of its own.
+        await lockReceiptEvidence(tx);
+        await bumpReceiptEvidenceEpoch(tx);
         const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
         // EVERY PARENT FIRST, THEN THE ROWS (round 46, item 3).
         //

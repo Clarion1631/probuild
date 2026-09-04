@@ -149,6 +149,8 @@ interface Recorder {
     expenses: any[];
     expenseUpdates: any[];
     intakeUpdates: any[];
+    lockCalls: string[];
+    epochBumps: string[];
     events: any[];
     /**
      * Every advisory-lock key this transaction took, IN ORDER: the
@@ -186,14 +188,21 @@ function fillData(rec: Recorder): Record<string, any> {
 
 function recorder(
     overrides: Partial<BookDependencies> = {},
-    opts: { estimates?: { id: string }[]; existingExpense?: Record<string, unknown> | null } = {},
+    opts: {
+        estimates?: { id: string }[];
+        intakeStillBooking?: boolean;
+        existingExpense?: Record<string, unknown> | null;
+    } = {},
 ): Recorder {
+    const intakeStillBooking = opts.intakeStillBooking !== false;
     const purchaseCalls: any[] = [];
     const sendMarks: string[] = [];
     const expenses: any[] = [];
     const expenseUpdates: any[] = [];
     const intakeUpdates: any[] = [];
     const events: any[] = [];
+    const lockCalls: string[] = [];
+    const epochBumps: string[] = [];
     const locks: string[] = [];
     const state: {
         existingExpense: any;
@@ -267,7 +276,31 @@ function recorder(
         },
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
-            updateMany: async (args: any) => { intakeUpdates.push(args.data); return { count: 1 }; },
+            // TWO fenced writes, in one transaction: the state fence
+            // (`state: 'BOOKING'`) refuses when a human voided the row, and the
+            // claim CAS (`claimToken`) refuses when the row was re-claimed.
+            // `intakeStillBooking` lets a test say "somebody voided it while
+            // QuickBooks was answering".
+            updateMany: async (args: any) => {
+                if (args.where?.state === "BOOKING" && !intakeStillBooking) return { count: 0 };
+                intakeUpdates.push(args.data);
+                return { count: 1 };
+            },
+        },
+        // THE RECEIPT-EVIDENCE FENCE (Codex PR #443 gate round 42, finding 1).
+        // Booking a row changes what the sweep reads, so the write is taken
+        // under the shared advisory lock; the fake records that it was asked
+        // for, and `lockCalls` below is what the assertion reads.
+        $executeRaw: async (query: TemplateStringsArray, ...values: unknown[]) => {
+            lockCalls.push(`${query.join("?")}|${values.join(",")}`);
+            return 1;
+        },
+        // The receipt-evidence EPOCH bump (round-43 gate, finding 4). Booking a
+        // row is evidence movement, so the counter a sweep fences its whole
+        // cycle against has to move with it — recorded here, asserted below.
+        $queryRaw: async (query: TemplateStringsArray, ...values: unknown[]) => {
+            epochBumps.push(`${query.join("?")}|${values.join(",")}`);
+            return [{ value: "1" }];
         },
         // TWO jobs. The advisory locks (the shared per-qbPurchaseId one and
         // the per-expense one) are RECORDED — taking them, in that order, is
@@ -320,7 +353,8 @@ function recorder(
         ...overrides,
     };
     return {
-        deps, sendMarks, purchaseCalls, expenses, expenseUpdates, intakeUpdates, events, locks, state,
+        deps, sendMarks, purchaseCalls, expenses, expenseUpdates, intakeUpdates, events,
+        lockCalls, epochBumps, locks, state,
         set existingExpense(value: any) { state.existingExpense = value; },
         get existingExpense() { return state.existingExpense; },
     };
@@ -1039,6 +1073,44 @@ test("the receipt bytes always ride along with the Purchase", async () => {
     assert.equal(r.purchaseCalls[0].fileContentType, "image/jpeg");
 });
 
+test("a void between the claim and the send stops it — QBO is never called", async () => {
+    // Everything before the send takes real time (a project lookup, a file
+    // download), and a human on the Receipts tab can void the row in that
+    // window. QBO is read-only from here: a Purchase created for a cancelled
+    // receipt cannot be taken back.
+    //
+    // The guard is the send fence itself, which CASes on `state = 'BOOKING'`
+    // AND the claim token in the same statement — so a void and a supersede are
+    // both caught at the last possible instant, rather than by a separate read
+    // taken slightly earlier. `markSendAttempted` returning false IS "somebody
+    // moved this row".
+    const { deps, purchaseCalls, intakeUpdates } = recorder({ markSendAttempted: async () => false });
+    const result = await bookReceipt(row(), deps);
+    assert.equal(result.outcome, "stale");
+    assert.deepEqual(purchaseCalls, [], "nothing was sent");
+    assert.deepEqual(intakeUpdates, [], "and nothing overwrote the human's decision");
+});
+
+test("the send fence is checked at the LAST instant, not merely before the download", async () => {
+    // The window this closes is the one after every slow step: if the fence ran
+    // earlier, a void landing during the file download would still book.
+    const marks: string[] = [];
+    const { deps, purchaseCalls } = recorder({
+        markSendAttempted: async () => { marks.push("fenced"); return true; },
+        downloadBytes: async () => { marks.push("downloaded"); return { ok: true as const, bytes: Buffer.from("bytes") }; },
+    });
+    await bookReceipt(row(), deps);
+    assert.deepEqual(marks, ["downloaded", "fenced"], "the fence comes after the slow work");
+    assert.equal(purchaseCalls.length, 1);
+});
+
+test("the normal path is unaffected: an unmoved row is sent", async () => {
+    const { deps, purchaseCalls } = recorder();
+    const result = await bookReceipt(row(), deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(purchaseCalls.length, 1);
+});
+
 // ── Expense.date is a business calendar day (round-6 item 3) ────────────────
 
 test("Expense.date is re-anchored to the company's local midnight", async () => {
@@ -1328,6 +1400,42 @@ test("a real create DOES mark it, before the call", async () => {
     assert.deepEqual(r.sendMarks, ["intake-1"]);
 });
 
+test("a void that lands AFTER the send parks the orphaned Purchase for a human", async () => {
+    // The pre-send re-read narrows this window but cannot close it: QuickBooks
+    // takes real time to answer, and the money exists the moment it does. QBO
+    // is read-only from this pipeline, so nothing here can take it back.
+    const { deps, purchaseCalls, intakeUpdates, events, expenses } = recorder({}, { intakeStillBooking: false });
+    const result = await bookReceipt(row(), deps);
+
+    assert.equal(result.outcome, "booked-after-void");
+    assert.equal((result as { qbPurchaseId: string }).qbPurchaseId, "QB-1");
+    assert.equal(purchaseCalls.length, 1, "the send did happen — that is the whole problem");
+
+    // BOTH TABLES. The Expense create used to run before the fence, so a void
+    // still polluted job costs with a purchase somebody had cancelled.
+    assert.deepEqual(expenses, [], "no Expense may be written for a voided row");
+
+    const parked = intakeUpdates.find(u => u.stateReason === "booked-after-void");
+    assert.ok(parked, "the row must record what happened");
+    assert.equal(parked.postVoidQbPurchaseId, "QB-1");
+    // NOT qbPurchaseId: that column means "this row is booked", and it is not.
+    assert.equal(parked.qbPurchaseId, undefined);
+    assert.equal(parked.state, undefined, "the human's state is never overwritten");
+    assert.equal(parked.bookedAt, undefined);
+
+    assert.ok(events.some(e => e.status === "booked-after-void"), "and it must be auditable");
+});
+
+test("the fence does not fire on the normal path — and the Expense IS written", async () => {
+    const { deps, intakeUpdates, expenses } = recorder();
+    const result = await bookReceipt(row(), deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(expenses.length, 1);
+    assert.ok(intakeUpdates.some(u => u.state === "BOOKED"));
+    assert.ok(intakeUpdates.some(u => u.expenseId), "and linked back onto the intake");
+    assert.ok(!intakeUpdates.some(u => u.stateReason === "booked-after-void"));
+});
+
 // ── An attachment QBO REFUSED is terminal (round-9 item 5) ─────────────────
 
 test("a 4xx or fault attachment failure goes to a human on the FIRST one", async () => {
@@ -1441,15 +1549,26 @@ test("losing the claim DURING the commit rolls back and reports stale", async ()
     // the successor's retry hits alreadyExists and books it once, under one
     // owner — but THIS worker must not complete a BOOKED write.
     const r = recorder();
-    (r.deps.db as any).receiptIntake.updateMany = async () => ({ count: 0 });
+    // The STATE fence passes (nobody voided it) and the CLAIM CAS fails
+    // (somebody re-claimed it). Zeroing both would be the VOID case, which is
+    // booked-after-void, not stale — they are different failures.
+    let calls = 0;
+    (r.deps.db as any).receiptIntake.updateMany = async () => ({ count: ++calls === 1 ? 1 : 0 });
     const result = await bookReceipt(row(), r.deps);
 
     assert.deepEqual(result, { outcome: "stale" });
+    assert.equal(calls, 2, "the claim CAS is a second write, after the Expense");
     assert.equal(r.purchaseCalls.length, 1, "the create did happen");
     assert.equal(r.events.length, 0, "but nothing is logged as booked");
 });
 
 test("the BOOKED write is a CAS on state AND token", async () => {
+    // BOTH, but as two writes in one transaction, and it has to be two: the
+    // first write moves the row to BOOKED, so a second one re-asserting
+    // `state: 'BOOKING'` would fail on this transaction's OWN uncommitted
+    // write, every time. So the state fence goes first (a void loses there, and
+    // is parked as booked-after-void) and the claim CAS follows (a re-claim
+    // loses there, and rolls the whole thing back as stale).
     const wheres: any[] = [];
     const r = recorder();
     (r.deps.db as any).receiptIntake.updateMany = async (args: any) => {
@@ -1457,7 +1576,10 @@ test("the BOOKED write is a CAS on state AND token", async () => {
         return { count: 1 };
     };
     await bookReceipt(row({ claimToken: "token-abc" }), r.deps);
-    assert.deepEqual(wheres, [{ id: "intake-1", state: "BOOKING", claimToken: "token-abc" }]);
+    assert.deepEqual(wheres, [
+        { id: "intake-1", state: "BOOKING" },
+        { id: "intake-1", claimToken: "token-abc" },
+    ]);
 });
 
 // ── A Purchase found by the idempotency query is still a Purchase ───────────
@@ -2220,10 +2342,13 @@ test("an estimate MOVED before the create parks instead of splitting the job", a
         assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
     }
     assert.equal(rec.expenses.length, 0, "nothing was written on either job");
-    assert.equal(
-        rec.intakeUpdates.filter((u: any) => u.state === "BOOKED").length, 0,
-        "and the row is not marked booked",
-    );
+    // The BOOKED write is Phase 2's VOID FENCE and now runs BEFORE the fills
+    // and the create, inside the same transaction as the throw — so a real
+    // Postgres rolls it back with everything else. The fake `$transaction`
+    // has no rollback, which is why the assertion is on what a rolled-back
+    // transaction can still be seen NOT to have done: no Expense, and no
+    // booking in the audit register.
+    assert.equal(rec.events.length, 0, "and nothing is logged as booked");
 });
 
 test("an estimate that lost its project before the create parks too", async () => {
@@ -2332,11 +2457,15 @@ test("an Expense re-attributed DURING the fill parks instead of booking", async 
         assert.equal(result.reason, "expense-conflict:attribution");
         assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
     }
-    // Nothing was marked BOOKED: the throw rolled the whole transaction back.
-    assert.equal(
-        rec.intakeUpdates.filter((u: any) => u.state === "BOOKED").length, 0,
-        "no booking on a row that ended up on another job",
-    );
+    // Nothing was booked: the throw rolled the whole transaction back.
+    // The BOOKED write is Phase 2's VOID FENCE and now runs BEFORE the fills
+    // and the create, inside the same transaction as the throw — so a real
+    // Postgres rolls it back with everything else. The fake `$transaction`
+    // has no rollback, which is why the assertion is on what a rolled-back
+    // transaction can still be seen NOT to have done: no Expense, and no
+    // booking in the audit register.
+    assert.equal(rec.expenses.length, 0, "no Expense on a row that ended up on another job");
+    assert.equal(rec.events.length, 0, "and nothing is logged as booked");
 });
 
 test("the locks are taken in one order: the Purchase, the parents, then the Expense", async () => {
@@ -2663,10 +2792,14 @@ test("an estimate REASSIGNED under the fill parks instead of half-writing", asyn
         assert.equal(result.reason, "expense-conflict:attribution");
         assert.equal(result.releaseStrongKey, false, "the Purchase exists");
     }
-    assert.equal(
-        rec.intakeUpdates.filter((u: any) => u.state === "BOOKED").length, 0,
-        "and nothing was marked BOOKED",
-    );
+    // The BOOKED write is Phase 2's VOID FENCE and now runs BEFORE the fills
+    // and the create, inside the same transaction as the throw — so a real
+    // Postgres rolls it back with everything else. The fake `$transaction`
+    // has no rollback, which is why the assertion is on what a rolled-back
+    // transaction can still be seen NOT to have done: no Expense, and no
+    // booking in the audit register.
+    assert.equal(rec.expenses.length, 0, "no Expense was written");
+    assert.equal(rec.events.length, 0, "and nothing is logged as booked");
 });
 
 test("a phase CLEARED between the read and the fill is not overrun either", async () => {
@@ -2701,4 +2834,43 @@ test("a phase CLEARED between the read and the fill is not overrun either", asyn
     assert.ok(attempted, "the write was issued");
     assert.equal(rec.existingExpense.costCodeId, null, "and the clear survived it");
     assert.equal(rec.existingExpense.costCodeSource, "manual-none");
+});
+
+test("the post-fill attribution check runs even when there was nothing to fill", async () => {
+    // ROUND 24: Phase 2's void fence made the fills conditional, and the
+    // re-attribution check must NOT become conditional with them. An empty
+    // `fill` means every column this pass had an opinion about was already
+    // answered — it does not mean the row cannot move. The writer that moves
+    // it does not take the per-expense lock, so it can commit between the
+    // reconcile's read and this commit on a row this pass never wrote to.
+    const rec = recorder();
+    // Fully answered: no phase fill (a human's), no tax fill, no excise fill,
+    // no receipt-link fill, no pair fill. `fill` comes back empty.
+    rec.existingExpense = onThisJob({
+        costCodeId: "cc-human", costCodeSource: "manual",
+        taxAmount: 9.99, taxAtSource: true, taxSource: "manual",
+        installedAtCustomer: false,
+        receiptUrl: "https://drive.google.com/file/d/HAND-FIXED/view",
+    });
+    let reads = 0;
+    (rec.deps.db as any).expense.findUnique = async () => {
+        reads += 1;
+        if (reads === 1) return { id: "expense-1" };
+        if (reads === 2) return rec.existingExpense;
+        // The post-fill re-read: somebody moved it while this pass wrote
+        // nothing at all.
+        return { projectId: "another-job", estimate: { projectId: "another-job" } };
+    };
+
+    const result = await bookReceipt(row(), rec.deps);
+
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "expense-conflict:attribution");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
+    // CONTROL: this pass really did have nothing to write, so the check cannot
+    // be passing because a guarded fill happened to run.
+    assert.equal(rec.expenseUpdates.length, 0, "no fill was issued");
+    assert.equal(rec.events.length, 0, "and nothing is logged as booked");
 });

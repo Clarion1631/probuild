@@ -49,6 +49,11 @@ let objects: Set<string>;
 let betweenReadAndWrite: (() => void) | null;
 
 const fakePrisma: any = {
+    // The receipt-evidence lock and its epoch bump (PR #443 gate rounds
+    // 42/45): every Expense writer takes them, and nothing in this suite
+    // depends on their result — only that they are answerable.
+    $executeRaw: async () => 1,
+    $queryRaw: async () => [{ value: "1" }],
     $transaction: async (fn: any) => fn(fakePrisma),
     $queryRawUnsafe: async (query: string) => {
         if (/FROM "Estimate"/.test(query) && /"projectId"/.test(query)) {

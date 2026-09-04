@@ -8,7 +8,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { backoffMs, MAX_BOOK_ATTEMPTS, preservedTaxWarning, routeState } from "../src/lib/receipt-intake/route-state";
+import { backoffMs, MAX_BOOK_ATTEMPTS, preservedTaxWarning, retryTargetFor, routeState } from "../src/lib/receipt-intake/route-state";
 
 const NO_HITS = { strong: null, weak: null };
 const clean = { docType: "receipt", amount: "364.98", totalCents: 36498, canonicalVendor: "lowes" };
@@ -186,4 +186,53 @@ test("backoff is 5m / 15m / 1h / 6h and then stays at 6h", () => {
     assert.equal(backoffMs(4), 6 * 60 * 60_000);
     assert.equal(backoffMs(10), 6 * 60 * 60_000);
     assert.equal(MAX_BOOK_ATTEMPTS, 20);
+});
+
+// ── Manual "Retry now" (Codex real issue 10) ────────────────────────────────
+
+test("only transient FAILURES are retryable — never a document verdict", async t => {
+    await t.test("a BOOKING row is always retryable; it is mid-flight, not parked", () => {
+        assert.equal(retryTargetFor("BOOKING", null), "BOOKING");
+        assert.equal(retryTargetFor("BOOKING", "push-paused"), "BOOKING");
+    });
+
+    await t.test("pre-read failures resume at RECEIVED so the document is read again", () => {
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "ai-unavailable"), "RECEIVED");
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "file-missing"), "RECEIVED");
+    });
+
+    await t.test("send failures resume at BOOKING — the read is already done", () => {
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "qbo-timeout"), "BOOKING");
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "qbo-5xx"), "BOOKING");
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "qbo-fault:503"), "BOOKING");
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "qbo-fault:429"), "BOOKING");
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "max-retries"), "BOOKING");
+    });
+
+    await t.test("document verdicts are NOT retryable — another attempt parks them again", () => {
+        for (const reason of [
+            "multi-doc", "no-estimate", "refund-or-zero", "invalid-date", "zero-total",
+            "weak-dup:abc", "strong-dup-amount-mismatch:abc", "vendor-mismatch:abc",
+            "qbo-fault:account-config", "qbo-fault:vendor-duplicate", "voided-by-user",
+        ]) {
+            assert.equal(retryTargetFor("NEEDS_REVIEW", reason), null, reason);
+        }
+    });
+
+    await t.test("an unknown or empty reason is not retryable — the list is CLOSED", () => {
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "something-new"), null);
+        assert.equal(retryTargetFor("NEEDS_REVIEW", ""), null);
+        assert.equal(retryTargetFor("NEEDS_REVIEW", null), null);
+    });
+
+    await t.test("no other state may be retried at all", () => {
+        for (const state of ["STAGING", "RECEIVED", "READ", "NEEDS_JOB", "BOOKED", "ARCHIVED", "DUPLICATE", "VOID", "NON_RECEIPT"]) {
+            assert.equal(retryTargetFor(state, "qbo-timeout"), null, state);
+        }
+    });
+
+    await t.test("a reason that merely CONTAINS a retryable one does not qualify", () => {
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "not-ai-unavailable"), null);
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "max-retries-exceeded"), null);
+    });
 });

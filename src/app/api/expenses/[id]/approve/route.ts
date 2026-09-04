@@ -12,6 +12,7 @@ import {
 } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
 import { lockAttributionParents } from "@/lib/phase-invariant";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 /**
  * APPROVING AN EXPENSE IS A MUTATION OF THE SAME ROW, SO IT TAKES THE SAME
@@ -66,6 +67,15 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
         const approved = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // THE RECEIPT-EVIDENCE LOCK IS THE OUTERMOST ONE, so it is taken
+            // before the attribution parents and before the per-expense lock
+            // (the rule is stated in receipt-evidence-lock.ts). Approving an
+            // Expense changes what the missing-receipt sweep reads, and this
+            // handler owns its own transaction, so it takes the lock and moves
+            // the epoch itself rather than going through
+            // `withReceiptEvidenceLock`, which exists for bare single writes.
+            await lockReceiptEvidence(tx);
+            await bumpReceiptEvidenceEpoch(tx);
             // THE PARENTS FIRST, THEN THE ROW (round 40, item 1). The global
             // order is Project -> Estimate -> EstimateItem -> CostCode ->
             // Expense, and EXPENSE IS LAST.

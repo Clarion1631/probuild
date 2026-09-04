@@ -7,6 +7,7 @@ import {
 } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
 import { lockAttributionParents } from "@/lib/phase-invariant";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 import { getCurrentUserWithPermissions, canAccessProject } from "@/lib/permissions";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 
@@ -141,6 +142,18 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         // uploaded (lost the race) or the one it replaced (won it).
         const settled = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // EXPENSE RECEIPT LINKAGE IS EVIDENCE (PR #443 gate round 42,
+            // finding 1). `receiptUrl` is one of the two things the
+            // missing-receipt sweep reads to decide a charge is answered, so
+            // setting it queues behind the same advisory lock the sweep holds
+            // across its reads and its verdicts — and that lock is the
+            // OUTERMOST one, taken before the attribution parents and the
+            // per-expense lock below. This handler owns its transaction (it
+            // has to: the write is fenced on the value it replaces), so it
+            // takes the lock and moves the epoch itself rather than going
+            // through `withReceiptEvidenceLock`.
+            await lockReceiptEvidence(tx);
+            await bumpReceiptEvidenceEpoch(tx);
             // THE PARENTS FIRST, THEN THE ROW (round 40, item 1). The global
             // order is Project -> Estimate -> EstimateItem -> CostCode ->
             // Expense, and EXPENSE IS LAST.

@@ -56,7 +56,8 @@ import {
 } from "@/lib/qbo-receipt-push";
 import type { AutomationEventInput } from "@/lib/automation-events";
 import type { VerifiedBytes } from "./stored-object";
-import { backoffMs, MAX_BOOK_ATTEMPTS, preservedTaxWarning } from "./route-state";
+import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS, preservedTaxWarning } from "./route-state";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
 export interface BookableRow {
@@ -175,6 +176,15 @@ export type BookResult =
     | { outcome: "booked"; qbPurchaseId: string; expenseId: string; alreadyExisted: boolean }
     /** A switch is off: stay BOOKING, try again in an hour, spend NO attempt. */
     | { outcome: "deferred"; reason: "push-disabled" | "push-paused" | "out-of-budget" }
+    /** A human changed the row (void, re-classify) between the claim and the
+     * send. Nothing was sent and nothing is written back — the row is already
+     * whatever they made it. */
+    | { outcome: "aborted"; reason: string }
+    /** The send WENT OUT and QuickBooks created a Purchase, but the row was
+     * voided before the booked write landed. The money exists in QBO and only a
+     * human can remove it; the id is parked on the row as
+     * `postVoidQbPurchaseId` with stateReason "booked-after-void". */
+    | { outcome: "booked-after-void"; qbPurchaseId: string }
     /**
      * Terminal: a human must look at it. No further automatic attempt.
      *
@@ -238,6 +248,16 @@ export interface ExistingExpense {
 }
 
 export interface BookPrismaClient {
+    /**
+     * The receipt-evidence lock runs through here (round-42 gate, finding 1):
+     * this transaction changes what the sweep reads, so it queues behind it.
+     */
+    $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>;
+    /**
+     * And the evidence EPOCH is bumped through here (round-43 gate, finding 4),
+     * so a sweep certifying a whole cycle can tell that evidence moved under it.
+     */
+    $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>;
     project: {
         findUnique(args: any): Promise<{
             id: string;
@@ -502,11 +522,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // back for a corrected re-upload.
     const download = await deps.downloadBytes(row.storagePath, row.fileSha256);
     if (!download.ok) {
-        if (download.kind === "missing") return parkedBeforeSend(row, "receipt-bytes-missing");
+        if (download.kind === "missing") return parkedBeforeSend(row, NO_ARTIFACT_PARK_REASONS.bytesMissing);
         // The attachment about to ride along with a real Purchase is NOT the
         // document this row was verified as. Refuse — a Purchase carrying the
         // wrong receipt is worse than one carrying none.
-        if (download.kind === "sha-mismatch") return parkedBeforeSend(row, "content-changed");
+        if (download.kind === "sha-mismatch") return parkedBeforeSend(row, NO_ARTIFACT_PARK_REASONS.contentChanged);
         return retry(row, deps, now, `storage:${download.message}`);
     }
     const bytes = download.bytes;
@@ -889,6 +909,16 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // ONE LOCK ORDER, STATED ONCE. Everything this transaction takes,
             // in the order it takes it:
             //
+            //   0. `lockReceiptEvidence` — THE OUTERMOST LOCK, before anything
+            //      is read or written here. This transaction moves a row to
+            //      BOOKED and attaches its Expense, which is exactly what the
+            //      missing-receipt sweep reads as "the receipt exists"
+            //      (round-42 gate, finding 1). receipt-evidence-lock.ts states
+            //      the rule for every writer: it is taken FIRST, before the
+            //      component lock, the bank-line identity lock, or any
+            //      `SELECT ... FOR UPDATE` — so it goes ahead of the three
+            //      below rather than between them, or the receipt pipeline's
+            //      writers would take the same two keys in two orders.
             //   1. `lockQboExpense`, keyed on `result.qbPurchaseId` — the
             //      identity. THE SAME LOCK THE QBO IMPORTER TAKES:
             //      `qbo-expense-sync` serializes every writer of one Purchase
@@ -922,6 +952,13 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // Project..Expense chain and taking it first cannot invert
             // anything inside it. It is first because it is the identity of
             // the document this whole transaction is about.
+            await lockReceiptEvidence(tx);
+            // AND MOVE THE EVIDENCE EPOCH (round-43 gate, finding 4). This
+            // transaction owns the lock directly rather than going through
+            // `withReceiptEvidenceLock`, so the bump the wrapper would have
+            // done has to be done here — a sweep certifying a cycle needs to
+            // see that evidence moved under it.
+            await bumpReceiptEvidenceEpoch(tx);
             await lockQboExpense(tx, result.qbPurchaseId);
             await lockAttributionParents(raw, {
                 projectId: project.id,
@@ -982,6 +1019,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     },
                 })
                 : null;
+            // The reconcile's verdict is taken here and its FILL is HELD: the
+            // writes wait until the void fence below has proved the row is
+            // still ours to book.
+            let fill: ReturnType<typeof reconcileExistingExpense>["fill"] = {};
             if (existing) {
                 // NEVER a blind link. See reconcileExistingExpense.
                 // From the SAME `booked` object the writes use: the reconcile
@@ -1009,6 +1050,88 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     throw new ExpenseConflictError(verdict.conflicts);
                 }
                 effective = verdict.attribution;
+                fill = verdict.fill;
+            }
+            // THE VOID FENCE, BEFORE ANY WRITE THIS TRANSACTION MAKES.
+            //
+            // It used to run after the Expense was created, which meant a void
+            // landing during the QBO round trip still committed an Expense —
+            // polluting job costs with a purchase somebody had explicitly
+            // cancelled. The Expense, the reconcile's guarded fills and the
+            // create all happen ONLY if this CAS succeeded, in the same
+            // transaction. Losing it writes nothing.
+            //
+            // It sits AFTER the reconcile READ and its VERDICT above and
+            // before any write: a conflicting imported Expense must park the
+            // row for a human, and marking it BOOKED on the way to that
+            // verdict would be the very thing the conflict check exists to
+            // prevent. The Phase 3 fills therefore wait here too — a row
+            // somebody voided mid-flight must not be left carrying a phase, a
+            // tax answer or a receipt link this pass wrote.
+            const claimed = await tx.receiptIntake.updateMany({
+                where: { id: row.id, state: "BOOKING" },
+                data: {
+                    state: "BOOKED",
+                    // Every OTHER value this column carries at BOOKING (a
+                    // defer reason like "push-paused", a retry note) is
+                    // transient and must not survive into BOOKED — but a
+                    // dropped-tax-reading warning is a fact about the
+                    // DOCUMENT, not about why booking was delayed, and must.
+                    // This CAS *is* the BOOKED write (the void fence), so the
+                    // preservation belongs here, not on the claim-confirm
+                    // update below.
+                    stateReason: preservedTaxWarning(row),
+                    qbPurchaseId: result.qbPurchaseId,
+                    bookedAt: now,
+                    lastError: null,
+                    nextRetryAt: null,
+                    // THE BOOKED VALUES, PERSISTED — the same object the
+                    // Expense and the audit event are built from, on the same
+                    // write that says BOOKED.
+                    //
+                    // "QuickBooks is authoritative for an existing Purchase"
+                    // was only half true: booking DERIVED the total, vendor,
+                    // date and tax from QBO and wrote them to the Expense, but
+                    // left this row carrying the OCR read. So `taxCents` — the
+                    // column Phase 3's sales-tax reporting is specified to
+                    // read — kept a figure no Purchase ever posted, and the
+                    // row and its own Expense disagreed under a qbPurchaseId
+                    // asserting they are one document.
+                    //
+                    // BOOKED OVERWRITES THE EXTRACTED VALUES, deliberately.
+                    // There is no `extracted*` column pair on this model, and
+                    // none is needed: `readJson` holds the raw model response
+                    // verbatim and is never rewritten, so the OCR original
+                    // remains auditable after the row records what posted.
+                    vendor: booked.vendor,
+                    txnDate: booked.txnDate,
+                    totalCents: booked.totalCents,
+                    taxCents: booked.taxCents,
+                },
+            });
+            if (claimed.count === 0) {
+                // The money EXISTS in QuickBooks and nothing here can take it
+                // back (QBO is read-only from this pipeline). Record the
+                // Purchase id where a human will see it — deliberately NOT
+                // `qbPurchaseId`, which means "this row is booked", and this
+                // row is not. The queue surfaces "booked-after-void" so
+                // somebody voids it in QBO by hand. No Expense is written.
+                //
+                // FENCED ON THE CLAIM as well: a superseded worker writes
+                // NOTHING to a row it no longer owns (Phase 1's rule). The
+                // orphaned Purchase still reaches a human either way — the
+                // "booked-after-void" audit event below is written regardless.
+                await tx.receiptIntake.updateMany({
+                    where: { id: row.id, claimToken: row.claimToken },
+                    data: {
+                        postVoidQbPurchaseId: result.qbPurchaseId,
+                        stateReason: "booked-after-void",
+                        nextRetryAt: null,
+                    },
+                });
+                return null;
+            }
+            if (existing) {
                 // EACH FIELD GETS ITS OWN GUARDED WRITE.
                 //
                 // The read above happened inside this transaction and inside
@@ -1033,7 +1156,6 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 // in the gap makes the fill match zero rows rather than
                 // writing a phase and a tax answer onto a job they were never
                 // about.
-                const fill = verdict.fill;
                 const expectedProjectId = existing.projectId ?? null;
 
                 // THE ATTRIBUTION IS FILLED AS A PAIR, OR NOT AT ALL
@@ -1246,14 +1368,23 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 // So the final state is re-read and compared with the intent. A
                 // mismatch throws, which rolls the fills back with it, and the
                 // row is parked for a person.
-                if (row.projectId) {
-                    const after = await tx.expense.findUnique({
-                        where: { id: existing.id },
-                        select: { projectId: true, estimate: { select: { projectId: true } } },
-                    });
-                    const finalProjectId = after?.projectId ?? after?.estimate?.projectId ?? null;
-                    if (finalProjectId !== row.projectId) throw new ExpenseConflictError(["attribution"]);
-                }
+            }
+            // ...AND IT RUNS WHETHER OR NOT THERE WAS ANYTHING TO FILL.
+            //
+            // An empty `fill` means every column this pass had an opinion about
+            // was already answered — it does NOT mean nothing moved. The
+            // re-attribution this catches is committed by a writer that does
+            // not take the per-expense lock, so it can land between the
+            // reconcile's read and this commit on a row this pass never wrote
+            // to. Linking the intake row to an Expense that is now on somebody
+            // else's job is the same failure either way.
+            if (existing && row.projectId) {
+                const after = await tx.expense.findUnique({
+                    where: { id: existing.id },
+                    select: { projectId: true, estimate: { select: { projectId: true } } },
+                });
+                const finalProjectId = after?.projectId ?? after?.estimate?.projectId ?? null;
+                if (finalProjectId !== row.projectId) throw new ExpenseConflictError(["attribution"]);
             }
             // THE PAIR, RE-READ UNDER LOCK (round 21, item 1).
             //
@@ -1364,57 +1495,48 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 select: { id: true },
                 });
             }
-            // CAS again inside the commit. If the row was re-claimed between
-            // the create and here, this transaction rolls back — including the
-            // Expense — and the successor retries: QBO's DocNumber idempotency
-            // returns the SAME Purchase, so it books once, under one owner.
-            // Completing a BOOKED write from a stale worker would leave two
-            // owners disagreeing about the row.
-            const claimed = await tx.receiptIntake.updateMany({
-                where: { id: row.id, state: "BOOKING", claimToken: row.claimToken },
+            // CLAIM CAS, inside the same commit, now that the Expense exists.
+            //
+            // The void fence above proved the row was still BOOKING (a void
+            // loses there, and is parked as booked-after-void); this proves WE
+            // still own it. If the row was re-claimed the whole transaction
+            // rolls back — the BOOKED write above, the guarded fills and the
+            // Expense with it — and the successor retries: QBO's DocNumber
+            // idempotency returns the SAME Purchase, so it books once, under
+            // one owner.
+            //
+            // It does NOT re-assert `state: "BOOKING"`: the fence above already
+            // moved this row to BOOKED inside this transaction, so requiring
+            // BOOKING here would fail on our own uncommitted write, every time.
+            const confirmed = await tx.receiptIntake.updateMany({
+                where: { id: row.id, claimToken: row.claimToken },
                 data: {
-                    state: "BOOKED",
-                    // Every OTHER value this column carries at BOOKING (a
-                    // defer reason like "push-paused", a retry note) is
-                    // transient and must not survive into BOOKED — but a
-                    // dropped-tax-reading warning is a fact about the
-                    // DOCUMENT, not about why booking was delayed, and must.
-                    stateReason: preservedTaxWarning(row),
-                    qbPurchaseId: result.qbPurchaseId,
                     expenseId: expense.id,
-                    bookedAt: now,
-                    lastError: null,
-                    nextRetryAt: null,
-                    // THE BOOKED VALUES, PERSISTED — the same object the
-                    // Expense and the audit event are built from.
-                    //
-                    // "QuickBooks is authoritative for an existing Purchase"
-                    // was only half true: booking DERIVED the total, vendor,
-                    // date and tax from QBO and wrote them to the Expense, but
-                    // left this row carrying the OCR read. So `taxCents` — the
-                    // column Phase 3's sales-tax reporting is specified to
-                    // read — kept a figure no Purchase ever posted, and the
-                    // row and its own Expense disagreed under a qbPurchaseId
-                    // asserting they are one document.
-                    //
-                    // BOOKED OVERWRITES THE EXTRACTED VALUES, deliberately.
-                    // There is no `extracted*` column pair on this model, and
-                    // none is needed: `readJson` holds the raw model response
-                    // verbatim and is never rewritten, so the OCR original
-                    // remains auditable after the row records what posted.
-                    vendor: booked.vendor,
-                    txnDate: booked.txnDate,
-                    totalCents: booked.totalCents,
-                    taxCents: booked.taxCents,
                     // Ownership is released by the write that completes the
                     // transition — a booked row is nobody's to hold.
                     claimToken: null,
                     claimedAt: null,
                 },
             });
-            if (claimed.count === 0) throw new StaleClaimError();
+            if (confirmed.count === 0) throw new StaleClaimError();
             return expense.id;
         });
+
+        if (expenseId === null) {
+            await deps.logEvent({
+                kind: "receipt-push",
+                status: "booked-after-void",
+                source: "intake-worker",
+                vendor: row.vendor ?? undefined,
+                projectName: project.name,
+                docNumber: result.docNumber,
+                fileName: row.fileName ?? undefined,
+                amountCents,
+                taxCents: taxApplied,
+                detail: { fileId, qbPurchaseId: result.qbPurchaseId, intakeId: row.id, sourceRef: row.sourceRef },
+            }).catch(() => { /* audit only */ });
+            return { outcome: "booked-after-void", qbPurchaseId: result.qbPurchaseId };
+        }
 
         // Audit row so the /automation register keeps seeing v2 bookings
         // alongside the bot's. Fire-and-forget by contract — never fails a

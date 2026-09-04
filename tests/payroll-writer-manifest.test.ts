@@ -125,43 +125,43 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     },
 
     // ---- server actions -----------------------------------------------------
-    "lib/actions.ts:3692::updateMany": {
+    "lib/actions.ts:3710::updateMany": {
         kind: "exempt",
         why: "createInvoiceFromTimeEntries's claim: stamps invoiceId/invoicedAt only inside the invoice-creation transaction. Same reasoning as lib/billing-core.ts's exemption below — it changes no hours, no cost and no readiness flag, and every payroll writer already refuses an entry once it is billed",
     },
-    "lib/actions.ts:15441::updateMany": {
+    "lib/actions.ts:15465::updateMany": {
         kind: "guarded",
         why: "markTimeEntryReviewed's reprice-and-stamp claim, wrapped in withPayrollWrite with a compare-and-set on updatedAt",
     },
-    "lib/actions.ts:15629::updateMany": {
+    "lib/actions.ts:15653::updateMany": {
         kind: "guarded",
         why: "the meal-skip decision, wrapped in withPayrollWrite — it changes what the day's settlement owes",
     },
-    "lib/actions.ts:15703::updateMany": {
+    "lib/actions.ts:15727::updateMany": {
         kind: "guarded",
         why: "logistics routing: restoring an entry to its prior project, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs",
     },
-    "lib/actions.ts:15716::updateMany": {
+    "lib/actions.ts:15740::updateMany": {
         kind: "guarded",
         why: "logistics routing: routing an entry to a new project, wrapped in withPayrollWrite for the same reason as the restore above",
     },
-    "lib/time-expense-core.ts:207::create": {
+    "lib/time-expense-core.ts:208::create": {
         kind: "guarded",
         why: "createTimeEntryCore, wrapped in withPayrollWriteTx — the canonical manual create every server action funnels through",
     },
-    "lib/time-expense-core.ts:448::updateMany": {
+    "lib/time-expense-core.ts:457::updateMany": {
         kind: "guarded",
         why: "tagTimeEntriesToChangeOrder, wrapped in withPayrollWrite — retagging changes which change order the hours bill against. The change order and the rows are re-read INSIDE the lock and projectId is pinned in the WHERE, so an entry rerouted to another job between the pre-check and the write cannot pick up this project's change order",
     },
-    "lib/time-expense-actions.ts:188::updateMany": {
+    "lib/time-expense-actions.ts:189::updateMany": {
         kind: "guarded",
         why: "the manual edit, wrapped in withPayrollWriteTx with the row re-read under FOR UPDATE",
     },
-    "lib/time-expense-actions.ts:233::deleteMany": {
+    "lib/time-expense-actions.ts:234::deleteMany": {
         kind: "guarded",
         why: "deleteTimeEntry (single delete), wrapped in withPayrollWriteTx over the one affected row id",
     },
-    "lib/time-expense-actions.ts:286::deleteMany": {
+    "lib/time-expense-actions.ts:287::deleteMany": {
         kind: "guarded",
         why: "deleteTimeEntries (bulk delete), wrapped in withPayrollWriteTx over every affected row id",
     },

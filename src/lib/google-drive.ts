@@ -1,5 +1,5 @@
 import { google } from 'googleapis';
-import { oauth2Client, loadToken } from './gmail-client';
+import { oauth2Client, loadToken, ensureDriveAuth } from './gmail-client';
 
 /**
  * Service to manage Google Drive provisioning and integration for ProBuild.
@@ -308,4 +308,64 @@ function getMockFiles(projectName: string, folderId?: string | null) {
         folders: [],
         files
     };
+}
+
+/**
+ * A BOUNDED metadata read for one Drive file, for verification rather than
+ * display.
+ *
+ * NO MOCK FALLBACK, deliberately, and that is the whole point of it being
+ * separate from the functions above. They degrade to mock data when no token is
+ * loaded, which is right for a UI that would otherwise be empty in development
+ * — and catastrophic here: "we could not ask Google" would come back as "the
+ * file is there", and a signed-memo resolution would be recorded against an
+ * artifact nobody ever confirmed exists. Unknown is its own answer.
+ */
+export type DriveFileProbe =
+    | { kind: "found"; id: string; name: string | null; trashed: boolean; webViewLink: string | null; mimeType: string | null }
+    /** Google answered, and there is no such file (or it is in the bin). */
+    | { kind: "missing"; reason: string }
+    /** We could not ask, or could not understand the answer. NOT a verdict. */
+    | { kind: "unreachable"; reason: string };
+
+/** Drive ids are long, opaque and URL-safe. Anything else is a paste error. */
+export function isDriveFileId(value: unknown): value is string {
+    return typeof value === "string" && /^[A-Za-z0-9_-]{10,200}$/.test(value.trim());
+}
+
+export async function probeDriveFile(fileId: string, timeoutMs = 5_000): Promise<DriveFileProbe> {
+    if (!isDriveFileId(fileId)) return { kind: "missing", reason: "invalid-id" };
+    // The stored company credential counts, not just the env var — see
+    // ensureDriveAuth. Without this, an admin who completed the connect flow
+    // still had every Drive call answer "no token".
+    if (!(await ensureDriveAuth()).ok) return { kind: "unreachable", reason: "no-drive-token" };
+    try {
+        const drive = google.drive({ version: "v3", auth: oauth2Client });
+        const response = await drive.files.get(
+            { fileId: fileId.trim(), fields: "id, name, trashed, webViewLink, mimeType", supportsAllDrives: true },
+            { timeout: timeoutMs },
+        );
+        const data = response.data;
+        if (!data?.id) return { kind: "unreachable", reason: "no-body" };
+        // A file in the bin is not a durable artifact: it disappears on its own.
+        if (data.trashed) return { kind: "missing", reason: "trashed" };
+        return {
+            kind: "found",
+            id: data.id,
+            name: data.name ?? null,
+            trashed: false,
+            webViewLink: data.webViewLink ?? null,
+            mimeType: data.mimeType ?? null,
+        };
+    } catch (error) {
+        const status = (error as { code?: number; status?: number })?.code
+            ?? (error as { status?: number })?.status;
+        // 404/410 are ANSWERS — that file is not there. Everything else
+        // (timeout, 5xx, auth, network) is us being unable to ask.
+        if (status === 404 || status === 410) return { kind: "missing", reason: `http-${status}` };
+        return {
+            kind: "unreachable",
+            reason: error instanceof Error ? error.message.slice(0, 120) : "unknown-error",
+        };
+    }
 }

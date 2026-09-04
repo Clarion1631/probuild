@@ -1,5 +1,11 @@
 // QBO bank register → bank-ledger ingest (source=QBO_REGISTER).
 //
+// THIN WRAPPER. The fetch + convert logic this script used to own now lives in
+// `src/lib/bank-register-pull.ts` so the nightly server-side cron
+// (/api/cron/bank-register-pull, 02:00 UTC) and this manual runner share ONE
+// implementation. Keep this script for ad-hoc/backfill windows — for the
+// day-to-day pull, the cron is the thing that runs.
+//
 // THE MISSING PIPE (found 2026-08-19 while surveying the live error state):
 // the ingest route has full QBO_REGISTER support — createQboObservations(),
 // race handling, content-conflict detection, all built and peer-reviewed —
@@ -7,10 +13,6 @@
 // BankLines. But NOTHING ever called it. Prod had 51 STATEMENT observations
 // and 0 QBO ones, so reconcile had nothing to match, every BankLine sat at
 // POSTED forever, and receipt-matching was starved of its only input.
-//
-// This script closes that gap: read the QBO General Ledger for the bank
-// account (the same fetchBankRegister() the /automation/bank page uses), map
-// each row to an ingest line, and POST them as source=QBO_REGISTER.
 //
 // WHAT THIS IS NOT: it does not create, edit, or void anything in
 // QuickBooks. QBO stays read-only (money-map rule 2). Observations are
@@ -85,38 +87,6 @@ function ymdDaysAgo(days) {
     return new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
 }
 
-/**
- * A GL row → an ingest line. The descriptor is what reconcile normalizes into
- * a payee, so it must carry the counterparty NAME; the type is appended to
- * keep otherwise-identical rows distinguishable. Whitespace is collapsed for
- * hash stability, exactly as the daily CSV parser does (that bug cost us a
- * 409-stall once already).
- *
- * DOC NUMBER — DO NOT put it in the descriptor. Verified against live QBO
- * 2026-08-19: on this realm `doc_num` holds a GOOGLE DRIVE FILE ID
- * ("1sEISJBJaGRYpivooQJBR") stamped by the receipt-automation pipeline, not a
- * human document number — the real transaction id is a short integer ("6625")
- * carried on the txn_type cell. Splicing doc_num into rawDescriptor would put
- * an opaque per-file identifier into the payee text, so a receipt re-filed
- * under a new Drive id would look like a different payee and never reconcile.
- * It is used ONLY as a check number, and only when it looks like one.
- */
-export function registerRowToLine(row) {
-    if (!row.qbTxnId) return null; // balance/summary rows carry no txn identity
-    const parts = [];
-    if (row.name && row.name.trim()) parts.push(row.name.trim());
-    if (row.qbType && row.qbType.trim()) parts.push(row.qbType.trim());
-    const rawDescriptor = parts.join(" ").replace(/\s+/g, " ").trim();
-    if (rawDescriptor === "") return null; // nothing to normalize a payee from
-    // Check number: only on check-type rows, only when doc_num is actually
-    // numeric (a Drive file id is not), leading zeros stripped so "01027" and
-    // "1027" are ONE identity — matching the daily CSV and monthly PDF parsers.
-    const isCheckish = /check/i.test(row.qbType || "");
-    const docNum = (row.docNum || "").trim();
-    const checkNumber = isCheckish && /^\d+$/.test(docNum) ? String(Number(docNum)) : null;
-    return { postedDate: row.date, amountCents: row.amountCents, rawDescriptor, checkNumber, qbTxnId: row.qbTxnId };
-}
-
 function chunk(arr, size) {
     const out = [];
     for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -152,28 +122,12 @@ async function main() {
     // is getFreshQBTokens from quickbooks-payments (there is no qbo-tokens.ts).
     const { fetchBankRegister } = await import("../src/lib/qbo-bank-register.ts");
     const { getFreshQBTokens } = await import("../src/lib/quickbooks-payments.ts");
+    // ONE convert implementation, shared with /api/cron/bank-register-pull.
+    const { convertRegisterRows } = await import("../src/lib/bank-register-pull.ts");
 
     const result = await fetchBankRegister(getFreshQBTokens, startDate, endDate);
     const rows = result.rows ?? [];
-    const lines = [];
-    let skipped = 0;
-    for (const row of rows) {
-        const line = registerRowToLine(row);
-        if (line) lines.push(line); else skipped++;
-    }
-
-    // A qbTxnId must appear at most once per request — the route's own
-    // duplicate check would 400 the whole batch otherwise. QBO can emit the
-    // same txn twice in a GL when it has multiple account-affecting splits;
-    // those are the SAME observation, so collapse them and sum nothing (the
-    // amounts are per-row and identical rows are true duplicates).
-    const byTxnId = new Map();
-    let collapsed = 0;
-    for (const line of lines) {
-        if (byTxnId.has(line.qbTxnId)) { collapsed++; continue; }
-        byTxnId.set(line.qbTxnId, line);
-    }
-    const unique = [...byTxnId.values()];
+    const { lines: unique, skipped, collapsed } = convertRegisterRows(rows);
 
     console.log(`QBO register ${startDate} → ${endDate}${result.stale ? "  [STALE CACHE]" : ""}`);
     console.log(`  ${rows.length} GL row(s) → ${unique.length} observation(s)  (${skipped} non-txn skipped, ${collapsed} duplicate txn id collapsed)`);

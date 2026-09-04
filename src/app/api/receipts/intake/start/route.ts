@@ -28,7 +28,21 @@ import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
 import { queueObjectCleanup } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
+
+/**
+ * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
+ * #443 gate round 42, finding 1).
+ *
+ * The missing-receipt sweep decides from the evidence it read and holds one
+ * advisory lock across those reads AND its verdicts, so every writer of that
+ * evidence takes the same lock inside its own transaction before writing. A
+ * bare `prisma.*` call is its own implicit transaction and cannot hold an
+ * xact-scoped lock, which is why these wrappers exist. Held for one write only.
+ */
+const evidenceCreate = <T>(args: Prisma.ReceiptIntakeCreateArgs): Promise<T> =>
+    withReceiptEvidenceLock<T>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.create(args) as unknown as Promise<T>);
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -238,7 +252,7 @@ export async function POST(req: Request) {
 
     let created: { id: string; sourceRef: string; state: string };
     try {
-        created = await prisma.receiptIntake.create({
+        created = await evidenceCreate({
             data: {
                 id,
                 source: decided.source,
@@ -794,6 +808,12 @@ async function repathWithCleanup(
 ): Promise<"moved" | "conflict" | "unavailable"> {
     try {
         return await prisma.$transaction(async tx => {
+            // FIRST statement of the transaction, as the evidence lock requires
+            // (round-42 gate, finding 1): a repath is a write the
+            // missing-receipt sweep reads, and it used to go through this
+            // route's own evidenceUpdateMany helper before the two writes were
+            // made atomic here.
+            await lockReceiptEvidence(tx);
             const { count } = await tx.receiptIntake.updateMany({
                 where: { id: existing.id, ...leaseFence(existing) },
                 data,
