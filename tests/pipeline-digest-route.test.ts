@@ -23,6 +23,7 @@ const HEALTH: PipelineHealth = {
     intuit: { status: "ok", indicator: "none" },
     qbo: {
         lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+        purchaseSyncRun: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
         lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
         lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
     },
@@ -35,6 +36,7 @@ const HEALTH: PipelineHealth = {
         unassigned: { status: "ok", count: 0 },
         quarantined: { status: "ok", count: 0 },
     },
+    payLinksPending: { status: "ok", count: 0 },
 };
 
 function handlers(overrides: Partial<PipelineDigestDependencies> = {}) {

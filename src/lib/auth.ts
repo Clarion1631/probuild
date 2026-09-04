@@ -65,9 +65,18 @@ export const authOptions: NextAuthOptions = {
 
                 // Activate user on first sign-in
                 if (existingUser.status === "PENDING") {
-                    await prisma.user.update({
-                        where: { id: existingUser.id },
-                        data: { status: "ACTIVATED" },
+                    // Same payroll write as the two mobile login paths: the
+                    // Gusto roster is "ACTIVATED and HOURLY" or "punched", so
+                    // this line can add somebody to a pay period's file, and
+                    // lockPayrollPeriod hashes that file and freezes it. The
+                    // transaction exists so the advisory lock has a scope --
+                    // outside one it would be released before the update ran.
+                    const { withPayrollUserWrite } = await import("./payroll-period");
+                    await prisma.$transaction(async (tx) => {
+                        const data = { status: "ACTIVATED" };
+                        await withPayrollUserWrite(tx, data, () =>
+                            tx.user.update({ where: { id: existingUser.id }, data })
+                        );
                     });
                     // Just-activated FIELD_CREW (or CJ) joins every "In Progress"
                     // project. Awaited rather than after() — this callback is not a

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { OAuth2Client } from "google-auth-library";
 import { prisma } from "@/lib/prisma";
+import { withPayrollUserWrite } from "@/lib/payroll-period";
 import { signMobileToken } from "@/lib/mobile-auth";
 
 export const dynamic = "force-dynamic";
@@ -68,7 +69,11 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: "AccessDenied" }, { status: 403 });
     }
     if (user.status === "PENDING") {
-        await prisma.user.update({ where: { id: user.id }, data: { status: "ACTIVATED" } });
+        // Same payroll write as the PIN path — see the note there.
+        await prisma.$transaction(async (tx) => {
+            const data = { status: "ACTIVATED" };
+            await withPayrollUserWrite(tx, data, () => tx.user.update({ where: { id: user.id }, data }));
+        });
     }
 
     const token = await signMobileToken(user, "google");

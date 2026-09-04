@@ -299,6 +299,16 @@ const fakeQuickbooks = {
         calls.sendQBPaymentCreateRequest.push({ requestBody, requestId });
         return { paymentId: `qb-payment-${calls.sendQBPaymentCreateRequest.length}`, amount: 0 };
     },
+    // The route creates ONE budget at request entry and threads it through every
+    // QuickBooks call AND the per-credit loop, so the fake module has to provide
+    // these two or the route throws before it reaches any of the behaviour under
+    // test. They are pure clock arithmetic in the real module and are mirrored
+    // exactly here rather than stubbed to "never exhausted" — a fake that
+    // pretended the budget were infinite would silently stop covering the loop's
+    // stop-on-the-wall branch.
+    createRouteDeadline: (budgetMs: number, startedAt: number = Date.now()) => ({ startedAt, budgetMs }),
+    isBudgetExhausted: (deadline: { startedAt: number; budgetMs: number } | undefined, now: number = Date.now()) =>
+        deadline ? deadline.startedAt + deadline.budgetMs - now <= 1_000 : false,
 };
 
 const fakeQuickbooksPayments = {
@@ -2431,4 +2441,38 @@ test("the batch response carries the counts the Bot Health line is built from", 
         credits: 3, applied: 1, proposed: 0, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0,
     });
     assert.equal(body.ok, true, "two credits sent to a human is still a clean batch");
+});
+
+test("the batch stops on the route budget wall and reports the credits it never reached", async () => {
+    seedMilestone({ amount: 100 });
+    seedMilestone({ amount: 300 });
+
+    const realExhausted = fakeQuickbooks.isBudgetExhausted;
+    let checks = 0;
+    // Exhausted from the SECOND credit onward, so the assertions below can tell
+    // "the loop stopped where the budget ran out" apart from "the loop never ran".
+    fakeQuickbooks.isBudgetExhausted = () => ++checks > 1;
+    try {
+        const { body } = await post(bankBatch([
+            { ref: "R-FIRST", amount: 100 },
+            { ref: "R-NEVER-REACHED", amount: 300 },
+        ]));
+        assert.equal(creditResult(body, "R-FIRST").status, "applied");
+
+        const skipped = creditResult(body, "R-NEVER-REACHED");
+        assert.equal(skipped.status, "budget_exhausted", "a credit the batch never got to is reported, not dropped");
+        assert.match(String(skipped.reason), /ran out of its budget/);
+        assert.equal(depositRow("R-NEVER-REACHED"), undefined, "it was skipped BEFORE any row or money write");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 1, "only the first credit reached QuickBooks");
+
+        // The catch-all bucket is what makes this visible: the tally still
+        // partitions the day, and ok goes false so the unattended runner does not
+        // log a half-finished day as a clean one.
+        assert.equal(body.counts.credits, 2);
+        assert.equal(body.counts.applied, 1);
+        assert.equal(body.counts.unresolved, 1);
+        assert.equal(body.ok, false, "a day that did not finish is not a clean day");
+    } finally {
+        fakeQuickbooks.isBudgetExhausted = realExhausted;
+    }
 });

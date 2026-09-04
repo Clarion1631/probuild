@@ -1,5 +1,16 @@
+import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { STAGING_SWEEP_MINUTES } from "./receipt-intake/worker";
+import {
+    PAID_DELETION_UNRESOLVABLE,
+    PAYLINK_MISSING_MARKER,
+    PAYLINK_PENDING_MARKER,
+    payLinkPendingWhere,
+    PENDING_DELETION_MARKER,
+    PENDING_DELETION_SETTLED_MARKER,
+    SETTLED_WITHOUT_QB_PAYMENT,
+    pendingCreateMarkerWhere,
+} from "@/lib/qbo-create-markers";
 
 /**
  * One summary of the receipt/QBO pipeline's health, shared by the on-demand
@@ -25,7 +36,7 @@ export const RECEIPT_STALE_HOURS = 72;
 
 export type ProbeStatus = "ok" | "error";
 /** Why a probe reports "error" — surfaced so a hang is distinguishable from a throw. */
-export type ProbeFailure = "timeout" | "error";
+export type ProbeFailure = "timeout" | "error" | "skipped";
 
 /** Statuspage indicators: "none" | "minor" | "major" | "critical"; "unknown" is ours. */
 export interface IntuitProbe {
@@ -67,8 +78,26 @@ export interface PipelineHealth {
     checkedAt: string;
     intuit: IntuitProbe;
     qbo: {
-        /** Newest Expense row QBO has synced into ProBuild job costs. */
+        /**
+         * Newest Expense row QBO has synced into ProBuild job costs.
+         *
+         * A DATA timestamp, not a heartbeat: it only moves when there is a new
+         * purchase to import, so a quiet week legitimately leaves it old. It is
+         * reported for information and cannot decide whether the sync is alive
+         * — that is `purchaseSyncRun` below.
+         */
         lastPurchaseSync: TimestampProbe;
+        /**
+         * Newest SUCCESSFUL purchase-sync run triggered by the scheduled CRON —
+         * the job-cost rail's own pulse, and the thing this file was missing.
+         * Nothing here used to go red when that cron stopped: `lastPurchaseSync`
+         * counted only as a failed PROBE, so a null or month-old timestamp added
+         * no reason at all and the digest read "Pipeline OK" while no purchase
+         * had been imported since. Manual/backfill runs are excluded on purpose,
+         * exactly as they are for the payments heartbeat: they must not be able
+         * to disguise a dead cron.
+         */
+        purchaseSyncRun: TimestampProbe;
         /** Newest receipt the bot actually CREATED (re-pushes don't count). */
         lastReceiptPush: TimestampProbe;
         /**
@@ -129,6 +158,38 @@ export interface PipelineHealth {
          */
         quarantined: CountProbe;
     };
+    /**
+     * Events in the last 24h where QuickBooks refused the CREDENTIAL (401/403,
+     * or a refresh that stranded). Optional so an older snapshot still fits.
+     */
+    qboAuth?: CountProbe;
+    /**
+     * Rows on either money rail that are LINKED to a QuickBooks invoice but
+     * still carry the `paylink-pending` marker — a bill the client has no way
+     * to pay yet.
+     *
+     * The pay-link sweep is supposed to clear these, and it reports its own
+     * `unresolved` count; but a maintenance run that never happened reports
+     * nothing at all, and that silence used to read as health. This is the
+     * standing measurement, taken here, that does not depend on any sweep
+     * having run.
+     */
+    payLinksPending: CountProbe;
+    /**
+     * Standing money-path queues only a human can clear.
+     *
+     * Optional so a caller that predates them (an older cached snapshot, a
+     * fixture) still typechecks; the verdict treats an absent probe as
+     * unmeasured rather than as zero, which is the honest reading.
+     */
+    /** Pay-link retries exhausted: a collectible invoice with no payable URL. */
+    payLinksMissing?: CountProbe;
+    parkedCreates?: CountProbe;
+    parkedDocumentSyncs?: CountProbe;
+    pendingDeletions?: CountProbe;
+    unreconciledMoney?: CountProbe;
+    /** Last successful maintenance cron; stale means nothing is working those queues. */
+    maintenanceRun?: { status: ProbeStatus; reason?: ProbeFailure; at: string | null };
 }
 
 /** A row this old in a working state has not been picked up, it has jammed. */
@@ -200,12 +261,54 @@ export const RECOVERED_BOOKING_DETAIL = '"attachment":"attached"';
 
 /** The payments cron's per-run audit row (see quickbooks-payments.ts). */
 export const PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
+
+/**
+ * The reason a route records when QuickBooks rejects the CREDENTIAL rather than
+ * the document (401/403, or a refresh that stranded). It needs its own line in
+ * the digest: "automation errors: 3" does not tell anyone to go and reconnect
+ * QuickBooks, and nothing else in this pipeline fixes itself less on its own.
+ */
+export const QBO_AUTH_EVENT_REASON = "qbo-auth";
+/**
+ * EVERY reason string that means "a human has to reconnect QuickBooks".
+ *
+ * The probe used to count the exact string `qbo-auth` and nothing else, so the
+ * reconnect alert only fired for a failure the PREFLIGHT classified. Everything
+ * the token path reports (`classifyPreflightFailure` in quickbooks-payments.ts)
+ * — not connected at all, a refresh whose replacement token could not be
+ * stored, a rotation we cannot resolve, a settings read that failed — is
+ * equally un-self-healing and was silently filed as an ordinary error.
+ *
+ * `qbo-unavailable` is deliberately NOT in this list. It is a real outage
+ * (429/5xx/network) that clears itself, and folding it in would tell Justin to
+ * reconnect QuickBooks every time Intuit had a bad five minutes. The 401/403
+ * leak that used to hide in that bucket is fixed at the source instead — see
+ * `isQboReconnectRequired` in quickbooks.ts.
+ */
+export const QBO_RECONNECT_EVENT_REASONS: readonly string[] = [
+    QBO_AUTH_EVENT_REASON,
+    "quickbooks-not-connected",
+    "token-not-persisted",
+    "token-rotation-ambiguous",
+    "token-fetch-failed",
+];
 /**
  * Only a run tagged "cron" counts as the heartbeat. On-view and manual
  * refreshes write their own source precisely so they cannot stand in for an
  * hourly job that has stopped running.
  */
 export const PAYMENTS_SYNC_CRON_SOURCE = "cron";
+
+/** The `source` the QBO maintenance cron stamps on its own run events. */
+export const QBO_MAINTENANCE_SOURCE = "qbo-maintenance-cron";
+
+/**
+ * Twice the cron cadence (hourly at :45, see vercel.json). One missed run is
+ * a blip; two in a row means the thing that works the repair queues is not
+ * running, and an empty queue because nothing sweeps it looks exactly like an
+ * empty queue because the work is done.
+ */
+export const MAINTENANCE_STALE_MS = 2 * 60 * 60_000;
 /**
  * Run statuses that prove the cron is alive. A "partial" run did execute, so
  * it counts for freshness — and is then flagged separately, immediately.
@@ -220,6 +323,36 @@ export const PAYMENTS_SYNC_HEARTBEAT_STATUSES = ["ok", "partial"];
 export const ATTACHMENT_FAILED_STATUS = "attachment-failed";
 /** The cron runs hourly; 26h leaves room for a couple of missed runs and DST. */
 export const PAYMENTS_SYNC_STALE_HOURS = 26;
+
+/**
+ * The scheduled QBO purchase sync's own audit row.
+ *
+ * `qbo-sync` / source `cron` is what /api/integrations/qbo-expenses/sync logs
+ * on its cron entry point (the manual POST logs `manual`/`backfill`, which are
+ * excluded for the same reason the payments heartbeat excludes on-view runs).
+ */
+export const PURCHASE_SYNC_EVENT_KIND = "qbo-sync";
+export const PURCHASE_SYNC_CRON_SOURCE = "cron";
+/** A "partial" run did execute, so it counts for freshness — then is flagged. */
+export const PURCHASE_SYNC_HEARTBEAT_STATUSES = ["ok", "partial"];
+/**
+ * The cron is scheduled every 4 hours (`30 * /4 * * *` in vercel.json), so 9h
+ * covers two consecutive misses plus a DST shift before it reads as stopped.
+ */
+export const DEFAULT_PURCHASE_SYNC_STALE_HOURS = 9;
+
+/**
+ * The configured staleness window, `QBO_PURCHASE_SYNC_STALE_HOURS`.
+ *
+ * Validated rather than trusted: a blank, zero, negative or non-numeric value
+ * falls back to the default. An env var that silently parsed to `NaN` would
+ * make every comparison below false, which is the fail-OPEN direction — a dead
+ * cron reading green is exactly the defect this heartbeat exists to fix.
+ */
+export function purchaseSyncStaleHours(): number {
+    const raw = Number(process.env.QBO_PURCHASE_SYNC_STALE_HOURS);
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PURCHASE_SYNC_STALE_HOURS;
+}
 
 /**
  * The verdict, split out from the database reads so the rules are testable
@@ -240,6 +373,12 @@ export const PAYMENTS_SYNC_STALE_HOURS = 26;
 export function evaluatePipelineHealth(input: {
     intuit: IntuitProbe;
     lastPurchaseSync: TimestampProbe;
+    /**
+     * REQUIRED, unlike `qboAuth` below. An optional heartbeat is a heartbeat a
+     * caller can forget to take, and "absent" would then read as "fine" — the
+     * precise shape of the bug this field exists to fix.
+     */
+    purchaseSyncRun: TimestampProbe;
     lastReceiptPush: TimestampProbe;
     lastPaymentsSync: TimestampProbe;
     receipts24h: CountsProbe;
@@ -253,12 +392,36 @@ export function evaluatePipelineHealth(input: {
      * ABSENT probe is silent; a probe that ran and found rows is a reason.
      */
     intakeQuarantined?: CountProbe;
+    /** Optional so existing snapshots stay valid; absent means "not measured". */
+    qboAuth?: CountProbe;
+    /**
+     * REQUIRED, for the same reason `purchaseSyncRun` is: an optional count is
+     * one a caller can forget to take, and "absent" would then read as "no
+     * unpaid-link rows" — the false green this probe exists to remove.
+     */
+    payLinksPending: CountProbe;
+    /**
+     * Standing money-path queues only a human can clear.
+     *
+     * Optional so a caller that predates them (an older cached snapshot, a
+     * fixture) still typechecks; the verdict treats an absent probe as
+     * unmeasured rather than as zero, which is the honest reading.
+     */
+    /** Pay-link retries exhausted: a collectible invoice with no payable URL. */
+    payLinksMissing?: CountProbe;
+    parkedCreates?: CountProbe;
+    parkedDocumentSyncs?: CountProbe;
+    pendingDeletions?: CountProbe;
+    unreconciledMoney?: CountProbe;
+    /** Last successful maintenance cron; stale means nothing is working those queues. */
+    maintenanceRun?: { status: ProbeStatus; reason?: ProbeFailure; at: string | null };
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
 
     const namedProbes: Array<[string, { status: ProbeStatus }]> = [
         ["lastPurchaseSync", input.lastPurchaseSync],
+        ["purchaseSyncRun", input.purchaseSyncRun],
         ["lastReceiptPush", input.lastReceiptPush],
         ["lastPaymentsSync", input.lastPaymentsSync],
         ["receipts24h", input.receipts24h],
@@ -268,6 +431,7 @@ export function evaluatePipelineHealth(input: {
         ["intakeNeedsReview", input.intakeNeedsReview],
         ["intakeUnassigned", input.intakeUnassigned],
         ...(input.intakeQuarantined ? [["intakeQuarantined", input.intakeQuarantined] as [string, { status: ProbeStatus }]] : []),
+        ["payLinksPending", input.payLinksPending],
     ];
     for (const [name, probe] of namedProbes) {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
@@ -280,6 +444,51 @@ export function evaluatePipelineHealth(input: {
         reasons.push("intuit-status-unreachable");
     } else if (input.intuit.indicator !== "none") {
         reasons.push(`intuit-${input.intuit.indicator}`);
+    }
+
+    if (input.qboAuth && input.qboAuth.status === "error") {
+        reasons.push("probe-failed:qboAuth");
+    } else if (input.qboAuth && input.qboAuth.count > 0) {
+        // Nothing will book until a human reconnects QuickBooks, so say that
+        // rather than folding it into a generic error count.
+        reasons.push("quickbooks-reconnect-needed");
+    }
+
+    if (input.payLinksPending.status === "ok" && input.payLinksPending.count > 0) {
+        // Linked in QuickBooks, no pay link written. The invoice exists and the
+        // client cannot pay it, and the maintenance sweep reporting ok:true
+        // while one of these sat in front of its cursor is exactly why this is
+        // measured here rather than taken on that sweep's word.
+        reasons.push(`pay-links-pending:${input.payLinksPending.count}`);
+    }
+
+    // Each standing queue, named and counted separately. Folding them into
+    // one number would tell an operator that something is parked without
+    // saying which thing, and they need different actions.
+    const queues: Array<[string, CountProbe | undefined]> = [
+        ["pay-links-missing", input.payLinksMissing],
+        ["parked-creates", input.parkedCreates],
+        ["parked-document-syncs", input.parkedDocumentSyncs],
+        ["pending-deletions", input.pendingDeletions],
+        ["unreconciled-money", input.unreconciledMoney],
+    ];
+    for (const [name, q] of queues) {
+        if (!q) continue;
+        if (q.status === "error") reasons.push(`probe-failed:${name}`);
+        else if (q.count > 0) reasons.push(`${name}:${q.count}`);
+    }
+
+    // The heartbeat for the thing that WORKS those queues. An empty queue
+    // because the sweep is dead looks exactly like an empty queue because
+    // the work is done, and only this tells them apart.
+    if (input.maintenanceRun) {
+        if (input.maintenanceRun.status === "error") reasons.push("probe-failed:maintenanceRun");
+        else {
+            const at = input.maintenanceRun.at ? Date.parse(input.maintenanceRun.at) : null;
+            if (at === null || Number.isNaN(at) || input.now - at > MAINTENANCE_STALE_MS) {
+                reasons.push("qbo-maintenance-stale");
+            }
+        }
     }
 
     if (input.stuck.status === "ok" && input.stuck.count > 0) {
@@ -340,6 +549,30 @@ export function evaluatePipelineHealth(input: {
         else if (input.lastPaymentsSync.runStatus === "partial") reasons.push("payments-sync-partial");
     }
 
+    if (input.purchaseSyncRun.status === "ok") {
+        // The job-cost rail's heartbeat, read exactly like the payments one —
+        // except that "never" gets its own reason. A pipeline whose purchase
+        // sync has NEVER completed a cron run is a different conversation from
+        // one that stopped, and both used to produce nothing at all here.
+        const at = input.purchaseSyncRun.at ? Date.parse(input.purchaseSyncRun.at) : null;
+        if (at === null || Number.isNaN(at)) {
+            reasons.push("purchase-sync-never-ran");
+        } else if (input.now - at > purchaseSyncStaleHours() * HOUR_MS) {
+            reasons.push("purchase-sync-stale");
+        }
+        // Reported alongside the freshness verdict rather than instead of it:
+        // "the last run failed" and "nothing has run in days" are separately
+        // actionable, and a run that failed still says nothing about freshness.
+        if (input.purchaseSyncRun.runStatus === "error") {
+            reasons.push("purchase-sync-error");
+        } else if (input.purchaseSyncRun.runStatus === "partial") {
+            // Ran, but left work undone (attachments it gave up on). It counts
+            // for freshness and is flagged the same day rather than hiding
+            // inside the staleness window.
+            reasons.push("purchase-sync-partial");
+        }
+    }
+
     if (input.lastReceiptPush.status === "ok") {
         const at = input.lastReceiptPush.at ? Date.parse(input.lastReceiptPush.at) : null;
         const stale = at === null || Number.isNaN(at) || input.now - at > RECEIPT_STALE_HOURS * HOUR_MS;
@@ -359,6 +592,143 @@ export interface ProbeResult<T> {
 }
 
 /**
+ * How many probes may hold a database connection at once.
+ *
+ * The pool this shares with the rest of the app is small (a connection limit of 5 in
+ * the Prisma client). Firing every probe at once meant the health check
+ * could take the whole pool for itself — so a slow database turned "report on
+ * the app" into "stall the app". Four at a time still finishes a nine-probe
+ * sweep in three waves.
+ */
+export const PROBE_CONCURRENCY = 4;
+
+/** The database handle a probe is given: a transaction client, not the pool. */
+export type ProbeDb = Prisma.TransactionClient;
+
+/** How a probe gets that handle. Injectable so a test needs no database. */
+export type ProbeRunner = <T>(timeoutMs: number, fn: (db: ProbeDb) => Promise<T>) => Promise<T>;
+
+/** A slot-limited gate. Exported so a test can drive one it can observe. */
+export interface Limiter {
+    /** `null` when the wait timed out: the caller did NOT get a slot. */
+    acquire(timeoutMs?: number): Promise<(() => void) | null>;
+}
+
+/**
+ * How long a probe will wait for a slot before giving up on running at all.
+ *
+ * A wedged database is the case this exists for: the probes ahead now hold
+ * their slots until their queries actually settle, so without a bound the ones
+ * behind would queue until the platform killed the whole request. Reporting a
+ * skipped probe is strictly better than reporting nothing at all.
+ */
+export const PROBE_ACQUIRE_TIMEOUT_MS = 2_000;
+
+export function createLimiter(limit: number): Limiter {
+    let inFlight = 0;
+    const waiting: Array<() => void> = [];
+    const release = () => {
+        // TRANSFER, do not decrement-then-wake.
+        //
+        // Decrementing first opened a window: the woken waiter increments in a
+        // later microtask, so a concurrent acquire() running in between saw
+        // inFlight below the limit, took the slot synchronously, and then BOTH
+        // incremented — the gate ran over its cap. Handing the slot straight to
+        // the next waiter keeps inFlight unchanged, so there is no window at all.
+        const next = waiting.shift();
+        if (next) {
+            next();
+            return;
+        }
+        inFlight--;
+    };
+    return {
+        async acquire(timeoutMs?: number) {
+            if (inFlight >= limit) {
+                // EVERY promise this creates is settled before returning, and the
+                // timer is cleared rather than unref'd.
+                //
+                // The first cut left both halves of the race dangling: the queue
+                // ticket was spliced out but never resolved, and the timeout promise
+                // stayed pending whenever the slot arrived first. Node 20 fails a
+                // test that exits with a promise still pending — and an unref'd
+                // timer means it may simply never fire, so the promise it would have
+                // resolved is unreachable rather than merely late.
+                let settleQueued: (granted: boolean) => void = () => {};
+                const queued = new Promise<boolean>((resolve) => { settleQueued = resolve; });
+                // `handed` records that release() actually TRANSFERRED a slot to us.
+                // The race below can pick the timeout even when the handoff already
+                // happened in the same tick; without this we would walk away from a
+                // slot we own and the gate would leak it permanently.
+                let handed = false;
+                const ticket = () => { handed = true; settleQueued(true); };
+                waiting.push(ticket);
+
+                let timer: ReturnType<typeof setTimeout> | undefined;
+                let settleTimeout: (granted: boolean) => void = () => {};
+                const expiry = new Promise<boolean>((resolve) => {
+                    settleTimeout = resolve;
+                    if (timeoutMs !== undefined) timer = setTimeout(() => resolve(false), timeoutMs);
+                });
+
+                const got = timeoutMs === undefined ? await queued : await Promise.race([queued, expiry]);
+
+                clearTimeout(timer);
+                settleTimeout(got);
+                if (!got && !handed) {
+                    // Drop the ticket, or the next release hands a slot to a waiter
+                    // that has already given up and the gate leaks one permanently.
+                    const at = waiting.indexOf(ticket);
+                    if (at > -1) waiting.splice(at, 1);
+                    settleQueued(false);
+                    return null;
+                }
+                // Reaching here means a slot was TRANSFERRED to us: `inFlight`
+                // already counts it, so incrementing again would double-count.
+            } else {
+                inFlight++;
+            }
+            let released = false;
+            // Idempotent: a double release would let the gate drift open.
+            return () => {
+                if (released) return;
+                released = true;
+                release();
+            };
+        },
+    };
+}
+
+const probeLimiter = createLimiter(PROBE_CONCURRENCY);
+
+/**
+ * The production runner: one short transaction per probe, carrying a
+ * SERVER-SIDE statement timeout.
+ *
+ * `SET LOCAL` scopes the timeout to this transaction, and Postgres itself
+ * cancels the statement when it expires — which is the part the JS race below
+ * cannot do. Losing a `Promise.race` abandons the promise, not the query: the
+ * connection stayed busy until the database finished whatever it was doing, so
+ * every timed-out probe leaked a pool slot for exactly as long as the wedge
+ * lasted. The race is still there as the backstop for a connection that never
+ * even reaches Postgres.
+ */
+export function statementTimeoutRunner(client: typeof prisma = prisma): ProbeRunner {
+    return <T>(timeoutMs: number, fn: (db: ProbeDb) => Promise<T>): Promise<T> => {
+        const ms = Math.max(1, Math.floor(timeoutMs));
+        return client.$transaction(
+            async (tx) => {
+                await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${ms}`);
+                return await fn(tx);
+            },
+            // A hair beyond the statement timeout, so the SERVER is what
+            // cancels and the error the probe reports is the real one.
+            { timeout: ms + 1_000, maxWait: ms + 1_000 },
+        );
+    };
+}
+
+/**
  * Run one probe under a deadline.
  *
  * A throwing query was already handled; a query that never SETTLES was not.
@@ -368,21 +738,55 @@ export interface ProbeResult<T> {
  * with no digest. Anything past the deadline is reported as a failed probe,
  * which forces ok:false the same way a thrown error does.
  *
+ * The deadline is enforced in TWO places on purpose. Postgres cancels the
+ * statement (statementTimeoutRunner), which is what actually frees the
+ * connection; the race here still answers the caller when the database never
+ * responds at all. And the slot is taken BEFORE the timer starts, so a probe
+ * queued behind three others is not marked timed-out for having waited.
+ *
  * Exported for tests: a never-settling fake is the only way to prove this.
  */
 export async function runProbe<T>(
     name: string,
-    run: () => Promise<T>,
+    run: (db: ProbeDb) => Promise<T>,
     onError: T,
     timeoutMs: number = PROBE_TIMEOUT_MS,
+    deps?: { withDb?: ProbeRunner; limiter?: Limiter; acquireTimeoutMs?: number },
 ): Promise<ProbeResult<T>> {
+    const withDb = deps?.withDb ?? statementTimeoutRunner();
+    const limiter = deps?.limiter ?? probeLimiter;
+    const acquireTimeoutMs = deps?.acquireTimeoutMs ?? PROBE_ACQUIRE_TIMEOUT_MS;
     const TIMED_OUT = Symbol("probe-timeout");
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const releaseSlot = await limiter.acquire(acquireTimeoutMs);
+    if (!releaseSlot) {
+        // Every slot is held by a probe whose query has not come back. Starting
+        // anyway is what the cap exists to prevent, and waiting forever turns a
+        // slow database into no answer at all.
+        console.error(`[pipeline-health] probe skipped, limiter saturated: ${name}`);
+        return { status: "error", reason: "skipped", value: onError };
+    }
+    // THE SLOT FOLLOWS THE QUERY, NOT THE RACE.
+    //
+    // Releasing it in a `finally` on the race handed it back the moment the JS
+    // timeout won — while the Prisma operation was still running and still
+    // holding a pool connection. A queued probe then started against a pool that
+    // was already full, so nine probes could pile onto five connections: the cap
+    // was counting callers, not work. The release is attached to the underlying
+    // promise instead, so a timed-out probe answers its caller immediately and
+    // still occupies its slot until the database actually lets go.
+    const work = withDb(timeoutMs, run);
+    void work.then(() => releaseSlot(), () => releaseSlot());
+    // Held so the timer promise can be SETTLED on the way out. Clearing the
+    // timeout alone left it pending forever on every successful probe, which is
+    // exactly the shape Node flags as an unresolved promise at exit.
+    let settleDeadline: (v: typeof TIMED_OUT) => void = () => {};
     try {
         const deadline = new Promise<typeof TIMED_OUT>(resolve => {
+            settleDeadline = resolve;
             timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
         });
-        const result = await Promise.race([run(), deadline]);
+        const result = await Promise.race([work, deadline]);
         if (result === TIMED_OUT) {
             console.error(`[pipeline-health] probe timed out after ${timeoutMs}ms: ${name}`);
             return { status: "error", reason: "timeout", value: onError };
@@ -392,8 +796,11 @@ export async function runProbe<T>(
         console.error(`[pipeline-health] probe failed: ${name}`, error instanceof Error ? error.name : "UnknownError");
         return { status: "error", reason: "error", value: onError };
     } finally {
-        // Never leave a pending timer holding the event loop open.
+        // Never leave a pending timer holding the event loop open, nor a promise
+        // that can never settle. The SLOT is deliberately not released here:
+        // `work` owns it now.
         clearTimeout(timer);
+        settleDeadline(TIMED_OUT);
     }
 }
 
@@ -405,24 +812,55 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     const probe = runProbe;
 
     const [
-        intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck,
+        intuit, lastPurchase, purchaseSyncRun, lastPush, lastPaymentsSync, receiptRows,
+        lastBankLine, stuck,
         intakeStuck, intakeNeedsReview, intakeUnassigned, intakeQuarantined,
+        qboAuth, payLinksPending,
+        payLinksMissing, parkedCreates, parkedDocumentSyncs, pendingDeletions, unreconciledMoney, maintenanceRun,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
         // QBO purchase sync land" timestamp this is asking for.
         probe<Date | null>(
             "lastPurchaseSync",
-            async () =>
-                (await prisma.expense.aggregate({ where: { qbPurchaseId: { not: null } }, _max: { qbSyncedAt: true } }))
+            async (db) =>
+                (await db.expense.aggregate({ where: { qbPurchaseId: { not: null } }, _max: { qbSyncedAt: true } }))
                     ._max.qbSyncedAt ?? null,
             null,
         ),
+        // The purchase-sync CRON's own pulse. Same two-read shape as the
+        // payments heartbeat below: freshness may only come from a run that
+        // actually ran (ok/partial), while the reported run status is the
+        // LATEST cron event whatever it was — otherwise a failure right after a
+        // success is invisible.
+        probe<{ createdAt: Date | null; latestStatus: string | null }>(
+            "purchaseSyncRun",
+            async (db) => {
+                const [fresh, latest] = await Promise.all([
+                    db.automationEvent.findFirst({
+                        where: {
+                            kind: PURCHASE_SYNC_EVENT_KIND,
+                            status: { in: PURCHASE_SYNC_HEARTBEAT_STATUSES },
+                            source: PURCHASE_SYNC_CRON_SOURCE,
+                        },
+                        orderBy: { createdAt: "desc" },
+                        select: { createdAt: true },
+                    }),
+                    db.automationEvent.findFirst({
+                        where: { kind: PURCHASE_SYNC_EVENT_KIND, source: PURCHASE_SYNC_CRON_SOURCE },
+                        orderBy: { createdAt: "desc" },
+                        select: { status: true },
+                    }),
+                ]);
+                return { createdAt: fresh?.createdAt ?? null, latestStatus: latest?.status ?? null };
+            },
+            { createdAt: null, latestStatus: null },
+        ),
         probe<Date | null>(
             "lastReceiptPush",
-            async () =>
+            async (db) =>
                 (
-                    await prisma.automationEvent.findFirst({
+                    await db.automationEvent.findFirst({
                         where: {
                             kind: "receipt-push",
                             OR: [
@@ -441,13 +879,13 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         ),
         probe<{ createdAt: Date | null; latestStatus: string | null }>(
             "lastPaymentsSync",
-            async () => {
+            async (db) => {
                 // TWO reads, deliberately. Freshness may only come from a run
                 // that actually ran (ok/partial), but the reason must reflect
                 // the LATEST event whatever it was — otherwise an error right
                 // after a success is invisible.
                 const [fresh, latest] = await Promise.all([
-                    prisma.automationEvent.findFirst({
+                    db.automationEvent.findFirst({
                         where: {
                             kind: PAYMENTS_SYNC_EVENT_KIND,
                             status: { in: PAYMENTS_SYNC_HEARTBEAT_STATUSES },
@@ -456,7 +894,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                         orderBy: { createdAt: "desc" },
                         select: { createdAt: true },
                     }),
-                    prisma.automationEvent.findFirst({
+                    db.automationEvent.findFirst({
                         where: { kind: PAYMENTS_SYNC_EVENT_KIND, source: PAYMENTS_SYNC_CRON_SOURCE },
                         orderBy: { createdAt: "desc" },
                         select: { status: true },
@@ -468,8 +906,8 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         ),
         probe<Array<{ status: string; _count: { _all: number } }>>(
             "receipts24h",
-            async () => {
-                const rows = await prisma.automationEvent.groupBy({
+            async (db) => {
+                const rows = await db.automationEvent.groupBy({
                     by: ["status"],
                     where: { kind: "receipt-push", createdAt: { gte: since24h } },
                     _count: { _all: true },
@@ -480,22 +918,34 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         ),
         probe<Date | null>(
             "bank",
-            async () => (await prisma.bankLine.aggregate({ _max: { postedDate: true } }))._max.postedDate ?? null,
+            async (db) => (await db.bankLine.aggregate({ _max: { postedDate: true } }))._max.postedDate ?? null,
             null,
         ),
         // ANY kind: a qbo-sync failure is exactly the thing this digest exists
         // to surface, even on a day with no receipt traffic at all.
         probe<number>(
             "stuck",
-            () => prisma.automationEvent.count({
+            (db) => db.automationEvent.count({
                 where: {
-                    // attachment-failed is a TERMINAL failure that leaves a
-                    // booked Purchase with no receipt. It is not literally
-                    // "error", so it used to sail past this count and the digest
-                    // could still read "Pipeline OK" on the strength of one
-                    // other good receipt in the window.
-                    status: { in: ["error", ATTACHMENT_FAILED_STATUS] },
                     createdAt: { gte: since24h },
+                    OR: [
+                        // attachment-failed is a TERMINAL failure that leaves a
+                        // booked Purchase with no receipt. It is not literally
+                        // "error", so it used to sail past this count and the
+                        // digest could still read "Pipeline OK" on the strength
+                        // of one other good receipt in the window.
+                        { status: { in: ["error", ATTACHMENT_FAILED_STATUS] } },
+                        // A "partial" run left work undone, which is a problem
+                        // even though it is not a hard failure. The payments
+                        // sweep and the purchase sync are excluded because each
+                        // reports its own *-sync-partial reason from its latest
+                        // run — counting them here too would say the same thing
+                        // twice.
+                        {
+                            status: "partial",
+                            kind: { notIn: [PAYMENTS_SYNC_EVENT_KIND, PURCHASE_SYNC_EVENT_KIND] },
+                        },
+                    ],
                 },
             }),
             0,
@@ -576,6 +1026,112 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             () => prisma.receiptIntake.count({ where: { state: "SHADOW_QUARANTINE" } }),
             0,
         ),
+        // Separate from `stuck` on purpose: this one names the fix.
+        probe<number>(
+            "qboAuth",
+            (db) => db.automationEvent.count({
+                where: { createdAt: { gte: since24h }, reason: { in: [...QBO_RECONNECT_EVENT_REASONS] } },
+            }),
+            0,
+        ),
+        // Both money rails, one number: a milestone and a progress billing in
+        // this state are the same problem for the client, and splitting them
+        // here would only invite a caller to check one.
+        probe<number>(
+            "payLinksPending",
+            async (db) => {
+                // Attempt-suffixed markers count too: a row on its third retry is
+                // every bit as unpayable as one on its first.
+                const where = { OR: payLinkPendingWhere(), qbInvoiceId: { not: null } };
+                const [milestones, billings] = await Promise.all([
+                    db.paymentSchedule.count({ where }),
+                    db.progressBilling.count({ where }),
+                ]);
+                return milestones + billings;
+            },
+            0,
+        ),
+        // THE STANDING QUEUES. Everything above measures whether something
+        // RAN; none of it measures what is sitting parked. Health could report
+        // green with a client mid-billed on both rails: an unknown-outcome
+        // create, a deletion queued and never confirmed, a milestone paid
+        // outside QuickBooks with its invoice still open. Each is money-path
+        // work that only a human can finish, so each is its own count and each
+        // one alone turns the check non-green.
+        // Retries exhausted: QuickBooks has an invoice with no payable URL and
+        // nothing automatic will fix it. Its own queue, because the action is
+        // different from every other one — somebody has to look at that invoice
+        // in QuickBooks.
+        probe<number>(
+            "payLinksMissing",
+            async (db) => {
+                const where = { qbSyncError: PAYLINK_MISSING_MARKER, qbInvoiceId: { not: null } };
+                const [milestones, billings] = await Promise.all([
+                    db.paymentSchedule.count({ where }),
+                    db.progressBilling.count({ where }),
+                ]);
+                return milestones + billings;
+            },
+            0,
+        ),
+        probe<number>(
+            "parkedCreates",
+            async (db) => {
+                const where = { OR: pendingCreateMarkerWhere() };
+                const [milestones, billings] = await Promise.all([
+                    db.paymentSchedule.count({ where }),
+                    db.progressBilling.count({ where }),
+                ]);
+                return milestones + billings;
+            },
+            0,
+        ),
+        probe<number>(
+            "parkedDocumentSyncs",
+            async (db) => {
+                // EVERY non-null marker, readable or not: an unreadable value is
+                // outstanding work too, and counting only the recognised ones is
+                // exactly the blind spot the maintenance sweep just lost.
+                const [estimates, invoices] = await Promise.all([
+                    db.estimate.count({ where: { qbSyncMarker: { not: null }, qbEstimateId: null } }),
+                    db.invoice.count({ where: { qbSyncMarker: { not: null }, qbInvoiceId: null } }),
+                ]);
+                return estimates + invoices;
+            },
+            0,
+        ),
+        probe<number>(
+            "pendingDeletions",
+            async (db) => db.paymentSchedule.count({
+                where: {
+                    qbSyncError: { in: [PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER] },
+                    qbInvoiceId: { not: null },
+                },
+            }),
+            0,
+        ),
+        probe<number>(
+            "unreconciledMoney",
+            async (db) => db.paymentSchedule.count({
+                where: { qbSyncError: { in: [PAID_DELETION_UNRESOLVABLE, SETTLED_WITHOUT_QB_PAYMENT] } },
+            }),
+            0,
+        ),
+        // ...and whether the thing that WORKS those queues is still running.
+        // A queue that is empty because nothing is sweeping it looks identical
+        // to one that is empty because the work is done.
+        probe<Date | null>(
+            "maintenanceRun",
+            async (db) =>
+                (
+                    await db.automationEvent.findFirst({
+                        where: { kind: PAYMENTS_SYNC_EVENT_KIND, source: QBO_MAINTENANCE_SOURCE, status: "ok" },
+                        orderBy: { createdAt: "desc" },
+                        select: { createdAt: true },
+                    })
+                )?.createdAt ?? null,
+            null,
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -587,6 +1143,12 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             status: lastPurchase.status,
             reason: lastPurchase.reason,
             at: lastPurchase.value?.toISOString() ?? null,
+        },
+        purchaseSyncRun: {
+            status: purchaseSyncRun.status,
+            reason: purchaseSyncRun.reason,
+            at: purchaseSyncRun.value.createdAt?.toISOString() ?? null,
+            runStatus: purchaseSyncRun.value.latestStatus,
         },
         lastReceiptPush: {
             status: lastPush.status,
@@ -622,6 +1184,14 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             reason: intakeQuarantined.reason,
             count: intakeQuarantined.value,
         },
+        qboAuth: { status: qboAuth.status, reason: qboAuth.reason, count: qboAuth.value },
+        payLinksPending: { status: payLinksPending.status, reason: payLinksPending.reason, count: payLinksPending.value },
+        payLinksMissing: { status: payLinksMissing.status, reason: payLinksMissing.reason, count: payLinksMissing.value },
+        parkedCreates: { status: parkedCreates.status, reason: parkedCreates.reason, count: parkedCreates.value },
+        parkedDocumentSyncs: { status: parkedDocumentSyncs.status, reason: parkedDocumentSyncs.reason, count: parkedDocumentSyncs.value },
+        pendingDeletions: { status: pendingDeletions.status, reason: pendingDeletions.reason, count: pendingDeletions.value },
+        unreconciledMoney: { status: unreconciledMoney.status, reason: unreconciledMoney.reason, count: unreconciledMoney.value },
+        maintenanceRun: { status: maintenanceRun.status, reason: maintenanceRun.reason, at: maintenanceRun.value?.toISOString() ?? null },
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });
@@ -632,6 +1202,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         intuit: snapshot.intuit,
         qbo: {
             lastPurchaseSync: snapshot.lastPurchaseSync,
+            purchaseSyncRun: snapshot.purchaseSyncRun,
             lastReceiptPush: snapshot.lastReceiptPush,
             lastPaymentsSync: snapshot.lastPaymentsSync,
         },
@@ -644,6 +1215,14 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             unassigned: snapshot.intakeUnassigned,
             quarantined: snapshot.intakeQuarantined,
         },
+        qboAuth: snapshot.qboAuth,
+        payLinksPending: snapshot.payLinksPending,
+        payLinksMissing: snapshot.payLinksMissing,
+        parkedCreates: snapshot.parkedCreates,
+        parkedDocumentSyncs: snapshot.parkedDocumentSyncs,
+        pendingDeletions: snapshot.pendingDeletions,
+        unreconciledMoney: snapshot.unreconciledMoney,
+        maintenanceRun: snapshot.maintenanceRun,
     };
 }
 
@@ -676,7 +1255,17 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         subject,
         `Checked: ${health.checkedAt}`,
         `Intuit status: ${health.intuit.indicator}${health.intuit.description ? ` (${health.intuit.description})` : ""}${health.intuit.status === "error" ? " [status page unreachable]" : ""}`,
-        `Last QBO purchase sync: ${ago(health.qbo.lastPurchaseSync, now)}`,
+        `Last QBO purchase booked: ${ago(health.qbo.lastPurchaseSync, now)}`,
+        // Surfaced exactly like the payments heartbeat below, and separately
+        // from the data timestamp above: "nothing new to import" and "the job
+        // that imports it has stopped" look identical on that line alone.
+        `Last purchase sync run: ${ago(health.qbo.purchaseSyncRun, now)}${
+            health.qbo.purchaseSyncRun.runStatus === "partial"
+                ? " [incomplete run]"
+                : health.qbo.purchaseSyncRun.runStatus === "error"
+                    ? " [last run FAILED]"
+                    : ""
+        }`,
         `Last receipt booked: ${ago(health.qbo.lastReceiptPush, now)}`,
         `Last payments sync: ${ago(health.qbo.lastPaymentsSync, now)}${
             health.qbo.lastPaymentsSync.runStatus === "partial"
@@ -713,6 +1302,15 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
             health.intake?.quarantined?.status === "error" ? "unavailable (probe failed)" : health.intake?.quarantined?.count ?? "unavailable"
         }`,
     ];
+    if (health.payLinksMissing?.status === "ok" && health.payLinksMissing.count > 0) {
+        lines.push(`${health.payLinksMissing.count} QuickBooks invoice(s) have NO payable link after repeated retries — open them in QuickBooks and enable payments by hand.`);
+    }
+    if (health.payLinksPending?.status === "ok" && health.payLinksPending.count > 0) {
+        lines.push(`${health.payLinksPending.count} QuickBooks invoice(s) are linked but still have no pay link — run QBO maintenance (sync-payment-options).`);
+    }
+    if (health.qboAuth && health.qboAuth.status === "ok" && health.qboAuth.count > 0) {
+        lines.push(`QuickBooks could not be used with the stored credential ${health.qboAuth.count} time(s) in 24h — reconnect it in Settings → Integrations.`);
+    }
     if (health.reasons.length > 0) lines.push(`Needs attention: ${health.reasons.join(", ")}`);
 
     return { subject, text: lines.join("\n") };

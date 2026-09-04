@@ -30,9 +30,59 @@
  *     are created without relying on Intuit's own invoice-email flow).
  */
 import { prisma } from "@/lib/prisma";
-import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { withTxRetry, lockMoneyParents, lockClientRow, lockProjectRow } from "./tx-retry";
 import { toNum } from "./prisma-helpers";
-import type { ProgressBilling, ProgressBillingLine } from "@prisma/client";
+import type { Prisma, ProgressBilling, ProgressBillingLine } from "@prisma/client";
+import { createRouteDeadline, remainingBudgetMs, QB_DOC_NUMBER_MAX_LEN, canonicalPrivateNote, qboTxnDate, type RouteDeadline, type QBTokens, type RemoteDocumentFacts } from "./quickbooks";
+import { documentMatchesClaim } from "./qbo-document-sync";
+import {
+    compensateAndUnlink,
+    compensationWindowMs,
+    isAmbiguousCreateFailure,
+    QBAmbiguousCreateError,
+    MILESTONE_PUSH_ROUTE_BUDGET_MS,
+    MILESTONE_CLEANUP_BUDGET_MS,
+} from "./quickbooks-payments";
+import {
+    composeCreateMarker,
+    isBlockedByAmbiguousCreate,
+    isQboInvoiceLinkedOrPending,
+    AMBIGUOUS_CREATE_MARKER,
+    CREATE_IN_FLIGHT_MARKER,
+    PAYLINK_PENDING_MARKER,
+    nextPayLinkState,
+    QBResolveRequiredError,
+    type CreateIdentity,
+} from "./qbo-create-markers";
+import { progressBillingIssuanceHash } from "./qbo-issuance";
+import { logAutomationEvent } from "./automation-events";
+
+/**
+ * THE one judgement on a freshly-created QuickBooks invoice, and it is the same
+ * one the ambiguous-create resolver and the document-sync recovery make about a
+ * candidate they find by DocNumber.
+ *
+ * Two predicates was the bug (Codex round 49): this rail compared grand totals
+ * only, at a FIVE-cent tolerance and with no look at the tax at all, while the
+ * resolver compared total AND `TxnTaxDetail.TotalTax` at half a cent. The
+ * identical QuickBooks response was therefore accepted here and refused there,
+ * so whether a document was accepted turned on nothing but whether the first
+ * HTTP response arrived.
+ *
+ * `null` means accept. A string is the refusal, written for the operator.
+ */
+function createdInvoiceRefusal(
+    document: RemoteDocumentFacts | null,
+    identity: CreateIdentity,
+): string | null {
+    // A 200 that described no invoice. `createQBMilestoneInvoice` already
+    // refuses that shape, so reaching here with it means the create is
+    // unverifiable, and an unverifiable create must never become a staged,
+    // collectible invoice.
+    if (!document) return "QuickBooks did not describe the invoice it created";
+    const verdict = documentMatchesClaim(document, identity);
+    return verdict.ok ? null : verdict.reason;
+}
 
 // Cent-round helper shared by every money computation below. EPSILON nudges
 // values like 1.005 (which float as 1.00499999999...) up to the cent they were
@@ -161,6 +211,13 @@ export async function createProgressBillingCore(
                 }
                 if (schedule.qbInvoiceId) {
                     throw new Error(`"${schedule.name}" already has a QuickBooks invoice staged — break the QuickBooks link first, then bill it here.`);
+                }
+                // A parked milestone has qbInvoiceId === null and may STILL have a
+                // real invoice in QuickBooks. Billing it into a progress invoice
+                // would leave the client holding two collectible invoices for the
+                // same money — the exact failure the marker exists to prevent.
+                if (isQboInvoiceLinkedOrPending(schedule)) {
+                    throw new QBResolveRequiredError(schedule.name);
                 }
                 if (schedule.stripeSessionId || schedule.stripePaymentIntentId) {
                     throw new Error(`A payment is in progress on "${schedule.name}" — wait for it to finish or void it before billing.`);
@@ -326,6 +383,14 @@ export async function createProgressBillingCore(
                     id: schedule.id,
                     status: "Pending",
                     qbInvoiceId: null,
+                    // The id being null is not enough: a create that started
+                    // between validation and here leaves the id null and the
+                    // marker set, and that row may already be billed in QBO.
+                    // Pinning the EXACT value read under the lock covers that
+                    // without a NULL-unsafe NOT IN, and now that markers carry a
+                    // per-issuance identity suffix there is no fixed list to
+                    // match against anyway.
+                    qbSyncError: schedule.qbSyncError,
                     stripeSessionId: null,
                     stripePaymentIntentId: null,
                     amount: schedule.amount,
@@ -509,6 +574,27 @@ export type UpdateProgressBillingInput = {
  * one without the other desynchronizes what QuickBooks charges from what
  * settlement credits. Delete and rebuild the Draft instead.
  */
+/**
+ * The billing moved between the guard read and the write.
+ *
+ * Its own type so callers can answer 409 rather than 500: nothing is wrong,
+ * two people (or a person and the stage path) simply touched one row at once,
+ * and the caller should re-read and decide again.
+ */
+export class ProgressBillingChangedError extends Error {
+    name = "ProgressBillingChangedError";
+    /** Read by callers as an HTTP status. */
+    readonly status = 409;
+    constructor(code: string) {
+        super(`${code} changed while you were editing it — refresh and try again.`);
+    }
+}
+
+/** Name-based: the Node 20 tsx loader can hand a caller a second copy of this module. */
+export function isProgressBillingChangedError(error: unknown): boolean {
+    return error instanceof Error && error.name === "ProgressBillingChangedError";
+}
+
 export async function updateProgressBillingCore(
     billingId: string,
     input: UpdateProgressBillingInput,
@@ -520,6 +606,13 @@ export async function updateProgressBillingCore(
 
         const billing = await tx.progressBilling.findUnique({ where: { id: billingId } });
         if (!billing) throw new Error("Progress billing not found");
+        // A parked row LOOKS editable — Draft, no qbInvoiceId — but a real,
+        // collectible QuickBooks invoice may exist for it. Editing it (even just
+        // the description) while that is unresolved risks the row later linking
+        // to an invoice whose content no longer matches what was actually billed.
+        if (isBlockedByAmbiguousCreate(billing)) {
+            throw new QBResolveRequiredError(billing.code);
+        }
         if (billing.status !== "Draft" || billing.qbInvoiceId) {
             throw new Error(`This billing is "${billing.status}"${billing.qbInvoiceId ? " and has a QuickBooks invoice staged" : ""} — only Draft billings without a staged QuickBooks invoice can be edited`);
         }
@@ -540,10 +633,27 @@ export async function updateProgressBillingCore(
             );
         }
 
-        await tx.progressBilling.update({
-            where: { id: billingId },
+        // CAS, not an update-by-id — the same shape deleteProgressBillingCore
+        // uses, and for the same reason. The guards above ran against a read;
+        // the stage path writes its `create-in-flight` claim with a bare
+        // `updateMany` from OUTSIDE this transaction, so `lockMoneyParents`
+        // does not serialise against it. A stage that lands its claim in the
+        // window between the read and the write here would otherwise get an
+        // unconditional edit anyway: the description changes while a create for
+        // the OLD description may already be landing at QuickBooks, and the row
+        // is then a candidate to adopt an invoice it no longer matches.
+        //
+        // Re-asserting all three predicates makes the edit lose that race
+        // instead of winning it silently. (The issuance hash carries
+        // `description` for the same reason — see qbo-issuance.ts — so even a
+        // write that somehow got through could not be adopted by the resolver.)
+        const edited = await tx.progressBilling.updateMany({
+            where: { id: billingId, status: "Draft", qbInvoiceId: null, qbSyncError: null },
             data: { description },
         });
+        if (edited.count !== 1) {
+            throw new ProgressBillingChangedError(billing.code);
+        }
 
         const withLines = await tx.progressBilling.findUnique({
             where: { id: billingId },
@@ -579,14 +689,324 @@ export async function deleteProgressBillingCore(
 
         const billing = await tx.progressBilling.findUnique({ where: { id: billingId } });
         if (!billing) throw new Error("Progress billing not found");
+        // A parked row LOOKS deletable — Draft, no qbInvoiceId — but a real,
+        // collectible QuickBooks invoice may exist for it. Deleting the draft
+        // would abandon that invoice with nothing in ProBuild pointing at it.
+        if (isBlockedByAmbiguousCreate(billing)) {
+            throw new QBResolveRequiredError(billing.code);
+        }
         if (billing.status !== "Draft" || billing.qbInvoiceId) {
             throw new Error(`This billing is "${billing.status}"${billing.qbInvoiceId ? " and has a QuickBooks invoice staged" : ""} — only Draft billings without a staged QuickBooks invoice can be deleted`);
         }
 
-        await tx.progressBilling.delete({ where: { id: billingId } }); // cascades to ProgressBillingLine only
+        // Re-assert the deletable state IN the delete itself, not just at the
+        // read above. The stage path's in-flight claim (stageProgressBillingToQuickBooksCore)
+        // writes its `qbSyncError` CAS with a bare `updateMany` outside this
+        // transaction — `lockMoneyParents` above does not serialize against it.
+        // A stage that lands its claim in the gap between the read and the
+        // delete would otherwise get an unconditional delete-by-id anyway,
+        // wiping the row (and its in-flight claim) out from under a create that
+        // may already be landing at QuickBooks, leaving a real invoice with
+        // nothing in ProBuild pointing at it. `deleteMany` with the same
+        // predicates makes this a CAS: it deletes only if nothing changed.
+        const deleted = await tx.progressBilling.deleteMany({
+            where: { id: billingId, status: "Draft", qbInvoiceId: null, qbSyncError: null },
+        }); // cascades to ProgressBillingLine only
+        if (deleted.count !== 1) {
+            throw new Error("This billing changed while being deleted — refresh and try again.");
+        }
 
         return { success: true as const, invoiceId: link.invoiceId, projectId: link.invoice.projectId };
     }));
+}
+
+/**
+ * The PrivateNote every staged progress-billing invoice carries in QuickBooks.
+ *
+ * ONE definition, used by the stage path that writes it and by the ambiguous-
+ * create resolver that has to recognise our invoice among whatever else shares
+ * a DocNumber. Two copies of this string would let the resolver quietly stop
+ * matching the invoices we actually create.
+ */
+export function progressBillingPrivateNote(invoiceCode: string, billingCode: string): string {
+    return `ProBuild ${invoiceCode} · ${billingCode}`;
+}
+
+/**
+ * The QBO calls staging makes. Injectable so a test can drive the REAL function
+ * (the in-flight claim, the pre-pay-link link write, the compensation window)
+ * against a fake QuickBooks instead of re-implementing those decisions.
+ */
+export interface ProgressBillingStageQbo {
+    getTokens(deadline: RouteDeadline): Promise<QBTokens>;
+    resolveCustomerAndItem(tokens: QBTokens, clientId: string, deadline: RouteDeadline): Promise<{ customerId: string; itemId: string }>;
+    createInvoice(
+        tokens: QBTokens,
+        input: {
+            docNumber: string;
+            customerId: string;
+            itemId: string;
+            description: string;
+            amount: number;
+            tax: { preTaxAmount: number; taxAmount: number } | null;
+            billEmail: string | null;
+            privateNote: string;
+            /**
+             * The accounting date, fixed at CLAIM time and recorded in the
+             * marker. Passed explicitly so the payload and the identity cannot
+             * disagree about which period this books to.
+             */
+            txnDate: string;
+        },
+        deadline: RouteDeadline,
+        // Returns the WHOLE created document, not just its total: the stage
+        // judges it with `documentMatchesClaim`, the same predicate a recovery
+        // applies to a candidate it finds by DocNumber. A seam that reported
+        // only a total could not express the case that predicate exists for --
+        // a matching grand total hiding a different pre-tax/tax split.
+    ): Promise<{ qbId: string; total: number; document: RemoteDocumentFacts | null }>;
+    getPaymentLink(tokens: QBTokens, qbInvoiceId: string, deadline: RouteDeadline): Promise<string | null>;
+    deleteInvoice(tokens: QBTokens, qbInvoiceId: string, deadline: RouteDeadline): Promise<boolean>;
+}
+
+/** The ProgressBilling reads/writes staging makes; the test seam's other half. */
+export interface ProgressBillingStageDb {
+    findUnique(args: any): Promise<any>;
+    updateMany(args: any): Promise<{ count: number }>;
+}
+
+/** What the final link decision settled on. */
+export type ProgressBillingLinkVerdict =
+    /** The link is written; the billing is Staged. */
+    | { outcome: "linked" }
+    /** The CAS lost: the row moved (or somebody else linked it first). */
+    | { outcome: "lost" }
+    /**
+     * The money state this invoice was ISSUED from no longer describes the
+     * billing — the client was repointed at another QuickBooks customer, or a
+     * field the hash covers moved. Compensates, like `lost`, but says so.
+     */
+    | { outcome: "mismatch"; detail: string };
+
+export interface ProgressBillingLinkArgs {
+    billingId: string;
+    invoiceId: string;
+    clientId: string;
+    qbId: string;
+    inFlightMarker: string;
+    /** The hash the marker carries — recomputed under the locks and compared. */
+    issuanceHash: string;
+    /** The content snapshot the QuickBooks invoice was created from. */
+    /** Money as Prisma hands it back, so it can be pinned in a WHERE unchanged. */
+    pinned: {
+        subtotal: Prisma.Decimal | number;
+        total: Prisma.Decimal | number;
+        taxAmount: Prisma.Decimal | number;
+        description: string;
+    };
+}
+
+export interface ProgressBillingStageDeps {
+    db?: ProgressBillingStageDb;
+    qbo?: ProgressBillingStageQbo;
+    logEvent?: typeof logAutomationEvent;
+    /**
+     * The final link decision. The default takes the money locks
+     * (Estimate → Invoice → Client), re-reads the customer mapping under them,
+     * refuses on any issuance divergence, and only then runs the CAS.
+     *
+     * Injectable so the in-memory stage tests can drive the SAME decision
+     * against a fake table; when a test supplies `db` and not this, the
+     * fallback runs the identical revalidation through that fake, so the two
+     * differ only in whether real row locks are taken.
+     */
+    finalizeLink?: (args: ProgressBillingLinkArgs) => Promise<ProgressBillingLinkVerdict>;
+}
+
+/**
+ * The issuance hash of a billing AS IT STANDS NOW.
+ *
+ * One definition, used by both finalizers below, so the locked path and the
+ * in-memory path cannot disagree about what "unchanged" means.
+ */
+function currentBillingIssuanceHash(row: {
+    status?: string | null;
+    subtotal: unknown;
+    total: unknown;
+    taxAmount: unknown;
+    description?: string | null;
+    qbCustomerId: string | null;
+}): string {
+    return progressBillingIssuanceHash({
+        // The literal the CAS itself requires — same reasoning as the identity
+        // above: this asks whether the PAYLOAD state moved, not whether the
+        // status did (the CAS answers that, and answers it first).
+        status: "Draft",
+        subtotal: row.subtotal,
+        total: row.total,
+        taxAmount: row.taxAmount,
+        description: row.description ?? null,
+        customerId: row.qbCustomerId,
+    });
+}
+
+/**
+ * The real link decision: money locks, re-read, issuance guard, CAS — all in ONE
+ * transaction, so nothing can commit between the check and the write.
+ *
+ * The write used to be a bare `updateMany` outside any transaction. It pinned
+ * the billing's own columns, which is enough to catch an edit to THIS row, and
+ * nothing else: the QuickBooks customer lives on Client and is not pinned by
+ * anything, so a client repointed at another customer between the create and
+ * the link left every predicate matching while the invoice sitting in
+ * QuickBooks billed somebody else.
+ */
+export async function finalizeProgressBillingLinkUnderLock(args: ProgressBillingLinkArgs): Promise<ProgressBillingLinkVerdict> {
+    return withTxRetry(() => prisma.$transaction(async (tx): Promise<ProgressBillingLinkVerdict> => {
+        // Project → Estimate → Invoice → Client (tx-retry.ts). Round 46: this used
+        // to lock `args.clientId`, a value the caller read before the transaction
+        // opened, and then read the real customer through `invoice.client`, a
+        // relation that takes no lock at all. A client re-pointed on the invoice
+        // in between left the locked row and the read row as two different
+        // clients.
+        //
+        // PEEK first, lock-free, so the PROJECT can be locked before the
+        // Invoice — the order every attribution writer takes
+        // (`lockAttributionParents`). Nothing here trusts the peek: the same
+        // scalars are re-read under the locks below and any movement refuses.
+        const peek = await tx.invoice.findUnique({
+            where: { id: args.invoiceId },
+            select: { projectId: true, clientId: true },
+        });
+        if (!peek?.clientId) return { outcome: "mismatch", detail: "its invoice no longer has a client" };
+        if (peek.projectId) await lockProjectRow(tx, peek.projectId);
+        await lockMoneyParents(tx, { invoiceId: args.invoiceId });
+        // FOR SHARE on the Client: this only reads the mapping, but it must not
+        // straddle the FOR UPDATE remap in resolveCustomerAndItem.
+        await lockClientRow(tx, peek.clientId, "share");
+        const parent = await tx.invoice.findUnique({
+            where: { id: args.invoiceId },
+            // The SCALARS, re-read under the locks.
+            select: { projectId: true, clientId: true },
+        });
+        if (!parent?.clientId) return { outcome: "mismatch", detail: "its invoice no longer has a client" };
+        if (parent.projectId !== peek.projectId) {
+            return { outcome: "mismatch", detail: "its invoice moved to a different project while this was being prepared" };
+        }
+        if (parent.clientId !== peek.clientId || parent.clientId !== args.clientId) {
+            return {
+                outcome: "mismatch",
+                detail: "its invoice now bills a different client than the one this create was prepared for",
+            };
+        }
+        const current = await tx.progressBilling.findUnique({
+            where: { id: args.billingId },
+            select: {
+                status: true, subtotal: true, total: true, taxAmount: true, description: true,
+                invoiceId: true,
+            },
+        });
+        if (!current) return { outcome: "mismatch", detail: "the billing no longer exists" };
+        // And it still hangs off the invoice whose client was just locked. A
+        // billing moved to another invoice would otherwise be judged against a
+        // customer that is no longer its own.
+        if (current.invoiceId !== args.invoiceId) {
+            return { outcome: "mismatch", detail: "it now belongs to a different invoice" };
+        }
+        // Read from the LOCKED client row, not through the billing's relations.
+        const client = await tx.client.findUnique({
+            where: { id: parent.clientId },
+            select: { qbCustomerId: true },
+        });
+        const hashNow = currentBillingIssuanceHash({
+            ...current,
+            qbCustomerId: client?.qbCustomerId ?? null,
+        });
+        if (hashNow !== args.issuanceHash) {
+            return {
+                outcome: "mismatch",
+                detail: "the QuickBooks customer or the amounts behind it changed while it was being created",
+            };
+        }
+        const claimed = await tx.progressBilling.updateMany({
+            where: progressBillingLinkWhere(args),
+            // PAYLINK_PENDING_MARKER, not null: the pay-link fetch is still to
+            // come, and if it fails this marker is the only thing that tells
+            // sweepPendingPayLinks there is a linked row left to finish.
+            data: { status: "Staged", qbInvoiceId: args.qbId, qbSyncedAt: new Date(), qbSyncError: PAYLINK_PENDING_MARKER },
+        });
+        return claimed.count === 1 ? { outcome: "linked" } : { outcome: "lost" };
+    }));
+}
+
+/**
+ * The same decision against an injected table. No row locks (there is no
+ * database), but the identical re-read, guard and CAS — so the in-memory tests
+ * exercise the real rule rather than a simplified stand-in.
+ */
+function finalizeProgressBillingLinkWithDb(db: ProgressBillingStageDb) {
+    return async (args: ProgressBillingLinkArgs): Promise<ProgressBillingLinkVerdict> => {
+        const current = await db.findUnique({ where: { id: args.billingId } });
+        if (!current) return { outcome: "mismatch", detail: "the billing no longer exists" };
+        const hashNow = currentBillingIssuanceHash({
+            ...current,
+            qbCustomerId: current.invoice?.client?.qbCustomerId ?? null,
+        });
+        if (hashNow !== args.issuanceHash) {
+            return {
+                outcome: "mismatch",
+                detail: "the QuickBooks customer or the amounts behind it changed while it was being created",
+            };
+        }
+        const claimed = await db.updateMany({
+            where: progressBillingLinkWhere(args),
+            // PAYLINK_PENDING_MARKER, not null: the pay-link fetch is still to
+            // come, and if it fails this marker is the only thing that tells
+            // sweepPendingPayLinks there is a linked row left to finish.
+            data: { status: "Staged", qbInvoiceId: args.qbId, qbSyncedAt: new Date(), qbSyncError: PAYLINK_PENDING_MARKER },
+        });
+        return claimed.count === 1 ? { outcome: "linked" } : { outcome: "lost" };
+    };
+}
+
+/**
+ * The CAS predicate, in one place so both finalizers pin the same thing.
+ *
+ * `taxAmount` is here alongside subtotal and total: the payload tax line is
+ * `{ preTaxAmount: subtotal, taxAmount }`, so a tax-only change re-issues a
+ * different invoice while leaving subtotal and total untouched — it was the one
+ * money column the pin had been missing.
+ */
+function progressBillingLinkWhere(args: ProgressBillingLinkArgs) {
+    return {
+        id: args.billingId,
+        status: "Draft",
+        qbInvoiceId: null,
+        // Prove we still own the claim before writing the link — without this, a
+        // row whose marker moved on for an unrelated reason (compensated,
+        // resolved by an admin, reclaimed by a retry) but still happened to read
+        // Draft/unlinked/unchanged could get THIS invoice attached to it.
+        qbSyncError: args.inFlightMarker,
+        subtotal: args.pinned.subtotal,
+        total: args.pinned.total,
+        taxAmount: args.pinned.taxAmount,
+        description: args.pinned.description,
+    };
+}
+
+async function defaultStageQbo(): Promise<ProgressBillingStageQbo> {
+    const { getFreshQBTokens, resolveCustomerAndItem } = await import("./quickbooks-payments");
+    const { createQBMilestoneInvoice, getQBInvoicePaymentLink, deleteQBInvoice } = await import("./quickbooks");
+    return {
+        getTokens: (deadline) => getFreshQBTokens(deadline),
+        resolveCustomerAndItem: (tokens, clientId, deadline) => resolveCustomerAndItem(tokens, clientId, deadline),
+        createInvoice: async (tokens, input, deadline) => {
+            const created = await createQBMilestoneInvoice(tokens, input, deadline);
+            return { qbId: created.qbId, total: created.total, document: created.document };
+        },
+        getPaymentLink: (tokens, qbInvoiceId, deadline) => getQBInvoicePaymentLink(tokens, qbInvoiceId, deadline),
+        deleteInvoice: (tokens, qbInvoiceId, deadline) => deleteQBInvoice(tokens, qbInvoiceId, deadline),
+    };
 }
 
 /**
@@ -596,17 +1016,34 @@ export async function deleteProgressBillingCore(
  * explicit "send" action on top of this, same split as the milestone rail
  * (pushMilestoneToQuickBooks stages; sendMilestoneInvoicesCore sends).
  *
- * Compensation: EVERYTHING after createQBMilestoneInvoice (the pay-link
- * fetch, the conditional link claim, and the claim's own error) runs inside
- * one try/catch. Any failure in that block attempts to delete the
- * just-created QBO invoice so it never sits orphaned and unreferenced in
- * QuickBooks; if the delete also fails, the error names the doc number + QBO
- * id so it can be removed by hand.
+ * Duplicate-bill safety, identical to the milestone rail:
+ *   1. The row is CAS-claimed `qbSyncError: null -> create-in-flight` BEFORE the
+ *      POST goes out. Losing that CAS refuses the stage; failing to WRITE it
+ *      aborts, because an unwritten marker is exactly the invisible-crash case
+ *      it guards.
+ *   2. A definitive refusal (4xx) releases the claim — QuickBooks created
+ *      nothing. An unknown outcome promotes it to `ambiguous-create` and the
+ *      next stage refuses until a human resolves it.
+ *   3. The returned QBO id is persisted BEFORE the pay-link fetch, so a timeout
+ *      on that second remote call can never abandon a real invoice. The row is
+ *      left `paylink-pending` for the maintenance sweep to finish.
+ *
+ * Compensation: bounded, and only in the window where the row is NOT yet
+ * linked. Once the link write lands, deleting the QBO invoice would strand a
+ * linked row pointing at nothing, so the pay-link stage never compensates.
  */
 export async function stageProgressBillingToQuickBooksCore(
     billingId: string,
+    deadline?: RouteDeadline,
+    deps?: ProgressBillingStageDeps,
 ): Promise<{ success: true; qbInvoiceId: string; qbInvoiceLink: string | null }> {
-    const billing = await prisma.progressBilling.findUnique({
+    const db: ProgressBillingStageDb = deps?.db ?? prisma.progressBilling;
+    const logEvent = deps?.logEvent ?? logAutomationEvent;
+    // Locked-and-revalidated by default. A test that injects only `db` gets the
+    // same rule against that fake table — not a bypass.
+    const finalizeLink = deps?.finalizeLink
+        ?? (deps?.db ? finalizeProgressBillingLinkWithDb(deps.db) : finalizeProgressBillingLinkUnderLock);
+    const billing = await db.findUnique({
         where: { id: billingId },
         include: {
             invoice: {
@@ -625,63 +1062,404 @@ export async function stageProgressBillingToQuickBooksCore(
     }
 
     const invoice = billing.invoice;
-    const { getFreshQBTokens, resolveCustomerAndItem } = await import("./quickbooks-payments");
-    const { createQBMilestoneInvoice, getQBInvoicePaymentLink, deleteQBInvoice } = await import("./quickbooks");
+    const qbo = deps?.qbo ?? await defaultStageQbo();
 
-    const tokens = await getFreshQBTokens();
-    const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId);
+    // Same split as the milestone push: `routeDeadline` is the platform
+    // ceiling this stage — and its possible compensating delete — must fit
+    // inside; `stageDeadline` (the work budget) carves MILESTONE_CLEANUP_BUDGET_MS
+    // off its front, sharing the same start time, so that reserve is still
+    // genuinely there when compensation begins instead of measured off the
+    // (by then exhausted) work budget.
+    const routeDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_ROUTE_BUDGET_MS);
+    const stageDeadline = createRouteDeadline(
+        Math.max(1_000, routeDeadline.budgetMs - MILESTONE_CLEANUP_BUDGET_MS),
+        routeDeadline.startedAt,
+    );
+
+    // Fail closed BEFORE spending a single QBO call: a previous attempt may
+    // already have created this invoice, or another stager is mid-flight right
+    // now. (ProgressBilling carries no updatedAt, so an in-flight marker has no
+    // readable age — it blocks either way, and the resolver is how it clears.)
+    if (isBlockedByAmbiguousCreate(billing)) {
+        throw new QBAmbiguousCreateError(billing.code);
+    }
+
+    const tokens = await qbo.getTokens(stageDeadline);
+    const { customerId, itemId } = await qbo.resolveCustomerAndItem(tokens, invoice.clientId, stageDeadline);
 
     const subtotal = toNum(billing.subtotal);
     const taxAmount = toNum(billing.taxAmount);
     const total = toNum(billing.total);
 
-    const { qbId } = await createQBMilestoneInvoice(tokens, {
-        docNumber: billing.code,
+    // Claim the stage BEFORE the request goes out. Losing this CAS means another
+    // stager got there first — refuse rather than race them into two invoices.
+    // The write is deliberately NOT swallowed: without the marker a crash
+    // between the POST and the link write is invisible, and the next stage
+    // creates a second collectible invoice.
+    //
+    // The marker CARRIES the recovery identity (docNumber + PrivateNote) in the
+    // same CAS, so a recovery never has to recompute it from state that may
+    // have moved since — see composeCreateMarker.
+    //
+    // The ISSUANCE HASH rides along for the same reason as on the milestone
+    // rail: the code and the note prove an invoice is ours, not that it still
+    // describes this billing. A create that lands, loses the link CAS below
+    // (the billing was edited or voided mid-stage) and then fails to compensate
+    // leaves a real invoice for the old total with a perfectly matching
+    // identity — the resolver must be able to see the row moved.
+    // Truncated to QBO's PrivateNote cap BEFORE it goes anywhere — this exact
+    // string is what createQBMilestoneInvoice will send (it truncates again,
+    // harmlessly) and what the marker's identity records. Composing the
+    // identity from the untruncated note would make it un-matchable: QBO
+    // stores the truncated version, resolveAmbiguousInvoiceCreateCore compares
+    // by exact equality, and a mismatch reads as "no invoice found" — which
+    // lets a `confirmed-none` clear release a row that already has a real,
+    // collectible duplicate sitting in QuickBooks.
+    // canonicalPrivateNote, not a bare `.slice()`: it also collapses whitespace
+    // runs and trims the ends, and it is the SAME function the create payload
+    // applies. A raw slice here left the marker holding an untrimmed string
+    // while QuickBooks stored the trimmed one, so a code carrying stray
+    // whitespace made our own invoice invisible to the resolver.
+    // Captured once and reused for the marker, the payload and the promotion
+    // below — the ambiguous-create marker must carry this SAME claim time, not
+    // a fresh one taken after the request ends. See composeCreateMarker's `at`.
+    const claimedAt = new Date();
+    const privateNote = canonicalPrivateNote(progressBillingPrivateNote(invoice.code, billing.code));
+    // Truncated to QBO's DocNumber cap BEFORE it goes anywhere — same reasoning
+    // as the PrivateNote truncation above. `createInvoice` (createQBMilestoneInvoice)
+    // truncates again defensively, but the marker's identity has to be composed
+    // from the SAME value QBO actually stores, or the resolver's exact-match
+    // lookup misses a document we did create.
+    const docNumber = billing.code.slice(0, QB_DOC_NUMBER_MAX_LEN);
+    const identity = {
+        docNumber,
+        privateNote,
+        // Pinned to the values the link CAS below requires, not to whatever was
+        // loaded — those are what this invoice is genuinely issued against.
+        issuanceHash: progressBillingIssuanceHash({
+            status: "Draft",
+            subtotal: billing.subtotal,
+            total: billing.total,
+            // The payload's tax line is { preTaxAmount: subtotal, taxAmount },
+            // so a tax-only edit re-issues a different invoice while leaving
+            // subtotal and total alone — and the customer decides who is
+            // billed at all. Both belong in the fingerprint.
+            taxAmount: billing.taxAmount,
+            // The one payload field a human can still move on a Draft
+            // (updateProgressBillingCore edits nothing else), and it is what
+            // the create sends as the QuickBooks line Description.
+            description: billing.description,
+            customerId,
+        }),
+        // The QBO invoice TOTAL this create expects to produce. DocNumber +
+        // PrivateNote prove a resolved match is OURS; they carry no dollar
+        // figure, so this is what lets the ambiguous-create resolver refuse a
+        // coincidental match whose total is wrong instead of linking it blind.
+        expectedTotal: total,
+        // ...and how that total is SPLIT. QuickBooks recomputes tax under
+        // Automated Sales Tax, and it can book the same grand total as a
+        // different pre-tax/tax pair, which is the number the sales-tax return
+        // reads. Recorded even when it is 0, because "we sent no tax" is an
+        // assertion the acceptance check has to be able to make.
+        expectedTax: taxAmount,
+        // WHICH BOOK and WHICH CUSTOMER this POST is going to — same reasoning
+        // as the milestone rail. Without the realm, a recovery run after a
+        // reconnect to a different company queries the wrong books, finds
+        // nothing, and offers to clear a row whose invoice is collectible.
+        realmId: tokens.realmId,
         customerId,
+        // The accounting PERIOD and the INCOME ACCOUNT. Without these the
+        // shared predicate silently skipped both checks on this rail: it only
+        // compares a field the identity actually records, so a progress
+        // billing booked to the wrong item, or dated into another period by a
+        // replay, was accepted here while the document rail refused exactly
+        // the same document. One predicate is only one rule if both callers
+        // give it the same facts.
+        txnDate: qboTxnDate(claimedAt),
         itemId,
-        description: billing.description,
-        amount: total,
-        tax: taxAmount > 0 ? { preTaxAmount: subtotal, taxAmount } : null,
-        billEmail: invoice.client?.email || null,
-        privateNote: `ProBuild ${invoice.code} · ${billing.code}`,
+    };
+    const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity, claimedAt);
+    // Pinned to the same content snapshot the create is about to build the
+    // invoice from — status alone lets a concurrent edit change subtotal,
+    // total, tax, or description between the pre-claim read above and this
+    // write and still pass the CAS, staging an invoice that no longer matches
+    // the billing.
+    const claimedSend = await db.updateMany({
+        where: {
+            id: billing.id,
+            status: "Draft",
+            qbInvoiceId: null,
+            qbSyncError: null,
+            subtotal: billing.subtotal,
+            total: billing.total,
+            taxAmount: billing.taxAmount,
+            description: billing.description,
+        },
+        data: { qbSyncError: inFlightMarker },
     });
+    if (claimedSend.count !== 1) {
+        throw new QBAmbiguousCreateError(billing.code);
+    }
 
+    let created: { qbId: string; total: number; document: RemoteDocumentFacts | null };
     try {
-        const payLink = await getQBInvoicePaymentLink(tokens, qbId);
-
-        // Conditional claim mirroring pushMilestoneToQuickBooks: guards pin id,
-        // Draft status, no existing qbInvoiceId, and the exact content snapshot
-        // (subtotal/total/description) this QBO invoice was created from — a
-        // mid-stage edit or concurrent stage can't silently attach to a row it no
-        // longer describes.
-        const linked = await prisma.progressBilling.updateMany({
-            where: {
-                id: billing.id,
-                status: "Draft",
-                qbInvoiceId: null,
-                subtotal: billing.subtotal,
-                total: billing.total,
-                description: billing.description,
-            },
-            data: { status: "Staged", qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date() },
-        });
-        if (linked.count !== 1) {
-            throw new Error("This billing changed while staging its QuickBooks invoice — refresh and try again.");
+        created = await qbo.createInvoice(tokens, {
+            docNumber,
+            customerId,
+            itemId,
+            description: billing.description,
+            amount: total,
+            tax: taxAmount > 0 ? { preTaxAmount: subtotal, taxAmount } : null,
+            billEmail: invoice.client?.email || null,
+            privateNote,
+            // FROM THE IDENTITY, so the document QuickBooks books is dated the
+            // way the claim says it is — including on a replay of an
+            // unconfirmed create, which must not drift into today's period.
+            txnDate: identity.txnDate,
+        }, stageDeadline);
+    } catch (error) {
+        if (!isAmbiguousCreateFailure(error)) {
+            // QuickBooks answered "no" and created nothing, so this billing is
+            // freely re-stageable: release the in-flight claim. Pinned to the
+            // exact marker we wrote — releasing someone else's claim would
+            // unblock a row whose outcome is genuinely unknown.
+            await db.updateMany({
+                where: { id: billing.id, qbSyncError: inFlightMarker },
+                data: { qbSyncError: null },
+            }).catch(() => {});
+            throw error;
         }
+        // Outcome unknown: the request may have created a real invoice. Promote
+        // the in-flight claim to the durable marker so the next stage refuses
+        // rather than double-billing.
+        await db.updateMany({
+            where: { id: billing.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
+            data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, identity, claimedAt) },
+        });
+        await logEvent({
+            kind: "qbo-payments-sync",
+            status: "error",
+            reason: AMBIGUOUS_CREATE_MARKER,
+            source: "progress-billing-stage",
+            docNumber: billing.code,
+            detail: { progressBillingId: billing.id, error: error instanceof Error ? error.name : "unknown" },
+        });
+        throw new QBAmbiguousCreateError(billing.code);
+    }
 
-        return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: payLink };
-    } catch (err) {
-        // Compensate: never leave a created QBO invoice unreferenced and
-        // unmentioned. Re-throw the informative "changed while staging" error
-        // once compensation succeeds; otherwise name the orphan so a human can
-        // remove it by hand.
-        const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
-        if (!compensated) {
+    const qbId = created.qbId;
+
+    // Compensate: never leave a created QBO invoice unreferenced and unmentioned.
+    // Bounded exactly like the milestone push's compensation — measured when
+    // compensation begins, capped by the route's real headroom. Only ever called
+    // while the row is still UNLINKED.
+    // Delete the invoice AND release any provisional link that landed for it.
+    // The link write below can fail after committing (a dead response), so
+    // "we never linked it" is not something this path can assume — the CAS
+    // inside compensateAndUnlink is pinned to the exact id, so it clears the
+    // row only when the row really does point at the invoice being deleted.
+    // A progress billing also has to come back to Draft to be re-stageable.
+    let compensationUnlinkFailed = false;
+    const compensate = async (): Promise<boolean> => {
+        // Measured off `routeDeadline`, not `stageDeadline` — the reserve was
+        // carved out of the route's front on entry, so it is still really
+        // there even once the work budget itself is exhausted.
+        const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(routeDeadline)));
+        const { deleted, unlinked } = await compensateAndUnlink(
+            db,
+            billing.id,
+            qbId,
+            () => qbo.deleteInvoice(tokens, qbId, cleanupDeadline),
+            { status: "Draft" },
+            inFlightMarker,
+            {
+                // An injected table (tests) runs the claim inline; the real client
+                // gets a real transaction, and with it the money locks.
+                transaction: deps?.db ? (async (fn: any) => fn(deps.db)) : undefined,
+                invoiceId: billing.invoiceId,
+                // A billing that has been PAID or VOIDED is not one this stage may
+                // reset to Draft and strip the link from — round 50: the clear used
+                // to pin only the link, so a settle racing it was overwritten and
+                // the paid row came back as a Draft with no invoice.
+                unsettled: { status: { in: ["Draft", "Staged", "Sent"] } },
+            },
+        );
+        compensationUnlinkFailed = deleted && !unlinked;
+        return deleted;
+    };
+    const orphanError = (reason: string) =>
+        new Error(
+            `Staging this billing's QuickBooks invoice failed (${reason}), and the abandoned QuickBooks invoice ${billing.code} (id ${qbId}) could not be deleted — remove it in QuickBooks by hand, then retry.`
+        );
+
+    // A lost claim after a successful compensation still needs saying when the
+    // row DID carry our link: the invoice is gone, but the row would keep
+    // pointing at it and refuse the next stage. Declared before either
+    // `compensate()` call site below so both can use it — the link-write catch
+    // used to skip this and silently drop the "deleted but not unlinked" state
+    // on the floor, re-throwing only the original write error.
+    const compensationNote = () =>
+        compensationUnlinkFailed
+            ? ` The abandoned QuickBooks invoice ${billing.code} was deleted, but the link in ProBuild could not be cleared — clear it before re-staging.`
+            : "";
+
+    // QuickBooks decides what an invoice IS; we only propose one. Automated
+    // Sales Tax recomputes the tax from the customer address and the item tax
+    // code, and a changed item, a rounding rule or a tax-exempt customer all
+    // move the answer. The create returns what QuickBooks actually booked, and
+    // this rail used to throw all of it away but the grand total: a billing for
+    // $10,890.00 could stage as a collectible invoice for some other amount,
+    // and ProBuild would report Staged and go on to bill against its OWN total
+    // forever, because nothing on this rail ever looks again.
+    //
+    // The comparison is `documentMatchesClaim`, the SAME predicate the
+    // ambiguous-create resolver and the document-sync recovery apply. It was a
+    // five-cent, total-only check here and a half-cent check on total AND tax
+    // there, so the identical QuickBooks response was accepted on one path and
+    // refused on the other, decided by nothing but whether the first HTTP
+    // response arrived. It now checks customer, DocNumber, PrivateNote, date,
+    // item, cent-normalized total and the TAX SPLIT, the last of which a
+    // matching grand total can hide entirely.
+    //
+    // Checked while the row is still UNLINKED, so the guarded compensation path
+    // above is still usable. An unreadable total or tax is a mismatch too: the
+    // real client already refuses to return a non-finite total
+    // (createQBMilestoneInvoice), so reaching here with one means the invoice
+    // is unverifiable, and an unverifiable invoice must not become a staged one.
+    const mismatch = createdInvoiceRefusal(created.document, identity);
+    if (mismatch) {
+        const detail = `QuickBooks did not create the invoice billing ${billing.code} asked for: ${mismatch}`;
+        await logEvent({
+            kind: "qbo-payments-sync",
+            status: "error",
+            reason: "create-total-mismatch",
+            source: "progress-billing-stage",
+            docNumber: billing.code,
+            detail: {
+                progressBillingId: billing.id,
+                qbInvoiceId: qbId,
+                expectedTotal: total,
+                createdTotal: created.document?.total ?? null,
+                expectedTax: taxAmount,
+                createdTax: created.document?.totalTax ?? null,
+                mismatch,
+            },
+        }).catch(() => {});
+        if (await compensate()) {
             throw new Error(
-                `Staging this billing's QuickBooks invoice failed (${err instanceof Error ? err.message : String(err)}), and the abandoned QuickBooks invoice ${billing.code} (id ${qbId}) could not be deleted — remove it in QuickBooks by hand, then retry.`
+                `${detail} — the QuickBooks invoice was deleted. Fix the tax setup in QuickBooks, then re-stage.${compensationNote()}`,
             );
         }
-        if (err instanceof Error) throw err;
-        throw new Error(`Staging this billing's QuickBooks invoice failed: ${String(err)}`);
+        // The delete did not land. That invoice is real, collectible and wrong,
+        // and nothing automatic can fix it — the resolver will refuse to link it
+        // (the marker's expectedTotal says what it should have been) and must
+        // not clear the row either, because the document genuinely exists. Park
+        // on the durable marker carrying the id, so the next stage refuses
+        // instead of double-billing and a human can find the document without
+        // searching the company file by DocNumber.
+        await db.updateMany({
+            where: { id: billing.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
+            data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, { ...identity, qbId }, claimedAt) },
+        }).catch(() => {});
+        throw orphanError(detail);
     }
+
+    // Persist the link FIRST, before the pay-link fetch. That read is another
+    // remote call, and a timeout there used to abandon a real, created invoice.
+    // Guards pin id, Draft status, no existing qbInvoiceId, and the exact content
+    // snapshot (subtotal/total/description) this QBO invoice was created from — a
+    // mid-stage edit or concurrent stage can't silently attach to a row it no
+    // longer describes.
+    let claimedLink: ProgressBillingLinkVerdict;
+    try {
+        claimedLink = await finalizeLink({
+            billingId: billing.id,
+            invoiceId: billing.invoiceId,
+            clientId: invoice.clientId,
+            qbId,
+            inFlightMarker,
+            issuanceHash: identity.issuanceHash,
+            pinned: {
+                subtotal: billing.subtotal,
+                total: billing.total,
+                taxAmount: billing.taxAmount,
+                description: billing.description,
+            },
+        });
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // "The write failed" is NOT the same as "nothing points at the new
+        // invoice". A commit whose response died, or a concurrent stage that
+        // linked this same invoice first (both share one issuance key, so
+        // Intuit hands them the same invoice), both land here with the row
+        // ALREADY pointing at `qbId`. Compensating on that deletes a live,
+        // correct QuickBooks invoice — the same failure the lost-CAS branch
+        // below already guards against, which this path was missing.
+        const current = await db.findUnique({
+            where: { id: billing.id },
+            select: { qbInvoiceId: true, qbInvoiceLink: true },
+        }).catch(() => null);
+        if (current?.qbInvoiceId === qbId) {
+            return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: current.qbInvoiceLink ?? null };
+        }
+        if (!(await compensate())) throw orphanError(message);
+        // Deleted, but check whether the local unlink ALSO landed —
+        // `compensate()` sets `compensationUnlinkFailed` from
+        // `compensateAndUnlink`'s `unlinked` field. Re-throwing the bare
+        // original error here used to discard that: the QBO invoice would be
+        // gone while the row kept its in-flight/link state, silently blocking
+        // every future stage attempt with no indication why.
+        throw new Error(`${message}${compensationNote()}`);
+    }
+
+    if (claimedLink.outcome !== "linked") {
+        // A lost claim is most often a CONCURRENT stage that linked this very
+        // invoice first (both share one issuance key, so Intuit returned the
+        // same invoice to both). Compensating would delete the winner's invoice
+        // out from under it.
+        const current = await db.findUnique({
+            where: { id: billing.id },
+            select: { qbInvoiceId: true, qbInvoiceLink: true },
+        }).catch(() => null);
+        if (current?.qbInvoiceId === qbId) {
+            return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: current.qbInvoiceLink ?? null };
+        }
+        // Say WHICH failure this was: "changed while staging" is misleading for
+        // a billing that never moved and whose CUSTOMER did — the operator would
+        // go looking at the billing and find nothing wrong with it.
+        const whatChanged = claimedLink.outcome === "mismatch"
+            ? `This billing could not be linked to its new QuickBooks invoice because ${claimedLink.detail}`
+            : "This billing changed while staging its QuickBooks invoice";
+        if (!(await compensate())) throw orphanError(whatChanged);
+        throw new Error(`${whatChanged} — refresh and try again.${compensationNote()}`);
+    }
+
+    // From here the row IS linked. Never compensate past this point: deleting
+    // the invoice would leave a Staged row pointing at nothing.
+    let payLink: string | null;
+    try {
+        payLink = await qbo.getPaymentLink(tokens, qbId, stageDeadline);
+    } catch (error) {
+        if (!isAmbiguousCreateFailure(error)) throw error;
+        // Linked but no pay link: PAYLINK_PENDING_MARKER stays for
+        // sweepPendingPayLinks (src/lib/quickbooks-payments.ts, run by the
+        // qbo-maintenance sync-payment-options action) to finish. The invoice
+        // exists and is correct; only the convenience link is missing, so this is
+        // a success, not something the operator must fix.
+        console.warn(`[progress-billing] pay link pending for ${billing.code} (QBO id ${qbId})`);
+        return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: null };
+    }
+
+    // Pinned to the id we just wrote, so a concurrent unlink/re-stage cannot
+    // have its link overwritten by ours — and routed through the SAME decision
+    // the sweep uses, because `getPaymentLink` can answer null without
+    // throwing. Writing `qbSyncError: null` on that answer is what used to
+    // drop an invoice with no payable URL straight out of the repair queue.
+    const next = nextPayLinkState(PAYLINK_PENDING_MARKER, payLink);
+    await db.updateMany({
+        where: { id: billing.id, qbInvoiceId: qbId },
+        data: { qbSyncError: next.marker, ...(next.link ? { qbInvoiceLink: next.link } : {}) },
+    });
+
+    return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: next.link ?? null };
 }

@@ -95,6 +95,26 @@
       "def": "CHECK ((result = ANY (ARRAY['SCHEDULED'::text, 'PASSED'::text, 'FAILED'::text, 'PARTIAL'::text])))"
     },
     {
+      "name": "PayrollPeriod_discard_unlocked",
+      "table": "\"PayrollPeriod\"",
+      "def": "CHECK (((\"discardedAt\" IS NULL) OR (\"lockedAt\" IS NULL)))"
+    },
+    {
+      "name": "PayrollPeriod_keys_present",
+      "table": "\"PayrollPeriod\"",
+      "def": "CHECK (((\"periodStartKey\" IS NOT NULL) AND (\"periodEndKey\" IS NOT NULL)))"
+    },
+    {
+      "name": "PayrollPeriod_locked_snapshot_complete",
+      "table": "\"PayrollPeriod\"",
+      "def": "CHECK (((\"lockedAt\" IS NULL) OR ((\"summaryCsvSnapshot\" IS NOT NULL) AND (\"detailCsvSnapshot\" IS NOT NULL) AND (\"exportHash\" IS NOT NULL))))"
+    },
+    {
+      "name": "PayrollPeriod_range_check",
+      "table": "\"PayrollPeriod\"",
+      "def": "CHECK ((\"periodEnd\" > \"periodStart\"))"
+    },
+    {
       "name": "QboPurchaseClassification_classification_check",
       "table": "\"QboPurchaseClassification\"",
       "def": "CHECK ((classification = ANY (ARRAY['job-cost'::text, 'overhead'::text, 'owner-draw'::text, 'unknown'::text])))"
@@ -143,6 +163,11 @@
       "name": "StatementImport_status_check",
       "table": "\"StatementImport\"",
       "def": "CHECK ((status = ANY (ARRAY['PENDING'::text, 'FINALIZED'::text, 'FAILED'::text])))"
+    },
+    {
+      "name": "User_payType_check",
+      "table": "\"User\"",
+      "def": "CHECK (((\"payType\" IS NULL) OR (\"payType\" = ANY (ARRAY['HOURLY'::text, 'SALARY'::text]))))"
     },
     {
       "name": "chk_client_message_one_owner",
@@ -212,6 +237,14 @@
       "forced": false
     },
     {
+      "name": "HelpRequest",
+      "forced": false
+    },
+    {
+      "name": "HelpSubmissionQuota",
+      "forced": false
+    },
+    {
       "name": "Inspection",
       "forced": false
     },
@@ -221,6 +254,10 @@
     },
     {
       "name": "McpKey",
+      "forced": false
+    },
+    {
+      "name": "PayrollPeriod",
       "forced": false
     },
     {
@@ -286,13 +323,21 @@
     {
       "name": "TaskPunchItem",
       "forced": false
+    },
+    {
+      "name": "TimeEntry",
+      "forced": false
+    },
+    {
+      "name": "User",
+      "forced": false
     }
   ],
   "policies": [],
   "functions": [
     {
       "name": "check_bank_line_amount_immutable()",
-      "def": "CREATE OR REPLACE FUNCTION public.check_bank_line_amount_immutable()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n     BEGIN\n       IF NEW.\"amountCents\" IS DISTINCT FROM OLD.\"amountCents\" THEN\n         RAISE EXCEPTION 'BankLine.amountCents is immutable (id %); amounts come from bank statements and can never be edited — insert a new BankLine/observation instead', OLD.\"id\";\n       END IF;\n       RETURN NEW;\n     END;\n     $function$\n"
+      "def": "CREATE OR REPLACE FUNCTION public.check_bank_line_amount_immutable()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n     BEGIN\n       IF NEW.\"amountCents\" IS DISTINCT FROM OLD.\"amountCents\" THEN\n         RAISE EXCEPTION 'BankLine.amountCents is immutable (id %); amounts come from bank statements and can never be edited \u2014 insert a new BankLine/observation instead', OLD.\"id\";\n       END IF;\n       RETURN NEW;\n     END;\n     $function$\n"
     },
     {
       "name": "check_refund_event_signs()",

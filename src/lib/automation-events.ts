@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import type { Prisma } from "@prisma/client";
 
 /**
  * Append-only event log behind the Automation Command Center.
@@ -57,15 +58,96 @@ function clip(value: string | undefined): string | undefined {
  * function, which would leave holes in the audit trail. One awaited insert
  * costs ~10ms; a swallowed failure costs nothing but the audit row.
  */
-/** Bounded, always-valid JSON — naive string slicing would corrupt the document. */
-function serializeDetail(detail: Record<string, unknown> | undefined): string | undefined {
-    if (!detail) return undefined;
-    const serialized = JSON.stringify(detail);
-    if (serialized.length <= 4000) return serialized;
-    return JSON.stringify({ truncated: true, keys: Object.keys(detail).slice(0, 20) });
+/** The column budget for a serialized `detail`. */
+const DETAIL_LIMIT = 4000;
+/** How much of any ONE value survives once the document is over budget. */
+const DETAIL_VALUE_LIMIT = 500;
+
+/** One oversized value, clipped, with its real length still on the record. */
+function clipDetailValue(value: unknown): unknown {
+    const text = typeof value === "string" ? value : undefined;
+    if (text !== undefined) {
+        return text.length > DETAIL_VALUE_LIMIT
+            ? `${text.slice(0, DETAIL_VALUE_LIMIT)} [+${text.length - DETAIL_VALUE_LIMIT} chars]`
+            : text;
+    }
+    if (value === null || typeof value !== "object") return value;
+    // A nested object or array: keep it if it is small, otherwise record it as
+    // clipped JSON rather than dropping the key entirely.
+    let nested: string | undefined;
+    try {
+        nested = JSON.stringify(value);
+    } catch {
+        return "[unserializable]";
+    }
+    if (nested === undefined) return undefined;
+    return nested.length > DETAIL_VALUE_LIMIT
+        ? `${nested.slice(0, DETAIL_VALUE_LIMIT)} [+${nested.length - DETAIL_VALUE_LIMIT} chars]`
+        : value;
 }
 
-export async function logAutomationEvent(input: AutomationEventInput): Promise<void> {
+/**
+ * Bounded, always-valid JSON — naive string slicing would corrupt the document.
+ *
+ * Truncation is now VALUE BY VALUE. The old form replaced the whole payload
+ * with a list of key names, which threw the record away precisely when it
+ * mattered: an ambiguous-create resolution logs the actor, the decision and the
+ * operator note beside a long create marker, and one oversized field took all
+ * of them with it — leaving an audit row that recorded a money decision was
+ * made and nothing about who made it or why.
+ *
+ * Now the long field is the only thing that loses anything. If clipping every
+ * value is still not enough (many fields rather than one long one), keys are
+ * dropped LONGEST FIRST, so the short high-signal ones — ids, actor, decision,
+ * reason — are the last to go, and the ones dropped are named.
+ */
+export function serializeDetail(detail: Record<string, unknown> | undefined): string | undefined {
+    if (!detail) return undefined;
+    let serialized: string | undefined;
+    try {
+        serialized = JSON.stringify(detail);
+    } catch {
+        // A cycle or a BigInt. Never fail the caller over an audit row.
+        return JSON.stringify({ truncated: true, keys: Object.keys(detail).slice(0, 20) });
+    }
+    if (serialized !== undefined && serialized.length <= DETAIL_LIMIT) return serialized;
+
+    const clipped: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(detail)) {
+        const kept = clipDetailValue(value);
+        if (kept !== undefined) clipped[key] = kept;
+    }
+    let out = JSON.stringify({ ...clipped, truncated: true });
+    if (out.length <= DETAIL_LIMIT) return out;
+
+    // Still over. Shed the most expensive keys until it fits.
+    const byCost = Object.keys(clipped).sort(
+        (a, b) => (JSON.stringify(clipped[b]) ?? "").length - (JSON.stringify(clipped[a]) ?? "").length,
+    );
+    const dropped: string[] = [];
+    while (out.length > DETAIL_LIMIT && byCost.length > 0) {
+        const key = byCost.shift() as string;
+        delete clipped[key];
+        dropped.push(key);
+        out = JSON.stringify({ ...clipped, truncated: true, droppedKeys: dropped });
+    }
+    // Everything was dropped and it STILL does not fit (a pathological key
+    // list). Fall back to the smallest honest statement rather than an insert
+    // that would fail and take the whole audit row with it.
+    return out.length <= DETAIL_LIMIT
+        ? out
+        : JSON.stringify({ truncated: true, droppedKeys: dropped.slice(0, 20) });
+}
+
+/**
+ * The row an event becomes, with every column already clipped to its budget.
+ *
+ * Split out from the writer so the FIRE-AND-FORGET path and the
+ * TRANSACTIONAL one below cannot disagree about what gets recorded: two
+ * copies of this shaping is how an audit row ends up with a field one caller
+ * writes and the other silently drops.
+ */
+export function automationEventData(input: AutomationEventInput): Prisma.AutomationEventCreateInput {
     const safeCents = (v: number | undefined) => {
         if (typeof v !== "number" || !Number.isFinite(v)) return undefined;
         const rounded = Math.round(v);
@@ -84,32 +166,56 @@ export async function logAutomationEvent(input: AutomationEventInput): Promise<v
         typeof input.detail?.qbPurchaseId === "string" && input.detail.qbPurchaseId
             ? input.detail.qbPurchaseId
             : undefined;
+    return {
+        kind: input.kind,
+        stage: clip(input.stage),
+        status: clip(input.status) ?? "unknown",
+        reason: clip(input.reason),
+        source: clip(input.source),
+        vendor: clip(input.vendor),
+        projectName: clip(input.projectName),
+        docNumber: clip(input.docNumber),
+        fileName: clip(input.fileName),
+        amountCents: safeCents(input.amountCents),
+        taxCents: safeCents(input.taxCents),
+        qbPurchaseId: clip(qbPurchaseId),
+        driveFileId: clip(driveFileId),
+        detail: serializeDetail(input.detail),
+    };
+}
 
+export async function logAutomationEvent(input: AutomationEventInput): Promise<void> {
     try {
-        await prisma.automationEvent.create({
-            data: {
-                kind: input.kind,
-                stage: clip(input.stage),
-                status: clip(input.status) ?? "unknown",
-                reason: clip(input.reason),
-                source: clip(input.source),
-                vendor: clip(input.vendor),
-                projectName: clip(input.projectName),
-                docNumber: clip(input.docNumber),
-                fileName: clip(input.fileName),
-                amountCents: safeCents(input.amountCents),
-                taxCents: safeCents(input.taxCents),
-                qbPurchaseId: clip(qbPurchaseId),
-                driveFileId: clip(driveFileId),
-                detail: serializeDetail(input.detail),
-            },
-        });
+        await prisma.automationEvent.create({ data: automationEventData(input) });
     } catch (error) {
         console.error(
             "automation event log failed",
             error instanceof Error ? error.name : "UnknownError",
         );
     }
+}
+
+/**
+ * The one place an automation event is NOT fire-and-forget.
+ *
+ * The comment above says the books write outranks the audit row, and for
+ * every automated path it does — a QuickBooks push that succeeded must not be
+ * undone because a log insert failed. A HUMAN OVERRIDE is the opposite case.
+ * Linking a parked row to an invoice, or asserting that QuickBooks holds
+ * nothing and releasing the row to bill again, is a decision a person made
+ * against evidence only they saw. The record of who decided it, and why, is
+ * not commentary on the write — it is the only thing that makes the write
+ * reviewable afterwards. Committed without it, the row silently changes state
+ * with no author.
+ *
+ * So this one THROWS, and runs inside the caller's transaction: either the
+ * decision and its audit row both commit, or neither does.
+ */
+export async function logAutomationEventInTx(
+    tx: { automationEvent: { create(args: { data: unknown }): Promise<unknown> } },
+    input: AutomationEventInput,
+): Promise<void> {
+    await tx.automationEvent.create({ data: automationEventData(input) });
 }
 
 // ── Dashboard reads ─────────────────────────────────────────────────────────

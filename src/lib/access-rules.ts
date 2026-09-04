@@ -28,6 +28,18 @@ export function isAdminOrManager(user: { role: string }): boolean {
     return ADMIN_ROLES.includes(user.role);
 }
 
+/**
+ * Who may resolve a QuickBooks invoice create whose outcome is unknown.
+ *
+ * Deliberately NARROWER than the `invoices` permission: the decision is "did
+ * QuickBooks already bill this client?", and getting it wrong either bills them
+ * twice or leaves money uncollected. ADMIN and FINANCE only — a MANAGER with
+ * full invoice access still does not get this one.
+ */
+export function canResolveAmbiguousCreate(user: { role: string }): boolean {
+    return user.role === "ADMIN" || user.role === "FINANCE";
+}
+
 // Default permissions by role (used when no UserPermission record exists)
 function getDefaultPermission(role: string, key: PermissionKey): boolean {
     const defaults: Record<string, PermissionKey[]> = {

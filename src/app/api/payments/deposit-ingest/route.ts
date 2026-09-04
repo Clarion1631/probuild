@@ -8,7 +8,14 @@ import { toNum } from "@/lib/prisma-helpers";
 import { recordPaymentCore } from "@/lib/payment-record-core";
 import { parsePaymentDateInput } from "@/lib/payment-date";
 import { getFreshQBTokens, settleMilestoneFromQBPayment } from "@/lib/quickbooks-payments";
-import { buildQBPaymentRequest, sendQBPaymentCreateRequest, type QBTokens } from "@/lib/quickbooks";
+import {
+    buildQBPaymentRequest,
+    sendQBPaymentCreateRequest,
+    createRouteDeadline,
+    isBudgetExhausted,
+    type QBTokens,
+    type RouteDeadline,
+} from "@/lib/quickbooks";
 import { toDepositReviewItem } from "@/lib/deposit-review";
 import { withTxRetry } from "@/lib/tx-retry";
 import { attributeDeposit, type MilestoneCandidate } from "@/lib/deposit-attribution";
@@ -55,12 +62,18 @@ import {
 } from "@/lib/deposit-sweep";
 
 export const dynamic = "force-dynamic";
-// A bank batch processes its whole day sequentially in ONE invocation (capped
-// at MAX_BANK_CREDITS_PER_BATCH), each credit potentially making two QuickBooks
-// round trips. 30s left no headroom for a slow day; the runner's own timeout is
-// larger still, so the server always gets to answer rather than the client
-// abandoning a batch that is mid-money-write.
+// 60, not 30: this route does real QBO work (token refresh, invoice read,
+// payment create) and 30s left no headroom for the serial sequence. A bank
+// batch is the same shape at a larger scale: it processes its whole day
+// sequentially in ONE invocation (capped at MAX_BANK_CREDITS_PER_BATCH), each
+// credit potentially making two QuickBooks round trips, and the runner's own
+// timeout is larger still, so the server always gets to answer rather than the
+// client abandoning a batch that is mid-money-write. The
+// DEPOSIT_INGEST_BUDGET_MS below is what actually stops it running long —
+// the ceiling is only the backstop behind it.
 export const maxDuration = 60;
+/** Whole-request budget, under the 60s ceiling. */
+export const DEPOSIT_INGEST_BUDGET_MS = 50_000;
 
 /**
  * Deposit auto-apply pipeline (Phase B1). The GTR receipt bot classifies an
@@ -175,6 +188,11 @@ export async function POST(req: Request) {
     const unauthorized = requireDepositIngestAuth(req);
     if (unauthorized) return unauthorized;
 
+    // Started HERE, before the matching and DB work: those run on the same
+    // 60s ceiling as the QBO calls that follow, so a budget created later let
+    // everything ahead of it spend the ceiling for free.
+    const deadline = createRouteDeadline(DEPOSIT_INGEST_BUDGET_MS);
+
     let raw: Record<string, unknown>;
     try {
         raw = await req.json();
@@ -188,7 +206,7 @@ export async function POST(req: Request) {
 
     // The deposit sweep's daily batch. Split BEFORE any photo-payload
     // validation: a bank batch has no fileId/projectName/amount of its own.
-    if (raw.source === BANK_DEPOSIT_SOURCE) return await handleBankBatch(raw);
+    if (raw.source === BANK_DEPOSIT_SOURCE) return await handleBankBatch(raw, deadline);
 
     const fileId = String(raw.fileId ?? "").trim();
     const projectName = String(raw.projectName ?? "").trim();
@@ -375,8 +393,8 @@ export async function POST(req: Request) {
 
     try {
         if (row.status === "qbo_created") return await resumeFromQboCreated(row);
-        if (row.status === "qbo_unknown") return await resumeFromQboUnknown(row);
-        return await matchAndApply(row, payload);
+        if (row.status === "qbo_unknown") return await resumeFromQboUnknown(row, deadline);
+        return await matchAndApply(row, payload, deadline);
     } catch (e: any) {
         return await recordAttemptFailure(row, e);
     }
@@ -440,7 +458,7 @@ function requireDepositIngestAuth(req: Request): NextResponse | null {
 
 // ── Matching + apply ─────────────────────────────────────────────────────────
 
-async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Promise<NextResponse> {
+async function matchAndApply(row: DepositIngest, payload: NormalizedPayload, deadline: RouteDeadline): Promise<NextResponse> {
     let schedule: MatchedSchedule | null = null;
 
     if (row.paymentScheduleId) {
@@ -532,7 +550,7 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
     }
 
     return schedule.qbInvoiceId
-        ? await applyQboLinked(row, schedule, payload)
+        ? await applyQboLinked(row, schedule, payload, deadline)
         : await applyNonQbo(row, schedule, payload);
 }
 
@@ -574,8 +592,13 @@ async function applyNonQbo(row: DepositIngest, schedule: MatchedSchedule, payloa
     return NextResponse.json({ ok: true, status: "applied", scheduleId: schedule.id, invoiceCode: schedule.invoiceCode });
 }
 
-async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, payload: NormalizedPayload): Promise<NextResponse> {
-    const tokens = await getFreshQBTokens(); // throws QBNotConnectedError → top-level catch → "failed" (pre-QBO, no boundary crossed)
+async function applyQboLinked(
+    row: DepositIngest,
+    schedule: MatchedSchedule,
+    payload: NormalizedPayload,
+    deadline: RouteDeadline,
+): Promise<NextResponse> {
+    const tokens = await getFreshQBTokens(deadline); // throws QBNotConnectedError → top-level catch → "failed" (pre-QBO, no boundary crossed)
     const opts = applyOptionsForRow(row);
 
     const built = await buildQBPaymentRequest(tokens, schedule.qbInvoiceId!, {
@@ -583,7 +606,7 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
         txnDate: payload.checkDate!,
         paymentRefNum: payload.checkNumber!,
         ...(opts.depositToAccountId ? { depositToAccountId: opts.depositToAccountId } : {}),
-    });
+    }, deadline);
     if (!built.ok) {
         // Deterministic guards (balance-mismatch, invoice-not-found,
         // missing-customer) never come good on a retry: the same request fails
@@ -617,10 +640,12 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
     }
 
     const requestId = depositRequestId(payload.fileId);
+    // Same budget as the refresh and the invoice read above: the send is the
+    // third serial QBO call in this request, and it is the one that moves money.
     return await sendAndSettle(row.id, schedule, {
         checkDate: payload.checkDate!, checkNumber: payload.checkNumber!, requestId, requestBody: built.requestBody,
         suppressClientReceipt: opts.suppressClientReceipt,
-    }, tokens);
+    }, tokens, deadline);
 }
 
 /**
@@ -639,14 +664,14 @@ function applyOptionsForRow(row: DepositIngest): { depositToAccountId?: string; 
         : {};
 }
 
-async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {
+async function resumeFromQboUnknown(row: DepositIngest, deadline: RouteDeadline): Promise<NextResponse> {
     const schedule = await loadMatchedSchedule(row.paymentScheduleId!);
     if (!schedule) return await finalizeReconcile(row, "reserved milestone no longer exists", {});
     const extracted = JSON.parse(row.extracted) as NormalizedPayload;
 
     let tokens: QBTokens;
     try {
-        tokens = await getFreshQBTokens();
+        tokens = await getFreshQBTokens(deadline);
     } catch (e: any) {
         // Stay qbo_unknown — a brief QB outage doesn't downgrade the state (the
         // original send may or may not have gone through).
@@ -661,7 +686,7 @@ async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {
     return await sendAndSettle(row.id, schedule, {
         checkDate: extracted.checkDate!, checkNumber: extracted.checkNumber!, requestId, requestBody: row.qbRequestPayload!,
         suppressClientReceipt: applyOptionsForRow(row).suppressClientReceipt,
-    }, tokens);
+    }, tokens, deadline);
 }
 
 async function resumeFromQboCreated(row: DepositIngest): Promise<NextResponse> {
@@ -679,10 +704,11 @@ async function sendAndSettle(
     schedule: MatchedSchedule,
     ctx: { checkDate: string; checkNumber: string; requestId: string; requestBody: string; suppressClientReceipt?: boolean },
     tokens: QBTokens,
+    deadline?: RouteDeadline,
 ): Promise<NextResponse> {
     let paymentId: string;
     try {
-        const sent = await sendQBPaymentCreateRequest(tokens, ctx.requestBody, ctx.requestId);
+        const sent = await sendQBPaymentCreateRequest(tokens, ctx.requestBody, ctx.requestId, deadline);
         paymentId = sent.paymentId;
     } catch (e: any) {
         // Response lost/timed out — stay qbo_unknown. The row already holds the exact
@@ -792,6 +818,13 @@ interface BankPayload extends NormalizedPayload {
     customerReference: string | null;
 }
 
+/**
+ * Deliberately NOT in TALLIED_SWEEP_STATUSES: a credit the batch never got to
+ * is not an outcome, so it belongs in the `unresolved` catch-all where it
+ * turns the batch `ok` false rather than reading as a clean day.
+ */
+const BUDGET_EXHAUSTED_STATUS = "budget_exhausted";
+
 interface BankCreditResult {
     bankReference: string;
     status: string;
@@ -888,7 +921,7 @@ function bankPayloadFor(credit: BankCredit, postDate: string): BankPayload {
  *      batch or already stored, with the same postDate and amountCents. Both
  *      go to a human — an amount is all a bank credit carries.
  */
-async function handleBankBatch(raw: Record<string, unknown>): Promise<NextResponse> {
+async function handleBankBatch(raw: Record<string, unknown>, deadline: RouteDeadline): Promise<NextResponse> {
     const parsed = parseBankBatch(raw);
     if (!parsed.ok) return NextResponse.json({ ok: false, reason: parsed.reason }, { status: 400 });
     const { postDate, credits, excluded, dryRun } = parsed.batch;
@@ -938,11 +971,27 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
 
     const results: BankCreditResult[] = [];
     for (const credit of credits) {
+        // Checked before EVERY credit: one credit costs several serial QuickBooks
+        // calls, so starting one with seconds left is how a batch gets killed
+        // mid-money-write instead of returning a result someone can act on. The
+        // skipped credits are still REPORTED, one result each, with a status
+        // outside TALLIED_SWEEP_STATUSES: they land in `unresolved`, the tally
+        // still partitions the day, and `ok` goes false. Tomorrow's replay (or a
+        // re-POST of the same day) picks them up exactly where this run stopped.
+        if (isBudgetExhausted(deadline)) {
+            results.push({
+                bankReference: credit.bankReference,
+                replay: replays.has(bankFileId(credit.bankReference)),
+                status: BUDGET_EXHAUSTED_STATUS,
+                reason: "the request ran out of its budget before this credit was processed — no money was written for it; re-post this day to continue",
+            });
+            continue;
+        }
         results.push(await processBankCredit(credit, postDate, {
             dryRun,
             replay: replays.has(bankFileId(credit.bankReference)),
             collidesWith: collisions.get(credit.bankReference) ?? [],
-        }));
+        }, deadline));
     }
 
     // Every outcome, terminal and not, derived from the RAW per-credit results
@@ -1088,6 +1137,7 @@ async function processBankCredit(
     credit: BankCredit,
     postDate: string,
     opts: { dryRun: boolean; replay: boolean; collidesWith: string[] },
+    deadline: RouteDeadline,
 ): Promise<BankCreditResult> {
     const payload = bankPayloadFor(credit, postDate);
     const claim = await claimBankRow(payload);
@@ -1110,8 +1160,8 @@ async function processBankCredit(
     }
     try {
         const response = row.status === "qbo_created" ? await resumeFromQboCreated(row)
-            : row.status === "qbo_unknown" ? await resumeFromQboUnknown(row)
-            : await matchAndApplyBank(row, payload, opts);
+            : row.status === "qbo_unknown" ? await resumeFromQboUnknown(row, deadline)
+            : await matchAndApplyBank(row, payload, opts, deadline);
         return await bankResult(credit.bankReference, opts.replay, response);
     } catch (e) {
         return await bankResult(credit.bankReference, opts.replay, await recordAttemptFailure(row, e));
@@ -1294,7 +1344,7 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
  *  - the credit must be at least 2 days old (younger credits are held
  *    `proposed`), and the reservation carries a cross-source claim check.
  */
-async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts: { dryRun: boolean }): Promise<NextResponse> {
+async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts: { dryRun: boolean }, deadline: RouteDeadline): Promise<NextResponse> {
     if (row.paymentScheduleId) {
         // A prior crashed attempt already reserved a milestone: resume THAT
         // reservation with the PRESERVED payload rather than re-matching, same
@@ -1310,7 +1360,7 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
         if (!reserved.qbInvoiceId) {
             return await finalizeReconcile(row, "reserved milestone lost its QuickBooks invoice link mid-flight", {});
         }
-        return await applyQboLinked(row, reserved, preserved);
+        return await applyQboLinked(row, reserved, preserved, deadline);
     }
 
     const amountLabel = `$${payload.amount.toFixed(2)}`;
@@ -1443,6 +1493,7 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
         row,
         { id: picked.id, invoiceId: picked.invoiceId, qbInvoiceId: picked.qbInvoiceId, invoiceCode: picked.invoice.code },
         payload,
+        deadline,
     );
 }
 

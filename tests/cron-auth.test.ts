@@ -133,3 +133,50 @@ test("a missing CRON_SECRET cannot be satisfied by 'Bearer undefined'", () => {
         assert.equal(isCronAuthorized(request("Bearer ")), false);
     });
 });
+
+// --- A failed RUN must not answer 200 ---
+
+test("the payments cron answers 503 when the run itself failed", async () => {
+    // A 200 carrying runFailed:true meant an outage that skipped every row
+    // showed up in Vercel's cron log as a clean hourly sync. The body is
+    // unchanged (plus retry:true) so nothing parsing it has to move.
+    //
+    // No database: src/lib/prisma.ts reads globalThis.prisma before it builds a
+    // client, so the REAL sync runs and takes its not-connected preflight exit.
+    const previousEnv = process.env.NODE_ENV;
+    const previousVercel = process.env.VERCEL_ENV;
+    const previousSecret = process.env.CRON_SECRET;
+    const previousPrisma = (globalThis as Record<string, unknown>).prisma;
+    (process.env as Record<string, string>).NODE_ENV = "production";
+    delete process.env.VERCEL_ENV;
+    process.env.CRON_SECRET = "s3cret";
+    const events: unknown[] = [];
+    (globalThis as Record<string, unknown>).prisma = {
+        paymentSchedule: { count: async () => 3 },
+        progressBilling: { count: async () => 1 },
+        integration: { findUnique: async () => null }, // -> QuickBooks not connected
+        automationEvent: { create: async (args: unknown) => { events.push(args); return {}; } },
+        automationSetting: { findUnique: async () => null, upsert: async () => ({}) },
+    };
+    try {
+        const { GET } = await import("../src/app/api/cron/quickbooks-payments/route");
+        const response = await GET(new Request("https://probuild.test/api/cron/quickbooks-payments", {
+            headers: { authorization: "Bearer s3cret" },
+        }));
+        assert.equal(response.status, 503);
+        const body = await response.json();
+        assert.equal(body.runFailed, true);
+        assert.equal(body.retry, true);
+        assert.equal(body.failureReason, "quickbooks-not-connected");
+        // Everything it had loaded is reported as skipped, not silently dropped.
+        assert.equal(body.skipped, 4);
+    } finally {
+        if (previousEnv === undefined) delete (process.env as Record<string, string>).NODE_ENV;
+        else (process.env as Record<string, string>).NODE_ENV = previousEnv;
+        if (previousVercel === undefined) delete process.env.VERCEL_ENV;
+        else process.env.VERCEL_ENV = previousVercel;
+        if (previousSecret === undefined) delete process.env.CRON_SECRET;
+        else process.env.CRON_SECRET = previousSecret;
+        (globalThis as Record<string, unknown>).prisma = previousPrisma;
+    }
+});

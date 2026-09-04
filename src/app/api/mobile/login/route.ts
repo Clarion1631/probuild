@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { withPayrollUserWrite } from "@/lib/payroll-period";
 import bcrypt from "bcryptjs";
 import { signMobileToken } from "@/lib/mobile-auth";
 
@@ -28,7 +29,16 @@ export async function POST(req: Request) {
         // sign-in flips PENDING -> ACTIVATED. Without this the PIN path is inconsistent
         // with Google and PENDING users would be silently auth'd without activation.
         if (user.status === "PENDING") {
-            await prisma.user.update({ where: { id: user.id }, data: { status: "ACTIVATED" } });
+            // ACTIVATION IS A PAYROLL WRITE. The Gusto roster is
+            // "ACTIVATED and HOURLY" or "punched in the period", so this line
+            // can ADD somebody to a pay period's file — and lockPayrollPeriod
+            // hashes that file and freezes it. A transaction is opened purely
+            // so the advisory lock has something to live in: outside one it
+            // would be released before the update ran.
+            await prisma.$transaction(async (tx) => {
+                const data = { status: "ACTIVATED" };
+                await withPayrollUserWrite(tx, data, () => tx.user.update({ where: { id: user.id }, data }));
+            });
         }
 
         const token = await signMobileToken(user, "pin");
