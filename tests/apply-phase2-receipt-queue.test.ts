@@ -27,6 +27,7 @@ import {
     resolveDatabaseUrl,
     resolveProdDatabaseUrl,
     statements,
+    targetHostMatches,
     targetMatches,
 } from "../scripts/apply-phase2-receipt-queue.mjs";
 
@@ -179,6 +180,78 @@ test("the target guard is exact on BOTH db and host — no degenerate substring 
     assert.equal(targetMatches({ db: "other", host: "10.0.0.5" }, "postgres", "10.0.0.5"), false);
     assert.equal(targetMatches(null, "postgres", "10.0.0.5"), false);
     assert.equal(targetMatches({ db: "postgres" }, "postgres", ""), true);
+});
+
+/**
+ * THE HOST CHECK COMPARED AN ADDRESS TO A NAME, SO IT COULD NEVER PASS.
+ *
+ * `host(inet_server_addr())` answers with the server's own IP — through the
+ * Supabase pooler an IPv6 literal — while --expect-host is the hostname out of
+ * DATABASE_URL. The sibling apply script printed exactly that refusal against
+ * production. Every case below injects its resolver, so no test touches DNS.
+ */
+const POOLER_HOST = "aws-0-us-west-2.pooler.supabase.com";
+const POOLER_V6 = "2600:1f13:838:6e45:7ee0:268:15b9:d263";
+const neverResolves = async () => {
+    throw new Error("the resolver must not be called for this case");
+};
+
+test("pre-fix control: the exact comparison refuses the production pooler outright", () => {
+    // This IS the bug, asserted directly, and it is deliberately still true:
+    // targetMatches stays exact, and the fix is a second DNS-aware check rather
+    // than a loosening of this one.
+    assert.equal(targetMatches({ db: "postgres", host: POOLER_V6 }, "postgres", POOLER_HOST), false);
+});
+
+test("the host check resolves --expect-host and requires the connected address to be in that set", async t => {
+    const resolvesTo = (...addresses: string[]) => async (hostname: string) => {
+        assert.equal(hostname, POOLER_HOST);
+        return addresses;
+    };
+
+    await t.test("a hostname that resolves to the connected IPv6 is accepted", async () => {
+        assert.equal(await targetHostMatches(POOLER_V6, POOLER_HOST, resolvesTo("52.32.178.7", POOLER_V6)), "dns");
+    });
+
+    await t.test("an IPv4-mapped answer is the same address written differently", async () => {
+        assert.equal(await targetHostMatches("::ffff:52.32.178.7", POOLER_HOST, resolvesTo("52.32.178.7")), "dns");
+    });
+
+    await t.test("an address outside the resolved set is REFUSED", async () => {
+        assert.equal(await targetHostMatches("203.0.113.9", POOLER_HOST, resolvesTo("52.32.178.7", POOLER_V6)), null);
+    });
+
+    await t.test("an expected literal address needs no lookup at all", async () => {
+        assert.equal(await targetHostMatches(POOLER_V6, POOLER_V6, neverResolves), "exact");
+        assert.equal(await targetHostMatches("127.0.0.1", "127.0.0.1", neverResolves), "exact");
+    });
+
+    await t.test("localhost is loopback by definition — the CI driver's case", async () => {
+        assert.equal(await targetHostMatches("127.0.0.1", "localhost", neverResolves), "loopback");
+        assert.equal(await targetHostMatches("::1", "localhost", neverResolves), "loopback");
+        assert.equal(await targetHostMatches("10.0.0.5", "localhost", neverResolves), null);
+    });
+
+    await t.test("no address at all (Unix socket) falls back to the URL's own hostname", async () => {
+        assert.equal(await targetHostMatches("", POOLER_HOST, neverResolves, POOLER_HOST), "unix-socket");
+        // ...and that fallback may never rescue a host the URL disagrees with,
+        // nor a connection that DID report an address.
+        assert.equal(await targetHostMatches("", POOLER_HOST, neverResolves, "db.example.com"), null);
+        assert.equal(await targetHostMatches("", POOLER_HOST, neverResolves), null);
+    });
+
+    await t.test("an empty --expect-host matches nothing", async () => {
+        assert.equal(await targetHostMatches("10.0.0.5", "", neverResolves), null);
+        assert.equal(await targetHostMatches("", "", neverResolves, ""), null);
+    });
+});
+
+test("the live path uses the DNS-aware check and keeps the db name exact", () => {
+    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-phase2-receipt-queue.mjs"), "utf8");
+    assert.match(source, /await targetHostMatches\(actual\.host, expectHost, lookupAddresses, urlHostname\)/);
+    assert.match(source, /String\(actual\.db \?\? ""\) !== String\(expectDb \?\? ""\)/);
+    // A falsy return is the refusal — the exit must not be conditional on a label.
+    assert.match(source, /if \(!hostMatch\) \{[\s\S]{0,400}?process\.exit\(1\);/);
 });
 
 test("column verification checks type, nullability and default — not just names", () => {

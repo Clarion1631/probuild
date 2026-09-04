@@ -39,7 +39,13 @@
 // --expect-db and --expect-host are BOTH required alongside --yes, matching
 // scripts/apply-receipt-intake.mjs: "--yes" alone only proves you meant to run
 // something, and a database NAME alone doesn't prove which SERVER it's on.
+//
+// --expect-host is the host out of DATABASE_URL (a NAME, through the pooler),
+// not the address the server reports for itself. It is resolved and the
+// connected address must be one of the addresses it resolves to — see
+// targetHostMatches for why an exact string compare could never pass.
 import { PrismaClient } from "@prisma/client";
+import dns from "node:dns";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -155,11 +161,82 @@ function readFlagValue(flag) {
     return idx >= 0 ? process.argv[idx + 1] : undefined;
 }
 
-/** Pure comparison, exported for unit testing without a live DB. Both values EXACT. */
+/**
+ * Pure comparison, exported for unit testing without a live DB. Both values EXACT.
+ *
+ * This stays exact and stays synchronous. It answers one question — did the
+ * operator type the very strings the server reported — and it is the first gate
+ * on the live path because that case needs no DNS at all. The host half is
+ * widened by targetHostMatches below, not here.
+ */
 export function targetMatches(actual, expectDb, expectHost) {
     if (!actual || typeof actual !== "object") return false;
     if (String(actual.db ?? "") !== String(expectDb ?? "")) return false;
     return String(actual.host ?? "") === String(expectHost ?? "");
+}
+
+/**
+ * An IPv4-mapped IPv6 address is an IPv4 address written another way.
+ *
+ * Postgres reports `::ffff:10.0.0.5` or `10.0.0.5` for the same server
+ * depending on how the listener is bound, and a resolver answers with the plain
+ * form, so both sides are normalised before they are compared.
+ */
+export function normalizeServerHost(host) {
+    const value = String(host ?? "").trim();
+    const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(value);
+    return mapped ? mapped[1] : value;
+}
+
+/** `localhost` is these two addresses by definition — no lookup, and none in tests. */
+export const LOOPBACK_ADDRESSES = ["127.0.0.1", "::1"];
+
+/** The real resolver. Used only on the live path; every test injects its own. */
+export async function lookupAddresses(hostname) {
+    const records = await dns.promises.lookup(hostname, { all: true });
+    return records.map(record => record.address);
+}
+
+/**
+ * THE SERVER ANSWERS WITH AN ADDRESS; `--expect-host` IS A NAME.
+ *
+ * `host(inet_server_addr())` is the server's own IP — through the Supabase
+ * pooler an IPv6 literal such as 2600:1f13:838:6e45:7ee0:268:15b9:d263 — while
+ * the operator passes the hostname out of DATABASE_URL,
+ * aws-0-us-west-2.pooler.supabase.com. Compared as strings those can never be
+ * equal, so the exact guard refused production every time (the sibling script
+ * printed exactly that). The fix is not to loosen the comparison: it is to
+ * resolve the NAME and require the connected ADDRESS to be in that set.
+ *
+ * Returns the rule that accepted the host, or NULL. **Null is the refusal** —
+ * a falsy return must stop the run. The label exists so the banner can say
+ * WHICH rule accepted the target rather than merely that something did:
+ *
+ *   "exact"       the operator typed the literal address the server reported.
+ *   "loopback"    --expect-host is localhost and the server answered from 127.0.0.1 / ::1.
+ *   "dns"         --expect-host resolves to the address the server answered from.
+ *   "unix-socket" the server reported NO address (a local socket has none) and
+ *                 the URL's own hostname is the expected one.
+ *
+ * `resolve` is injected so unit tests never touch DNS. `urlHostname` is
+ * consulted for the socket case ONLY: it describes what was DIALLED rather than
+ * what answered, so it is the weakest of the four and is never allowed to
+ * rescue a connection that did report an address.
+ */
+export async function targetHostMatches(actualHost, expectHost, resolve = lookupAddresses, urlHostname = "") {
+    const expect = String(expectHost ?? "").trim();
+    // Nothing to verify against is a refusal, never a match. (main() already
+    // requires --expect-host; this makes the helper safe on its own terms.)
+    if (!expect) return null;
+    if (String(actualHost ?? "") === String(expectHost ?? "")) return "exact";
+    const actual = normalizeServerHost(actualHost);
+    if (actual === "") {
+        return String(urlHostname ?? "").trim().toLowerCase() === expect.toLowerCase() ? "unix-socket" : null;
+    }
+    const loopback = /^localhost$/i.test(expect);
+    const addresses = loopback ? LOOPBACK_ADDRESSES : await resolve(expect);
+    const matched = (addresses ?? []).some(address => normalizeServerHost(address) === actual);
+    return matched ? (loopback ? "loopback" : "dns") : null;
 }
 
 /** The closed set the CHECK allows. Exported for tests. */
@@ -712,11 +789,45 @@ async function main() {
         const [actual] = await prisma.$queryRawUnsafe(
             `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
         );
-        console.log(`connected to db="${actual.db}" host="${actual.host}"`);
-        if (!targetMatches(actual, expectDb, expectHost)) {
-            console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}".`);
+        console.log(`connected to db="${actual.db}" host="${actual.host || "(none — Unix socket)"}"`);
+        // THE DATABASE NAME STAYS EXACT. Only the host comparison is widened,
+        // and only because the two sides speak different languages.
+        if (String(actual.db ?? "") !== String(expectDb ?? "")) {
+            console.error(`REFUSING: expected db="${expectDb}" but connected to db="${actual.db}".`);
             process.exit(1);
         }
+        let urlHostname = "";
+        try {
+            urlHostname = new URL(url).hostname;
+        } catch {
+            // An unparseable URL was already reported by redactTarget above; the
+            // socket rule simply has no hostname to compare and cannot apply.
+        }
+        // The exact case first, so a target that needs no DNS never depends on it.
+        let hostMatch = targetMatches(actual, expectDb, expectHost) ? "exact" : null;
+        if (!hostMatch) {
+            try {
+                hostMatch = await targetHostMatches(actual.host, expectHost, lookupAddresses, urlHostname);
+            } catch (error) {
+                console.error(
+                    `REFUSING: --expect-host "${expectHost}" could not be resolved (${error?.message ?? error}), `
+                    + `so the connected address "${actual.host || "(none — Unix socket)"}" cannot be checked against it.`,
+                );
+                process.exit(1);
+            }
+        }
+        if (!hostMatch) {
+            console.error(
+                `REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" `
+                + `host="${actual.host || "(none — Unix socket)"}" — "${expectHost}" is not that address and does not resolve to it.`,
+            );
+            process.exit(1);
+        }
+        console.log(
+            `host check: ${hostMatch} — --expect-host "${expectHost}" vs the address the server reported `
+            + `("${actual.host || "(none — Unix socket)"}")`
+            + (hostMatch === "unix-socket" ? `; no address to compare, so the URL's own hostname "${urlHostname}" was used` : ""),
+        );
 
         /**
          * AND THE DATABASE ITSELF HAS TO AGREE IT IS PRODUCTION.
