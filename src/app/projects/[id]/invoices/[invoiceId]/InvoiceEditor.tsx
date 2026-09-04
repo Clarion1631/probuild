@@ -324,7 +324,12 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
     }
 
     async function handleDelete() {
-        if (!confirm("Are you sure you want to delete this invoice? This cannot be undone.")) return;
+        const hadBeenSent = !!initialInvoice.sentAt
+            || (initialInvoice.payments || []).some((p: any) => !!p.qbInvoiceSentAt || !!p.qbInvoiceId);
+        const confirmMessage = hadBeenSent
+            ? "This invoice was already sent to the client and may carry an active payment link. Deleting it does NOT notify them or cancel that link. Delete anyway? This cannot be undone."
+            : "Are you sure you want to delete this invoice? This cannot be undone.";
+        if (!confirm(confirmMessage)) return;
         setIsDeleting(true);
         try {
             const res = await deleteInvoice(initialInvoice.id);

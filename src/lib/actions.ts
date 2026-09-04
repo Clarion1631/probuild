@@ -2335,7 +2335,7 @@ interface PostApprovalInfo {
     payLink: string | null;
 }
 
-async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Promise<PostApprovalInfo | null> {
+async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string, signatureName: string): Promise<PostApprovalInfo | null> {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: { id: true, projectId: true, leadId: true },
@@ -2386,7 +2386,11 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
         select: { id: true, code: true },
     });
     if (!invoice) {
-        const created = await createInvoiceFromEstimateInternal(estimateId);
+        const created = await createInvoiceFromEstimateInternal(estimateId, {
+            source: "signing",
+            actorType: "CLIENT",
+            actorName: signatureName,
+        });
         invoice = await prisma.invoice.update({
             where: { id: created.id },
             data: { status: "Issued", issueDate: new Date() },
@@ -2495,7 +2499,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     // ─── 0. The job is won: ensure project + invoice + QuickBooks deposit link ───
     let postApproval: PostApprovalInfo | null = null;
     try {
-        postApproval = await ensureProjectAndDepositInvoiceForEstimate(estimateId);
+        postApproval = await ensureProjectAndDepositInvoiceForEstimate(estimateId, signatureName);
         if (postApproval && estimate && !estimate.projectId) {
             // Conversion just created the project — let the signed-PDF filing below see it.
             (estimate as { projectId: string | null }).projectId = postApproval.projectId;
@@ -2762,12 +2766,12 @@ export async function approveEstimate(estimateId: string, signatureName: string,
 }
 
 export async function deleteInvoice(invoiceId: string) {
-    await assertInvoicePermission();
+    const user = await assertInvoicePermission();
 
     // Guard failures return { error } instead of throwing: production masks
     // thrown server-action messages, so the client would never see the reason.
     try {
-    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
+    const { projectId, snapshot } = await withTxRetry(() => prisma.$transaction(async (tx) => {
         await lockMoneyParents(tx, { invoiceId });
         const invoice = await tx.invoice.findUnique({
             where: { id: invoiceId },
@@ -2783,9 +2787,43 @@ export async function deleteInvoice(invoiceId: string) {
         const { assertInvoiceHasNoChangeOrderBilling } = await import("./billing-core");
         await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "delete");
 
+        // Snapshot before delete — the activity log is the only place this
+        // survives once the row (and its milestones, cascaded) is gone.
+        const snapshot = {
+            code: invoice.code,
+            total: toNum(invoice.totalAmount),
+            balanceDue: toNum(invoice.balanceDue),
+            status: invoice.status,
+            hadBeenSent: !!invoice.sentAt || invoice.payments.some((p) => !!p.qbInvoiceSentAt),
+            milestones: invoice.payments.map((p) => ({
+                name: p.name,
+                amount: toNum(p.amount),
+                status: p.status,
+                lastEmailedAt: p.qbInvoiceSentAt ? p.qbInvoiceSentAt.toISOString() : null,
+                qbInvoiceId: p.qbInvoiceId,
+            })),
+        };
+
         await tx.invoice.delete({ where: { id: invoiceId } });
-        return invoice.projectId;
+        return { projectId: invoice.projectId, snapshot };
     }));
+
+    try {
+        await logActivity({
+            projectId,
+            actorType: "TEAM",
+            actorName: user?.name || user?.email || "Team",
+            actorUserId: user?.id ?? null,
+            action: "deleted_invoice",
+            entityType: "invoice",
+            entityId: invoiceId,
+            entityName: `Invoice ${snapshot.code}`,
+            metadata: { ...snapshot, source: "ui" },
+        });
+    } catch (e) {
+        console.error("[deleteInvoice] activity log failed:", e);
+    }
+
     revalidatePath("/projects/" + projectId + "/invoices");
     revalidatePath("/invoices");
     return { success: true as const, projectId };
@@ -3512,19 +3550,27 @@ export async function createInvoiceFromEstimate(estimateId: string) {
     // inherits the estimate's numbers, so the source estimate must be in scope.
     const user = await assertInvoicePermission();
     assertEstimateScope(user, await estimateOwnerOrThrow(estimateId));
-    return createInvoiceFromEstimateInternal(estimateId);
+    return createInvoiceFromEstimateInternal(estimateId, {
+        source: "ui",
+        actorType: "TEAM",
+        actorName: user?.name || user?.email || "Team",
+        actorUserId: user?.id ?? null,
+    });
 }
 
-async function createInvoiceFromEstimateInternal(estimateId: string) {
+async function createInvoiceFromEstimateInternal(
+    estimateId: string,
+    actor: { source: "ui" | "mcp" | "signing"; actorType: "TEAM" | "CLIENT" | "SYSTEM"; actorName: string; actorUserId?: string | null },
+) {
     const { createInvoiceFromEstimateCore } = await import("./billing-core");
-    return createInvoiceFromEstimateCore(estimateId);
+    return createInvoiceFromEstimateCore(estimateId, actor);
 }
 
 export async function createOneOffInvoice(
     projectId: string,
     items: { name: string; amount: number; dueDate?: string | null }[],
 ) {
-    await assertInvoicePermission();
+    const user = await assertInvoicePermission();
 
     if (!items.length) throw new Error("At least one line item is required");
 
@@ -3569,12 +3615,28 @@ export async function createOneOffInvoice(
     const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
     await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
 
+    try {
+        await logActivity({
+            projectId,
+            actorType: "TEAM",
+            actorName: user?.name || user?.email || "Team",
+            actorUserId: user?.id ?? null,
+            action: "created_invoice",
+            entityType: "invoice",
+            entityId: invoice.id,
+            entityName: `Invoice ${invoiceCode}`,
+            metadata: { code: invoiceCode, total, milestoneCount: validatedItems.length, source: "ui" },
+        });
+    } catch (e) {
+        console.error("[createOneOffInvoice] activity log failed:", e);
+    }
+
     revalidatePath(`/projects/${projectId}/invoices`);
     return { id: invoice.id, projectId };
 }
 
 export async function createInvoiceFromTimeEntries(projectId: string, timeEntryIds: string[]) {
-    await assertInvoicePermission();
+    const user = await assertInvoicePermission();
     if (!timeEntryIds.length) throw new Error("No time entries selected");
 
     const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
@@ -3641,8 +3703,24 @@ export async function createInvoiceFromTimeEntries(projectId: string, timeEntryI
         if (claimed.count !== uniqueIds.length) {
             throw new Error("A selected time entry was billed or tagged concurrently; no invoice was created. Refresh and try again.");
         }
-        return { id: invoice.id, projectId };
+        return { id: invoice.id, projectId, code: "INV-" + String(invoice.number).padStart(5, "0"), total: totalAmount, milestoneCount: entries.length };
     }));
+
+    try {
+        await logActivity({
+            projectId: result.projectId,
+            actorType: "TEAM",
+            actorName: user?.name || user?.email || "Team",
+            actorUserId: user?.id ?? null,
+            action: "created_invoice",
+            entityType: "invoice",
+            entityId: result.id,
+            entityName: `Invoice ${result.code}`,
+            metadata: { code: result.code, total: result.total, milestoneCount: result.milestoneCount, source: "ui" },
+        });
+    } catch (e) {
+        console.error("[createInvoiceFromTimeEntries] activity log failed:", e);
+    }
 
     revalidatePath("/projects/" + projectId + "/invoices");
     revalidatePath("/projects/" + projectId + "/time-expenses");

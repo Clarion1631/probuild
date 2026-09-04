@@ -1180,7 +1180,11 @@ function createHandler(actor: RouteMcpActor) {
                 },
             },
             async ({ estimateId }) => {
-                const result = await createInvoiceFromEstimateGuarded(estimateId);
+                const actorUserId = await actor.resolveActorUserId();
+                const result = await createInvoiceFromEstimateGuarded(estimateId, {
+                    actorName: mcpActivityActorName(actor.actorLabel),
+                    actorUserId,
+                });
                 if (!result.ok) return { ...textResult({ error: result.error }), isError: true };
                 return textResult(result);
             },
