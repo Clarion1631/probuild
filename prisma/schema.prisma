@@ -664,10 +664,26 @@ model Invoice {
 
   payments         PaymentSchedule[]
   progressBillings ProgressBilling[]
+  emailAttempt     InvoiceEmailAttempt?
 
   @@index([projectId])
   @@index([createdAt])
   @@index([estimateId])
+}
+
+// Short-lived, crash-safe provider checkpoint for invoice and milestone emails.
+// Payload contains a signed portal bearer, so migration DDL revokes this table
+// from PUBLIC/anon/authenticated; only the server-side database role may read it.
+model InvoiceEmailAttempt {
+  invoiceId         String   @id
+  invoice           Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  kind              String
+  attemptKey        String   @unique
+  payload           Json
+  startedAt         DateTime @db.Timestamptz(6)
+  providerStartedAt DateTime? @db.Timestamptz(6)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 }
 
 model PaymentSchedule {
@@ -702,6 +718,14 @@ model PaymentSchedule {
   qbSyncedAt      DateTime?
   qbInvoiceSentAt DateTime? // last time the QBO invoice email was sent to the client
   qbSyncError     String? // "voided" | "notFound" — set by the sync poller when the linked QBO invoice is gone/voided; cleared on a successful re-push
+
+  // Durable QBO invoice-create lifecycle. The opaque request id/fingerprint are
+  // written before the provider POST, survive an ambiguous response, and are
+  // cleared only when an authoritative unlink/reset advances the generation.
+  qbCreateGeneration  Int       @default(0)
+  qbCreateRequestId   String?   @unique
+  qbCreateFingerprint String?
+  qbCreateStartedAt   DateTime? @db.Timestamptz(6)
 
   // EstimatePaymentSchedule row this milestone was cloned from at invoicing time.
   // Payment mirrors settle/unwind by this link (name+amount matching is the legacy fallback).
@@ -1630,6 +1654,10 @@ model ChangeOrder {
   status        String   @default("Draft") // Draft, Sent, Approved, Declined
   totalAmount   Decimal  @default(0)
   balanceDue    Decimal  @default(0)
+  // Optimistic-concurrency token for approval/billing — bumped in every transaction that
+  // changes billing inputs (items, schedules, pricing, status, signatures); NOT bumped by
+  // passive writes like viewedAt.
+  revision      Int      @default(0)
   pricingType   String   @default("FIXED")
   // COST_PLUS only: a TRUE markup on actuals — billing = (labor + expenses) * (1 + markupPercent/100), see lib/billing-core.ts.
   // Deliberately a different semantic from ChangeOrderItem.markupPercent / EstimateItem.markupPercent, which hold gross margin on sell.
@@ -1642,6 +1670,15 @@ model ChangeOrder {
   clientSignatureUrl String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
   approvedBy         String?
   approvedAt         DateTime?
+
+  // Customer-visible tax terms frozen at the first guarded send (or an atomic manual approval
+  // directly from Draft). Sent resends, portal/manual approval, rendering, scheduling, and billing
+  // preserve/read this tuple; a Sent scope edit clears it while returning the CO to Draft.
+  // termsTaxExempt !== null is the presence discriminator. null on an Approved legacy row retains
+  // the historical live-estimate fallback because there is no safe source for a backfill.
+  termsTaxExempt      Boolean?
+  termsTaxRateName    String?
+  termsTaxRatePercent Decimal? @db.Decimal
 
   // Company countersignature (set by countersignChangeOrderAsCompany — ADMIN/MANAGER).
   // Separate fields so countersigning never overwrites the customer's approval/audit trail.
@@ -1657,6 +1694,7 @@ model ChangeOrder {
   timeEntries      TimeEntry[]
   expenses         Expense[]
   billings         ChangeOrderBilling[]
+  automationJobs   ChangeOrderAutomationJob[]
 
   // Schedule tasks generated from this CO (provenance / idempotency).
   generatedScheduleTasks ScheduleTask[]
@@ -1727,6 +1765,51 @@ model ChangeOrderBilling {
   createdBy         String?
 
   @@index([changeOrderId])
+}
+
+// Durable, independently retryable work for a specific change-order revision.
+// The payload freezes the exact billing/email/schedule inputs before dispatch;
+// the stable idempotency key and fenced lease make inline + cron drainers safe.
+// Kinds and states intentionally remain strings so deployment does not depend on
+// a PostgreSQL enum or a CHECK constraint that can drift from application code.
+model ChangeOrderAutomationJob {
+  id            String      @id @default(cuid())
+  changeOrderId String
+  // Restrict preserves provider-attempt evidence/key until guarded deletion has
+  // explicitly reconciled it; an ambiguous email must never disappear by cascade.
+  changeOrder   ChangeOrder @relation(fields: [changeOrderId], references: [id], onDelete: Restrict)
+  eventRevision Int
+  kind          String // REVIEW_EMAIL | APPROVAL_BILL | APPROVAL_CLIENT_EMAIL | APPROVAL_SCHEDULE | APPROVAL_TEAM_EMAIL
+  approvalMode  String? // CLIENT | MANUAL; null for non-approval jobs
+  status        String      @default("PENDING") // PENDING | PROCESSING | SUCCEEDED | SKIPPED | CANCELED | NEEDS_ATTENTION
+
+  // Frozen provider/automation input and the terminal outcome. Email payloads
+  // can contain recipient addresses, so this table is never exposed to app roles.
+  payload Json?
+  result  Json?
+
+  // Passed unchanged to external providers on every retry.
+  idempotencyKey String @unique
+  // Event dedupe is distinct from provider idempotency. Approval jobs derive it
+  // from CO/revision/kind; review jobs additionally include a preview generation
+  // so recipient changes can create a new frozen dispatch at the same revision.
+  dedupeKey      String @unique
+
+  attempts               Int       @default(0)
+  maxAttempts            Int       @default(8)
+  nextAttemptAt          DateTime?
+  firstProviderAttemptAt DateTime?
+  processingStartedAt    DateTime?
+  claimToken             String?
+  providerMessageId      String?
+  lastError              String?
+  completedAt            DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  @@index([changeOrderId])
+  @@index([changeOrderId, eventRevision, kind])
+  @@index([status, nextAttemptAt, createdAt])
 }
 
 model VendorTag {

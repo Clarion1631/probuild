@@ -22,3 +22,51 @@ It was deleted rather than converted to `migrate deploy`, because:
 If a CI-driven migration path is wanted later, it needs an approval gate and a
 main-branch guard first. Until then, apply schema changes locally and
 deliberately.
+
+## Recording applied migrations in prod's `_prisma_migrations`
+
+Prod is written by `scripts/apply-*.mjs`; CI's throwaway database is built from
+`prisma/migrations/`. Nothing runs `migrate deploy` against prod, so prod's
+history table only learns about a migration when someone records it by hand.
+That is a deliberate one-off step, done **after** the DDL is verified present
+in prod and **after** the migration file is on `main`:
+
+```powershell
+# From a worktree checked out at origin/main. Both URLs are the SESSION pooler
+# (port 5432, no ?pgbouncer=true) — DIRECT_URL's real host is IPv6-only here.
+$env:DIRECT_URL = "<DATABASE_URL from .env.production.local, :6543 -> :5432, ?pgbouncer=true removed>"
+$env:DATABASE_URL = $env:DIRECT_URL
+npx prisma migrate resolve --applied <migration_folder_name>
+npx prisma migrate status   # must end with "Database schema is up to date!"
+```
+
+`resolve --applied` only inserts a history row (name + checksum of the file);
+it runs no SQL. Never record a migration whose DDL you have not confirmed in
+prod with an `information_schema` / `pg_indexes` / `pg_constraint` query — a
+false row makes `migrate status` lie forever.
+
+### 2026-09-04 reconciliation
+
+Three weeks after the baseline the history had fallen behind again: prod held
+7 rows, `main` held 14 migrations. A read-only `migrate diff` also showed new
+drift in the other direction. The audit (PR #470) found:
+
+| Migration on `main` | DDL in prod? | Action |
+|---|---|---|
+| `20260826000000_bank_image_schema_history` | yes (`apply-bank-image.mjs`) | record |
+| `20260827000000_inspection_schema_history` | yes (`apply-inspections-schema.mjs`) | record |
+| `20260829020000_time_meal_breaks_bank_image_extraction` | yes | record |
+| `20260829190000_qbo_purchase_classification_updated_at_default` | **no** — `apply-qbo-purchase-classification.mjs` ran before #411 added the `SET DEFAULT` | re-run that script, then record |
+| `20260901000000_percent_complete` | yes | record |
+| `20260902000000_deposit_sweep` | yes | record |
+| `20260903000000_deposit_sweep_fingerprint` | yes | record |
+| `20260817000000_add_change_order_revision`, `20260817000001_add_change_order_automation_jobs` | yes (PR #402's `apply-co-revision-schema.mjs` ran against prod on 2026-08-17 without merging) | adopted onto `main` verbatim by PR #470; record after it merges |
+
+Objects prod has that `main` still does not model — `PayrollPeriod`,
+`HelpSubmissionQuota`, `HelpRequest.submissionId`/`provider*`,
+`User.payType`/`lastRateSyncAt`, `TimeEntry_startTime_idx`, and the
+`TimeEntry` user/project FKs as `ON DELETE RESTRICT` — all belong to PR #441
+(`scripts/apply-payroll-phase5.mjs`), which was mergeable and CI-green at the
+time, so they were left for that PR rather than adopted twice. Its script has
+to be re-run before its deploy anyway: prod lacks `User.payrollRevision` and
+RLS on `TimeEntry`/`HelpRequest`, which later rounds of that script add.

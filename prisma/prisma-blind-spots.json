@@ -167,6 +167,10 @@
       "forced": false
     },
     {
+      "name": "ChangeOrderAutomationJob",
+      "forced": false
+    },
+    {
       "name": "DailyLog",
       "forced": false
     },
@@ -204,6 +208,10 @@
     },
     {
       "name": "Inspection",
+      "forced": false
+    },
+    {
+      "name": "InvoiceEmailAttempt",
       "forced": false
     },
     {
