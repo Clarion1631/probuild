@@ -317,6 +317,116 @@ export function targetMatches(actual, expectDb, expectHost) {
     return String(actual.host ?? "") === String(expectHost ?? "");
 }
 
+const IPV4_LITERAL = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+const IPV4_MAPPED = /^(?:::ffff:|(?:0{1,4}:){5}ffff:)((?:\d{1,3}\.){3}\d{1,3})$/;
+
+/**
+ * ONE SPELLING PER ADDRESS.
+ *
+ * inet_server_addr() reports an address, and the same server has more than one
+ * way to write itself: a dual-stack listener answers an IPv4 client as
+ * ::ffff:10.0.0.5, and IPv6 text is case-insensitive. Normalising first keeps
+ * the comparison about WHICH SERVER, not about how it spelled itself.
+ */
+export function normalizeServerAddress(value) {
+    const text = String(value ?? "").trim().toLowerCase();
+    const mapped = text.match(IPV4_MAPPED);
+    return mapped ? mapped[1] : text;
+}
+
+/**
+ * Is this already an address, or a name DNS has to answer for?
+ *
+ * Deliberately not a full validator: a wrong guess here only decides whether we
+ * ASK DNS about the string, and DNS refuses a name that is not one.
+ */
+export function isAddressLiteral(host) {
+    const text = normalizeServerAddress(host);
+    if (!text) return false;
+    if (IPV4_LITERAL.test(text)) return true;
+    return text.includes(":") && /^[0-9a-f:.]+$/.test(text);
+}
+
+/**
+ * The addresses --expect-host can legitimately turn out to be.
+ *
+ * A literal is itself. localhost is the loopback pair, answered here rather
+ * than through the resolver because a machine may have no record for it.
+ * Anything else is a NAME, and only DNS knows what it stands for.
+ */
+export async function resolveExpectedAddresses(expectHost, lookup) {
+    const host = String(expectHost ?? "").trim();
+    if (!host) return [];
+    if (isAddressLiteral(host)) return [normalizeServerAddress(host)];
+    if (host.toLowerCase() === "localhost") return ["127.0.0.1", "::1"];
+    const records = await lookup(host, { all: true });
+    const list = Array.isArray(records) ? records : [records];
+    return list
+        .map((record) => normalizeServerAddress(record && typeof record === "object" ? record.address : record))
+        .filter(Boolean);
+}
+
+/**
+ * THE HOST HALF OF THE GUARD, RESOLVED RATHER THAN STRING-COMPARED.
+ *
+ * The exact compare above asks whether the operator typed the same characters
+ * the SERVER reports, and the server reports host(inet_server_addr()) -- an IP.
+ * An operator naming the pooler (aws-0-us-west-2.pooler.supabase.com) could
+ * therefore never satisfy it: the guard refused production for BEING
+ * production, and a guard that cannot be satisfied correctly is one people
+ * learn to weaken. Resolving the expected NAME and asking whether the address
+ * we reached is one of its addresses is the same question, asked so it can
+ * actually be answered.
+ *
+ * Still exact at the bottom: the connected address must be IN the resolved set.
+ * No substring, no prefix, no "close enough".
+ */
+export async function hostMatchesResolved(actualHost, expectHost, lookup) {
+    const actual = normalizeServerAddress(actualHost);
+    const expected = String(expectHost ?? "").trim();
+    if (!expected) return { ok: false, reason: "no --expect-host was given" };
+    // A Unix-socket connection has no server address to report. The URL host
+    // check (and, on prod, the project ref and the baseline row) has already
+    // run, so there is nothing further this comparison can add: say so rather
+    // than refuse a target the other guards already accepted.
+    if (!actual) {
+        return { ok: true, note: "inet_server_addr() is NULL (a Unix-socket connection): the URL host checked above is the only host evidence." };
+    }
+    if (normalizeServerAddress(expected) === actual) return { ok: true, note: null };
+    let addresses;
+    try {
+        addresses = await resolveExpectedAddresses(expected, lookup);
+    } catch (error) {
+        return { ok: false, reason: `host "${expected}" could not be resolved: ${error?.message ?? error}` };
+    }
+    if (addresses.length === 0) return { ok: false, reason: `host "${expected}" resolved to no addresses` };
+    if (addresses.includes(actual)) {
+        return { ok: true, note: `host "${expected}" resolves to ${addresses.join(", ")}, which includes ${actual}` };
+    }
+    return { ok: false, reason: `host "${expected}" resolves to ${addresses.join(", ")}, not ${actual}` };
+}
+
+/**
+ * The database name EXACTLY, then the host resolved. Carries the reason as
+ * well as the verdict so a refusal can say which half of the target failed.
+ */
+export async function targetMatchesResolved(actual, expectDb, expectHost, lookup) {
+    if (!actual || typeof actual !== "object") return { ok: false, reason: "the server reported no identity row" };
+    if (String(actual.db ?? "") !== String(expectDb ?? "")) {
+        return { ok: false, reason: `database "${String(actual.db ?? "")}" is not "${String(expectDb ?? "")}"` };
+    }
+    // Unchanged fast path: the operator passed the exact address the server
+    // reports, which is what scripts/ci-apply-receipt-intake-e2e.mjs does. No DNS.
+    if (targetMatches(actual, expectDb, expectHost)) return { ok: true, note: null };
+    return hostMatchesResolved(actual.host, expectHost, lookup);
+}
+
+/** The real resolver, imported lazily so this module stays inert on import. */
+async function lookupHostAddresses(host, options) {
+    const dns = await import("node:dns/promises");
+    return dns.lookup(host, options);
+}
+
 /** The closed set of states the CHECK constraint allows. Exported for tests. */
 export const RECEIPT_INTAKE_STATES = [
     "STAGING", "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING",
@@ -966,10 +1076,12 @@ async function main() {
         }
         const actual = identity.actual;
         console.log(`connected to db="${actual.db}" host="${actual.host}"`);
-        if (!targetMatches(actual, expectDb, expectHost)) {
-            console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}".`);
+        const match = await targetMatchesResolved(actual, expectDb, expectHost, lookupHostAddresses);
+        if (!match.ok) {
+            console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}" (${match.reason}).`);
             process.exit(1);
         }
+        if (match.note) console.log(match.note);
 
         if (dryRun) {
             console.log(`--dry-run: ${statements.length} statements would run against the target above.`);

@@ -31,6 +31,7 @@ import {
     expectedColumns,
     statements,
     targetMatches,
+    targetMatchesResolved,
     verifyConstraints,
     chooseTarget,
     hostOf,
@@ -199,6 +200,100 @@ test("the target guard needs BOTH the database name and the host, EXACTLY", () =
     assert.equal(targetMatches({ db: "postgres", host: "10.0.0.5" }, "postgres", "1"), false);
     assert.equal(targetMatches({ db: "postgres", host: "10.0.0.5" }, "postgres", "10.0.0.55"), false);
     assert.equal(targetMatches({ db: "postgres", host: "" }, "postgres", "10.0.0.5"), false);
+});
+
+test("the host half RESOLVES the expected name rather than string-comparing it", async () => {
+    // --expect-host takes a HOSTNAME (the deploy note passes the pooler), while
+    // inet_server_addr() reports an ADDRESS. Comparing those two as strings can
+    // never pass through the Supabase pooler, so the guard refused production
+    // for BEING production and the only way past it was to weaken the flag.
+    const pooler = "aws-0-us-west-2.pooler.supabase.com";
+    const asked: string[] = [];
+    const lookup = async (host: string, options: { all: boolean }) => {
+        asked.push(host);
+        assert.equal(options.all, true, "the resolver must be asked for EVERY address");
+        return [
+            { address: "2600:1f13:838:6e45::1", family: 6 },
+            { address: "52.32.1.9", family: 4 },
+        ];
+    };
+
+    // 1. The address we reached IS one the expected name resolves to.
+    const accepted = await targetMatchesResolved(
+        { db: "postgres", host: "52.32.1.9" }, "postgres", pooler, lookup,
+    );
+    assert.equal(accepted.ok, true, accepted.reason);
+    assert.deepEqual(asked, [pooler]);
+    // PRE-FIX CONTROL: the exact string compare refuses that same target, which
+    // is the bug. Without this the test above would also pass on a guard that
+    // accepted everything.
+    assert.equal(targetMatches({ db: "postgres", host: "52.32.1.9" }, "postgres", pooler), false);
+
+    // 2. An address the name does NOT resolve to is still refused.
+    const refused = await targetMatchesResolved(
+        { db: "postgres", host: "10.0.0.5" }, "postgres", pooler, lookup,
+    );
+    assert.equal(refused.ok, false);
+    assert.match(String(refused.reason), /not 10\.0\.0\.5/);
+
+    // 3. IPv4-mapped IPv6 is the SAME address, spelled the way a dual-stack
+    //    listener spells it to an IPv4 client.
+    const mapped = await targetMatchesResolved(
+        { db: "postgres", host: "::ffff:52.32.1.9" }, "postgres", pooler, lookup,
+    );
+    assert.equal(mapped.ok, true, mapped.reason);
+
+    // 4. A literal address is not a name: accepted without asking DNS, in the
+    //    exact form the CI driver passes and in the mapped/uppercase form.
+    asked.length = 0;
+    const literal = await targetMatchesResolved(
+        { db: "postgres", host: "127.0.0.1" }, "postgres", "127.0.0.1", lookup,
+    );
+    assert.equal(literal.ok, true, literal.reason);
+    const literalMapped = await targetMatchesResolved(
+        { db: "postgres", host: "52.32.1.9" }, "postgres", "::FFFF:52.32.1.9", lookup,
+    );
+    assert.equal(literalMapped.ok, true, literalMapped.reason);
+    assert.deepEqual(asked, [], "a literal address must never be resolved");
+
+    // 5. The DATABASE is still compared exactly: no resolution rescues the
+    //    right host on the wrong database.
+    const wrongDb = await targetMatchesResolved(
+        { db: "staging", host: "52.32.1.9" }, "postgres", pooler, lookup,
+    );
+    assert.equal(wrongDb.ok, false);
+    assert.equal((await targetMatchesResolved(null, "postgres", pooler, lookup)).ok, false);
+
+    // 6. A Unix-socket connection reports NO address. The URL host check has
+    //    already run, so this says so rather than refusing what the other
+    //    guards accepted.
+    const socket = await targetMatchesResolved(
+        { db: "postgres", host: "" }, "postgres", pooler, lookup,
+    );
+    assert.equal(socket.ok, true, socket.reason);
+    assert.match(String(socket.note), /Unix-socket/);
+
+    // 7. localhost is the loopback pair, answered without the resolver.
+    asked.length = 0;
+    assert.equal((await targetMatchesResolved({ db: "postgres", host: "127.0.0.1" }, "postgres", "localhost", lookup)).ok, true);
+    assert.equal((await targetMatchesResolved({ db: "postgres", host: "::1" }, "postgres", "localhost", lookup)).ok, true);
+    assert.deepEqual(asked, []);
+
+    // 8. A name that resolves to nothing is a refusal, never a pass.
+    const empty = await targetMatchesResolved(
+        { db: "postgres", host: "52.32.1.9" }, "postgres", "nowhere.example", async () => [],
+    );
+    assert.equal(empty.ok, false);
+    assert.match(String(empty.reason), /no addresses/);
+
+    // 9. So is a resolver that fails. A guard that turns itself off when DNS is
+    //    unhappy is the guard not existing.
+    const boom = await targetMatchesResolved(
+        { db: "postgres", host: "52.32.1.9" }, "postgres", "nowhere.example",
+        async () => { throw new Error("ENOTFOUND"); },
+    );
+    assert.equal(boom.ok, false);
+    assert.match(String(boom.reason), /ENOTFOUND/);
 });
 
 test("the partial-index verification checks UNIQUE and the exact predicate", () => {
