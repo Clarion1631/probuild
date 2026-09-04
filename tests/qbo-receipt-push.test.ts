@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     createQBReceiptPurchase,
     ensureQBVendor,
     QboAccountConfigError,
     QboVendorDuplicateError,
     QboPurchaseFaultError,
+    stableAttachmentFileName,
+    compareExistingPurchase,
+    readBookedPurchase,
     type CreateQBReceiptPurchaseInput,
+    type ExistingPurchaseCheck,
     type QboReceiptProjectCandidate,
     type QboReceiptPushDependencies,
     type ReceiptAttachmentStatus,
@@ -54,6 +60,47 @@ function baseInput(overrides: Partial<CreateQBReceiptPurchaseInput> = {}): Creat
     };
 }
 
+/**
+ * A QBO Purchase that AGREES with baseInput(), in the shape QBO really returns
+ * one: TotalAmt and TxnDate on the entity, the vendor on EntityRef, and the job
+ * on each expense line's CustomerRef.
+ *
+ * The fixtures used to be `{ Id, PrivateNote }` because those were the only two
+ * fields the code selected — which is exactly the finding: two fields can say
+ * "this is our Purchase" and cannot say "and it agrees with this document".
+ */
+function bookedPurchase(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+        Id: "purchase-99",
+        TotalAmt: 150,
+        TxnDate: "2026-07-15",
+        EntityRef: { value: "vendor-1", name: "Home Depot", type: "Vendor" },
+        Line: [{
+            Amount: 150,
+            DetailType: "AccountBasedExpenseLineDetail",
+            AccountBasedExpenseLineDetail: {
+                AccountRef: { value: EXPENSE_ACCOUNT_ID, name: "COGS Supplies & materials" },
+                CustomerRef: { value: "cust-1", name: "Mueller Remodel" },
+            },
+        }],
+        ...over,
+    };
+}
+
+/** The verdict a matching books row produces, for the result deepEquals below. */
+const MATCHED = {
+    verdict: "match",
+    differences: [],
+    booked: {
+        totalAmount: 150,
+        txnDate: "2026-07-15",
+        vendor: "Home Depot",
+        projectNames: ["Mueller Remodel"],
+        lines: [{ tax: false, customerId: "cust-1", customerName: "Mueller Remodel", readable: true }],
+        taxAmount: 0,
+    },
+};
+
 /** The account-identity check runs against whatever id was queried — return the shape it expects for either. */
 function defaultAccountRow(query: string): Array<{ Id: string; Name: string; AccountType: string }> {
     if (query.includes(`'${BANK_ACCOUNT_ID}'`)) {
@@ -69,7 +116,7 @@ function defaultAccountRow(query: string): Array<{ Id: string; Name: string; Acc
 }
 
 interface DepsOverrides {
-    existingRows?: Array<{ Id: string; PrivateNote?: string }>;
+    existingRows?: Array<Record<string, unknown>>;
     createdId?: string;
     customerId?: string;
     vendorId?: string;
@@ -161,7 +208,7 @@ function createDeps(overrides: DepsOverrides = {}) {
 test("createQBReceiptPurchase short-circuits when the DocNumber and marker both match", async () => {
     const input = baseInput();
     const marker = `[gtr-file:${input.fileId}]`;
-    const { deps, calls } = createDeps({ existingRows: [{ Id: "purchase-99", PrivateNote: `note ${marker}` }] });
+    const { deps, calls } = createDeps({ existingRows: [bookedPurchase({ PrivateNote: `note ${marker}` })] });
     const result = await createQBReceiptPurchase(TOKENS, input, deps);
 
     assert.deepEqual(result, {
@@ -171,6 +218,7 @@ test("createQBReceiptPurchase short-circuits when the DocNumber and marker both 
         alreadyExists: true,
         // No file in this input, so there is nothing to attach.
         attachment: "skipped",
+        existing: MATCHED,
     });
     assert.equal(calls.creates.length, 0);
     assert.equal(calls.vendorCalls.length, 0);
@@ -540,7 +588,7 @@ function createRouteHandlers(overrides: Partial<QboReceiptCreateHandlerDependenc
         getFreshTokens: overrides.getFreshTokens ?? (async () => TOKENS),
         createPurchase:
             overrides.createPurchase ??
-            (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const })),
+            (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck })),
         // Stub the audit logger: unit tests must never touch the real Prisma client.
         logEvent: overrides.logEvent ?? (() => {}),
         // Same for the pause switch — the real read fails CLOSED (paused) with no DB.
@@ -561,7 +609,7 @@ test("route POST forwards tax:true only as an explicit boolean — string \"true
     const { POST } = createRouteHandlers({
         createPurchase: async (_tokens, input) => {
             inputs.push(input);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck };
         },
     });
     const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
@@ -876,7 +924,7 @@ test("route POST forwards overheadCategory only as a string", async () => {
     const { POST } = createRouteHandlers({
         createPurchase: async (_tokens, input) => {
             inputs.push(input);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck };
         },
     });
     for (const overheadCategory of ["Meals", 42]) {
@@ -918,7 +966,7 @@ test("already-exists uploads the receipt when the lost first attempt never attac
     const marker = `[gtr-file:${input.fileId}]`;
     const uploads: Array<{ purchaseId: string; fileName: string }> = [];
     const { deps, calls } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [], // QBO has the Purchase but no file on it
         uploadAttachment: async (_t, purchaseId, file) => {
             uploads.push({ purchaseId, fileName: file.fileName });
@@ -934,10 +982,13 @@ test("already-exists uploads the receipt when the lost first attempt never attac
         docNumber: input.fileId.slice(0, 21),
         alreadyExists: true,
         attachment: "attached",
+        existing: MATCHED,
     });
     // Still idempotent on the books: no second Purchase.
     assert.equal(calls.creates.length, 0);
-    assert.deepEqual(uploads, [{ purchaseId: "99", fileName: "receipt.jpg" }]);
+    assert.deepEqual(uploads, [
+        { purchaseId: "99", fileName: stableAttachmentFileName(input.fileId, input.fileName) },
+    ]);
 });
 
 test("already-exists does NOT re-upload when the deterministic filename is already attached", async () => {
@@ -945,8 +996,8 @@ test("already-exists does NOT re-upload when the deterministic filename is alrea
     const marker = `[gtr-file:${input.fileId}]`;
     let uploadCount = 0;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
-        attachableRows: [attachableRow("99", "receipt.jpg")],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
+        attachableRows: [attachableRow("99", stableAttachmentFileName(input.fileId, input.fileName))],
         uploadAttachment: async () => {
             uploadCount += 1;
             return "attached";
@@ -959,11 +1010,36 @@ test("already-exists does NOT re-upload when the deterministic filename is alrea
     assert.equal(uploadCount, 0, "an existing attachment must never be duplicated");
 });
 
+test("already-exists does NOT treat an unrelated receipt's identical caller-chosen filename as a match", async () => {
+    // Two different receipts, both uploaded by a phone that names every photo
+    // "receipt.jpg" — the exact collision stableAttachmentFileName exists to
+    // prevent. The Attachable on file belongs to a DIFFERENT fileId, so it
+    // must never be read as "this receipt is already attached".
+    const input = baseInput({ ...FILE_INPUT, fileId: "totally-different-receipt-id" });
+    const marker = `[gtr-file:${input.fileId}]`;
+    let uploadCount = 0;
+    const { deps } = createDeps({
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
+        // Same caller-chosen "FileName" as the unrelated receipt would have
+        // produced under the old naive scheme, but it is not OUR stable name.
+        attachableRows: [attachableRow("99", "receipt.jpg")],
+        uploadAttachment: async () => {
+            uploadCount += 1;
+            return "attached";
+        },
+    });
+
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.equal(result.ok && result.alreadyExists && result.attachment, "attached");
+    assert.equal(uploadCount, 1, "an unrelated same-name attachment must not short-circuit the real upload");
+});
+
 test("already-exists ignores an Attachable that belongs to a different entity type", async () => {
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         // Same id + filename, but linked to an Invoice — entity ids are only
         // unique per type, so this must not count as our receipt.
         attachableRows: [{
@@ -985,7 +1061,7 @@ test("a failed attachment LOOKUP is retryable, not a terminal ok:true", async ()
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableQueryImpl: async () => {
             throw new Error("QBO down");
         },
@@ -1016,7 +1092,7 @@ test("an attachment upload that times out PROPAGATES from both paths, so the pus
     );
 
     const existing = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [],
         uploadAttachment: async () => timeout(),
     });
@@ -1040,7 +1116,7 @@ test("a thrown NETWORK-ish attachment failure is retryable from both paths", asy
     );
 
     const existing = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [],
         uploadAttachment: boom,
     });
@@ -1060,7 +1136,7 @@ test("a TERMINAL attachment status still rides along on ok:true from both paths"
     assert.equal(freshResult.ok && !freshResult.alreadyExists && freshResult.attachment, "failed:fault");
 
     const existing = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [],
         uploadAttachment: terminal,
     });
@@ -1408,7 +1484,7 @@ test("the route hands the SAME deadline to the token fetch and the create", asyn
         },
         createPurchase: async (_t, _i, deadline) => {
             seen.push(deadline);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck };
         },
     });
     await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
@@ -1421,6 +1497,543 @@ test("the route hands the SAME deadline to the token fetch and the create", asyn
     assert.ok(seen[0], "the token fetch must receive the budget");
     assert.deepEqual(seen[0], seen[1], "both legs share one budget");
     assert.equal(seen[0]!.budgetMs, 50_000);
+});
+// --- The route budget reaches the LATE calls of ensureQBVendor ---
+
+/**
+ * ensureQBVendor took a RouteDeadline but only its FIRST query carried it, so
+ * the candidate scan, the create, and the post-6240 re-query each opened a
+ * fresh 20s window. A vendor resolve could therefore run well past the route
+ * ceiling and be killed mid-write, which is the exact failure the shared budget
+ * exists to prevent.
+ *
+ * Each test spends the budget INSIDE the preceding call, then asserts the next
+ * one is never issued. The no-deadline control in the same test is what makes
+ * that meaningful: without it the assertion would also pass on code that made
+ * no call at all.
+ */
+function vendorFetchStub(options: { burnAtCall: number; duplicateFault?: boolean }) {
+    const urls: string[] = [];
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        urls.push(u);
+        if (urls.length === options.burnAtCall) {
+            await new Promise(resolve => setTimeout(resolve, 600));
+        }
+        if (u.includes("/query?query=")) {
+            // Calls 1 and 2 (exact DisplayName, then the LIKE-prefix scan) miss;
+            // a fourth query is the post-6240 re-query, which finds the winner.
+            return new Response(JSON.stringify({ QueryResponse: urls.length > 3 ? { Vendor: [{ Id: "vendor-42" }] } : {} }), { status: 200 });
+        }
+        if (u.includes("/vendor?") && init?.method === "POST") {
+            return options.duplicateFault
+                ? new Response('{"Fault":{"Error":[{"code":"6240"}]}}', { status: 400 })
+                : new Response(JSON.stringify({ Vendor: { Id: "vendor-1" } }), { status: 200 });
+        }
+        throw new Error(`Unexpected fetch in test: ${u}`);
+    }) as unknown as typeof fetch;
+    return { impl, urls };
+}
+
+/** 1.4s of budget, spent by a 600ms call: the next call starts under the 1s floor. */
+const BUDGET_MS = 1_400;
+
+test("ensureQBVendor: the candidate scan is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+
+    const spent = vendorFetchStub({ burnAtCall: 1 });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBVendor(TOKENS, "Home Depot", createRouteDeadline(BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 1, "the LIKE-prefix scan must not be issued");
+
+    // Control: the same stub with no budget reaches the scan.
+    const control = vendorFetchStub({ burnAtCall: 1 });
+    assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-1");
+    assert.equal(control.urls.length, 3);
+    assert.match(decodeURIComponent(control.urls[1]), /DisplayName LIKE 'Home%'/);
+});
+
+test("ensureQBVendor: the create is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+
+    const spent = vendorFetchStub({ burnAtCall: 2 });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBVendor(TOKENS, "Home Depot", createRouteDeadline(BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 2, "no Vendor may be created with no budget left");
+
+    const control = vendorFetchStub({ burnAtCall: 2 });
+    assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-1");
+    assert.equal(control.urls.length, 3);
+    assert.match(control.urls[2], /\/vendor\?/);
+});
+
+test("ensureQBVendor: the post-6240 re-query is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+
+    const spent = vendorFetchStub({ burnAtCall: 3, duplicateFault: true });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBVendor(TOKENS, "Home Depot", createRouteDeadline(BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    // The budget, not the duplicate, is the reason — a re-query that never ran
+    // must not be reported as "no match was found".
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 3, "the re-query must not be issued");
+
+    const control = vendorFetchStub({ burnAtCall: 3, duplicateFault: true });
+    assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-42");
+    assert.equal(control.urls.length, 4);
+});
+
+// -- An EXISTING Purchase is validated, not assumed (round-34 item 2) --------
+
+/**
+ * The finding: the idempotency query selected `Id, PrivateNote`, so a Purchase
+ * that was already in the books was treated as interchangeable with the read
+ * this pass had just done — and book.ts then wrote the Expense from the OCR
+ * values. A v1-cutover Purchase (the Apps Script posted it from its OWN read)
+ * or a Drive revision that kept its fileId therefore left ProBuild's job cost
+ * carrying a total, a date or a job QuickBooks does not have.
+ */
+const TAX_INPUT = {
+    projectName: "Mueller Remodel",
+    vendor: "Home Depot",
+    date: "2026-07-15",
+    totalAmount: 150,
+    groups: [
+        { category: "Receipt (pre-tax)", amount: 137.5 },
+        { category: "Sales tax", amount: 12.5, tax: true },
+    ],
+};
+
+const readBooked = (over: Record<string, unknown> = {}) =>
+    readBookedPurchase(bookedPurchase(over), TAX_ACCOUNT_ID);
+
+test("the idempotency query asks for the WHOLE Purchase, not two fields", async () => {
+    const input = baseInput();
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps, calls } = createDeps({ existingRows: [bookedPurchase({ PrivateNote: `note ${marker}` })] });
+    await createQBReceiptPurchase(TOKENS, input, deps);
+    // QBO cannot return a nested Line / EntityRef from a field list.
+    assert.match(calls.queries[0], /^SELECT \* FROM Purchase WHERE DocNumber = /);
+});
+
+test("a Purchase that agrees is a match, and books unchanged", () => {
+    const check = compareExistingPurchase(readBooked(), baseInput());
+    assert.equal(check.verdict, "match");
+    assert.deepEqual(check.differences, []);
+});
+
+test("AMOUNT: a difference is DERIVED from the books, never taken from the read", () => {
+    // Real money posted against QBO's number. The disagreement is OCR noise on
+    // our side, so the books win and the Expense records what was actually paid.
+    const check = compareExistingPurchase(readBooked({ TotalAmt: 162.75 }), baseInput());
+    assert.equal(check.verdict, "derive");
+    assert.deepEqual(check.differences, ["amount"]);
+    assert.equal(check.booked.totalAmount, 162.75);
+});
+
+test("AMOUNT: a sub-tolerance difference is not a difference at all", () => {
+    // Two cents, the same tolerance the group/total reconciliation allows: a
+    // two-line tax split can round each half independently.
+    for (const total of [150.01, 149.98, 150.02]) {
+        assert.equal(compareExistingPurchase(readBooked({ TotalAmt: total }), baseInput()).verdict, "match", String(total));
+    }
+    assert.equal(compareExistingPurchase(readBooked({ TotalAmt: 150.03 }), baseInput()).verdict, "derive");
+});
+
+test("DATE and VENDOR differences are derived too", () => {
+    const date = compareExistingPurchase(readBooked({ TxnDate: "2026-07-11" }), baseInput());
+    assert.deepEqual([date.verdict, date.differences, date.booked.txnDate], ["derive", ["date"], "2026-07-11"]);
+
+    const vendor = compareExistingPurchase(
+        readBooked({ EntityRef: { value: "v9", name: "The Home Depot #4712" } }),
+        baseInput(),
+    );
+    assert.deepEqual([vendor.verdict, vendor.differences], ["derive", ["vendor"]]);
+    // Case and spacing are not identity.
+    const same = compareExistingPurchase(readBooked({ EntityRef: { value: "v1", name: "  home   depot " } }), baseInput());
+    assert.equal(same.verdict, "match");
+});
+
+test("PROJECT: a different job is a REVIEW — nothing may pick a side automatically", () => {
+    // Which job carries the cost is an attribution decision, not noise. Deriving
+    // it would silently move money between jobs; using the read would file it
+    // under a job the books disagree with.
+    const check = compareExistingPurchase(
+        readBooked({
+            Line: [{
+                Amount: 150,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: EXPENSE_ACCOUNT_ID },
+                    CustomerRef: { value: "cust-9", name: "Mesplay Kitchen" },
+                },
+            }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(check.booked.projectNames, ["Mesplay Kitchen"]);
+});
+
+test("PROJECT: lines split across TWO jobs is an ambiguity, and also a review", () => {
+    const check = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { Amount: 75, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mueller Remodel" } } },
+                { Amount: 75, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mesplay Kitchen" } } },
+            ],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.booked.projectNames.sort(), ["Mesplay Kitchen", "Mueller Remodel"]);
+});
+
+test("TAX: a split the books do not have is a review, not a derive", () => {
+    // The reseller-permit reclaim is a state filing. Whether this document's
+    // sales tax is sitting on the reclaimable account is a fact about the books
+    // that a human has to reconcile, not a number to copy either way.
+    const noSplit = compareExistingPurchase(readBooked(), TAX_INPUT);
+    assert.equal(noSplit.verdict, "review");
+    assert.deepEqual(noSplit.differences, ["tax"]);
+    assert.equal(noSplit.booked.taxAmount, 0);
+
+    // The control: the same document against a Purchase that DOES carry the
+    // split on the tax account books clean.
+    const split = compareExistingPurchase(
+        readBooked({
+            Line: [
+                // BOTH lines carry the customer ID, not just its display name:
+                // a name is not an identity, and the tax line is money too.
+                { Amount: 137.5, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { value: "cust-1", name: "Mueller Remodel" } } },
+                { Amount: 12.5, AccountBasedExpenseLineDetail: { AccountRef: { value: TAX_ACCOUNT_ID }, CustomerRef: { value: "cust-1", name: "Mueller Remodel" } } },
+            ],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(split.verdict, "match");
+    assert.equal(split.booked.taxAmount, 12.5);
+});
+
+test("an UNREADABLE total or date is a review — never a silent pass", () => {
+    // QBO returns both on every Purchase, so their absence means we are not
+    // looking at what we think we are. "I could not check" must not read the
+    // same as "I checked and it agrees" on the path that decides what a real
+    // Expense records.
+    for (const over of [{ TotalAmt: undefined }, { TotalAmt: "n/a" }, { TotalAmt: 0 }]) {
+        const check = compareExistingPurchase(readBooked(over), baseInput());
+        assert.equal(check.verdict, "review", JSON.stringify(over));
+        assert.ok(check.differences.includes("amount"));
+    }
+    for (const over of [{ TxnDate: undefined }, { TxnDate: "07/15/2026" }, { TxnDate: "2026-02-31" }]) {
+        const check = compareExistingPurchase(readBooked(over), baseInput());
+        assert.equal(check.verdict, "review", JSON.stringify(over));
+        assert.ok(check.differences.includes("date"));
+    }
+});
+
+test("a VENDOR ref with no display name is not comparable, and is not a mismatch", () => {
+    // QBO documents `name` on a ReferenceType as optional, so its absence is a
+    // fact about the response shape rather than about the books. The vendor is
+    // a DERIVE field — QuickBooks wins it outright — so nothing is lost by
+    // skipping a comparison that cannot be made.
+    const check = compareExistingPurchase(
+        readBooked({ EntityRef: { value: "vendor-1" } }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "match");
+    assert.equal(check.booked.vendor, null);
+});
+
+test("a CUSTOMER ref with no display name is a REVIEW: the job was never confirmed", () => {
+    // The job is not a derive field, and this is the half of the old rule that
+    // was wrong. An id with no name says the lines agree with EACH OTHER; it
+    // says nothing about whether they agree with this receipt, and the expected
+    // customer's id is not known on the replay branch (resolving it there would
+    // CREATE a QBO customer). "I could not check" must not read the same as "I
+    // checked and it agrees" — the same rule the total and the date already
+    // follow.
+    const check = compareExistingPurchase(
+        readBooked({
+            Line: [{ Amount: 150, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { value: "cust-1" } } }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(check.booked.projectNames, []);
+});
+
+// -- Attribution is PER LINE, not "one line agreed" (round-35 P1) ------------
+
+/**
+ * The finding: the project check ran only `if (projectNames.length > 0)` and
+ * built that list from the lines that HAD a readable customer name. A Purchase
+ * that was only partly coded therefore passed on the strength of its coded
+ * half, and one that was not coded at all skipped the check entirely — and
+ * book.ts then wrote a real Expense for the WHOLE amount against a job
+ * QuickBooks does not carry it under.
+ */
+function linesOf(...lines: Record<string, unknown>[]) {
+    return readBooked({ Line: lines });
+}
+
+const CODED = {
+    Amount: 100,
+    AccountBasedExpenseLineDetail: {
+        AccountRef: { value: EXPENSE_ACCOUNT_ID },
+        CustomerRef: { value: "cust-1", name: "Mueller Remodel" },
+    },
+};
+/** The line with no CustomerRef at all: real money on this Purchase, on no job. */
+const UNCODED = {
+    Amount: 50,
+    AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID } },
+};
+
+test("ALL lines coded to this job books clean", () => {
+    const check = compareExistingPurchase(linesOf(CODED, { ...CODED, Amount: 50 }), baseInput());
+    assert.equal(check.verdict, "match");
+    assert.deepEqual(check.differences, []);
+});
+
+test("ONE coded line plus an UNCODED one is a review — the old rule called this a match", () => {
+    // $100 on the job, $50 on nothing, and the Expense would have been written
+    // for the full $150 against the job.
+    const check = compareExistingPurchase(linesOf(CODED, UNCODED), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(
+        check.booked.lines.map(l => l.customerId),
+        ["cust-1", null],
+        "the uncoded line is RECORDED, not dropped — that is what the name set could not do",
+    );
+});
+
+test("ZERO coded lines is a review — the old rule skipped the check entirely", () => {
+    const check = compareExistingPurchase(linesOf(UNCODED, { ...UNCODED, Amount: 100 }), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(check.booked.projectNames, [], "nothing to build the old rule's list from");
+});
+
+test("all coded, one to a DIFFERENT customer, is a review", () => {
+    const other = {
+        Amount: 50,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { value: "cust-9", name: "Mesplay Kitchen" },
+        },
+    };
+    const check = compareExistingPurchase(linesOf(CODED, other), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+});
+
+test("identity is compared on CustomerRef.value, so two customers sharing a NAME is still a review", () => {
+    // Two QBO customers can carry the same display name — a sub-customer under
+    // a different parent, a duplicate nobody merged. The name comparison alone
+    // cannot see it.
+    const twin = {
+        Amount: 50,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { value: "cust-2", name: "Mueller Remodel" },
+        },
+    };
+    const check = compareExistingPurchase(linesOf(CODED, twin), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+});
+
+test("an UNCODED TAX line is a REVIEW: reclaimable tax is money on a job too", () => {
+    // This test used to assert the opposite — that the reclaimable account was
+    // attribution enough and a tax line needed no customer. It is not: the
+    // Purchase's whole gross is then recorded against the project the OTHER
+    // lines name, including a tax split nobody attributed to it. Tax was
+    // excluded from the "is this line coded at all" guard entirely, so it was
+    // the one kind of money that could ride along unassigned.
+    const taxLine = { Amount: 12.5, AccountBasedExpenseLineDetail: { AccountRef: { value: TAX_ACCOUNT_ID } } };
+    const uncodedTax = compareExistingPurchase(
+        readBooked({
+            Line: [{ ...CODED, Amount: 137.5 }, taxLine],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(uncodedTax.verdict, "review");
+    assert.ok(uncodedTax.differences.includes("project"));
+
+    // THE CONTROL: the same split with the tax line CODED books clean, so this
+    // is not a rule that simply refuses every tax split.
+    const ok = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { ...CODED, Amount: 137.5 },
+                {
+                    Amount: 12.5,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: TAX_ACCOUNT_ID },
+                        CustomerRef: { value: "cust-1", name: "Mueller Remodel" },
+                    },
+                },
+            ],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(ok.verdict, "match");
+
+    const wrongJob = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { ...CODED, Amount: 137.5 },
+                {
+                    Amount: 12.5,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: TAX_ACCOUNT_ID },
+                        CustomerRef: { value: "cust-9", name: "Mesplay Kitchen" },
+                    },
+                },
+            ],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(wrongJob.verdict, "review");
+    assert.ok(wrongJob.differences.includes("project"));
+});
+
+test("a line shape this code cannot read is a review, never a silent skip", () => {
+    // An item-based expense line, a v1-cutover Purchase, anything without an
+    // AccountBasedExpenseLineDetail: there is no CustomerRef to find, and the
+    // money on it is real.
+    const itemBased = {
+        Amount: 50,
+        DetailType: "ItemBasedExpenseLineDetail",
+        ItemBasedExpenseLineDetail: { ItemRef: { value: "item-1" } },
+    };
+    const check = compareExistingPurchase(linesOf(CODED, itemBased), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.equal(check.booked.lines[1].readable, false);
+});
+
+test("a Purchase with NO lines at all is a review", () => {
+    const check = compareExistingPurchase(readBooked({ Line: [] }), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+});
+
+test("a REVIEW outranks a DERIVE when both kinds of difference are present", () => {
+    const check = compareExistingPurchase(
+        readBooked({
+            TotalAmt: 999,
+            Line: [{ Amount: 999, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mesplay Kitchen" } } }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["amount", "project"]);
+});
+
+// ── EVERY monetary line carries the customer id (Codex round-16 item 2) ────
+//
+// The old rule let one NAMED line validate a Purchase while other money sat
+// unassigned, and the worker then recorded the whole gross against that
+// project. Three shapes got through; each is a test below, each with the
+// control that proves the rule is not simply "refuse everything".
+
+test("ONE CODED + ONE UNCODED line is a review, not a match", () => {
+    // The headline case: real money on this Purchase, on no job at all, waved
+    // through because a sibling line named the right one.
+    const mixed = compareExistingPurchase(
+        readBooked({ Line: [{ ...CODED, Amount: 60 }, { ...UNCODED, Amount: 40 }] }),
+        baseInput(),
+    );
+    assert.equal(mixed.verdict, "review");
+    assert.ok(mixed.differences.includes("project"));
+});
+
+test("a NAME without an id is not attribution — a name is not an identity", () => {
+    // The pre-fix hole: the "is this line coded at all" guard was
+    // `!tax && !customerId && !customerName`, so a display name alone
+    // satisfied it. QBO's `name` on a ReferenceType is documented optional and
+    // is a label, not a key.
+    const namedOnly = {
+        Amount: 100,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { name: "Mueller Remodel" },
+        },
+    };
+    const check = compareExistingPurchase(readBooked({ Line: [namedOnly] }), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.ok(check.differences.includes("project"));
+
+    // CONTROL: the same line WITH the id books clean.
+    const withId = compareExistingPurchase(readBooked({ Line: [{ ...CODED }] }), baseInput());
+    assert.equal(withId.verdict, "match");
+});
+
+test("ZERO ids across every line is an absence, not agreement", () => {
+    // `ids.size <= 1` was satisfied by an EMPTY set, so a Purchase whose lines
+    // carried names and no ids passed with nothing pinned at all.
+    const allNamed = [0, 1].map(i => ({
+        Amount: 50,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { name: "Mueller Remodel" },
+        },
+        _i: i,
+    }));
+    const check = compareExistingPurchase(readBooked({ Line: allNamed }), baseInput());
+    assert.equal(check.verdict, "review");
+
+    // HONEST NOTE ON `ids.size === 1`: the per-line `!line.customerId` guard
+    // now rejects this shape before the size is ever consulted, so the change
+    // from `<= 1` to `=== 1` is belt-and-braces rather than an independently
+    // load-bearing guard — a mutation back to `<= 1` alone changes nothing
+    // observable. It is written as `=== 1` because that is what the rule
+    // means, and so that relaxing the per-line guard cannot silently reopen
+    // the empty-set hole. Asserted here as a source fact, not a behaviour.
+    const src = readFileSync(path.join(__dirname, "..", "src/lib/qbo-receipt-push.ts"), "utf8");
+    assert.match(src, /return ids\.size === 1 && confirmedByName;/);
+    assert.match(src, /if \(!line\.customerId\) return false;/);
+});
+
+test("TWO DIFFERENT customer ids is still a review — the split-across-jobs case", () => {
+    // Unchanged behaviour, asserted so the `=== 1` tightening cannot be read
+    // as having relaxed anything.
+    const split = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { ...CODED, Amount: 50 },
+                {
+                    Amount: 50,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: EXPENSE_ACCOUNT_ID },
+                        CustomerRef: { value: "cust-2", name: "Mueller Remodel" },
+                    },
+                },
+            ],
+        }),
+        baseInput(),
+    );
+    assert.equal(split.verdict, "review");
+});
+
+test("ALL lines coded to one confirmed job is a match — the control", () => {
+    // Without this, a rule that refused every existing Purchase would pass
+    // every assertion above.
+    const ok = compareExistingPurchase(
+        readBooked({ Line: [{ ...CODED, Amount: 50 }, { ...CODED, Amount: 50 }] }),
+        baseInput(),
+    );
+    assert.equal(ok.verdict, "match");
+    assert.deepEqual(ok.differences, []);
 });
 
 
@@ -2231,7 +2844,12 @@ test("two simultaneous pushes of one file upload the attachment ONCE and agree o
 
     assert.equal(order.length, 2, "both deliveries went through the per-file lock");
     assert.equal(uploads.length, 1, "the receipt image is uploaded exactly once");
-    assert.deepEqual(uploads[0], { purchaseId: "77", fileName: "receipt.jpg" });
+    // The uploaded name is this branch's STABLE one (fileId-derived), not the
+    // caller's raw "receipt.jpg"  see the collision test above.
+    assert.deepEqual(uploads[0], {
+        purchaseId: "77",
+        fileName: stableAttachmentFileName(input.fileId, input.fileName),
+    });
     assert.equal(first.ok && first.qbPurchaseId, "77");
     assert.equal(second.ok && second.qbPurchaseId, "77");
     // One of the two ran first and created; the other found the committed

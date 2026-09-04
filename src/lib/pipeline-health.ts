@@ -1,5 +1,6 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { STAGING_SWEEP_MINUTES } from "./receipt-intake/worker";
 import {
     PAID_DELETION_UNRESOLVABLE,
     PAYLINK_MISSING_MARKER,
@@ -113,6 +114,51 @@ export interface PipelineHealth {
     /** Automation events (ANY kind) that errored in the last 24h. */
     stuck: CountProbe;
     /**
+     * Receipt Pipeline v2 (ReceiptIntake). Every other probe here reads
+     * AutomationEvent, which only ever records a BOOKING — so a v2 row that
+     * never reaches QuickBooks is invisible to all of them. A jammed intake
+     * queue reported a perfectly healthy pipeline right up until somebody
+     * noticed the expenses were missing.
+     */
+    intake: {
+        /**
+         * Three shapes of "the worker stopped": RECEIVED/BOOKING overdue,
+         * STAGING overdue (the route died mid-upload, or the sweeper is dead),
+         * and live READ overdue (a worker that died right after routing).
+         */
+        stuck: CountProbe;
+        /** NEEDS_REVIEW backlog. Reported always; a reason only when rows are STUCK. */
+        needsReview: CountProbe;
+        /**
+         * NEEDS_JOB rows older than INTAKE_STUCK_HOURS — a receipt nobody has
+         * matched to a job. Terminal for the worker, so it can pile up
+         * indefinitely while every other probe reads green: the exact
+         * silent-failure mode this whole check exists to eliminate. Only the
+         * OVERDUE ones count, so a receipt uploaded ten minutes ago is not an
+         * alert.
+         */
+        unassigned: CountProbe;
+        /**
+         * TERMINAL, UNBOOKED, AND WAITING ON A PERSON — the states nothing
+         * else here can see.
+         *
+         * Enumerated from RECEIPT_INTAKE_STATES rather than guessed at.
+         * STAGING/RECEIVED/READ/BOOKING are working states (`stuck` covers
+         * them); BOOKED and ARCHIVED reached QuickBooks; SHADOW_DONE was
+         * booked by v1; DUPLICATE and NON_RECEIPT are decided answers that
+         * deliberately never book; NEEDS_REVIEW and NEEDS_JOB have their own
+         * probes above; VOID has no writer anywhere in the codebase. That
+         * leaves SHADOW_QUARANTINE, which the cutover creates for a
+         * pre-boundary row with no evidence v1 booked it and no Drive identity
+         * to make a v2 booking idempotent. It is terminal, it is NEVER
+         * auto-requeued, and it is an expense that has reached nobody's books
+         * — so a queue of them could grow indefinitely while every other probe
+         * read green, which is the exact silent failure this check exists to
+         * eliminate.
+         */
+        quarantined: CountProbe;
+    };
+    /**
      * Events in the last 24h where QuickBooks refused the CREDENTIAL (401/403,
      * or a refresh that stranded). Optional so an older snapshot still fits.
      */
@@ -145,6 +191,24 @@ export interface PipelineHealth {
     /** Last successful maintenance cron; stale means nothing is working those queues. */
     maintenanceRun?: { status: ProbeStatus; reason?: ProbeFailure; at: string | null };
 }
+
+/** A row this old in a working state has not been picked up, it has jammed. */
+export const INTAKE_STUCK_HOURS = 6;
+/**
+ * STAGING is meant to last one HTTP request. Half an hour of it means the
+ * intake route died mid-upload or the sweeper is not running — and since
+ * STAGING is invisible to the worker's claim by design, nothing else would
+ * ever notice.
+ *
+ * ROW AGE ALONE IS THE WRONG QUESTION, same as it is for the sweeper's own
+ * "is this row stuck" call (worker.ts's uploadLeaseActive). A signed upload
+ * URL is valid for two hours (SIGNED_UPLOAD_TTL_MS), and a resumed /start
+ * re-issues one on an EXISTING row without touching createdAt — so a client
+ * on a slow connection, still inside its own upload window, used to get
+ * flagged "stuck" here while its upload was about to land. The count below
+ * only counts a STAGING row past this age AND past its own upload lease.
+ */
+export const INTAKE_STAGING_STUCK_MINUTES = 30;
 
 /**
  * Intuit's own status page.
@@ -320,6 +384,14 @@ export function evaluatePipelineHealth(input: {
     receipts24h: CountsProbe;
     bank: TimestampProbe;
     stuck: CountProbe;
+    intakeStuck: CountProbe;
+    intakeNeedsReview: CountProbe;
+    intakeUnassigned: CountProbe;
+    /**
+     * Optional so an older caller (or a stored snapshot) still evaluates. An
+     * ABSENT probe is silent; a probe that ran and found rows is a reason.
+     */
+    intakeQuarantined?: CountProbe;
     /** Optional so existing snapshots stay valid; absent means "not measured". */
     qboAuth?: CountProbe;
     /**
@@ -355,6 +427,10 @@ export function evaluatePipelineHealth(input: {
         ["receipts24h", input.receipts24h],
         ["bank", input.bank],
         ["stuck", input.stuck],
+        ["intakeStuck", input.intakeStuck],
+        ["intakeNeedsReview", input.intakeNeedsReview],
+        ["intakeUnassigned", input.intakeUnassigned],
+        ...(input.intakeQuarantined ? [["intakeQuarantined", input.intakeQuarantined] as [string, { status: ProbeStatus }]] : []),
         ["payLinksPending", input.payLinksPending],
     ];
     for (const [name, probe] of namedProbes) {
@@ -419,6 +495,38 @@ export function evaluatePipelineHealth(input: {
         // Includes attachment-failed: a receipt that never reached QuickBooks
         // is a failure someone has to act on, not a footnote.
         reasons.push(`errors-24h:${input.stuck.count}`);
+    }
+
+    // A row sitting in RECEIVED/BOOKING/STAGING or live READ past its fuse means
+    // the worker is not draining the queue — a wedged cron, an exhausted retry
+    // budget, a storage outage. The backlog number rides along so the digest can
+    // say how big the hole is, but only the STUCK count is a failure:
+    // NEEDS_REVIEW rows are working as designed (a human was asked a question)
+    // and would otherwise hold the pipeline red until somebody cleared them.
+    if (input.intakeStuck.status === "ok" && input.intakeStuck.count > 0) {
+        const backlog =
+            input.intakeNeedsReview.status === "ok" ? `,needs-review:${input.intakeNeedsReview.count}` : "";
+        reasons.push(`intake-stuck:${input.intakeStuck.count}${backlog}`);
+    }
+
+    // A receipt waiting hours for someone to say which job it belongs to is not
+    // "working as designed" — it is an expense that will never reach job cost.
+    // Its own reason, because the fix is different: assign a project, not
+    // restart a worker.
+    if (input.intakeUnassigned.status === "ok" && input.intakeUnassigned.count > 0) {
+        reasons.push(`intake-unassigned:${input.intakeUnassigned.count}`);
+    }
+
+    // A quarantined shadow-week row is a receipt the cutover could neither
+    // retire nor hand to v2, so NOBODY has booked it and nothing will until a
+    // person checks QuickBooks and uses "book anyway". Terminal and never
+    // auto-requeued, which is precisely why it needs its own reason: unlike
+    // the NEEDS_REVIEW backlog it is not "working as designed", and unlike a
+    // stuck row no restart clears it. It is also not covered by ANY other
+    // probe here — the count is why the spec's claim that these rows are
+    // visible via pipeline health is true rather than aspirational.
+    if (input.intakeQuarantined?.status === "ok" && input.intakeQuarantined.count > 0) {
+        reasons.push(`receipt-quarantine:${input.intakeQuarantined.count}`);
     }
 
     if (input.lastPaymentsSync.status === "ok") {
@@ -705,7 +813,9 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
 
     const [
         intuit, lastPurchase, purchaseSyncRun, lastPush, lastPaymentsSync, receiptRows,
-        lastBankLine, stuck, qboAuth, payLinksPending,
+        lastBankLine, stuck,
+        intakeStuck, intakeNeedsReview, intakeUnassigned, intakeQuarantined,
+        qboAuth, payLinksPending,
         payLinksMissing, parkedCreates, parkedDocumentSyncs, pendingDeletions, unreconciledMoney, maintenanceRun,
     ] = await Promise.all([
         fetchIntuitStatus(),
@@ -838,6 +948,82 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                     ],
                 },
             }),
+            0,
+        ),
+        // ReceiptIntake: the v2 queue. Three shapes of "the worker stopped",
+        // all of which used to read green:
+        //   RECEIVED/BOOKING overdue — the classic jam.
+        //   STAGING overdue          — the route died mid-upload, or the sweeper
+        //                              is dead. STAGING is invisible to the
+        //                              claim by design, so nothing else notices.
+        //   READ overdue, LIVE only  — a worker that died right after routing
+        //                              leaves a bookable row parked forever.
+        //                              dryRun rows legitimately REST in READ for
+        //                              the whole shadow week, so they are
+        //                              excluded or the check is red by design.
+        probe<number>(
+            "intakeStuck",
+            () =>
+                prisma.receiptIntake.count({
+                    where: {
+                        OR: [
+                            {
+                                state: { in: ["RECEIVED", "BOOKING"] },
+                                createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * HOUR_MS) },
+                            },
+                            {
+                                state: "STAGING",
+                                createdAt: { lt: new Date(now - INTAKE_STAGING_STUCK_MINUTES * 60_000) },
+                                // NOT uploadLeaseActive, expressed as a query
+                                // rather than called as a predicate (this is
+                                // an aggregate count, not a row scan): a live
+                                // lease means either an explicit expiry that
+                                // has not passed yet, or — for the inline,
+                                // no-signed-URL path — a row young enough to
+                                // still be inside the sweeper's own grace
+                                // window. A STAGING row satisfying either is
+                                // still on the clock, not stuck.
+                                OR: [
+                                    { uploadUrlExpiresAt: { lte: new Date(now) } },
+                                    {
+                                        uploadUrlExpiresAt: null,
+                                        createdAt: { lt: new Date(now - STAGING_SWEEP_MINUTES * 60_000) },
+                                    },
+                                ],
+                            },
+                            {
+                                state: "READ",
+                                dryRun: false,
+                                createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * HOUR_MS) },
+                            },
+                        ],
+                    },
+                }),
+            0,
+        ),
+        probe<number>(
+            "intakeNeedsReview",
+            () => prisma.receiptIntake.count({ where: { state: "NEEDS_REVIEW" } }),
+            0,
+        ),
+        probe<number>(
+            "intakeUnassigned",
+            () =>
+                prisma.receiptIntake.count({
+                    where: {
+                        state: "NEEDS_JOB",
+                        createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * HOUR_MS) },
+                    },
+                }),
+            0,
+        ),
+        // NO AGE THRESHOLD, unlike NEEDS_JOB. A quarantined row is terminal the
+        // instant the cutover writes it — nothing is coming to move it on — so
+        // "wait six hours in case it resolves itself" would be waiting for
+        // something that cannot happen.
+        probe<number>(
+            "intakeQuarantined",
+            () => prisma.receiptIntake.count({ where: { state: "SHADOW_QUARANTINE" } }),
             0,
         ),
         // Separate from `stuck` on purpose: this one names the fix.
@@ -982,6 +1168,22 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             at: lastBankLine.value?.toISOString() ?? null,
         },
         stuck: { status: stuck.status, reason: stuck.reason, count: stuck.value },
+        intakeStuck: { status: intakeStuck.status, reason: intakeStuck.reason, count: intakeStuck.value },
+        intakeNeedsReview: {
+            status: intakeNeedsReview.status,
+            reason: intakeNeedsReview.reason,
+            count: intakeNeedsReview.value,
+        },
+        intakeUnassigned: {
+            status: intakeUnassigned.status,
+            reason: intakeUnassigned.reason,
+            count: intakeUnassigned.value,
+        },
+        intakeQuarantined: {
+            status: intakeQuarantined.status,
+            reason: intakeQuarantined.reason,
+            count: intakeQuarantined.value,
+        },
         qboAuth: { status: qboAuth.status, reason: qboAuth.reason, count: qboAuth.value },
         payLinksPending: { status: payLinksPending.status, reason: payLinksPending.reason, count: payLinksPending.value },
         payLinksMissing: { status: payLinksMissing.status, reason: payLinksMissing.reason, count: payLinksMissing.value },
@@ -1007,6 +1209,12 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         receipts24h: snapshot.receipts24h,
         bank: snapshot.bank,
         stuck: snapshot.stuck,
+        intake: {
+            stuck: snapshot.intakeStuck,
+            needsReview: snapshot.intakeNeedsReview,
+            unassigned: snapshot.intakeUnassigned,
+            quarantined: snapshot.intakeQuarantined,
+        },
         qboAuth: snapshot.qboAuth,
         payLinksPending: snapshot.payLinksPending,
         payLinksMissing: snapshot.payLinksMissing,
@@ -1075,6 +1283,24 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
                     : "no lines"
         }`,
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
+        // Optional-chained on purpose: a digest that THROWS means no morning
+        // email at all, which is strictly worse than a digest missing a line.
+        // Same rule as "no probe may throw" above.
+        `Receipt intake stuck >${INTAKE_STUCK_HOURS}h: ${
+            health.intake?.stuck?.status === "error" ? "unavailable (probe failed)" : health.intake?.stuck?.count ?? "unavailable"
+        }`,
+        `Receipt intake awaiting review: ${
+            health.intake?.needsReview?.status === "error" ? "unavailable (probe failed)" : health.intake?.needsReview?.count ?? "unavailable"
+        }`,
+        `Receipt intake awaiting a job (>${INTAKE_STUCK_HOURS}h): ${
+            health.intake?.unassigned?.status === "error" ? "unavailable (probe failed)" : health.intake?.unassigned?.count ?? "unavailable"
+        }`,
+        // Its own line, not folded into "awaiting review": a quarantined row
+        // needs somebody to check QuickBooks and decide, which is a different
+        // action from clearing a review item.
+        `Receipt intake quarantined (cutover, needs a decision): ${
+            health.intake?.quarantined?.status === "error" ? "unavailable (probe failed)" : health.intake?.quarantined?.count ?? "unavailable"
+        }`,
     ];
     if (health.payLinksMissing?.status === "ok" && health.payLinksMissing.count > 0) {
         lines.push(`${health.payLinksMissing.count} QuickBooks invoice(s) have NO payable link after repeated retries — open them in QuickBooks and enable payments by hand.`);

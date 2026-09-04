@@ -99,7 +99,18 @@ model ReceiptIntake {
   createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
 
   // file (Supabase secure-docs, private)
-  storagePath String  // receipts/intake/<id>.<ext> in SECURE_BUCKET
+  storagePath String  // receipts/intake/<id>.<ext> in the `receipt-intake` bucket
+  // When the signed upload URL /intake/start last issued stops working. The
+  // sweeper uses THIS, not createdAt: a row whose URL was re-issued is older
+  // than its lease, and judging it on row age parked receipts whose own upload
+  // link was still live. Null on rows that never had a signed URL.
+  uploadUrlExpiresAt DateTime?
+  // Bumped every time a signed upload URL is issued, and EMBEDDED IN THE PATH
+  // that URL points at (`receipts/intake/<id>.v<n>.<ext>`). /start claims the
+  // new lease in ONE checked update before it signs anything; every park,
+  // publish and reject fences on the version it observed. That is what makes a
+  // sweep verdict about v1 land on nothing once the client has resumed on v2.
+  uploadLeaseVersion Int       @default(0)
   fileName    String?
   mimeType    String
   fileSize    Int
@@ -158,6 +169,8 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
   "suggestedConfidence" DOUBLE PRECISION, "createdById" TEXT,
   "storagePath" TEXT NOT NULL, "fileName" TEXT, "mimeType" TEXT NOT NULL,
   "fileSize" INTEGER NOT NULL, "fileSha256" TEXT NOT NULL,
+  "expectedSha256" TEXT, "uploadUrlExpiresAt" TIMESTAMP(3),
+  "uploadLeaseVersion" INTEGER NOT NULL DEFAULT 0,
   "vendor" TEXT, "txnDate" DATE, "totalCents" INTEGER, "taxCents" INTEGER,
   "docType" TEXT, "refNumber" TEXT, "memo" TEXT, "readJson" TEXT, "readAt" TIMESTAMP(3),
   "dedupStrongKey" TEXT, "dedupWeakKey" TEXT, "duplicateOfId" TEXT,
@@ -184,7 +197,24 @@ CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx" ON "ReceiptIntake"("cre
 --   expenseId  -> "Expense"(id)  ON DELETE SET NULL
 ```
 
-Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2).
+Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2):
+
+```bash
+SUPABASE_URL=... SUPABASE_SERVICE_KEY=...   node scripts/apply-receipt-intake.mjs --target prod --yes --expect-db postgres --expect-host <host>
+```
+
+It does BOTH halves of the rollout and verifies each:
+
+1. **Schema** — additive, idempotent DDL, then a shape check (every column, the CHECK
+   constraint, the FKs, and the partial unique index verified by its DEFINITION, not its
+   name).
+2. **Storage** — creates the private `receipt-intake` bucket, or verifies the existing one.
+   It exits nonzero on a different file-size limit, a different MIME allow-list, or a public
+   bucket, and never rewrites one.
+
+Both halves are safe to re-run. The bucket step needs `SUPABASE_URL` and
+`SUPABASE_SERVICE_KEY`; without them the script refuses rather than skipping it, because a
+missing bucket policy is invisible until a 400 MB object is already stored.
 
 ## 3. Endpoint contracts
 
@@ -201,7 +231,7 @@ Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2).
   `threadName?`) or JSON `{fileBase64, mimeType, fileName?, source, sourceRef?, projectId?,
   costCodeId?, threadName?}`. `source` in mobile|email|drive|chat|web. Machine callers MUST
   send `sourceRef`; session/Bearer callers get `web:<uuid>` / `mobile:<uuid>` minted
-  server-side. Max 15 MB. Accept pdf/jpeg/png/heic/webp/gif/txt; sniff magic bytes for
+  server-side. Max 8 MiB (QuickBooks' attachment ceiling). Accept pdf/jpeg/png/heic/webp/gif; sniff magic bytes for
   images the way `receipts/parse` does (route.ts:37).
 - **Behavior**: sha256 the bytes; create the row (catch P2002 on `sourceRef` and return the
   existing row with `{ok:true, alreadyReceived:true}`); upload to `SECURE_BUCKET` at
@@ -282,8 +312,15 @@ Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2).
      of the same file), else the intake `id`; `fileBase64` via
      `downloadDocBytes(storagePath)`; `projectName` = project.name.
   5. On `ok:true`, one transaction: create `Expense` (estimateId; costCodeId = chosen, else
-     `matchCostCode(suggestedPhaseCode)`; amount = pre-tax amount when tax was split, else
-     total — mirrors the QBO COGS line; vendor; date=txnDate; status "Pending"; receiptUrl
+     `matchCostCode(suggestedPhaseCode)`; **amount = the GROSS total paid, tax INCLUDED**
+     (Justin, 2026-09-01 — this REPLACES the "pre-tax" rule this line used to state; see
+     the as-built note in §7); vendor; date=txnDate; **status "Reviewed"** (as-built — not
+     "Pending": the row is created WITH `qbPurchaseId` already set, so it is QBO-managed
+     from birth exactly like a QBO import, and `assertExpenseMutableOutsideQbo`
+     (`qbo-expense-guard.ts`) rejects approve/edit/delete on anything carrying a
+     `qbPurchaseId`. A booked-then-"Pending" row would sit in the bookkeeper queue's
+     actionable list (`manager/receipts/page.tsx` lists `status: "Pending"`) with no route
+     able to act on it — "Pending" is not a reachable state for a booked row); receiptUrl
      = Drive view URL when a Drive fileId is known, else the `secure:` ref; qbPurchaseId)
      and set the row BOOKED {qbPurchaseId, expenseId, bookedAt}. Also log one
      `AutomationEvent {kind:"receipt-push", source:"intake-worker"}` so the /automation
@@ -341,6 +378,379 @@ All gated on Script Property `V2_FORWARD === "true"`; all send `x-receipt-intake
   original for v1 to process as usual. The move-to-`_Forwarded` branch (which hides the
   file from v1) activates only under a second property `V2_LIVE === "true"` at cutover.
 
+### As-built notes (2026-09-01) — where the implementation differs from the plan above
+
+The Apps Script side is a separate PR in `qbo-clasp`. The endpoint contract it must code
+against is the one above, with these six clarifications from the build:
+
+1. **`GET /api/receipts/intake` accepts the shared secret as well as a staff session.**
+   §3 said staff-only, but §6's nightly mirror polls `?state=BOOKED` with
+   `x-receipt-intake-secret` — it has no session to present. A SESSION caller still needs
+   ADMIN | MANAGER | FINANCE (403 otherwise); the secret caller is the mirror.
+2. **`POST /api/receipts/intake/<id>/archived` is also on the proxy's public bypass**,
+   spelled out as its own exact pattern (`/api/receipts/intake/[^/]+/archived`). It is a
+   DESCENDANT of the intake path, and the intake bypass is exact-match on purpose, so
+   without its own entry the proxy would answer the mirror with a 307 to /login. The
+   route is secret-only: a session, however privileged, is refused, because only the
+   mirror can know that a file now exists in Drive. It is also state-conditional
+   (`updateMany WHERE state = 'BOOKED'`), so two mirror runs racing one row cannot both
+   claim the transition — the loser gets 409.
+3. **`threadName` is accepted and NOT persisted.** The chat forwarder should keep sending
+   it, but `memo` belongs to the read step (it holds a check's handwritten memo line) and
+   there is no other column for it yet. Phase 2 adds one when the queue page needs to link
+   back to the thread.
+4. **The phase suggestion is resolved to `suggestedCostCodeId` at READ time**, not at
+   booking, using the same `matchCostCode` the v1 ingest uses. Booking then takes
+   `costCodeId ?? suggestedCostCodeId`. Same outcome as §4 step 5, but the suggestion is
+   visible in the queue before anything books.
+5. **A non-Drive row's intake id is a UUIDv4**, so its QBO DocNumber is the first 21
+   characters of that UUID (risk 5 above, unchanged in substance — the PrivateNote marker
+   check in `createQBReceiptPurchase` still turns any truncation collision into a
+   `docnumber-conflict` rather than a mis-attached Purchase).
+6. **Tests live in `tests/receipt-intake-*.test.ts`, run by `tsx --test`**, not
+   `test/receipt-intake/*.test.mjs`. That is the repo's existing convention (every other
+   suite is there and wired into `npm run test:unit`); the rule that mattered — no
+   `mock.module`, function injection only, because CI pins Node 20 — is followed.
+
+### Round-1 review changes (2026-09-01)
+
+**DECISION (Justin, overrides §4.5): `Expense.amount` is the GROSS total paid, tax
+included.** The QBO Purchase still splits the sales tax onto its own reclaimable account —
+that is unchanged and it is what the reseller-permit filing reads. But `Expense` has no tax
+column, and the expenses already imported from QuickBooks (`lib/qbo-expense-sync.ts`)
+record the gross line total, so booking pre-tax here would put two meanings of `amount` in
+one table and silently under-count every receipt this pipeline touched. `ReceiptIntake.taxCents`
+keeps the split; Phase 3 adds `Expense.taxAmount` and can derive the pre-tax figure without
+re-reading a single document.
+
+Also changed, all with tests:
+
+- **Dry-run rows are excluded from the claim, not skipped inside it.** The batch is ten
+  rows; after a couple of shadow days the ten oldest were all parked ones, so no NEW receipt
+  was ever reached and the queue looked healthy while processing nothing. A one-shot
+  `requeueDryRunParked` on the first live pass un-parks the backlog (and flips `dryRun` in
+  the same statement, or the rows would re-park forever). This is the one thing that changes
+  a row's `dryRun` after intake.
+- **Read budget: 25s per row, 2 retries per model at 1s/3s.** The Apps Script's 5 retries at
+  2s..32s suits a 6-minute trigger, not a 60-second function shared by ten rows. The worker
+  also stops TAKING new rows once 40s of its 60s are gone. Exhaustion returns AI_UNAVAILABLE,
+  which never spends `attempts` — but `busyPasses` now counts them and parks the row after 20
+  (v3.4), so an endless outage still ends in front of a human.
+- **`sourceRef` reuse is decided on `fileSha256`.** The row is inserted BEFORE the upload, so
+  the unique index is the decision point: same bytes is a replay (200, the existing row),
+  different bytes is 409 `sourceRef-conflict` and storage is never touched. Previously both
+  cases got a 200 and a second, real receipt could be swallowed.
+- **Vendor is not part of the strong KEY, but it is part of the CONFIRMATION.** The v3.6
+  vendor-less key stands; a same-total hit whose canonical vendor differs now routes to
+  NEEDS_REVIEW `vendor-mismatch:<id>` rather than DUPLICATE.
+- **Negative and zero totals** route to NEEDS_REVIEW `refund-or-zero` (replacing
+  `zero-total`) and claim no key.
+- **A second weak-dedup check runs INSIDE the READ→BOOKING transaction**, the last instant
+  before money moves. The claim advisory lock is one global constant so only one batch runs
+  at a time.
+- **A NEEDS_REVIEW park RELEASES the strong key unless a QBO send was attempted** (v3.5
+  rule): otherwise the key is held by a document that never became a purchase, and a
+  corrected re-send is quarantined against nothing.
+- **Transient throws (storage, Prisma, network) retry on the normal backoff.** Only the
+  classified QBO fault types are terminal. `MAX_BOOK_ATTEMPTS` is now `>=`, so it means 20
+  attempts in total.
+- **Non-secret callers cannot choose `source` or `sourceRef`** — the server mints both from
+  the auth kind; anything else is a 400. Only shared-secret callers may declare
+  drive/email/chat. An existing row's fields come back only to its creator or a bookkeeping
+  role.
+- **The shared-secret GET is limited to `state=BOOKED|ARCHIVED`** and a minimal field set
+  (no error text, hashes, or user ids).
+- Archive callback is idempotent for an identical retry (200), 409 only for a DIFFERENT
+  Drive file id. HEIC sniffing accepts `hevc`/`hevx`; `mif1`/`heif` store as image/heif.
+  P2002 resolves the owner by `dedupStrongKey` instead of string-matching Prisma's `meta`
+  (which is empty for a partial index on some engine builds). The apply script matches
+  `--expect-host` exactly and verifies the index is UNIQUE with the exact predicate.
+
+**Left as-is, deliberately:** the pre-existing asset-suffix proxy bypass (not introduced
+here); multipart buffering before the size check (the platform body limit applies first);
+PDFs carrying embedded JavaScript (never opened server-side — the bytes go to Gemini and to
+QBO as an attachment).
+
+
+### Objects are sealed on finalize
+
+The upload path is writable by whoever holds the signed URL, and that URL is `upsert: true`
+so a resumed `/start` can replace its own partial upload. Both are necessary, and together
+they mean the bytes at the upload path can change AFTER verification.
+
+So `/finalize` verifies, then **copies** the bytes to `receipts/<id>/<sha256>.<ext>` — a
+content-addressed path the client was never given a URL for — deletes the upload path, and
+points the row there. Every later reader (the Gemini read step, the booker) re-hashes what
+it downloads and refuses on a mismatch: `content-changed`, terminal. A hash stored once and
+never re-checked proves nothing about what is being served now.
+
+A failed delete of the upload path is an orphan, not a correctness problem (the row already
+points at the sealed copy), so it goes on the `storage-cleanup-pending` queue.
+
+**Sweeper timing.** A `STAGING` row is only parked `file-missing` once the signed upload
+URL's **2-hour** lifetime has passed — parking at the 15-minute sweep window declared
+receipts missing while their own upload link was still usable. A late `/finalize` on a row
+the sweeper already parked re-validates and **recovers** it rather than reporting
+`alreadyFinalized`, which would leave a real receipt parked while telling the caller it was
+fine.
+
+### Upload limits, and text receipts
+
+| path | ceiling | why |
+|---|---|---|
+| `POST /api/receipts/intake` (JSON) | **3 MiB raw** | base64 inflates by 4/3, so 3 MiB encodes to ~4 MiB and fits the serverless body cap. 4 MiB raw would be a ~5.4 MiB request that dies at the edge with a 413 this code never sees. |
+| `POST /api/receipts/intake` (multipart) | **4 MiB** | bytes are sent as-is. |
+| two-step (`/start` + signed URL + `/finalize`) | **8 MiB** | the bytes never pass through this server. The ceiling is QuickBooks' own attachment limit: anything larger is a receipt that would be stored, read, and then stranded `unsupported-attachment:size` after we had already told the sender we had it. One constant, `QBO_ATTACHMENT_MAX_BYTES` in `intake-core.ts`. |
+
+Both inline ceilings answer with a 413 naming the two-step path.
+
+**The 8 MiB ceiling is set on the Supabase bucket as well as in code.** The signed upload
+URL bypasses this server entirely, so application code cannot stop the write — it can only
+refuse the object afterwards, by which time the bytes are already paid for and sitting in
+the bucket. Set it where the write happens:
+
+> `node scripts/apply-receipt-intake.mjs --target prod --yes --expect-db … --expect-host …`, with
+> `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` in the environment. It creates the bucket when
+> missing and VERIFIES it when present, and exits **nonzero** if it exists with a different
+> file-size limit, a different MIME allow-list, or as a public bucket. It never silently
+> "corrects" one: overwriting a limit somebody set deliberately is how a 400 MB upload
+> becomes possible again next quarter.
+
+Receipts live in their **own** bucket, `receipt-intake` — not `secure-docs`:
+
+* Those limits are **per bucket**, so `secure-docs` cannot carry a receipt policy without
+  imposing it on contracts, e-signatures and invoice PDFs.
+* A signed upload URL is a **write capability**. Issuing one against the bucket that also
+  holds countersigned contracts means a path-handling bug in intake is a write into the
+  contract store.
+* The orphan sweep **deletes** objects, unattended, from paths read out of an event log. It
+  must not be able to reach anything but receipts.
+
+All intake reads and writes go through `src/lib/receipt-intake/bucket.ts`, which is the one
+place that names the bucket.
+
+The server-side check stays regardless, and is checked in this order:
+1. **Object metadata first** (`list({ search })` → `metadata.size`) — one small request that
+   costs the same whatever the object weighs. Oversize is rejected here, with no body read.
+2. **Then the downloaded byte length**, as a second line for anything the metadata missed.
+
+An **unknown** size is `transient`, not permission to proceed: a storage hiccup, a missing
+client or an API without metadata all used to fall through to the download — which is the
+read this check exists to avoid, taken on exactly the objects we know least about. Both
+callers retry a transient answer.
+
+**`text/plain` is refused with a 415.** QuickBooks cannot attach a `.txt`, so accepting one
+meant reading it with Gemini and then stranding it unbookable at
+`unsupported-attachment` — worse than a clear refusal at the door. v1 converted these using
+Apps Script's HTML→PDF `getAs`, which has no Node equivalent: a real port means a PDF
+generator with wrapping, pagination and WinAnsi encoding (pdf-lib's standard fonts THROW on
+characters they cannot encode), which is a new silent-corruption surface on a money document
+for the rarest input in the pipeline. The 415 says to send a PDF or an image instead.
+
+### Every worker write is fenced on the claim token
+
+`ReceiptIntake.claimToken` is re-stamped on every claim, and each row carries it through the
+pass. Every transition — `finishRouting`, `promoteToBooking`, `markSendAttempted`, each
+book-result write, and the `BOOKED` commit — is a CAS on `{id, state, claimToken}`.
+
+The one that matters most is `markSendAttempted`: it is the **last fence before
+QuickBooks**. A worker whose invocation was killed and whose row has since been re-claimed
+finds zero rows there and aborts with `outcome: "stale"` **having sent nothing** — so a
+zombie cannot post a Purchase the live worker is about to post as well. A claim lost later,
+between the create and the commit, rolls the transaction back (Expense included); the
+successor's retry hits QBO's DocNumber idempotency, gets the same Purchase, and books it
+once under one owner.
+
+### Two machine secrets, not one
+
+They belong to different programs, so they are different keys and rotate independently.
+A single shared secret gave a script that only copies files to Drive the power to inject
+Purchases into the books, and gave the ingest forwarders the power to enumerate every
+receipt in the system.
+
+| secret | may do | may NOT do |
+|---|---|---|
+| `RECEIPT_INTAKE_SECRET` (the Apps Script forwarders) | `POST /api/receipts/intake`, `/intake/start`, `/intake/{id}/finalize`, declaring `source` in **drive, email, chat** only | read the queue; archive anything |
+| `RECEIPT_ARCHIVE_SECRET` (the nightly Drive mirror) | `GET /api/receipts/intake?state=BOOKED|ARCHIVED` (minimal field set + signed URL), `POST /api/receipts/intake/{id}/archived` | create, publish or modify a row; declare any source |
+
+Cross-use is **403**, not 401: the caller is authenticated, it is just holding the other
+program's key, and saying so is what makes a mis-wired script obvious instead of looking
+like a rotation problem. Setting both variables to the same value is refused at runtime —
+that would silently undo the split.
+
+### Phase suggestion: confidence, and re-validation at booking
+
+The reader returns `suggested_phase_confidence` (0..1) alongside the phase code. It is
+persisted as `ReceiptIntake.suggestedConfidence`, so the queue can sort by it, and it is
+recorded on the booking's `AutomationEvent` when the suggestion is what got used. Absent or
+unparseable is **null, never 0** — "the model didn't say" and "the model is sure it is a
+poor match" have to stay distinguishable.
+
+At booking, BOTH the captured `costCodeId` and the suggestion are re-checked against the
+project the row will actually book to, via the same `isCostCodeAllowedForProject` the
+clock-in uses. The row may have been read while it had no project (`NEEDS_JOB`) or a
+different one that a human then corrected, and a cost code from the old project is not a
+phase of the new one. A mismatch clears the code and books UNCODED with a note — the
+receipt and its total are still right, and a bookkeeper assigning a phase is routine, while
+an expense silently attached to the wrong phase is not.
+
+### Upload paths (two of them)
+
+`POST /api/receipts/intake` carries the file in the REQUEST BODY, so it is limited by the
+serverless body cap (~4.5 MB, and base64 JSON inflates a payload by a third). It rejects
+anything over **4 MB** with a 413 that names the two-step path. That limit is about the
+transport, not the document.
+
+For anything larger — most phone photos — use the two-step flow, which never puts the bytes
+through this server at all:
+
+1. `POST /api/receipts/intake/start` with
+   `{sha256, mimeType, fileName?, fileSize?, source?, sourceRef?, uploadId?, projectId?}`.
+
+   **`sha256` is REQUIRED** — 64 lowercase hex characters, the hash of the bytes you are
+   about to upload. Anything else is `400 {reason: "missing-sha256"}` and no row is created.
+   It is the only thing that gives the row an identity before any bytes exist: without it a
+   reused `sourceRef` carrying a DIFFERENT document is indistinguishable from an honest
+   retry, and `/start` would hand out an upsert-capable URL pointed at another document's
+   object — a swap that would only surface at `/finalize`, by which point the original bytes
+   are gone.
+
+   **The success response is a UNION, discriminated by `kind`.** Switch on it; `ok: true`
+   alone does NOT mean there is somewhere to PUT bytes.
+
+   ```ts
+   type StartResponse =
+     | { ok: true; kind: "upload"; id: string; uploadUrl: string; token: string;
+         storagePath: string; uploadLease: string; maxBytes: number;
+         sourceRef?: string; state?: string; resumed?: boolean; recovered?: boolean }
+     | { ok: true; kind: "settled"; alreadyReceived: true; id: string; state: string };
+   ```
+
+   - `kind: "upload"` — the row is `STAGING` (invisible to the worker) or a recoverable park
+     that has been re-armed, and the response carries a short-lived Supabase signed upload
+     URL bound to a server-chosen path. **`uploadLease` is the generation that URL was issued
+     under** — an opaque string; treat it as a token to hand back, never parse it.
+   - `kind: "settled"` — this `sourceRef` is already held AND its stored bytes still hash to
+     what was published, so there is nothing to upload. It carries **no `uploadUrl` and no
+     `uploadLease`**, deliberately. Do not look for them.
+
+   **Concurrent `/start` calls for one `sourceRef` return the SAME `uploadLease`.** A retry
+   that finds a still-live lease EXTENDS it rather than replacing it — same path, same lease
+   version, same generation — so every 200 this endpoint hands out stays finalizable. (Until
+   round 19 each adoption minted its own generation and only the last was stored, which made
+   the earlier caller's 200 carry a lease `/finalize` refused as stale.) A call that loses a
+   genuine race — the row was repathed or published while its URL was being signed — is
+   answered `409 {error: "publish-conflict", retryable: true}`, and the remedy is to call
+   `/start` again.
+2. `PUT` the bytes straight to `uploadUrl`.
+3. `POST /api/receipts/intake/{id}/finalize` with `{uploadLease, sha256?}` -> publishes
+   `STAGING` -> `RECEIVED`. The server re-reads the object and derives the mime, the size and
+   the sha FROM STORAGE; a declared `sha256` is checked against that and a mismatch is a 409.
+   Over 8 MiB or an unreadable format deletes the row and refuses.
+
+**`uploadLease` is REQUIRED on `/finalize`, and this is a breaking contract change.** A call
+that omits it, or that presents a generation the row has since moved past, is refused
+`409 {error: "lease-stale", retryable: false}` **before the server reads or writes a single
+object** — and the caller's remedy is to call `/start` again and use the URL and lease that
+come back, not to retry the same body.
+
+The reason it cannot be optional: `/start` rotates the generation on every issue and every
+adoption, and two `/start` calls for one row hand out URLs for the **same path**. Without
+the echo, `/finalize` read whichever generation was current when it happened to arrive, so a
+delayed finalizer silently adopted a lease issued after it started — inspecting a second
+client's half-written object and rejecting (deleting) the row while that client still held a
+working URL. The echoed value is also what every fence in `/finalize` pins, so a publish or a
+reject can only ever land on the lease the caller proved it holds.
+
+Both paths share `decideSource` (provenance and idempotency), so a session/Bearer caller can
+never choose `source` or `sourceRef` on either, and `uploadId` is scoped to the authenticated
+user on both. Both new paths are on the proxy's exact-match bypass and both refuse a
+`next-action` dispatch with 403.
+
+### CUTOVER SEQUENCE — do these in this order (2026-09-02)
+
+The hazard this order exists to prevent: v2's QuickBooks identity for an
+email/chat/mobile/web row is the intake UUID, which v1 never saw. QBO's DocNumber
+idempotency therefore CANNOT recognise a Purchase v1 already created for the same
+document. Run both pipelines live at once, or replay the shadow backlog through v2, and
+those receipts book twice on real books.
+
+Drive rows are the exception: v2 books them under the Drive file id, which IS v1's
+identity, so an overlap on a Drive-sourced file is idempotent. That is not enough to make
+an overlap safe in general.
+
+1. **Flip the Apps Script to forwarder mode** (`V2_FORWARD=true`). It now COPIES bytes to
+   `/api/receipts/intake` and still books everything itself. ProBuild is in dry-run:
+   it reads, dedups and routes, and books nothing.
+2. **Run the shadow week.** Gate on §8: 5 consecutive days where every archived v1 file has
+   a v2 row agreeing on vendor/date/total, and no v2 row stuck in RECEIVED over an hour.
+3. **Flip the Apps Script to `V2_LIVE=true`.** It now MOVES files to `_Forwarded` instead of
+   booking them. v1 stops writing to QuickBooks. ProBuild is still in dry-run, so for this
+   window NOTHING books — that is intended and it is why the window is short.
+4. **Confirm zero v1 bookings for 24 hours.** Watch the Automation register and QBO. This
+   is the step that makes the next one safe: it proves v1 is out of the books before v2
+   enters them, so the two can never both create a Purchase for one document.
+4a. **Record the boundary.** When step 3 happens, write the instant v1 stopped booking into
+   the `cutoverV1StoppedAt` AutomationSetting row (or the `CUTOVER_V1_STOPPED_AT` env var) as
+   an ISO timestamp. This is the ONLY input that separates "v1 booked it" from "nobody booked
+   it", and nothing in the database can infer it.
+5. **Only then set `RECEIPT_INTAKE_DRYRUN=false`.** On its first pass the worker splits the
+   shadow backlog. The boundary narrows the CANDIDATES; **evidence** decides each one:
+   - before the boundary AND provably booked by v1 -> `SHADOW_DONE` / `booked-by-v1`.
+     Terminal; v2 never books these. Evidence is either an `AutomationEvent`
+     (`kind: receipt-push`, status `created`/`already-exists`) whose `driveFileId` matches
+     the row — v1's pushes go through ProBuild's create route, which logs them — or the
+     forwarder sending `archivedByV1: true` on the forward.
+   - before the boundary, NO evidence, and a **Drive** row -> handed to v2. Safe precisely
+     because a Drive row books under the **Drive file id**, so if v1 did book it after all,
+     QBO's DocNumber/requestid idempotency collapses the two into one Purchase.
+   - before the boundary, NO evidence, and **not** a Drive row -> `SHADOW_QUARANTINE`.
+     There is no shared identity here: v2 would book under the intake UUID, which v1 never
+     saw, so a duplicate would go through silently. Booking risks double-paying; retiring
+     risks losing a real expense. Terminal, never auto-requeued. **Phase 1b follow-up, not
+     built here:** the design is a Receipts tab with a "book anyway" action for whoever has
+     checked QuickBooks — same deferral as `NEEDS_JOB` and `NEEDS_REVIEW` rows, which also
+     have no review UI in Phase 1 (see §3's GET /api/receipts/intake note: the Phase 2
+     `/automation` Receipts tab is the intended consumer). Until that ships, rows in any of
+     these three states are visible via the `ReceiptIntake` table directly (or
+     `GET /api/receipts/intake?state=`) and via the pipeline-health report, which counts
+     each of them separately: NEEDS_REVIEW (`intake.needsReview`), NEEDS_JOB
+     (`intake.unassigned`) and SHADOW_QUARANTINE (`intake.quarantined`, reason
+     `receipt-quarantine:<n>` and its own digest line). The quarantine count carries no age
+     threshold, because the state is terminal the instant it is written — nothing is coming
+     to move it on.
+   - after the boundary -> handed to v2. v1 had already stopped, so nobody booked these.
+   With no boundary recorded in live mode the worker **halts the entire pass before
+   claiming anything** and logs `cutover-boundary-missing`. Not just the retire: booking
+   anything while we cannot tell what v1 already booked is the double-booking this whole
+   mechanism exists to prevent.
+
+Retired rows keep their read results and dedup keys, so a post-cutover resend of a
+shadow-week receipt still collides with them and is caught as a duplicate.
+
+**Rolling back** after step 5 means turning `V2_LIVE` off again and `RECEIPT_INTAKE_DRYRUN`
+back on. Rows received while v2 was live are already booked and stay `BOOKED`; v1 will not
+re-book them, because its own `_Forwarded` move already took those files out of its path.
+
+Three things a human must do before this can leave shadow mode:
+
+- Set **both** `RECEIPT_INTAKE_SECRET` (new, independent of `RECEIPT_INGEST_SECRET`) and
+  `RECEIPT_ARCHIVE_SECRET` in Vercel — `authenticateIntake` requires both to be present and
+  to differ (§ "Two machine secrets, not one"): a caller presenting either value is refused
+  outright when its variable is unset, and setting them to the *same* value is refused too,
+  since that would silently re-merge the two capabilities it exists to keep apart. Give the
+  matching value to each consumer as a Script Property — `RECEIPT_INTAKE_SECRET` to the
+  ingest forwarders (drive/email/chat), `RECEIPT_ARCHIVE_SECRET` to the nightly Drive mirror
+  that polls `GET /api/receipts/intake?state=BOOKED|ARCHIVED`. Missing `RECEIPT_ARCHIVE_SECRET`
+  specifically means the archive mirror gets a blanket 401 from cutover day one, silently —
+  nothing else exercises that path pre-launch to surface the gap.
+- Re-run `node scripts/snapshot-prisma-blind-spots.mjs --write` against production AFTER
+  `scripts/apply-receipt-intake.mjs` has run there. The new partial index and CHECK
+  constraint were added to `prisma/prisma-blind-spots.json` by hand (the snapshotter needs
+  a live production connection, which this branch never had), so their rendered
+  definitions are asserted, not observed. CI's `migrations` job is what will catch a
+  mismatch.
+
 ## 8. Shadow-week gate
 
 - `RECEIPT_INTAKE_DRYRUN` unset/true: every row gets `dryRun=true` — reader, dedup, and
@@ -387,9 +797,12 @@ All gated on Script Property `V2_FORWARD === "true"`; all send `x-receipt-intake
 1. **Public-bypass route**: `/api/receipts/intake` bypasses the proxy, so the handler is
    the only gate. Mitigated by the fail-closed secret check + the 401 e2e matrix; Codex
    must review the auth block specifically. (Risk to watch, no decision needed.)
-2. **Expense.amount = pre-tax when tax is split** (mirrors the QBO COGS line under the
-   reseller-permit rule in sendToQBOviaAPI.js). Confirm pre-tax is the job-cost number you
-   want feeding variance reports.
+2. ~~**Expense.amount = pre-tax when tax is split**~~ **RESOLVED 2026-09-01: GROSS.**
+   Justin's call. `Expense.amount` is the total paid, tax INCLUDED, matching what the
+   QBO-imported expenses in `lib/qbo-expense-sync.ts` already record. The QBO Purchase
+   still splits the tax onto its own reclaimable account — that is unchanged and it is
+   what the reseller-permit filing reads. `ReceiptIntake.taxCents` keeps the split so
+   Phase 3 can add `Expense.taxAmount`. No open question here.
 3. **Archive via nightly Apps Script mirror** (§6) instead of a Drive service account —
    confirm, or provision a service account now if same-hour archiving matters to Marge.
 4. **HEIC**: stored and read fine (Gemini accepts image/heic), but the Phase 2 queue page

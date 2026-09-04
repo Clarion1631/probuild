@@ -53,6 +53,10 @@
       "schedule": "0 14 * * *"
     },
     {
+      "path": "/api/cron/receipt-intake-worker",
+      "schedule": "*/5 * * * *"
+    },
+    {
       "path": "/api/cron/qbo-maintenance",
       "schedule": "45 * * * *"
     }

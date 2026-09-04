@@ -91,6 +91,32 @@ jobs:
       # The focused integration regression deliberately drifts the disposable
       # database's function and trigger after proving the checker recognizes
       # the production snapshot. It therefore runs last in this job.
+      # The receipt-intake claim transaction against a REAL Postgres. The rest
+      # of that feature's suites mock every DB call, so the SQL — a void
+      # function read through $queryRaw, a claim that behaves differently than
+      # its mock — is the one part they cannot see.
+      - name: Receipt-intake claim + advisory locks against real Postgres
+        run: npx tsx --test tests/receipt-intake-claim-db.test.ts
+        env:
+          RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # THE APPLY SCRIPT ITSELF, run end to end the way production will run it.
+      # Its exported helpers are unit-tested and its statement list is replayed
+      # by the DB-gated suite, but main() is executed by nothing else: not the
+      # flag parsing, not the identity gate, not the statements running in order
+      # against a real server, not the second run being a genuine no-op. It
+      # builds two databases -- one pre-Phase-1, and one carrying the OLD
+      # Phase-1 table with DEFAULT 'RECEIVED' so the additive upgrade and the
+      # state-default repair are exercised -- and asserts both end up matching
+      # what the committed migration produces.
+      #
+      # `--target ci` inside the driver: the ambient URL, no production baseline
+      # or project-ref check, and a refusal if that URL looks like Supabase.
+      - name: Apply script end-to-end against real Postgres
+        run: node scripts/ci-apply-receipt-intake-e2e.mjs
+        env:
+          APPLY_E2E_SERVER_URL: postgresql://probuild:probuild@localhost:5432/postgres
+          APPLY_E2E_DB: probuild_apply_fresh
       # Two REAL connections contending on a User row. Every other concurrency
       # proof in the suite is an injected sequence, which shows the branch exists
       # but not that PostgreSQL serializes the way the code assumes. Runs BEFORE
@@ -500,6 +526,18 @@ jobs:
       # against the throwaway DB — so unlike the provider secrets above it's a
       # literal here rather than a repo secret (there's nothing to rotate).
       DEPOSIT_INGEST_SECRET: "e2e-ci-deposit-ingest-secret"
+
+      # Shared secret for the Receipt Pipeline v2 intake endpoint
+      # (src/app/api/receipts/intake/route.ts). Same reasoning as
+      # DEPOSIT_INGEST_SECRET above: nothing external depends on this value, it
+      # only gates e2e/receipt-intake.spec.ts against the throwaway DB, so it is
+      # a literal rather than a repo secret. The spec's "env var unset" case is
+      # a unit test (tests/receipt-intake-auth.test.ts), not this job.
+      RECEIPT_INTAKE_SECRET: "e2e-ci-receipt-intake-secret"
+      # The archive mirror's key is DELIBERATELY different — the specs assert
+      # that cross-use between the two capabilities is a 403.
+      RECEIPT_ARCHIVE_SECRET: "e2e-ci-receipt-archive-secret"
+
       # The deposit sweep's live-apply switch (src/lib/deposit-sweep.ts). It is
       # OFF by default — booking money on an amount-only match is Justin's
       # decision, not a default — so the e2e cases that exercise the MONEY
@@ -507,6 +545,7 @@ jobs:
       # would be. Everything here runs against the throwaway CI database with
       # QuickBooks mocked (E2E_QBO_MOCK), so no real money can move.
       DEPOSIT_SWEEP_LIVE_APPLY: "true"
+
       # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
       # its deterministic keyword fallback instead of calling Gemini, so
       # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.

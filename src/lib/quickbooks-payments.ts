@@ -3045,7 +3045,7 @@ export const automationSettingCursorStore: PaymentsSyncCursorStore = {
  * rows 0-99 are equally unverified but sat before the cursor, so the run
  * reported them as nothing left to do and called itself clean.
  */
-async function countUnvisited(
+export async function countUnvisited(
     count: (where: Record<string, unknown>) => Promise<number>,
     state: { cursorId: string | null; originalCursor: string | null; wrapped: boolean },
 ): Promise<number> {
@@ -3160,6 +3160,26 @@ export async function forEachPendingPage<T extends { id: string }>(
             cursorId = lastCompletedId;
             await saveCursor(cursorId);
         }
+
+        // DID THE HANDLER ACTUALLY FINISH THIS PAGE?
+        //
+        // `lastCompletedId` is the furthest row it verified, and on a page cut
+        // short by a deadline or a QBO outage that is somewhere in the middle.
+        // The short-page branch below reads "fewer rows than we asked for" as
+        // "end of the collection" and RESETS the cursor to the top — so a
+        // 40-row final page that stopped after row 10 threw rows 11-40 away
+        // AND returned before `countRemaining`, so they were never counted as
+        // skipped either. The run reported a clean drain and thirty payments
+        // silently went unverified until the window happened to roll back over
+        // them.
+        const finishedPage = lastCompletedId !== null
+            && lastCompletedId === page[page.length - 1].id;
+        // Stopped mid-page: keep the cursor exactly where the handler got to
+        // and fall through to the counting path, which measures the unvisited
+        // tail (everything after `cursorId`) rather than assuming there is
+        // none. A full page that stopped early needs no special case — the
+        // outage and budget guards at the top of the loop catch it there.
+        if (!finishedPage) break;
 
         // A short page means we reached the end of the collection.
         if (page.length < take) {

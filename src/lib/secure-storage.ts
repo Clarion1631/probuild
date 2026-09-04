@@ -1,4 +1,5 @@
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
+import { isReceiptUrlRef, resolveReceiptUrl } from "./receipt-intake/receipt-url";
 
 /**
  * Private bucket for documents that carry legal or PII weight: e-signatures, executed
@@ -98,6 +99,7 @@ export function parseOwnStorageUrl(
 /**
  * Turn a stored document reference into something a browser can load.
  *
+ * - receipt ref     → short-lived signed URL against the receipts bucket
  * - secure ref      → short-lived signed URL against the private bucket
  * - data: URL       → returned unchanged (legacy inline signatures still render)
  * - absolute URL    → returned unchanged (legacy public-bucket object, still served)
@@ -111,6 +113,11 @@ export async function resolveDocUrl(
     ttlSeconds: number = DEFAULT_SIGNED_URL_TTL_SECONDS,
 ): Promise<string | null> {
     if (!stored) return null;
+
+    // `receipt-intake://<bucket>/<path>` — what the receipt pipeline writes to
+    // Expense.receiptUrl. Handled here so EVERY existing reader resolves it,
+    // rather than each one learning a second scheme.
+    if (isReceiptUrlRef(stored)) return await resolveReceiptUrl(stored, ttlSeconds);
 
     const securePath = secureRefPath(stored);
     if (securePath) {
@@ -171,6 +178,111 @@ export async function resolveDocUrls<K extends string>(
         },
         {} as Record<K, string | null>,
     );
+}
+
+/**
+ * Why a download did not produce bytes.
+ *
+ * `downloadDocBytes` collapses every failure to `null`, which is fine for a PDF
+ * that renders without a signature but NOT for a money path: "the object is
+ * gone" and "Supabase was briefly unreachable" demand opposite responses. The
+ * first is terminal (a human must re-upload); the second must be retried, and
+ * treating it as terminal would park good receipts during a storage blip.
+ *
+ * `not-found` is only ever returned when storage AFFIRMATIVELY said the object
+ * is missing. Anything ambiguous — a network error, a 5xx, no configured
+ * client — is `transient`, because guessing "gone" on incomplete evidence is
+ * the failure mode that loses documents.
+ */
+export type DocBytesResult =
+    | { ok: true; bytes: Buffer }
+    | { ok: false; kind: "not-found" }
+    | { ok: false; kind: "transient"; message: string };
+
+/**
+ * Storage's shapes for "this key does not exist", and ONLY those.
+ *
+ * `status === 400` used to count as not-found, which is badly wrong: Supabase
+ * returns 400 for a malformed request, a bad JWT, an expired service key, and
+ * assorted config faults. Any of those made the caller conclude the receipt was
+ * GONE — a terminal verdict that parks the row and RELEASES its dedup key — when
+ * the object was sitting there untouched. A rotated key would have emptied the
+ * queue into review and unlocked every key on the way out.
+ *
+ * So: an affirmative 404, or an explicit not-found error code. Everything else,
+ * including every other 4xx, is transient/config and retries.
+ */
+const NOT_FOUND_CODES = new Set(["nosuchkey", "not_found", "object_not_found", "entitynotfound"]);
+
+export function isNotFoundError(
+    error: { message?: string; status?: number; statusCode?: string | number; error?: string } | null,
+): boolean {
+    if (!error) return false;
+    if (Number(error.status ?? error.statusCode) === 404) return true;
+    const code = String(error.error ?? "").toLowerCase().replace(/[\s-]/g, "_");
+    if (NOT_FOUND_CODES.has(code)) return true;
+    const message = String(error.message ?? "").toLowerCase();
+    // Exact phrases only — a substring like "not found" inside some other
+    // sentence is not evidence of absence.
+    return message === "object not found" || message === "the resource was not found";
+}
+
+/**
+ * Tagged download. Same resolution rules as downloadDocBytes (secure ref, data
+ * URL, our own storage URL, legacy bare path) but the caller is told WHY it
+ * failed. Use this on any path where a missing file changes what happens to
+ * real money.
+ */
+export async function downloadDocBytesResult(
+    stored: string | null | undefined,
+): Promise<DocBytesResult> {
+    if (!stored) return { ok: false, kind: "not-found" };
+
+    if (isDataUrl(stored)) {
+        const bytes = await downloadDocBytes(stored);
+        return bytes ? { ok: true, bytes } : { ok: false, kind: "not-found" };
+    }
+
+    let bucket: string;
+    let path: string;
+
+    const securePath = secureRefPath(stored);
+    if (securePath) {
+        bucket = SECURE_BUCKET;
+        path = securePath;
+    } else if (/^https?:\/\//i.test(stored)) {
+        const parsed = parseOwnStorageUrl(stored);
+        // Not ours, or naming a bucket we never write absolute URLs for. That is
+        // a REFUSAL, not a transient failure — retrying cannot make it ours.
+        if (!parsed || parsed.bucket !== STORAGE_BUCKET) return { ok: false, kind: "not-found" };
+        bucket = parsed.bucket;
+        path = parsed.path;
+    } else {
+        if (stored.startsWith("/") || stored.includes("..")) return { ok: false, kind: "not-found" };
+        bucket = STORAGE_BUCKET;
+        path = stored;
+    }
+
+    const supabase = getSupabase();
+    // No client is a CONFIGURATION fault, not a missing object. Retry it.
+    if (!supabase) return { ok: false, kind: "transient", message: "storage-not-configured" };
+    try {
+        const { data, error } = await supabase.storage.from(bucket).download(path);
+        if (error) {
+            return isNotFoundError(error as { message?: string; status?: number })
+                ? { ok: false, kind: "not-found" }
+                : { ok: false, kind: "transient", message: String(error.message ?? "download-failed").slice(0, 200) };
+        }
+        if (!data) return { ok: false, kind: "not-found" };
+        return { ok: true, bytes: Buffer.from(await data.arrayBuffer()) };
+    } catch (error) {
+        // A throw is a transport fault every time — never evidence of absence.
+        return {
+            ok: false,
+            kind: "transient",
+            message: error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 200) : "download-threw",
+        };
+    }
 }
 
 /**
@@ -256,6 +368,58 @@ export async function uploadSecureDoc(
 }
 
 /** Best-effort removal of a secure object, for compensating a failed DB write. */
+/**
+ * Delete, and REFUSE to report success on anything less than a confirmed one.
+ *
+ * `removeSecureDoc` returns quietly when the ref is unusable or no storage
+ * client is configured, which is right for its best-effort callers (a leftover
+ * signature is not worth failing a contract over) but wrong for the receipt
+ * cleanup queue: "no client" there would mark an orphan resolved on a
+ * misconfigured deployment and lose it permanently. Same delete, honest result.
+ *
+ * Deliberately a separate export rather than a behaviour change to
+ * removeSecureDoc: several callers outside this feature do not guard it.
+ */
+/**
+ * Byte size of a stored object WITHOUT downloading it.
+ *
+ * The signed upload URL bypasses this server entirely, so the first time we see
+ * a two-step object is when something reads it — and reading it is exactly what
+ * must not happen for a 400 MB file. `list` with a search returns the metadata
+ * row, which is one small request regardless of the object's size.
+ *
+ * Returns null when the size cannot be determined (missing object, no client,
+ * an older storage API without metadata): callers treat that as "unknown" and
+ * fall through to their normal path rather than refusing on an absence.
+ */
+export async function secureObjectSize(storagePath: string): Promise<number | null> {
+    const supabase = getSupabase();
+    if (!supabase) return null;
+    const slash = storagePath.lastIndexOf("/");
+    const dir = slash > 0 ? storagePath.slice(0, slash) : "";
+    const name = slash > 0 ? storagePath.slice(slash + 1) : storagePath;
+    try {
+        const { data, error } = await supabase.storage
+            .from(SECURE_BUCKET)
+            .list(dir, { search: name, limit: 100 });
+        if (error || !data) return null;
+        const match = data.find(entry => entry.name === name);
+        const size = (match?.metadata as { size?: unknown } | undefined)?.size;
+        return typeof size === "number" && Number.isFinite(size) ? size : null;
+    } catch {
+        return null;
+    }
+}
+
+export async function removeSecureDocStrict(ref: string): Promise<void> {
+    const path = secureRefPath(ref);
+    if (!path) throw new Error(`not a secure ref: ${String(ref).slice(0, 80)}`);
+    const supabase = getSupabase();
+    if (!supabase) throw new Error("secure storage is not configured");
+    const { error } = await supabase.storage.from(SECURE_BUCKET).remove([path]);
+    if (error) throw error;
+}
+
 export async function removeSecureDoc(ref: string): Promise<void> {
     const path = secureRefPath(ref);
     if (!path) return;

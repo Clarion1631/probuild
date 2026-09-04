@@ -84,6 +84,61 @@ function bucketApi(bucket: string) {
             return { data: [], error: null };
         },
 
+        /**
+         * Metadata listing — the ONLY way `receiptObjectSize` (bucket.ts) and
+         * `secureObjectSize` (secure-storage.ts) ask "is this object there, and
+         * how big is it" without downloading it.
+         *
+         * It was missing, and its absence was not inert: `from.list` was
+         * `undefined`, so the call THREW, and both callers classify a throw as
+         * TRANSIENT — "storage is having a moment", not "the object is gone".
+         * Every intake replay that reached the existence check therefore
+         * answered 503 instead of the 200/heal the caller had earned. A stub
+         * that omits a method does not omit a behaviour; it invents one.
+         *
+         * Shape follows storage-api: `name` is relative to `dir`, sub-folders
+         * come back once with `metadata: null`, and `search` is a PREFIX filter
+         * on that name (the SQL is `name ilike prefix || search || '%'`), not a
+         * substring one.
+         */
+        async list(
+            dir: string,
+            opts?: { search?: string; limit?: number; offset?: number },
+        ) {
+            const prefix = dir ? `${key(bucket, dir)}/` : `${bucket}/`;
+            // A folder must appear ONCE however many objects sit under it, and
+            // an object shadows nothing — so entries are keyed by name.
+            const entries = new Map<string, StoredObject | null>();
+            for (const [k, stored] of objects()) {
+                if (!k.startsWith(prefix)) continue;
+                const rest = k.slice(prefix.length);
+                if (!rest) continue;
+                const slash = rest.indexOf("/");
+                if (slash === -1) entries.set(rest, stored);
+                else if (!entries.has(rest.slice(0, slash))) entries.set(rest.slice(0, slash), null);
+            }
+            const search = (opts?.search ?? "").toLowerCase();
+            const names = [...entries.keys()]
+                .filter(name => !search || name.toLowerCase().startsWith(search))
+                .sort();
+            const offset = opts?.offset ?? 0;
+            const data = names
+                .slice(offset, offset + (opts?.limit ?? 100))
+                .map(name => {
+                    const stored = entries.get(name) ?? null;
+                    return {
+                        name,
+                        id: stored ? `${bucket}/${dir ? `${dir}/` : ""}${name}` : null,
+                        // `size` is the field both callers read; a folder has no
+                        // metadata at all, which is how they tell the two apart.
+                        metadata: stored
+                            ? { size: stored.bytes.length, mimetype: stored.contentType }
+                            : null,
+                    };
+                });
+            return { data, error: null };
+        },
+
         async download(path: string) {
             const stored = objects().get(key(bucket, path));
             if (!stored) return { data: null, error: { message: "Object not found" } };

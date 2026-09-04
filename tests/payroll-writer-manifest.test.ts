@@ -153,15 +153,15 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "guarded",
         why: "tagTimeEntriesToChangeOrder, wrapped in withPayrollWrite — retagging changes which change order the hours bill against. The change order and the rows are re-read INSIDE the lock and projectId is pinned in the WHERE, so an entry rerouted to another job between the pre-check and the write cannot pick up this project's change order",
     },
-    "lib/time-expense-actions.ts:180::updateMany": {
+    "lib/time-expense-actions.ts:181::updateMany": {
         kind: "guarded",
         why: "the manual edit, wrapped in withPayrollWriteTx with the row re-read under FOR UPDATE",
     },
-    "lib/time-expense-actions.ts:225::deleteMany": {
+    "lib/time-expense-actions.ts:226::deleteMany": {
         kind: "guarded",
         why: "deleteTimeEntry (single delete), wrapped in withPayrollWriteTx over the one affected row id",
     },
-    "lib/time-expense-actions.ts:278::deleteMany": {
+    "lib/time-expense-actions.ts:279::deleteMany": {
         kind: "guarded",
         why: "deleteTimeEntries (bulk delete), wrapped in withPayrollWriteTx over every affected row id",
     },

@@ -11,6 +11,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     evaluatePipelineHealth,
     formatPipelineDigest,
@@ -20,6 +22,8 @@ import {
     PROBE_CONCURRENCY,
     BOOKED_PUSH_STATUSES,
     type PipelineHealth,
+    INTAKE_STUCK_HOURS,
+    INTAKE_STAGING_STUCK_MINUTES,
     type ProbeRunner,
 } from "../src/lib/pipeline-health";
 
@@ -49,6 +53,10 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         receipts24h: { status: "ok" as const, counts: { created: 4 } },
         bank: { status: "ok" as const, at: iso(48 * HOUR) },
         stuck: { status: "ok" as const, count: 0 },
+        intakeStuck: { status: "ok" as const, count: 0 },
+        intakeNeedsReview: { status: "ok" as const, count: 0 },
+        intakeUnassigned: { status: "ok" as const, count: 0 },
+        intakeQuarantined: { status: "ok" as const, count: 0 },
         payLinksPending: { status: "ok" as const, count: 0 },
         now: NOW,
         ...overrides,
@@ -218,6 +226,12 @@ function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
         receipts24h: { status: "ok", counts: { created: 4, fallback: 1 } },
         bank: { status: "ok", at: "2026-08-29T00:00:00.000Z" },
         stuck: { status: "ok", count: 0 },
+        intake: {
+            stuck: { status: "ok", count: 0 },
+            needsReview: { status: "ok", count: 0 },
+            unassigned: { status: "ok", count: 0 },
+            quarantined: { status: "ok", count: 0 },
+        },
         payLinksPending: { status: "ok" as const, count: 0 },
         ...overrides,
     };
@@ -591,6 +605,175 @@ test("the journey mapper renders attachment-failed as failed, not in-flight", as
     // arriving - the bot has already stopped.
     assert.equal(journey.finalState, "error");
     assert.equal(journey.finalReason, "failed:fault");
+});
+
+// ── Receipt Pipeline v2 intake queue ───────────────────────────────────────
+// Every other probe in this file reads AutomationEvent, which only records a
+// BOOKING — so a v2 row that never reaches QuickBooks is invisible to all of
+// them. A jammed intake queue reported a perfectly healthy pipeline.
+
+test("rows stuck in the intake queue fail the check and name the backlog", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        intakeStuck: { status: "ok", count: 4 },
+        intakeNeedsReview: { status: "ok", count: 11 },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["intake-stuck:4,needs-review:11"]);
+});
+
+test("a NEEDS_REVIEW backlog alone is NOT a failure", () => {
+    // Those rows are working as designed — a human was asked a question.
+    // Failing on them would hold the pipeline red until somebody cleared the
+    // queue, which trains everyone to ignore the signal.
+    const v = evaluatePipelineHealth(snapshot({ intakeNeedsReview: { status: "ok", count: 40 } }));
+    assert.deepEqual(v, { ok: true, reasons: [] });
+});
+
+test("receipts nobody assigned a job to are an ALERT, not a green backlog", () => {
+    // NEEDS_JOB is terminal for the worker, so it can pile up indefinitely
+    // while every other probe reads green. Its own reason, because the fix is
+    // different: assign a project, not restart a worker.
+    const v = evaluatePipelineHealth(snapshot({ intakeUnassigned: { status: "ok", count: 5 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["intake-unassigned:5"]);
+});
+
+test("stuck and unassigned are reported separately", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        intakeStuck: { status: "ok", count: 2 },
+        intakeUnassigned: { status: "ok", count: 3 },
+    }));
+    assert.ok(v.reasons.some(r => r.startsWith("intake-stuck:2")));
+    assert.ok(v.reasons.includes("intake-unassigned:3"));
+});
+
+test("QUARANTINED cutover rows are counted, and get their own reason", () => {
+    // SHADOW_QUARANTINE is terminal, never auto-requeued, and NOBODY has
+    // booked it: v1 stopped, and v2 refused because there is no shared QBO
+    // identity to make a second booking idempotent. It is neither NEEDS_REVIEW
+    // nor NEEDS_JOB, so before this it was invisible to every probe here and a
+    // pile of unbooked expenses read as a healthy pipeline.
+    const v = evaluatePipelineHealth(snapshot({ intakeQuarantined: { status: "ok", count: 3 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["receipt-quarantine:3"]);
+});
+
+test("the quarantine reason is separate from review and unassigned", () => {
+    // Three different actions: check QuickBooks and decide, clear a review
+    // item, assign a job. Folding them into one number hides two of them.
+    const v = evaluatePipelineHealth(snapshot({
+        intakeUnassigned: { status: "ok", count: 2 },
+        intakeQuarantined: { status: "ok", count: 4 },
+    }));
+    assert.ok(v.reasons.includes("intake-unassigned:2"));
+    assert.ok(v.reasons.includes("receipt-quarantine:4"));
+});
+
+test("CONTROL: a NEEDS_REVIEW backlog does not produce a quarantine reason", () => {
+    // Without this, a count that accidentally selected every parked state
+    // would still pass the test above.
+    const v = evaluatePipelineHealth(snapshot({ intakeNeedsReview: { status: "ok", count: 40 } }));
+    assert.deepEqual(v.reasons, []);
+});
+
+test("an intake probe that FAILED is not an intake probe that found nothing", () => {
+    for (const name of ["intakeStuck", "intakeNeedsReview", "intakeUnassigned", "intakeQuarantined"] as const) {
+        const v = evaluatePipelineHealth(snapshot({ [name]: { status: "error", reason: "timeout", count: 0 } }));
+        assert.equal(v.ok, false, name);
+        assert.ok(v.reasons.includes(`probe-failed:${name}`), name);
+    }
+});
+
+test("the stuck reason survives a failed backlog probe rather than lying about it", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        intakeStuck: { status: "ok", count: 2 },
+        intakeNeedsReview: { status: "error", reason: "error", count: 0 },
+    }));
+    assert.ok(v.reasons.includes("intake-stuck:2"), "no invented needs-review count");
+    assert.ok(v.reasons.includes("probe-failed:intakeNeedsReview"));
+});
+
+test("STAGING gets a much shorter fuse than the working states", () => {
+    // STAGING is meant to last one HTTP request; RECEIVED/BOOKING/READ are
+    // queue states measured in hours.
+    assert.equal(INTAKE_STAGING_STUCK_MINUTES, 30);
+    assert.equal(INTAKE_STUCK_HOURS, 6);
+    assert.ok(INTAKE_STAGING_STUCK_MINUTES * 60_000 < INTAKE_STUCK_HOURS * 3_600_000);
+});
+
+// ── A STAGING row's own upload lease, not just its age (Codex round-17 item 5) ──
+
+test("a STAGING row is not counted as stuck while its own upload lease is still live", () => {
+    // The count() query talks to real Prisma, so this is a source-level pin
+    // (same technique receipt-url.test.ts and receipt-intake-stored-object.
+    // test.ts use for the properties a live DB is needed to exercise for
+    // real): the STAGING branch of intakeStuck must gate on the lease, not
+    // on createdAt alone, or a client mid-upload on a slow connection —
+    // whose /start re-issued a signed URL without touching createdAt — reads
+    // as "stuck" while its own link is still perfectly good.
+    const root = path.resolve(__dirname, "..");
+    const src = readFileSync(path.join(root, "src/lib/pipeline-health.ts"), "utf8");
+    const stagingBranch = src.slice(
+        src.indexOf('state: "STAGING"'),
+        src.indexOf('state: "READ"'),
+    );
+    assert.match(
+        stagingBranch,
+        /uploadUrlExpiresAt/,
+        "the STAGING stuck-count must consult the upload lease, not createdAt alone",
+    );
+});
+
+test("the quarantine PROBE actually counts SHADOW_QUARANTINE, with no age gate", () => {
+    // Same source-level pin as the STAGING test above, for the same reason:
+    // count() talks to real Prisma. Two properties, and both matter — the
+    // state it selects, and that it does NOT carry a createdAt threshold. A
+    // quarantined row is terminal the instant the cutover writes it, so an
+    // age gate copied from the NEEDS_JOB probe next door would hide every one
+    // of them for six hours for no reason.
+    const root = path.resolve(__dirname, "..");
+    const src = readFileSync(path.join(root, "src/lib/pipeline-health.ts"), "utf8");
+    // Anchored on the probe DECLARATION, not on the name — the name also
+    // appears in namedProbes above, and slicing from there would read the
+    // whole evaluator and pass on any mention of the state anywhere.
+    const declared = /probe<number>\(\r?\n\s*"intakeQuarantined",([\s\S]*?)\r?\n\s*\),/.exec(src);
+    assert.ok(declared, "the probe exists");
+    const branch = declared[1];
+    assert.match(branch, /state: "SHADOW_QUARANTINE"/);
+    assert.ok(!branch.includes("createdAt"), "no age threshold on a terminal state");
+    // And it is a REASON, not just a printed number.
+    assert.match(src, /receipt-quarantine:\$\{input\.intakeQuarantined\.count\}/);
+});
+
+test("the digest prints all four intake numbers", () => {
+    const { text } = formatPipelineDigest(sampleHealth({
+        intake: {
+            stuck: { status: "ok", count: 3 },
+            needsReview: { status: "ok", count: 7 },
+            unassigned: { status: "ok", count: 2 },
+            quarantined: { status: "ok", count: 5 },
+        },
+    }));
+    assert.match(text, /Receipt intake stuck >6h: 3/);
+    assert.match(text, /Receipt intake awaiting review: 7/);
+    assert.match(text, /Receipt intake awaiting a job \(>6h\): 2/);
+    // SHADOW_QUARANTINE rows are terminal and unbooked, and no other line here
+    // can see them: before this they were invisible to the whole digest.
+    assert.match(text, /Receipt intake quarantined \(cutover, needs a decision\): 5/);
+});
+
+test("the digest says a failed intake probe is unavailable, never zero", () => {
+    const { text } = formatPipelineDigest(sampleHealth({
+        intake: {
+            stuck: { status: "error", reason: "timeout", count: 0 },
+            needsReview: { status: "error", reason: "timeout", count: 0 },
+            unassigned: { status: "error", reason: "timeout", count: 0 },
+            quarantined: { status: "error", reason: "timeout", count: 0 },
+        },
+    }));
+    assert.match(text, /Receipt intake stuck >6h: unavailable \(probe failed\)/);
+    assert.match(text, /Receipt intake awaiting review: unavailable \(probe failed\)/);
+    assert.match(text, /Receipt intake quarantined \(cutover, needs a decision\): unavailable \(probe failed\)/);
 });
 
 // ─── A refused credential names its own fix ─────────────────────────────────

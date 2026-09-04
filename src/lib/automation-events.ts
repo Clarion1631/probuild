@@ -18,7 +18,19 @@ import type { Prisma } from "@prisma/client";
  */
 
 export interface AutomationEventInput {
-    kind: "receipt-push" | "qbo-sync" | "receipt-stage" | "setting" | "qbo-payments-sync";
+    kind:
+        | "receipt-push"
+        | "qbo-sync"
+        | "receipt-stage"
+        | "setting"
+        | "qbo-payments-sync"
+        /**
+         * A rejected intake object whose DELETE from storage failed. The row is
+         * already gone, so nothing else remembers the orphan — without this the
+         * bytes sit in a private bucket forever, unreferenced. The receipt
+         * worker's sweep retries the deletion and resolves the event.
+         */
+        | "storage-cleanup-pending";
     stage?: string;
     status: string;
     reason?: string;
@@ -386,6 +398,32 @@ export function resolveEventFileId(e: { driveFileId: string | null; detail: stri
     return null;
 }
 
+/**
+ * The v2 pipeline's own row id, for events that have no Drive file behind them.
+ *
+ * `fileId` means a DRIVE file id — it is what `driveFileId` is dual-written
+ * from, what the cutover queries to decide "did v1 book this", and what a
+ * DocNumber is derived from. The intake worker used to put its cuid there for
+ * email, chat, mobile and web receipts, which filled that column with ids no
+ * Drive query can ever match. Those rows carry `intakeId` instead, and it is a
+ * first-class identity here: an intake beacon and its push event group by it
+ * exactly as a Drive pair groups by fileId.
+ */
+export function resolveEventIntakeId(e: { detail: string | null }): string | null {
+    if (!e.detail) return null;
+    try {
+        const d = JSON.parse(e.detail) as { intakeId?: unknown };
+        return typeof d.intakeId === "string" && d.intakeId ? d.intakeId : null;
+    } catch {
+        return null;
+    }
+}
+
+/** Any identity at all — the test every "id-less event" branch actually means. */
+function hasResolvedId(e: { driveFileId: string | null; qbPurchaseId: string | null; detail: string | null }): boolean {
+    return !!(resolveEventFileId(e) || resolveEventQbPurchaseId(e) || resolveEventIntakeId(e));
+}
+
 /** Same idea as `resolveEventFileId`, for the QBO Purchase id. */
 export function resolveEventQbPurchaseId(e: { qbPurchaseId: string | null; detail: string | null }): string | null {
     if (e.qbPurchaseId) return e.qbPurchaseId;
@@ -535,9 +573,15 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
 
     const byFileId = new Map<string, number>();
     const byQbPurchaseId = new Map<string, number>();
+    // v2 rows with no Drive file behind them (email, chat, mobile, web) are
+    // keyed by their intake id. It is exactly as strong an identity as a Drive
+    // file id — a cuid, unique per row — and without it those receipts would
+    // fall through to the docNumber-prefix heuristic below.
+    const byIntakeId = new Map<string, number>();
     sorted.forEach((e, i) => {
         const fileId = resolveEventFileId(e);
         const qbPurchaseId = resolveEventQbPurchaseId(e);
+        const intakeId = resolveEventIntakeId(e);
         if (fileId) {
             const existing = byFileId.get(fileId);
             if (existing !== undefined) union(i, existing);
@@ -548,10 +592,19 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
             if (existing !== undefined) union(i, existing);
             else byQbPurchaseId.set(qbPurchaseId, i);
         }
+        if (intakeId) {
+            const existing = byIntakeId.get(intakeId);
+            if (existing !== undefined) union(i, existing);
+            else byIntakeId.set(intakeId, i);
+        }
         // The bridge: an event carrying BOTH ids ties the fileId cluster and
         // the qbPurchaseId cluster together — this is the actual N1 fix.
         if (fileId && qbPurchaseId) {
             union(byFileId.get(fileId)!, byQbPurchaseId.get(qbPurchaseId)!);
+        }
+        // Same bridge for a v2 receipt: its intake id and its Purchase id.
+        if (intakeId && qbPurchaseId) {
+            union(byIntakeId.get(intakeId)!, byQbPurchaseId.get(qbPurchaseId)!);
         }
     });
 
@@ -569,7 +622,7 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
     // rather than arbitrarily attached to one of the colliding receipts.
     const idRootsByDoc = new Map<string, Set<number>>();
     sorted.forEach((e, i) => {
-        if (!resolveEventFileId(e) && !resolveEventQbPurchaseId(e)) return;
+        if (!hasResolvedId(e)) return;
         const doc = e.docNumber as string;
         const roots = idRootsByDoc.get(doc) ?? new Set<number>();
         roots.add(find(i));
@@ -585,7 +638,7 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
     // `weaklyBridgedIndices` is read below.
     const weaklyBridgedIndices = new Set<number>();
     sorted.forEach((e, i) => {
-        if (resolveEventFileId(e) || resolveEventQbPurchaseId(e)) return;
+        if (hasResolvedId(e)) return;
         const roots = idRootsByDoc.get(e.docNumber as string);
         if (roots && roots.size === 1) {
             union(i, [...roots][0]);
@@ -600,7 +653,7 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
     // which is exactly the collision this whole scheme exists to avoid.
     const byPrefix = new Map<string, number>();
     sorted.forEach((e, i) => {
-        if (resolveEventFileId(e) || resolveEventQbPurchaseId(e)) return;
+        if (hasResolvedId(e)) return;
         const doc = e.docNumber as string;
         const roots = idRootsByDoc.get(doc);
         if (roots && roots.size === 1) return; // already bridged above
@@ -622,13 +675,22 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
         const groupEvents = indices.map((i) => sorted[i]); // already ascending (createdAt, id)
         let driveFileId: string | null = null;
         let qbPurchaseId: string | null = null;
+        let intakeId: string | null = null;
         for (const e of groupEvents) {
             driveFileId = driveFileId ?? resolveEventFileId(e);
+            intakeId = intakeId ?? resolveEventIntakeId(e);
             const qb = resolveEventQbPurchaseId(e);
             if (qb) qbPurchaseId = qb;
         }
         const doc = groupEvents[0].docNumber as string;
-        const key = driveFileId ?? (qbPurchaseId ? `qb:${qbPurchaseId}` : `prefix:${doc}`);
+        // `prefix:<doc>` is the LAST resort, and it is not an identity: two
+        // different receipts can share a 21-char DocNumber prefix, so keying on
+        // it merges them into one journey. A v2 row with no Drive file has a
+        // real id of its own — the intake cuid — and it belongs here, or every
+        // email/chat/mobile receipt that collides on a prefix is presented as
+        // one receipt in the Command Center.
+        const key = driveFileId
+            ?? (qbPurchaseId ? `qb:${qbPurchaseId}` : intakeId ? `intake:${intakeId}` : `prefix:${doc}`);
 
         // Finding 5: real id evidence (driveFileId/qbPurchaseId) on the
         // group is necessary but not sufficient — if ANY member only joined
@@ -647,7 +709,10 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
             steps: [], finalState: "in-flight", finalReason: null,
             syncedExpenseId: null, syncedProjectName: null,
             driveFileId, qbPurchaseId, synced: null, backfilled: false,
-            keyConfirmed: (Boolean(driveFileId) || Boolean(qbPurchaseId)) && !hasWeakBridgeMember,
+            // An intake id is as much proof as a Drive id: a cuid, unique per
+            // row, written by the code that owns the row.
+            keyConfirmed:
+                (Boolean(driveFileId) || Boolean(qbPurchaseId) || Boolean(intakeId)) && !hasWeakBridgeMember,
         };
         for (const e of groupEvents) {
             if (e.source === "backfill") j.backfilled = true;

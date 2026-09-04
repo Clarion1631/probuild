@@ -13,6 +13,7 @@ import {
 } from "@/lib/time-expense-core";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
+import { isReceiptUrlRef, resolveReceiptUrl } from "@/lib/receipt-intake/receipt-url";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
 import {
@@ -470,7 +471,7 @@ export async function getTimeExpenseData(projectId: string) {
         orderBy: { startTime: "desc" },
     });
 
-    const expenses = await prisma.expense.findMany({
+    const expenseRows = await prisma.expense.findMany({
         where: { estimate: { projectId } },
         include: {
             costCode: { select: { id: true, name: true, code: true } },
@@ -480,6 +481,17 @@ export async function getTimeExpenseData(projectId: string) {
         },
         orderBy: { createdAt: "desc" },
     });
+
+    // `receiptUrl` is a stored REFERENCE for anything the receipt pipeline
+    // booked (`receipt-intake://…`), not a link — the tab renders it as an
+    // href, so it is resolved to a short-lived signed URL here. Legacy absolute
+    // URLs and data URLs come back unchanged.
+    const expenses = await Promise.all(expenseRows.map(async expense => ({
+        ...expense,
+        receiptUrl: isReceiptUrlRef(expense.receiptUrl)
+            ? await resolveReceiptUrl(expense.receiptUrl)
+            : expense.receiptUrl,
+    })));
 
     const costCodes = await prisma.costCode.findMany({
         where: { isActive: true },

@@ -229,3 +229,55 @@ test("journeyKey: falls back to docNumber+firstSeen only when neither driveFileI
     const j = { driveFileId: null, qbPurchaseId: null, docNumber: "DOC-3", firstSeen };
     assert.equal(journeyKey(j), `DOC-3:${firstSeen.toISOString()}`);
 });
+
+// ── A v2 receipt with no Drive file behind it still groups (round-14 C) ────
+
+test("intakeId is a first-class identity, and never masquerades as a Drive id", async () => {
+    const { resolveEventFileId, resolveEventIntakeId } =
+        await import("../src/lib/automation-events");
+
+    const INTAKE_ID = "cmpd6xca1009x1iizdf4suln3";
+    const doc = "cmpd6xca1009x1iizd";
+    // A v2 receipt with no Drive file behind it: an intake beacon and the push
+    // event that booked it. Before the fix the worker put the intake cuid in
+    // `fileId`, which is dual-written into the `driveFileId` COLUMN — filling
+    // it with ids no Drive query can ever match.
+    const intake = fakeEvent({
+        id: "e1", stage: "intake", status: "staged", docNumber: doc,
+        detail: JSON.stringify({ intakeId: INTAKE_ID }),
+        createdAt: new Date("2026-09-01T10:00:00Z"),
+    });
+    const push = fakeEvent({
+        id: "e2", status: "created", docNumber: doc, qbPurchaseId: "QB-1",
+        detail: JSON.stringify({ intakeId: INTAKE_ID, qbPurchaseId: "QB-1" }),
+        createdAt: new Date("2026-09-01T10:05:00Z"),
+    });
+
+    // Neither event claims a Drive id, because neither has one.
+    assert.equal(resolveEventFileId(intake), null);
+    assert.equal(resolveEventFileId(push), null);
+    assert.equal(resolveEventIntakeId(intake), INTAKE_ID);
+
+    // They are still ONE receipt, joined on the intake id — proof, not the
+    // docNumber-prefix heuristic, which is explicitly a guess.
+    const journeys = [...groupEventsIntoJourneys([intake, push]).values()];
+    assert.equal(journeys.length, 1);
+    assert.equal(journeys[0].steps.length, 2);
+    assert.equal(journeys[0].keyConfirmed, true, "an id match is proof, not a guess");
+});
+
+test("two DIFFERENT v2 receipts sharing a docNumber prefix stay apart", () => {
+    // The control: the intake id is what keeps them separate. Without it both
+    // would fall into the prefix bucket and be presented as one receipt.
+    const doc = "COLLIDING-PREFIX-00000";
+    const a = fakeEvent({
+        id: "a", docNumber: doc, detail: JSON.stringify({ intakeId: "intake-a" }),
+        createdAt: new Date("2026-09-01T10:00:00Z"),
+    });
+    const b = fakeEvent({
+        id: "b", docNumber: doc, detail: JSON.stringify({ intakeId: "intake-b" }),
+        createdAt: new Date("2026-09-01T10:01:00Z"),
+    });
+    const journeys = [...groupEventsIntoJourneys([a, b]).values()];
+    assert.equal(journeys.length, 2, "two ids, two receipts");
+});

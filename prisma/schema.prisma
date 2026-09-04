@@ -69,6 +69,7 @@ model User {
   mcpKeys                   McpKey[]
   createdInspections        Inspection[]              @relation("InspectionCreator")
   percentCompleteUpdates    Project[]                 @relation("PercentCompleteUpdatedBy")
+  receiptIntakes            ReceiptIntake[]
   lockedPayrollPeriods      PayrollPeriod[]           @relation("PayrollPeriodLocker")
 }
 
@@ -398,6 +399,7 @@ model Project {
   decisions               Decision[]
   permits                 Permit[]
   inspections             Inspection[]
+  receiptIntakes          ReceiptIntake[]
 
   // ── Percent complete (earned revenue / earned margin) ──────────────────────
   // percentComplete is the EFFECTIVE value every screen shows; percentCompleteAuto
@@ -728,6 +730,12 @@ model Expense {
 
   createdAt DateTime @default(now())
 
+  /// Back-relation for ReceiptIntake.expenseId. Declared here rather than left
+  /// SQL-only because `prisma migrate diff` WOULD see a foreign key that
+  /// schema.prisma does not declare and propose dropping it, which breaks CI's
+  /// "migrations reproduce production" assertion.
+  receiptIntake ReceiptIntake?
+
   @@index([estimateId])
   @@index([changeOrderId])
 }
@@ -980,6 +988,7 @@ model CostCode {
   purchaseOrderItems PurchaseOrderItem[]
   catalogItems       CatalogItem[]
   scheduleTasks      ScheduleTask[]
+  receiptIntakes     ReceiptIntake[]
 }
 
 model CostType {
@@ -3178,4 +3187,173 @@ model BankImageMatch {
   note        String?
 
   @@index([bankLineId])
+}
+
+/// Receipt Pipeline v2 — the single intake row for one inbound document
+/// (docs/plans/PHASE-1-INTAKE-CORE-SPEC.md). Every source (mobile capture, the
+/// Apps Script Drive/email/chat forwarders, the web uploader) lands here first;
+/// the cron worker reads it with Gemini, dedups it, routes it, and only then
+/// books it to QuickBooks + Expense.
+///
+/// `state` is a String with a SQL CHECK, not a Prisma enum — matching
+/// BankLine.state and Expense.status.
+/// ONE LIVE CLAIM PER OBJECT PATH, enforced by the primary key.
+///
+/// Publishing and deleting the same object are mutually exclusive, and until
+/// now that exclusion lived entirely in the JSON `detail` of an AutomationEvent
+/// -- which no constraint could enforce and no two transactions serialized on.
+/// A sweeper converting an EXPIRED provisional intent into a deleting claim and
+/// a publisher inserting a fresh publishing claim touched DIFFERENT rows, so at
+/// READ COMMITTED both read "the path is free", both committed, and the sweeper
+/// deleted the object the publisher had just sealed but not yet pointed at: a
+/// RECEIVED row with no bytes behind it.
+///
+/// The path being the PRIMARY KEY makes a second live claim impossible even if
+/// the advisory lock both claim transactions take were somehow missed.
+model ReceiptObjectClaim {
+  /// The object this claim is over. One row per path -- that IS the invariant.
+  storagePath String   @id
+  /// Random per acquisition. The holder re-reads it before acting, so an
+  /// expired claim taken over by somebody else cannot be mistaken for its own.
+  token       String
+  /// publishing | deleting
+  kind        String
+  /// When the claim lapses. A dead holder must not block a path forever.
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
+model ReceiptIntake {
+  id          String  @id @default(cuid())
+  source      String // mobile | email | drive | chat | web
+  /// "drive:<fileId>" | "email:<gmailMsgId>:<sha16>" | "mobile:<uploadId>" |
+  /// "chat:<messageName>:<n>" | "web:<uuid>" — the caller's idempotency key.
+  sourceRef   String  @unique
+  /// STAGING is the state a row is BORN in: the object is not in the bucket
+  /// yet, so the worker's claim predicate excludes it. The intake route flips
+  /// it to RECEIVED in one UPDATE after the upload lands. A row that never gets
+  /// there is swept to NEEDS_REVIEW after 15 minutes.
+  state       String  @default("STAGING") // STAGING RECEIVED READ NEEDS_JOB NEEDS_REVIEW BOOKING BOOKED ARCHIVED DUPLICATE VOID NON_RECEIPT SHADOW_DONE SHADOW_QUARANTINE
+  dryRun      Boolean @default(true)
+  /// no-estimate | multi-doc | zero-total | weak-dup:<id> |
+  /// strong-dup-amount-mismatch:<id> | qbo-fault:<code> | max-retries |
+  /// push-disabled | push-paused
+  stateReason String?
+  /// tax-implausible, and nothing else. A DURABLE marker: `stateReason` is
+  /// overwritten by every deferred booking and every park, so a warning left
+  /// there did not survive to BOOKED. Written once by routing.
+  taxWarning  String?
+
+  projectId           String?
+  project             Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  costCodeId          String?
+  costCode            CostCode? @relation(fields: [costCodeId], references: [id])
+  suggestedCostCodeId String?
+  suggestedConfidence Float?
+  createdById         String?
+  createdBy           User?     @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  // file (Supabase secure-docs, private)
+  storagePath String // receipts/intake/<id>.<ext> in SECURE_BUCKET
+  fileName    String?
+  mimeType    String
+  fileSize    Int
+  fileSha256  String
+  /// What the CLIENT said it was about to upload, recorded by /intake/start.
+  /// The two-step flow hands the bytes straight to storage, so this is the only
+  /// way to notice that a reused sourceRef is carrying a DIFFERENT document.
+  expectedSha256 String?
+  /// When the signed upload URL /intake/start last issued stops working.
+  /// The sweeper uses THIS, not createdAt, to decide whether an object could
+  /// still arrive: a row whose URL was re-issued is younger than its row, and
+  /// parking it on row age declared a receipt missing while its own upload link
+  /// was live. Null on rows that never had a signed URL (the single-shot path).
+  uploadUrlExpiresAt DateTime?
+  /// Bumped every time a signed upload URL is issued for this row, and embedded
+  /// in the path that URL points at. It is what makes "the upload the sweeper
+  /// looked at" and "the upload the client is doing now" different things: a
+  /// resumed /start moves the row to v2 while a sweep is still deciding about
+  /// v1, and every destructive write fences on the version it observed, so the
+  /// sweep's verdict lands on nothing.
+  uploadLeaseVersion Int       @default(0)
+  /// The ADOPTION GENERATION of the current lease: a fresh random value written
+  /// every time a lease is issued, extended or re-armed for this row.
+  ///
+  /// It exists because /start's own discard CAS needed a column that provably
+  /// MOVES on adoption and it had none. That CAS pinned `uploadUrlExpiresAt`,
+  /// but a reuse writes "now + 2h" exactly as the original issue did — so two
+  /// requests landing in the same millisecond (or on hosts whose clocks agree
+  /// too well) wrote the SAME expiry, the CAS matched, and the delete removed a
+  /// row another request had already adopted and handed a working URL for. The
+  /// version cannot serve instead: it is embedded in the object path, so
+  /// bumping it on a same-path reuse would break the lease-reuse contract.
+  uploadLeaseNonce   String?
+
+  // read results (cents, like AutomationEvent)
+  vendor     String?
+  txnDate    DateTime? @db.Date
+  totalCents Int?
+  taxCents   Int?
+  docType    String? // receipt | check | multi | non_receipt
+  refNumber  String? // cleaned invoice #, or "Check<num>" for checks
+  memo       String?
+  readJson   String? // raw Gemini JSON, audit only
+  readAt     DateTime?
+
+  // dedup
+  dedupStrongKey String?
+  dedupWeakKey   String?
+  duplicateOfId  String?
+
+  // booking + archive
+  /// Set the instant before the QBO create is attempted. A park BEFORE this is
+  /// true provably created no Purchase, so its strong key can be released; a
+  /// park after it must keep the key, because QuickBooks may hold a Purchase
+  /// whose response we lost.
+  sendAttempted      Boolean  @default(false)
+  /// Positive evidence that v1 (the Apps Script) already booked this document.
+  /// The cutover retires ONLY rows carrying it — never rows that merely predate
+  /// the boundary, because "old" is not proof anybody booked anything.
+  archivedByV1       Boolean  @default(false)
+  qbPurchaseId       String?
+  expenseId          String?   @unique
+  expense            Expense?  @relation(fields: [expenseId], references: [id], onDelete: SetNull)
+  archiveDriveFileId String?
+  /// Fencing token for the worker's claim, rewritten on every claim.
+  ///
+  /// `nextRetryAt` is a time-based lease and cannot tell a LIVE worker from a
+  /// stale one whose invocation was killed and resumed: both hold the same row
+  /// id and both believe they own it. The token can — a completing transition
+  /// matches on it, so a worker whose claim was superseded writes nothing
+  /// instead of overwriting the state its successor just produced.
+  claimToken         String?
+  claimedAt          DateTime?
+  attempts           Int       @default(0)
+  /// Consecutive passes where the AI service was UNAVAILABLE (never the
+  /// document's fault, so it must not spend `attempts`). Ported from v3.4:
+  /// an outage that never ends still has to end somewhere, so after 20 the
+  /// row is parked for a human instead of retrying forever.
+  busyPasses         Int       @default(0)
+  lastError          String?
+  nextRetryAt        DateTime?
+  bookedAt           DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // NOTE: a partial UNIQUE index on dedupStrongKey (WHERE state NOT IN
+  // ('DUPLICATE','VOID') AND dedupStrongKey IS NOT NULL) exists in SQL only —
+  // Prisma cannot represent partial indexes and silently drops them (CLAUDE.md,
+  // baseline notes). Keep this comment; never regenerate it away.
+  @@index([state, nextRetryAt])
+  @@index([projectId])
+  /// Both are FK targets the queue filters and joins on; without these a
+  /// cost-code or user-scoped read scans the whole table once it has volume.
+  @@index([costCodeId])
+  @@index([createdById])
+  @@index([dedupWeakKey])
+  @@index([createdAt])
 }

@@ -574,8 +574,23 @@ function expenseMatchesQboWrite(
     );
 }
 
-async function lockQboExpense(
-    transaction: ExpenseTransaction,
+/** The one capability `lockQboExpense` needs, so any writer can share it. */
+export interface QboExpenseLockClient {
+    $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
+}
+
+/**
+ * THE per-Purchase advisory lock. Exported so every writer of an Expense keyed
+ * by a QBO Purchase id takes the SAME one.
+ *
+ * The receipt-intake worker links an Expense by `qbPurchaseId` too, and it was
+ * doing so unlocked — so the importer could create the row between that
+ * worker's lookup and its link, and the two disagreed about what the Expense
+ * said. Copying the lock string into book.ts would have been two constants
+ * that must never drift; sharing the function is one.
+ */
+export async function lockQboExpense(
+    transaction: QboExpenseLockClient,
     qbPurchaseId: string,
 ): Promise<void> {
     // Serialize all writers for one QBO Purchase id before reading its SyncToken.

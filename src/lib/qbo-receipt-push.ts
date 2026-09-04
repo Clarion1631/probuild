@@ -233,8 +233,92 @@ export interface CreateQBReceiptPurchaseInput {
  */
 export type ReceiptAttachmentStatus = "attached" | "already-attached" | "skipped" | `failed:${string}`;
 
+/**
+ * What QuickBooks ACTUALLY holds for a Purchase that already exists, read off
+ * the entity rather than assumed from the payload we would have sent.
+ *
+ * `projectNames` is a list because the job rides on each LINE's CustomerRef and
+ * a Purchase can carry several. It is a SUMMARY, kept for the review snapshot —
+ * the verdict is decided from `lines`, because a set of names cannot represent
+ * the line that carried no name at all.
+ */
+export interface BookedPurchaseValues {
+    /** QBO's `TotalAmt`. Null only when the entity did not carry a usable one. */
+    totalAmount: number | null;
+    /** QBO's `TxnDate`, as a calendar day. Null when absent or not a real date. */
+    txnDate: string | null;
+    /** `EntityRef.name`. Null when QBO returned the ref without a display name. */
+    vendor: string | null;
+    /** Distinct `CustomerRef.name`s across the expense lines. */
+    projectNames: string[];
+    /**
+     * EVERY entry of `Line`, in order, with what could be read of its job
+     * attribution — including the ones that carry none. The distinct-name set
+     * above cannot answer "is all of this money on this job", because a line
+     * with no customer, or one this code cannot parse at all, leaves no trace
+     * in it: see attributionAgrees.
+     */
+    lines: BookedExpenseLine[];
+    /** Dollars posted to the reimbursable-sales-tax account. */
+    taxAmount: number;
+}
+
+/**
+ * One `Purchase.Line` entry's job attribution, read off the entity.
+ *
+ * `readable: false` means the entry is not an account-based expense line, so
+ * there is no `AccountBasedExpenseLineDetail` to find a `CustomerRef` on at
+ * all. That is NOT the same as an account-based line that simply carries no
+ * customer — both fail the check, but only one of them is a shape this code
+ * understands, and conflating them would hide the difference from the review.
+ */
+export interface BookedExpenseLine {
+    /** Posted to the reimbursable-sales-tax account rather than an expense one. */
+    tax: boolean;
+    /** `CustomerRef.value` — the identity. Null when the ref is absent or unusable. */
+    customerId: string | null;
+    /** `CustomerRef.name` — a display string, and optional per QBO's own docs. */
+    customerName: string | null;
+    /** False when the entry is not an account-based expense line. */
+    readable: boolean;
+}
+
+/**
+ * What may be done with a Purchase that is already in the books.
+ *
+ * - `match`  — the books agree with this document; book it as planned.
+ * - `derive` — they disagree about the AMOUNT, DATE or VENDOR. QuickBooks is
+ *   the booked truth for those (real money posted against them, and the
+ *   difference is OCR noise on our side), so the Expense is written from the
+ *   QBO values and the difference is recorded.
+ * - `review` — they disagree about the PROJECT or the TAX SPLIT, the Purchase
+ *   is not FULLY attributed to that project (see attributionAgrees), or QBO did
+ *   not give a usable total or date at all. Those are attribution decisions, not
+ *   noise: which job carries the cost, and whether the sales tax is sitting on
+ *   the reclaimable account. Neither side may be preferred automatically, so no
+ *   Expense is written and a human looks.
+ */
+export interface ExistingPurchaseCheck {
+    verdict: "match" | "derive" | "review";
+    /** Stable, sorted field names: "amount" | "date" | "vendor" | "project" | "tax". */
+    differences: string[];
+    booked: BookedPurchaseValues;
+}
+
 export type CreateQBReceiptPurchaseResult =
-    | { ok: true; qbPurchaseId: string; docNumber: string; alreadyExists: true; attachment: ReceiptAttachmentStatus }
+    | {
+        ok: true;
+        qbPurchaseId: string;
+        docNumber: string;
+        alreadyExists: true;
+        attachment: ReceiptAttachmentStatus;
+        /**
+         * The books, compared against what THIS document says. Present only on
+         * the alreadyExists branch, because it is the only one where a Purchase
+         * we did not write in this call decides what the Expense should say.
+         */
+        existing: ExistingPurchaseCheck;
+    }
     | { ok: true; qbPurchaseId: string; docNumber: string; alreadyExists: false; attachment: ReceiptAttachmentStatus }
     | { ok: false; reason: "project-not-matched"; projectName: string }
     | { ok: false; reason: "docnumber-conflict"; docNumber: string }
@@ -254,6 +338,32 @@ export interface QboReceiptProjectCandidate {
 export interface QboReceiptPushDependencies {
     qbQueryFn: <T = any>(tokens: QBTokens, query: string) => Promise<T[]>;
     qbCreateFn: (tokens: QBTokens, payload: Record<string, unknown>, requestId: string) => Promise<{ id: string }>;
+    /**
+     * Invoked IMMEDIATELY before qbCreateFn, and nowhere else.
+     *
+     * Callers that record "a Purchase may now exist" need that record to happen
+     * at the last possible instant. Everything above this line — the DocNumber
+     * query, the project match, the vendor/customer ensures, the account
+     * verification, the money validation — can fail without any Purchase being
+     * created, and a caller that marked earlier would treat those as
+     * "might have booked" forever.
+     *
+     * Throwing from this hook aborts the create, which is the point: it is also
+     * the caller's last chance to check it still owns the row.
+     */
+    onBeforeCreate?: () => Promise<void>;
+    /**
+     * Invoked when the idempotency query finds THIS file's Purchase already in
+     * QuickBooks, immediately before anything else is done with it.
+     *
+     * The alreadyExists branch returns WITHOUT ever reaching qbCreateFn, so
+     * `onBeforeCreate` never fires on it. That left the caller unable to tell
+     * "a Purchase exists for this row" from "nothing was ever sent" — and a row
+     * that exhausted its retries on this path would hand back its dedup key
+     * while a real Purchase sat in the books, so a resubmission would book the
+     * same receipt twice. This hook is that signal.
+     */
+    onExistingPurchase?: () => Promise<void>;
     ensureVendorFn: (tokens: QBTokens, name: string) => Promise<string>;
     // Injectable (unlike the plain re-export of ensureQBCustomer) because the
     // customer is now resolved on EVERY create — there is no more per-client
@@ -305,6 +415,237 @@ function findExactProjectMatch(
     const target = normalizeProjectName(projectName);
     const matches = projects.filter(p => normalizeProjectName(p.name) === target);
     return matches.length === 1 ? matches[0] : null;
+}
+
+/**
+ * The cents a booked value may differ by and still count as the same money.
+ *
+ * Two, matching the tolerance the group/total reconciliation above already
+ * allows: a two-line tax split can round each half independently.
+ */
+const BOOKED_AMOUNT_TOLERANCE_CENTS = 2;
+
+/** A QBO ReferenceType's display name, when it carried one. */
+function refName(ref: unknown): string | null {
+    if (!ref || typeof ref !== "object") return null;
+    const name = (ref as { name?: unknown }).name;
+    return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
+/**
+ * A QBO ReferenceType's id. The `name` beside it is a display string two
+ * different customers can share; THIS is the identity.
+ */
+function refValue(ref: unknown): string | null {
+    if (!ref || typeof ref !== "object") return null;
+    const value = (ref as { value?: unknown }).value;
+    if (typeof value === "string") return value.trim() || null;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    return null;
+}
+
+function expenseLineDetail(line: unknown): Record<string, unknown> | null {
+    if (!line || typeof line !== "object") return null;
+    const detail = (line as { AccountBasedExpenseLineDetail?: unknown }).AccountBasedExpenseLineDetail;
+    return detail && typeof detail === "object" ? (detail as Record<string, unknown>) : null;
+}
+
+/**
+ * READ THE BOOKS. Every value comes off the QBO entity — nothing is inferred
+ * from the payload this process would have sent, because the whole point is to
+ * find out where the two disagree.
+ */
+export function readBookedPurchase(purchase: Record<string, unknown>, taxAccountId: string): BookedPurchaseValues {
+    const rawTotal = Number(purchase.TotalAmt);
+    const rawDate = purchase.TxnDate;
+    const lines = Array.isArray(purchase.Line) ? purchase.Line : [];
+
+    let taxCents = 0;
+    const projectNames = new Set<string>();
+    const expenseLines: BookedExpenseLine[] = [];
+    for (const line of lines) {
+        const detail = expenseLineDetail(line);
+        // RECORDED, not skipped. A line this code cannot parse still carries
+        // money on this Purchase, and dropping it here is what let a partly
+        // attributed document read as a fully attributed one.
+        if (!detail) {
+            expenseLines.push({ tax: false, customerId: null, customerName: null, readable: false });
+            continue;
+        }
+        const customer = refName(detail.CustomerRef);
+        if (customer) projectNames.add(customer);
+        const account = (detail.AccountRef as { value?: unknown } | undefined)?.value;
+        const tax = account !== undefined && String(account) === taxAccountId;
+        if (tax) {
+            const amount = Number((line as { Amount?: unknown }).Amount);
+            if (Number.isFinite(amount)) taxCents += Math.round(amount * 100);
+        }
+        expenseLines.push({
+            tax,
+            customerId: refValue(detail.CustomerRef),
+            customerName: customer,
+            readable: true,
+        });
+    }
+
+    return {
+        totalAmount: Number.isFinite(rawTotal) && rawTotal > 0 ? rawTotal : null,
+        txnDate: isValidCalendarDate(rawDate) ? rawDate : null,
+        vendor: refName(purchase.EntityRef),
+        projectNames: Array.from(projectNames),
+        lines: expenseLines,
+        taxAmount: taxCents / 100,
+    };
+}
+
+/**
+ * IS EVERY DOLLAR ON THIS PURCHASE ON THE JOB THIS RECEIPT SAYS IT IS?
+ *
+ * The rule this replaces read the DISTINCT customer names off the lines and
+ * passed when exactly one of them matched. That answered "does some line agree"
+ * rather than "do they all", and the difference is money: a Purchase carrying a
+ * $50 line coded to this job plus a $100 line coded to nothing at all read as a
+ * clean match, and the Expense was then written for the whole $150 against a
+ * job QuickBooks only holds a third of. A Purchase with NO coded lines missed
+ * the check entirely — the guard was inside `projectNames.length > 0` — and
+ * passed unconditionally.
+ *
+ * So it is per line now, and the burden of proof runs the other way: the
+ * default is `review`, and a `match` has to be earned by every line.
+ *
+ *   - Nothing readable to attribute is not a pass. "I could not check" must not
+ *     read the same as "I checked and it agrees", exactly as for the total and
+ *     the date above.
+ *   - Every NON-TAX line must be coded. A tax line need not be: it posts to the
+ *     reclaimable-sales-tax account, which is its own attribution, and an
+ *     uncoded one misfiles nothing.
+ *   - A customer NAME that disagrees is fatal wherever it sits, tax line
+ *     included — that is the old two-jobs ambiguity, kept.
+ *   - Identity between lines is compared on `CustomerRef.value`, never the
+ *     display name: two QBO customers can share one. More than one id on a
+ *     document is the same split-across-jobs ambiguity by a route the name
+ *     comparison cannot see.
+ *   - And at least one line has to be confirmed BY NAME. Ids agreeing with each
+ *     other says the lines agree with each other, not that they agree with this
+ *     receipt: the expected customer's id is not known on this branch (it is
+ *     resolved after the idempotency query, and resolving it here would CREATE
+ *     a QBO customer on a replay path), so the name is the only form of the
+ *     expected identity available to compare against.
+ */
+function attributionAgrees(lines: BookedExpenseLine[], expectedProjectName: string): boolean {
+    if (lines.length === 0) return false;
+    const expected = normalizeProjectName(expectedProjectName);
+
+    // EVERY MONETARY LINE CARRIES THE SAME CUSTOMER ID — tax included.
+    //
+    // The previous rule accepted three shapes it should not have, and each one
+    // let money onto a job nobody had attributed it to while the worker
+    // recorded the WHOLE gross against that project:
+    //
+    //   - a non-tax line with a matching display NAME and no customer id. The
+    //     "not attributed at all" guard read `!tax && !customerId &&
+    //     !customerName`, so a name alone satisfied it — and a name is not an
+    //     identity. One named line then validated every other line beside it.
+    //   - a TAX line with no customer ref at all. Tax was excluded from that
+    //     guard entirely, so reclaimable sales tax could sit unassigned on a
+    //     Purchase this check called fully attributed.
+    //   - `ids.size <= 1`, which is satisfied by ZERO ids: a Purchase whose
+    //     lines carried names and no ids passed with nothing pinned.
+    //
+    // So the id is derived from the lines themselves and then required of all
+    // of them: exactly one distinct id across every line, at least one line
+    // confirming that id belongs to the expected project BY NAME (the expected
+    // customer's own id is not resolvable on this branch — resolving it would
+    // CREATE a QBO customer on a replay path), and no line missing either.
+    const ids = new Set<string>();
+    let confirmedByName = false;
+    for (const line of lines) {
+        if (!line.readable) return false;
+        // Tax is money too. A line we cannot attribute is a line that has to
+        // go to a human, whichever account it posts to.
+        if (!line.customerId) return false;
+        ids.add(line.customerId);
+        if (line.customerName) {
+            if (normalizeProjectName(line.customerName) !== expected) return false;
+            confirmedByName = true;
+        }
+    }
+    // `=== 1`, not `<= 1`: zero ids is not agreement, it is an absence.
+    return ids.size === 1 && confirmedByName;
+}
+
+/**
+ * THE ONE VENDOR COMPARISON IN THE CODEBASE.
+ *
+ * Exported because `book.ts` needs the identical question — "are these two
+ * spellings the same vendor?" — when it reconciles a receipt against an
+ * Expense the QBO importer already wrote. It used to compare byte-for-byte
+ * there while this compared case- and whitespace-insensitively, so QBO's
+ * canonical "Home Depot" and a receipt's "  home   depot " were the SAME
+ * vendor to the identity check and a `expense-conflict:vendor` park to the
+ * reconcile. Two normalizers is how that happens; one cannot.
+ */
+export function normalizeVendorName(name: string): string {
+    return name.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * COMPARE THE BOOKS AGAINST THIS DOCUMENT, and say which way the disagreement
+ * has to be resolved. See ExistingPurchaseCheck for the rule and why the two
+ * halves are split where they are.
+ *
+ * An UNREADABLE total or date is a `review`, never a pass. QBO returns both on
+ * every Purchase, so their absence means we are not looking at what we think we
+ * are looking at — and "I could not check" must not read the same as "I checked
+ * and it agrees" on the one path that decides what a real Expense records.
+ *
+ * A missing vendor or customer NAME is different: QBO documents the `name` on a
+ * ReferenceType as optional, so its absence is a fact about the response shape
+ * rather than about the books. Those compare only when a name is present, and
+ * the snapshot records what was (and was not) readable.
+ */
+export function compareExistingPurchase(
+    booked: BookedPurchaseValues,
+    input: Pick<CreateQBReceiptPurchaseInput, "projectName" | "vendor" | "date" | "totalAmount" | "groups">,
+): ExistingPurchaseCheck {
+    const derive: string[] = [];
+    const review: string[] = [];
+
+    const plannedCents = Math.round(Number(input.totalAmount) * 100);
+    if (booked.totalAmount === null) {
+        review.push("amount");
+    } else if (Math.abs(Math.round(booked.totalAmount * 100) - plannedCents) > BOOKED_AMOUNT_TOLERANCE_CENTS) {
+        derive.push("amount");
+    }
+
+    if (booked.txnDate === null) {
+        review.push("date");
+    } else if (booked.txnDate !== input.date) {
+        derive.push("date");
+    }
+
+    const plannedVendor = (input.vendor ?? "").trim();
+    if (booked.vendor && plannedVendor && normalizeVendorName(booked.vendor) !== normalizeVendorName(plannedVendor)) {
+        derive.push("vendor");
+    }
+
+    // EVERY line, not "one name that matched". See attributionAgrees: a
+    // partly-coded Purchase used to pass on the strength of its coded half, and
+    // an entirely uncoded one skipped the check altogether.
+    if (!attributionAgrees(booked.lines, input.projectName)) review.push("project");
+
+    const plannedTaxCents = input.groups
+        .filter(g => g.tax === true)
+        .reduce((sum, g) => sum + Math.round(Number(g.amount) * 100), 0);
+    const bookedTaxCents = Math.round(booked.taxAmount * 100);
+    if (Math.abs(bookedTaxCents - plannedTaxCents) > BOOKED_AMOUNT_TOLERANCE_CENTS) {
+        review.push("tax");
+    }
+
+    const differences = [...review, ...derive].sort();
+    if (review.length > 0) return { verdict: "review", differences, booked };
+    if (derive.length > 0) return { verdict: "derive", differences, booked };
+    return { verdict: "match", differences, booked };
 }
 
 /** Same round-trip validation parseBackfillDate uses in the qbo-expenses/sync route. */
@@ -410,6 +751,25 @@ async function defaultListInProgressProjects(): Promise<QboReceiptProjectCandida
  */
 export function attachmentFileName(rawFileName: string | undefined): string {
     return (rawFileName || "receipt").replace(/[\r\n"]/g, "") || "receipt";
+}
+
+/**
+ * The Attachable FileName idempotency actually runs on — derived from the
+ * receipt's OWN identity, never the caller-chosen display name.
+ *
+ * `fileId` is the Drive file id, or (for drive-less sources) the intake row's
+ * own cuid — see book.ts's `fileId = driveFileIdOf(row) ?? row.id` — so it is
+ * unique per receipt and cannot collide with a different document. Before
+ * this, `ensureAttachmentOnExistingPurchase` matched on the caller-supplied
+ * `fileName` alone, which is routinely identical across unrelated receipts
+ * (most phones name every photo "receipt.jpg" or worse). A Purchase that
+ * already carried a DIFFERENT receipt under that same generic name read as
+ * "already attached" for this one too, and the real bytes were never sent.
+ */
+export function stableAttachmentFileName(fileId: string, rawFileName: string | undefined): string {
+    const ext = (rawFileName || "").match(/\.[A-Za-z0-9]{1,8}$/)?.[0]?.toLowerCase() ?? "";
+    const safeId = fileId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 100) || "unknown";
+    return attachmentFileName(`receipt-${safeId}${ext}`);
 }
 
 export async function defaultUploadAttachment(
@@ -533,7 +893,7 @@ function planAttachmentUpload(
     if (!contentType) return null;
     if (!isValidBase64(input.fileBase64)) return null;
     if (Buffer.byteLength(input.fileBase64, "base64") > MAX_ATTACHMENT_BYTES) return null;
-    return { base64: input.fileBase64, contentType, fileName: attachmentFileName(input.fileName) };
+    return { base64: input.fileBase64, contentType, fileName: stableAttachmentFileName(input.fileId, input.fileName) };
 }
 
 /**
@@ -1113,20 +1473,39 @@ async function createQBReceiptPurchaseUnderLock(
 
     const docNumber = input.fileId.slice(0, 21);
     const marker = `[gtr-file:${input.fileId}]`;
+    // Read once, up here, because the idempotency branch below needs the tax
+    // account to tell a reclaimable-tax line apart from an expense line.
+    const bankAccountId = process.env.QBO_RECEIPT_BANK_ACCOUNT_ID || BANK_ACCOUNT_ID_DEFAULT;
+    const expenseAccountId = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || EXPENSE_ACCOUNT_ID_DEFAULT;
+    const taxAccountId = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || TAX_ACCOUNT_ID_DEFAULT;
 
     // Idempotency first — never re-create a Purchase for a file already
     // pushed. A DocNumber hit whose PrivateNote does NOT carry this file's
     // full marker is a genuine id collision (truncated to 21 chars — two
     // different Drive fileIds can share that prefix), not a re-send: refuse
     // rather than silently attach to the wrong Purchase.
-    const existing = await qbQueryFn<{ Id: string; PrivateNote?: string }>(
+    //
+    // `SELECT *`, not `Id, PrivateNote`. Two fields were enough to answer "is
+    // this our Purchase"; they were NOT enough to answer "does it say what this
+    // document says", and the caller went on to write an Expense from the OCR
+    // read regardless. A v1-cutover Purchase, or one posted from an earlier
+    // revision of the same Drive file, then left ProBuild's job cost carrying a
+    // number, a date or a job the books do not have. QBO cannot return a
+    // nested Line/EntityRef/TxnTaxDetail from a field list, so the whole entity
+    // is fetched — it is one row, and only on the replay path.
+    const existing = await qbQueryFn<Record<string, unknown>>(
         tokens,
-        `SELECT Id, PrivateNote FROM Purchase WHERE DocNumber = '${escapeQBString(docNumber)}'`,
+        `SELECT * FROM Purchase WHERE DocNumber = '${escapeQBString(docNumber)}'`,
     );
     if (existing.length > 0) {
-        if (existing.length > 1 || !(existing[0].PrivateNote ?? "").includes(marker)) {
+        if (existing.length > 1 || !(String(existing[0].PrivateNote ?? "")).includes(marker)) {
             return { ok: false, reason: "docnumber-conflict", docNumber };
         }
+        // THE PURCHASE EXISTS. Say so before doing anything else with it: the
+        // attachment re-check below is a QBO round trip that can fail, and the
+        // caller still has to know a Purchase is there.
+        await deps.onExistingPurchase?.();
+        const booked = compareExistingPurchase(readBookedPurchase(existing[0], taxAccountId), input);
         // The Purchase exists, but that does NOT mean the receipt file made it
         // across. The common way to reach this branch is a first attempt whose
         // Purchase response was lost (timeout/kill) AFTER QBO committed it —
@@ -1135,14 +1514,21 @@ async function createQBReceiptPurchaseUnderLock(
         // every retry took this same early return. Re-check and fill the gap.
         const attachment = await ensureAttachmentOnExistingPurchase(
             tokens,
-            existing[0].Id,
+            String(existing[0].Id),
             input,
             qbQueryFn,
             uploadAttachment,
             deadline,
             refreshTokensFn,
         );
-        return { ok: true, qbPurchaseId: existing[0].Id, docNumber, alreadyExists: true, attachment };
+        return {
+            ok: true,
+            qbPurchaseId: String(existing[0].Id),
+            docNumber,
+            alreadyExists: true,
+            attachment,
+            existing: booked,
+        };
     }
 
     const projects = await listProjects();
@@ -1226,10 +1612,6 @@ async function createQBReceiptPurchaseUnderLock(
         throw error;
     }
 
-    const bankAccountId = process.env.QBO_RECEIPT_BANK_ACCOUNT_ID || BANK_ACCOUNT_ID_DEFAULT;
-    const expenseAccountId = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || EXPENSE_ACCOUNT_ID_DEFAULT;
-    const taxAccountId = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || TAX_ACCOUNT_ID_DEFAULT;
-
     const refSuffix = input.invoice
         ? ` · Invoice ${input.invoice}`
         : input.checkNumber
@@ -1286,6 +1668,7 @@ async function createQBReceiptPurchaseUnderLock(
     if (isBudgetExhausted(deadline)) {
         throw new QBBudgetExhaustedError("Route budget exhausted before the QBO Purchase create");
     }
+    await deps.onBeforeCreate?.();
     const created = await qbCreateFn(tokens, payload, requestId);
 
     let attachment: ReceiptAttachmentStatus = "skipped";
