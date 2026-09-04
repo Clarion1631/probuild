@@ -1,0 +1,985 @@
+/**
+ * Gusto hours export — overtime table + golden-file CSVs (Phase 5 spec test 1
+ * and 2, docs/plans/PHASE-5-GUSTO-AND-MOBILE-RELEASE-SPEC.md).
+ *
+ * Everything here runs against the PURE core (src/lib/gusto-export-core.ts), so
+ * there is no database and no mocking. The two things most likely to go wrong
+ * silently in a payroll file are (a) overtime being re-derived slightly
+ * differently from src/lib/overtime.ts and (b) the WA meal deduction being
+ * taken twice; both get a dedicated case below.
+ *
+ * The golden CSVs are byte-compared. tests/fixtures/*.csv are marked `-text` in
+ * .gitattributes so a Windows checkout cannot rewrite their line endings and
+ * turn a real regression into a passing (or a passing test into a failing) run.
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import {
+    blockingEntries,
+    buildGustoExport,
+    jobCostingOnlyEmployees,
+    planDeferredSettlements,
+    summaryCsvEmployees,
+    sumEmployeeTotals,
+    toDetailCsv,
+    toSummaryCsv,
+    type ExportEntry,
+    type ExportUser,
+} from "../src/lib/gusto-export-core";
+
+// One test below imports hashExport from gusto-export-db, which statically
+// imports prisma and (transitively) mobile-auth's module-load secret guard.
+// Nothing here touches a database.
+process.env.NEXTAUTH_SECRET ??= "test-secret-for-gusto-export-tests";
+process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
+
+const TZ = "America/Los_Angeles";
+
+const alice: ExportUser = { id: "u-alice", name: "Alice Field", email: "alice@example.com", payType: "HOURLY" };
+// Matches the DEFAULT salaried list in src/lib/payroll-config.ts.
+const cj: ExportUser = { id: "u-cj", name: "CJ Manager", email: "cj@goldentouchremodeling.com", payType: "SALARY" };
+const zoe: ExportUser = { id: "u-zoe", name: "Zoe Zero", email: "zoe@example.com", payType: "HOURLY" };
+const dana: ExportUser = { id: "u-dana", name: "Dana Danger", email: "dana@example.com", payType: "HOURLY" };
+
+let seq = 0;
+type EntryOverrides = Omit<Partial<ExportEntry>, "startTime"> & {
+    userId: string;
+    /** ISO instant — spelled as a string here so the fixtures read as wall-clock facts. */
+    startTime: string;
+    durationHours: number;
+};
+
+function entry(overrides: EntryOverrides): ExportEntry {
+    seq += 1;
+    const start = new Date(overrides.startTime);
+    return {
+        id: overrides.id ?? `e${String(seq).padStart(2, "0")}`,
+        userId: overrides.userId,
+        startTime: start,
+        // `?? ` would swallow an explicit null — and an explicit null IS the
+        // "still clocked in" case this fixture needs to express.
+        endTime: "endTime" in overrides ? overrides.endTime! : new Date(start.getTime() + overrides.durationHours * 3_600_000),
+        durationHours: overrides.durationHours,
+        shiftHours: overrides.shiftHours ?? overrides.durationHours,
+        mealDeductionHours: overrides.mealDeductionHours ?? 0,
+        needsReview: overrides.needsReview ?? false,
+        isEdited: overrides.isEdited ?? false,
+        mealOutcome: overrides.mealOutcome ?? null,
+        projectName: overrides.projectName ?? "Mueller Remodel",
+        costCodeLabel: overrides.costCodeLabel ?? "01-DEMO",
+    };
+}
+
+/** 8am PDT on the given day. August is PDT (UTC-7). */
+const at8am = (day: string) => `${day}T15:00:00.000Z`;
+/** Company-local midnight boundaries for the fixture period, Mon 2026-08-17 .. Mon 2026-08-31. */
+const PERIOD_START = new Date("2026-08-17T07:00:00.000Z");
+const PERIOD_END = new Date("2026-08-31T07:00:00.000Z");
+
+function totalsFor(userId: string, result: ReturnType<typeof buildGustoExport>) {
+    const row = result.employees.find((employee) => employee.user.id === userId);
+    assert.ok(row, `no totals for ${userId}`);
+    return row;
+}
+
+// ── Overtime table (spec test 1) ────────────────────────────────────────────
+
+test("a week of exactly 40 hours has no overtime", () => {
+    const entries = ["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"].map((day) =>
+        entry({ userId: alice.id, startTime: at8am(day), durationHours: 8 })
+    );
+    const result = buildGustoExport({ entries, users: [alice], periodStart: PERIOD_START, periodEnd: PERIOD_END, timeZone: TZ });
+    const row = totalsFor(alice.id, result);
+    assert.equal(row.regularHours, 40);
+    assert.equal(row.overtimeHours, 0);
+    assert.equal(row.doubleOvertimeHours, 0, "WA has no double time — the column is structural");
+});
+
+test("the 41st hour is overtime, split inside the entry that crosses 40", () => {
+    const entries = [
+        ...["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20"].map((day) =>
+            entry({ userId: alice.id, startTime: at8am(day), durationHours: 10 })
+        ),
+        entry({ userId: alice.id, startTime: at8am("2026-08-21"), durationHours: 1 }),
+    ];
+    const result = buildGustoExport({ entries, users: [alice], periodStart: PERIOD_START, periodEnd: PERIOD_END, timeZone: TZ });
+    const row = totalsFor(alice.id, result);
+    assert.equal(row.regularHours, 40);
+    assert.equal(row.overtimeHours, 1);
+    // The entry that straddles the threshold is the one that carries the split.
+    const friday = result.detail.find((d) => d.dayKey === "2026-08-21");
+    assert.equal(friday?.regularHours, 0);
+    assert.equal(friday?.overtimeHours, 1);
+});
+
+test("a meal-deducted 9h shift pays 8.5h and is never deducted again", () => {
+    const entries = [
+        entry({
+            userId: alice.id,
+            startTime: at8am("2026-08-17"),
+            durationHours: 8.5,
+            shiftHours: 9,
+            mealDeductionHours: 0.5,
+        }),
+    ];
+    const result = buildGustoExport({ entries, users: [alice], periodStart: PERIOD_START, periodEnd: PERIOD_END, timeZone: TZ });
+    assert.equal(totalsFor(alice.id, result).totalHours, 8.5);
+    const detail = result.detail[0];
+    assert.equal(detail.paidHours, 8.5);
+    assert.equal(detail.shiftHours, 9);
+    assert.equal(detail.mealDeductionHours, 0.5);
+    // The csv must report the PAID hours, not shift minus meal computed again.
+    assert.match(toDetailCsv(result.detail), /"9\.00","0\.50","8\.50"/);
+});
+
+test("hours worked BEFORE the period, in the same workweek, push in-period hours into overtime", () => {
+    // Period opens Wednesday; Mon+Tue of that same Mon-Sun week are outside it.
+    const periodStart = new Date("2026-08-19T07:00:00.000Z");
+    const entries = [
+        entry({ userId: alice.id, startTime: at8am("2026-08-17"), durationHours: 10 }),
+        entry({ userId: alice.id, startTime: at8am("2026-08-18"), durationHours: 10 }),
+        entry({ userId: alice.id, startTime: at8am("2026-08-19"), durationHours: 10 }),
+        entry({ userId: alice.id, startTime: at8am("2026-08-20"), durationHours: 10 }),
+        entry({ userId: alice.id, startTime: at8am("2026-08-21"), durationHours: 4 }),
+    ];
+    const result = buildGustoExport({ entries, users: [alice], periodStart, periodEnd: PERIOD_END, timeZone: TZ });
+    const row = totalsFor(alice.id, result);
+    // 24 in-period hours: 20 of them still regular (week hits 40 mid-Friday), 4 OT.
+    assert.equal(row.regularHours, 20);
+    assert.equal(row.overtimeHours, 4);
+    assert.equal(result.detail.length, 3, "only in-period entries are exported");
+});
+
+test("two projects on the same day are two entries and one day of hours", () => {
+    const entries = [
+        entry({ userId: alice.id, startTime: "2026-08-17T15:00:00.000Z", durationHours: 4, projectName: "Mueller Remodel" }),
+        entry({
+            userId: alice.id,
+            startTime: "2026-08-17T20:00:00.000Z",
+            durationHours: 4,
+            shiftHours: 4.5,
+            mealDeductionHours: 0.5,
+            projectName: "Mesplay Kitchen",
+        }),
+    ];
+    const result = buildGustoExport({ entries, users: [alice], periodStart: PERIOD_START, periodEnd: PERIOD_END, timeZone: TZ });
+    assert.equal(totalsFor(alice.id, result).totalHours, 8);
+    assert.equal(result.detail.length, 2);
+    // One meal deduction for the day, already applied to the entry that carries it.
+    assert.deepEqual(
+        result.detail.map((d) => [d.projectName, d.paidHours, d.mealDeductionHours]),
+        [
+            ["Mueller Remodel", 4, 0],
+            ["Mesplay Kitchen", 4, 0.5],
+        ]
+    );
+});
+
+test("a Sunday-to-Monday midnight shift belongs to the week it STARTED in", () => {
+    // Sun 2026-08-23 23:00 PDT = 2026-08-24 06:00Z; the following Monday's week
+    // starts at 2026-08-24 07:00Z, so the instant alone is ambiguous.
+    const entries = [
+        // 40 hours already banked in the Mon 8/17 week.
+        ...["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"].map((day) =>
+            entry({ userId: alice.id, startTime: at8am(day), durationHours: 8 })
+        ),
+        entry({ userId: alice.id, startTime: "2026-08-24T06:00:00.000Z", durationHours: 4 }),
+    ];
+    const result = buildGustoExport({ entries, users: [alice], periodStart: PERIOD_START, periodEnd: PERIOD_END, timeZone: TZ });
+    const row = totalsFor(alice.id, result);
+    // Attributed to the 8/17 week, which was already at 40 — so all 4 are OT.
+    assert.equal(row.regularHours, 40);
+    assert.equal(row.overtimeHours, 4);
+});
+
+// ── Readiness (spec test 2, the 409 condition) ──────────────────────────────
+
+test("open, flagged, zero-hour and unsettled-meal entries all block; outside the period they do not", () => {
+    const entries = [
+        entry({ userId: alice.id, id: "open-1", startTime: at8am("2026-08-18"), durationHours: 0, endTime: null }),
+        entry({ userId: alice.id, id: "flagged-1", startTime: at8am("2026-08-19"), durationHours: 8, needsReview: true }),
+        // CLOSED with no hours. buildGustoExport drops it, which is exactly why
+        // it has to block: a silently missing shift is a silently missing wage.
+        entry({ userId: alice.id, id: "zero-1", startTime: at8am("2026-08-20"), durationHours: 0 }),
+        // Settlement could not run for this day (worker mid-shift, or it
+        // failed). DEFERRED means "paid in full, meal not taken out yet".
+        entry({ userId: alice.id, id: "deferred-1", startTime: at8am("2026-08-21"), durationHours: 8, mealOutcome: "DEFERRED" }),
+        entry({ userId: alice.id, id: "fine", startTime: at8am("2026-08-24"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+        // Same workweek, before the period — fetched for the 40h threshold only.
+        entry({ userId: alice.id, id: "outside", startTime: at8am("2026-08-14"), durationHours: 8, needsReview: true }),
+    ];
+    // Alice HAS in-period hours, so her out-of-period context row is judged as
+    // it always was (it is excluded here by the envelope argument, which this
+    // call deliberately passes as the period).
+    const blocking = blockingEntries(entries, [alice], PERIOD_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(
+        blocking.map((row) => [row.id, row.reason]),
+        [
+            ["open-1", "open"],
+            ["flagged-1", "needsReview"],
+            ["zero-1", "zeroDuration"],
+            ["deferred-1", "deferred"],
+        ]
+    );
+    assert.equal(blocking[0].userLabel, "Alice Field");
+});
+
+test("a worker with no payType blocks the export — guessing is a wrong paycheque either way", () => {
+    const unknown: ExportUser = { id: "u-new", name: "New Hire", email: "new@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: unknown.id, startTime: at8am("2026-08-18"), durationHours: 8 })],
+        users: [unknown],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => row.reason), ["unknownPayType"]);
+    assert.equal(result.blocking[0].userLabel, "New Hire");
+});
+
+test("a payType-less worker with NO in-period hours does not block", () => {
+    // Reverses an earlier reading here, deliberately (review round 21). The
+    // argument for blocking was that a zero-hour worker still ships a 0.00 row,
+    // so the file asserts something about them. True — but a 0.00 row is not a
+    // payment, and an unanswered pay type cannot make it wrong. The cost of the
+    // old reading was that hiring somebody on Friday froze Monday's payroll for
+    // everyone until an admin answered a question about a person with no hours.
+    const unknown: ExportUser = { id: "u-new", name: "New Hire", email: "new@example.com", payType: null };
+    const result = buildGustoExport({
+        // Same workweek, before the period — fetched for the 40h threshold only.
+        entries: [entry({ userId: unknown.id, startTime: at8am("2026-08-14"), durationHours: 8 })],
+        users: [unknown],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => row.reason), []);
+});
+
+test("but the SAME worker blocks the moment they have in-period hours", () => {
+    // The pay type is still required before their first real hours reach a pay
+    // run — the moment it can actually cost somebody money.
+    const unknown: ExportUser = { id: "u-new", name: "New Hire", email: "new@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: unknown.id, startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" })],
+        users: [unknown],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => row.reason), ["unknownPayType"]);
+    // And the blocker points at the actual punch, not at the period boundary.
+    assert.equal(result.blocking[0].startTime.getTime(), new Date(at8am("2026-08-18")).getTime());
+});
+
+test("PAYROLL_SALARIED_EMAILS unblocks the SAME worker it classifies as salaried", () => {
+    // Round-review finding: the classifier (isSalaried, used for the SUMMARY
+    // csv) and this blocker used to read the env override differently — the
+    // classifier consulted it, the blocker did not. A null-payType user named
+    // in PAYROLL_SALARIED_EMAILS read as salaried everywhere else (the roster
+    // UI, the zero-rate guard) while the export itself kept 409ing for them
+    // forever, because nothing had ever answered payType. Passing the SAME
+    // isSalaried predicate to both closes that gap.
+    const named: ExportUser = { id: "u-named", name: "Named Salaried", email: "named@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: named.id, startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" })],
+        users: [named],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+        isSalaried: (user) => user.email === named.email,
+    });
+    assert.deepEqual(result.blocking, []);
+    assert.equal(result.employees[0].salaried, true);
+});
+
+test("the zero-hour roster is driven by payType HOURLY, not by role", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
+    // An hourly ADMIN or FINANCE user is a real arrangement; keying the roster
+    // off role alone dropped them from the file entirely.
+    assert.match(source, /status: "ACTIVATED", payType: "HOURLY"/);
+    // The role-based null-payType clause is GONE: it pulled in every activated
+    // hourly-role user regardless of hours, which is what let a new hire with no
+    // punches block the whole pay run.
+    assert.doesNotMatch(source, /payType: null, role: \{ in: \[\.\.\.HOURLY_PAID_ROLES\] \}/);
+    // Null pay types reach the roster only by having actually worked.
+    assert.match(source, /id: \{ in: punchedUserIds \}/);
+});
+
+test("a ZERO-HOUR roster member with no payType does NOT block the others' pay run", () => {
+    const unanswered: ExportUser = { id: "u-quiet", name: "Quiet Hire", email: "quiet@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: alice.id, startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" })],
+        users: [alice, unanswered],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => [row.userId, row.reason]), []);
+});
+
+test("readiness looks at the whole workweek ENVELOPE, not just the period", () => {
+    // Period ends Thu 2026-08-27; the trailing partial week runs to Sun 08-30.
+    // An open punch on Fri 08-28 is outside the period but inside the week, and
+    // it still decides how much of the period's time is overtime.
+    const periodEnd = new Date("2026-08-27T07:00:00.000Z");
+    const envelopeEnd = new Date("2026-08-31T07:00:00.000Z");
+    const entries = [
+        entry({ userId: alice.id, id: "in-period", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+        entry({ userId: alice.id, id: "open-after", startTime: at8am("2026-08-28"), durationHours: 0, endTime: null }),
+    ];
+    const withEnvelope = buildGustoExport({
+        entries,
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd,
+        timeZone: TZ,
+        envelopeStart: PERIOD_START,
+        envelopeEnd,
+    });
+    assert.deepEqual(withEnvelope.blocking.map((row) => row.id), ["open-after"]);
+
+    // Without the envelope the same open punch is invisible — the bug.
+    const withoutEnvelope = buildGustoExport({
+        entries,
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd,
+        timeZone: TZ,
+    });
+    assert.deepEqual(withoutEnvelope.blocking, []);
+});
+
+test("a manual entry with hours but no endTime is COMPLETED, not open", () => {
+    // Manual entries recorded durationHours with endTime NULL. Treating that as
+    // "still clocked in" blocked every export containing one, and dropped its
+    // hours from the totals. OPEN now means endTime null AND no duration.
+    const manual = entry({ userId: alice.id, id: "manual", startTime: at8am("2026-08-18"), durationHours: 8 });
+    const result = buildGustoExport({
+        entries: [{ ...manual, endTime: null }],
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking, [], "a completed manual entry must not block payroll");
+    assert.equal(totalsFor(alice.id, result).totalHours, 8, "and its hours must be exported");
+});
+
+test("a genuinely open punch — no endTime AND no duration — still blocks", () => {
+    const result = buildGustoExport({
+        entries: [entry({ userId: alice.id, id: "open", startTime: at8am("2026-08-18"), durationHours: 0, endTime: null })],
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => row.reason), ["open"]);
+});
+
+test("a zero-hour entry is dropped from the totals — which is why blocking has to catch it", () => {
+    const entries = [entry({ userId: alice.id, id: "zero-1", startTime: at8am("2026-08-20"), durationHours: 0 })];
+    const result = buildGustoExport({ entries, users: [alice], periodStart: PERIOD_START, periodEnd: PERIOD_END, timeZone: TZ });
+    assert.equal(totalsFor(alice.id, result).totalHours, 0);
+    assert.equal(result.detail.length, 0);
+    assert.equal(result.blocking.length, 1, "silently exporting nothing for it is the bug");
+});
+
+// ── DEFERRED-day settlement plan (carried over from the deleted route) ──────
+
+test("settlement skips today, the day a worker is still punched into, and any locked day", () => {
+    const unsettled = [
+        { userId: "u1", dayKey: "2026-08-20" },
+        { userId: "u1", dayKey: "2026-08-20" }, // same day twice — one settle
+        { userId: "u2", dayKey: "2026-08-21" },
+        { userId: "u3", dayKey: "2026-08-25" }, // today
+    ];
+    const plan = planDeferredSettlements({
+        unsettled,
+        openPunchDayKeys: ["u2|2026-08-21"],
+        todayKey: "2026-08-25",
+        isDayLocked: () => false,
+    });
+    assert.deepEqual(plan, [{ userId: "u1", dayKey: "2026-08-20" }]);
+
+    assert.deepEqual(
+        planDeferredSettlements({ unsettled, openPunchDayKeys: [], todayKey: "2026-08-25", isDayLocked: () => true }),
+        [],
+        "re-downloading a LOCKED period must be a read-only recompute"
+    );
+});
+
+test("an open punch TODAY does not suppress settlement of that worker's DEFERRED day weeks ago", () => {
+    // The regression this pins: the open-punch guard used to be company-wide and
+    // time-unbounded, so u1 clocking in this morning left their 2026-08-20
+    // DEFERRED day unsettled — and it then exported at FULL pay, no meal out.
+    const plan = planDeferredSettlements({
+        unsettled: [{ userId: "u1", dayKey: "2026-08-20" }],
+        openPunchDayKeys: ["u1|2026-09-15"],
+        todayKey: "2026-09-15",
+        isDayLocked: () => false,
+    });
+    assert.deepEqual(plan, [{ userId: "u1", dayKey: "2026-08-20" }]);
+});
+
+test("a locked day is never settled even when the requested range itself is unlocked", () => {
+    const plan = planDeferredSettlements({
+        unsettled: [
+            { userId: "u1", dayKey: "2026-08-20" },
+            { userId: "u1", dayKey: "2026-09-10" },
+        ],
+        openPunchDayKeys: [],
+        todayKey: "2026-09-15",
+        isDayLocked: (dayKey) => dayKey < "2026-08-31",
+    });
+    assert.deepEqual(plan, [{ userId: "u1", dayKey: "2026-09-10" }]);
+});
+
+// ── CSV injection (a payroll file is opened by a bookkeeper) ───────────────
+
+test("formula leads in free text are defused, and quoting alone would not have done it", () => {
+    const entries = [
+        entry({
+            userId: alice.id,
+            startTime: at8am("2026-08-17"),
+            durationHours: 8,
+            projectName: '=HYPERLINK("http://evil.test","Invoice")',
+            costCodeLabel: "+1",
+        }),
+    ];
+    const result = buildGustoExport({ entries, users: [alice], periodStart: PERIOD_START, periodEnd: PERIOD_END, timeZone: TZ });
+    const csv = toDetailCsv(result.detail);
+    // The apostrophe sits INSIDE the quotes — a spreadsheet strips the quotes
+    // and then sees text, not a formula.
+    assert.ok(csv.includes(`"'=HYPERLINK(""http://evil.test"",""Invoice"")","'+1"`), csv);
+    assert.ok(!csv.includes(`"=HYPERLINK`), "an unescaped formula lead reached the file");
+});
+
+test("a leading minus in a NAME is defused", () => {
+    const weird: ExportUser = { id: "u-x", name: "-Bob", email: "bob@example.com", payType: "HOURLY" };
+    const result = buildGustoExport({
+        entries: [entry({ userId: weird.id, startTime: at8am("2026-08-17"), durationHours: 8 })],
+        users: [weird],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.ok(toSummaryCsv(result.employees).includes(`"'-Bob"`));
+});
+
+// ── Golden files (spec test 2) ─────────────────────────────────────────────
+
+function fixtureScenario(options: { shuffled?: boolean } = {}) {
+    seq = 0;
+    const entries: ExportEntry[] = [
+        // Alice: five 9-hour shifts paying 8.5 each = 42.5 -> 40 regular + 2.5 OT.
+        ...["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"].map((day) =>
+            entry({
+                userId: alice.id,
+                startTime: at8am(day),
+                durationHours: 8.5,
+                shiftHours: 9,
+                mealDeductionHours: 0.5,
+                mealOutcome: "AUTO_DEDUCTED",
+            })
+        ),
+        // CJ is salaried: present in DETAIL, absent from SUMMARY.
+        entry({
+            userId: cj.id,
+            startTime: "2026-08-17T16:00:00.000Z",
+            durationHours: 8,
+            projectName: "Mesplay Kitchen",
+            costCodeLabel: "99-PM",
+            isEdited: true,
+        }),
+        // Dana carries the CSV-injection case INTO the golden file, so the byte
+        // compare — not just a unit assertion — is what pins the escaping.
+        entry({
+            userId: dana.id,
+            startTime: "2026-08-18T16:00:00.000Z",
+            durationHours: 4,
+            projectName: '=cmd|" /C calc"!A0',
+            costCodeLabel: "-2",
+        }),
+        // Zoe has no entries at all — she still gets a 0.00 summary row.
+    ];
+    return buildGustoExport({
+        entries: options.shuffled ? [...entries].reverse() : entries,
+        users: options.shuffled ? [zoe, dana, cj, alice] : [alice, cj, dana, zoe],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+        employeeMappings: { [alice.id]: "GUSTO-1001", [cj.id]: "GUSTO-1002" },
+        isSalaried: (user) => user.email === cj.email,
+    });
+}
+
+function readFixture(name: string): string {
+    return readFileSync(path.join(__dirname, "fixtures", name), "utf8");
+}
+
+test("summary CSV matches the golden file (salaried excluded, zero-hours row kept)", () => {
+    const result = fixtureScenario();
+    assert.equal(totalsFor(alice.id, result).regularHours, 40);
+    assert.equal(totalsFor(alice.id, result).overtimeHours, 2.5);
+    assert.equal(toSummaryCsv(result.employees), readFixture("gusto-export-summary.csv"));
+});
+
+test("detail CSV matches the golden file (salaried included, meal columns preserved)", () => {
+    const result = fixtureScenario();
+    assert.equal(toDetailCsv(result.detail), readFixture("gusto-export-detail.csv"));
+});
+
+test("the export hash covers the DETAIL too — identical summary totals are not enough", async () => {
+    const { hashExport } = await import("../src/lib/gusto-export-db");
+
+    const oneShift = buildGustoExport({
+        entries: [entry({ userId: alice.id, startTime: at8am("2026-08-17"), durationHours: 8, projectName: "Mueller Remodel" })],
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    // Same person, same day, same 8 paid hours — split across two projects. The
+    // SUMMARY csv is byte-identical; only the detail moved.
+    const splitShift = buildGustoExport({
+        entries: [
+            entry({ userId: alice.id, startTime: "2026-08-17T15:00:00.000Z", durationHours: 4, projectName: "Mueller Remodel" }),
+            entry({ userId: alice.id, startTime: "2026-08-17T20:00:00.000Z", durationHours: 4, projectName: "Mesplay Kitchen" }),
+        ],
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+
+    const summaryA = toSummaryCsv(oneShift.employees);
+    const summaryB = toSummaryCsv(splitShift.employees);
+    assert.equal(summaryA, summaryB, "premise: the summaries really are identical");
+    assert.notEqual(toDetailCsv(oneShift.detail), toDetailCsv(splitShift.detail));
+
+    const hashA = hashExport(summaryA, toDetailCsv(oneShift.detail));
+    const hashB = hashExport(summaryB, toDetailCsv(splitShift.detail));
+    assert.notEqual(hashA, hashB, "a summary-only hash would have called these two periods identical");
+    assert.equal(hashA, hashExport(summaryA, toDetailCsv(oneShift.detail)), "and it is deterministic");
+});
+
+test("the same period exports byte-identically twice — the lock's exportHash depends on it", () => {
+    // Entries are fed in a different order the second time: employee and detail
+    // ordering must come from the data, not from however the query returned it,
+    // or a re-download of a locked period would hash differently for no reason.
+    assert.equal(toSummaryCsv(fixtureScenario().employees), toSummaryCsv(fixtureScenario({ shuffled: true }).employees));
+    assert.equal(toDetailCsv(fixtureScenario().detail), toDetailCsv(fixtureScenario({ shuffled: true }).detail));
+});
+
+test("the settle button and the readiness check look at the SAME window", () => {
+    // Readiness blocks on a deferred day anywhere in the workweek envelope, so
+    // settling only the literal pay period left a blocker just outside a
+    // midweek or Sunday-start period that the button could never clear.
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const action = source.slice(source.indexOf("export async function settleDeferredDaysForPeriod"));
+    const body = action.slice(0, action.indexOf("\nexport async function"));
+    assert.match(body, /payrollLockEnvelope\(/, "the settle action must use the envelope, not the raw period");
+    assert.match(body, /startTime: \{ gte: envelope\.start, lt: envelope\.end \}/);
+});
+
+test("an UNRECOGNISED payType is unknown, never a default", () => {
+    // The DB CHECK rejects these, but a value that somehow exists must block the
+    // export rather than being quietly treated as hourly or salaried.
+    const odd: ExportUser = { id: "u-odd", name: "Odd One", email: "odd@example.com", payType: "CONTRACT" };
+    const result = buildGustoExport({
+        entries: [entry({ userId: odd.id, startTime: at8am("2026-08-18"), durationHours: 8 })],
+        users: [odd],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => row.reason), ["unknownPayType"]);
+});
+
+
+
+test("a disabled former employee with only a CONTEXT punch is not on the roster", () => {
+    // The wider query exists to get the 40h threshold right. A punch in the
+    // surrounding context week is not a reason to put somebody on this period's
+    // roster — and doing so BLOCKED the export, because nobody had set a pay
+    // type on an account that is gone.
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
+    assert.match(source, /entry\.startTime >= periodStart && entry\.startTime < periodEnd/);
+
+    // And the pure half agrees: a context-only punch contributes no blocker.
+    const former: ExportUser = { id: "u-gone", name: "Former Hire", email: "gone@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: former.id, startTime: at8am("2026-08-14"), durationHours: 8 })],
+        users: [],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking, [], "nobody on the roster, so nothing to answer for");
+    assert.deepEqual(result.employees, []);
+});
+
+test("ONE definition of an open punch, shared by the export and the settle button", async () => {
+    const { isOpenEntry } = await import("../src/lib/gusto-export-core");
+    // Nobody has said how long it was: no end time AND no duration.
+    assert.equal(isOpenEntry({ endTime: null, durationHours: null }), true);
+    assert.equal(isOpenEntry({ endTime: null, durationHours: 0 }), true);
+    // A manual entry records paid hours and leaves endTime null forever — a
+    // COMPLETED shift. Calling it open blocked every export containing one.
+    assert.equal(isOpenEntry({ endTime: null, durationHours: 8 }), false);
+    assert.equal(isOpenEntry({ endTime: new Date(), durationHours: 8 }), false);
+
+    // The settle action uses the SAME predicate. When the two disagreed, the
+    // export blocked on a day the button considered finished, and the period
+    // could never be cleared from either end.
+    const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const fn = actions.slice(actions.indexOf("export async function settleDeferredDaysForPeriod"));
+    const body = fn.slice(0, fn.indexOf(String.fromCharCode(10) + "export "));
+    assert.match(body, /isOpenEntry/);
+    assert.match(body, /openCandidates\.filter\(\(row\) => isOpenEntry\(row\)\)/);
+});
+
+// ── Rounding the authoritative OT split (review round 12, item 1) ─────────
+//
+// src/lib/overtime.ts decides the 40-hour threshold, which entry crosses it and
+// how that entry divides. None of that is re-decided here. All these cover is
+// ROUNDING: the detail CSV prints each entry to two decimals and the summary
+// prints the employee total to two decimals, and those are different operations
+// on the same numbers.
+
+test("five 8h01m punches: 40.08 paid, and the detail adds up to the summary", async () => {
+    const { toHundredths } = await import("../src/lib/gusto-export-core");
+    // 8h01m = 481 minutes. Five of them is 2,405 minutes = 40.0833h, which is
+    // 40.08 once rounded — NOT the 40.10 you get by rounding each punch to 8.02
+    // and adding. That gap is the whole reason this exists.
+    const days = ["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"];
+    const entries = days.map((day) =>
+        entry({ userId: alice.id, startTime: at8am(day), durationHours: 481 / 60 })
+    );
+    const result = buildGustoExport({
+        entries,
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    const totals = totalsFor(alice.id, result);
+
+    assert.equal(totals.totalHours, 40.08, "the paid total is the aggregate, rounded once");
+    // 2,405 minutes is five minutes past the 40-hour threshold, so those five
+    // minutes ARE overtime under the WA rule. Anything else would be a different
+    // rule, not a different rounding.
+    assert.equal(totals.regularHours, 40);
+    assert.equal(totals.overtimeHours, 0.08);
+
+    // The reconciliation that matters: the two files agree.
+    const detailRegular = result.detail.reduce((sum, row) => sum + toHundredths(row.regularHours), 0);
+    const detailOvertime = result.detail.reduce((sum, row) => sum + toHundredths(row.overtimeHours), 0);
+    assert.equal(detailRegular, toHundredths(totals.regularHours));
+    assert.equal(detailOvertime, toHundredths(totals.overtimeHours));
+
+    // Naive per-entry rounding would have produced 40.01 regular against a
+    // summary of 40.00 — a cent of hours from nowhere.
+    assert.notEqual(detailRegular, 8.02 * 100 * 4 + 7.93 * 100);
+});
+
+test("the allocator takes overtime.ts's split as authority and only rounds it", async () => {
+    const { allocateWeekHundredths } = await import("../src/lib/gusto-export-core");
+    // 38.75 banked, then a 3.5h shift that overtime.ts split 1.25 / 2.25.
+    const allocation = allocateWeekHundredths([
+        { entry: "a", regularHours: 38.75, overtimeHours: 0 },
+        { entry: "b", regularHours: 1.25, overtimeHours: 2.25 },
+    ]);
+    assert.deepEqual(
+        allocation.map((a) => [a.entry, a.regularHundredths, a.overtimeHundredths]),
+        [
+            ["a", 3875, 0],
+            ["b", 125, 225],
+        ]
+    );
+});
+
+test("the residue lands on real rows and never changes the total", async () => {
+    const { allocateWeekHundredths } = await import("../src/lib/gusto-export-core");
+    // Three thirds of an hour: each 0.333..., true total 1.00. Rounding each
+    // independently gives 0.33 x 3 = 0.99, so one hundredth has to be placed.
+    const third = 1 / 3;
+    const allocation = allocateWeekHundredths([
+        { entry: "a", regularHours: third, overtimeHours: 0 },
+        { entry: "b", regularHours: third, overtimeHours: 0 },
+        { entry: "c", regularHours: third, overtimeHours: 0 },
+    ]);
+    const total = allocation.reduce((sum, a) => sum + a.regularHundredths, 0);
+    assert.equal(total, 100, "the parts sum to the rounded aggregate, exactly");
+    // No row moves by more than a hundredth from its true value.
+    for (const a of allocation) {
+        assert.ok(Math.abs(a.regularHundredths - third * 100) <= 1);
+    }
+});
+
+test("a week entirely under 40 hours has no overtime anywhere", async () => {
+    const { allocateWeekHundredths } = await import("../src/lib/gusto-export-core");
+    const allocation = allocateWeekHundredths([
+        { entry: "a", regularHours: 7.33, overtimeHours: 0 },
+        { entry: "b", regularHours: 6.67, overtimeHours: 0 },
+    ]);
+    assert.deepEqual(
+        allocation.map((a) => [a.regularHundredths, a.overtimeHundredths]),
+        [
+            [733, 0],
+            [667, 0],
+        ]
+    );
+});
+
+test("consecutive periods splitting one workweek each add up on their own", async () => {
+    const { toHundredths } = await import("../src/lib/gusto-export-core");
+    // One Mon-Sun week, five 8h01m punches, cut in two by the period boundary:
+    // Mon-Tue in the first period, Wed-Fri in the second. The OT classification
+    // still comes from the WHOLE week; only the rounding residue is apportioned
+    // per period, or a hundredth could land on a row the period never emits.
+    const days = ["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"];
+    const entries = days.map((day) =>
+        entry({ userId: alice.id, startTime: at8am(day), durationHours: 481 / 60 })
+    );
+    const boundary = new Date("2026-08-19T07:00:00.000Z"); // Wed 00:00 local
+
+    for (const [start, end] of [
+        [PERIOD_START, boundary],
+        [boundary, PERIOD_END],
+    ] as const) {
+        const result = buildGustoExport({
+            entries,
+            users: [alice],
+            periodStart: start,
+            periodEnd: end,
+            timeZone: TZ,
+        });
+        const totals = totalsFor(alice.id, result);
+        const detailRegular = result.detail.reduce((sum, row) => sum + toHundredths(row.regularHours), 0);
+        const detailOvertime = result.detail.reduce((sum, row) => sum + toHundredths(row.overtimeHours), 0);
+        assert.equal(detailRegular, toHundredths(totals.regularHours), "regular reconciles within the period");
+        assert.equal(detailOvertime, toHundredths(totals.overtimeHours), "overtime reconciles within the period");
+    }
+});
+
+test("a detail row's paid hours equal its own regular + overtime, always", async () => {
+    const { toHundredths } = await import("../src/lib/gusto-export-core");
+    // Odd minutes across a 40-hour crossing: the row that straddles the
+    // threshold is the one where a raw duration and the allocated split most
+    // easily disagree.
+    const days = ["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"];
+    const result = buildGustoExport({
+        entries: days.map((day) =>
+            entry({ userId: alice.id, startTime: at8am(day), durationHours: 481 / 60 })
+        ),
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    for (const row of result.detail) {
+        assert.equal(
+            toHundredths(row.paidHours),
+            toHundredths(row.regularHours) + toHundredths(row.overtimeHours),
+            `${row.dayKey}: a row that does not add up is the row a bookkeeper reconciles by hand`
+        );
+    }
+    // And the column still totals the employee's paid hours.
+    const paid = result.detail.reduce((sum, row) => sum + toHundredths(row.paidHours), 0);
+    assert.equal(paid, toHundredths(totalsFor(alice.id, result).totalHours));
+});
+
+// ── Context rows outside the period (review round 17, item 2) ───────────────
+
+/**
+ * The envelope reaches back to the start of the workweek so the OT split inside
+ * the period is computed against the hours that already pushed that week toward
+ * 40. Those extra days are CONTEXT, not payable rows.
+ */
+const ENVELOPE_START = new Date("2026-08-10T07:00:00.000Z"); // Mon of the week PERIOD_START falls in
+const CONTEXT_DAY = at8am("2026-08-14"); // inside the envelope, before the period
+
+test("a FORMER employee's context row does not block a period they have no hours in", () => {
+    // Dana left. Her last shift was flagged and never resolved, and it sits in
+    // the workweek tail the envelope pulls in. She has nobody left to fix it and
+    // no hours in this run to be wrong about — blocking on it froze the payroll
+    // export permanently.
+    const entries = [
+        entry({ userId: alice.id, id: "alice-in", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+        entry({ userId: dana.id, id: "dana-context", startTime: CONTEXT_DAY, durationHours: 8, needsReview: true }),
+    ];
+    const blocking = blockingEntries(entries, [alice, dana], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => row.id), []);
+});
+
+test("the same is true of an unsettled DEFERRED meal on a context row", () => {
+    const entries = [
+        entry({ userId: alice.id, id: "alice-in", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+        entry({ userId: dana.id, id: "dana-deferred", startTime: CONTEXT_DAY, durationHours: 8, mealOutcome: "DEFERRED" }),
+    ];
+    const blocking = blockingEntries(entries, [alice, dana], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => row.id), []);
+});
+
+test("but the moment that person HAS in-period hours, their context row blocks again", () => {
+    // Now Dana's context row can change a number in this file: the OT split for
+    // that week is built from both rows. It is a real blocker again.
+    const entries = [
+        entry({ userId: dana.id, id: "dana-context", startTime: CONTEXT_DAY, durationHours: 8, needsReview: true }),
+        entry({ userId: dana.id, id: "dana-in", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+    ];
+    const blocking = blockingEntries(entries, [dana], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => [row.id, row.reason]), [["dana-context", "needsReview"]]);
+});
+
+test("an IN-PERIOD row of somebody with no other hours still blocks", () => {
+    // The exemption is about being outside the period, never about being a
+    // lightly-used account — otherwise one flagged shift would export unnoticed.
+    const entries = [
+        entry({ userId: dana.id, id: "dana-only", startTime: at8am("2026-08-18"), durationHours: 8, needsReview: true }),
+    ];
+    const blocking = blockingEntries(entries, [dana], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => [row.id, row.reason]), [["dana-only", "needsReview"]]);
+});
+
+test("an OPEN context punch of a current worker with in-period hours still blocks", () => {
+    // Somebody still on the clock from before the period: their hours are not
+    // final, and they ARE being paid this run.
+    const entries = [
+        entry({ userId: alice.id, id: "alice-open-context", startTime: CONTEXT_DAY, durationHours: 0, endTime: null }),
+        entry({ userId: alice.id, id: "alice-in", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+    ];
+    const blocking = blockingEntries(entries, [alice], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => [row.id, row.reason]), [["alice-open-context", "open"]]);
+});
+
+// ── The review page totals the SAME set the summary CSV contains (round 6, finding 3) ──
+//
+// /manager/payroll-export summed every row in `result.employees` for its four
+// cards — salaried staff included, whose hours are carried for job costing and
+// deliberately left out of the file (toSummaryCsv skips them). So the hours and
+// the head count a human read, approved and then FROZE could be larger than the
+// file underneath them. There is now one selector, `summaryCsvEmployees`, used
+// by both, and these tests hold the two to the same number.
+
+/** Parse a summary CSV back into numbers, so the comparison is against the FILE, not against another call to the same helper. */
+function parseSummaryCsv(csv: string): { rows: number; regular: number; overtime: number; total: number } {
+    const lines = csv.trim().split("\n");
+    const body = lines.slice(1); // drop the header
+    let regular = 0;
+    let overtime = 0;
+    for (const line of body) {
+        // Every field is quoted by csvField, and none of the numeric ones can
+        // contain a comma, so a plain split is exact for these columns.
+        const cells = line.split(",").map((cell) => cell.replace(/^"|"$/g, ""));
+        regular += Number(cells[3]);
+        overtime += Number(cells[4]);
+    }
+    return { rows: body.length, regular, overtime, total: regular + overtime };
+}
+
+test("the review page's card totals equal the summary CSV's totals, salaried staff excluded", () => {
+    // A mixed roster: two hourly people with real hours (one of them into
+    // overtime, so regular and overtime are both non-trivial) and one salaried
+    // person who also worked. The salaried hours are the whole point — they are
+    // in `employees`, in the table and in the DETAIL csv, and NOT in the file.
+    const entries = [
+        // Alice: 45 hours in one Mon-Sun week -> 40 regular + 5 overtime.
+        ...[0, 1, 2, 3, 4].map((day) =>
+            entry({
+                userId: alice.id,
+                startTime: `2026-08-${17 + day}T15:00:00Z`,
+                durationHours: 9,
+            })
+        ),
+        // Dana: a flat 8-hour day.
+        entry({ userId: dana.id, startTime: "2026-08-18T15:00:00Z", durationHours: 8 }),
+        // CJ is SALARIED and worked 6 hours. Job costing wants them; Gusto
+        // must not see them, because Gusto already pays CJ a salary.
+        entry({ userId: cj.id, startTime: "2026-08-19T15:00:00Z", durationHours: 6 }),
+    ];
+
+    const result = buildGustoExport({
+        entries,
+        users: [alice, dana, cj],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+        isSalaried: (user) => user.payType === "SALARY",
+    });
+
+    const fromCsv = parseSummaryCsv(toSummaryCsv(result.employees));
+    // EXACTLY what page.tsx computes for its four cards.
+    const cards = sumEmployeeTotals(summaryCsvEmployees(result.employees));
+
+    assert.equal(cards.people, fromCsv.rows, "the People card counts the rows in the file");
+    assert.equal(cards.regular.toFixed(2), fromCsv.regular.toFixed(2), "Regular hours card");
+    assert.equal(cards.overtime.toFixed(2), fromCsv.overtime.toFixed(2), "Overtime hours card");
+    assert.equal(cards.total.toFixed(2), fromCsv.total.toFixed(2), "Total hours card");
+
+    // THE CONTROL. Without it the assertions above would pass just as well on a
+    // roster where the two sets happen to be identical. The naive total — the
+    // one the page used to show — is a DIFFERENT number, by exactly CJ's hours.
+    const naive = sumEmployeeTotals(result.employees);
+    assert.equal(naive.people, cards.people + 1, "the salaried person really is in `employees`");
+    assert.equal(
+        Number((naive.total - cards.total).toFixed(2)),
+        6,
+        "and their 6 hours are exactly what the old card total added on top of the file"
+    );
+
+    // The complement is the other half of what the page shows, separately labelled.
+    const jobCosting = sumEmployeeTotals(jobCostingOnlyEmployees(result.employees));
+    assert.equal(jobCosting.people, 1);
+    assert.equal(jobCosting.total.toFixed(2), "6.00");
+    assert.equal(
+        jobCosting.people + cards.people,
+        result.employees.length,
+        "the two sets partition the roster — nobody is shown twice and nobody vanishes"
+    );
+});
+
+test("a salaried person with hours never reaches the summary CSV at all", () => {
+    // The invariant the selector encodes, stated directly against the bytes.
+    const result = buildGustoExport({
+        entries: [entry({ userId: cj.id, startTime: "2026-08-19T15:00:00Z", durationHours: 6 })],
+        users: [cj],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+        isSalaried: (user) => user.payType === "SALARY",
+    });
+    const csv = toSummaryCsv(result.employees);
+    assert.equal(parseSummaryCsv(csv).rows, 0, "header only");
+    assert.ok(!csv.includes(cj.email));
+    // And the page would show 0 on every card for this period, matching.
+    const cards = sumEmployeeTotals(summaryCsvEmployees(result.employees));
+    assert.deepEqual(cards, { regular: 0, overtime: 0, total: 0, people: 0 });
+});
+
+test("the review page totals THROUGH the shared selector — not its own copy of the rule", () => {
+    // The behavioural tests above compare two functions. This is what stops the
+    // page from growing a second, divergent implementation of "who is on the
+    // file": there is one selector, and the page has to call it.
+    const page = readFileSync(
+        path.join(__dirname, "..", "src", "app", "manager", "payroll-export", "page.tsx"),
+        "utf8"
+    );
+    assert.match(page, /summaryCsvEmployees\(result\.employees\)/, "the cards total the CSV's set");
+    assert.match(page, /const totals = sumEmployeeTotals\(payrollEmployees\)/);
+    // The old shape: a hand-rolled reduce over EVERY employee, and a People card
+    // reading result.employees.length.
+    assert.ok(
+        !/result\.employees\.reduce\(/.test(page),
+        "a hand-rolled total over every employee is the bug this replaced"
+    );
+    assert.ok(
+        !/tabular-nums">\{result\.employees\.length\}/.test(page),
+        "the People card must not count the whole roster"
+    );
+});

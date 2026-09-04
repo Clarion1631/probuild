@@ -221,11 +221,33 @@ const fakeIntegrationStore = {
     getQBSettings: async () => ({ connected: true, glMappings: {} }),
 };
 
+import { canActOnFinancialsResolved } from "@/lib/financial-access";
+import { NextResponse } from "next/server";
+
 const PERMISSIONS_SPECIFIER = "@/lib/permissions";
 const PRISMA_SPECIFIER = "@/lib/prisma";
 const QB_PAYMENTS_SPECIFIER = "@/lib/quickbooks-payments";
 const INTEGRATION_STORE_SPECIFIER = "@/lib/integration-store";
 const QUICKBOOKS_SPECIFIER = "@/lib/quickbooks";
+const INTEGRATION_ACCESS_SPECIFIER = "@/lib/integration-access";
+/**
+ * The shared integration gate (Phase 5) now runs inside this route before the
+ * per-document checks. Its real implementation does a SECOND session lookup
+ * through next/headers, which does not exist in this harness, so the fake
+ * answers from the same `state.user` — through the REAL predicate, so a
+ * FIELD_CREW or CLIENT caller is refused here exactly as in production.
+ */
+const fakeIntegrationAccess = {
+    requireIntegrationAccess: async () => {
+        const u = state.user as { id: string; role: string; status?: string | null } | null;
+        if (!u) return { response: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
+        if (!canActOnFinancialsResolved(u.role, hasPermission(u as never, "financialReports" as never), u.status)) {
+            return { response: NextResponse.json({ error: "Forbidden" }, { status: 403 }) };
+        }
+        return { viewer: { id: u.id, role: u.role } };
+    },
+};
+
 /**
  * The SAME module, imported under a different specifier.
  *
@@ -265,6 +287,7 @@ before(async () => {
         }
         if (id === QB_PAYMENTS_SPECIFIER) return fakeQbPayments;
         if (id === INTEGRATION_STORE_SPECIFIER) return fakeIntegrationStore;
+        if (id === INTEGRATION_ACCESS_SPECIFIER) return fakeIntegrationAccess;
         if (id === RELATIVE_PRISMA_SPECIFIER && /qbo-document-sync/.test(this.filename ?? "")) {
             return { prisma: fakePrisma };
         }

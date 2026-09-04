@@ -1,8 +1,27 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
+import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { prisma } from "@/lib/prisma";
 import { createHelpChatGitHubIssue } from "@/lib/help-chat/github";
+import { authorizeBugWidgetUser, bugFixIssueLabels } from "@/lib/help-chat/bug-widget-auth";
+import {
+  checkHelpSubmission,
+  claimProviderLease,
+  completeUnderLease,
+  providerDeadlineSignal,
+  renewProviderLease,
+  helpChatResponse,
+  HELP_THROTTLED_MESSAGE,
+  isMobileClient,
+  MOBILE_SUBMISSION_ID_REQUIRED,
+  readJsonBody,
+  reserveHelpRequest,
+  submissionMarker,
+  SUBMISSION_KEY_CONFLICT,
+  SUBMISSION_KEY_CONFLICT_MESSAGE,
+  publicGithubIssue,
+  toPublicHelpRequest,
+} from "@/lib/help-chat/submission-guard";
+import { findIssueByMarker } from "@/lib/help-chat/github";
 
 function buildBugFixDetails(description: string, steps?: string) {
   const details = [description.trim()];
@@ -14,29 +33,45 @@ function buildBugFixDetails(description: string, steps?: string) {
   return details.join("\n\n");
 }
 
+// Phase 5 G5: any ACTIVATED staff member can report a bug, from the web or
+// from the crew app's Bearer token (authenticateMobileOrSession, allowlisted in
+// src/proxy.ts). Everything downstream — the GitHub issue and the HelpRequest
+// row — is unchanged.
 export async function POST(req: NextRequest) {
-  const session = await getServerSession(authOptions);
-  if (!session?.user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const auth = await authenticateMobileOrSession(req);
+  if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+
+  const allowed = authorizeBugWidgetUser(auth.user);
+  if (!allowed.ok) return NextResponse.json({ error: allowed.error }, { status: allowed.status });
+
+  const userId = auth.user.id;
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) {
+    // 400, not a 500 — the crew app retries 5xx, so an unparseable body would
+    // become a retry loop.
+    return NextResponse.json({ error: "Malformed request body" }, { status: 400 });
+  }
+  const submission = checkHelpSubmission(parsed.body);
+  if (!submission.ok) {
+    return NextResponse.json({ error: submission.error }, { status: submission.status });
   }
 
-  const role = (session.user as any).role;
-  if (role !== "ADMIN") {
-    return NextResponse.json(
-      { error: "Admin access required" },
-      { status: 403 }
-    );
-  }
+  const { title, description, steps, currentPage, conversationId, submissionId } = submission;
 
-  const userId = (session.user as any).id;
-  const { title, description, steps, currentPage, conversationId } =
-    await req.json();
-
-  if (!title || !description || !conversationId) {
+  // Every mobile-JWT submission needs an idempotency key, on BOTH routes: the
+  // app retries on network failure, and without one each retry is a new report
+  // and a new GitHub issue.
+  if (isMobileClient(auth) && !submissionId) {
     return NextResponse.json(
-      { error: "Missing required fields" },
+      {
+        error: "This version of the app can't report bugs safely. Please update it.",
+        code: MOBILE_SUBMISSION_ID_REQUIRED,
+      },
       { status: 400 }
     );
+  }
+  if (!conversationId) {
+    return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
   }
 
   const conversation = await prisma.chatConversation.findFirst({
@@ -52,58 +87,179 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const issueDetails = buildBugFixDetails(description, steps);
-    const ghIssue = await createHelpChatGitHubIssue({
-      title,
-      description: issueDetails,
-      currentPage: currentPage || null,
-      labelPrefix: "Bug Fix",
-      labels: ["bug-fix", "agent-task"],
-      metadata: [
-        steps?.trim() ? `**Steps to Reproduce:**\n${steps.trim()}` : "",
-        `**Conversation ID:** \`${conversationId}\``,
-      ],
-    });
+    const issueDetails = buildBugFixDetails(description, steps ?? undefined);
 
-    if (!ghIssue) {
-      return NextResponse.json(
-        { error: "Failed to create GitHub issue for Phantom" },
-        { status: 502 }
-      );
+    // Claim a slot and create the row FIRST, in one statement. The report is
+    // durable before anything external is called, so a GitHub failure cannot
+    // lose it, and the throttle is decided by the database rather than by a
+    // read-then-write that five concurrent requests all pass.
+    const reserved = await reserveHelpRequest({
+      userId,
+      type: "bug_fix",
+      question: title,
+      response: issueDetails,
+      currentPage,
+      conversationId,
+      submissionId,
+    });
+    if (!reserved.ok) {
+      // Same rule as /request: an idempotency key reused for different content
+      // is not a retry. Nothing is filed and nothing is attached.
+      if (reserved.reason === "payload-conflict") {
+        return NextResponse.json(
+          { error: SUBMISSION_KEY_CONFLICT_MESSAGE, code: SUBMISSION_KEY_CONFLICT },
+          { status: 409 }
+        );
+      }
+      return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
+    }
+    // See the request route: a stale `submitting` row is resumed, not returned.
+    if (reserved.existing && !reserved.resume) {
+      const prior = await prisma.helpRequest.findUnique({ where: { id: reserved.id } });
+      // Same rule as /request: a replay is only terminal once the issue exists.
+      return helpChatResponse({
+        body: { request: toPublicHelpRequest(prior), duplicate: true },
+        filed: reserved.providerState === "created",
+        submissionId,
+      });
+    }
+    const requestId = reserved.id;
+    // THE CONTENT THAT GETS FILED — the stored row's, not this request's. A
+    // resume finishes the report that was SAVED; the incoming body only got
+    // this far because its fingerprint matched, so reading it here would buy
+    // nothing and could drift. `steps` is already folded into the stored
+    // `response` by buildBugFixDetails, so the fingerprint covers it too.
+    const filing = reserved.payload;
+
+    // Same provider-reconciliation protocol as /api/help-chat/request. A resume
+    // happens precisely because the previous attempt's outcome is unknown — it
+    // may have created the issue and crashed before recording it — so ask
+    // GitHub for the marker before filing anything.
+    // Claim the right to call GitHub. Two attempts can reach this point at
+    // once — a double-tap, or a retry overlapping the first request — and both
+    // would file, because neither issue exists yet when they both search.
+    const leaseToken = await claimProviderLease(requestId);
+    if (!leaseToken) {
+      const inFlight = await prisma.helpRequest.findUnique({ where: { id: requestId } });
+      return helpChatResponse({
+        body: { request: toPublicHelpRequest(inFlight), duplicate: true, inFlight: true },
+        filed: inFlight?.providerState === "created",
+        submissionId,
+      });
     }
 
-    const externalIssueRef = `github-issue:${ghIssue.number}`;
+    const marker = submissionMarker(requestId);
+    // ONE absolute deadline for the whole provider interaction, shared by the
+    // marker search AND the create. Giving each call its own fresh timeout let
+    // the pair run for twice the budget and outlive the lease fencing them.
+    const deadline = providerDeadlineSignal();
+    const alreadyFiled = reserved.resume ? await findIssueByMarker(marker, deadline) : null;
+    // The search may have eaten most of the deadline, and the create still has
+    // to land inside the lease. Fenced on the token: a superseded attempt must
+    // not be able to extend a lease it no longer holds.
+    if (reserved.resume && !alreadyFiled && !(await renewProviderLease(requestId, leaseToken))) {
+        const lost = await prisma.helpRequest.findUnique({ where: { id: requestId } });
+        return helpChatResponse({
+            body: { request: toPublicHelpRequest(lost), duplicate: true, inFlight: true, superseded: true },
+            filed: lost?.providerState === "created",
+            submissionId,
+        });
+    }
 
-    const result = await prisma.$queryRaw<any[]>`
-      INSERT INTO "HelpRequest" (
-        "userId",
-        "type",
-        "question",
-        "response",
-        "currentPage",
-        "status",
-        "changeLocation",
-        "externalIssueRef",
-        "conversationId"
-      )
-      VALUES (
-        ${userId},
-        'bug_fix',
-        ${title},
-        ${issueDetails},
-        ${currentPage || null},
-        'submitted',
-        ${ghIssue.url},
-        ${externalIssueRef},
-        ${conversationId}
-      )
-      RETURNING *
-    `;
+    const ghIssue =
+      alreadyFiled ??
+      (await createHelpChatGitHubIssue({
+        signal: deadline,
+        title: filing.question,
+        description: filing.response,
+        currentPage: filing.currentPage,
+        labelPrefix: "Bug Fix",
+        // Phase 5 G5 opened the widget to every ACTIVATED role, but the
+        // agent-task label is what hands the issue to Phantom unattended —
+        // only ADMIN/MANAGER can trigger that (bug-widget-auth.ts).
+        labels: bugFixIssueLabels(auth.user),
+        metadata: [
+          // NO STEPS HERE. They are already inside `filing.response` —
+          // buildBugFixDetails folds them into the stored description, which is
+          // what `description` above is — so adding them again printed the same
+          // text twice in every issue body. Worse on a RESUME: `steps` is the
+          // INCOMING body while `filing` is the STORED report, so the duplicate
+          // could disagree with the copy above it (round 7, finding 5).
+          `**Conversation ID:** \`${filing.conversationId}\``,
+          // The idempotency marker, in the body, so a resumed attempt can find
+          // this issue instead of opening a second one.
+          marker,
+        ],
+      }));
 
-    return NextResponse.json({
-      request: result[0],
+    if (!ghIssue) {
+      // The report is already SAVED; only the Phantom hand-off failed. Leaving
+      // providerState 'pending' is what lets a later retry resume it. Fenced,
+      // so a superseded attempt cannot mark a filed report pending again.
+      const held = await completeUnderLease(requestId, leaseToken, {
+        filed: false,
+        status: "submitted_no_issue",
+      });
+      const saved = await prisma.helpRequest.findUnique({ where: { id: requestId } });
+      // 202, NOT 502 — the shared durable-submission contract
+      // (helpChatResponse, and the same branch in /api/help-chat/request).
+      // A 5xx tells the crew app the request failed, so it retries; the report
+      // is already durable, so every retry was a second attempt at a hand-off
+      // that had already been recorded as pending. 202 + status "pending" says
+      // what actually happened: we have it, GitHub does not have it yet.
+      return helpChatResponse({
+        body: {
+          request: toPublicHelpRequest(saved),
+          // Same rule as the filed branch below and as /api/help-chat/request:
+          // once the fence says we did not record this, the answer is the
+          // stored row's. "We got no issue back" is a fact about THIS attempt,
+          // and the winner may well have filed one.
+          githubIssue: held ? null : publicGithubIssue(saved),
+          ...(held ? {} : { superseded: true }),
+        },
+        // The STORED state decides, not "we got no issue back": a superseded
+        // attempt may have lost the race to one that DID file.
+        filed: saved?.providerState === "created",
+        submissionId,
+      });
+    }
+
+    // Attach the issue to the row that already exists — a retry updates it
+    // instead of filing a second report. Fenced on the lease.
+    const held = await completeUnderLease(requestId, leaseToken, {
+      filed: true,
       issueNumber: ghIssue.number,
       issueUrl: ghIssue.url,
+      status: "submitted",
+    });
+    const request = await prisma.helpRequest.findUnique({ where: { id: requestId } });
+
+    // TWO THINGS THIS USED TO GET WRONG (round 21, P1). It answered 200
+    // unconditionally — even when the fence said this attempt recorded nothing
+    // and the winner had not finished, which is the 202 "we have it, GitHub
+    // does not have it yet" case the rest of the contract already speaks. And
+    // it named THIS attempt's issue whether or not the row points at it, so a
+    // superseded reporter was sent to the losing issue.
+    //
+    // So: the status code comes from the stored providerState (helpChatResponse,
+    // same as every other exit here and on /api/help-chat/request), and once the
+    // lease is lost the issue comes from the re-read row and nowhere else.
+    const issue: { number: number; url: string | null } | null = held
+      ? { number: ghIssue.number, url: ghIssue.url }
+      : publicGithubIssue(request);
+    return helpChatResponse({
+      body: {
+        request: toPublicHelpRequest(request),
+        // The widget reads these two names (src/components/HelpChatWidget.tsx);
+        // `githubIssue` is what the no-issue branch above and /request speak.
+        // Both are emitted from the SAME value so they cannot disagree.
+        issueNumber: issue?.number ?? null,
+        issueUrl: issue?.url ?? null,
+        githubIssue: issue,
+        ...(held ? {} : { superseded: true }),
+      },
+      filed: request?.providerState === "created",
+      submissionId,
     });
   } catch (error) {
     console.error("Bug fix submission error:", error);

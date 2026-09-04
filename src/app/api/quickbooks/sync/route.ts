@@ -22,6 +22,7 @@ import {
     type DocumentIdentityFacts,
 } from "@/lib/qbo-document-sync";
 import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
+import { requireIntegrationAccess } from "@/lib/integration-access";
 import { prisma } from "@/lib/prisma";
 import { logAutomationEvent } from "@/lib/automation-events";
 import type { Prisma } from "@prisma/client";
@@ -461,6 +462,11 @@ export async function POST(req: NextRequest) {
         // request came through the app, not that THIS caller may sync THIS
         // record — checked before any token fetch or QuickBooks call, so an
         // unauthorized request never spends a QBO round trip.
+        // Shared integration gate first (staff + ACTIVATED + financialReports),
+        // after the cheap shape validation above and before any record lookup.
+        const gate = await requireIntegrationAccess();
+        if ("response" in gate) return gate.response;
+
         const user = await currentStaffUserOrNull();
         if (!user) {
             return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

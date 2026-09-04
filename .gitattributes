@@ -1,7 +1,13 @@
+# Golden-file CSVs are byte-compared by tests/gusto-export.test.ts. Git's
+# autocrlf would rewrite their line endings on a Windows checkout and either
+# hide a real regression or fail a correct build, so they are checked out
+# verbatim.
+tests/fixtures/*.csv -text
+
 # Line endings for the files CI's "Migrations reproduce production" job hashes
 # or compares byte-for-byte. `prisma migrate deploy` checksums each
 # migration.sql, and PostgreSQL stores a plpgsql body exactly as written, so a
-# CRLF checkout (core.autocrlf=true on Windows) puts \r inside function bodies
+# CRLF checkout (core.autocrlf=true on Windows) puts  inside function bodies
 # and makes scripts/check-migrations-match.mjs report definitions that differ
 # from prisma/prisma-blind-spots.json while looking identical. CI on ubuntu
 # checks out LF and never sees this. Pin LF so every machine matches CI.

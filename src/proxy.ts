@@ -17,6 +17,13 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
     // authenticateMobileOrSession. Without them here the proxy answered the app's
     // POST with a 307 to /login — the "Couldn't send" skip-lunch failure (2026-08-30).
     /^\/api\/time-entries(?:\/[^/]+(?:\/(?:meal-skip|logistics))?)?\/?$/,
+    // The help widget's two submit endpoints. Both call
+    // authenticateMobileOrSession and then their own ACTIVATED-staff check
+    // (src/lib/help-chat/bug-widget-auth.ts), so bypassing the proxy hands auth
+    // to the route rather than removing it — the app's "Report a bug" screen
+    // posts here with a Bearer token. Exact match: no descendant of
+    // /api/help-chat/ inherits this.
+    /^\/api\/help-chat\/(?:bug-fix|request)\/?$/,
     /^\/api\/files\/(?:signed-upload|register)\/?$/,
     /^\/api\/(?:expenses|receipts\/parse)\/?$/,
     /^\/api\/rooms\/scan-import\/?$/,

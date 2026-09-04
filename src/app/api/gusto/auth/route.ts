@@ -1,9 +1,16 @@
 import { NextResponse } from "next/server";
+import { requireGustoAccess } from "@/lib/gusto-access";
 
 const GUSTO_AUTH_URL = "https://api.gusto.com/oauth/authorize";
 const SCOPES = "employees:read payrolls:read";
 
 export async function GET() {
+    // Starting an OAuth flow is a privileged act: it is the first half of
+    // writing credentials into the integration settings. Any signed-in account
+    // could begin one before this gate existed.
+    const gate = await requireGustoAccess();
+    if ("response" in gate) return gate.response;
+
     const clientId = process.env.GUSTO_CLIENT_ID;
     if (!clientId) {
         return NextResponse.json({ error: "GUSTO_CLIENT_ID not configured in Vercel" }, { status: 500 });

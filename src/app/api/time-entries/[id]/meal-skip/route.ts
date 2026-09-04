@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { withPayrollWrite, withPeriodLockedRoute } from "@/lib/payroll-period";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { canApproveMealSkip, checkMealSkipDecision } from "@/lib/wa-breaks";
 import { isValidChatWebhookUrl } from "@/lib/chat-webhook";
@@ -44,7 +45,12 @@ async function notifyApprovers(text: string): Promise<void> {
     }
 }
 
-export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function POST(req: Request, context: { params: Promise<{ id: string }> }) {
+    // A payroll write inside: a locked period is a 423, never a 500.
+    return withPeriodLockedRoute(() => POSTHandler(req, context));
+}
+
+async function POSTHandler(req: Request, { params }: { params: Promise<{ id: string }> }): Promise<NextResponse> {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
@@ -74,10 +80,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         return NextResponse.json({ id: entry.id, mealSkipStatus: entry.mealSkipStatus, alreadyRequested: true });
     }
 
-    const updated = await prisma.timeEntry.updateMany({
+    // Payroll write: goes through the advisory-lock protocol so a locked
+    // period refuses it (src/lib/payroll-period.ts).
+    const updated = await withPayrollWrite({ entryIds: [id] }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.updateMany({
         where: { id, userId: user.id, endTime: null, mealSkipStatus: null },
         data: { mealSkipStatus: "PENDING", mealSkipRequestedAt: new Date() },
-    });
+        })
+    );
     if (updated.count === 0) {
         const current = await prisma.timeEntry.findUnique({ where: { id }, select: { mealSkipStatus: true, endTime: true } });
         if (current?.mealSkipStatus) {
@@ -96,7 +106,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return NextResponse.json({ id, mealSkipStatus: "PENDING", waiverOnFile: !!entry.user.mealWaiverSignedAt });
 }
 
-export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function PATCH(req: Request, context: { params: Promise<{ id: string }> }) {
+    // A payroll write inside: a locked period is a 423, never a 500.
+    return withPeriodLockedRoute(() => PATCHHandler(req, context));
+}
+
+async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: string }> }): Promise<NextResponse> {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
@@ -136,7 +151,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
 
     // Guarded update: only a still-PENDING row flips, so two approvers
     // deciding at once cannot overwrite each other.
-    const flipped = await prisma.timeEntry.updateMany({
+    // Payroll write: goes through the advisory-lock protocol so a locked
+    // period refuses it (src/lib/payroll-period.ts).
+    const flipped = await withPayrollWrite({ entryIds: [id] }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.updateMany({
         // APPROVED additionally requires the shift to STILL be open at write time —
         // a clock-out racing this decision must not leave "approved" on a row
         // whose pay was already settled by the attestation path.
@@ -153,7 +171,8 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             mealSkipDecidedAt: new Date(),
             ...(reason !== undefined ? { mealSkipReason: reason } : {}),
         },
-    });
+        })
+    );
     if (flipped.count === 0) {
         return NextResponse.json({ error: "Request was already decided", code: "NOT_PENDING" }, { status: 409 });
     }

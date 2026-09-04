@@ -1,7 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { saveGustoSettings } from "@/lib/integration-store";
+import { requireGustoAccess } from "@/lib/gusto-access";
 
 export async function GET(req: NextRequest) {
+    // The callback WRITES access tokens, so it is gated too. The CSRF state
+    // cookie below proves the request came from a flow this browser started; it
+    // does not prove the person is allowed to connect the integration.
+    const gate = await requireGustoAccess();
+    if ("response" in gate) return gate.response;
+
     const { searchParams } = new URL(req.url);
     const code = searchParams.get("code");
     const state = searchParams.get("state");

@@ -18,6 +18,7 @@ import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
 import { parsePaymentDateInput } from "./payment-date";
+import { rowFingerprint, type RowFingerprintInput } from "./rate-import";
 import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { PROJECT_STATUS_IN_PROGRESS } from "./project-status";
@@ -9073,10 +9074,34 @@ export async function resetProjectPercentCompleteToAuto(projectId: string) {
 }
 
 export async function deleteProjects(projectIds: string[]) {
-    await assertActiveStaff();
-    await prisma.project.deleteMany({
-        where: { id: { in: projectIds } }
-    });
+    const user = await assertActiveStaff();
+    // ADMIN only — src/lib/permissions.ts has no dedicated project-delete
+    // permission key, and deleting a project is irreversible (it cascades
+    // through everything payroll_parent_delete refuses to let it touch, but
+    // still destroys estimates, invoices, messages, files). An active session
+    // alone let any staff role — FIELD_CREW included — remove a job.
+    if (user.role !== "ADMIN") throw new Error("Forbidden");
+    const { deleteParentsWithTimeEntries } = await import("./payroll-parent-delete");
+    // ONE transaction for the whole selection: every project is checked before
+    // any project is deleted. Looping per project left the caller half-deleted
+    // when the third job in the list turned out to have time entries — the
+    // first two were already gone and there was nothing to undo them with.
+    //
+    // A single deleteMany, which is what this used to be, was worse still: it
+    // CASCADEd every punch on every job in the list into nothing — locked,
+    // exported, paid hours included — and reported success.
+    //
+    // A project with ANY time entries — locked or not — throws
+    // TimeEntriesExistError out of here and rolls the batch back. Historical
+    // paid hours predate PayrollPeriod and have no lock to trip, so "unlocked"
+    // is never read as "safe to delete". Server actions have no status code,
+    // so the caller sees the error's message.
+    await deleteParentsWithTimeEntries(
+        projectIds.map((projectId) => ({ projectId })),
+        async (tx) => {
+            await (tx as unknown as typeof prisma).project.deleteMany({ where: { id: { in: projectIds } } });
+        }
+    );
     revalidatePath(`/projects`);
     return { success: true };
 }
@@ -15343,22 +15368,84 @@ export async function markTimeEntryReviewed(entryId: string) {
     const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, name: true, email: true, role: true } });
     if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
 
-    const entry = await prisma.timeEntry.findUnique({ where: { id: entryId }, select: { id: true, needsReview: true, notes: true, reviewReason: true } });
+    // Cheap fail-fast only. Everything that DECIDES anything is re-read
+    // row-locked inside the transaction below — this copy is stale the moment
+    // another writer touches the row.
+    const entry = await prisma.timeEntry.findUnique({
+        where: { id: entryId },
+        select: { id: true, needsReview: true },
+    });
     if (!entry) throw new Error("Time entry not found");
     if (!entry.needsReview) return { success: true }; // already reviewed — idempotent
 
-    const stamp = `[Reviewed by ${user.name || user.email} ${new Date().toISOString().slice(0, 10)}]`;
-    await prisma.timeEntry.update({
-        where: { id: entryId },
-        data: {
+    const { ZERO_RATE_REVIEW_NOTE, zeroRateBlocks } = await import("./pay-rate-guard");
+    const { withPayrollWrite } = await import("./payroll-period");
+    const { readOwnerRatesForUpdate } = await import("./pay-rate-guard");
+
+    const reviewed = await withPayrollWrite({ entryIds: [entryId] }, async (tx) => {
+        const client = tx as unknown as typeof prisma;
+
+        // The entry as it stands NOW, row-locked. Everything below is decided
+        // from this read, not from the copy taken before the transaction: an
+        // edit landing in between changes the hours the reprice multiplies, the
+        // reason being cleared, and whether there is still anything to review.
+        const [live] = (await client.$queryRawUnsafe(
+            `SELECT "needsReview", "reviewReason", "notes", "durationHours", "userId", "updatedAt"
+             FROM "TimeEntry" WHERE "id" = $1`,
+            entryId
+        )) as Array<{
+            needsReview: boolean;
+            reviewReason: string | null;
+            notes: string | null;
+            durationHours: number | null;
+            userId: string;
+            updatedAt: Date;
+        }>;
+        if (!live) throw new Error("Time entry not found");
+        // Somebody already cleared it. Idempotent, not an error.
+        if (!live.needsReview) return "already";
+
+        const data: Record<string, unknown> = {
             needsReview: false,
-            // Retire the settlement-owned notes (src/lib/wa-breaks.ts) so a later
-            // day re-plan cannot read them as "still unanswered" and re-flag a row
-            // a manager already looked at. Other reasons (GPS etc.) are kept.
-            reviewReason: stripSettlementNotes(entry.reviewReason),
-            notes: entry.notes ? `${entry.notes}\n${stamp}` : stamp,
-        },
+            reviewReason: stripSettlementNotes(live.reviewReason),
+        };
+
+        // The $0-rate flag is the only thing stopping a manager-closed free
+        // shift being exported. Clearing it demands a real rate NOW, and the
+        // entry is repriced from that rate in this same write.
+        if ((live.reviewReason ?? "").includes(ZERO_RATE_REVIEW_NOTE)) {
+            const owner = await readOwnerRatesForUpdate(tx as never, live.userId, toNum);
+            if (
+                !owner ||
+                zeroRateBlocks({
+                    role: owner.role,
+                    email: owner.email,
+                    payType: owner.payType,
+                    hourlyRate: owner.hourlyRate,
+                })
+            ) {
+                throw new Error(
+                    `${owner?.name || "That team member"} still has no hourly rate. Set it on Company → Team Members first — clearing this flag would export the shift at $0.`
+                );
+            }
+            const hours = live.durationHours ?? 0;
+            data.laborCost = hours * owner.hourlyRate;
+            data.burdenCost = hours * owner.burdenRate;
+        }
+
+        const stamp = `[Reviewed by ${user.name || user.email} ${new Date().toISOString().slice(0, 10)}]`;
+        data.notes = live.notes ? `${live.notes}\n${stamp}` : stamp;
+
+        // Compare-and-set on updatedAt: a concurrent write between the read
+        // above and here would make the reprice describe different hours.
+        const claim = await client.timeEntry.updateMany({
+            where: { id: entryId, updatedAt: live.updatedAt },
+            data,
+        });
+        if (claim.count !== 1) throw new Error("This entry changed while it was being reviewed. Reload and try again.");
+        return "reviewed";
     });
+    if (reviewed === "already") return { success: true };
 
     revalidatePath("/manager/time-entries");
     return { success: true };
@@ -15535,7 +15622,11 @@ export async function decideMealSkip(entryId: string, decision: "APPROVED" | "DE
         } as const;
         throw new Error(messages[check.code]);
     }
-    const flipped = await prisma.timeEntry.updateMany({
+    // A skip decision changes what the day's settlement owes, so it is a
+    // payroll write and takes the advisory-lock protocol.
+    const { withPayrollWrite: withPayrollWriteForSkip } = await import("./payroll-period");
+    const flipped = await withPayrollWriteForSkip({ entryIds: [entryId] }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.updateMany({
         // APPROVED additionally requires the shift to STILL be open at write time
         // (a clock-out racing this decision already settled pay via attestation).
         where: {
@@ -15544,7 +15635,8 @@ export async function decideMealSkip(entryId: string, decision: "APPROVED" | "DE
             ...(decision === "APPROVED" ? { endTime: null, user: { mealWaiverSignedAt: { not: null } } } : {}),
         },
         data: { mealSkipStatus: decision, mealSkipDecidedById: user.id, mealSkipDecidedAt: new Date() },
-    });
+        })
+    );
     if (flipped.count === 0) throw new Error("Request was already decided or the shift closed");
     revalidatePath("/manager/time-entries");
     return { success: true };
@@ -15583,29 +15675,46 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
 
     const entry = await prisma.timeEntry.findUnique({
         where: { id: entryId },
-        select: { id: true, projectId: true, routedFromProjectId: true, invoiceId: true, invoicedAt: true, project: { select: { isLogistics: true } } },
+        select: { id: true, projectId: true, routedFromProjectId: true, invoiceId: true, invoicedAt: true, changeOrderId: true, project: { select: { isLogistics: true } } },
     });
     if (!entry) throw new Error("Time entry not found");
     if (!entry.project.isLogistics && !entry.routedFromProjectId) throw new Error("Not a logistics entry");
     if (entry.invoiceId != null || entry.invoicedAt != null) throw new Error("This time was already invoiced and cannot be re-routed");
+    // A change-order tag belongs to the job the entry is ON — moving the entry
+    // and leaving the tag would bill this job's hours against another job's
+    // change order. Refused, not silently cleared: same rule and same wording
+    // as PATCH /api/time-entries/[id]/logistics, which is the other door to
+    // this exact write.
+    if (entry.changeOrderId != null) {
+        throw new Error("This time is tagged to a change order — remove the change-order tag before re-routing it");
+    }
 
     // Guarded at write time (Codex): an invoice landing between our read and
     // the write must win — count 0 means "changed underneath you".
+    // Re-coding rewrites the project and cost code that the DETAIL csv reports,
+    // so a locked period must refuse it like any other payroll write.
+    const { withPayrollWrite: withPayrollWriteForRoute } = await import("./payroll-period");
     if (routeToProjectId === null) {
         if (entry.routedFromProjectId) {
-            const r = await prisma.timeEntry.updateMany({
-                where: { id: entryId, invoiceId: null, invoicedAt: null },
-                data: { projectId: entry.routedFromProjectId, costCodeId: null, routedFromProjectId: null, routedAt: null, routedById: null },
-            });
-            if (r.count === 0) throw new Error("This entry changed underneath you (invoiced?) — reload");
+            // Captured before the callback: the narrowing above does not survive
+            // the async boundary, and this is the project the entry goes back to.
+            const restoreProjectId = entry.routedFromProjectId;
+            const r = await withPayrollWriteForRoute({ entryIds: [entryId] }, async (tx) =>
+                (tx as unknown as typeof prisma).timeEntry.updateMany({
+                where: { id: entryId, invoiceId: null, invoicedAt: null, changeOrderId: null },
+                data: { projectId: restoreProjectId, costCodeId: null, routedFromProjectId: null, routedAt: null, routedById: null },
+                })
+            );
+            if (r.count === 0) throw new Error("This entry changed underneath you (invoiced, or tagged to a change order?) — reload");
         }
     } else {
         const job = await prisma.project.findUnique({ where: { id: routeToProjectId }, select: { id: true, isLogistics: true, status: true } });
         if (!job || job.isLogistics || job.status !== PROJECT_STATUS_IN_PROGRESS) throw new Error("That job is not available for routing");
         const costCode = await prisma.costCode.findUnique({ where: { code: LOGISTICS_COST_CODE }, select: { id: true } });
         if (!costCode) throw new Error(`${LOGISTICS_COST_CODE} cost code is missing`);
-        const r = await prisma.timeEntry.updateMany({
-            where: { id: entryId, invoiceId: null, invoicedAt: null },
+        const r = await withPayrollWriteForRoute({ entryIds: [entryId] }, async (tx) =>
+            (tx as unknown as typeof prisma).timeEntry.updateMany({
+            where: { id: entryId, invoiceId: null, invoicedAt: null, changeOrderId: null },
             data: {
                 projectId: job.id,
                 costCodeId: costCode.id,
@@ -15614,10 +15723,1011 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
                 routedAt: new Date(),
                 routedById: user.id,
             },
-        });
-        if (r.count === 0) throw new Error("This entry changed underneath you (invoiced?) — reload");
+            })
+        );
+        if (r.count === 0) throw new Error("This entry changed underneath you (invoiced, or tagged to a change order?) — reload");
     }
     revalidatePath("/manager/logistics");
     revalidatePath("/manager/time-entries");
     return { success: true };
+}
+
+// ============ Payroll (Phase 5 — docs/plans/PHASE-5-GUSTO-AND-MOBILE-RELEASE-SPEC.md) ============
+
+/**
+ * STAFF, and then ADMIN or the `financialReports` permission. Pay rates and
+ * payroll exports are money, not team administration — the same gate the
+ * export endpoint, the roster endpoint and the integration settings use, from
+ * ONE predicate, so they can never disagree about who may see rates.
+ *
+ * The staff half is not decoration: `financialReports` is an assignable
+ * permission, so it could be granted to a portal CLIENT, and this gate used to
+ * let that customer read and mutate the whole company's payroll (round 15,
+ * finding 1).
+ */
+async function requirePayrollAccess() {
+    const { canActOnFinancials } = await import("./financial-access");
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Not authenticated");
+    if (!canActOnFinancials(user)) throw new Error("Forbidden");
+    return user;
+}
+
+/**
+ * Step 1 of the rate import: parse a pasted Gusto employee export and return
+ * the diff for a human to look at, each row carrying its own fingerprint.
+ * WRITES NOTHING.
+ */
+export async function previewGustoRateImport(csvText: string) {
+    await requirePayrollAccess();
+    if (typeof csvText !== "string" || !csvText.trim()) {
+        return { success: false as const, error: "Paste the CSV first." };
+    }
+    const { parseGustoRateCsv, diffRates, hasDuplicateTargets } = await import("./rate-import");
+    const parsed = parseGustoRateCsv(csvText);
+    const users = await importableUsers();
+
+    // The WHOLE preview is refused when the file claims one person twice: if it
+    // lists somebody with two different rates, nobody can say which the office
+    // meant, and importing the other rows while dropping the ambiguous one
+    // leaves a half-applied payroll change nobody reviewed.
+    if (hasDuplicateTargets(parsed.rows, users)) {
+        return {
+            success: false as const,
+            error: "That file lists the same team member more than once. Fix the file and import it again — nothing was previewed.",
+        };
+    }
+
+    // Every row token is bound to THIS file. Apply re-hashes the CSV it is
+    // handed and re-signs from it, so a token cannot be carried across to a
+    // different file and applied against rows nobody previewed.
+    const rows = diffRates(parsed.rows, users, signRateRow, hashImportCsv(csvText));
+    return { success: true as const, rows, errors: parsed.errors, csvHash: hashImportCsv(csvText) };
+}
+
+/** sha256 of the pasted CSV, verbatim. Not normalised — a different file is a different decision. */
+function hashImportCsv(csvText: string): string {
+    return createHash("sha256").update(csvText, "utf8").digest("hex");
+}
+
+/**
+ * HMAC the row claim with NEXTAUTH_SECRET. The unsigned fingerprint is plain
+ * concatenation a client can reproduce, so on its own it proves nothing: a
+ * caller could fabricate an "approved" row it was never shown. Signing makes it
+ * evidence that THIS server built THIS preview.
+ */
+function signRateRow(input: RowFingerprintInput): string {
+    return createHmac("sha256", process.env.NEXTAUTH_SECRET ?? "")
+        .update(rowFingerprint(input), "utf8")
+        .digest("hex");
+}
+
+/**
+ * Everyone the import may write to, with rates as canonical decimal TEXT (never
+ * a float).
+ *
+ * STAFF ONLY. This loaded every User row, and diffRates matches on EMAIL first
+ * and then on an exact full name — so a portal CLIENT account sharing a name
+ * with somebody on the Gusto export could be matched, given a pay type and a
+ * pay rate, and from then on appear on every pay period's file (round 8,
+ * finding 2). A customer is not an employee, and the import has no business
+ * being able to make one.
+ */
+async function importableUsers() {
+    const { payrollEligibleUserWhere } = await import("./payroll-config");
+    const users = await prisma.user.findMany({
+        where: payrollEligibleUserWhere(),
+        select: {
+            id: true, name: true, email: true, hourlyRate: true, status: true,
+            payType: true, lastRateSyncAt: true, payrollRevision: true,
+        },
+    });
+    return users.map((u) => ({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        // Prisma.Decimal -> exact 2-place text. toNum() would put money through
+        // a float on the way to the screen and back.
+        hourlyRate: u.hourlyRate.toFixed(2),
+        status: u.status,
+        payType: u.payType ?? null,
+        // ISO text, DISPLAY ONLY — the "last confirmed" label. Not the replay
+        // guard any more; payrollRevision below is.
+        lastRateSyncAt: u.lastRateSyncAt ? u.lastRateSyncAt.toISOString() : null,
+        // The value signed at preview time and re-read at apply time are
+        // compared as the same thing — this counter is the replay guard.
+        payrollRevision: u.payrollRevision,
+    }));
+}
+
+/**
+ * Step 2: apply the approved rows.
+ *
+ * Three independent guards, because a server action argument is an HTTP body,
+ * not the preview's return value:
+ *
+ *  1. each row carries its OWN fingerprint (userId + the rate at preview time +
+ *     what is about to be written), re-derived here from live data. Per row, so
+ *     a human can tick a SUBSET without the save being rejected;
+ *  2. disabled accounts are refused;
+ *  3. the write itself is `updateMany where id AND hourlyRate = previewedOld`
+ *     inside one transaction — if anybody changed that rate between preview and
+ *     save, the count is 0 and the WHOLE batch is rolled back. That is the
+ *     guard that actually holds; the fingerprint is what produces a good error.
+ *
+ * hourlyRate is written from canonical decimal TEXT through Prisma.Decimal, so
+ * the value never passes through a JS float.
+ */
+export async function applyGustoRateImport(
+    rows: Array<{ userId: string; newHourly: string | null; payType?: string | null; rowHash: string }>,
+    /**
+     * REQUIRED. Re-parsed and re-hashed here, never trusted from the browser.
+     *
+     * It used to be optional, which meant the whole file check could be skipped
+     * by simply not sending it — the rows were then applied on their tokens
+     * alone. A file with unreadable rows is a file somebody has to look at
+     * again: importing the rows that happened to parse leaves a half-applied pay
+     * change nobody reviewed, and the errors were on the screen they clicked
+     * Save from.
+     */
+    csvText: string
+) {
+    const importer = await requirePayrollAccess();
+    if (typeof csvText !== "string" || !csvText.trim()) {
+        return { success: false as const, error: "Re-run the preview — the file this import came from was not sent." };
+    }
+    const { parseGustoRateCsv } = await import("./rate-import");
+    const reparsed = parseGustoRateCsv(csvText);
+    if (reparsed.errors.length > 0) {
+        return {
+            success: false as const,
+            error: `That file still has ${reparsed.errors.length} row${reparsed.errors.length === 1 ? "" : "s"} that could not be read. Fix the file and preview it again — nothing was saved.`,
+        };
+    }
+    // The hash the row tokens must have been signed with. Computed from the file
+    // the SERVER just parsed, so it can only match tokens this server issued for
+    // this exact file.
+    const csvHash = hashImportCsv(csvText);
+    if (!Array.isArray(rows) || rows.length === 0) {
+        return { success: false as const, error: "Nothing to save." };
+    }
+    const { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } = await import("./rate-import");
+    const { Prisma } = await import("@prisma/client");
+
+    const seen = new Set<string>();
+    const clean: Array<{ userId: string; newHourly: string | null; payType: string | null; rowHash: string }> = [];
+    for (const row of rows) {
+        if (!row || typeof row.userId !== "string" || !row.userId) continue;
+        if (typeof row.rowHash !== "string" || !row.rowHash) {
+            return { success: false as const, error: "Run the preview again before saving." };
+        }
+        if (seen.has(row.userId)) return { success: false as const, error: "The same team member appears twice." };
+        const payType = row.payType === "SALARY" || row.payType === "HOURLY" ? row.payType : null;
+
+        // A SALARY row carries no hourly rate: Gusto's compensation figure for a
+        // salaried person is ANNUAL (92,000, not 44.23), so reading it as an
+        // hourly rate is nonsense. Their pay type is the useful part.
+        let rate: string | null = null;
+        if (row.newHourly != null) {
+            rate = parseRateValue(String(row.newHourly));
+            if (rate == null || rate.startsWith("-") || Number(rate) > MAX_IMPORTABLE_HOURLY_RATE) {
+                return {
+                    success: false as const,
+                    error: `Rate out of range or unreadable for one of the rows (0 to ${MAX_IMPORTABLE_HOURLY_RATE}, at most two decimal places).`,
+                };
+            }
+        }
+        if (rate == null && !payType) {
+            return { success: false as const, error: "A row has neither a rate nor a pay type — re-run the preview." };
+        }
+        seen.add(row.userId);
+        clean.push({ userId: row.userId, newHourly: rate, payType, rowHash: row.rowHash });
+    }
+    if (clean.length === 0) return { success: false as const, error: "Nothing to save." };
+
+    const known = await prisma.user.findMany({
+        where: { id: { in: clean.map((r) => r.userId) } },
+        select: { id: true, status: true, hourlyRate: true, payType: true, lastRateSyncAt: true, payrollRevision: true },
+    });
+    if (known.length !== clean.length) {
+        return { success: false as const, error: "One of those team members no longer exists — re-run the preview." };
+    }
+    if (known.some((u) => u.status === "DISABLED")) {
+        return { success: false as const, error: "One of those accounts is disabled — re-run the preview." };
+    }
+
+    const byId = new Map(known.map((u) => [u.id, u]));
+    for (const row of clean) {
+        const live = byId.get(row.userId)!;
+        // Re-signed from the LIVE row. A mismatch means either the member's rate
+        // or pay type moved since the preview, or the token was forged.
+        // timingSafeEqual so the comparison cannot be probed byte by byte.
+        const expected = signRateRow({
+            userId: row.userId,
+            oldHourly: live.hourlyRate.toFixed(2),
+            oldPayType: live.payType ?? null,
+            // Closes the A -> B -> A replay: setting a rate (or pay type) back
+            // by hand restores the values this token was signed over, but this
+            // counter still moved when that happened, so the old approval
+            // stops verifying. lastRateSyncAt cannot do this any more — a
+            // pay-type-only write leaves it untouched (round-32 gate).
+            oldPayrollRevision: live.payrollRevision,
+            csvHash,
+            newHourly: row.newHourly,
+            payType: row.payType,
+        });
+        const a = Buffer.from(expected, "utf8");
+        const b = Buffer.from(row.rowHash, "utf8");
+        if (a.length !== b.length || !timingSafeEqual(a, b)) {
+            return {
+                success: false as const,
+                error: "One of those team members changed since the preview was generated, or this file is not the one that was previewed. Nothing was saved — re-run the preview and check it again.",
+            };
+        }
+    }
+
+    const syncedAt = new Date();
+    try {
+        await prisma.$transaction(async (tx) => {
+            const { acquirePayrollWriteLock } = await import("./payroll-period");
+            const { payrollEligibleUserWhere } = await import("./payroll-config");
+            const { requireFinancialActorInTx } = await import("./user-mutation-guard");
+            // TIER 1 OF THE GLOBAL LOCK ORDER, before any row lock. Rates and
+            // pay types are EXPORT INPUTS — pay type decides who is on the
+            // Gusto roster at all — so this import has to serialise against a
+            // period being locked, not just against another rate writer. See
+            // the same lock in pay-rate-write.ts.
+            await acquirePayrollWriteLock(tx as never);
+            // TIER 2: the actor's row FOR SHARE and EXCLUSIVE locks on every
+            // row this import will write, taken as ONE ascending-id sequence so
+            // two concurrent imports cannot deadlock on each other. This is the
+            // other half of settlement's FOR SHARE: a day mid-reprice holds the
+            // shared lock, so this import waits rather than changing the rate
+            // underneath it and leaving one day priced at two different rates.
+            //
+            // And the AUTHORITY is re-decided here, under those locks.
+            // requirePayrollAccess() above ran before this transaction opened;
+            // an importer disabled, demoted or stripped of `financialReports`
+            // while this request waited for the payroll lock used to write
+            // anyway (round 21, P1). The refusal rolls the whole batch back.
+            await requireFinancialActorInTx(tx as never, importer.id, {
+                alsoLock: clean.map((row) => ({ id: row.userId, mode: "FOR UPDATE" as const })),
+            });
+            for (const row of clean) {
+                const live = byId.get(row.userId)!;
+                // Compare-and-set on BOTH values we showed the human. Rate
+                // alone was not enough: a concurrent null -> SALARY correction
+                // changes no rate, so a stale HOURLY preview would have
+                // overwritten it. A concurrent edit makes count 0, the throw
+                // rolls the whole batch back, and nobody ends up half-imported.
+                const result = await tx.user.updateMany({
+                    where: {
+                        // STAFF ONLY — see importableUsers. Belt and braces
+                        // with the load above: the preview is one request and
+                        // the apply is another, so a role change in between
+                        // must not be able to land a rate on a customer.
+                        ...payrollEligibleUserWhere(),
+                        id: row.userId,
+                        hourlyRate: live.hourlyRate,
+                        payType: live.payType,
+                        // Same value the token was verified against, so the
+                        // check and the write cannot be split by a concurrent
+                        // import (or a rates-panel edit) landing in between.
+                        // payrollRevision, not lastRateSyncAt: the latter no
+                        // longer moves on a pay-type-only write, so it cannot
+                        // detect one happening concurrently (round-32 gate).
+                        payrollRevision: live.payrollRevision,
+                        status: { not: "DISABLED" },
+                    },
+                    data: {
+                        ...(row.newHourly != null ? { hourlyRate: new Prisma.Decimal(row.newHourly) } : {}),
+                        ...(row.payType ? { payType: row.payType } : {}),
+                        // "Last confirmed" — ONLY for a row that actually
+                        // carries a rate. A pay-type-only row must not move
+                        // this, or the rates panel shows a rate as confirmed
+                        // when nobody looked at it.
+                        ...(row.newHourly != null ? { lastRateSyncAt: syncedAt } : {}),
+                        // Every clean row carries a rate change, a pay-type
+                        // change, or both (checked above) — this counter moves
+                        // whenever either does, which is what makes it usable
+                        // as the next preview's replay guard.
+                        payrollRevision: { increment: 1 },
+                    },
+                });
+                if (result.count !== 1) {
+                    throw new Error(
+                        "Somebody changed one of these team members while this import was being saved. Nothing was saved — re-run the preview."
+                    );
+                }
+            }
+        });
+    } catch (error: any) {
+        return { success: false as const, error: error?.message || "Could not save those rates." };
+    }
+
+    revalidatePath("/company/team-members");
+    revalidatePath("/manager/time-entries");
+    revalidatePath("/manager/payroll-export");
+    return { success: true as const, updated: clean.length };
+}
+
+/**
+ * Set a team member's pay type by hand, from the Payroll rates panel. The
+ * payroll export refuses to run while somebody with hours has no answer, so
+ * this is the screen that unblocks it.
+ */
+export async function setUserPayType(
+    userId: string,
+    payType: string,
+    /**
+     * Answering for somebody who has already LEFT.
+     *
+     * A disabled account with hours in an unclosed period blocks the export
+     * forever otherwise: the pay type can only be set on an active user, and
+     * re-activating a former employee to unblock payroll is a worse cure than
+     * the disease (they reappear on the dispatch board, in pickers, in
+     * auto-assignment). This writes the pay type WITHOUT touching status.
+     */
+    options: { historical?: boolean } = {}
+) {
+    const setter = await requirePayrollAccess();
+    if (payType !== "HOURLY" && payType !== "SALARY") {
+        return { success: false as const, error: "Pay type must be hourly or salary." };
+    }
+    const { acquirePayrollWriteLock } = await import("./payroll-period");
+    const { requireFinancialActorInTx } = await import("./user-mutation-guard");
+    const { payrollEligibleUserWhere } = await import("./payroll-config");
+    // A PAYROLL WRITE, not a profile edit. payType decides who appears on the
+    // Gusto roster and whether their hours are summarised, so this is an input
+    // to the export hash that lockPayrollPeriod freezes. Taking the shared
+    // payroll advisory lock FIRST — tier 1 of the global lock order — is what
+    // makes this writer wait for a period being locked instead of committing
+    // between that lock's "confirmed" recompute and its COMMIT. The row lock
+    // comes after, same order as every other rate writer (pay-rate-write.ts).
+    const updated = await prisma.$transaction(async (tx) => {
+        await acquirePayrollWriteLock(tx as never);
+        // TIER 2, and the authority with it. requirePayrollAccess() above ran
+        // before this transaction opened; re-decide it on the actor's row as
+        // this transaction's locks actually hold it, and take the EXCLUSIVE
+        // lock on the member being written in the same ascending-id sequence
+        // (round 21, P1). Refusal throws, exactly as the pre-check does.
+        await requireFinancialActorInTx(tx as never, setter.id, {
+            alsoLock: [{ id: userId, mode: "FOR UPDATE" }],
+        });
+        return tx.user.updateMany({
+            // ...and only on a STAFF account. A pay type on a portal CLIENT is
+            // what puts a customer on the Gusto roster (round 8, finding 2);
+            // `count !== 1` below turns that into the same refusal a missing
+            // user gets.
+            where: {
+                AND: [
+                    payrollEligibleUserWhere(),
+                    options.historical ? { id: userId } : { id: userId, status: { not: "DISABLED" } },
+                ],
+            },
+            // lastRateSyncAt is NOT touched here — it means "a rate was actually
+            // confirmed", and this write never touches hourlyRate/burdenRate.
+            // payrollRevision moves instead: the rate-import token is signed over
+            // it (see oldPayrollRevision in applyGustoRateImport), so a
+            // HOURLY -> SALARY -> HOURLY cycle still advances the counter and an
+            // old, already-shown approval's signature stops verifying even though
+            // payType (and lastRateSyncAt) end up back where they started.
+            data: { payType, payrollRevision: { increment: 1 } },
+        });
+    });
+    if (updated.count !== 1) return { success: false as const, error: "That team member is not available." };
+
+    revalidatePath("/company/team-members");
+    revalidatePath("/manager/payroll-export");
+    return { success: true as const };
+}
+
+/**
+ * Freeze a pay period after its CSVs have been downloaded and checked.
+ *
+ * `periodEndKey` is EXCLUSIVE (the day after the last day), matching
+ * PayrollPeriod and the export endpoint. The summary CSV is recomputed here
+ * rather than taken from the caller: exportHash has to describe what the
+ * database actually held at lock time, not what a browser posted.
+ *
+ * Refuses while any in-range entry is still open or flagged — the same
+ * condition that makes the download 409, checked again at the moment of the
+ * write so a lock can never freeze a period that was not exportable.
+ */
+export async function lockPayrollPeriod(
+    periodStartKey: string,
+    periodEndKey: string,
+    /**
+     * The export hash the human actually reviewed, from the page they were
+     * looking at. REQUIRED, and compared unconditionally under the exclusive
+     * lock: an optional check is one a caller can skip, and skipping it is
+     * exactly how a period gets frozen around numbers nobody approved.
+     */
+    reviewedExportHash: string
+) {
+    const user = await requirePayrollAccess();
+    const { resolveCompanyTimeZone } = await import("./company-timezone");
+    const { startOfDateInTimeZone } = await import("./tz-date");
+    const { validatePayrollRange } = await import("./payroll-config");
+    const { loadGustoExport } = await import("./gusto-export-db");
+    const { acquirePayrollLockCreationLock } = await import("./payroll-period");
+
+    // ONE validator, shared with the endpoint and the page (day-key shape, real
+    // calendar day, positive length, 62-day cap) - a lock must never cover a
+    // range the export itself would refuse to produce.
+    const range = validatePayrollRange(periodStartKey, periodEndKey);
+    if (!range.ok) return { success: false as const, error: range.error };
+
+    // Shape-checked before anything else: a caller that sends "" or junk is not
+    // proving it reviewed anything, and must not be able to slip past the
+    // comparison below by sending a falsy value.
+    if (typeof reviewedExportHash !== "string" || !/^[0-9a-f]{64}$/.test(reviewedExportHash)) {
+        return {
+            success: false as const,
+            error: "Reload the page before locking — the numbers being locked could not be identified.",
+        };
+    }
+
+    const timeZone = await resolveCompanyTimeZone();
+    const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
+    const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
+
+    // A period cannot be locked while any of it is still running. The OT
+    // ENVELOPE has to be past too: hours still to be worked in the trailing
+    // workweek change how much of the period counts as overtime, so freezing
+    // now would freeze a number that has not finished happening.
+    const { payrollLockEnvelope } = await import("./payroll-config");
+    const { dayKeyInTimeZone } = await import("./tz-date");
+    const envelope = payrollLockEnvelope(periodStart, periodEnd, timeZone);
+    if (envelope.end.getTime() > Date.now()) {
+        const lastDay = dayKeyInTimeZone(new Date(envelope.end.getTime() - 1), timeZone);
+        return {
+            success: false as const,
+            error: `This period is not over yet. Its workweeks run through ${lastDay} — wait until after that before locking.`,
+        };
+    }
+
+    // Pass 1, OUTSIDE the transaction: readiness. Cheap, and it gives the human
+    // a useful message instead of a rolled-back transaction.
+    //
+    // The loader THROWS on a locked period whose frozen CSVs are incomplete
+    // (LockedSnapshotMissingError, round 6). This action returns structured
+    // refusals rather than throwing, so that one is turned into a message here —
+    // otherwise the one period that needs an admin to unlock and re-lock it
+    // would answer with a generic action failure and no instruction.
+    let precheck: Awaited<ReturnType<typeof loadGustoExport>>;
+    try {
+        precheck = await loadGustoExport(periodStart, periodEnd, {
+            startKey: range.startKey,
+            endKey: range.endKey,
+            // THE zone periodStart/periodEnd were derived from. Required, and it
+            // is what the export is computed in — see the `timeZone` option on
+            // loadGustoExport. Outside a transaction there is nothing held still
+            // to check it against; the confirm pass below runs inside one and
+            // does check.
+            timeZone,
+        });
+    } catch (error: any) {
+        const { isLabelRowMissingError, isLockedSnapshotMissingError, isNonStaffOnPayrollError } = await import(
+            "./gusto-export-db"
+        );
+        // All three are "there is no correct export for this period" — surfaced
+        // as a message rather than a thrown action, for the same reason.
+        if (
+            isLockedSnapshotMissingError(error) ||
+            isNonStaffOnPayrollError(error) ||
+            isLabelRowMissingError(error)
+        ) {
+            return { success: false as const, error: error.message };
+        }
+        throw error;
+    }
+    // An already-locked period is NOT re-lockable. Re-running the lock would
+    // overwrite lockedAt, the locker, the hash and both snapshots — rewriting
+    // the payroll audit trail after mutable names, Gusto mappings or cost codes
+    // had changed. Unlocking is the deliberate, ADMIN-only way back.
+    if (precheck.period?.lockedAt) {
+        return {
+            success: false as const,
+            error: "That period is already locked. An admin has to unlock it before it can be locked again.",
+        };
+    }
+    // Overlapping ENVELOPES, not just overlapping periods: two locks whose
+    // workweek envelopes overlap would each freeze — and each claim a different
+    // exportHash for — the same punches.
+    if (precheck.overlappingLocks.length > 0) {
+        const listed = precheck.overlappingLocks.map((row) => `${row.periodStartKey} to ${row.periodEndKey}`).join(", ");
+        return {
+            success: false as const,
+            error: `This period's workweeks overlap an already-locked period (${listed}). Unlock that one first, or pick the exact period.`,
+        };
+    }
+    if (precheck.blocking.length > 0) {
+        return {
+            success: false as const,
+            error: `${precheck.blocking.length} time ${precheck.blocking.length === 1 ? "entry is" : "entries are"} not ready (open, flagged, zero hours, an unsettled meal, or a missing pay type) - clear them before locking.`,
+        };
+    }
+
+    // Pass 2, INSIDE one transaction: take the lock FIRST, then recompute. The
+    // ordering is the whole point. Once lockedAt is committed every gated write
+    // path is refused, so a recompute that still agrees with the pre-check
+    // proves nothing slipped in between - and if it disagrees, the throw rolls
+    // the lock back rather than freezing a period around numbers a human never
+    // saw. Check-then-act would have locked whatever the racing write left.
+    const lockedAt = new Date();
+    try {
+        const committed = await prisma.$transaction(async (tx) => {
+            // Overlapping periods would each claim the same punches and each
+            // hold a different exportHash for them, so "what did we pay for this
+            // punch" would have two answers. FOR UPDATE (raw - Prisma has no
+            // row-lock option) serialises two concurrent locks of overlapping
+            // ranges rather than letting both commit.
+            // EXCLUSIVE payroll advisory lock, FIRST. It waits for every
+            // in-flight hours writer holding the shared lock and blocks new
+            // ones until this transaction commits, so the recompute below
+            // cannot race a write. It also serialises two concurrent lock
+            // creations, which is what makes the overlap check below sound —
+            // FOR UPDATE cannot lock a row nobody has inserted yet.
+            await acquirePayrollLockCreationLock(tx as never);
+
+            // TIER 2, before any other row this transaction touches: the
+            // locker's own authority, re-decided on their row as this
+            // transaction holds it. requirePayrollAccess() ran before the
+            // pre-check pass, and this transaction then waits for the exclusive
+            // payroll lock behind every in-flight hours writer — a locker
+            // disabled, demoted or stripped of `financialReports` in that gap
+            // used to freeze the period anyway, under their name (round 21,
+            // P1). The throw rolls the whole lock back.
+            const { requireFinancialActorInTx } = await import("./user-mutation-guard");
+            await requireFinancialActorInTx(tx as never, user.id);
+
+            // LOCKED overlaps only. An unlocked row is not a claim on anything —
+            // it is a leftover from an unlock or a range somebody typed wrong —
+            // and treating it as a conflict made a typo permanent: the wrong
+            // range could not be locked, and every corrected range that touched
+            // it was refused too. Discarded rows are excluded by the same
+            // predicate, because a discarded row can never be locked (CHECK
+            // PayrollPeriod_discard_unlocked).
+            const overlapping = await tx.$queryRaw<Array<{ id: string; periodStartKey: string | null; periodEndKey: string | null }>>`
+                SELECT "id", "periodStartKey", "periodEndKey"
+                FROM "PayrollPeriod"
+                WHERE "lockedAt" IS NOT NULL
+                  AND "periodStartKey" < ${range.endKey} AND "periodEndKey" > ${range.startKey}
+                FOR UPDATE
+            `;
+            // Envelope overlap, re-checked INSIDE the transaction now that the
+            // exclusive advisory lock is held. The pre-check outside is
+            // advisory: two locks racing each other both passed it, and only
+            // this one is serialised.
+            // Keyed on the STABLE day keys, exactly like findOverlappingLockedPeriods.
+            // Timestamps move with the company time zone; these do not.
+            const rangeConflicts = (await tx.$queryRaw<Array<{ periodStartKey: string | null; periodEndKey: string | null }>>`
+                SELECT "periodStartKey", "periodEndKey"
+                FROM "PayrollPeriod"
+                WHERE "lockedAt" IS NOT NULL
+                  AND "periodStartKey" < ${range.endKey}
+                  AND "periodEndKey" > ${range.startKey}
+                  AND NOT ("periodStartKey" = ${range.startKey} AND "periodEndKey" = ${range.endKey})
+                FOR UPDATE
+            `);
+            if (rangeConflicts.length > 0) {
+                const listed = rangeConflicts.map((row) => `${row.periodStartKey} to ${row.periodEndKey}`).join(", ");
+                throw new Error(
+                    `This period's workweeks overlap an already-locked period (${listed}). Unlock that one first, or pick the exact period.`
+                );
+            }
+
+            const conflicting = overlapping.filter(
+                (row) => row.periodStartKey !== range.startKey || row.periodEndKey !== range.endKey
+            );
+            if (conflicting.length > 0) {
+                const listed = conflicting
+                    .map((row) => `${row.periodStartKey} to ${row.periodEndKey}`)
+                    .join(", ");
+                throw new Error(
+                    `This range overlaps an existing pay period (${listed}). Pay periods cannot overlap - pick the exact period, or unlock the other one first.`
+                );
+            }
+
+            // Re-check INSIDE the transaction: the pre-check above is advisory,
+            // and two concurrent locks of the same period would otherwise both
+            // pass it. The exclusive advisory lock serialises them, so the
+            // second one sees the first one's committed lockedAt.
+            const existing = await tx.payrollPeriod.findUnique({
+                where: { periodStartKey_periodEndKey: { periodStartKey: range.startKey, periodEndKey: range.endKey } },
+                select: { lockedAt: true },
+            });
+            if (existing?.lockedAt) {
+                throw new Error("That period was locked by someone else while this lock was being taken.");
+            }
+
+            await tx.payrollPeriod.upsert({
+                // Keyed on the STABLE day keys, not the timestamps — those move
+                // if the company time zone changes and would miss this row.
+                where: { periodStartKey_periodEndKey: { periodStartKey: range.startKey, periodEndKey: range.endKey } },
+                // timeZone is persisted so enforcement can rebuild this
+                // period's workweek envelope exactly as it was, even if
+                // CompanySettings.timeZone changes later.
+                // The CSVs are FROZEN here. A locked period is served from
+                // these verbatim afterwards: they are built from mutable inputs
+                // (name, email, payType, Gusto id mapping, a punch's project and
+                // cost code) and recomputing later would not reproduce the file
+                // that was actually sent to payroll.
+                create: {
+                    periodStartKey: range.startKey,
+                    periodEndKey: range.endKey,
+                    periodStart,
+                    periodEnd,
+                    lockedAt,
+                    lockedById: user.id,
+                    exportHash: precheck.exportHash,
+                    timeZone,
+                    summaryCsvSnapshot: precheck.summaryCsv,
+                    detailCsvSnapshot: precheck.detailCsv,
+                },
+                update: {
+                    // The timestamps are refreshed too: an UNLOCKED row keyed to
+                    // these days may have been created in a different zone.
+                    periodStart,
+                    periodEnd,
+                    // Re-locking the exact same range REVIVES a discarded row.
+                    // Without this the upsert would set lockedAt on a row that
+                    // still carries discardedAt and trip the CHECK constraint,
+                    // turning a legitimate re-lock into an unreadable database
+                    // error.
+                    discardedAt: null,
+                    discardedById: null,
+                    discardedReason: null,
+                    lockedAt,
+                    lockedById: user.id,
+                    exportHash: precheck.exportHash,
+                    timeZone,
+                    summaryCsvSnapshot: precheck.summaryCsv,
+                    detailCsvSnapshot: precheck.detailCsv,
+                },
+            });
+
+            // Everything this recompute reads — the company zone, the Gusto
+            // mappings, the period rows, the entries, the users — goes through
+            // `tx`, so it sees exactly the snapshot this transaction's locks are
+            // holding. It used to read the zone and the mappings on the GLOBAL
+            // client: two extra connections outside the transaction, free to
+            // pick up an edit the lock was specifically freezing, and free to
+            // block on a single-connection pool. `timeZone` is the value the row
+            // above was just written with, and loadGustoExport REFUSES if the
+            // zone it resolves under FOR SHARE disagrees — a zone change mid-lock
+            // rolls the lock back instead of freezing a period whose stored
+            // timeZone does not describe its own CSVs.
+            const confirmed = await loadGustoExport(periodStart, periodEnd, {
+                client: tx,
+                startKey: range.startKey,
+                endKey: range.endKey,
+                timeZone,
+            });
+            if (confirmed.blocking.length > 0) {
+                throw new Error(
+                    "Someone changed a time entry in this period while it was being locked. Nothing was locked - refresh and try again."
+                );
+            }
+            if (confirmed.exportHash !== precheck.exportHash) {
+                throw new Error(
+                    "The hours in this period changed while it was being locked. Nothing was locked - re-download the CSVs and try again."
+                );
+            }
+            // The lock binds to what a HUMAN reviewed, not merely to what was
+            // self-consistent across this request. If the page they clicked from
+            // was rendered before somebody edited an entry, both hashes above
+            // agree with each other and disagree with what was on screen.
+            if (confirmed.exportHash !== reviewedExportHash) {
+                throw new Error(
+                    "This period changed since the page you are looking at was loaded. Nothing was locked - refresh, check the numbers again, then lock."
+                );
+            }
+            return confirmed.exportHash;
+        });
+
+        revalidatePath("/manager/payroll-export");
+        revalidatePath("/manager/time-entries");
+        return { success: true as const, exportHash: committed };
+    } catch (error: any) {
+        return { success: false as const, error: error?.message || "Could not lock this period." };
+    }
+}
+
+/**
+ * Settle the WA meal deduction on every DEFERRED day in a period.
+ *
+ * This used to happen implicitly inside loadGustoExport, which meant a GET
+ * request and an ordinary page render mutated payroll rows. Now it is an
+ * explicit button: the export REFUSES a period with unsettled days, and a human
+ * decides when to settle them.
+ *
+ * Never settles today, never settles a day a worker is still punched into, and
+ * never settles a day inside a locked period.
+ */
+export async function settleDeferredDaysForPeriod(periodStartKey: string, periodEndKey: string) {
+    const settler = await requirePayrollAccess();
+    const { resolveCompanyTimeZone } = await import("./company-timezone");
+    const { startOfDateInTimeZone } = await import("./tz-date");
+    const { dayKeyInTimeZone } = await import("./tz-date");
+    const { validatePayrollRange, payrollLockEnvelope } = await import("./payroll-config");
+    const { planDeferredSettlements } = await import("./gusto-export-core");
+    const { lockedPeriodFor, loadLockedPeriods, isPeriodLockedError } = await import("./payroll-period");
+    const { settleDay } = await import("./wa-breaks-db");
+
+    const range = validatePayrollRange(periodStartKey, periodEndKey);
+    if (!range.ok) return { success: false as const, error: range.error };
+
+    // ONE zone for the whole operation: the window, the per-row day keys, the
+    // locked-day pre-check, and settlement itself.
+    //
+    // This used to be two. The window was built in the CONFIGURED zone while
+    // every day key came from toCompanyDayKey, hardcoded to
+    // America/Los_Angeles, because that is the zone settlement itself worked
+    // in. For a New York company an entry at 00:30 Monday is a Pacific SUNDAY:
+    // it was grouped under Sunday, settled under Sunday, and settlement then
+    // rewrote every OTHER row on that Pacific Sunday — including rows outside
+    // the period the operator asked to settle. The two zones agreed only for a
+    // Pacific company (round 7, finding 1).
+    //
+    // settleDay and its whole day-window filtering now take the zone as a
+    // REQUIRED parameter, so the agreement holds in every zone rather than in
+    // one, and there is no default left to fall back to silently.
+    const timeZone = await resolveCompanyTimeZone();
+    const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
+    const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
+    const dayKey = (instant: Date) => dayKeyInTimeZone(instant, timeZone);
+
+    // The SAME window readiness and locking use. Readiness blocks on a deferred
+    // day anywhere in the workweek envelope, so settling only the literal pay
+    // period left a blocker just outside a midweek or Sunday-start period that
+    // the button could never clear.
+    const envelope = payrollLockEnvelope(periodStart, periodEnd, timeZone);
+
+    const unsettled = await prisma.timeEntry.findMany({
+        where: {
+            startTime: { gte: envelope.start, lt: envelope.end },
+            mealOutcome: "DEFERRED",
+            endTime: { not: null },
+        },
+        select: { userId: true, startTime: true },
+    });
+    if (unsettled.length === 0) return { success: true as const, settled: 0, skipped: 0 };
+
+    const affectedUserIds = [...new Set(unsettled.map((row) => row.userId))];
+    // The SAME "still on the clock" test the export uses (isOpenEntry). A bare
+    // `endTime: null` counted every completed manual entry as an open punch, so
+    // this button skipped days the export was blocking on — a period that could
+    // never be cleared from either end.
+    const { isOpenEntry } = await import("./gusto-export-core");
+    const openCandidates = await prisma.timeEntry.findMany({
+        where: { endTime: null, userId: { in: affectedUserIds } },
+        select: { userId: true, startTime: true, endTime: true, durationHours: true },
+    });
+    const openRows = openCandidates.filter((row) => isOpenEntry(row));
+    const lockedPeriods = await loadLockedPeriods();
+
+    const plan = planDeferredSettlements({
+        unsettled: unsettled.map((row) => ({ userId: row.userId, dayKey: dayKey(row.startTime) })),
+        openPunchDayKeys: openRows.map((row) => `${row.userId}|${dayKey(row.startTime)}`),
+        todayKey: dayKey(new Date()),
+        // The SAME zone `key` was derived in, so this pre-check and the guard
+        // settleDay takes for itself (assertSettlementDayUnlocked) read the key
+        // as the same instant.
+        isDayLocked: (key) =>
+            !!lockedPeriodFor(lockedPeriods, startOfDateInTimeZone(key, timeZone), { timeZone }),
+    });
+
+    let settled = 0;
+    for (const item of plan) {
+        try {
+            // The operator's id travels INTO the per-day transaction: settleDay
+            // re-decides their payroll authority there, under the payroll lock,
+            // for every day (round 21, P1). This loop is long — one transaction
+            // per deferred day — so "authorized once, before the loop" was the
+            // widest version of the stale-authorization hole on this surface.
+            const result = await settleDay(item.userId, item.dayKey, null, timeZone, settler.id);
+            if (result >= 0) settled += 1;
+        } catch (error) {
+            // A day that became locked mid-run is skipped, not fatal — the
+            // remaining days are still worth settling. A REVOKED OPERATOR is
+            // not skippable: settleDay rethrows that, and it propagates out of
+            // this action exactly as the pre-check's refusal would have.
+            if (!isPeriodLockedError(error)) throw error;
+        }
+    }
+
+    const distinctDays = new Set(unsettled.map((row) => `${row.userId}|${dayKey(row.startTime)}`)).size;
+
+    revalidatePath("/manager/payroll-export");
+    revalidatePath("/manager/time-entries");
+    return {
+        success: true as const,
+        settled,
+        // Days deliberately left alone: still open, today, or inside a locked period.
+        skipped: distinctDays - settled,
+    };
+}
+
+/**
+ * ADMIN only — unlocking re-opens paid hours for editing, which is exactly the
+ * situation the lock exists to prevent, so it is not a manager-level action.
+ * Clears lockedAt but keeps the row and its exportHash: "this is what we
+ * exported" has to survive the unlock.
+ */
+/**
+ * Retire a period row created over the wrong range.
+ *
+ * Unlocking does not remove the row, and every overlap check refuses a range
+ * that touches an existing one — so a mistyped period used to be permanent:
+ * neither it nor any corrected range covering those days could be locked again.
+ * Discarding retires the row so the right range can be created.
+ *
+ * ADMIN only, reason required, UNLOCKED rows only. Locked hours have been
+ * exported and paid; retiring their row would take the freeze off them, which
+ * is why the database refuses it too (CHECK PayrollPeriod_discard_unlocked).
+ */
+export async function discardPayrollPeriod(periodStartKey: string, periodEndKey: string, reason: string) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Not authenticated");
+    if (user.role !== "ADMIN") throw new Error("Forbidden");
+
+    const trimmedReason = typeof reason === "string" ? reason.trim() : "";
+    if (trimmedReason.length < 5) {
+        return { success: false as const, error: "Say why this period is being discarded — it goes in the audit trail." };
+    }
+
+    const { validatePayrollRange } = await import("./payroll-config");
+    const range = validatePayrollRange(periodStartKey, periodEndKey);
+    if (!range.ok) return { success: false as const, error: range.error };
+
+    const discardedAt = new Date();
+    const result = await prisma.$transaction(async (tx) => {
+        // EXCLUSIVE payroll lock, first — the same one lockPayrollPeriod takes.
+        // Without it a lock creation racing this discard could set lockedAt on
+        // the row between the check below and the write, and the discard would
+        // retire a period that had just been locked.
+        const { acquirePayrollLockCreationLock } = await import("./payroll-period");
+        await acquirePayrollLockCreationLock(tx as never);
+
+        // TIER 2: the actor's own row, and the ADMIN check re-run on what it
+        // holds. The pre-check above read their role before this transaction
+        // opened and before it queued behind the exclusive payroll lock, so an
+        // admin demoted or disabled in that gap still retired a period (round
+        // 21, P1). requireAdmin because canActOnFinancials admits a MANAGER and
+        // this action does not.
+        const { requireFinancialActorInTx } = await import("./user-mutation-guard");
+        await requireFinancialActorInTx(tx as never, user.id, { requireAdmin: true });
+
+        // lockedAt IS NULL in the WHERE, not just checked beforehand: the guard
+        // and the write have to be the same statement.
+        const discarded = await tx.payrollPeriod.updateMany({
+            where: {
+                periodStartKey: range.startKey,
+                periodEndKey: range.endKey,
+                lockedAt: null,
+                discardedAt: null,
+            },
+            data: { discardedAt, discardedById: user.id, discardedReason: trimmedReason },
+        });
+        if (discarded.count === 0) return { ok: false as const };
+
+        await tx.auditLog.create({
+            data: {
+                entity: "PayrollPeriod",
+                entityId: `${range.startKey}..${range.endKey}`,
+                action: "discard",
+                actorId: user.id,
+                actorEmail: user.email ?? null,
+                snapshot: {
+                    periodStartKey: range.startKey,
+                    periodEndKey: range.endKey,
+                    reason: trimmedReason,
+                    discardedAt: discardedAt.toISOString(),
+                },
+            },
+        });
+        return { ok: true as const };
+    });
+
+    if (!result.ok) {
+        return {
+            success: false as const,
+            error: "There is no unlocked, un-discarded period for those dates. A locked period must be unlocked first.",
+        };
+    }
+
+    revalidatePath("/manager/payroll-export");
+    revalidatePath("/manager/time-entries");
+    return { success: true as const };
+}
+
+export async function unlockPayrollPeriod(
+    periodStartKey: string,
+    periodEndKey: string,
+    /**
+     * The lockedAt the CALLER was looking at, as an ISO string.
+     *
+     * Unlock is destructive — it drops the frozen CSV snapshots — and it used to
+     * match on the date range alone. So a stale page could unlock a period that
+     * had been unlocked and re-locked since, throwing away a DIFFERENT lock's
+     * snapshot than the one on screen, and a double-submit could unlock a fresh
+     * lock somebody had just taken. Comparing the lockedAt makes the button act
+     * on the lock it was rendered for, or on nothing.
+     */
+    expectedLockedAt: string
+) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Not authenticated");
+    if (user.role !== "ADMIN") throw new Error("Forbidden");
+
+    // The same shared validator the lock action and the export use.
+    const { validatePayrollRange } = await import("./payroll-config");
+    const { STALE_LOCK_CODE } = await import("./payroll-period");
+    const range = validatePayrollRange(periodStartKey, periodEndKey);
+    if (!range.ok) return { success: false as const, error: range.error };
+
+    const expected = typeof expectedLockedAt === "string" ? new Date(expectedLockedAt) : new Date(NaN);
+    if (Number.isNaN(expected.getTime())) {
+        return {
+            success: false as const,
+            code: STALE_LOCK_CODE,
+            error: "Refresh the page and try again — this unlock does not say which lock it is for.",
+        };
+    }
+
+    const unlocked = await prisma.$transaction(async (tx) => {
+        // The EXCLUSIVE payroll lock, the same one lockPayrollPeriod takes. It is
+        // what makes this compare-and-set meaningful: without it, a lock creation
+        // can commit between the read and the write, and the unlock would drop a
+        // snapshot the check never saw.
+        const { acquirePayrollLockCreationLock } = await import("./payroll-period");
+        await acquirePayrollLockCreationLock(tx as never);
+
+        // TIER 2, and the ADMIN check with it, on the row this transaction
+        // holds rather than on the pre-transaction read above. Unlock is the
+        // most destructive action on this surface — it drops the frozen CSV
+        // snapshots — and it was authorized against a role that could have
+        // changed while this transaction queued for the exclusive payroll lock
+        // (round 21, P1).
+        const { requireFinancialActorInTx } = await import("./user-mutation-guard");
+        await requireFinancialActorInTx(tx as never, user.id, { requireAdmin: true });
+
+        // Unlock deletes the snapshot: the period is editable again, so a frozen
+        // CSV would immediately stop describing it. The row and its exportHash
+        // stay as the record that this period WAS exported.
+        //
+        // Matched on the STABLE day keys. Reconstructing timestamps in today's
+        // zone missed the row entirely if the company zone had changed since the
+        // lock — zero rows updated, and the caller was still told it succeeded.
+        //
+        // `lockedAt: expected` IS the compare-and-set, and `not: null` makes an
+        // already-unlocked period fail it too rather than reporting success for
+        // a no-op.
+        return tx.payrollPeriod.updateMany({
+            where: {
+                periodStartKey: range.startKey,
+                periodEndKey: range.endKey,
+                lockedAt: expected,
+                NOT: { lockedAt: null },
+            },
+            data: { lockedAt: null, summaryCsvSnapshot: null, detailCsvSnapshot: null },
+        });
+    });
+
+    if (unlocked.count === 0) {
+        // One message for every miss. Distinguishing "no such period" from
+        // "somebody re-locked it" would require a second read that could itself
+        // be stale, and the action is the same either way: look again.
+        return {
+            success: false as const,
+            code: STALE_LOCK_CODE,
+            error: "That period is not locked the way this page shows it — somebody may have unlocked or re-locked it since. Nothing was changed; refresh and check before unlocking.",
+        };
+    }
+
+    revalidatePath("/manager/payroll-export");
+    revalidatePath("/manager/time-entries");
+    return { success: true as const };
 }
