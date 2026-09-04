@@ -125,23 +125,23 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     },
 
     // ---- server actions -----------------------------------------------------
-    "lib/actions.ts:3638::updateMany": {
+    "lib/actions.ts:3692::updateMany": {
         kind: "exempt",
         why: "createInvoiceFromTimeEntries's claim: stamps invoiceId/invoicedAt only inside the invoice-creation transaction. Same reasoning as lib/billing-core.ts's exemption below — it changes no hours, no cost and no readiness flag, and every payroll writer already refuses an entry once it is billed",
     },
-    "lib/actions.ts:15071::updateMany": {
+    "lib/actions.ts:15441::updateMany": {
         kind: "guarded",
         why: "markTimeEntryReviewed's reprice-and-stamp claim, wrapped in withPayrollWrite with a compare-and-set on updatedAt",
     },
-    "lib/actions.ts:15259::updateMany": {
+    "lib/actions.ts:15629::updateMany": {
         kind: "guarded",
         why: "the meal-skip decision, wrapped in withPayrollWrite — it changes what the day's settlement owes",
     },
-    "lib/actions.ts:15333::updateMany": {
+    "lib/actions.ts:15703::updateMany": {
         kind: "guarded",
         why: "logistics routing: restoring an entry to its prior project, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs",
     },
-    "lib/actions.ts:15346::updateMany": {
+    "lib/actions.ts:15716::updateMany": {
         kind: "guarded",
         why: "logistics routing: routing an entry to a new project, wrapped in withPayrollWrite for the same reason as the restore above",
     },
@@ -202,7 +202,7 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     },
 
     // ---- billing ------------------------------------------------------------
-    "lib/billing-core.ts:1370::updateMany": {
+    "lib/billing-core.ts:1469::updateMany": {
         kind: "exempt",
         why: "the invoice claim: stamps invoiceId/invoicedAt inside the billing transaction. It changes no hours, no cost and no readiness flag, and every payroll writer already refuses an entry once it is billed",
     },
