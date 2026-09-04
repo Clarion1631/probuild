@@ -63,8 +63,21 @@ const statements = [
   // and clearing them first guarantees the CREATE below can never fail mid-rebuild
   // (the statements are separate pooler calls — a failed CREATE after a committed
   // DROP would leave the table with NO reservation index).
+  //
+  // The `extracted` guard is NOT cosmetic. Invoice staging (the deposit sweep's
+  // payer-evidence path) is a money boundary that deliberately leaves
+  // settleStartedAt NULL: it marks itself by writing `stagedScheduleId` into the
+  // row's own `extracted` payload, because it has no column of its own. So a
+  // `failed` row that staged a QuickBooks invoice and then threw looks exactly
+  // like a legacy unmarked row to the clause above. Clearing ITS reservation
+  // would stop the next sweep entering reserved recovery: it would re-match the
+  // milestone and could create a SECOND QuickBooks invoice for the same money.
+  // Matched with LIKE rather than `extracted::jsonb ? 'stagedScheduleId'` because
+  // `extracted` is TEXT and the cast would throw on any row that is not valid
+  // JSON — this script must stay safe to re-run against whatever is in there.
   `UPDATE "DepositIngest" SET "paymentScheduleId" = NULL
-     WHERE "status" = 'failed' AND "settleStartedAt" IS NULL AND "paymentScheduleId" IS NOT NULL`,
+     WHERE "status" = 'failed' AND "settleStartedAt" IS NULL AND "paymentScheduleId" IS NOT NULL
+       AND "extracted" NOT LIKE '%"stagedScheduleId"%'`,
   `DROP INDEX IF EXISTS "DepositIngest_paymentScheduleId_reservation_key"`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "DepositIngest_paymentScheduleId_reservation_key"
      ON "DepositIngest" ("paymentScheduleId")

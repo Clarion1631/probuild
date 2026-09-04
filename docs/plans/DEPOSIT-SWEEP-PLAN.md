@@ -132,6 +132,41 @@ VISUAL (deployed preview, screenshot-verifiable):
    Live auto-apply vs suggest-only. Codex's stance: "amount-only, no payer evidence should never live auto-apply", and after round 2 Codex still recommends suggest-only for payer-less credits. But branch deposits never carry a payer (`docs/WTB-CHECK-IMAGES.md:50-58`), so that rule means suggest-only forever for nearly every check. The plan's position: the union rule, the cross-source claim check, and the 2-day wait NARROW the race to one residual (two sources claiming the same amount inside 14 days with no row yet written by either); they do not close it. The plan recommends live auto-apply after the shadow week; Justin decides after seeing the shadow week's numbers, including how often same-amount claims occurred.
 3. `DepositToAccountRef` = the WTB bank account (QBO Id 154) directly, vs Undeposited Funds per `docs/DEPOSIT-PIPELINE.md:48`. Recommended: the bank account. All three Hoppe payments used it, and Vanessa matches the feed line to the payment, not to a deposit batch.
 
+## Amendment 2026-09-03 (Justin): payer evidence admits unrequested milestones
+
+**DECIDED 2026-09-03 (Justin).** Key finding 2 above says candidates require `qbInvoiceSentAt`. That is right when nothing else names the payer, and wrong for the case that actually happens: customers pay milestones BEFORE the office sends the request. Christensen paid $25,000 by cashier's check on 2026-08-24 (bank ref 26236015002403, a `BankImage` row naming "SANDI CHRISTENSEN") against "Upon arrival Construction Start", a milestone with `qbInvoiceSentAt = null` AND `qbInvoiceId = null`. Mesplay did the same for $24,000 (8/28) and $16,500 (8/13). Under the requested-only rule all of them land `unmatched`.
+
+Two changes, both in `src/app/api/payments/deposit-ingest/route.ts`:
+
+1. **Payer evidence opens a second candidate set.** The `BankImage` lookup and `selectPayerBearingImage` now run BEFORE the candidate queries (an image conflict is still an immediate human hand-off). When exactly one image names a payer, `matchAndApplyBank` builds `payerScoped` alongside the requested set: `PaymentSchedule` Pending, invoice in `OPEN_INVOICE_STATUSES`, exact amount, invoice client agreeing with the payer via `namesAgree`, and the invoice already in existence when the money arrived (`issueDate ?? createdAt <= requestedBy` — the chronology guard `qbInvoiceSentAt` provided for the requested set). No `qbInvoiceSentAt` requirement. Candidates are the union of the two sets, deduped by id; the 14-day Paid union and the "exactly one, and Pending" uniqueness rule are unchanged, so two payer-scoped milestones at one amount still go to a human.
+
+2. **A payer-corroborated milestone with no QBO invoice gets one staged.** When the picked milestone has `qbInvoiceId = null` and the attribution carries payer corroboration (`verified`/`recorded`), the sweep reserves the milestone, calls `pushMilestoneToQuickBooks`, reloads it and applies the payment against the new invoice. `createQBMilestoneInvoice` only POSTs `/invoice`, so nothing is emailed to the customer. The dry-run and 2-day-wait hold-backs still come FIRST, so a shadow run creates nothing (its `proposed` note says it would create the invoice and apply). Without payer corroboration the old "no QuickBooks invoice link — record this one by hand" answer stands.
+
+### Invoice staging is a money boundary, and is treated as one
+
+Creating that invoice is an external write with no column of its own (this amendment ships no schema change), so the marker rides in the row's existing `extracted` payload: `stageInvoicePush` writes `{stagedScheduleId, stagedAt}` under a CAS on (`id`, status `processing`, this reservation) BEFORE the network call; zero rows means the row was re-classified mid-flight and the sweep stops before QuickBooks is touched. `stagedScheduleIdOf` is the only reader, and `crossedAnyBoundary` — the single definition every exhaustion and stale-reclaim path uses, both sources — counts it alongside `qbPaymentId` / `qbRequestPayload` / `settleStartedAt`. Consequences, each with tests:
+
+- a staged row's stale reclaim keeps its reservation AND its preserved payload, and resumes through the reserved branch: it applies with no second push once `qbInvoiceId` is set, and when it is NOT set the sweep never re-pushes (`pushMilestoneToQuickBooks` is idempotent only once the link exists; a crash between the QBO create and its link write leaves no link, so a retry would duplicate the invoice) — it reconciles, reservation retained, telling the human to check QuickBooks;
+- a push that THROWS is an unknown outcome: it falls to the outer catch as `failed`, consuming an attempt, and `recordAttemptFailure` keeps the reservation while the marker is set;
+- a push that RETURNS without a link reconciles, reservation retained (`unmatched` sits outside the partial reservation index, so it would hand the milestone to the next deposit that wanted it);
+- a deterministic payment guard (`invoice-not-found` / `missing-customer` / `balance-mismatch`) AFTER the invoice was staged also reconciles with the reservation, naming the guard and the invoice — the same reasoning. An unstaged row keeps the old `unmatched` answer, which is still correct: nothing was created;
+- retry exhaustion never passes `nullReservation: true` for a staged row;
+- **a collision found after staging STOPS the worker.** Only a PAYMENT boundary is too late to call back. A row whose sole boundary is the staging marker still has its payment ahead of it, so `persistCollisionVerdict` moves it atomically to `reconcile` — reservation RETAINED, boundary-aware reason, review task filed — via a CAS on (`id`, status `processing`, `extracted` as read). `applyQboLinked`'s own `status: "processing"` CAS then finds nothing and the worker stops before any payment. Leaving such a row `processing` let the staging worker pay out a credit the batch had just ruled ambiguous.
+
+Net effect on the case that prompted this: the Christensen credit books once the check image is filed.
+
+### DEFERRED to a schema-backed follow-up: re-evaluating `unmatched` bank rows
+
+An earlier cut of this amendment also made an `unmatched` BANK row reclaimable, so that a credit which could not be matched today would heal on the next daily POST once its invoice was sent or its check image arrived. **That half is not in this PR** (Justin, 2026-09-03, after three review rounds converged on the same conclusion). Every attempt to make it safe ran into the same wall: the sweep and a human can both be working one deposit, and the only shared state to contend on was `OfficeTask.status` — a legacy display column with no ownership semantics. A claim written there loses to any ordinary edit (title, notes, due date) that leaves the pinned fields untouched, and a stale claim resurrected by a human's own write blocks them for another TTL. Reviews also found that `failed` retries never re-acquire the claim, and that applied-row task healing archives tasks a human already took.
+
+The follow-up ships the schema those problems actually need:
+
+- an OfficeTask **claim column** (owner + claimed-at, or a version counter) so ownership is a first-class field every mutation contends on, rather than a sentinel squatting in a display string;
+- an **`invoice_staging` status** for `DepositIngest`, which requires changing the partial unique index's predicate (`scripts/apply-deposit-ingest-schema.mjs` hard-codes six status literals; a seventh value would put the row OUTSIDE the index and leave the milestone unprotected for the whole invoice-create window) — an apply script plus a matching migration, run against prod before merge;
+- with those in place, `unmatched` re-evaluation, its task ownership protocol (claim, re-assert before each money boundary, release on a no-money outcome, re-acquire for `failed` retries), and real cross-process Postgres contention tests.
+
+Until then an `unmatched` bank row stays terminal exactly as it is on `main`: a human works it, and `?force=1` is the escape hatch.
+
 ## Out of scope
 
 Worklist UI (Phase C), Lowe's/Amazon receipt sourcing, a QBO register cron for money out, the photo path's matching rules (only a pre-reserve claim check and a zero-match message are added), and making the weekly image job daily.

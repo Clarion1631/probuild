@@ -27,6 +27,8 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
     BANK_APPLY_MIN_AGE_DAYS,
@@ -234,6 +236,19 @@ const fakePrisma: Row = {
             callLog.push("CLAIM_QUERY");
             return tables.depositIngest.findFirst(args);
         },
+        updateMany: async (args: { where: Row; data: Row }) => {
+            onDepositUpdateMany?.(args.where);
+            return tables.depositIngest.updateMany(args);
+        },
+        // Detached copy, like real Prisma. The in-memory table hands back the
+        // live object, which would let a caller's snapshot silently track a
+        // concurrent write — and hide every read-then-CAS race.
+        findUnique: async (args: { where: Row }) => {
+            const found = await tables.depositIngest.findUnique(args);
+            const snapshot = found ? { ...found } : null;
+            onDepositRead?.(found);
+            return snapshot;
+        },
     }),
     bankImage: {
         findMany: async (args: Row) => {
@@ -282,13 +297,33 @@ const calls = {
     sendQBPaymentCreateRequest: [] as Row[],
     settleMilestoneFromQBPayment: [] as Row[],
     recordPaymentCore: [] as Row[],
+    pushMilestoneToQuickBooks: [] as Row[],
 };
+
+/** Milestones whose staging push must fail (the "could not create" branch). */
+let pushFailsFor = new Set<string>();
+/** Fires inside the fake getFreshQBTokens — see the money-write mocks below. */
+let onFreshTokens: (() => void) | null = null;
+/** Milestones whose staging push RETURNS but leaves no qbInvoiceId behind. */
+let pushLeavesNoLink = new Set<string>();
+/** Fires just after the staging marker is written, before the QBO create —
+ *  the window a concurrent collision cancel would have to win. */
+let onStagedPush: (() => void) | null = null;
+/** Fires before every depositIngest.updateMany, so a test can move the row
+ *  out from under a CAS. */
+let onDepositUpdateMany: ((where: Row) => void) | null = null;
+/** Fires after a DepositIngest read, so a test can land a concurrent write in
+ *  the gap between that read and the CAS which pins what it saw. */
+let onDepositRead: ((row: Row | null) => void) | null = null;
+/** When set, buildQBPaymentRequest rejects with this deterministic guard. */
+let qboGuardReason: string | null = null;
 
 let qboBalanceByInvoice = new Map<string, number>();
 
 const fakeQuickbooks = {
     buildQBPaymentRequest: async (_tokens: unknown, qbInvoiceId: string, opts: Row) => {
         calls.buildQBPaymentRequest.push({ qbInvoiceId, ...opts });
+        if (qboGuardReason) return { ok: false, reason: qboGuardReason };
         const balance = qboBalanceByInvoice.get(qbInvoiceId);
         if (balance != null && Math.round(balance * 100) !== Math.round(opts.amount * 100)) {
             return { ok: false, reason: "balance-mismatch", qbBalance: balance, expected: opts.amount };
@@ -302,7 +337,28 @@ const fakeQuickbooks = {
 };
 
 const fakeQuickbooksPayments = {
-    getFreshQBTokens: async () => ({ accessToken: "t", refreshToken: "r", realmId: "realm" }),
+    getFreshQBTokens: async () => {
+        // The one interception point BETWEEN the reservation and the invoice
+        // staging CAS, so a test can simulate the row being re-classified
+        // mid-flight (the batch preflight cancelling it).
+        onFreshTokens?.();
+        return { accessToken: "t", refreshToken: "r", realmId: "realm" };
+    },
+    /** The real one creates a QBO invoice and writes qbInvoiceId back onto the
+     *  milestone; that write is what the route reloads to find. */
+    pushMilestoneToQuickBooks: async (paymentScheduleId: string, tokens: Row) => {
+        calls.pushMilestoneToQuickBooks.push({ paymentScheduleId, tokens });
+        // By now the staging marker IS written — this is the window a
+        // concurrent collision cancel would have to win.
+        onStagedPush?.();
+        if (pushFailsFor.has(paymentScheduleId)) throw new Error("QB milestone invoice create failed: 500");
+        const schedule = tables.paymentSchedule.rows.find(r => r.id === paymentScheduleId);
+        const qbInvoiceId = `qb-inv-staged-${calls.pushMilestoneToQuickBooks.length}`;
+        // pushLeavesNoLink: the QBO create landed but no link was saved (a
+        // crash, or the compensating-delete path) — the function still RETURNS.
+        if (schedule && !pushLeavesNoLink.has(paymentScheduleId)) schedule.qbInvoiceId = qbInvoiceId;
+        return { qbInvoiceId, payLink: null, qbTotal: undefined };
+    },
     settleMilestoneFromQBPayment: async (input: Row) => {
         calls.settleMilestoneFromQBPayment.push(input);
         const schedule = tables.paymentSchedule.rows.find(r => r.id === input.paymentScheduleId);
@@ -399,6 +455,8 @@ function seedMilestone(opts: {
     invoiceStatus?: string;
     name?: string;
     paymentDate?: Date | null;
+    /** The invoice's own date, for the payer-scoped chronology guard. */
+    invoiceIssueDate?: Date | null;
 }) {
     scheduleSeq += 1;
     const id = `sched-${scheduleSeq}`;
@@ -423,6 +481,12 @@ function seedMilestone(opts: {
             projectId: opts.projectId ?? "project-1",
             code: opts.invoiceCode ?? `INV-${scheduleSeq}`,
             status: opts.invoiceStatus ?? "Issued",
+            // Issued well before the credit posts — the realistic order, and
+            // what the payer-scoped chronology guard requires.
+            issueDate: opts.invoiceIssueDate === undefined
+                ? new Date(TODAY.getTime() - 45 * 86_400_000)
+                : opts.invoiceIssueDate,
+            createdAt: new Date(TODAY.getTime() - 60 * 86_400_000),
             project: { id: opts.projectId ?? "project-1", name: opts.projectName ?? "Hoppe Hall Bath" },
             client: { name: opts.clientName ?? "Hoppe" },
         },
@@ -475,6 +539,13 @@ beforeEach(() => {
     callLog.length = 0;
     for (const key of Object.keys(calls) as Array<keyof typeof calls>) calls[key] = [];
     qboBalanceByInvoice = new Map();
+    pushFailsFor = new Set();
+    pushLeavesNoLink = new Set();
+    onFreshTokens = null;
+    onStagedPush = null;
+    onDepositUpdateMany = null;
+    onDepositRead = null;
+    qboGuardReason = null;
     scheduleSeq = 0;
     tables.officeBoardColumn.rows.push({ id: "col-1", name: "To Do", position: 0, createdAt: new Date() });
     process.env.DEPOSIT_INGEST_SECRET = SECRET;
@@ -2129,6 +2200,10 @@ test("B1: a COLLISION that cannot file its task is unresolved too, not a quiet u
     await t.test("a replay that still cannot file the task keeps saying so", async () => {
         // The daily re-POST used to answer a clean `unmatched` forever for a
         // review nobody could see.
+        // Two milestones at the amount, so the daily re-evaluation reaches the
+        // same ambiguous verdict the row already carries — the point here is
+        // the invisible task, not the match.
+        seedMilestone({ amount: 9292.92 });
         seedMilestone({ amount: 9292.92 });
         tables.depositIngest.rows.push({
             id: "row-taskless", fileId: bankFileId("REF-TASKLESS"), status: "unmatched", source: BANK_DEPOSIT_SOURCE,
@@ -2431,4 +2506,607 @@ test("the batch response carries the counts the Bot Health line is built from", 
         credits: 3, applied: 1, proposed: 0, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0,
     });
     assert.equal(body.ok, true, "two credits sent to a human is still a clean batch");
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. Payer evidence admits an UNREQUESTED milestone
+//    (amendment 2026-09-03, Justin — the Christensen case: customers pay
+//    before the office sends the request)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** The real shape: a $25,000 cashier's check, bank ref 26236015002403, with a
+ *  filed image naming SANDI CHRISTENSEN, against a milestone nobody sent. */
+function seedChristensen(opts: { image?: string | null; amount?: number; ref?: string } = {}) {
+    const amount = opts.amount ?? 25000;
+    const ref = opts.ref ?? "26236015002403";
+    const milestone = seedMilestone({
+        amount,
+        requested: false,
+        qbInvoiceId: null,
+        projectName: "Christensen Remodel",
+        clientName: "Sandi Christensen",
+        invoiceCode: "INV-CHRIS",
+        name: "Upon arrival Construction Start",
+    });
+    if (opts.image !== null) {
+        tables.bankImage.rows.push({
+            id: `img-${ref}`, source: "WTB_ONLINE", sourceExternalId: `${ref}:front`, kind: "CHECK_FRONT",
+            payerName: opts.image ?? "SANDI CHRISTENSEN", memoText: null, normalizedCheckNumber: "1027",
+            amountCents: Math.round(amount * 100), documentDate: utc(SETTLED_DAY),
+        });
+    }
+    return { milestone, ref, amount };
+}
+
+test("payer evidence admits an UNSENT milestone: the QBO invoice is staged, then the payment applied", async () => {
+    const { milestone, ref, amount } = seedChristensen();
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+    assert.equal(result.scheduleId, milestone);
+
+    // The invoice the office never sent is created exactly once, with the
+    // tokens the route already holds.
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 1);
+    assert.equal(calls.pushMilestoneToQuickBooks[0].paymentScheduleId, milestone);
+    assert.equal(calls.pushMilestoneToQuickBooks[0].tokens.realmId, "realm");
+
+    // …and the payment is built against THAT id, not the null the candidate
+    // was read with.
+    const staged = tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId;
+    assert.ok(staged, "the push must leave a qbInvoiceId behind");
+    assert.equal(calls.buildQBPaymentRequest.length, 1);
+    assert.equal(calls.buildQBPaymentRequest[0].qbInvoiceId, staged);
+
+    // Bank-row money options, unchanged by the new path.
+    assert.equal(calls.buildQBPaymentRequest[0].depositToAccountId, BANK_DEPOSIT_TO_ACCOUNT_ID);
+    assert.equal(calls.buildQBPaymentRequest[0].depositToAccountId, "154");
+    assert.equal(calls.settleMilestoneFromQBPayment[0].suppressClientReceipt, true);
+});
+
+test("no payer image: an unsent milestone is still not a candidate", async () => {
+    const { ref, amount } = seedChristensen({ image: null });
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "unmatched");
+    assert.match(String(result.reason), /no requested pending milestone matches/);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    assert.equal(calls.buildQBPaymentRequest.length, 0);
+});
+
+test("a payer image naming a DIFFERENT customer does not admit the unsent milestone", async () => {
+    const { milestone, ref, amount } = seedChristensen({ image: "Sandi Mesplay" });
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "unmatched", "a check from another family must never open a milestone up");
+    assert.match(String(result.reason), /no requested pending milestone matches/);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+});
+
+test("a dry run stages nothing — no QuickBooks invoice is created", async () => {
+    const { milestone, ref, amount } = seedChristensen();
+
+    const { body } = await post(bankBatch([{ ref, amount }], { dryRun: true }));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "proposed");
+    assert.match(String(result.reason), /would create the QuickBooks invoice/);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "a dry run must never create an invoice");
+    assert.equal(calls.buildQBPaymentRequest.length, 0);
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId, null);
+});
+
+test("two unsent milestones for the same payer at one amount is ambiguous, not a guess", async () => {
+    const { ref, amount } = seedChristensen();
+    seedMilestone({
+        amount, requested: false, qbInvoiceId: null,
+        projectName: "Christensen Remodel", clientName: "Sandi Christensen",
+        invoiceCode: "INV-CHRIS-2", name: "Upon rough-in",
+    });
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "unmatched");
+    assert.match(String(result.reason), /matches 2 milestones/);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    assert.equal(calls.buildQBPaymentRequest.length, 0);
+});
+
+test("C3: a failed invoice push consumes an attempt and never becomes a daily retry", async () => {
+    const { milestone, ref, amount } = seedChristensen();
+    pushFailsFor.add(milestone);
+
+    // A push that throws is an UNKNOWN outcome (the invoice may exist), so it
+    // is a `failed` attempt, not an `unmatched` question the sweep re-asks
+    // for free every day.
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "failed", `expected failed, got ${result.status}: ${result.reason}`);
+    assert.match(String(result.reason), /QB milestone invoice create failed/);
+    assert.equal(calls.buildQBPaymentRequest.length, 0, "no payment is built against an invoice that may not exist");
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+
+    const row = depositRow(ref)!;
+    assert.equal(row.attempts, 1, "the attempt budget is charged");
+    assert.equal(row.paymentScheduleId, milestone, "the reservation survives the staged boundary");
+    assert.ok(JSON.parse(row.extracted).stagedScheduleId, "…and so does the staging marker");
+
+    // The retry resumes through the RESERVED branch and refuses to push again:
+    // a crash between the QBO create and its link write leaves no link, so a
+    // second push would make a second invoice.
+    const replay = await post(bankBatch([{ ref, amount }]));
+    const after = creditResult(replay.body, ref);
+    assert.equal(after.status, "reconcile", `expected reconcile, got ${after.status}: ${after.reason}`);
+    assert.match(String(after.reason), /may have been created .* but the link was not saved/);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 1, "the sweep never pushes an unlinked milestone twice");
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+    assert.equal(depositRow(ref)!.paymentScheduleId, milestone, "reconcile keeps the reservation for the human");
+});
+
+test("C2: the invoice-staging boundary is durable across a crash", async t => {
+    /** A row mid-staging: reserved, marker written, lease long stale. */
+    const seedStagedRow = (ref: string, milestone: string, amount: number, extra: Row = {}) => {
+        tables.depositIngest.rows.push({
+            id: `staged-${ref}`, fileId: bankFileId(ref), status: "processing", source: BANK_DEPOSIT_SOURCE,
+            bankReference: ref, attempts: 1, amountCents: Math.round(amount * 100), postDate: utc(SETTLED_DAY),
+            paymentScheduleId: milestone,
+            extracted: JSON.stringify({
+                source: "bank", bankReference: ref, postDate: SETTLED_DAY, amountCents: Math.round(amount * 100),
+                fileId: bankFileId(ref), projectName: "", amount, fileUrl: null, fileName: `bank ref ${ref}`,
+                payerName: null, checkDate: SETTLED_DAY, checkNumber: ref, memo: "DEPOSIT - DDA/MMKT",
+                baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT",
+                customerReference: null, stagedScheduleId: milestone, stagedAt: new Date().toISOString(),
+            }),
+            processingStartedAt: new Date(Date.now() - 60 * 60_000), updatedAt: new Date(), ...extra,
+        });
+    };
+
+    await t.test("crashed after the marker, before the link: a human is asked, never a second push", async () => {
+        const { milestone } = seedChristensen({ ref: "REF-STAGE-A", amount: 25000 });
+        seedStagedRow("REF-STAGE-A", milestone, 25000);
+
+        const { body } = await post(bankBatch([{ ref: "REF-STAGE-A", amount: 25000 }]));
+        const result = creditResult(body, "REF-STAGE-A");
+        assert.equal(result.status, "reconcile", `expected reconcile, got ${result.status}: ${result.reason}`);
+        assert.match(String(result.reason), /may have been created .* but the link was not saved/);
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "the create is never re-issued blind");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+        assert.equal(depositRow("REF-STAGE-A")!.paymentScheduleId, milestone);
+    });
+
+    await t.test("crashed after qbInvoiceId was persisted: it applies, with no second push", async () => {
+        const { milestone } = seedChristensen({ ref: "REF-STAGE-B", amount: 25000 });
+        // The push DID land and its link write committed; the crash came before
+        // qbRequestPayload was persisted.
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId = "qb-inv-staged-crash";
+        seedStagedRow("REF-STAGE-B", milestone, 25000);
+
+        const { body } = await post(bankBatch([{ ref: "REF-STAGE-B", amount: 25000 }]));
+        const result = creditResult(body, "REF-STAGE-B");
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "an already-linked milestone is never pushed again");
+        assert.equal(calls.buildQBPaymentRequest.length, 1);
+        assert.equal(calls.buildQBPaymentRequest[0].qbInvoiceId, "qb-inv-staged-crash");
+        // It RESUMED the reservation rather than re-matching: a reserved resume
+        // runs no candidate query at all, so the milestone cannot be redirected
+        // by evidence that changed while the row was down.
+        assert.equal(queries.paymentSchedule.length, 0, "a staged row must never re-match");
+        assert.equal(depositRow("REF-STAGE-B")!.paymentScheduleId, milestone);
+    });
+
+    await t.test("a stale reclaim of a staged row keeps its reservation and its payload", async () => {
+        const { milestone } = seedChristensen({ ref: "REF-STAGE-C", amount: 25000 });
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId = "qb-inv-staged-keep";
+        seedStagedRow("REF-STAGE-C", milestone, 25000);
+        const extractedBefore = depositRow("REF-STAGE-C")!.extracted;
+
+        await post(bankBatch([{ ref: "REF-STAGE-C", amount: 25000 }]));
+        const row = depositRow("REF-STAGE-C")!;
+        assert.equal(row.paymentScheduleId, milestone, "the stale reclaim must not release the staged milestone");
+        assert.ok(JSON.parse(extractedBefore).stagedScheduleId);
+        assert.equal(
+            JSON.parse(row.extracted).stagedScheduleId, milestone,
+            "…nor overwrite the preserved payload with a freshly-built one",
+        );
+    });
+});
+
+test("payer-scoped chronology: an invoice raised AFTER the deposit is not a candidate", async t => {
+    await t.test("raised two days after the money arrived", async () => {
+        const milestone = seedMilestone({
+            amount: 25000, requested: false, qbInvoiceId: null,
+            projectName: "Christensen Remodel", clientName: "Sandi Christensen",
+            name: "Upon arrival Construction Start",
+            invoiceIssueDate: utc(isoDaysAgo(1)),
+        });
+        // …and created then too: this invoice did not exist when the money came in.
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.invoice.createdAt = utc(isoDaysAgo(1));
+        tables.bankImage.rows.push({
+            id: "img-late-invoice", source: "WTB_ONLINE", sourceExternalId: "REF-LATE-INV:front", kind: "CHECK_FRONT",
+            payerName: "SANDI CHRISTENSEN", memoText: null, normalizedCheckNumber: "1027",
+            amountCents: 2_500_000, documentDate: utc(SETTLED_DAY),
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-LATE-INV", amount: 25000 }]));
+        const result = creditResult(body, "REF-LATE-INV");
+        assert.equal(result.status, "unmatched");
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+    });
+
+    await t.test("the same invoice, raised before the deposit, applies", async () => {
+        const { milestone, ref, amount } = seedChristensen({ ref: "REF-EARLY-INV" });
+
+        const { body } = await post(bankBatch([{ ref, amount }]));
+        const result = creditResult(body, ref);
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+    });
+});
+
+test("C2: staging stops dead if the row was re-classified after the reservation", async () => {
+    // The batch preflight can cancel a row (a collision found on a later
+    // credit) while this one is mid-flight. The staging CAS is the same lock
+    // from the other end as applyQboLinked's: whichever lands first, the other
+    // sees zero rows and stops BEFORE QuickBooks is touched.
+    const { milestone, ref, amount } = seedChristensen({ ref: "REF-STAGE-CANCELLED" });
+    onFreshTokens = () => {
+        const row = tables.depositIngest.rows.find(r => r.fileId === bankFileId("REF-STAGE-CANCELLED"))!;
+        row.status = "unmatched";
+        row.lastError = "cancelled by the preflight";
+    };
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "unmatched");
+    assert.equal(result.reason, "cancelled by the preflight", "the cancelled row's own verdict is what is reported");
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "no invoice is created for a deposit we no longer own");
+    assert.equal(calls.buildQBPaymentRequest.length, 0);
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId, null);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. Codex round 2: staging arbitration, exhaustion, promotion, task safety
+// ═════════════════════════════════════════════════════════════════════════════
+
+
+/** A row mid-staging: reserved, marker written, lease long stale. */
+function seedStagedRow(ref: string, milestone: string, amount: number, extra: Row = {}) {
+    tables.depositIngest.rows.push({
+        id: `staged-${ref}`, fileId: bankFileId(ref), status: "processing", source: BANK_DEPOSIT_SOURCE,
+        bankReference: ref, attempts: 1, amountCents: Math.round(amount * 100), postDate: utc(SETTLED_DAY),
+        paymentScheduleId: milestone,
+        extracted: JSON.stringify({
+            source: "bank", bankReference: ref, postDate: SETTLED_DAY, amountCents: Math.round(amount * 100),
+            fileId: bankFileId(ref), projectName: "", amount, fileUrl: null, fileName: `bank ref ${ref}`,
+            payerName: null, checkDate: SETTLED_DAY, checkNumber: ref, memo: "DEPOSIT - DDA/MMKT",
+            baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT",
+            customerReference: null, stagedScheduleId: milestone, stagedAt: new Date().toISOString(),
+        }),
+        processingStartedAt: new Date(Date.now() - 60 * 60_000), updatedAt: new Date(), ...extra,
+    });
+}
+
+test("R2-F1: staging and the collision cancel are the same lock from opposite ends", async t => {
+    await t.test("staging lands between the preflight's read and its write: the cancel misses", async () => {
+        // The genuinely concurrent order, driven through the route's OWN
+        // cancel: persistCollisionVerdict reads the row, a worker stages an
+        // invoice against it in that gap, and the cancel write must then find
+        // nothing. Its CAS pins the `extracted` it read, and the staging write
+        // is the only thing that moves it.
+        const milestone = seedMilestone({ amount: 7373.73 });
+        const ref = "REF-LOCK-STAGE";
+        tables.depositIngest.rows.push({
+            id: "lock-stage", fileId: bankFileId(ref), status: "processing", source: BANK_DEPOSIT_SOURCE,
+            bankReference: ref, attempts: 1, amountCents: 737_373, postDate: utc(SETTLED_DAY),
+            paymentScheduleId: milestone,
+            extracted: JSON.stringify({ fileId: bankFileId(ref), amount: 7373.73 }),
+            processingStartedAt: new Date(), updatedAt: new Date(),
+        });
+
+        // One shot, in the gap after the preflight has read the row.
+        onDepositRead = live => {
+            if (!live || live.id !== "lock-stage") return;
+            onDepositRead = null;
+            live.extracted = JSON.stringify({
+                fileId: bankFileId(ref), amount: 7373.73,
+                stagedScheduleId: milestone, stagedAt: new Date().toISOString(),
+            });
+        };
+
+        // A second credit at the same amount makes this day a collision, which
+        // is what puts the cancel in front of the staged row at all.
+        const { body } = await post(bankBatch([
+            { ref, amount: 7373.73 },
+            { ref: "REF-LOCK-OTHER", amount: 7373.73 },
+        ]));
+
+        const row = depositRow(ref)!;
+        assert.notEqual(row.status, "unmatched", "the cancel must not land on a row that staged an invoice");
+        assert.equal(row.paymentScheduleId, milestone, "…nor take its milestone away");
+        // …and the missed cancel must not just SHRUG. Reporting "past-boundary"
+        // and leaving the row `processing` was the P0: the worker that staged
+        // the invoice would go on to win applyQboLinked's CAS and pay out a
+        // credit this very batch had proven ambiguous.
+        assert.equal(row.status, "reconcile", "a staged row the cancel missed must still be STOPPED");
+        assert.match(String(row.lastError), /already created a QuickBooks invoice for milestone/);
+        assert.ok(row.officeTaskId, "and a human is asked");
+        assert.equal(creditResult(body, ref).status, "reconcile");
+        assert.equal(body.ok, false, "the runner must fail on it");
+
+        // The staging worker now CONTINUES from where it was. Its next step is
+        // applyQboLinked, whose processing→qbo_unknown CAS is the money
+        // boundary — and it must find nothing.
+        const claimed = await tables.depositIngest.updateMany({
+            where: { id: "lock-stage", status: "processing" },
+            data: { status: "qbo_unknown", qbRequestPayload: '{"TotalAmt":7373.73}' },
+        });
+        assert.equal(claimed.count, 0, "the worker's money-boundary CAS must find nothing");
+        assert.equal(calls.buildQBPaymentRequest.length, 0, "no payment request is built");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "and none is sent");
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+    });
+
+    await t.test("cancel first: staging stops, and no invoice is created at all", async () => {
+        const { milestone, ref, amount } = seedChristensen({ ref: "REF-LOCK-CANCEL" });
+        onFreshTokens = () => {
+            const row = tables.depositIngest.rows.find(r => r.fileId === bankFileId(ref))!;
+            row.status = "unmatched";
+            row.paymentScheduleId = null;
+            row.lastError = "cancelled by the collision preflight";
+        };
+
+        const { body } = await post(bankBatch([{ ref, amount }]));
+        assert.equal(creditResult(body, ref).status, "unmatched");
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId, null);
+    });
+
+    await t.test("a collision found after staging STOPS the worker, holding the milestone", async () => {
+        // Two credits on the same day at the same amount is a collision. A
+        // staged row cannot simply be set aside (a QuickBooks invoice may exist
+        // against its milestone) — but its PAYMENT is still ahead of it, so it
+        // must be stopped rather than waved through. Leaving it `processing`
+        // let the staging worker walk past applyQboLinked's CAS and pay out a
+        // credit the batch had just ruled ambiguous.
+        const { milestone } = seedChristensen({ ref: "REF-PRE-STAGED", amount: 25000 });
+        seedStagedRow("REF-PRE-STAGED", milestone, 25000);
+
+        const { body } = await post(bankBatch([
+            { ref: "REF-PRE-STAGED", amount: 25000 },
+            { ref: "REF-PRE-OTHER", amount: 25000 },
+        ]));
+        const staged = depositRow("REF-PRE-STAGED")!;
+        assert.equal(staged.status, "reconcile", "a staged row is stopped, not cancelled and not left running");
+        assert.equal(staged.paymentScheduleId, milestone, "…and it keeps the milestone a QBO invoice may point at");
+        assert.match(String(staged.lastError), /already created a QuickBooks invoice for milestone/);
+        assert.match(String(staged.lastError), /check QuickBooks before recording anything/);
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "an ambiguous credit must never reach a payment");
+        assert.equal(calls.buildQBPaymentRequest.length, 0);
+        assert.ok(staged.officeTaskId, "a human is asked");
+        // Its twin is escalated rather than quietly filed: a QuickBooks invoice
+        // may exist for money the preflight cannot untangle.
+        assert.equal(creditResult(body, "REF-PRE-OTHER").status, "reconcile");
+        assert.equal(body.ok, false, "the runner must fail on it");
+    });
+
+    await t.test("the worker's own CAS then refuses to pay, even mid-flight", async () => {
+        // The same race from the worker's side: the collision verdict lands
+        // while this credit is between its invoice create and its payment. The
+        // status moved to `reconcile`, so applyQboLinked's `status: "processing"`
+        // CAS finds nothing and stops BEFORE QuickBooks is asked for a payment.
+        const { milestone, ref, amount } = seedChristensen({ ref: "REF-CANCEL-MIDFLIGHT" });
+        onStagedPush = () => {
+            const row = tables.depositIngest.rows.find(r => r.fileId === bankFileId(ref))!;
+            row.status = "reconcile";
+            row.lastError = "collision found by the preflight while this credit was staging";
+        };
+
+        const { body } = await post(bankBatch([{ ref, amount }]));
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 1, "the invoice was already created");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "…but no payment follows a cancelled row");
+        assert.notEqual(creditResult(body, ref).status, "applied");
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+    });
+
+    await t.test("a PAYMENT-boundary row is still untouchable by a collision", async () => {
+        // Past the payment request there is nothing to cancel: the money may
+        // already have moved, so the row keeps its state and its reservation
+        // and the batch escalates instead.
+        const milestone = seedMilestone({ amount: 9393.93 });
+        tables.depositIngest.rows.push({
+            id: "paid-boundary", fileId: bankFileId("REF-PAYBOUND"), status: "qbo_unknown",
+            source: BANK_DEPOSIT_SOURCE, bankReference: "REF-PAYBOUND",
+            extracted: JSON.stringify({ fileId: bankFileId("REF-PAYBOUND"), amount: 9393.93 }),
+            attempts: 1, amountCents: 939_393, postDate: utc(SETTLED_DAY),
+            paymentScheduleId: milestone, qbRequestPayload: '{"TotalAmt":9393.93}',
+            processingStartedAt: new Date(), updatedAt: new Date(),
+        });
+
+        const { body } = await post(bankBatch([
+            { ref: "REF-PAYBOUND", amount: 9393.93 },
+            { ref: "REF-PAYBOUND-TWIN", amount: 9393.93 },
+        ]));
+        const row = depositRow("REF-PAYBOUND")!;
+        assert.notEqual(row.status, "unmatched", "a row past the payment boundary is never cancelled");
+        assert.equal(row.paymentScheduleId, milestone);
+        assert.equal(creditResult(body, "REF-PAYBOUND-TWIN").status, "reconcile", "its twin is escalated");
+        assert.equal(body.ok, false);
+    });
+});
+
+test("R2-F3: attempt eight stages an invoice and then throws — the reservation survives", async () => {
+    const { milestone, ref, amount } = seedChristensen({ ref: "REF-EXHAUST" });
+    pushFailsFor.add(milestone);
+    // Seven pre-boundary failures already burned; this POST is attempt eight.
+    tables.depositIngest.rows.push({
+        id: "exhausted", fileId: bankFileId(ref), status: "failed", source: BANK_DEPOSIT_SOURCE,
+        bankReference: ref, attempts: 7, amountCents: Math.round(amount * 100), postDate: utc(SETTLED_DAY),
+        extracted: JSON.stringify({ fileId: bankFileId(ref), amount }),
+        lastError: "QuickBooks unavailable", updatedAt: new Date(),
+    });
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "reconcile", `expected reconcile, got ${result.status}: ${result.reason}`);
+
+    const row = depositRow(ref)!;
+    assert.equal(row.attempts, 8, "the last attempt was spent");
+    assert.equal(
+        row.paymentScheduleId, milestone,
+        "exhaustion must NOT release a milestone that may have a QuickBooks invoice against it",
+    );
+    assert.ok(JSON.parse(row.extracted).stagedScheduleId, "…and the staging marker survives for the human");
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+});
+
+test("R2-F4: a push that returns without a link reconciles, holding the milestone", async () => {
+    const { milestone, ref, amount } = seedChristensen({ ref: "REF-NOLINK-BACK" });
+    pushLeavesNoLink.add(milestone);
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    // `unmatched` sat OUTSIDE the reservation index, so another deposit could
+    // have taken this milestone in the window before the next POST promoted it.
+    assert.equal(result.status, "reconcile", `expected reconcile, got ${result.status}: ${result.reason}`);
+    assert.match(String(result.reason), /may have been created .* but no link/);
+    assert.equal(depositRow(ref)!.paymentScheduleId, milestone, "the hold is kept, not released");
+    assert.equal(calls.buildQBPaymentRequest.length, 0);
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+});
+
+test("R2 gaps: staged recovery and the staging CAS", async t => {
+    await t.test("a staged FAILED row whose qbInvoiceId committed resumes to applied", async () => {
+        const { milestone, amount } = seedChristensen({ ref: "REF-FAILED-LINKED", amount: 25000 });
+        // The push landed and its link write committed; the throw came after.
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId = "qb-inv-committed";
+        seedStagedRow("REF-FAILED-LINKED", milestone, amount, {
+            status: "failed", attempts: 2, lastError: "socket hang up",
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-FAILED-LINKED", amount }]));
+        const result = creditResult(body, "REF-FAILED-LINKED");
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "the invoice already exists — never push again");
+        assert.equal(queries.paymentSchedule.length, 0, "a staged row resumes, it does not re-match");
+        assert.equal(calls.buildQBPaymentRequest[0].qbInvoiceId, "qb-inv-committed");
+    });
+
+    await t.test("staging stops when the reservation moved, even though the status did not", async () => {
+        const { milestone, ref, amount } = seedChristensen({ ref: "REF-STAGE-MOVED" });
+        onFreshTokens = () => {
+            // Still `processing` — only the reservation changed under us.
+            tables.depositIngest.rows.find(r => r.fileId === bankFileId(ref))!.paymentScheduleId = "sched-someone-else";
+        };
+
+        const { body } = await post(bankBatch([{ ref, amount }]));
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "no invoice for a milestone we no longer hold");
+        assert.equal(calls.buildQBPaymentRequest.length, 0);
+        assert.notEqual(creditResult(body, ref).status, "applied");
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId, null);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. CI Codex Review Gate (PR #458): staged-invoice guards and task ownership
+// ═════════════════════════════════════════════════════════════════════════════
+
+test("G1: a deterministic payment guard AFTER the invoice was staged keeps the hold", async t => {
+    for (const reason of ["invoice-not-found", "missing-customer", "balance-mismatch"]) {
+        await t.test(reason, async () => {
+            const ref = `REF-GUARD-${reason}`;
+            const { milestone, amount } = seedChristensen({ ref });
+            qboGuardReason = reason;
+
+            const { body } = await post(bankBatch([{ ref, amount }]));
+            const result = creditResult(body, ref);
+            // The invoice definitely exists by now, so `unmatched` would hand
+            // this milestone to the next deposit that wanted it.
+            assert.equal(result.status, "reconcile", `expected reconcile, got ${result.status}: ${result.reason}`);
+            assert.match(String(result.reason), /already created the QuickBooks invoice/);
+            assert.match(String(result.reason), /INV-CHRIS/, "the reason names the invoice");
+            assert.equal(calls.pushMilestoneToQuickBooks.length, 1);
+            assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "the guard rejects before any payment");
+            assert.equal(depositRow(ref)!.paymentScheduleId, milestone, "the reservation is retained");
+        });
+    }
+
+    await t.test("…but an UNSTAGED row still goes unmatched, as before", async () => {
+        // Same guard, no staging: nothing was created, so nothing is held.
+        seedMilestone({ amount: 1500, qbInvoiceId: "qb-inv-plain", invoiceCode: "INV-PLAIN" });
+        qboGuardReason = "balance-mismatch";
+
+        const { body } = await post(bankBatch([{ ref: "REF-GUARD-PLAIN", amount: 1500 }]));
+        assert.equal(creditResult(body, "REF-GUARD-PLAIN").status, "unmatched");
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. Gate round 2 (PR #458): mutual exclusion, and honest handoff notes
+// ═════════════════════════════════════════════════════════════════════════════
+
+test("P1: the reservation-index rebuild must not erase a STAGED hold", async t => {
+    // scripts/apply-deposit-ingest-schema.mjs is documented as idempotent and
+    // safe to re-run, and its preflight clears `failed` reservations that carry
+    // no settleStartedAt. Invoice staging deliberately leaves settleStartedAt
+    // NULL (it marks itself inside `extracted`), so without an explicit guard
+    // that supported rerun would release a milestone a QuickBooks invoice may
+    // already point at — and the next sweep would re-match and create a second
+    // invoice for the same money.
+    //
+    // Read as TEXT, never imported: importing an apply script executes it
+    // (CLAUDE.md, 2026-09-02).
+    const scriptPath = fileURLToPath(new URL("../scripts/apply-deposit-ingest-schema.mjs", import.meta.url));
+    const script = readFileSync(scriptPath, "utf8");
+
+    await t.test("the cleanup predicate carries the staged guard", () => {
+        const cleanup = script.slice(
+            script.indexOf('UPDATE "DepositIngest" SET "paymentScheduleId" = NULL'),
+            script.indexOf('DROP INDEX IF EXISTS "DepositIngest_paymentScheduleId_reservation_key"'),
+        );
+        assert.ok(cleanup, "the preflight UPDATE must still be there");
+        assert.match(cleanup, /"status" = 'failed'/);
+        assert.match(cleanup, /"settleStartedAt" IS NULL/);
+        assert.match(
+            cleanup, /"extracted" NOT LIKE '%"stagedScheduleId"%'/,
+            "a failed row that staged a QuickBooks invoice must keep its reservation",
+        );
+    });
+
+    await t.test("no other apply script or migration carries an unguarded copy", () => {
+        // The predicate lives in exactly one place; the baseline migration
+        // carries the index DDL, not this data preflight. If a second copy ever
+        // appears it must be guarded too, or CI's migration-parity job and this
+        // fix would disagree.
+        for (const rel of ["../scripts/apply-deposit-sweep-schema.mjs",
+                           "../prisma/migrations/20260814000000_baseline_production/migration.sql"]) {
+            const other = readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+            assert.equal(
+                other.includes('SET "paymentScheduleId" = NULL'), false,
+                `${rel} must not hold a second, unguarded copy of the reservation cleanup`,
+            );
+        }
+    });
+
+    await t.test("and a failed+staged row still resumes instead of re-matching", async () => {
+        // The end the guard protects: reservation intact — so the sweep goes
+        // through reserved recovery and never runs the candidate query again.
+        const { milestone, amount } = seedChristensen({ ref: "REF-REBUILD", amount: 25000 });
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId = "qb-inv-survived";
+        seedStagedRow("REF-REBUILD", milestone, amount, {
+            status: "failed", attempts: 2, lastError: "socket hang up", settleStartedAt: null,
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-REBUILD", amount }]));
+        assert.equal(creditResult(body, "REF-REBUILD").status, "applied");
+        assert.equal(queries.paymentSchedule.length, 0, "a staged row resumes; it must never re-match");
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "and never creates a second invoice");
+        assert.equal(calls.buildQBPaymentRequest[0].qbInvoiceId, "qb-inv-survived");
+    });
 });
