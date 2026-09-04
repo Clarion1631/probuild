@@ -47,7 +47,15 @@ const PHASE1_MIGRATION = "20260901000000_receipt_intake";
  * a later feature's column on ReceiptIntake would read as a shape the Phase 1
  * apply script had failed to produce.
  */
-const PHASE1_DEPENDENT_MIGRATIONS = ["20260901120000_phase2_receipt_queue"];
+const PHASE1_DEPENDENT_MIGRATIONS = [
+    // Phase 3 adds `taxAtSource`, `installedAtCustomer` and `costCodeSource`
+    // to ReceiptIntake. Unparked, the reference database gets 50 columns while
+    // the Phase 1 apply script builds 47 — which reads as a shape the script
+    // failed to produce, which is precisely the misreading this list exists
+    // to prevent.
+    "20260901120000_expense_attribution",
+    "20260901120000_phase2_receipt_queue",
+];
 
 /** Move a migration directory aside, and put it back however this process ends. */
 function parkForTheRun(name) {
