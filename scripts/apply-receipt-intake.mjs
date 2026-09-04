@@ -45,6 +45,7 @@
 // scripts/apply-bank-image.mjs: "--yes" alone only proves you meant to run
 // something, and a database NAME alone doesn't prove which SERVER it's on.
 import { PrismaClient } from "@prisma/client";
+import dns from "node:dns";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -317,114 +318,106 @@ export function targetMatches(actual, expectDb, expectHost) {
     return String(actual.host ?? "") === String(expectHost ?? "");
 }
 
-const IPV4_LITERAL = /^(?:\d{1,3}\.){3}\d{1,3}$/;
-const IPV4_MAPPED = /^(?:::ffff:|(?:0{1,4}:){5}ffff:)((?:\d{1,3}\.){3}\d{1,3})$/;
+/** `localhost` is these two addresses by definition -- no lookup, and none in tests. */
+export const LOOPBACK_ADDRESSES = ["127.0.0.1", "::1"];
 
 /**
- * ONE SPELLING PER ADDRESS.
+ * An IPv4-mapped IPv6 address is an IPv4 address written another way.
  *
- * inet_server_addr() reports an address, and the same server has more than one
- * way to write itself: a dual-stack listener answers an IPv4 client as
- * ::ffff:10.0.0.5, and IPv6 text is case-insensitive. Normalising first keeps
- * the comparison about WHICH SERVER, not about how it spelled itself.
+ * Postgres reports `::ffff:10.0.0.5` or `10.0.0.5` for the same server
+ * depending on how the listener is bound, and a resolver answers with the plain
+ * form, so both sides are normalised before they are compared.
  */
-export function normalizeServerAddress(value) {
-    const text = String(value ?? "").trim().toLowerCase();
-    const mapped = text.match(IPV4_MAPPED);
-    return mapped ? mapped[1] : text;
+export function normalizeServerHost(host) {
+    const value = String(host ?? "").trim();
+    const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(value);
+    return mapped ? mapped[1] : value;
+}
+
+/** The real resolver. Used only on the live path; every test injects its own. */
+export async function lookupAddresses(hostname) {
+    const records = await dns.promises.lookup(hostname, { all: true });
+    return records.map(record => record.address);
 }
 
 /**
- * Is this already an address, or a name DNS has to answer for?
+ * THROUGH THE POOLER, THE SERVER THAT ANSWERS IS THE PROJECT'S OWN DATABASE.
  *
- * Deliberately not a full validator: a wrong guess here only decides whether we
- * ASK DNS about the string, and DNS refuses a name that is not one.
+ * Measured 2026-09-04, not assumed: aws-0-us-west-2.pooler.supabase.com
+ * resolves to three IPv4 addresses (54.70.143.232, 35.160.209.8,
+ * 44.238.118.41) and publishes no AAAA at all, while production's
+ * `inet_server_addr()` reports 2600:1f13:838:6e45:7ee0:268:15b9:d263 -- which is
+ * exactly the AAAA of db.ghzdbzdnwjxazvmcefbh.supabase.co. Supavisor hands the
+ * session to the project database, and it is that database, not the pooler,
+ * that answers `current_database()` and `inet_server_addr()`. So resolving
+ * --expect-host ALONE still refuses production: the project's direct host has
+ * to be resolved too.
+ *
+ * This sharpens the guard rather than weakening it. `<project-ref>` comes from
+ * the URL username, and verifyProdIdentity has already refused unless it equals
+ * APPLY_EXPECT_PROJECT_REF -- so accepting this address says "you reached the
+ * database of the project you named", which is a stronger claim than "you
+ * reached something behind the regional pooler", which is shared.
+ *
+ * Empty unless the URL is a production pooler URL carrying a parseable ref:
+ * there is nothing to widen to, and nothing is widened.
  */
-export function isAddressLiteral(host) {
-    const text = normalizeServerAddress(host);
-    if (!text) return false;
-    if (IPV4_LITERAL.test(text)) return true;
-    return text.includes(":") && /^[0-9a-f:.]+$/.test(text);
+export function directDbHostForUrl(url) {
+    const ref = projectRefOf(url);
+    if (!ref) return "";
+    const hostname = hostOf(url);
+    return hostname.toLowerCase().endsWith(PROD_POOLER_HOST_SUFFIX) ? `db.${ref}.supabase.co` : "";
 }
 
 /**
- * The addresses --expect-host can legitimately turn out to be.
+ * THE SERVER ANSWERS WITH AN ADDRESS; `--expect-host` IS A NAME.
  *
- * A literal is itself. localhost is the loopback pair, answered here rather
- * than through the resolver because a machine may have no record for it.
- * Anything else is a NAME, and only DNS knows what it stands for.
+ * `host(inet_server_addr())` is the server's own IP -- through the Supabase
+ * pooler an IPv6 literal such as 2600:1f13:838:6e45:7ee0:268:15b9:d263 -- while
+ * the operator passes the hostname out of DATABASE_URL,
+ * aws-0-us-west-2.pooler.supabase.com. Compared as strings those can never be
+ * equal, so the exact guard refused production every time, printing exactly
+ * that. The fix is not to loosen the comparison: it is to resolve the NAME and
+ * require the connected ADDRESS to be in that set.
+ *
+ * Returns the rule that accepted the host, or NULL. **Null is the refusal** --
+ * a falsy return must stop the run. The label exists so the banner can say
+ * WHICH rule accepted the target rather than merely that something did:
+ *
+ *   "exact"       the operator typed the literal address the server reported.
+ *   "loopback"    --expect-host is localhost and the server answered from 127.0.0.1 / ::1.
+ *   "dns"         --expect-host resolves to the address the server answered from.
+ *   "project-db"  `directHost` -- the project's own database, which is what
+ *                 answers behind the pooler -- resolves to that address.
+ *   "unix-socket" the server reported NO address (a local socket has none) and
+ *                 the URL's own hostname is the expected one.
+ *
+ * `resolve` is injected so unit tests never touch DNS. `urlHostname` is
+ * consulted for the socket case ONLY: it describes what was DIALLED rather than
+ * what answered, so it is the weakest of the five and is never allowed to
+ * rescue a connection that did report an address. `directHost` is passed in
+ * (from directDbHostForUrl) rather than derived here, so this function knows
+ * nothing about Supabase and a caller cannot widen the set by accident.
  */
-export async function resolveExpectedAddresses(expectHost, lookup) {
-    const host = String(expectHost ?? "").trim();
-    if (!host) return [];
-    if (isAddressLiteral(host)) return [normalizeServerAddress(host)];
-    if (host.toLowerCase() === "localhost") return ["127.0.0.1", "::1"];
-    const records = await lookup(host, { all: true });
-    const list = Array.isArray(records) ? records : [records];
-    return list
-        .map((record) => normalizeServerAddress(record && typeof record === "object" ? record.address : record))
-        .filter(Boolean);
-}
-
-/**
- * THE HOST HALF OF THE GUARD, RESOLVED RATHER THAN STRING-COMPARED.
- *
- * The exact compare above asks whether the operator typed the same characters
- * the SERVER reports, and the server reports host(inet_server_addr()) -- an IP.
- * An operator naming the pooler (aws-0-us-west-2.pooler.supabase.com) could
- * therefore never satisfy it: the guard refused production for BEING
- * production, and a guard that cannot be satisfied correctly is one people
- * learn to weaken. Resolving the expected NAME and asking whether the address
- * we reached is one of its addresses is the same question, asked so it can
- * actually be answered.
- *
- * Still exact at the bottom: the connected address must be IN the resolved set.
- * No substring, no prefix, no "close enough".
- */
-export async function hostMatchesResolved(actualHost, expectHost, lookup) {
-    const actual = normalizeServerAddress(actualHost);
-    const expected = String(expectHost ?? "").trim();
-    if (!expected) return { ok: false, reason: "no --expect-host was given" };
-    // A Unix-socket connection has no server address to report. The URL host
-    // check (and, on prod, the project ref and the baseline row) has already
-    // run, so there is nothing further this comparison can add: say so rather
-    // than refuse a target the other guards already accepted.
-    if (!actual) {
-        return { ok: true, note: "inet_server_addr() is NULL (a Unix-socket connection): the URL host checked above is the only host evidence." };
+export async function targetHostMatches(actualHost, expectHost, resolve = lookupAddresses, urlHostname = "", directHost = "") {
+    const expect = String(expectHost ?? "").trim();
+    // Nothing to verify against is a refusal, never a match. (main() already
+    // requires --expect-host; this makes the helper safe on its own terms.)
+    if (!expect) return null;
+    if (String(actualHost ?? "") === String(expectHost ?? "")) return "exact";
+    const actual = normalizeServerHost(actualHost);
+    if (actual === "") {
+        return String(urlHostname ?? "").trim().toLowerCase() === expect.toLowerCase() ? "unix-socket" : null;
     }
-    if (normalizeServerAddress(expected) === actual) return { ok: true, note: null };
-    let addresses;
-    try {
-        addresses = await resolveExpectedAddresses(expected, lookup);
-    } catch (error) {
-        return { ok: false, reason: `host "${expected}" could not be resolved: ${error?.message ?? error}` };
-    }
-    if (addresses.length === 0) return { ok: false, reason: `host "${expected}" resolved to no addresses` };
-    if (addresses.includes(actual)) {
-        return { ok: true, note: `host "${expected}" resolves to ${addresses.join(", ")}, which includes ${actual}` };
-    }
-    return { ok: false, reason: `host "${expected}" resolves to ${addresses.join(", ")}, not ${actual}` };
-}
-
-/**
- * The database name EXACTLY, then the host resolved. Carries the reason as
- * well as the verdict so a refusal can say which half of the target failed.
- */
-export async function targetMatchesResolved(actual, expectDb, expectHost, lookup) {
-    if (!actual || typeof actual !== "object") return { ok: false, reason: "the server reported no identity row" };
-    if (String(actual.db ?? "") !== String(expectDb ?? "")) {
-        return { ok: false, reason: `database "${String(actual.db ?? "")}" is not "${String(expectDb ?? "")}"` };
-    }
-    // Unchanged fast path: the operator passed the exact address the server
-    // reports, which is what scripts/ci-apply-receipt-intake-e2e.mjs does. No DNS.
-    if (targetMatches(actual, expectDb, expectHost)) return { ok: true, note: null };
-    return hostMatchesResolved(actual.host, expectHost, lookup);
-}
-
-/** The real resolver, imported lazily so this module stays inert on import. */
-async function lookupHostAddresses(host, options) {
-    const dns = await import("node:dns/promises");
-    return dns.lookup(host, options);
+    if (/^localhost$/i.test(expect)) return LOOPBACK_ADDRESSES.includes(actual) ? "loopback" : null;
+    const resolvesToActual = async name => {
+        const addresses = await resolve(name);
+        return (addresses ?? []).some(address => normalizeServerHost(address) === actual);
+    };
+    if (await resolvesToActual(expect)) return "dns";
+    const direct = String(directHost ?? "").trim();
+    if (direct && await resolvesToActual(direct)) return "project-db";
+    return null;
 }
 
 /** The closed set of states the CHECK constraint allows. Exported for tests. */
@@ -1076,12 +1069,44 @@ async function main() {
         }
         const actual = identity.actual;
         console.log(`connected to db="${actual.db}" host="${actual.host}"`);
-        const match = await targetMatchesResolved(actual, expectDb, expectHost, lookupHostAddresses);
-        if (!match.ok) {
-            console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}" (${match.reason}).`);
+        if (String(actual.db ?? "") !== String(expectDb ?? "")) {
+            console.error(`REFUSING: expected db="${expectDb}" but connected to db="${actual.db}".`);
             process.exit(1);
         }
-        if (match.note) console.log(match.note);
+        // Behind the pooler it is the PROJECT'S database that answers, and its
+        // address is published under db.<ref>.supabase.co, not under the pooler
+        // name. The ref is the one verifyProdIdentity already matched to
+        // APPLY_EXPECT_PROJECT_REF, so this names a stricter target, not a looser one.
+        const urlHostname = hostOf(url);
+        const directHost = directDbHostForUrl(url);
+        // The exact case first, so a target that needs no DNS never depends on it.
+        let hostMatch = targetMatches(actual, expectDb, expectHost) ? "exact" : null;
+        if (!hostMatch) {
+            try {
+                hostMatch = await targetHostMatches(actual.host, expectHost, lookupAddresses, urlHostname, directHost);
+            } catch (error) {
+                const unresolved = directHost ? `"${expectHost}" / "${directHost}"` : `"${expectHost}"`;
+                console.error(
+                    `REFUSING: ${unresolved} could not be resolved (${error?.message ?? error}), so the connected `
+                    + `address "${actual.host || "(none -- Unix socket)"}" cannot be checked against it.`,
+                );
+                process.exit(1);
+            }
+        }
+        if (!hostMatch) {
+            const names = directHost ? `"${expectHost}" or "${directHost}"` : `"${expectHost}"`;
+            console.error(
+                `REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" `
+                + `host="${actual.host || "(none -- Unix socket)"}" -- that address is not ${names}, and neither name resolves to it.`,
+            );
+            process.exit(1);
+        }
+        console.log(
+            `host check: ${hostMatch} -- --expect-host "${expectHost}" vs the address the server reported `
+            + `("${actual.host || "(none -- Unix socket)"}")`
+            + (hostMatch === "project-db" ? `; behind the pooler the project's own database answers, so "${directHost}" was resolved too` : "")
+            + (hostMatch === "unix-socket" ? `; no address to compare, so the URL's own hostname "${urlHostname}" was used` : ""),
+        );
 
         if (dryRun) {
             console.log(`--dry-run: ${statements.length} statements would run against the target above.`);
