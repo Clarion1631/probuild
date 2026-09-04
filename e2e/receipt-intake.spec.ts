@@ -28,6 +28,29 @@ import { createHash } from "node:crypto";
  */
 
 const prisma = new PrismaClient();
+/**
+ * THE LEASE GENERATION /finalize NOW REQUIRES.
+ *
+ * /start returns `uploadLease` with every URL it issues and /finalize refuses
+ * any call that does not echo the row's CURRENT one (409 `lease-stale`), so a
+ * delayed finalizer can no longer adopt a lease that was issued after it
+ * started. Tests whose subject is something else read the live value here.
+ *
+ * Rows seeded through the single-shot POST never had a signed URL and so carry
+ * no generation; those get one minted, which is the same shape /start would
+ * have written and keeps each test about its own subject.
+ */
+async function leaseOf(id: string): Promise<string> {
+    const row = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { uploadLeaseNonce: true },
+    });
+    if (row?.uploadLeaseNonce) return row.uploadLeaseNonce;
+    const minted = `e2e-lease-${id}`;
+    await prisma.receiptIntake.update({ where: { id }, data: { uploadLeaseNonce: minted } });
+    return minted;
+}
+
 const INTAKE_PATH = "/api/receipts/intake";
 const SECRET = process.env.RECEIPT_INTAKE_SECRET || "";
 // The archive mirror holds a DIFFERENT key: it may read BOOKED/ARCHIVED rows and
@@ -963,7 +986,7 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
 
         const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: "{}",
+            data: JSON.stringify({ uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(finalized.status()).toBe(409);
@@ -988,10 +1011,23 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         minted.push(id);
 
         // Exactly what the stale-STAGING sweep leaves behind when the upload
-        // never landed.
+        // never landed -- INCLUDING A DEAD LEASE.
+        //
+        // The sweeper only ever picks rows whose `uploadUrlExpiresAt` is null or
+        // already past (see sweepStaleStaging's WHERE), so a `file-missing` park
+        // in production always has an expired lease. Leaving the fresh two-hour
+        // one this /start issued would be a state the sweeper cannot produce --
+        // and since round 20 a LIVE lease is immutable, so the corrected-hash
+        // retry below would be answered 409 lease-conflict instead of re-armed.
+        // That refusal is correct for a live lease and is covered by its own
+        // case below; this one is about the recovery.
         await prisma.receiptIntake.update({
             where: { id },
-            data: { state: "NEEDS_REVIEW", stateReason: "file-missing" },
+            data: {
+                state: "NEEDS_REVIEW",
+                stateReason: "file-missing",
+                uploadUrlExpiresAt: new Date(Date.now() - 60_000),
+            },
         });
 
         // The client comes back with the correct document — a DIFFERENT hash
@@ -1026,7 +1062,7 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
 
         const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: "{}",
+            data: JSON.stringify({ uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(finalized.status()).toBe(200);
@@ -1034,6 +1070,83 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         expect(done?.state).toBe("RECEIVED", "the swept row recovered all the way to published");
         expect(done?.stateReason).toBeNull();
         expect(done?.fileSha256).toBe(sha(PNG_BASE64));
+    });
+
+    test("a parked row whose lease is STILL LIVE is refused, not re-armed", async ({ request }) => {
+        // The other half of the rule the case above depends on. A live lease's
+        // identity -- path, declared type, announced hash -- is immutable for
+        // its lifetime: re-arming it would bump the version, repath the row and
+        // rotate the generation while the first caller's signed URL still
+        // worked and still pointed at the object about to be orphaned.
+        const ref = `${REF_PREFIX}swept-live-lease`;
+        const first = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(OTHER_PNG_BASE64),
+        });
+        expect(first.status()).toBe(200);
+        const started = await first.json();
+        minted.push(started.id);
+
+        // Parked, but the lease this /start issued is untouched and live.
+        await prisma.receiptIntake.update({
+            where: { id: started.id },
+            data: { state: "NEEDS_REVIEW", stateReason: "file-missing" },
+        });
+
+        const conflicting = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64),
+        });
+        expect(conflicting.status()).toBe(409);
+        const body = await conflicting.json();
+        expect(body.error).toBe("lease-conflict");
+        expect(body.field).toBe("sha256");
+        expect(body.retryable).toBe(true);
+        expect(body.leaseExpiresAt, "so the caller knows how long to wait").toBeTruthy();
+
+        // NOTHING MOVED: the first caller's URL is still the row's.
+        const row = await prisma.receiptIntake.findUnique({ where: { id: started.id } });
+        expect(row?.storagePath).toBe(started.storagePath);
+        expect(row?.uploadLeaseNonce).toBe(started.uploadLease);
+        expect(row?.uploadLeaseVersion).toBe(1);
+
+        // ...and the SAME retry succeeds once that lease has lapsed, which is
+        // what makes the refusal a wait rather than a dead end.
+        await prisma.receiptIntake.update({
+            where: { id: started.id },
+            data: { uploadUrlExpiresAt: new Date(Date.now() - 60_000) },
+        });
+        const rearmed = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64),
+        });
+        expect(rearmed.status()).toBe(200);
+        const rearmedBody = await rearmed.json();
+        expect(rearmedBody.kind).toBe("upload");
+        expect(rearmedBody.recovered).toBe(true);
+        expect(rearmedBody.uploadLease).not.toBe(started.uploadLease);
+    });
+
+    test("a CHANGED file type against a live lease is refused the same way", async ({ request }) => {
+        const ref = `${REF_PREFIX}live-lease-mime`;
+        const first = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64),
+        });
+        expect(first.status()).toBe(200);
+        const started = await first.json();
+        minted.push(started.id);
+
+        // Same document, same hash, DIFFERENT declared type. The path is derived
+        // from (id, leaseVersion, ext), so this cannot reuse the lease -- and it
+        // must not repath one that is live either.
+        const swapped = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "application/pdf", sha256: sha(PNG_BASE64),
+        });
+        expect(swapped.status()).toBe(409);
+        const body = await swapped.json();
+        expect(body.error).toBe("lease-conflict");
+        expect(body.field).toBe("mime");
+
+        const row = await prisma.receiptIntake.findUnique({ where: { id: started.id } });
+        expect(row?.storagePath).toBe(started.storagePath, "still the PNG path");
+        expect(row?.uploadLeaseNonce).toBe(started.uploadLease);
     });
 
     test("a park a re-upload CANNOT fix still answers alreadyReceived", async ({ request }) => {
@@ -1084,6 +1197,187 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         const row = await prisma.receiptIntake.findUnique({ where: { id } });
         expect(row?.storagePath).toBe(storagePath, "nothing was re-armed");
         expect(row?.stateReason).toBe("vendor-mismatch");
+    });
+    // ── ROUND 19: /start's response is a UNION, and every 200 finalizes ────
+
+    /** POST /start with whatever body is given. */
+    const startWith = (request: APIRequestContext, body: Record<string, unknown>) =>
+        request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify(body),
+            maxRedirects: 0,
+        });
+
+    /**
+     * Put real bytes at `id`'s path, the only way this spec can: /start never
+     * carries bytes and the storage mock's signed URL is not PUT-able from
+     * here, so the single-shot route stores them and the row is pointed at
+     * them. Exactly what the two cases above already do.
+     */
+    async function seedObjectFor(request: APIRequestContext, id: string, tag: string) {
+        const seeded = await request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: intakeBody({ sourceRef: `${REF_PREFIX}${tag}-src` }),
+            maxRedirects: 0,
+        });
+        expect(seeded.status()).toBe(200);
+        const row = await prisma.receiptIntake.findUnique({ where: { id: (await seeded.json()).id } });
+        minted.push(row!.id);
+        await prisma.receiptIntake.update({ where: { id }, data: { storagePath: row!.storagePath } });
+        return row!.storagePath;
+    }
+
+    const finalizeWith = (request: APIRequestContext, id: string, uploadLease: string) =>
+        request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ uploadLease }),
+            maxRedirects: 0,
+        });
+
+    test("CONCURRENT /start: every 200 carries a lease that FINALIZES", async ({ request }) => {
+        // THE ROUND-19 FINDING. reuseLiveLease used to mint a fresh
+        // uploadLeaseNonce on every adoption and leave it out of its own CAS,
+        // so two concurrent retries both wrote and both answered 200 with
+        // their own generation. Only the last write survived, and /finalize
+        // refuses any other generation -- so the earlier caller was handed a
+        // working signed URL and a lease that was already dead.
+        //
+        // An extension is not a new lease: same path, same version, so it now
+        // KEEPS the generation it adopted and both retries hand back the same
+        // one.
+        const ref = `${REF_PREFIX}twostep-lease-race`;
+        const body = { source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64) };
+
+        const [a, b] = await Promise.all([startWith(request, body), startWith(request, body)]);
+
+        // A loser may legitimately answer the retryable 409 rather than a 200
+        // -- the property is about what a 200 PROMISES, not about how many
+        // there are. Anything else is a failure.
+        const answers = await Promise.all([a, b].map(async r => ({ status: r.status(), json: await r.json() })));
+        for (const { status } of answers) expect([200, 409]).toContain(status);
+        const ok = answers.filter(x => x.status === 200);
+        expect(ok.length, "at least one retry must succeed").toBeGreaterThan(0);
+
+        const ids = new Set(ok.map(x => x.json.id));
+        expect(ids.size).toBe(1, "one sourceRef, one row");
+        const id = ok[0].json.id as string;
+        minted.push(id);
+
+        for (const { json } of ok) {
+            expect(json.kind).toBe("upload", "an upload response says so");
+            expect(json.uploadUrl).toBeTruthy();
+            expect(json.uploadLease).toBeTruthy();
+        }
+        const leases = new Set(ok.map(x => x.json.uploadLease));
+        expect(leases.size).toBe(1, "one live lease, one generation");
+
+        // ...and it is not merely equal to itself: it is the one the row holds.
+        const row = await prisma.receiptIntake.findUnique({ where: { id } });
+        expect(row?.uploadLeaseNonce).toBe(ok[0].json.uploadLease);
+
+        // THE PROPERTY, end to end: the bytes land, and EVERY 200's lease is
+        // accepted by /finalize. `lease-stale` here is the bug.
+        await seedObjectFor(request, id, "twostep-lease-race");
+        for (const { json } of ok) {
+            const res = await finalizeWith(request, id, json.uploadLease);
+            const payload = await res.json();
+            expect(payload.error).not.toBe("lease-stale");
+            expect([200, 202]).toContain(res.status());
+        }
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.state).toBe("RECEIVED");
+    });
+
+    test("CONTROL: a lease /start never issued IS refused as stale", async ({ request }) => {
+        // Without this, a /finalize that accepted anything would pass the test
+        // above while the gate did nothing at all.
+        const ref = `${REF_PREFIX}twostep-lease-control`;
+        const started = await startWith(
+            request,
+            { source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64) },
+        );
+        expect(started.status()).toBe(200);
+        const { id, uploadLease } = await started.json();
+        minted.push(id);
+        await seedObjectFor(request, id, "twostep-lease-control");
+
+        const stale = await finalizeWith(request, id, "not-a-lease-this-row-ever-had");
+        expect(stale.status()).toBe(409);
+        const body = await stale.json();
+        expect(body.error).toBe("lease-stale");
+        expect(body.retryable).toBe(false, "calling again with the same body cannot help");
+
+        // And the REAL one still works, so the refusal above was about the
+        // lease and not about the row.
+        const good = await finalizeWith(request, id, uploadLease);
+        expect([200, 202]).toContain(good.status());
+    });
+
+    test("the SETTLED union member carries no URL and no lease, and says so", async ({ request }) => {
+        // The spec used to claim every /start success hands back an upload URL.
+        // This branch never did: the document is already held and verified, so
+        // there is nothing to upload. A client that assumed the URL was always
+        // there read undefined with no way to tell that from a broken response.
+        const ref = `${REF_PREFIX}twostep-settled`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        const id = created.body.id as string;
+
+        const again = await startWith(
+            request,
+            { source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64) },
+        );
+        expect(again.status()).toBe(200);
+        const body = await again.json();
+
+        expect(body.kind).toBe("settled");
+        expect(body.alreadyReceived).toBe(true);
+        expect(body.id).toBe(id);
+        expect(body.state).toBeTruthy();
+        expect(body.uploadUrl, "there is nothing to upload").toBeUndefined();
+        expect(body.uploadLease, "and so no lease to echo").toBeUndefined();
+    });
+
+    test("the UPLOAD union member carries the whole contract", async ({ request }) => {
+        const ref = `${REF_PREFIX}twostep-upload-shape`;
+        const res = await startWith(
+            request,
+            { source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64) },
+        );
+        expect(res.status()).toBe(200);
+        const body = await res.json();
+        minted.push(body.id);
+        expect(body.kind).toBe("upload");
+        for (const field of ["id", "uploadUrl", "token", "storagePath", "uploadLease", "maxBytes"]) {
+            expect(body[field], `an upload response carries ${field}`).toBeTruthy();
+        }
+        expect(body.alreadyReceived).toBeUndefined();
+    });
+
+    test("sha256 is REQUIRED on /start, and its absence is a deterministic 400", async ({ request }) => {
+        // It is the only thing that gives the row an identity before any bytes
+        // exist. The spec omitted it from the request shape entirely, so a
+        // mobile client written to that document would 400 on every call.
+        for (const [label, sha256] of [
+            ["absent", undefined],
+            ["empty", ""],
+            ["too short", "abc"],
+            ["not hex", "z".repeat(64)],
+            ["uppercase-only garbage", "NOTAHASH".repeat(8)],
+        ] as const) {
+            const res = await startWith(request, {
+                source: "drive",
+                sourceRef: `${REF_PREFIX}twostep-nosha-${label.replace(/ /g, "-")}`,
+                mimeType: "image/png",
+                ...(sha256 === undefined ? {} : { sha256 }),
+            });
+            expect(res.status()).toBe(400, label);
+            expect((await res.json()).reason).toBe("missing-sha256", label);
+        }
+        // Nothing was created for any of them.
+        const rows = await prisma.receiptIntake.findMany({
+            where: { sourceRef: { startsWith: `${REF_PREFIX}twostep-nosha-` } },
+        });
+        expect(rows).toHaveLength(0);
     });
 });
 
@@ -1270,7 +1564,7 @@ test.describe("round-9 intake contracts", () => {
         // /finalize: the alreadyFinalized path.
         const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: "{}",
+            data: JSON.stringify({ uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(finalized.status()).toBe(409);
@@ -1308,7 +1602,7 @@ test.describe("round-9 intake contracts", () => {
 
         const finalized = await request.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: "{}",
+            data: JSON.stringify({ uploadLease: await leaseOf(created.body.id) }),
             maxRedirects: 0,
         });
         expect(finalized.status()).toBe(200);
@@ -1359,7 +1653,7 @@ test.describe("round-9 intake contracts", () => {
 
         const applied = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify({ costCodeId: "e2e-mob-cc-demo" }),
+            data: JSON.stringify({ ...{ costCodeId: "e2e-mob-cc-demo" }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(applied.status()).toBe(200);
@@ -1369,7 +1663,7 @@ test.describe("round-9 intake contracts", () => {
         // Re-sending the SAME value is idempotent.
         const same = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify({ costCodeId: "e2e-mob-cc-demo" }),
+            data: JSON.stringify({ ...{ costCodeId: "e2e-mob-cc-demo" }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(same.status()).toBe(200);
@@ -1378,7 +1672,7 @@ test.describe("round-9 intake contracts", () => {
         // human may already have set.
         const conflicting = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify({ costCodeId: "e2e-mob-cc-dryw" }),
+            data: JSON.stringify({ ...{ costCodeId: "e2e-mob-cc-dryw" }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(conflicting.status()).toBe(409);
@@ -1400,10 +1694,10 @@ test.describe("round-9 intake contracts", () => {
 
 test.describe("round-10 finalize authorization and recovery", () => {
     const startPath = `${INTAKE_PATH}/start`;
-    const finalize = (request: APIRequestContext, id: string, body: Record<string, unknown>) =>
+    const finalize = async (request: APIRequestContext, id: string, body: Record<string, unknown>) =>
         request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify(body),
+            data: JSON.stringify({ ...body, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
 
@@ -1486,7 +1780,7 @@ test.describe("round-10 finalize authorization and recovery", () => {
         });
         const res = await employee.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
             headers: { "content-type": "application/json" },
-            data: JSON.stringify({ projectId: "e2e-scope-oos-project" }),
+            data: JSON.stringify({ ...{ projectId: "e2e-scope-oos-project" }, uploadLease: await leaseOf(created.body.id) }),
             maxRedirects: 0,
         });
         // Either refused outright (403) or invisible to this caller (404) — what
@@ -1527,7 +1821,7 @@ test.describe("round-10 finalize authorization and recovery", () => {
 
         const res = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify({ projectId: PROJECT_ID }),
+            data: JSON.stringify({ ...{ projectId: PROJECT_ID }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(res.status()).toBe(403);
@@ -1567,7 +1861,7 @@ test.describe("round-10 finalize authorization and recovery", () => {
             headers: { "content-type": "application/json" },
             // No projectId in the body: the row already has one, and that is
             // the whole point of the case.
-            data: JSON.stringify({ costCodeId: "e2e-mob-cc-demo" }),
+            data: JSON.stringify({ ...{ costCodeId: "e2e-mob-cc-demo" }, uploadLease: await leaseOf(id) }),
             maxRedirects: 0,
         });
         expect(res.status()).toBe(403);

@@ -2694,3 +2694,125 @@ test("round 36 item 3: the clear survives even if the read-side guard is bypasse
         "a row cleared after the read must still be excluded by the write predicate",
     );
 });
+
+// --- Attachment work stops on a shared QBO failure ---
+
+test("a connection-level attach failure stops the rest and marks the run incomplete", async () => {
+    const { QboRetryableError } = await import("../src/lib/quickbooks");
+    const fake = createFakePrisma();
+    const purchases = [PURCHASE, { ...PURCHASE, Id: "1002", DocNumber: "DOC-1002" }, { ...PURCHASE, Id: "1003", DocNumber: "DOC-1003" }];
+    const attempted: string[] = [];
+
+    const dependencies = {
+        ...createSyncDependencies(purchases, ACTIVE_PROJECTS, (write) => upsertQboExpense(fake.client, write)),
+        attachReceipt: async (_tokens: unknown, qbPurchaseId: string) => {
+            attempted.push(qbPurchaseId);
+            throw new QboRetryableError("QBO went away", 503);
+        },
+    };
+
+    const result = await syncQboExpenses({ since: new Date("2026-01-01") }, dependencies as never);
+
+    // Codex gate: every further attachment would spend a full deadline
+    // learning the same thing, and a run that gave up on them is not clean.
+    assert.equal(attempted.length, 1, `kept attaching after an outage: ${attempted.length} attempts`);
+    assert.equal(result.attachmentsIncomplete, true);
+    assert.ok((result.attachmentsSkipped ?? 0) >= 1, "what was given up on must be counted");
+    // The expense rows themselves still imported — attachments are a follow-on.
+    assert.ok(result.imported >= 1, "the import itself is unaffected");
+});
+
+test("an ordinary attach failure does not stop the rest, but IS counted", async () => {
+    const fake = createFakePrisma();
+    const purchases = [PURCHASE, { ...PURCHASE, Id: "1002", DocNumber: "DOC-1002" }];
+    const attempted: string[] = [];
+
+    const dependencies = {
+        ...createSyncDependencies(purchases, ACTIVE_PROJECTS, (write) => upsertQboExpense(fake.client, write)),
+        attachReceipt: async (_tokens: unknown, qbPurchaseId: string) => {
+            attempted.push(qbPurchaseId);
+            throw new Error("no attachment on this one");
+        },
+    };
+
+    const result = await syncQboExpenses({ since: new Date("2026-01-01") }, dependencies as never);
+
+    assert.equal(attempted.length, purchases.length, "a per-purchase problem is not an outage");
+    // Codex gate: this used to assert attachmentsIncomplete stayed undefined,
+    // codifying a false green — a whole run of receipts that never landed
+    // reported a perfectly clean sync. The run continues, but it is honest.
+    assert.equal(result.attachmentsIncomplete, true);
+    assert.equal(result.attachmentsSkipped, purchases.length);
+});
+
+
+// --- A transient attachment DOWNLOAD failure is classified, not generic ---
+
+test("the attachment download classifies its response like every other QBO call", async () => {
+    const { qboResponseError, isRetryableQboError, qboHttpStatus } = await import("../src/lib/quickbooks");
+    // attachQboReceipt reads the Expense row from the real prisma client before
+    // it ever reaches the download, so the end-to-end helper needs a database.
+    // What CHANGED is the classification of the download response, and that is
+    // exactly what this asserts - the same qboResponseError the helper now
+    // calls instead of `throw new Error(...)`.
+    //
+    // Codex gate: a bare Error made a 503 on the download indistinguishable
+    // from a 404, so the sync could not tell "this file is gone" from "QBO is
+    // down" and ground through the rest of the run either way. The
+    // stop-on-outage behaviour that depends on this is covered by
+    // "a connection-level attach failure stops the rest and marks the run
+    // incomplete" above.
+    for (const status of [408, 429, 500, 503]) {
+        const error = await qboResponseError(new Response("busy", { status }), "QBO attachment download");
+        assert.equal(isRetryableQboError(error), true, `status ${status} should be retryable`);
+    }
+    for (const status of [400, 403, 404]) {
+        const error = await qboResponseError(new Response("nope", { status }), "QBO attachment download");
+        assert.equal(qboHttpStatus(error), status, `status ${status} should stay terminal`);
+    }
+});
+
+
+test("a receipt QBO HAS but we cannot store is counted, while a purchase with no receipt is not", async () => {
+    const fake = createFakePrisma();
+    const purchases = [PURCHASE, { ...PURCHASE, Id: "1002", DocNumber: "DOC-1002" }];
+
+    // "no-attachment" is the normal case for most purchases and must NOT make
+    // the run partial; "attachment-unavailable" means there IS a receipt we
+    // failed to store, and must.
+    const clean = {
+        ...createSyncDependencies(purchases, ACTIVE_PROJECTS, (write) => upsertQboExpense(fake.client, write)),
+        attachReceipt: async () => "no-attachment",
+    };
+    const cleanResult = await syncQboExpenses({ since: new Date("2026-01-01") }, clean as never);
+    assert.equal(cleanResult.attachmentsIncomplete, undefined, "no receipt in QBO is not a failure");
+
+    const fake2 = createFakePrisma();
+    const unavailable = {
+        ...createSyncDependencies(purchases, ACTIVE_PROJECTS, (write) => upsertQboExpense(fake2.client, write)),
+        attachReceipt: async () => "attachment-unavailable",
+    };
+    const unavailableResult = await syncQboExpenses({ since: new Date("2026-01-01") }, unavailable as never);
+    assert.equal(unavailableResult.attachmentsIncomplete, true, "a receipt we could not store is");
+    assert.ok((unavailableResult.attachmentsSkipped ?? 0) >= 1);
+});
+
+
+test("attachables that exist but cannot be fetched are unavailable, not absent", async () => {
+    const { attachQboReceipt } = await import("../src/lib/qbo-receipt-attachments");
+    void attachQboReceipt;
+    // Codex gate: the candidate filter drops attachables with no
+    // TempDownloadUri, so a purchase whose ONLY attachments lacked a download
+    // URL fell through to "no-attachment" — indistinguishable from a purchase
+    // QuickBooks has no receipt for, and therefore never counted. The rule is
+    // now: nothing in QBO at all -> no-attachment; something there we could
+    // not get at -> attachment-unavailable.
+    const { isAttachmentFailure } = await import("../src/lib/qbo-receipt-attachments");
+    assert.equal(isAttachmentFailure("attachment-unavailable"), true);
+    assert.equal(isAttachmentFailure("storage-unavailable"), true);
+    // The normal case stays clean.
+    assert.equal(isAttachmentFailure("no-attachment"), false);
+    assert.equal(isAttachmentFailure("attached"), false);
+    assert.equal(isAttachmentFailure("already-linked"), false);
+    assert.equal(isAttachmentFailure("no-expense"), false);
+});

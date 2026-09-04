@@ -1,3 +1,4 @@
+import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { validTimeZone, DEFAULT_COMPANY_TIME_ZONE } from "./tz-date";
 export type { CalendarDateVerdict } from "./tz-date";
@@ -20,8 +21,17 @@ export {
     dateInputInTimeZone,
 } from "./tz-date";
 
-export async function resolveCompanyTimeZone(): Promise<string> {
-    const settings = await prisma.companySettings.findUnique({
+/**
+ * Either the base client or a transaction client. The payroll lock resolves the
+ * zone INSIDE its own transaction, while it holds FOR SHARE on the
+ * CompanySettings row — a read on the global client would be a second
+ * connection, outside that transaction, free to see a zone the lock is
+ * specifically holding still.
+ */
+export type CompanyTimeZoneClient = typeof prisma | Prisma.TransactionClient;
+
+export async function resolveCompanyTimeZone(client: CompanyTimeZoneClient = prisma): Promise<string> {
+    const settings = await client.companySettings.findUnique({
         where: { id: "singleton" },
         select: { timeZone: true },
     });

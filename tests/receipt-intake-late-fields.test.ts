@@ -441,8 +441,17 @@ test("the publish CAS carries installedAtCustomer, so a concurrent finalize lose
     );
     assert.deepEqual(merged.apply, { installedAtCustomer: true } as never);
     // ...and the route applies that guard to the publishing update.
+    //
+    // The fence is `leaseFence`, not the bare `publishFence` this pin used to
+    // name: leaseFence IS publishFence plus the lease GENERATION (see
+    // stored-object.ts), so it is the same fence with one more pin on it. The
+    // anchor is asserted rather than assumed — an `indexOf` miss returns -1,
+    // and `slice(-1)` would make every assertion below one about the file's
+    // last character.
     const commit = FINALIZE.slice(FINALIZE.indexOf("state: \"RECEIVED\""));
-    const fence = FINALIZE.slice(FINALIZE.indexOf("where: { id, ...publishFence(row)"));
+    const fenceAt = FINALIZE.indexOf("where: { id, ...leaseFence(leased)");
+    assert.ok(fenceAt > 0, "the publishing CAS is still where this pin thinks it is");
+    const fence = FINALIZE.slice(fenceAt);
     assert.match(fence.slice(0, 120), /\.\.\.merged\.guard/, "the CAS includes every captured value");
     assert.ok(commit.length > 0);
 });

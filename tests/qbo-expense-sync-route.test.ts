@@ -10,6 +10,7 @@ const TOKENS = {
 
 function createHandlers(options: { cronEnabled?: boolean; syncError?: Error } = {}) {
     const calls: Array<{ since: Date; until?: Date; mode: "incremental" | "backfill"; tokens: typeof TOKENS }> = [];
+    const events: any[] = [];
     const handlers = createQboExpenseSyncHandlers({
         getIngestSecret: () => "ingest-secret",
         getCronSecret: () => "cron-secret",
@@ -29,11 +30,12 @@ function createHandlers(options: { cronEnabled?: boolean; syncError?: Error } = 
         now: () => new Date("2026-07-29T12:00:00.000Z"),
         incrementalLookbackDays: 7,
         // Stub the audit logger and pause switch — with no DB the real pause
-        // read fails CLOSED (paused) and would 503 the cron test.
-        logEvent: () => {},
+        // read fails CLOSED (paused) and would 503 the cron test. Real events
+        // are still captured so a test can assert on the recorded reason.
+        logEvent: (e: any) => { events.push(e); },
         isSyncPaused: async () => false,
     });
-    return { ...handlers, calls };
+    return { ...handlers, calls, events };
 }
 
 test("POST rejects a missing ingest secret", async () => {
@@ -194,4 +196,28 @@ test("sync failures return a stable reason without exposing upstream QBO details
 
     assert.equal(response.status, 500);
     assert.deepEqual(await response.json(), { ok: false, reason: "sync-failed" });
+});
+
+test("round 33 gate: a 401/403 from the CDC purchase read is recorded as qbo-auth, not a generic error", async () => {
+    // Codex gate: getQBPurchaseChangesSince used to convert every non-2xx into
+    // a bare Error, so a credential rejection here reached this route as an
+    // unclassified "sync-failed" and pipeline-health.ts's reconnect alert
+    // (which only fires on the reason string "qbo-auth") never saw it.
+    const qboAuthError = Object.assign(new Error("QBO Purchase CDC failed (401): ..."), {
+        name: "QboHttpError",
+        status: 401,
+    });
+    const { POST, events } = createHandlers({ syncError: qboAuthError as any });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-expenses/sync", {
+        method: "POST",
+        body: JSON.stringify({ mode: "incremental" }),
+        headers: {
+            "content-type": "application/json",
+            "x-ingest-key": "ingest-secret",
+        },
+    }));
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
+    assert.equal(events.at(-1)?.reason, "qbo-auth");
 });

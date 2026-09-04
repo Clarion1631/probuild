@@ -200,7 +200,7 @@ CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx" ON "ReceiptIntake"("cre
 Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2):
 
 ```bash
-SUPABASE_URL=... SUPABASE_SERVICE_KEY=...   node scripts/apply-receipt-intake.mjs --yes --expect-db postgres --expect-host <host>
+SUPABASE_URL=... SUPABASE_SERVICE_KEY=...   node scripts/apply-receipt-intake.mjs --target prod --yes --expect-db postgres --expect-host <host>
 ```
 
 It does BOTH halves of the rollout and verifies each:
@@ -509,7 +509,7 @@ URL bypasses this server entirely, so application code cannot stop the write —
 refuse the object afterwards, by which time the bytes are already paid for and sitting in
 the bucket. Set it where the write happens:
 
-> `node scripts/apply-receipt-intake.mjs --yes --expect-db … --expect-host …`, with
+> `node scripts/apply-receipt-intake.mjs --target prod --yes --expect-db … --expect-host …`, with
 > `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` in the environment. It creates the bucket when
 > missing and VERIFIES it when present, and exits **nonzero** if it exists with a different
 > file-size limit, a different MIME allow-list, or as a public bucket. It never silently
@@ -604,15 +604,63 @@ transport, not the document.
 For anything larger — most phone photos — use the two-step flow, which never puts the bytes
 through this server at all:
 
-1. `POST /api/receipts/intake/start` with `{mimeType, fileName?, fileSize?, source?,
-   sourceRef?, uploadId?, projectId?}` -> `{id, uploadUrl, token, storagePath, maxBytes}`.
-   Creates the row in `STAGING` (invisible to the worker) and returns a short-lived Supabase
-   signed upload URL bound to a server-chosen path.
+1. `POST /api/receipts/intake/start` with
+   `{sha256, mimeType, fileName?, fileSize?, source?, sourceRef?, uploadId?, projectId?}`.
+
+   **`sha256` is REQUIRED** — 64 lowercase hex characters, the hash of the bytes you are
+   about to upload. Anything else is `400 {reason: "missing-sha256"}` and no row is created.
+   It is the only thing that gives the row an identity before any bytes exist: without it a
+   reused `sourceRef` carrying a DIFFERENT document is indistinguishable from an honest
+   retry, and `/start` would hand out an upsert-capable URL pointed at another document's
+   object — a swap that would only surface at `/finalize`, by which point the original bytes
+   are gone.
+
+   **The success response is a UNION, discriminated by `kind`.** Switch on it; `ok: true`
+   alone does NOT mean there is somewhere to PUT bytes.
+
+   ```ts
+   type StartResponse =
+     | { ok: true; kind: "upload"; id: string; uploadUrl: string; token: string;
+         storagePath: string; uploadLease: string; maxBytes: number;
+         sourceRef?: string; state?: string; resumed?: boolean; recovered?: boolean }
+     | { ok: true; kind: "settled"; alreadyReceived: true; id: string; state: string };
+   ```
+
+   - `kind: "upload"` — the row is `STAGING` (invisible to the worker) or a recoverable park
+     that has been re-armed, and the response carries a short-lived Supabase signed upload
+     URL bound to a server-chosen path. **`uploadLease` is the generation that URL was issued
+     under** — an opaque string; treat it as a token to hand back, never parse it.
+   - `kind: "settled"` — this `sourceRef` is already held AND its stored bytes still hash to
+     what was published, so there is nothing to upload. It carries **no `uploadUrl` and no
+     `uploadLease`**, deliberately. Do not look for them.
+
+   **Concurrent `/start` calls for one `sourceRef` return the SAME `uploadLease`.** A retry
+   that finds a still-live lease EXTENDS it rather than replacing it — same path, same lease
+   version, same generation — so every 200 this endpoint hands out stays finalizable. (Until
+   round 19 each adoption minted its own generation and only the last was stored, which made
+   the earlier caller's 200 carry a lease `/finalize` refused as stale.) A call that loses a
+   genuine race — the row was repathed or published while its URL was being signed — is
+   answered `409 {error: "publish-conflict", retryable: true}`, and the remedy is to call
+   `/start` again.
 2. `PUT` the bytes straight to `uploadUrl`.
-3. `POST /api/receipts/intake/{id}/finalize` with `{sha256?}` -> publishes `STAGING` ->
-   `RECEIVED`. The server re-reads the object and derives the mime, the size and the sha
-   FROM STORAGE; a declared `sha256` is checked against that and a mismatch is a 409. Over
-   8 MiB or an unreadable format deletes the row and refuses.
+3. `POST /api/receipts/intake/{id}/finalize` with `{uploadLease, sha256?}` -> publishes
+   `STAGING` -> `RECEIVED`. The server re-reads the object and derives the mime, the size and
+   the sha FROM STORAGE; a declared `sha256` is checked against that and a mismatch is a 409.
+   Over 8 MiB or an unreadable format deletes the row and refuses.
+
+**`uploadLease` is REQUIRED on `/finalize`, and this is a breaking contract change.** A call
+that omits it, or that presents a generation the row has since moved past, is refused
+`409 {error: "lease-stale", retryable: false}` **before the server reads or writes a single
+object** — and the caller's remedy is to call `/start` again and use the URL and lease that
+come back, not to retry the same body.
+
+The reason it cannot be optional: `/start` rotates the generation on every issue and every
+adoption, and two `/start` calls for one row hand out URLs for the **same path**. Without
+the echo, `/finalize` read whichever generation was current when it happened to arrive, so a
+delayed finalizer silently adopted a lease issued after it started — inspecting a second
+client's half-written object and rejecting (deleting) the row while that client still held a
+working URL. The echoed value is also what every fence in `/finalize` pins, so a publish or a
+reject can only ever land on the lease the caller proved it holds.
 
 Both paths share `decideSource` (provenance and idempotency), so a session/Bearer caller can
 never choose `source` or `sourceRef` on either, and `uploadId` is scoped to the authenticated
@@ -665,8 +713,12 @@ an overlap safe in general.
      have no review UI in Phase 1 (see §3's GET /api/receipts/intake note: the Phase 2
      `/automation` Receipts tab is the intended consumer). Until that ships, rows in any of
      these three states are visible via the `ReceiptIntake` table directly (or
-     `GET /api/receipts/intake?state=`) and via the pipeline-health report's NEEDS_REVIEW /
-     NEEDS_JOB counts.
+     `GET /api/receipts/intake?state=`) and via the pipeline-health report, which counts
+     each of them separately: NEEDS_REVIEW (`intake.needsReview`), NEEDS_JOB
+     (`intake.unassigned`) and SHADOW_QUARANTINE (`intake.quarantined`, reason
+     `receipt-quarantine:<n>` and its own digest line). The quarantine count carries no age
+     threshold, because the state is terminal the instant it is written — nothing is coming
+     to move it on.
    - after the boundary -> handed to v2. v1 had already stopped, so nobody booked these.
    With no boundary recorded in live mode the worker **halts the entire pass before
    claiming anything** and logs `cutover-boundary-missing`. Not just the retire: booking

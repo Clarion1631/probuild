@@ -159,12 +159,31 @@ export function routeState(read: RouteInput, dedupHits: DedupHits, hasProject: b
 export const TAX_IMPLAUSIBLE_REASON = "tax-implausible";
 
 /**
- * Pull the tax-implausible marker back out of a `stateReason`, discarding
- * anything else it may currently hold (a defer reason like "push-paused" must
- * NOT ride along into BOOKED — only this one warning is meant to survive).
+ * THE WARNING HAS ITS OWN COLUMN, because `stateReason` is not durable.
+ *
+ * Routing wrote the marker into `stateReason`, and everything downstream
+ * then overwrote that column for its own reasons: a deferred booking
+ * replaces it with "push-disabled" or "push-paused", a park with a park
+ * reason. The BOOKED transition read the marker out of whatever the column
+ * happened to hold at that moment, so any row that took the deferred path --
+ * which is EVERY row during the disabled-push cutover -- reached BOOKED with
+ * the evidence already erased. An automatically booked receipt with a bad tax
+ * read became indistinguishable from one with a clean read.
+ *
+ * `taxWarning` is written once, by routing, and nothing else touches it.
+ *
+ * `stateReason` is still consulted as a FALLBACK, for rows that were already
+ * mid-flight when the column was added: one sitting in BOOKING carrying the
+ * marker in the old place must not lose it at deploy time.
  */
-export function preservedTaxWarning(stateReason: string | null | undefined): string | null {
-    return (stateReason ?? "").split(";").includes(TAX_IMPLAUSIBLE_REASON) ? TAX_IMPLAUSIBLE_REASON : null;
+export function preservedTaxWarning(row: {
+    taxWarning?: string | null;
+    stateReason?: string | null;
+}): string | null {
+    if (row.taxWarning === TAX_IMPLAUSIBLE_REASON) return TAX_IMPLAUSIBLE_REASON;
+    return (row.stateReason ?? "").split(";").includes(TAX_IMPLAUSIBLE_REASON)
+        ? TAX_IMPLAUSIBLE_REASON
+        : null;
 }
 
 /**

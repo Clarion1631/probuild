@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     createQBReceiptPurchase,
     ensureQBVendor,
@@ -8,10 +10,15 @@ import {
     QboVendorDuplicateError,
     QboPurchaseFaultError,
     stableAttachmentFileName,
+    compareExistingPurchase,
+    readBookedPurchase,
     type CreateQBReceiptPurchaseInput,
+    type ExistingPurchaseCheck,
     type QboReceiptProjectCandidate,
     type QboReceiptPushDependencies,
     type ReceiptAttachmentStatus,
+    type ReceiptFileLock,
+    type ReceiptLeaseStore,
 } from "../src/lib/qbo-receipt-push";
 import {
     createQboReceiptCreateHandlers,
@@ -31,6 +38,14 @@ const TAX_ACCOUNT_ID = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || "1150040032";
 
 const PROJECT: QboReceiptProjectCandidate = { id: "project-1", name: "Mueller Remodel" };
 
+/**
+ * The per-file lock, stubbed out for the single-caller tests. The default
+ * implementation is a Postgres advisory lock inside a transaction, and these
+ * tests run without a database; contention itself is covered by the concurrency
+ * test at the end of this file.
+ */
+const INLINE_LOCK: ReceiptFileLock = (_fileId, run) => run();
+
 function baseInput(overrides: Partial<CreateQBReceiptPurchaseInput> = {}): CreateQBReceiptPurchaseInput {
     return {
         projectName: "Mueller Remodel",
@@ -44,6 +59,47 @@ function baseInput(overrides: Partial<CreateQBReceiptPurchaseInput> = {}): Creat
         ...overrides,
     };
 }
+
+/**
+ * A QBO Purchase that AGREES with baseInput(), in the shape QBO really returns
+ * one: TotalAmt and TxnDate on the entity, the vendor on EntityRef, and the job
+ * on each expense line's CustomerRef.
+ *
+ * The fixtures used to be `{ Id, PrivateNote }` because those were the only two
+ * fields the code selected — which is exactly the finding: two fields can say
+ * "this is our Purchase" and cannot say "and it agrees with this document".
+ */
+function bookedPurchase(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+        Id: "purchase-99",
+        TotalAmt: 150,
+        TxnDate: "2026-07-15",
+        EntityRef: { value: "vendor-1", name: "Home Depot", type: "Vendor" },
+        Line: [{
+            Amount: 150,
+            DetailType: "AccountBasedExpenseLineDetail",
+            AccountBasedExpenseLineDetail: {
+                AccountRef: { value: EXPENSE_ACCOUNT_ID, name: "COGS Supplies & materials" },
+                CustomerRef: { value: "cust-1", name: "Mueller Remodel" },
+            },
+        }],
+        ...over,
+    };
+}
+
+/** The verdict a matching books row produces, for the result deepEquals below. */
+const MATCHED = {
+    verdict: "match",
+    differences: [],
+    booked: {
+        totalAmount: 150,
+        txnDate: "2026-07-15",
+        vendor: "Home Depot",
+        projectNames: ["Mueller Remodel"],
+        lines: [{ tax: false, customerId: "cust-1", customerName: "Mueller Remodel", readable: true }],
+        taxAmount: 0,
+    },
+};
 
 /** The account-identity check runs against whatever id was queried — return the shape it expects for either. */
 function defaultAccountRow(query: string): Array<{ Id: string; Name: string; AccountType: string }> {
@@ -60,7 +116,7 @@ function defaultAccountRow(query: string): Array<{ Id: string; Name: string; Acc
 }
 
 interface DepsOverrides {
-    existingRows?: Array<{ Id: string; PrivateNote?: string }>;
+    existingRows?: Array<Record<string, unknown>>;
     createdId?: string;
     customerId?: string;
     vendorId?: string;
@@ -72,6 +128,35 @@ interface DepsOverrides {
     attachableRows?: Array<Record<string, unknown>>;
     /** Lets a test make the attachable lookup itself fail. */
     attachableQueryImpl?: () => Promise<Array<Record<string, unknown>>>;
+    /** Stand-in for the per-file advisory lock; defaults to running inline. */
+    withFileLock?: ReceiptFileLock;
+    /** Full control of the Purchase lookup, for the concurrency test's shared QBO state. */
+    existingRowsImpl?: () => Array<Record<string, unknown>>;
+    /** Full control of the create, so two callers can share one idempotent QBO. */
+    qbCreateImpl?: QboReceiptPushDependencies["qbCreateFn"];
+}
+
+/**
+ * A faithful stand-in for `pg_advisory_xact_lock(hashtext('receipt-push:' || fileId))`:
+ * mutual exclusion keyed by fileId, shared by every caller that is handed it.
+ * The real lock lives in the database so it also spans processes; what matters
+ * to the code under test is that the second caller does not start until the
+ * first has finished.
+ */
+function createFileLock() {
+    const chains = new Map<string, Promise<unknown>>();
+    const order: string[] = [];
+    const lock = (<T,>(fileId: string, run: () => Promise<T>): Promise<T> => {
+        const previous = chains.get(fileId) ?? Promise.resolve();
+        const next = previous.then(() => {
+            order.push(fileId);
+            return run();
+        });
+        // Never let one caller's failure poison the queue for the next.
+        chains.set(fileId, next.then(() => undefined, () => undefined));
+        return next;
+    }) as ReceiptFileLock;
+    return { lock, order };
 }
 
 function createDeps(overrides: DepsOverrides = {}) {
@@ -82,6 +167,8 @@ function createDeps(overrides: DepsOverrides = {}) {
         customerCalls: [] as string[],
     };
     const deps: Partial<QboReceiptPushDependencies> = {
+        // Runs the push inline unless a test supplies the serializing lock.
+        withFileLock: overrides.withFileLock ?? ((_fileId, run) => run()),
         qbQueryFn: async (_tokens: unknown, query: string) => {
             calls.queries.push(query);
             if (/FROM Account/i.test(query)) {
@@ -91,12 +178,13 @@ function createDeps(overrides: DepsOverrides = {}) {
                 if (overrides.attachableQueryImpl) return (await overrides.attachableQueryImpl()) as never[];
                 return (overrides.attachableRows ?? []) as never[];
             }
+            if (overrides.existingRowsImpl) return overrides.existingRowsImpl() as never[];
             return (overrides.existingRows ?? []) as never[];
         },
-        qbCreateFn: async (_tokens, payload, requestId) => {
+        qbCreateFn: overrides.qbCreateImpl ?? (async (_tokens, payload, requestId) => {
             calls.creates.push({ payload, requestId });
             return { id: overrides.createdId ?? "purchase-1" };
-        },
+        }),
         ensureVendorFn:
             overrides.vendorImpl ??
             (async (_tokens, name: string) => {
@@ -120,7 +208,7 @@ function createDeps(overrides: DepsOverrides = {}) {
 test("createQBReceiptPurchase short-circuits when the DocNumber and marker both match", async () => {
     const input = baseInput();
     const marker = `[gtr-file:${input.fileId}]`;
-    const { deps, calls } = createDeps({ existingRows: [{ Id: "purchase-99", PrivateNote: `note ${marker}` }] });
+    const { deps, calls } = createDeps({ existingRows: [bookedPurchase({ PrivateNote: `note ${marker}` })] });
     const result = await createQBReceiptPurchase(TOKENS, input, deps);
 
     assert.deepEqual(result, {
@@ -130,6 +218,7 @@ test("createQBReceiptPurchase short-circuits when the DocNumber and marker both 
         alreadyExists: true,
         // No file in this input, so there is nothing to attach.
         attachment: "skipped",
+        existing: MATCHED,
     });
     assert.equal(calls.creates.length, 0);
     assert.equal(calls.vendorCalls.length, 0);
@@ -400,6 +489,34 @@ test("createQBReceiptPurchase treats a TERMINAL attachment failure as non-fatal"
     }
 });
 
+// ─── Purchase create: an unreadable 2xx is retryable, not a terminal 500 ───
+
+test("createQBReceiptPurchase treats a malformed/empty 2xx purchase-create response as retryable", async () => {
+    // Codex gate: parseJsonOrNull degrades a genuine parse failure to `null`,
+    // and the old code turned that (and any 2xx body with neither Purchase nor
+    // Fault) into a bare Error — reaching the route as a terminal push-failed
+    // 500 instead of the retryable 503 an unknown create outcome actually is.
+    // The `requestid` this create is sent under makes a QuickBooks retry safe
+    // either way this one actually resolved. Drives the REAL
+    // defaultQbCreatePurchase (qbCreateFn left unset) through real fetch; the
+    // account/vendor/customer/query seams stay faked so only the create call
+    // itself is real.
+    const { deps } = createDeps();
+    delete deps.qbCreateFn;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+        new Response("not json at all", { status: 200, headers: { "content-type": "application/json" } })
+    ) as typeof fetch;
+    try {
+        await assert.rejects(
+            () => createQBReceiptPurchase(TOKENS, baseInput(), deps),
+            (error: unknown) => (error as Error)?.name === "QboRetryableError",
+        );
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
 // ─── Vendor 6240 duplicate-name recovery ───────────────────────────────────
 
 test("createQBReceiptPurchase maps a QboVendorDuplicateError to a terminal duplicate-name result", async () => {
@@ -471,7 +588,7 @@ function createRouteHandlers(overrides: Partial<QboReceiptCreateHandlerDependenc
         getFreshTokens: overrides.getFreshTokens ?? (async () => TOKENS),
         createPurchase:
             overrides.createPurchase ??
-            (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const })),
+            (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck })),
         // Stub the audit logger: unit tests must never touch the real Prisma client.
         logEvent: overrides.logEvent ?? (() => {}),
         // Same for the pause switch — the real read fails CLOSED (paused) with no DB.
@@ -492,7 +609,7 @@ test("route POST forwards tax:true only as an explicit boolean — string \"true
     const { POST } = createRouteHandlers({
         createPurchase: async (_tokens, input) => {
             inputs.push(input);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck };
         },
     });
     const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
@@ -807,7 +924,7 @@ test("route POST forwards overheadCategory only as a string", async () => {
     const { POST } = createRouteHandlers({
         createPurchase: async (_tokens, input) => {
             inputs.push(input);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck };
         },
     });
     for (const overheadCategory of ["Meals", 42]) {
@@ -849,7 +966,7 @@ test("already-exists uploads the receipt when the lost first attempt never attac
     const marker = `[gtr-file:${input.fileId}]`;
     const uploads: Array<{ purchaseId: string; fileName: string }> = [];
     const { deps, calls } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [], // QBO has the Purchase but no file on it
         uploadAttachment: async (_t, purchaseId, file) => {
             uploads.push({ purchaseId, fileName: file.fileName });
@@ -865,6 +982,7 @@ test("already-exists uploads the receipt when the lost first attempt never attac
         docNumber: input.fileId.slice(0, 21),
         alreadyExists: true,
         attachment: "attached",
+        existing: MATCHED,
     });
     // Still idempotent on the books: no second Purchase.
     assert.equal(calls.creates.length, 0);
@@ -878,7 +996,7 @@ test("already-exists does NOT re-upload when the deterministic filename is alrea
     const marker = `[gtr-file:${input.fileId}]`;
     let uploadCount = 0;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [attachableRow("99", stableAttachmentFileName(input.fileId, input.fileName))],
         uploadAttachment: async () => {
             uploadCount += 1;
@@ -901,7 +1019,7 @@ test("already-exists does NOT treat an unrelated receipt's identical caller-chos
     const marker = `[gtr-file:${input.fileId}]`;
     let uploadCount = 0;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         // Same caller-chosen "FileName" as the unrelated receipt would have
         // produced under the old naive scheme, but it is not OUR stable name.
         attachableRows: [attachableRow("99", "receipt.jpg")],
@@ -921,7 +1039,7 @@ test("already-exists ignores an Attachable that belongs to a different entity ty
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         // Same id + filename, but linked to an Invoice — entity ids are only
         // unique per type, so this must not count as our receipt.
         attachableRows: [{
@@ -943,7 +1061,7 @@ test("a failed attachment LOOKUP is retryable, not a terminal ok:true", async ()
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableQueryImpl: async () => {
             throw new Error("QBO down");
         },
@@ -974,7 +1092,7 @@ test("an attachment upload that times out PROPAGATES from both paths, so the pus
     );
 
     const existing = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [],
         uploadAttachment: async () => timeout(),
     });
@@ -998,7 +1116,7 @@ test("a thrown NETWORK-ish attachment failure is retryable from both paths", asy
     );
 
     const existing = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [],
         uploadAttachment: boom,
     });
@@ -1018,7 +1136,7 @@ test("a TERMINAL attachment status still rides along on ok:true from both paths"
     assert.equal(freshResult.ok && !freshResult.alreadyExists && freshResult.attachment, "failed:fault");
 
     const existing = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [],
         uploadAttachment: terminal,
     });
@@ -1155,9 +1273,22 @@ test("429/5xx uploads are retryable; other 4xx stay terminal", async () => {
             String(status),
         );
     }
-    for (const status of [400, 403, 404]) {
+    // 403 is carved out below — it is a credential refusal (qbo-auth), not a
+    // repeating business rejection.
+    for (const status of [400, 404]) {
         assert.equal(await upload(jsonResponse(status, {})), `failed:${status}`);
     }
+});
+
+test("a 403 upload is a credential refusal, not a terminal failed:403", async () => {
+    // Round 29 gate: this used to bank as `failed:403` on ok:true, which the
+    // Apps Script treats as final — the connection stayed broken until someone
+    // noticed. It must throw and carry the status, like a 401 that survives
+    // the forced refresh.
+    await assert.rejects(
+        () => upload(jsonResponse(403, {})),
+        (error: unknown) => (error as Error)?.name === "QboAttachmentAuthError" && (error as { status?: number }).status === 403,
+    );
 });
 
 
@@ -1197,7 +1328,10 @@ test("a 401 upload forces ONE token refresh and retries in place", async () => {
     assert.equal(seen.length, 2, "original attempt plus one retry");
 });
 
-test("a 401 that survives the refresh is retryable, not terminal", async () => {
+test("a 401 that survives the refresh is a credential refusal, not a generic retry", async () => {
+    // Round 29 gate: this used to become a plain QboRetryableError, which the
+    // route reads as "qbo-unavailable" — an outage, not the broken connection
+    // it actually is.
     const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
     let refreshes = 0;
     const impl = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
@@ -1209,12 +1343,12 @@ test("a 401 that survives the refresh is retryable, not terminal", async () => {
                 return { accessToken: "fresh-token", refreshToken: "r", realmId: "test-realm" };
             }),
         ),
-        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+        (error: unknown) => (error as Error)?.name === "QboAttachmentAuthError" && (error as { status?: number }).status === 401,
     );
     assert.equal(refreshes, 1, "must not retry the refresh in a loop");
 });
 
-test("a failing refresh does not crash the upload; the 401 becomes retryable", async () => {
+test("a failing refresh does not crash the upload; the 401 becomes a credential refusal", async () => {
     const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
     const impl = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
     await assert.rejects(
@@ -1223,7 +1357,7 @@ test("a failing refresh does not crash the upload; the 401 becomes retryable", a
                 throw new Error("not connected");
             }),
         ),
-        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+        (error: unknown) => (error as Error)?.name === "QboAttachmentAuthError",
     );
 });
 
@@ -1273,6 +1407,7 @@ test("the whole push, end to end, stops before the route ceiling", async () => {
             },
             ensureCustomerFn: async () => slow("cust-1"),
             listProjects: async () => [PROJECT],
+            withFileLock: INLINE_LOCK,
             qbCreateFn: async () => {
                 createCalls++;
                 return slow({ id: "purchase-1" });
@@ -1349,7 +1484,7 @@ test("the route hands the SAME deadline to the token fetch and the create", asyn
         },
         createPurchase: async (_t, _i, deadline) => {
             seen.push(deadline);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck };
         },
     });
     await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
@@ -1363,3 +1498,1559 @@ test("the route hands the SAME deadline to the token fetch and the create", asyn
     assert.deepEqual(seen[0], seen[1], "both legs share one budget");
     assert.equal(seen[0]!.budgetMs, 50_000);
 });
+// --- The route budget reaches the LATE calls of ensureQBVendor ---
+
+/**
+ * ensureQBVendor took a RouteDeadline but only its FIRST query carried it, so
+ * the candidate scan, the create, and the post-6240 re-query each opened a
+ * fresh 20s window. A vendor resolve could therefore run well past the route
+ * ceiling and be killed mid-write, which is the exact failure the shared budget
+ * exists to prevent.
+ *
+ * Each test spends the budget INSIDE the preceding call, then asserts the next
+ * one is never issued. The no-deadline control in the same test is what makes
+ * that meaningful: without it the assertion would also pass on code that made
+ * no call at all.
+ */
+function vendorFetchStub(options: { burnAtCall: number; duplicateFault?: boolean }) {
+    const urls: string[] = [];
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        urls.push(u);
+        if (urls.length === options.burnAtCall) {
+            await new Promise(resolve => setTimeout(resolve, 600));
+        }
+        if (u.includes("/query?query=")) {
+            // Calls 1 and 2 (exact DisplayName, then the LIKE-prefix scan) miss;
+            // a fourth query is the post-6240 re-query, which finds the winner.
+            return new Response(JSON.stringify({ QueryResponse: urls.length > 3 ? { Vendor: [{ Id: "vendor-42" }] } : {} }), { status: 200 });
+        }
+        if (u.includes("/vendor?") && init?.method === "POST") {
+            return options.duplicateFault
+                ? new Response('{"Fault":{"Error":[{"code":"6240"}]}}', { status: 400 })
+                : new Response(JSON.stringify({ Vendor: { Id: "vendor-1" } }), { status: 200 });
+        }
+        throw new Error(`Unexpected fetch in test: ${u}`);
+    }) as unknown as typeof fetch;
+    return { impl, urls };
+}
+
+/** 1.4s of budget, spent by a 600ms call: the next call starts under the 1s floor. */
+const BUDGET_MS = 1_400;
+
+test("ensureQBVendor: the candidate scan is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+
+    const spent = vendorFetchStub({ burnAtCall: 1 });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBVendor(TOKENS, "Home Depot", createRouteDeadline(BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 1, "the LIKE-prefix scan must not be issued");
+
+    // Control: the same stub with no budget reaches the scan.
+    const control = vendorFetchStub({ burnAtCall: 1 });
+    assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-1");
+    assert.equal(control.urls.length, 3);
+    assert.match(decodeURIComponent(control.urls[1]), /DisplayName LIKE 'Home%'/);
+});
+
+test("ensureQBVendor: the create is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+
+    const spent = vendorFetchStub({ burnAtCall: 2 });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBVendor(TOKENS, "Home Depot", createRouteDeadline(BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 2, "no Vendor may be created with no budget left");
+
+    const control = vendorFetchStub({ burnAtCall: 2 });
+    assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-1");
+    assert.equal(control.urls.length, 3);
+    assert.match(control.urls[2], /\/vendor\?/);
+});
+
+test("ensureQBVendor: the post-6240 re-query is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+
+    const spent = vendorFetchStub({ burnAtCall: 3, duplicateFault: true });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBVendor(TOKENS, "Home Depot", createRouteDeadline(BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    // The budget, not the duplicate, is the reason — a re-query that never ran
+    // must not be reported as "no match was found".
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 3, "the re-query must not be issued");
+
+    const control = vendorFetchStub({ burnAtCall: 3, duplicateFault: true });
+    assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-42");
+    assert.equal(control.urls.length, 4);
+});
+
+// -- An EXISTING Purchase is validated, not assumed (round-34 item 2) --------
+
+/**
+ * The finding: the idempotency query selected `Id, PrivateNote`, so a Purchase
+ * that was already in the books was treated as interchangeable with the read
+ * this pass had just done — and book.ts then wrote the Expense from the OCR
+ * values. A v1-cutover Purchase (the Apps Script posted it from its OWN read)
+ * or a Drive revision that kept its fileId therefore left ProBuild's job cost
+ * carrying a total, a date or a job QuickBooks does not have.
+ */
+const TAX_INPUT = {
+    projectName: "Mueller Remodel",
+    vendor: "Home Depot",
+    date: "2026-07-15",
+    totalAmount: 150,
+    groups: [
+        { category: "Receipt (pre-tax)", amount: 137.5 },
+        { category: "Sales tax", amount: 12.5, tax: true },
+    ],
+};
+
+const readBooked = (over: Record<string, unknown> = {}) =>
+    readBookedPurchase(bookedPurchase(over), TAX_ACCOUNT_ID);
+
+test("the idempotency query asks for the WHOLE Purchase, not two fields", async () => {
+    const input = baseInput();
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps, calls } = createDeps({ existingRows: [bookedPurchase({ PrivateNote: `note ${marker}` })] });
+    await createQBReceiptPurchase(TOKENS, input, deps);
+    // QBO cannot return a nested Line / EntityRef from a field list.
+    assert.match(calls.queries[0], /^SELECT \* FROM Purchase WHERE DocNumber = /);
+});
+
+test("a Purchase that agrees is a match, and books unchanged", () => {
+    const check = compareExistingPurchase(readBooked(), baseInput());
+    assert.equal(check.verdict, "match");
+    assert.deepEqual(check.differences, []);
+});
+
+test("AMOUNT: a difference is DERIVED from the books, never taken from the read", () => {
+    // Real money posted against QBO's number. The disagreement is OCR noise on
+    // our side, so the books win and the Expense records what was actually paid.
+    const check = compareExistingPurchase(readBooked({ TotalAmt: 162.75 }), baseInput());
+    assert.equal(check.verdict, "derive");
+    assert.deepEqual(check.differences, ["amount"]);
+    assert.equal(check.booked.totalAmount, 162.75);
+});
+
+test("AMOUNT: a sub-tolerance difference is not a difference at all", () => {
+    // Two cents, the same tolerance the group/total reconciliation allows: a
+    // two-line tax split can round each half independently.
+    for (const total of [150.01, 149.98, 150.02]) {
+        assert.equal(compareExistingPurchase(readBooked({ TotalAmt: total }), baseInput()).verdict, "match", String(total));
+    }
+    assert.equal(compareExistingPurchase(readBooked({ TotalAmt: 150.03 }), baseInput()).verdict, "derive");
+});
+
+test("DATE and VENDOR differences are derived too", () => {
+    const date = compareExistingPurchase(readBooked({ TxnDate: "2026-07-11" }), baseInput());
+    assert.deepEqual([date.verdict, date.differences, date.booked.txnDate], ["derive", ["date"], "2026-07-11"]);
+
+    const vendor = compareExistingPurchase(
+        readBooked({ EntityRef: { value: "v9", name: "The Home Depot #4712" } }),
+        baseInput(),
+    );
+    assert.deepEqual([vendor.verdict, vendor.differences], ["derive", ["vendor"]]);
+    // Case and spacing are not identity.
+    const same = compareExistingPurchase(readBooked({ EntityRef: { value: "v1", name: "  home   depot " } }), baseInput());
+    assert.equal(same.verdict, "match");
+});
+
+test("PROJECT: a different job is a REVIEW — nothing may pick a side automatically", () => {
+    // Which job carries the cost is an attribution decision, not noise. Deriving
+    // it would silently move money between jobs; using the read would file it
+    // under a job the books disagree with.
+    const check = compareExistingPurchase(
+        readBooked({
+            Line: [{
+                Amount: 150,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: EXPENSE_ACCOUNT_ID },
+                    CustomerRef: { value: "cust-9", name: "Mesplay Kitchen" },
+                },
+            }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(check.booked.projectNames, ["Mesplay Kitchen"]);
+});
+
+test("PROJECT: lines split across TWO jobs is an ambiguity, and also a review", () => {
+    const check = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { Amount: 75, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mueller Remodel" } } },
+                { Amount: 75, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mesplay Kitchen" } } },
+            ],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.booked.projectNames.sort(), ["Mesplay Kitchen", "Mueller Remodel"]);
+});
+
+test("TAX: a split the books do not have is a review, not a derive", () => {
+    // The reseller-permit reclaim is a state filing. Whether this document's
+    // sales tax is sitting on the reclaimable account is a fact about the books
+    // that a human has to reconcile, not a number to copy either way.
+    const noSplit = compareExistingPurchase(readBooked(), TAX_INPUT);
+    assert.equal(noSplit.verdict, "review");
+    assert.deepEqual(noSplit.differences, ["tax"]);
+    assert.equal(noSplit.booked.taxAmount, 0);
+
+    // The control: the same document against a Purchase that DOES carry the
+    // split on the tax account books clean.
+    const split = compareExistingPurchase(
+        readBooked({
+            Line: [
+                // BOTH lines carry the customer ID, not just its display name:
+                // a name is not an identity, and the tax line is money too.
+                { Amount: 137.5, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { value: "cust-1", name: "Mueller Remodel" } } },
+                { Amount: 12.5, AccountBasedExpenseLineDetail: { AccountRef: { value: TAX_ACCOUNT_ID }, CustomerRef: { value: "cust-1", name: "Mueller Remodel" } } },
+            ],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(split.verdict, "match");
+    assert.equal(split.booked.taxAmount, 12.5);
+});
+
+test("an UNREADABLE total or date is a review — never a silent pass", () => {
+    // QBO returns both on every Purchase, so their absence means we are not
+    // looking at what we think we are. "I could not check" must not read the
+    // same as "I checked and it agrees" on the path that decides what a real
+    // Expense records.
+    for (const over of [{ TotalAmt: undefined }, { TotalAmt: "n/a" }, { TotalAmt: 0 }]) {
+        const check = compareExistingPurchase(readBooked(over), baseInput());
+        assert.equal(check.verdict, "review", JSON.stringify(over));
+        assert.ok(check.differences.includes("amount"));
+    }
+    for (const over of [{ TxnDate: undefined }, { TxnDate: "07/15/2026" }, { TxnDate: "2026-02-31" }]) {
+        const check = compareExistingPurchase(readBooked(over), baseInput());
+        assert.equal(check.verdict, "review", JSON.stringify(over));
+        assert.ok(check.differences.includes("date"));
+    }
+});
+
+test("a VENDOR ref with no display name is not comparable, and is not a mismatch", () => {
+    // QBO documents `name` on a ReferenceType as optional, so its absence is a
+    // fact about the response shape rather than about the books. The vendor is
+    // a DERIVE field — QuickBooks wins it outright — so nothing is lost by
+    // skipping a comparison that cannot be made.
+    const check = compareExistingPurchase(
+        readBooked({ EntityRef: { value: "vendor-1" } }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "match");
+    assert.equal(check.booked.vendor, null);
+});
+
+test("a CUSTOMER ref with no display name is a REVIEW: the job was never confirmed", () => {
+    // The job is not a derive field, and this is the half of the old rule that
+    // was wrong. An id with no name says the lines agree with EACH OTHER; it
+    // says nothing about whether they agree with this receipt, and the expected
+    // customer's id is not known on the replay branch (resolving it there would
+    // CREATE a QBO customer). "I could not check" must not read the same as "I
+    // checked and it agrees" — the same rule the total and the date already
+    // follow.
+    const check = compareExistingPurchase(
+        readBooked({
+            Line: [{ Amount: 150, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { value: "cust-1" } } }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(check.booked.projectNames, []);
+});
+
+// -- Attribution is PER LINE, not "one line agreed" (round-35 P1) ------------
+
+/**
+ * The finding: the project check ran only `if (projectNames.length > 0)` and
+ * built that list from the lines that HAD a readable customer name. A Purchase
+ * that was only partly coded therefore passed on the strength of its coded
+ * half, and one that was not coded at all skipped the check entirely — and
+ * book.ts then wrote a real Expense for the WHOLE amount against a job
+ * QuickBooks does not carry it under.
+ */
+function linesOf(...lines: Record<string, unknown>[]) {
+    return readBooked({ Line: lines });
+}
+
+const CODED = {
+    Amount: 100,
+    AccountBasedExpenseLineDetail: {
+        AccountRef: { value: EXPENSE_ACCOUNT_ID },
+        CustomerRef: { value: "cust-1", name: "Mueller Remodel" },
+    },
+};
+/** The line with no CustomerRef at all: real money on this Purchase, on no job. */
+const UNCODED = {
+    Amount: 50,
+    AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID } },
+};
+
+test("ALL lines coded to this job books clean", () => {
+    const check = compareExistingPurchase(linesOf(CODED, { ...CODED, Amount: 50 }), baseInput());
+    assert.equal(check.verdict, "match");
+    assert.deepEqual(check.differences, []);
+});
+
+test("ONE coded line plus an UNCODED one is a review — the old rule called this a match", () => {
+    // $100 on the job, $50 on nothing, and the Expense would have been written
+    // for the full $150 against the job.
+    const check = compareExistingPurchase(linesOf(CODED, UNCODED), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(
+        check.booked.lines.map(l => l.customerId),
+        ["cust-1", null],
+        "the uncoded line is RECORDED, not dropped — that is what the name set could not do",
+    );
+});
+
+test("ZERO coded lines is a review — the old rule skipped the check entirely", () => {
+    const check = compareExistingPurchase(linesOf(UNCODED, { ...UNCODED, Amount: 100 }), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(check.booked.projectNames, [], "nothing to build the old rule's list from");
+});
+
+test("all coded, one to a DIFFERENT customer, is a review", () => {
+    const other = {
+        Amount: 50,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { value: "cust-9", name: "Mesplay Kitchen" },
+        },
+    };
+    const check = compareExistingPurchase(linesOf(CODED, other), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+});
+
+test("identity is compared on CustomerRef.value, so two customers sharing a NAME is still a review", () => {
+    // Two QBO customers can carry the same display name — a sub-customer under
+    // a different parent, a duplicate nobody merged. The name comparison alone
+    // cannot see it.
+    const twin = {
+        Amount: 50,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { value: "cust-2", name: "Mueller Remodel" },
+        },
+    };
+    const check = compareExistingPurchase(linesOf(CODED, twin), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+});
+
+test("an UNCODED TAX line is a REVIEW: reclaimable tax is money on a job too", () => {
+    // This test used to assert the opposite — that the reclaimable account was
+    // attribution enough and a tax line needed no customer. It is not: the
+    // Purchase's whole gross is then recorded against the project the OTHER
+    // lines name, including a tax split nobody attributed to it. Tax was
+    // excluded from the "is this line coded at all" guard entirely, so it was
+    // the one kind of money that could ride along unassigned.
+    const taxLine = { Amount: 12.5, AccountBasedExpenseLineDetail: { AccountRef: { value: TAX_ACCOUNT_ID } } };
+    const uncodedTax = compareExistingPurchase(
+        readBooked({
+            Line: [{ ...CODED, Amount: 137.5 }, taxLine],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(uncodedTax.verdict, "review");
+    assert.ok(uncodedTax.differences.includes("project"));
+
+    // THE CONTROL: the same split with the tax line CODED books clean, so this
+    // is not a rule that simply refuses every tax split.
+    const ok = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { ...CODED, Amount: 137.5 },
+                {
+                    Amount: 12.5,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: TAX_ACCOUNT_ID },
+                        CustomerRef: { value: "cust-1", name: "Mueller Remodel" },
+                    },
+                },
+            ],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(ok.verdict, "match");
+
+    const wrongJob = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { ...CODED, Amount: 137.5 },
+                {
+                    Amount: 12.5,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: TAX_ACCOUNT_ID },
+                        CustomerRef: { value: "cust-9", name: "Mesplay Kitchen" },
+                    },
+                },
+            ],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(wrongJob.verdict, "review");
+    assert.ok(wrongJob.differences.includes("project"));
+});
+
+test("a line shape this code cannot read is a review, never a silent skip", () => {
+    // An item-based expense line, a v1-cutover Purchase, anything without an
+    // AccountBasedExpenseLineDetail: there is no CustomerRef to find, and the
+    // money on it is real.
+    const itemBased = {
+        Amount: 50,
+        DetailType: "ItemBasedExpenseLineDetail",
+        ItemBasedExpenseLineDetail: { ItemRef: { value: "item-1" } },
+    };
+    const check = compareExistingPurchase(linesOf(CODED, itemBased), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.equal(check.booked.lines[1].readable, false);
+});
+
+test("a Purchase with NO lines at all is a review", () => {
+    const check = compareExistingPurchase(readBooked({ Line: [] }), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+});
+
+test("a REVIEW outranks a DERIVE when both kinds of difference are present", () => {
+    const check = compareExistingPurchase(
+        readBooked({
+            TotalAmt: 999,
+            Line: [{ Amount: 999, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mesplay Kitchen" } } }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["amount", "project"]);
+});
+
+// ── EVERY monetary line carries the customer id (Codex round-16 item 2) ────
+//
+// The old rule let one NAMED line validate a Purchase while other money sat
+// unassigned, and the worker then recorded the whole gross against that
+// project. Three shapes got through; each is a test below, each with the
+// control that proves the rule is not simply "refuse everything".
+
+test("ONE CODED + ONE UNCODED line is a review, not a match", () => {
+    // The headline case: real money on this Purchase, on no job at all, waved
+    // through because a sibling line named the right one.
+    const mixed = compareExistingPurchase(
+        readBooked({ Line: [{ ...CODED, Amount: 60 }, { ...UNCODED, Amount: 40 }] }),
+        baseInput(),
+    );
+    assert.equal(mixed.verdict, "review");
+    assert.ok(mixed.differences.includes("project"));
+});
+
+test("a NAME without an id is not attribution — a name is not an identity", () => {
+    // The pre-fix hole: the "is this line coded at all" guard was
+    // `!tax && !customerId && !customerName`, so a display name alone
+    // satisfied it. QBO's `name` on a ReferenceType is documented optional and
+    // is a label, not a key.
+    const namedOnly = {
+        Amount: 100,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { name: "Mueller Remodel" },
+        },
+    };
+    const check = compareExistingPurchase(readBooked({ Line: [namedOnly] }), baseInput());
+    assert.equal(check.verdict, "review");
+    assert.ok(check.differences.includes("project"));
+
+    // CONTROL: the same line WITH the id books clean.
+    const withId = compareExistingPurchase(readBooked({ Line: [{ ...CODED }] }), baseInput());
+    assert.equal(withId.verdict, "match");
+});
+
+test("ZERO ids across every line is an absence, not agreement", () => {
+    // `ids.size <= 1` was satisfied by an EMPTY set, so a Purchase whose lines
+    // carried names and no ids passed with nothing pinned at all.
+    const allNamed = [0, 1].map(i => ({
+        Amount: 50,
+        AccountBasedExpenseLineDetail: {
+            AccountRef: { value: EXPENSE_ACCOUNT_ID },
+            CustomerRef: { name: "Mueller Remodel" },
+        },
+        _i: i,
+    }));
+    const check = compareExistingPurchase(readBooked({ Line: allNamed }), baseInput());
+    assert.equal(check.verdict, "review");
+
+    // HONEST NOTE ON `ids.size === 1`: the per-line `!line.customerId` guard
+    // now rejects this shape before the size is ever consulted, so the change
+    // from `<= 1` to `=== 1` is belt-and-braces rather than an independently
+    // load-bearing guard — a mutation back to `<= 1` alone changes nothing
+    // observable. It is written as `=== 1` because that is what the rule
+    // means, and so that relaxing the per-line guard cannot silently reopen
+    // the empty-set hole. Asserted here as a source fact, not a behaviour.
+    const src = readFileSync(path.join(__dirname, "..", "src/lib/qbo-receipt-push.ts"), "utf8");
+    assert.match(src, /return ids\.size === 1 && confirmedByName;/);
+    assert.match(src, /if \(!line\.customerId\) return false;/);
+});
+
+test("TWO DIFFERENT customer ids is still a review — the split-across-jobs case", () => {
+    // Unchanged behaviour, asserted so the `=== 1` tightening cannot be read
+    // as having relaxed anything.
+    const split = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { ...CODED, Amount: 50 },
+                {
+                    Amount: 50,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: EXPENSE_ACCOUNT_ID },
+                        CustomerRef: { value: "cust-2", name: "Mueller Remodel" },
+                    },
+                },
+            ],
+        }),
+        baseInput(),
+    );
+    assert.equal(split.verdict, "review");
+});
+
+test("ALL lines coded to one confirmed job is a match — the control", () => {
+    // Without this, a rule that refused every existing Purchase would pass
+    // every assertion above.
+    const ok = compareExistingPurchase(
+        readBooked({ Line: [{ ...CODED, Amount: 50 }, { ...CODED, Amount: 50 }] }),
+        baseInput(),
+    );
+    assert.equal(ok.verdict, "match");
+    assert.deepEqual(ok.differences, []);
+});
+
+
+// --- The REAL ensure helpers must honour the route budget ---
+
+test("the real vendor/customer ensures are bounded by the route budget", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError, QBTimeoutError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    // Codex gate: ensureQBVendor/ensureQBCustomer make several QBO round trips
+    // of their own (exact-name query, prefix query, create, duplicate
+    // re-query). Those calls did not carry the budget, so a push could sit in
+    // the ensures until the platform killed the function. This drives the REAL
+    // helpers - nothing is replaced with a fake ensure - and only the network
+    // underneath them is slow.
+    const CEILING_MS = 60_000;
+    const CALL_MS = 400;
+    const calls: string[] = [];
+
+    const slowFetch = (async (url: string) => {
+        calls.push(String(url));
+        await new Promise(resolve => setTimeout(resolve, CALL_MS));
+        // Every lookup comes back empty, so the helpers walk their full path.
+        return new Response(JSON.stringify({ QueryResponse: {} }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        });
+    }) as unknown as typeof fetch;
+
+    // Enough budget for a few calls, nowhere near enough for the whole push.
+    const deadline = createRouteDeadline(2_200);
+    const started = Date.now();
+
+    const error = await withFetch(slowFetch, () =>
+        createQBReceiptPurchase(
+            TOKENS,
+            baseInput({ ...FILE_INPUT }),
+            // Only the database read is stubbed; every QBO call is real.
+            { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK },
+            deadline,
+        ),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    const elapsed = Date.now() - started;
+
+    assert.ok(error, "the push must stop itself rather than run to the ceiling");
+    assert.ok(
+        isQBBudgetExhaustedError(error) || error instanceof QBTimeoutError,
+        `stopped for the wrong reason: ${error?.name}: ${error?.message}`,
+    );
+    // The point of the whole exercise: nowhere near the 60s route ceiling.
+    assert.ok(elapsed < CEILING_MS / 10, `ran ${elapsed}ms, which is not comfortably under ${CEILING_MS}ms`);
+    // Proof the real helpers were exercised: several distinct QBO round trips
+    // happened through qbTimedFetch before the budget cut them off.
+    assert.ok(calls.length >= 2, `expected several real QBO calls, saw ${calls.length}`);
+    // The customer ensure runs first, so that is where the budget bites here;
+    // both helpers are on the same clock and the assertion accepts either.
+    assert.ok(
+        calls.some(url => /Customer|Vendor/i.test(url)),
+        `a real ensure should have queried QBO: ${calls.join(", ")}`,
+    );
+    // And it stopped INSIDE the ensure rather than completing the whole push.
+    assert.equal(
+        calls.some(url => /purchase\?requestid/i.test(url)),
+        false,
+        "the books write must not have been reached",
+    );
+});
+
+test("an already-spent budget stops the real ensures before any QBO call", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    let calls = 0;
+    const countingFetch = (async () => {
+        calls++;
+        return new Response(JSON.stringify({ QueryResponse: {} }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        });
+    }) as unknown as typeof fetch;
+
+    const spent = createRouteDeadline(2_000, Date.now() - 12_000);
+    const error = await withFetch(countingFetch, () =>
+        createQBReceiptPurchase(
+            TOKENS,
+            baseInput({ ...FILE_INPUT }),
+            { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK },
+            spent,
+        ),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(isQBBudgetExhaustedError(error), `got ${error?.name}: ${error?.message}`);
+    assert.equal(calls, 0, "not one QBO request may be issued on an exhausted budget");
+});
+
+
+// --- The account-verification cache must not bind waiters to another clock ---
+
+test("two concurrent pushes each honour THEIR OWN remaining budget", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    // Codex gate: caching the in-flight PROMISE bound every waiter to the
+    // first request's lifetime, so a push with two seconds left would await a
+    // verification started under someone else's 50s deadline and sit there
+    // long past its own ceiling.
+    let verifyStarted = 0;
+    const slowAccounts = async (query: string) => {
+        if (/FROM Account/i.test(query)) {
+            verifyStarted++;
+            // Longer than the second request's budget, shorter than the first's.
+            await new Promise(resolve => setTimeout(resolve, 1_500));
+            return defaultAccountRow(query);
+        }
+        return [];
+    };
+
+    const makeDeps = () => ({
+        qbQueryFn: (async (_t: unknown, query: string) => await slowAccounts(query)) as never,
+        ensureVendorFn: (async () => "vendor-1") as never,
+        ensureCustomerFn: (async () => "cust-1") as never,
+        listProjects: async () => [PROJECT],
+        withFileLock: INLINE_LOCK,
+        qbCreateFn: (async () => ({ id: "purchase-1" })) as never,
+        uploadAttachment: (async () => "attached" as ReceiptAttachmentStatus) as never,
+    });
+
+    // A realm nothing else has used, so the module-level verification cache is
+    // COLD and both pushes genuinely wait on the same in-flight verification.
+    const tokens = { ...TOKENS, realmId: `realm-concurrency-${Date.now()}` };
+    const generous = createRouteDeadline(30_000);
+    const nearlySpent = createRouteDeadline(1_400, Date.now() - 700); // ~700ms left
+
+    const started = Date.now();
+    const [slowResult, fastResult] = await Promise.allSettled([
+        createQBReceiptPurchase(tokens, baseInput(), makeDeps(), generous),
+        createQBReceiptPurchase(tokens, baseInput({ fileId: "2BcDeFgHiJkLmNoPqRsTuVwXyZ0987654321" }), makeDeps(), nearlySpent),
+    ]);
+    const elapsed = Date.now() - started;
+
+    // Both pushes shared one in-flight verification rather than duplicating it.
+    // One shared in-flight verification, not one per push.
+    assert.equal(verifyStarted, 3, "three account queries: one verification, shared");
+
+    // The short-budget push must have given up on its OWN clock, well before
+    // the 1.5s verification finished.
+    assert.equal(fastResult.status, "rejected", "the short-budget push should not have waited it out");
+    if (fastResult.status === "rejected") {
+        assert.ok(
+            isQBBudgetExhaustedError(fastResult.reason),
+            `expected a budget error, got ${(fastResult.reason as Error)?.name}: ${(fastResult.reason as Error)?.message}`,
+        );
+    }
+    // The generous push is unaffected by the other one walking away.
+    assert.equal(slowResult.status, "fulfilled", `generous push failed: ${JSON.stringify(slowResult)}`);
+    assert.ok(elapsed < 10_000, `took ${elapsed}ms`);
+});
+
+// --- Attachment lookup: classify by status, not by "it threw" ---
+
+test("a 400/404 attachment lookup is terminal, not an endless retry", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    // 403 is carved out below — it is a credential refusal (qbo-auth), not a
+    // repeating business rejection.
+    for (const status of [400, 404]) {
+        const { deps } = createDeps({
+            existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+            attachableQueryImpl: async () => {
+                throw new QboHttpError(`QB query failed (${status})`, status);
+            },
+        });
+        const result = await createQBReceiptPurchase(TOKENS, input, deps);
+        // QuickBooks answered with a refusal that will repeat: record it and
+        // move on rather than resending forever.
+        assert.equal(result.ok, true, `status ${status} should stay ok:true`);
+        assert.equal(
+            result.ok && result.alreadyExists && result.attachment,
+            `failed:${status}`,
+            `status ${status}`,
+        );
+    }
+});
+
+test("a 403 attachment lookup is a credential refusal, not a terminal failed:403", async () => {
+    // Round 29 gate: this used to bank as `failed:403` on ok:true too.
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableQueryImpl: async () => {
+            throw new QboHttpError("QB query failed (403)", 403);
+        },
+    });
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, deps),
+        (error: unknown) => (error as Error)?.name === "QboAttachmentAuthError" && (error as { status?: number }).status === 403,
+    );
+});
+
+test("a 429/5xx attachment lookup stays retryable", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    for (const status of [429, 500, 503]) {
+        const { deps } = createDeps({
+            existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+            attachableQueryImpl: async () => {
+                throw new QboHttpError(`QB query failed (${status})`, status);
+            },
+        });
+        await assert.rejects(
+            () => createQBReceiptPurchase(TOKENS, input, deps),
+            (e: unknown) => (e as Error)?.name === "QboRetryableError",
+            `status ${status}`,
+        );
+    }
+});
+
+test("qbQuery raises a typed QboHttpError carrying the status", async () => {
+    const { qbQuery, qboHttpStatus } = await import("../src/lib/quickbooks");
+    const impl = (async () => new Response("nope", { status: 404 })) as unknown as typeof fetch;
+    const error = await withFetch(impl, () => qbQuery(TOKENS, "SELECT Id FROM Vendor")).then(
+        () => null,
+        (e: unknown) => e as Error,
+    );
+    assert.equal(error?.name, "QboHttpError");
+    assert.equal(qboHttpStatus(error), 404);
+});
+
+
+// --- Recovery lookup must match the upload path's transient set ---
+
+test("a 401 attachment LOOKUP forces one refresh and retries, like the upload does", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    // Codex gate: the upload retried a 401 after a forced refresh while the
+    // lookup treated it as terminal - one recovery step giving up exactly
+    // where the other kept going.
+    let lookups = 0;
+    let refreshes = 0;
+    const uploads: string[] = [];
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableQueryImpl: async () => {
+            lookups++;
+            if (lookups === 1) throw new QboHttpError("QB query failed (401)", 401);
+            return []; // after the refresh: no attachment on file yet
+        },
+        uploadAttachment: async (t) => {
+            uploads.push(t.accessToken);
+            return "attached";
+        },
+    });
+
+    deps.refreshTokensFn = async () => {
+        refreshes++;
+        return { accessToken: "fresh-token", refreshToken: "r", realmId: "test-realm" };
+    };
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.equal(result.ok && result.alreadyExists && result.attachment, "attached");
+    assert.equal(lookups, 2, "one retry after the refresh");
+    assert.equal(refreshes, 1, "exactly one forced refresh");
+    assert.deepEqual(uploads, ["fresh-token"], "the upload must use the refreshed token");
+});
+
+test("a 401 lookup that survives the refresh is a credential refusal, not a generic retry", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    let refreshes = 0;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableQueryImpl: async () => {
+            throw new QboHttpError("QB query failed (401)", 401);
+        },
+    });
+
+    deps.refreshTokensFn = async () => {
+        refreshes++;
+        return { accessToken: "fresh-token", refreshToken: "r", realmId: "test-realm" };
+    };
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, deps),
+        (e: unknown) => (e as Error)?.name === "QboAttachmentAuthError" && (e as { status?: number }).status === 401,
+    );
+    assert.equal(refreshes, 1, "must not loop on the refresh");
+});
+
+test("a 408 attachment lookup is retryable, matching the upload path", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableQueryImpl: async () => {
+            throw new QboHttpError("QB query failed (408)", 408);
+        },
+    });
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, deps),
+        (e: unknown) => (e as Error)?.name === "QboRetryableError",
+    );
+});
+
+test("the lookup and the upload agree on which statuses are transient", async () => {
+    const { isTransientAttachmentStatus } = await import("../src/lib/qbo-receipt-push");
+    // One list, both paths.
+    for (const status of [401, 408, 429, 500, 503]) {
+        assert.equal(isTransientAttachmentStatus(status), true, String(status));
+    }
+    for (const status of [400, 403, 404, 413, 415]) {
+        assert.equal(isTransientAttachmentStatus(status), false, String(status));
+    }
+});
+
+// --- The shared verification runs on its own clock, whoever starts it ---
+
+test("a SHORT-budget push starting the verification does not poison it for others", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    // Codex gate: ordering matters. When the impatient request is the one that
+    // KICKS OFF the shared verification, binding that work to its deadline
+    // killed the verification everyone else was waiting on. The shared work
+    // now has its own fixed budget; the initiator only gives up on its own.
+    let accountQueries = 0;
+    const slowAccounts = async (query: string) => {
+        if (/FROM Account/i.test(query)) {
+            accountQueries++;
+            await new Promise(resolve => setTimeout(resolve, 1_200));
+            return defaultAccountRow(query);
+        }
+        return [];
+    };
+    const makeDeps = () => ({
+        qbQueryFn: (async (_t: unknown, query: string) => await slowAccounts(query)) as never,
+        ensureVendorFn: (async () => "vendor-1") as never,
+        ensureCustomerFn: (async () => "cust-1") as never,
+        listProjects: async () => [PROJECT],
+        withFileLock: INLINE_LOCK,
+        qbCreateFn: (async () => ({ id: "purchase-1" })) as never,
+        uploadAttachment: (async () => "attached" as ReceiptAttachmentStatus) as never,
+    });
+
+    // Cold cache for this realm so the verification genuinely runs.
+    const tokens = { ...TOKENS, realmId: `realm-order-${Date.now()}` };
+    const nearlySpent = createRouteDeadline(1_400, Date.now() - 700); // ~700ms left
+
+    // The impatient one goes FIRST and therefore starts the shared work.
+    const impatient = createQBReceiptPurchase(tokens, baseInput(), makeDeps(), nearlySpent);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const patient = createQBReceiptPurchase(
+        tokens,
+        baseInput({ fileId: "3CdEfGhIjKlMnOpQrStUvWxYz1234567890" }),
+        makeDeps(),
+        createRouteDeadline(30_000),
+    );
+
+    const [impatientResult, patientResult] = await Promise.allSettled([impatient, patient]);
+
+    assert.equal(impatientResult.status, "rejected", "the initiator should give up on its own budget");
+    if (impatientResult.status === "rejected") {
+        assert.ok(
+            isQBBudgetExhaustedError(impatientResult.reason),
+            `expected a budget error, got ${(impatientResult.reason as Error)?.name}`,
+        );
+    }
+    // The whole point: the patient push still completes.
+    assert.equal(
+        patientResult.status,
+        "fulfilled",
+        `the shared verification was poisoned: ${JSON.stringify(patientResult)}`,
+    );
+    assert.equal(accountQueries, 3, "one shared verification, not one per push");
+});
+
+
+// --- One transient classification, shared by every create path ---
+
+test("a 503 on the REAL vendor/customer/purchase create reaches the route as a 503 retry", async () => {
+    // Codex gate: each create classified for itself and none knew about
+    // transient statuses, so a 503 came back as a bare Error and the route
+    // reported an unknown failure (500) instead of the outage it plainly was.
+    // This drives the real helpers through the real route handler; only the
+    // network underneath returns 503.
+    const events: AutomationEventInput[] = [];
+    const serviceUnavailable = (async () =>
+        new Response(JSON.stringify({ Fault: { Error: [{ code: "5000" }] } }), {
+            status: 503,
+            headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+
+    const { POST } = createRouteHandlers({
+        getFreshTokens: async () => TOKENS,
+        createPurchase: (tokens, input, deadline) =>
+            withFetch(serviceUnavailable, async () => {
+                const mod = await import("../src/lib/qbo-receipt-push");
+                // Real ensures, real queries, real create — nothing stubbed but
+                // the project list, which is a database read.
+                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK }, deadline);
+            }),
+        logEvent: event => { events.push(event); },
+    });
+
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: JSON.stringify({
+            fileId: "file-503",
+            projectName: PROJECT.name,
+            vendor: "Home Depot",
+            date: "2026-07-15",
+            totalAmount: 100,
+            groups: [{ category: "03 Plumbing", amount: 100 }],
+        }),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-unavailable" });
+    assert.equal(events[0].reason, "qbo-unavailable");
+});
+
+test("408/429/5xx share one transient classification at the boundary", async () => {
+    const { isTransientQboStatus } = await import("../src/lib/quickbooks");
+    for (const status of [408, 429, 500, 502, 503, 504]) {
+        assert.equal(isTransientQboStatus(status), true, String(status));
+    }
+    for (const status of [400, 401, 403, 404, 409, 422]) {
+        assert.equal(isTransientQboStatus(status), false, String(status));
+    }
+});
+
+test("qboResponseError picks the class from the status", async () => {
+    const { qboResponseError, isRetryableQboError, qboHttpStatus } = await import("../src/lib/quickbooks");
+
+    const transient = await qboResponseError(new Response("busy", { status: 503 }), "QB vendor create");
+    assert.equal(isRetryableQboError(transient), true);
+    assert.equal(qboHttpStatus(transient), null, "a retryable error is not a plain HTTP error");
+
+    const terminal = await qboResponseError(new Response("nope", { status: 400 }), "QB vendor create");
+    assert.equal(terminal.name, "QboHttpError");
+    assert.equal(qboHttpStatus(terminal), 400);
+});
+
+
+// --- A deterministic 4xx from an ensure is terminal, not a retry loop ---
+
+test("a 400 on the REAL customer create is a terminal qbo-fault at the route", async () => {
+    // Codex gate: a business refusal from an ensure arrived as an untyped
+    // QboHttpError and fell through to the generic 500, so the bot retried an
+    // answer QuickBooks had already given, verbatim, forever.
+    const events: AutomationEventInput[] = [];
+    const badRequest = (async (url: string) =>
+        // Lookups come back empty so the ensure proceeds to the create, which
+        // QuickBooks refuses.
+        /\/customer\b/.test(String(url)) && !String(url).includes("query")
+            ? new Response(JSON.stringify({ Fault: { Error: [{ code: "6240" }] } }), { status: 400 })
+            : new Response(JSON.stringify({ QueryResponse: {} }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            })) as unknown as typeof fetch;
+
+    const { POST } = createRouteHandlers({
+        getFreshTokens: async () => TOKENS,
+        createPurchase: (tokens, input, deadline) =>
+            withFetch(badRequest, async () => {
+                const mod = await import("../src/lib/qbo-receipt-push");
+                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK }, deadline);
+            }),
+        logEvent: event => { events.push(event); },
+    });
+
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: JSON.stringify({
+            fileId: "file-400",
+            projectName: PROJECT.name,
+            vendor: "Home Depot",
+            date: "2026-07-15",
+            totalAmount: 100,
+            groups: [{ category: "03 Plumbing", amount: 100 }],
+        }),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+
+    // 200 + ok:false is terminal for the Apps Script: it books via the email
+    // path instead of hammering a refusal.
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, "qbo-fault");
+    assert.equal(body.detail, "400");
+    assert.equal(events[0].reason, "qbo-fault:400");
+});
+
+test("a business 4xx from an ensure is terminal, while a 503 stays retryable", async () => {
+    // Was written with 403. A 401/403 is now classified as qbo-auth (the
+    // CREDENTIAL is bad, not the receipt — see the qbo-auth tests above), so
+    // the terminal-4xx rule is exercised with a real business refusal instead.
+    const { QboHttpError, QboRetryableError } = await import("../src/lib/quickbooks");
+
+    const terminal = createRouteHandlers({
+        createPurchase: async () => { throw new QboHttpError("QB customer create failed (400): closed period", 400); },
+    });
+    const terminalResponse = await terminal.POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(terminalResponse.status, 200);
+    assert.deepEqual(await terminalResponse.json(), { ok: false, reason: "qbo-fault", detail: "400" });
+
+    const transient = createRouteHandlers({
+        createPurchase: async () => { throw new QboRetryableError("QB customer create failed (503)", 503); },
+    });
+    const transientResponse = await transient.POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(transientResponse.status, 503);
+    assert.deepEqual(await transientResponse.json(), { ok: false, retry: true, reason: "qbo-unavailable" });
+});
+
+
+// --- deposit-ingest: the money-moving send shares the request budget ---
+
+test("the deposit-ingest booking passes its deadline into the payment send", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const { sendQBPaymentCreateRequest } = await import("../src/lib/quickbooks");
+
+    // Codex gate: the initial booking built its request under the shared
+    // budget but then sent it without one, so the third and most important
+    // serial call - the one that moves money - ran unbounded.
+    const spent = createRouteDeadline(2_000, Date.now() - 12_000);
+    let calls = 0;
+    const countingFetch = (async () => {
+        calls++;
+        return new Response(JSON.stringify({ Payment: { Id: "p1", TotalAmt: 100 } }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        });
+    }) as unknown as typeof fetch;
+
+    const error = await withFetch(countingFetch, () =>
+        sendQBPaymentCreateRequest(TOKENS, JSON.stringify({ TotalAmt: 100 }), "req-1", spent),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(isQBBudgetExhaustedError(error), `got ${error?.name}: ${error?.message}`);
+    assert.equal(calls, 0, "an exhausted budget must not issue the payment create");
+});
+
+test("the payment send succeeds normally when there is budget left", async () => {
+    const { createRouteDeadline, sendQBPaymentCreateRequest } = await import("../src/lib/quickbooks");
+    const okFetch = (async () =>
+        new Response(JSON.stringify({ Payment: { Id: "p9", TotalAmt: 250 } }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+
+    const sent = await withFetch(okFetch, () =>
+        sendQBPaymentCreateRequest(TOKENS, JSON.stringify({ TotalAmt: 250 }), "req-2", createRouteDeadline(30_000)),
+    );
+    assert.deepEqual(sent, { paymentId: "p9", amount: 250 });
+});
+
+
+// --- A failed 401 refresh must not be swallowed ---
+
+test("typed refresh failures propagate from the attachment 401 retry", async () => {
+    const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
+    const { QBTimeoutError, QboRetryableError, QBTokenStrandedError } = await import("../src/lib/quickbooks");
+    const { QBTokenPersistenceError } = await import("../src/lib/quickbooks-payments");
+
+    // Codex gate: `.catch(() => null)` made a QBO outage, a stranded token and
+    // a persistence failure all look like an ordinary 401, hiding the one
+    // thing a human needs to act on.
+    const unauthorized = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
+    for (const error of [
+        new QBTimeoutError("refresh timed out"),
+        new QboRetryableError("503 from Intuit", 503),
+        new QBTokenStrandedError("ECONNRESET"),
+        new QBTokenPersistenceError(),
+    ]) {
+        const thrown = await withFetch(unauthorized, () =>
+            defaultUploadAttachment(TOKENS, "99", uploadFile, async () => { throw error; }),
+        ).then(() => null, (e: unknown) => e as Error);
+        assert.equal(thrown?.name, error.name, `${error.name} was swallowed`);
+    }
+});
+
+test("an ordinary refresh failure still degrades to the plain 401 outcome", async () => {
+    const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
+    const unauthorized = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
+    const thrown = await withFetch(unauthorized, () =>
+        defaultUploadAttachment(TOKENS, "99", uploadFile, async () => { throw new Error("not connected"); }),
+    ).then(() => null, (e: unknown) => e as Error);
+    // The 401 survived — a credential refusal, but not masquerading as a token error.
+    assert.equal(thrown?.name, "QboAttachmentAuthError");
+});
+
+// --- The recovery lookup's 401 retry matches the upload branch exactly ---
+
+test("typed refresh failures propagate from the attachment LOOKUP 401 retry too", async () => {
+    const { QboHttpError, QBTimeoutError, QboRetryableError, QBTokenStrandedError } = await import("../src/lib/quickbooks");
+    const { QBTokenPersistenceError } = await import("../src/lib/quickbooks-payments");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    // Codex gate: the upload branch preserved these; the existing-purchase
+    // recovery branch still swallowed them, so the same outage read as an
+    // ordinary 401 depending on which call happened to hit it first.
+    for (const error of [
+        new QBTimeoutError("refresh timed out"),
+        new QboRetryableError("503 from Intuit", 503),
+        new QBTokenStrandedError("ECONNRESET"),
+        new QBTokenPersistenceError(),
+    ]) {
+        const { deps } = createDeps({
+            existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+            attachableQueryImpl: async () => {
+                throw new QboHttpError("QB query failed (401)", 401);
+            },
+        });
+        deps.refreshTokensFn = async () => { throw error; };
+        const thrown = await createQBReceiptPurchase(TOKENS, input, deps).then(
+            () => null,
+            (e: unknown) => e as Error,
+        );
+        assert.equal(thrown?.name, error.name, `${error.name} was swallowed by the lookup branch`);
+    }
+});
+
+// ─── Route: a bad CREDENTIAL is not a bad receipt ──────────────────────────
+
+test("route: QBO 401/403 is qbo-auth 503, not a terminal qbo-fault", async () => {
+    // The 4xx-is-terminal rule is right for a business refusal and wrong for
+    // this one: nothing is wrong with the receipt, the connection is broken.
+    // Answering 200 qbo-fault told the bot to give up and book by email, for
+    // every receipt, silently, until somebody noticed.
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    for (const status of [401, 403]) {
+        const events: AutomationEventInput[] = [];
+        const { POST } = createRouteHandlers({
+            createPurchase: async () => {
+                throw new QboHttpError(`QB purchase create failed (${status})`, status);
+            },
+            logEvent: event => { events.push(event); },
+        });
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+            method: "POST",
+            body: validBody(),
+            headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+        }));
+        assert.equal(response.status, 503, `status ${status}`);
+        assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
+        assert.equal(events.length, 1);
+        assert.equal(events[0].status, "error", "an error event is what puts it in the digest");
+        assert.equal(events[0].reason, "qbo-auth");
+    }
+});
+
+test("route: a vendor/purchase 401/403 fault is qbo-auth, not a business fault", async () => {
+    // Round 29 gate: QboPurchaseFaultError is a business-rule-shaped error, not
+    // a plain QboHttpError, so qboHttpStatus() cannot see its status. A 401/403
+    // fault used to read as a repeating business refusal (qbo-fault, terminal)
+    // and park the receipt instead of retrying once QuickBooks reconnects.
+    for (const status of [401, 403]) {
+        const events: AutomationEventInput[] = [];
+        const { POST } = createRouteHandlers({
+            createPurchase: async () => {
+                throw new QboPurchaseFaultError(status, `QB purchase create failed: ${status}`, "3200");
+            },
+            logEvent: event => { events.push(event); },
+        });
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+            method: "POST",
+            body: validBody(),
+            headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+        }));
+        assert.equal(response.status, 503, `status ${status}`);
+        assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
+        assert.equal(events[0].reason, "qbo-auth");
+    }
+});
+
+test("route: an attachment 401/403 credential refusal is qbo-auth, not qbo-unavailable or a terminal fault", async () => {
+    // Round 29 gate: the attachment path's 401 came back as a generic
+    // QboRetryableError (read as qbo-unavailable, an outage) and its 403 as a
+    // terminal `failed:403` on ok:true (the Apps Script stops resending). Both
+    // are actually the same broken connection the purchase-create path already
+    // recognizes.
+    const { QboAttachmentAuthError } = await import("../src/lib/qbo-receipt-push");
+    for (const status of [401, 403]) {
+        const events: AutomationEventInput[] = [];
+        const { POST } = createRouteHandlers({
+            createPurchase: async () => {
+                throw new QboAttachmentAuthError(status, `QB attachment upload rejected the credential (status ${status})`);
+            },
+            logEvent: event => { events.push(event); },
+        });
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+            method: "POST",
+            body: validBody(),
+            headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+        }));
+        assert.equal(response.status, 503, `status ${status}`);
+        assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
+        assert.equal(events[0].reason, "qbo-auth");
+    }
+});
+
+test("route: a token refresh that strands or cannot be saved is qbo-auth too", async () => {
+    const { QBTokenStrandedError } = await import("../src/lib/quickbooks");
+    const { QBTokenPersistenceError } = await import("../src/lib/quickbooks-payments");
+    for (const error of [new QBTokenStrandedError("HTTP 500"), new QBTokenPersistenceError()]) {
+        const events: AutomationEventInput[] = [];
+        const { POST } = createRouteHandlers({
+            getFreshTokens: async () => {
+                throw error;
+            },
+            logEvent: event => { events.push(event); },
+        });
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+            method: "POST",
+            body: validBody(),
+            headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+        }));
+        assert.equal(response.status, 503, error.name);
+        assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
+        assert.equal(events[0].reason, "qbo-auth");
+    }
+});
+
+test("route: a genuine business 4xx is still terminal", async () => {
+    // The guard above must not swallow the case it was carved out of.
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const events: AutomationEventInput[] = [];
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => {
+            throw new QboHttpError("QB vendor create failed (400): closed period", 400);
+        },
+        logEvent: event => { events.push(event); },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: false, reason: "qbo-fault", detail: "400" });
+    assert.equal(events[0].status, "fallback");
+});
+
+// ─── Concurrent deliveries of the same receipt ──────────────────────────────
+
+test("two simultaneous pushes of one file upload the attachment ONCE and agree on the purchase id", async () => {
+    // Round 34 gate: without mutual exclusion both requests miss the opening
+    // DocNumber lookup (neither has committed), both call create — QBO
+    // de-duplicates on `requestid` and hands BOTH the same Purchase — and both
+    // then upload the receipt unconditionally, because the
+    // deterministic-FileName check only runs on the `alreadyExists` path. The
+    // Purchase ends up carrying the same image twice.
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    // One shared QuickBooks: a Purchase store that is idempotent on requestid,
+    // and an Attachable store the deterministic-FileName check reads back.
+    let purchase: { Id: string; PrivateNote: string } | null = null;
+    const seenRequestIds = new Set<string>();
+    const attachables: Array<Record<string, unknown>> = [];
+    const uploads: Array<{ purchaseId: string; fileName: string }> = [];
+
+    const qbCreateImpl: QboReceiptPushDependencies["qbCreateFn"] = async (_t, payload, requestId) => {
+        seenRequestIds.add(requestId);
+        // QBO's own idempotency: a repeat requestid returns the SAME Purchase.
+        if (!purchase) purchase = { Id: "77", PrivateNote: String(payload.PrivateNote) };
+        return { id: purchase.Id };
+    };
+    const shared = {
+        existingRowsImpl: () => (purchase ? [purchase] : []),
+        attachableQueryImpl: async () => attachables,
+        qbCreateImpl,
+        uploadAttachment: (async (_t: unknown, purchaseId: string, file: { fileName: string }) => {
+            uploads.push({ purchaseId, fileName: file.fileName });
+            attachables.push(attachableRow(purchaseId, file.fileName));
+            return "attached" as ReceiptAttachmentStatus;
+        }) as QboReceiptPushDependencies["uploadAttachment"],
+    };
+
+    const { lock, order } = createFileLock();
+    const a = createDeps({ ...shared, withFileLock: lock });
+    const b = createDeps({ ...shared, withFileLock: lock });
+
+    const [first, second] = await Promise.all([
+        createQBReceiptPurchase(TOKENS, input, a.deps),
+        createQBReceiptPurchase(TOKENS, input, b.deps),
+    ]);
+
+    assert.equal(order.length, 2, "both deliveries went through the per-file lock");
+    assert.equal(uploads.length, 1, "the receipt image is uploaded exactly once");
+    // The uploaded name is this branch's STABLE one (fileId-derived), not the
+    // caller's raw "receipt.jpg"  see the collision test above.
+    assert.deepEqual(uploads[0], {
+        purchaseId: "77",
+        fileName: stableAttachmentFileName(input.fileId, input.fileName),
+    });
+    assert.equal(first.ok && first.qbPurchaseId, "77");
+    assert.equal(second.ok && second.qbPurchaseId, "77");
+    // One of the two ran first and created; the other found the committed
+    // Purchase and took the already-exists path, which re-checked by filename.
+    const flags = [first.ok && first.alreadyExists, second.ok && second.alreadyExists].sort();
+    assert.deepEqual(flags, [false, true]);
+    const attachmentResults = [
+        first.ok ? first.attachment : null,
+        second.ok ? second.attachment : null,
+    ].sort();
+    assert.deepEqual(attachmentResults, ["already-attached", "attached"]);
+    assert.equal(seenRequestIds.size, 1, "both callers use the same QBO idempotency key");
+    // The marker is what proves the found Purchase is ours, not a DocNumber collision.
+    assert.ok(purchase && String((purchase as any).PrivateNote).includes(marker));
+});
+
+test("the push cannot run outside the per-file lock", async () => {
+    // The lock is only an invariant if there is no way round it: the
+    // implementation must not be exported, and the exported entry point must
+    // take the lease before doing anything else.
+    const mod: Record<string, unknown> = await import("../src/lib/qbo-receipt-push");
+    assert.equal(mod.createQBReceiptPurchaseUnderLock, undefined, "the unlocked implementation must stay private");
+
+    const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/qbo-receipt-push.ts", "utf8"));
+    const entry = src.slice(
+        src.indexOf("export async function createQBReceiptPurchase("),
+        src.indexOf("async function createQBReceiptPurchaseUnderLock("),
+    );
+    assert.match(entry, /withFileLock\(input\.fileId, \(\) => createQBReceiptPurchaseUnderLock\(/);
+});
+
+test("round 35 gate: no database transaction wraps any QuickBooks call in the push", async () => {
+    // The defect: `defaultWithReceiptFileLock` held `pg_advisory_xact_lock`
+    // inside ONE interactive transaction for the whole lookup→create→attach —
+    // up to 55 seconds of a pooled connection spanning several Intuit HTTP
+    // round trips, while the callback's own Prisma reads needed connections
+    // from that same pool. During an outage, when every push runs to its full
+    // deadline, concurrent receipts starve the pool and take unrelated requests
+    // down with them. A source assertion, because the property being protected
+    // is structural: there must be NO transaction here at all.
+    const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/qbo-receipt-push.ts", "utf8"));
+    assert.doesNotMatch(src, /\$transaction\(/, "nothing in the push may hold a transaction across QBO I/O");
+    assert.doesNotMatch(src, /pg_advisory_xact_lock\(/, "the transaction-scoped advisory lock is gone");
+    assert.doesNotMatch(src, /pg_advisory_lock\(/, "a session-level lock does not survive pgbouncer transaction pooling");
+    // Every lease store method is a single statement in its own implicit
+    // transaction — acquire, then release, with the QBO work in between.
+    assert.match(src, /export async function withReceiptFileLease</);
+});
+
+/**
+ * In-memory stand-in for the `AutomationSetting` row the lease lives in.
+ * `create` collides exactly the way the primary key does, which is the branch
+ * the acquire loop pivots on.
+ */
+function memoryLeaseStore(seed?: Record<string, string>) {
+    const rows = new Map<string, string>(Object.entries(seed ?? {}));
+    const store: ReceiptLeaseStore = {
+        async create(key, value) {
+            if (rows.has(key)) {
+                const collision = new Error("Unique constraint failed on the fields: (`key`)") as Error & { code?: string };
+                collision.code = "P2002";
+                throw collision;
+            }
+            rows.set(key, value);
+        },
+        async read(key) {
+            return rows.get(key) ?? null;
+        },
+        async swap(key, expected, value) {
+            if (rows.get(key) !== expected) return false;
+            rows.set(key, value);
+            return true;
+        },
+        async release(key, expected) {
+            if (rows.get(key) === expected) rows.delete(key);
+        },
+    };
+    return { rows, store };
+}
+
+const LEASE_KEY_PREFIX = "qbo-receipt-push.lease:";
+
+test("round 35 gate: two simultaneous pushes take the REAL lease — one upload, and the loser takes the re-check path", async () => {
+    // Same guarantee the advisory lock gave, now from a durable CAS lease that
+    // holds no connection across the QuickBooks calls. The loser does NOT skip:
+    // it waits, then finds the committed Purchase and re-checks the attachment
+    // by deterministic FileName.
+    const { withReceiptFileLease } = await import("../src/lib/qbo-receipt-push");
+    const input = baseInput({ ...FILE_INPUT });
+
+    let purchase: { Id: string; PrivateNote: string } | null = null;
+    const attachables: Array<Record<string, unknown>> = [];
+    const uploads: Array<{ purchaseId: string; fileName: string }> = [];
+    const shared = {
+        existingRowsImpl: () => (purchase ? [purchase] : []),
+        attachableQueryImpl: async () => attachables,
+        qbCreateImpl: (async (_t: unknown, payload: Record<string, unknown>) => {
+            if (!purchase) purchase = { Id: "77", PrivateNote: String(payload.PrivateNote) };
+            return { id: purchase.Id };
+        }) as QboReceiptPushDependencies["qbCreateFn"],
+        uploadAttachment: (async (_t: unknown, purchaseId: string, file: { fileName: string }) => {
+            uploads.push({ purchaseId, fileName: file.fileName });
+            attachables.push(attachableRow(purchaseId, file.fileName));
+            return "attached" as ReceiptAttachmentStatus;
+        }) as QboReceiptPushDependencies["uploadAttachment"],
+    };
+
+    const { rows, store } = memoryLeaseStore();
+    const entered: string[] = [];
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const lock: ReceiptFileLock = (fileId, run) =>
+        withReceiptFileLease(
+            fileId,
+            () => {
+                entered.push(fileId);
+                concurrent++;
+                maxConcurrent = Math.max(maxConcurrent, concurrent);
+                return run().finally(() => { concurrent--; });
+            },
+            undefined,
+            // A real (short) timer, so the winner's work actually gets to run
+            // between the loser's polls instead of starving it on microtasks.
+            { store, sleep: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, Math.min(ms, 5))) },
+        );
+
+    const [first, second] = await Promise.all([
+        createQBReceiptPurchase(TOKENS, input, createDeps({ ...shared, withFileLock: lock }).deps),
+        createQBReceiptPurchase(TOKENS, input, createDeps({ ...shared, withFileLock: lock }).deps),
+    ]);
+
+    assert.equal(entered.length, 2, "both deliveries ran");
+    assert.equal(maxConcurrent, 1, "but never at the same time");
+    assert.equal(uploads.length, 1, "the receipt image is uploaded exactly once");
+    assert.equal(first.ok && first.qbPurchaseId, "77");
+    assert.equal(second.ok && second.qbPurchaseId, "77");
+    const flags = [first.ok && first.alreadyExists, second.ok && second.alreadyExists].sort();
+    assert.deepEqual(flags, [false, true], "the loser took the already-exists re-check path");
+    assert.equal(rows.size, 0, "and both released their lease on the way out");
+});
+
+test("round 35 gate: a crashed holder's lease expires and the next push proceeds", async () => {
+    // The cost of trading a transaction-scoped lock for a durable claim: a
+    // killed process leaves its row behind. The TTL is what stops that from
+    // blocking the receipt forever.
+    const { withReceiptFileLease } = await import("../src/lib/qbo-receipt-push");
+    const key = `${LEASE_KEY_PREFIX}stranded-file`;
+    const dead = JSON.stringify({ t: "crashed-worker", x: Date.now() - 1 });
+    const { rows, store } = memoryLeaseStore({ [key]: dead });
+
+    let ran = false;
+    const result = await withReceiptFileLease("stranded-file", async () => { ran = true; return "done"; }, undefined, { store });
+
+    assert.equal(result, "done");
+    assert.equal(ran, true, "the expired claim did not block the next push");
+    assert.notEqual(rows.get(key), dead, "and it was taken over by CAS, not ignored");
+    assert.equal(rows.size, 0, "then released");
+});
+
+test("round 35 gate: a LIVE holder is waited for, and a loser that runs out of wait is retryable, not terminal", async () => {
+    // Nothing is pushed: the winner is mid-create, so the only correct answer
+    // is "come back", never the terminal ok:false fallback the deterministic
+    // outcomes take.
+    const { withReceiptFileLease, isReceiptPushInProgressError, RECEIPT_FILE_LEASE_MAX_WAIT_MS } =
+        await import("../src/lib/qbo-receipt-push");
+    const key = `${LEASE_KEY_PREFIX}busy-file`;
+    let clock = 1_000_000;
+    const held = JSON.stringify({ t: "the-winner", x: clock + 10 * 60_000 });
+    const { rows, store } = memoryLeaseStore({ [key]: held });
+
+    let ran = false;
+    await assert.rejects(
+        () => withReceiptFileLease("busy-file", async () => { ran = true; return 1; }, undefined, {
+            store,
+            now: () => clock,
+            // Advancing the clock IS the sleep: the wait is bounded by
+            // RECEIPT_FILE_LEASE_MAX_WAIT_MS, so this terminates deterministically.
+            sleep: async (ms: number) => { clock += ms; },
+        }),
+        (e: unknown) => isReceiptPushInProgressError(e),
+    );
+    assert.equal(ran, false, "the push never started");
+    assert.equal(rows.get(key), held, "the live holder's claim is untouched");
+    assert.ok(clock - 1_000_000 >= RECEIPT_FILE_LEASE_MAX_WAIT_MS, "it really did wait the whole window first");
+});
+
+test("round 35 gate: the route answers a lease loser with a retryable 409, never a terminal fallback", async () => {
+    const { QBReceiptPushInProgressError } = await import("../src/lib/qbo-receipt-push");
+    const events: AutomationEventInput[] = [];
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => { throw new QBReceiptPushInProgressError("file-1"); },
+        logEvent: event => { events.push(event); },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "push-in-progress" });
+    assert.equal(events[0].reason, "push-in-progress");
+});
+

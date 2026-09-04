@@ -155,22 +155,29 @@ export default function TimeClockClient({
     const totalHours = useMemo(() => sortedEntries.reduce((s, e) => s + (e.durationHours || 0), 0), [sortedEntries]);
     const totalCost = useMemo(() => sortedEntries.reduce((s, e) => s + (e.laborCost || 0), 0), [sortedEntries]);
 
+    // A legacy flat-cost row: zero hours carrying a hand-typed cost. The editor
+    // prices from hours x stored rate, so opening one and saving would reprice
+    // it to $0 and destroy a real recorded cost. Read-only until somebody
+    // converts it deliberately; the server refuses these too.
+    const isLegacyUnitEntry = (entry: TimeEntryDetailed) =>
+        !(entry.durationHours && entry.durationHours > 0) && entry.laborCost != null && entry.laborCost !== 0;
+
     const openModal = (entry?: TimeEntryDetailed) => {
         if (entry) {
+            if (isLegacyUnitEntry(entry)) {
+                toast.error(
+                    "This is a legacy flat-cost entry. Editing it would reprice it from hours it does not have — delete it and re-enter the time."
+                );
+                return;
+            }
             setEditId(entry.id);
             setSelectedUserId(entry.userId);
             setSelectedCostCodeId(entry.costCodeId || "");
             const d = new Date(entry.startTime);
             setDate(d.toISOString().split('T')[0]);
-            if (entry.durationHours === 0 && entry.laborCost !== null) {
-                setEntryType("unit");
-                setManualCost(entry.laborCost.toString());
-                setHours("");
-            } else {
-                setEntryType("hourly");
-                setHours(entry.durationHours != null ? parseFloat(entry.durationHours.toFixed(2)).toString() : "");
-                setManualCost("");
-            }
+            setEntryType("hourly");
+            setHours(entry.durationHours != null ? parseFloat(entry.durationHours.toFixed(2)).toString() : "");
+            setManualCost("");
         } else {
             setEditId(null);
             setSelectedUserId(currentUser.id);
@@ -189,23 +196,16 @@ export default function TimeClockClient({
         e.preventDefault();
         setIsSubmitting(true);
         try {
-            const selectedUser = teamMembers.find(u => u.id === selectedUserId);
-            let duration = 0;
-            let cost = 0;
-            if (entryType === "hourly") {
-                duration = parseFloat(hours) || 0;
-                cost = duration * (selectedUser?.hourlyRate || 0);
-            } else {
-                duration = 0;
-                cost = parseFloat(manualCost) || 0;
-            }
+            // Cost is NOT sent. The server derives it from the member's stored
+            // rates — a server action's arguments are an HTTP body, so any cost
+            // posted from here could be anything, against anyone, and it landed
+            // straight in payroll and job costing.
             const payload = {
                 projectId: project.id,
                 userId: selectedUserId,
                 costCodeId: selectedCostCodeId || null,
                 date,
-                durationHours: duration,
-                laborCost: cost
+                durationHours: parseFloat(hours) || 0,
             };
             if (editId) {
                 await updateTimeEntry(editId, payload);
@@ -491,11 +491,17 @@ export default function TimeClockClient({
                                     <button
                                         type="button"
                                         onClick={() => setEntryType("unit")}
-                                        className={`py-2 px-3 rounded-lg text-sm font-medium border transition ${entryType === "unit" ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-white border-slate-200 text-slate-500 hover:border-slate-300"}`}
+                                        disabled
+                                        title="Flat-cost entries are paused: the cost used to be typed here and sent straight to payroll. Ask Justin if you need this back — it needs a rate the server can verify."
+                                        className={`py-2 px-3 rounded-lg text-sm font-medium border transition opacity-40 cursor-not-allowed ${entryType === "unit" ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-white border-slate-200 text-slate-500"}`}
                                     >
                                         📦 Unit / Fixed
                                     </button>
                                 </div>
+                                {/* The flat-cost ("unit") mode is disabled above: it posted a
+                                    caller-chosen laborCost, which the server no longer accepts.
+                                    The UI is left in place rather than deleted so the decision is
+                                    visible — see the note on the button. */}
                                 {entryType === "hourly" ? (
                                     <div>
                                         <label className="block text-sm font-semibold text-hui-textMain mb-1">Hours Worked</label>

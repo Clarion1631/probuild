@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserWithPermissions, isAdminOrManager } from "@/lib/permissions";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
-import { skippedAuditSummary, syncQboExpenses } from "@/lib/qbo-expense-sync";
+import { skippedAuditSummary, syncQboExpenses, QBO_EXPENSE_SYNC_BUDGET_MS } from "@/lib/qbo-expense-sync";
+import { createRouteDeadline } from "@/lib/quickbooks";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 
@@ -39,7 +40,10 @@ export async function POST() {
     const since = new Date(Date.now() - lookbackDays() * 86_400_000);
     const source = `manual:${user.id}`;
     try {
-        const tokens = await getFreshQBTokens();
+        // At entry, before the refresh: the refresh is itself a QBO round trip
+        // on this route's ceiling.
+        const deadline = createRouteDeadline(QBO_EXPENSE_SYNC_BUDGET_MS);
+        const tokens = await getFreshQBTokens(deadline);
         const result = await syncQboExpenses(
             {
                 since,
@@ -47,7 +51,7 @@ export async function POST() {
                 overheadProjectId: process.env.QBO_EXPENSE_OVERHEAD_PROJECT_ID || undefined,
             },
             undefined,
-            { tokens },
+            { tokens, deadline },
         );
         const counts = {
             imported: result.imported,
@@ -61,13 +65,24 @@ export async function POST() {
             attributionRaceSkipped: result.attributionRaceSkipped,
             skipped: result.skipped.length,
         };
+        // A run that could not land every receipt did not finish cleanly.
+        const incomplete = result.attachmentsIncomplete === true;
         await logAutomationEvent({
             kind: "qbo-sync",
-            status: "ok",
+            status: incomplete ? "partial" : "ok",
+            reason: incomplete ? "attachments-incomplete" : undefined,
             source,
             detail: { mode: "incremental", since: since.toISOString().slice(0, 10), imported: result.imported, updated: result.updated, deactivated: result.removed, attributionRaceSkipped: result.attributionRaceSkipped, by: user.name || user.email || undefined, ...skippedAuditSummary(result.skipped) },
         });
-        return NextResponse.json({ ok: true, ...counts });
+        return NextResponse.json({
+            // A run that left receipts unlanded did not finish cleanly, and the
+            // Command Center must not show it as a clean pass.
+            ok: !incomplete,
+            ...(incomplete
+                ? { reason: "attachments-incomplete", attachmentsSkipped: result.attachmentsSkipped ?? 0 }
+                : {}),
+            ...counts,
+        });
     } catch (error) {
         if (error instanceof QBNotConnectedError) {
             await logAutomationEvent({ kind: "qbo-sync", status: "error", reason: "quickbooks-not-connected", source });

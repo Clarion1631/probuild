@@ -1235,14 +1235,38 @@ test.describe.serial("gated server actions reject an unauthenticated caller for 
   // separates "the guard threw" from "the request never dispatched an action at
   // all". Pin it here so that distinction cannot rot silently.
   test("an unknown action id is refused distinguishably, so the denials below mean something", async ({ playwright }) => {
+    // The property this control exists for: a DENIAL must be tellable from
+    // Next saying "I have never heard of that action id". Without it a typo in
+    // an action id would look exactly like a successful defence and every test
+    // below would pass while proving nothing.
+    //
+    // There are now TWO layers that can refuse, and both are asserted here.
     const anonymous = await playwright.request.newContext({ storageState: undefined });
     try {
-      const result = await invokeServerAction(anonymous, {
+      // OUTER: with no session evidence at all the proxy refuses at the edge,
+      // before Next ever sees the id (src/proxy.ts). It says which refusal it
+      // is rather than returning a bare 403 that could be mistaken for an
+      // action's own authorization error.
+      const blocked = await invokeServerAction(anonymous, {
         actionId: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef00",
         args: [],
       });
-      expect(result.status).toBe(404);
-      expect(result.body).toContain("Server action not found");
+      expect(blocked.status).toBe(403);
+      expect(blocked.body).toContain("server-action-blocked");
+
+      // INNER: past that layer, Next still answers the unknown-id case in its
+      // own distinguishable way — which is what makes the denials below
+      // meaningful, because they are NOT this.
+      const unknown = await invokeServerAction(anonymous, {
+        actionId: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef00",
+        args: [],
+        portalCookie: true,
+      });
+      expect(unknown.status).toBe(404);
+      expect(unknown.body).toContain("Server action not found");
+
+      // And the two are genuinely different answers, which is the whole point.
+      expect(blocked.status).not.toBe(unknown.status);
     } finally {
       await anonymous.dispose();
     }
@@ -1257,11 +1281,25 @@ test.describe.serial("gated server actions reject an unauthenticated caller for 
     {
       label: "anonymous",
       forgedCookie: false,
-      // No cookie REACHES the action, because src/proxy.ts only interrogates
-      // cookie-bearing requests. Next renders a thrown Server Action as a 500
-      // carrying a React Flight error frame (`1:E{"digest":...}`), so this is
-      // the in-action guard — assertContractContextAccess / assertActiveStaff —
-      // observably firing, not an edge redirect.
+      // Carries a portal session cookie so the request REACHES the action.
+      //
+      // It used to carry nothing: the proxy only interrogated cookie-bearing
+      // requests, so a bare dispatch sailed through to Next. Round 49 closed
+      // that — an action id is a public build artefact, not an authorization
+      // token, so a dispatch with no session evidence at all is now refused at
+      // the edge. Leaving this variant cookieless would therefore assert
+      // nothing about the ACTION: it would be stopped by the proxy and pass
+      // even if every gate below were deleted.
+      //
+      // The cookie is not a valid token. The proxy checks presence (it cannot
+      // verify a JWT at the edge); `resolveSessionClientId` and the staff
+      // gates do the real work and refuse it. Past the outer layer, refused by
+      // the inner one — which is exactly what this variant is for.
+      portalCookie: true,
+      // Next renders a thrown Server Action as a 500 carrying a React Flight
+      // error frame (`1:E{"digest":...}`), so this is the in-action guard —
+      // assertContractContextAccess / assertActiveStaff — observably firing,
+      // not an edge refusal.
       assertRejected: (result: { status: number; body: string }) => {
         expect(result.status, "the action should have run and thrown").toBe(500);
         expect(result.body, "expected a Flight error frame from the thrown guard")
@@ -1282,7 +1320,7 @@ test.describe.serial("gated server actions reject an unauthenticated caller for 
     },
   ];
 
-  for (const { label, forgedCookie, assertRejected } of DENIAL_VARIANTS) {
+  for (const { label, forgedCookie, portalCookie, assertRejected } of DENIAL_VARIANTS) {
     test(`createContractFromTemplate writes nothing for a ${label} caller`, async ({ playwright }) => {
       const anonymous = await playwright.request.newContext({ storageState: undefined });
       try {
@@ -1292,6 +1330,7 @@ test.describe.serial("gated server actions reject an unauthenticated caller for 
           actionId: resolveServerActionId("createContractFromTemplate"),
           args: [TEMPLATE_ID, { type: "project", id: PROJECT_ID }, DENIED_TEMPLATE_TITLE],
           forgedCookie,
+          portalCookie,
         });
 
         assertRejected(result);
@@ -1318,6 +1357,7 @@ test.describe.serial("gated server actions reject an unauthenticated caller for 
             "<p>nope</p>",
           ],
           forgedCookie,
+          portalCookie,
         });
 
         assertRejected(result);
@@ -1340,6 +1380,7 @@ test.describe.serial("gated server actions reject an unauthenticated caller for 
           actionId: resolveServerActionId("convertLeadToProject"),
           args: [DENIED_LEAD_ID],
           forgedCookie,
+          portalCookie,
         });
 
         assertRejected(result);

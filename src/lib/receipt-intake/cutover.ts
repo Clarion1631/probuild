@@ -132,3 +132,105 @@ export function triageCutoverRows(
     }
     return triage;
 }
+
+/**
+ * A candidate PLUS the row state the verdict about it was reached against.
+ *
+ * The triage above only needs the identity fields; these are the ones the write
+ * has to prove are still true when it lands.
+ */
+export interface CutoverRow extends CutoverCandidate {
+    state: string;
+    stateReason: string | null;
+    dryRun: boolean;
+    /**
+     * Pinned at whatever was OBSERVED, not required to be null.
+     *
+     * A shadow-parked row is excluded from the claim entirely
+     * (eligibleClaimWhere's NOT clause), so no live worker can be holding one
+     * on the pass that runs the cutover — any token still on it is a leftover
+     * from a pass that died during the shadow week. Demanding null would
+     * therefore hide such a row from the cutover FOREVER: nothing can re-claim
+     * it to release the token, so it would never be retired, requeued or
+     * quarantined, and nobody would be told. Pinning the observed value still
+     * catches a claim taken after the select, which is the race that matters.
+     */
+    claimToken: string | null;
+}
+
+export interface CutoverWriteClient {
+    updateMany(args: {
+        where: Record<string, unknown>;
+        data: Record<string, unknown>;
+    }): Promise<{ count: number }>;
+}
+
+export interface CutoverMove {
+    /** Rows the verdict actually landed on. */
+    moved: number;
+    /** Rows that changed under us between the select and the write. */
+    skippedMoved: number;
+}
+
+/**
+ * APPLY ONE CUTOVER VERDICT, FENCED ON THE ROW IT WAS DECIDED ABOUT.
+ *
+ * The three cutover writes used to constrain nothing but `id: { in: [...] }`.
+ * The candidates are read in the same transaction, but READ COMMITTED means a
+ * concurrent writer that never touches the claim's advisory lock — an admin
+ * review, a future queue UI, a late completion — can still move a row in the
+ * gap between that SELECT and these UPDATEs. The verdict then landed on a row
+ * it was never computed for: a human's review was overwritten with
+ * SHADOW_DONE or SHADOW_QUARANTINE, or `dryRun: false` handed a row to v2 that
+ * somebody had just parked. Every one of those is terminal and none of them is
+ * visible afterwards.
+ *
+ * So each write re-asserts the WHOLE predicate the row was selected by
+ * (`dryRun: true`, one of the parked states) plus the exact evidence the
+ * verdict was reached on: that row's own `state`, `stateReason` and
+ * `claimToken`. A row that moved matches nothing, is counted as
+ * `skippedMoved`, and simply comes back round on the next pass — where it will
+ * be triaged against whatever it looks like then.
+ *
+ * Grouped by the observed (state, stateReason, claimToken) rather than issued
+ * per row: the shadow backlog is the whole of a week and this runs inside the claim
+ * transaction, so one statement per distinct observed state is the difference
+ * between a handful of round trips and hundreds.
+ */
+export async function applyCutoverVerdict(
+    rows: CutoverRow[],
+    data: Record<string, unknown>,
+    db: CutoverWriteClient,
+): Promise<CutoverMove> {
+    type Group = { state: string; stateReason: string | null; claimToken: string | null; ids: string[] };
+    const groups = new Map<string, Group>();
+    for (const row of rows) {
+        // JSON, so two different observations can never collapse into one
+        // group and be written under each other's fence.
+        const key = JSON.stringify([row.state, row.stateReason, row.claimToken]);
+        const group = groups.get(key)
+            ?? { state: row.state, stateReason: row.stateReason, claimToken: row.claimToken, ids: [] };
+        group.ids.push(row.id);
+        groups.set(key, group);
+    }
+
+    let moved = 0;
+    let skippedMoved = 0;
+    for (const group of groups.values()) {
+        const { count } = await db.updateMany({
+            where: {
+                id: { in: group.ids },
+                // The parked predicate the candidates were SELECTED by...
+                dryRun: true,
+                // ...and the exact evidence this verdict was reached on.
+                state: group.state,
+                stateReason: group.stateReason,
+                claimToken: group.claimToken,
+            },
+            data,
+        });
+        moved += count;
+        skippedMoved += group.ids.length - count;
+    }
+    return { moved, skippedMoved };
+}

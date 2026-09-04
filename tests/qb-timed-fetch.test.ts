@@ -51,6 +51,24 @@ before(async () => {
             setTimeout(() => res.destroy(), 30);
             return;
         }
+        if (req.url?.startsWith("/v3/company/errstall")) {
+            // A non-2xx whose ERROR body never finishes arriving.
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.write('{"Fault":');
+            held.push(() => res.destroy());
+            return;
+        }
+        if (req.url?.startsWith("/v3/company/errreset")) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.write('{"Fault":');
+            setTimeout(() => res.destroy(), 30);
+            return;
+        }
+        if (req.url?.startsWith("/v3/company/plain-400")) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end('{"error":"invalid_grant"}');
+            return;
+        }
         if (req.url?.startsWith("/v3/company/slow")) {
             // Each call costs real time, so a sequence of them accumulates.
             setTimeout(() => {
@@ -484,3 +502,182 @@ test("CUMULATIVE latency: serial calls stop before the route ceiling", async () 
     assert.ok(elapsed < CEILING_MS, `ran ${elapsed}ms, past the ${CEILING_MS}ms ceiling`);
     assert.ok(calls > 1, "should have made several calls before stopping");
 });
+
+// --- The route budget reaches the LATE calls of ensureQBCustomer ---
+
+/**
+ * ensureQBCustomer accepted a RouteDeadline but passed it to none of its four
+ * QBO calls, so the stored-id check, the exact-name lookup, the LIKE-prefix
+ * scan and the create each opened a fresh 20s window. Four of those in series
+ * outlive any route ceiling, which is how a receipt push got killed mid-write.
+ *
+ * These use a stubbed global fetch rather than the local server above: the URL
+ * is built from QB_API_BASE inside the module, so it cannot be pointed here.
+ * (That is not the `mock.module` hazard — no module identity is replaced.)
+ *
+ * Each test spends the budget INSIDE the preceding call, then asserts the next
+ * one is never issued. The no-deadline control in the same test is what makes
+ * that meaningful: without it the assertion would also pass on code that made
+ * no call at all.
+ */
+const CUSTOMER_TOKENS = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
+
+/** 1.4s of budget, spent by a 600ms call: the next call starts under the 1s floor. */
+const CUSTOMER_BUDGET_MS = 1_400;
+
+async function withFetch<T>(impl: typeof fetch, run: () => Promise<T>): Promise<T> {
+    const original = globalThis.fetch;
+    globalThis.fetch = impl;
+    try {
+        return await run();
+    } finally {
+        globalThis.fetch = original;
+    }
+}
+
+function customerFetchStub(options: { burnAtCall: number }) {
+    const urls: string[] = [];
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        urls.push(u);
+        if (urls.length === options.burnAtCall) {
+            await new Promise(resolve => setTimeout(resolve, 600));
+        }
+        if (u.includes("/query?query=")) {
+            // Every lookup misses, so the sequence always runs to the create.
+            return new Response(JSON.stringify({ QueryResponse: {} }), { status: 200 });
+        }
+        if (u.includes("/customer?") && init?.method === "POST") {
+            return new Response(JSON.stringify({ Customer: { Id: "cust-new" } }), { status: 200 });
+        }
+        throw new Error(`Unexpected fetch in test: ${u}`);
+    }) as unknown as typeof fetch;
+    return { impl, urls };
+}
+
+test("ensureQBCustomer: the stored-id trust check is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError, ensureQBCustomer } = await import("../src/lib/quickbooks");
+    const client = { name: "Mueller Remodel", qbCustomerId: "cust-stored" };
+
+    const spent = customerFetchStub({ burnAtCall: 99 });
+    // Budget started 10s ago with only 2s allowed: nothing left at entry.
+    const error = await withFetch(spent.impl, () =>
+        ensureQBCustomer(CUSTOMER_TOKENS, client, createRouteDeadline(2_000, Date.now() - 10_000)),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 0, "not one QBO call may start with no budget left");
+
+    const control = customerFetchStub({ burnAtCall: 99 });
+    assert.equal(await withFetch(control.impl, () => ensureQBCustomer(CUSTOMER_TOKENS, client)), "cust-new");
+    assert.match(decodeURIComponent(control.urls[0]), /WHERE Id = 'cust-stored'/);
+    assert.equal(control.urls.length, 4);
+});
+
+test("ensureQBCustomer: the candidate scan is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError, ensureQBCustomer } = await import("../src/lib/quickbooks");
+    const client = { name: "Mueller Remodel" };
+
+    const spent = customerFetchStub({ burnAtCall: 1 });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBCustomer(CUSTOMER_TOKENS, client, createRouteDeadline(CUSTOMER_BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 1, "the LIKE-prefix scan must not be issued");
+
+    const control = customerFetchStub({ burnAtCall: 1 });
+    assert.equal(await withFetch(control.impl, () => ensureQBCustomer(CUSTOMER_TOKENS, client)), "cust-new");
+    assert.equal(control.urls.length, 3);
+    assert.match(decodeURIComponent(control.urls[1]), /DisplayName LIKE 'Mueller%'/);
+});
+
+test("ensureQBCustomer: the create is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError, ensureQBCustomer } = await import("../src/lib/quickbooks");
+    const client = { name: "Mueller Remodel" };
+
+    const spent = customerFetchStub({ burnAtCall: 2 });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBCustomer(CUSTOMER_TOKENS, client, createRouteDeadline(CUSTOMER_BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 2, "no Customer may be created with no budget left");
+
+    const control = customerFetchStub({ burnAtCall: 2 });
+    assert.equal(await withFetch(control.impl, () => ensureQBCustomer(CUSTOMER_TOKENS, client)), "cust-new");
+    assert.equal(control.urls.length, 3);
+    assert.match(control.urls[2], /\/customer\?/);
+});
+
+// --- Reading the ERROR body is a body read too ---
+
+test("a stalled error body surfaces the timeout, not a tidy empty message", async () => {
+    const { qboResponseError, isQBTimeoutError } = await import("../src/lib/quickbooks");
+    // Codex gate: `.catch(() => "")` around res.text() swallowed a timeout or a
+    // dead socket while reading the ERROR body, turning an outage into
+    // "failed (400): " — status preserved, real failure lost.
+    const res = await qbTimedFetch(`${base}/v3/company/errstall`, {}, 150);
+    assert.equal(res.ok, false);
+
+    const outcome = await qboResponseError(res, "QB query").then(
+        (e) => ({ returned: e }),
+        (thrown: unknown) => ({ thrown }),
+    );
+    assert.ok("thrown" in outcome, `expected a throw, got ${String((outcome as { returned?: Error }).returned)}`);
+    assert.equal(isQBTimeoutError((outcome as { thrown: unknown }).thrown), true);
+});
+
+test("a reset error body is connection-level, not an empty message", async () => {
+    const { qboResponseError, isRetryableQboError } = await import("../src/lib/quickbooks");
+    const res = await qbTimedFetch(`${base}/v3/company/errreset`, {}, 5_000);
+    const outcome = await qboResponseError(res, "QB query").then(
+        (e) => ({ returned: e }),
+        (thrown: unknown) => ({ thrown }),
+    );
+    assert.ok("thrown" in outcome, "a dead socket must not resolve to an empty body");
+    assert.equal(isRetryableQboError((outcome as { thrown: unknown }).thrown), true);
+});
+
+test("an ordinary error body is still read into the message", async () => {
+    const { qboResponseError, qboHttpStatus } = await import("../src/lib/quickbooks");
+    const res = await qbTimedFetch(`${base}/v3/company/plain-400`, {}, 5_000);
+    const error = await qboResponseError(res, "QB query");
+    assert.equal(qboHttpStatus(error), 400);
+    assert.match(error.message, /invalid_grant/);
+});
+
+
+
+
+
+// --- An invoice create must actually return an invoice ---
+
+test("a 200 with no usable Invoice is ambiguous, never a silent link", async () => {
+    const { createQBMilestoneInvoice, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const { isAmbiguousCreateFailure } = await import("../src/lib/quickbooks-payments");
+    const TOKENS = { accessToken: "a", refreshToken: "r", realmId: "test-realm" };
+    const args = {
+        docNumber: "INV-1", idempotencyKey: "sched-1", customerId: "c1", itemId: "i1",
+        description: "d", amount: 100, dueDate: null, billEmail: null, privateNote: "n",
+    };
+
+    // Codex gate: an empty id and a NaN-coerced 0 total let the caller link a
+    // milestone to nothing, or "verify" the amount against a fabricated zero.
+    for (const body of [{}, { Invoice: {} }, { Invoice: { Id: "" } }, { Invoice: { Id: "1" } }, { Invoice: { Id: "1", TotalAmt: "abc" } }]) {
+        const original = globalThis.fetch;
+        globalThis.fetch = (async () => new Response(JSON.stringify(body), {
+            status: 200, headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+        try {
+            const error = await createQBMilestoneInvoice(TOKENS, args).then(() => null, (e: unknown) => e as Error);
+            assert.ok(error, `${JSON.stringify(body)} should not resolve`);
+            // Round 36 gate: this used to be a plain QboRetryableError. The
+            // create boundary now names it for what it is — an outcome we never
+            // learned — and the money rail's own predicate must agree, or the
+            // caller would RELEASE its in-flight claim and re-send.
+            assert.equal(isQBAmbiguousDocumentCreateError(error), true, `${JSON.stringify(body)} -> ${error?.name}`);
+            assert.equal(isAmbiguousCreateFailure(error), true, `${JSON.stringify(body)} must keep the row parked`);
+        } finally {
+            globalThis.fetch = original;
+        }
+    }
+});
+

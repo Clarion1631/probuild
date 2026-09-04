@@ -31,8 +31,15 @@ import {
     qbTimedFetch,
     parseJsonOrNull,
     isQBTimeoutError,
+    isQBTokenStrandedError,
     isBudgetExhausted,
+    remainingBudgetMs,
+    createRouteDeadline,
     QBBudgetExhaustedError,
+    qboHttpStatus,
+    isTransientQboStatus,
+    qboResponseError,
+    qboErrorFromStatus,
     type RouteDeadline,
     QboRetryableError,
     isRetryableQboError,
@@ -57,6 +64,32 @@ export { QboRetryableError, isRetryableQboError, isRetryableQboStatus };
  */
 export function isTransientAttachmentStatus(status: number): boolean {
     return status === 401 || status === 408 || isRetryableQboStatus(status);
+}
+
+/**
+ * The attachment upload or lookup was refused on the CREDENTIAL, not the file
+ * — a 401 that survived a forced token refresh, or a 403. Distinct from a QBO
+ * business-rule fault: reconnecting QuickBooks fixes this, retrying with the
+ * same token never will, and it must not be reported as a terminal
+ * `failed:<status>` next to `ok:true` either, or the Apps Script stops
+ * resending and the receipt keeps its missing image until someone notices the
+ * connection is down.
+ */
+export class QboAttachmentAuthError extends Error {
+    status: number;
+    constructor(status: number, message: string) {
+        super(message);
+        this.name = "QboAttachmentAuthError";
+        this.status = status;
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQboAttachmentAuthError(error: unknown): error is QboAttachmentAuthError {
+    return (
+        error instanceof QboAttachmentAuthError ||
+        (error instanceof Error && error.name === "QboAttachmentAuthError")
+    );
 }
 
 /** Thrown by ensureQBVendor when QBO rejects the create as a duplicate name (fault 6240) and a re-query still can't find it. */
@@ -98,7 +131,8 @@ export async function ensureQBVendor(
     const prefix = trimmed.split(/\s+/)[0];
     const candidates = await qbQuery<{ Id: string; DisplayName?: string }>(
         tokens,
-        `SELECT Id, DisplayName FROM Vendor WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`
+        `SELECT Id, DisplayName FROM Vendor WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`,
+        deadline,
     );
     const matches = candidates.filter(c => normalize(c.DisplayName ?? "") === normalize(trimmed));
     if (matches.length > 1) {
@@ -107,15 +141,19 @@ export async function ensureQBVendor(
     if (matches.length === 1) return matches[0].Id;
 
     const res = await qbFetch("/vendor", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({ DisplayName: trimmed }),
     });
     if (!res.ok) {
+        // 408/429/5xx is QuickBooks being unavailable, not a verdict on this
+        // vendor — classify it before any body sniffing.
+        if (isTransientQboStatus(res.status)) throw await qboResponseError(res, "QB vendor create");
         const err = await res.text();
         if (err.includes("6240")) {
             // A concurrent create can win the race between our lookup and our
             // create — re-query once rather than assuming the duplicate is gone.
-            const requery = await qbQuery(tokens, `SELECT Id FROM Vendor WHERE DisplayName = '${escapeQBString(trimmed)}'`);
+            const requery = await qbQuery(tokens, `SELECT Id FROM Vendor WHERE DisplayName = '${escapeQBString(trimmed)}'`, deadline);
             if (requery.length > 0) return requery[0].Id;
             throw new QboVendorDuplicateError(trimmed);
         }
@@ -126,7 +164,12 @@ export async function ensureQBVendor(
             const faultCode = err.match(/"code"\s*:\s*"(\d+)"/)?.[1];
             throw new QboPurchaseFaultError(res.status, `QB vendor create failed: ${err}`, faultCode);
         }
-        throw new Error(`QB vendor create failed: ${err}`);
+        // Everything else (401, 404, 409, ...) goes through the shared
+        // classifier rather than a bare Error, which dropped the status: a 401
+        // then reached the route as an unknown failure and got retried forever
+        // instead of being reported as the `qbo-auth` reconnect it is. The body
+        // is already consumed here, hence the from-status form.
+        throw qboErrorFromStatus(res.status, err, "QB vendor create");
     }
     const data = await parseJsonOrNull(res);
     if (!data?.Vendor?.Id) {
@@ -190,8 +233,92 @@ export interface CreateQBReceiptPurchaseInput {
  */
 export type ReceiptAttachmentStatus = "attached" | "already-attached" | "skipped" | `failed:${string}`;
 
+/**
+ * What QuickBooks ACTUALLY holds for a Purchase that already exists, read off
+ * the entity rather than assumed from the payload we would have sent.
+ *
+ * `projectNames` is a list because the job rides on each LINE's CustomerRef and
+ * a Purchase can carry several. It is a SUMMARY, kept for the review snapshot —
+ * the verdict is decided from `lines`, because a set of names cannot represent
+ * the line that carried no name at all.
+ */
+export interface BookedPurchaseValues {
+    /** QBO's `TotalAmt`. Null only when the entity did not carry a usable one. */
+    totalAmount: number | null;
+    /** QBO's `TxnDate`, as a calendar day. Null when absent or not a real date. */
+    txnDate: string | null;
+    /** `EntityRef.name`. Null when QBO returned the ref without a display name. */
+    vendor: string | null;
+    /** Distinct `CustomerRef.name`s across the expense lines. */
+    projectNames: string[];
+    /**
+     * EVERY entry of `Line`, in order, with what could be read of its job
+     * attribution — including the ones that carry none. The distinct-name set
+     * above cannot answer "is all of this money on this job", because a line
+     * with no customer, or one this code cannot parse at all, leaves no trace
+     * in it: see attributionAgrees.
+     */
+    lines: BookedExpenseLine[];
+    /** Dollars posted to the reimbursable-sales-tax account. */
+    taxAmount: number;
+}
+
+/**
+ * One `Purchase.Line` entry's job attribution, read off the entity.
+ *
+ * `readable: false` means the entry is not an account-based expense line, so
+ * there is no `AccountBasedExpenseLineDetail` to find a `CustomerRef` on at
+ * all. That is NOT the same as an account-based line that simply carries no
+ * customer — both fail the check, but only one of them is a shape this code
+ * understands, and conflating them would hide the difference from the review.
+ */
+export interface BookedExpenseLine {
+    /** Posted to the reimbursable-sales-tax account rather than an expense one. */
+    tax: boolean;
+    /** `CustomerRef.value` — the identity. Null when the ref is absent or unusable. */
+    customerId: string | null;
+    /** `CustomerRef.name` — a display string, and optional per QBO's own docs. */
+    customerName: string | null;
+    /** False when the entry is not an account-based expense line. */
+    readable: boolean;
+}
+
+/**
+ * What may be done with a Purchase that is already in the books.
+ *
+ * - `match`  — the books agree with this document; book it as planned.
+ * - `derive` — they disagree about the AMOUNT, DATE or VENDOR. QuickBooks is
+ *   the booked truth for those (real money posted against them, and the
+ *   difference is OCR noise on our side), so the Expense is written from the
+ *   QBO values and the difference is recorded.
+ * - `review` — they disagree about the PROJECT or the TAX SPLIT, the Purchase
+ *   is not FULLY attributed to that project (see attributionAgrees), or QBO did
+ *   not give a usable total or date at all. Those are attribution decisions, not
+ *   noise: which job carries the cost, and whether the sales tax is sitting on
+ *   the reclaimable account. Neither side may be preferred automatically, so no
+ *   Expense is written and a human looks.
+ */
+export interface ExistingPurchaseCheck {
+    verdict: "match" | "derive" | "review";
+    /** Stable, sorted field names: "amount" | "date" | "vendor" | "project" | "tax". */
+    differences: string[];
+    booked: BookedPurchaseValues;
+}
+
 export type CreateQBReceiptPurchaseResult =
-    | { ok: true; qbPurchaseId: string; docNumber: string; alreadyExists: true; attachment: ReceiptAttachmentStatus }
+    | {
+        ok: true;
+        qbPurchaseId: string;
+        docNumber: string;
+        alreadyExists: true;
+        attachment: ReceiptAttachmentStatus;
+        /**
+         * The books, compared against what THIS document says. Present only on
+         * the alreadyExists branch, because it is the only one where a Purchase
+         * we did not write in this call decides what the Expense should say.
+         */
+        existing: ExistingPurchaseCheck;
+    }
     | { ok: true; qbPurchaseId: string; docNumber: string; alreadyExists: false; attachment: ReceiptAttachmentStatus }
     | { ok: false; reason: "project-not-matched"; projectName: string }
     | { ok: false; reason: "docnumber-conflict"; docNumber: string }
@@ -248,7 +375,22 @@ export interface QboReceiptPushDependencies {
         purchaseId: string,
         file: { base64: string; contentType: string; fileName: string },
     ) => Promise<ReceiptAttachmentStatus>;
+    /**
+     * Forced token refresh used by the 401 retry on the attachment lookup and
+     * upload. Injectable for the same reason the other QBO calls are: those
+     * retries are real behaviour that needs covering without a live Intuit.
+     */
+    refreshTokensFn: () => Promise<QBTokens>;
+    /**
+     * Mutual exclusion for one Drive file across concurrent deliveries — see
+     * `withReceiptFileLease`. Injectable so the interleaving can be
+     * driven deterministically in a test with no database.
+     */
+    withFileLock: ReceiptFileLock;
 }
+
+/** Run `run` with nobody else pushing the same Drive file at the same time. */
+export type ReceiptFileLock = <T>(fileId: string, run: () => Promise<T>) => Promise<T>;
 
 const BANK_ACCOUNT_ID_DEFAULT = "154"; // Washington Trust Bank
 const EXPENSE_ACCOUNT_ID_DEFAULT = "98"; // COGS Supplies & materials
@@ -273,6 +415,237 @@ function findExactProjectMatch(
     const target = normalizeProjectName(projectName);
     const matches = projects.filter(p => normalizeProjectName(p.name) === target);
     return matches.length === 1 ? matches[0] : null;
+}
+
+/**
+ * The cents a booked value may differ by and still count as the same money.
+ *
+ * Two, matching the tolerance the group/total reconciliation above already
+ * allows: a two-line tax split can round each half independently.
+ */
+const BOOKED_AMOUNT_TOLERANCE_CENTS = 2;
+
+/** A QBO ReferenceType's display name, when it carried one. */
+function refName(ref: unknown): string | null {
+    if (!ref || typeof ref !== "object") return null;
+    const name = (ref as { name?: unknown }).name;
+    return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
+/**
+ * A QBO ReferenceType's id. The `name` beside it is a display string two
+ * different customers can share; THIS is the identity.
+ */
+function refValue(ref: unknown): string | null {
+    if (!ref || typeof ref !== "object") return null;
+    const value = (ref as { value?: unknown }).value;
+    if (typeof value === "string") return value.trim() || null;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    return null;
+}
+
+function expenseLineDetail(line: unknown): Record<string, unknown> | null {
+    if (!line || typeof line !== "object") return null;
+    const detail = (line as { AccountBasedExpenseLineDetail?: unknown }).AccountBasedExpenseLineDetail;
+    return detail && typeof detail === "object" ? (detail as Record<string, unknown>) : null;
+}
+
+/**
+ * READ THE BOOKS. Every value comes off the QBO entity — nothing is inferred
+ * from the payload this process would have sent, because the whole point is to
+ * find out where the two disagree.
+ */
+export function readBookedPurchase(purchase: Record<string, unknown>, taxAccountId: string): BookedPurchaseValues {
+    const rawTotal = Number(purchase.TotalAmt);
+    const rawDate = purchase.TxnDate;
+    const lines = Array.isArray(purchase.Line) ? purchase.Line : [];
+
+    let taxCents = 0;
+    const projectNames = new Set<string>();
+    const expenseLines: BookedExpenseLine[] = [];
+    for (const line of lines) {
+        const detail = expenseLineDetail(line);
+        // RECORDED, not skipped. A line this code cannot parse still carries
+        // money on this Purchase, and dropping it here is what let a partly
+        // attributed document read as a fully attributed one.
+        if (!detail) {
+            expenseLines.push({ tax: false, customerId: null, customerName: null, readable: false });
+            continue;
+        }
+        const customer = refName(detail.CustomerRef);
+        if (customer) projectNames.add(customer);
+        const account = (detail.AccountRef as { value?: unknown } | undefined)?.value;
+        const tax = account !== undefined && String(account) === taxAccountId;
+        if (tax) {
+            const amount = Number((line as { Amount?: unknown }).Amount);
+            if (Number.isFinite(amount)) taxCents += Math.round(amount * 100);
+        }
+        expenseLines.push({
+            tax,
+            customerId: refValue(detail.CustomerRef),
+            customerName: customer,
+            readable: true,
+        });
+    }
+
+    return {
+        totalAmount: Number.isFinite(rawTotal) && rawTotal > 0 ? rawTotal : null,
+        txnDate: isValidCalendarDate(rawDate) ? rawDate : null,
+        vendor: refName(purchase.EntityRef),
+        projectNames: Array.from(projectNames),
+        lines: expenseLines,
+        taxAmount: taxCents / 100,
+    };
+}
+
+/**
+ * IS EVERY DOLLAR ON THIS PURCHASE ON THE JOB THIS RECEIPT SAYS IT IS?
+ *
+ * The rule this replaces read the DISTINCT customer names off the lines and
+ * passed when exactly one of them matched. That answered "does some line agree"
+ * rather than "do they all", and the difference is money: a Purchase carrying a
+ * $50 line coded to this job plus a $100 line coded to nothing at all read as a
+ * clean match, and the Expense was then written for the whole $150 against a
+ * job QuickBooks only holds a third of. A Purchase with NO coded lines missed
+ * the check entirely — the guard was inside `projectNames.length > 0` — and
+ * passed unconditionally.
+ *
+ * So it is per line now, and the burden of proof runs the other way: the
+ * default is `review`, and a `match` has to be earned by every line.
+ *
+ *   - Nothing readable to attribute is not a pass. "I could not check" must not
+ *     read the same as "I checked and it agrees", exactly as for the total and
+ *     the date above.
+ *   - Every NON-TAX line must be coded. A tax line need not be: it posts to the
+ *     reclaimable-sales-tax account, which is its own attribution, and an
+ *     uncoded one misfiles nothing.
+ *   - A customer NAME that disagrees is fatal wherever it sits, tax line
+ *     included — that is the old two-jobs ambiguity, kept.
+ *   - Identity between lines is compared on `CustomerRef.value`, never the
+ *     display name: two QBO customers can share one. More than one id on a
+ *     document is the same split-across-jobs ambiguity by a route the name
+ *     comparison cannot see.
+ *   - And at least one line has to be confirmed BY NAME. Ids agreeing with each
+ *     other says the lines agree with each other, not that they agree with this
+ *     receipt: the expected customer's id is not known on this branch (it is
+ *     resolved after the idempotency query, and resolving it here would CREATE
+ *     a QBO customer on a replay path), so the name is the only form of the
+ *     expected identity available to compare against.
+ */
+function attributionAgrees(lines: BookedExpenseLine[], expectedProjectName: string): boolean {
+    if (lines.length === 0) return false;
+    const expected = normalizeProjectName(expectedProjectName);
+
+    // EVERY MONETARY LINE CARRIES THE SAME CUSTOMER ID — tax included.
+    //
+    // The previous rule accepted three shapes it should not have, and each one
+    // let money onto a job nobody had attributed it to while the worker
+    // recorded the WHOLE gross against that project:
+    //
+    //   - a non-tax line with a matching display NAME and no customer id. The
+    //     "not attributed at all" guard read `!tax && !customerId &&
+    //     !customerName`, so a name alone satisfied it — and a name is not an
+    //     identity. One named line then validated every other line beside it.
+    //   - a TAX line with no customer ref at all. Tax was excluded from that
+    //     guard entirely, so reclaimable sales tax could sit unassigned on a
+    //     Purchase this check called fully attributed.
+    //   - `ids.size <= 1`, which is satisfied by ZERO ids: a Purchase whose
+    //     lines carried names and no ids passed with nothing pinned.
+    //
+    // So the id is derived from the lines themselves and then required of all
+    // of them: exactly one distinct id across every line, at least one line
+    // confirming that id belongs to the expected project BY NAME (the expected
+    // customer's own id is not resolvable on this branch — resolving it would
+    // CREATE a QBO customer on a replay path), and no line missing either.
+    const ids = new Set<string>();
+    let confirmedByName = false;
+    for (const line of lines) {
+        if (!line.readable) return false;
+        // Tax is money too. A line we cannot attribute is a line that has to
+        // go to a human, whichever account it posts to.
+        if (!line.customerId) return false;
+        ids.add(line.customerId);
+        if (line.customerName) {
+            if (normalizeProjectName(line.customerName) !== expected) return false;
+            confirmedByName = true;
+        }
+    }
+    // `=== 1`, not `<= 1`: zero ids is not agreement, it is an absence.
+    return ids.size === 1 && confirmedByName;
+}
+
+/**
+ * THE ONE VENDOR COMPARISON IN THE CODEBASE.
+ *
+ * Exported because `book.ts` needs the identical question — "are these two
+ * spellings the same vendor?" — when it reconciles a receipt against an
+ * Expense the QBO importer already wrote. It used to compare byte-for-byte
+ * there while this compared case- and whitespace-insensitively, so QBO's
+ * canonical "Home Depot" and a receipt's "  home   depot " were the SAME
+ * vendor to the identity check and a `expense-conflict:vendor` park to the
+ * reconcile. Two normalizers is how that happens; one cannot.
+ */
+export function normalizeVendorName(name: string): string {
+    return name.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * COMPARE THE BOOKS AGAINST THIS DOCUMENT, and say which way the disagreement
+ * has to be resolved. See ExistingPurchaseCheck for the rule and why the two
+ * halves are split where they are.
+ *
+ * An UNREADABLE total or date is a `review`, never a pass. QBO returns both on
+ * every Purchase, so their absence means we are not looking at what we think we
+ * are looking at — and "I could not check" must not read the same as "I checked
+ * and it agrees" on the one path that decides what a real Expense records.
+ *
+ * A missing vendor or customer NAME is different: QBO documents the `name` on a
+ * ReferenceType as optional, so its absence is a fact about the response shape
+ * rather than about the books. Those compare only when a name is present, and
+ * the snapshot records what was (and was not) readable.
+ */
+export function compareExistingPurchase(
+    booked: BookedPurchaseValues,
+    input: Pick<CreateQBReceiptPurchaseInput, "projectName" | "vendor" | "date" | "totalAmount" | "groups">,
+): ExistingPurchaseCheck {
+    const derive: string[] = [];
+    const review: string[] = [];
+
+    const plannedCents = Math.round(Number(input.totalAmount) * 100);
+    if (booked.totalAmount === null) {
+        review.push("amount");
+    } else if (Math.abs(Math.round(booked.totalAmount * 100) - plannedCents) > BOOKED_AMOUNT_TOLERANCE_CENTS) {
+        derive.push("amount");
+    }
+
+    if (booked.txnDate === null) {
+        review.push("date");
+    } else if (booked.txnDate !== input.date) {
+        derive.push("date");
+    }
+
+    const plannedVendor = (input.vendor ?? "").trim();
+    if (booked.vendor && plannedVendor && normalizeVendorName(booked.vendor) !== normalizeVendorName(plannedVendor)) {
+        derive.push("vendor");
+    }
+
+    // EVERY line, not "one name that matched". See attributionAgrees: a
+    // partly-coded Purchase used to pass on the strength of its coded half, and
+    // an entirely uncoded one skipped the check altogether.
+    if (!attributionAgrees(booked.lines, input.projectName)) review.push("project");
+
+    const plannedTaxCents = input.groups
+        .filter(g => g.tax === true)
+        .reduce((sum, g) => sum + Math.round(Number(g.amount) * 100), 0);
+    const bookedTaxCents = Math.round(booked.taxAmount * 100);
+    if (Math.abs(bookedTaxCents - plannedTaxCents) > BOOKED_AMOUNT_TOLERANCE_CENTS) {
+        review.push("tax");
+    }
+
+    const differences = [...review, ...derive].sort();
+    if (review.length > 0) return { verdict: "review", differences, booked };
+    if (derive.length > 0) return { verdict: "derive", differences, booked };
+    return { verdict: "match", differences, booked };
 }
 
 /** Same round-trip validation parseBackfillDate uses in the qbo-expenses/sync route. */
@@ -319,6 +692,8 @@ async function defaultQbCreatePurchase(
         qbDeadline: deadline,
     });
     if (!res.ok) {
+        // Transient first: a 503 here is an outage, not a business rule.
+        if (isTransientQboStatus(res.status)) throw await qboResponseError(res, "QB purchase create");
         const text = await res.text();
         // A business-rule rejection (bad account ref, closed period, ...) is
         // terminal and distinct from a transient/network failure — thread the
@@ -328,7 +703,10 @@ async function defaultQbCreatePurchase(
             const faultCode = text.match(/"code"\s*:\s*"(\d+)"/)?.[1];
             throw new QboPurchaseFaultError(res.status, `QB purchase create failed: ${text}`, faultCode);
         }
-        throw new Error(`QB purchase create failed: ${text}`);
+        // Same rule as the vendor create: a non-2xx that is neither transient
+        // nor a 400/403 business rule still carries its status through the
+        // shared classifier, so a 401 lands on the route's `qbo-auth` branch.
+        throw qboErrorFromStatus(res.status, text, "QB purchase create");
     }
     const data = await parseJsonOrNull(res);
     // Intuit documents that a 200 response can still carry a Fault body.
@@ -337,7 +715,17 @@ async function defaultQbCreatePurchase(
         if (data?.Fault) {
             throw new QboPurchaseFaultError(res.status, `QB purchase create returned a Fault: ${JSON.stringify(data.Fault).slice(0, 500)}`, faultCode);
         }
-        throw new Error("QB purchase create returned no Purchase body");
+        // QuickBooks answered 2xx but the body was unusable — empty or
+        // malformed JSON (parseJsonOrNull degrades a genuine parse failure to
+        // `null`), or valid JSON with neither a Purchase nor a Fault. Whether
+        // the Purchase actually landed is genuinely UNKNOWN from here, same as
+        // a timeout — a generic Error used to reach the route as a terminal
+        // push-failed/500, which then either gave up or got retried without
+        // ever surfacing the ambiguity as retryable. QboRetryableError instead:
+        // the route maps it to a retryable 503, and the `requestid` this create
+        // was sent under makes QuickBooks itself dedupe the replay, so
+        // retrying is safe either way this actually resolved.
+        throw new QboRetryableError("QB purchase create returned an unreadable 2xx response (no Purchase, no Fault)");
     }
     return { id: data.Purchase.Id };
 }
@@ -442,13 +830,35 @@ export async function defaultUploadAttachment(
     // whole extra bot pass (or, before transient statuses were retryable at
     // all, was abandoned entirely).
     if (res.status === 401) {
-        const refreshed = await refresh().catch(() => null);
+        // `.catch(() => null)` swallowed the reason the refresh failed, so a
+        // QBO outage, a stranded token, or a persistence failure all became an
+        // indistinguishable "no fresh token" and the push carried on to report
+        // a plain 401. Those are all things a human or a retry must know about.
+        const refreshed = await refresh().catch((error: unknown) => {
+            if (
+                isQBTimeoutError(error) ||
+                isRetryableQboError(error) ||
+                isQBTokenStrandedError(error) ||
+                (error instanceof Error && error.name === "QBTokenPersistenceError")
+            ) {
+                throw error;
+            }
+            return null;
+        });
         if (refreshed) res = await post(refreshed);
     }
     if (!res.ok) {
-        // Busy, timed out, or still unauthorized: QBO is not refusing this
-        // file, so raise and let the push be retried rather than banking a
-        // terminal "failed:503" next to ok:true.
+        // A 401 that reaches here already survived the forced refresh above —
+        // it, and a 403, mean QBO is refusing the CREDENTIAL, not the file.
+        // Neither is a transient outage (QboRetryableError) nor a business
+        // fault a retry will repeat identically forever (failed:<status>) —
+        // it is a distinct, reconnect-and-it-fixes-itself failure.
+        if (res.status === 401 || res.status === 403) {
+            throw new QboAttachmentAuthError(res.status, `QB attachment upload rejected the credential (status ${res.status})`);
+        }
+        // Busy, timed out: QBO is not refusing this file, so raise and let the
+        // push be retried rather than banking a terminal "failed:503" next to
+        // ok:true.
         if (isTransientAttachmentStatus(res.status)) {
             throw new QboRetryableError(`QB attachment upload failed with status ${res.status}`, res.status);
         }
@@ -505,17 +915,50 @@ async function ensureAttachmentOnExistingPurchase(
     input: CreateQBReceiptPurchaseInput,
     qbQueryFn: QboReceiptPushDependencies["qbQueryFn"],
     uploadAttachment: QboReceiptPushDependencies["uploadAttachment"],
+    deadline?: RouteDeadline,
+    /** Injectable for tests; defaults to the real token refresh. */
+    refreshTokens?: () => Promise<QBTokens>,
 ): Promise<ReceiptAttachmentStatus> {
     const plan = planAttachmentUpload(input);
     if (!plan) return "skipped";
     // QBO transaction ids are numeric; refuse anything else rather than escape it.
     if (!/^\d+$/.test(purchaseId)) return "skipped";
 
+    const refresh = refreshTokens ?? (async () => {
+        const { getFreshQBTokens } = await import("./quickbooks-payments");
+        return getFreshQBTokens(deadline);
+    });
+    const lookupSql = `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`;
+
     try {
-        const rows = await qbQueryFn<QBAttachable>(
-            tokens,
-            `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`,
-        );
+        // The token can age out between the Purchase lookup and here, exactly
+        // as it can on the upload. One forced refresh repairs it in place
+        // instead of costing the receipt a whole extra bot pass.
+        let activeTokens = tokens;
+        let rows: QBAttachable[];
+        try {
+            rows = await qbQueryFn<QBAttachable>(activeTokens, lookupSql);
+        } catch (error) {
+            if (qboHttpStatus(error) !== 401) throw error;
+            // Identical handling to the upload branch above: a typed refresh
+            // failure is the thing a human needs to act on, and swallowing it
+            // made a QBO outage, a stranded token and a persistence failure all
+            // look like an ordinary 401 on the lookup.
+            const refreshed = await refresh().catch((refreshError: unknown) => {
+                if (
+                    isQBTimeoutError(refreshError) ||
+                    isRetryableQboError(refreshError) ||
+                    isQBTokenStrandedError(refreshError) ||
+                    (refreshError instanceof Error && refreshError.name === "QBTokenPersistenceError")
+                ) {
+                    throw refreshError;
+                }
+                return null;
+            });
+            if (!refreshed) throw error;
+            activeTokens = refreshed;
+            rows = await qbQueryFn<QBAttachable>(activeTokens, lookupSql);
+        }
         // Entity ids are only unique per entity type, so a value-only query can
         // surface attachments from other transaction types — keep Purchase links.
         const alreadyAttached = (rows ?? []).some(
@@ -527,15 +970,49 @@ async function ensureAttachmentOnExistingPurchase(
                 ) && (row.FileName ?? "") === plan.fileName,
         );
         if (alreadyAttached) return "already-attached";
-        return await uploadAttachment(tokens, purchaseId, plan);
+        return await uploadAttachment(activeTokens, purchaseId, plan);
     } catch (error) {
-        // Anything THROWN here is a connection-level or transient failure — a
-        // timeout, a 429/5xx, a network error, or the Attachable lookup itself
-        // failing. None of those say "this file cannot be attached", so none may
-        // become a terminal `failed:` on an ok:true response: that is what made
-        // the Apps Script stop retrying and leave the Purchase unattached.
-        // Terminal outcomes come back from uploadAttachment as VALUES.
-        if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+        // Retryable: our deadline, a 429/5xx, a transport failure. These say
+        // nothing about the file, so they must NOT become a terminal `failed:`
+        // on an ok:true response — that is what made the Apps Script stop
+        // resending and leave the Purchase unattached.
+        //
+        // Token failures pass through UNCHANGED rather than being re-wrapped:
+        // a stranded or unpersisted token is a connection that needs human
+        // attention, and flattening it into a generic retryable error loses
+        // exactly the detail that says so.
+        if (
+            isQBTimeoutError(error) ||
+            isRetryableQboError(error) ||
+            isQBTokenStrandedError(error) ||
+            isQboAttachmentAuthError(error) ||
+            (error instanceof Error && error.name === "QBTokenPersistenceError")
+        ) {
+            throw error;
+        }
+
+        // A 401 that reaches here already survived the forced refresh above —
+        // it, and a 403, are the credential being refused, not the file or the
+        // lookup query. Same reasoning as the upload path: neither a transient
+        // outage nor a repeating business fault.
+        const status = qboHttpStatus(error);
+        if (status === 401 || status === 403) {
+            throw new QboAttachmentAuthError(status, `QB attachment lookup rejected the credential (status ${status})`);
+        }
+        // Same transient set as the upload path, which this must match: 408
+        // joins 429/5xx as retryable.
+        if (status !== null && isTransientAttachmentStatus(status)) {
+            throw new QboRetryableError(`QB attachment lookup failed with status ${status}`, status);
+        }
+        // Terminal: QuickBooks answered with a refusal that will repeat. A
+        // 400/403/404 is a real answer (bad query, no access, no such
+        // purchase) — retrying it forever is a loop, so it rides along on
+        // ok:true as a recorded failure instead.
+        if (status !== null) {
+            return `failed:${status}`;
+        }
+
+        // Unclassifiable — treat as retryable rather than silently bank it.
         throw new QboRetryableError(
             `QB attachment step failed: ${error instanceof Error ? error.name : "error"}`,
         );
@@ -565,7 +1042,32 @@ export class QboAccountConfigError extends Error {
 // Keyed by realm + account ids so a reconnect to a different QBO company (or
 // an env change) re-verifies, and rejected entries are evicted so one
 // transient query failure can't poison a warm process forever.
-const verifiedAccountsCache = new Map<string, Promise<void>>();
+/**
+ * Completed verifications only, with a TTL.
+ *
+ * Caching the in-flight PROMISE bound every waiter to the first request's
+ * lifetime: a second request with two seconds of budget left would await a
+ * verification started under someone else's 50s deadline, and sit there long
+ * past its own. Worse, a request that had already given up left its promise in
+ * the map for the next one to inherit. Now only a finished, successful result
+ * is cached; concurrent callers still share the in-flight work (below) but
+ * each RACES it against its own budget and walks away on time.
+ */
+const verifiedAccountsCache = new Map<string, number>();
+/** Short TTL: account config is mutable, and this only exists to skip repeat round trips. */
+const VERIFIED_ACCOUNTS_TTL_MS = 5 * 60_000;
+/**
+ * The shared verification's OWN budget, independent of whoever happened to
+ * start it.
+ *
+ * Binding it to the initiator's deadline meant a push with 700ms left would
+ * kick off the verification everyone else waits on and then poison it for all
+ * of them. The shared work gets a fixed, generous budget; each waiter races it
+ * against its own remaining time (below) and walks away alone.
+ */
+const ACCOUNT_VERIFY_BUDGET_MS = 20_000;
+/** In-flight verifications, shared so concurrent pushes do not duplicate the queries. */
+const verifyingAccounts = new Map<string, Promise<void>>();
 
 /**
  * Resolve a Shop/overhead category folder name to its QBO expense account by
@@ -597,15 +1099,25 @@ async function resolveOverheadAccountId(
 
 async function verifyReceiptAccounts(
     tokens: QBTokens,
+    /**
+     * Deliberately NOT the caller's query function: this runs on the shared
+     * verification's own clock so one impatient request cannot cut short the
+     * work every concurrent push is waiting on.
+     */
     qbQueryFn: QboReceiptPushDependencies["qbQueryFn"],
     bankAccountId: string,
     expenseAccountId: string,
     taxAccountId: string,
+    deadline?: RouteDeadline,
 ): Promise<void> {
     const cacheKey = `${tokens.realmId}|${bankAccountId}|${expenseAccountId}|${taxAccountId}`;
-    let verifiedAccountsPromise = verifiedAccountsCache.get(cacheKey);
-    if (!verifiedAccountsPromise) {
-        verifiedAccountsPromise = (async () => {
+
+    const verifiedAt = verifiedAccountsCache.get(cacheKey);
+    if (verifiedAt !== undefined && Date.now() - verifiedAt < VERIFIED_ACCOUNTS_TTL_MS) return;
+
+    let verifyingPromise = verifyingAccounts.get(cacheKey);
+    if (!verifyingPromise) {
+        verifyingPromise = (async () => {
             // Role separation: the whole point of the tax account is a clean
             // filing report, so it must not collapse onto another role's
             // account (e.g. QBO_RECEIPT_TAX_ACCOUNT_ID pasted as "98").
@@ -646,11 +1158,262 @@ async function verifyReceiptAccounts(
                     `tax account ${taxAccountId} is ${tax?.AccountType ?? "missing"} (need Cost of Goods Sold or Expense).`,
                 );
             }
+            // Only a COMPLETED, successful verification is remembered.
+            verifiedAccountsCache.set(cacheKey, Date.now());
         })();
-        verifiedAccountsCache.set(cacheKey, verifiedAccountsPromise);
-        verifiedAccountsPromise.catch(() => verifiedAccountsCache.delete(cacheKey));
+        verifyingAccounts.set(cacheKey, verifyingPromise);
+        // Always clear the in-flight slot, success or failure, so a request
+        // that gave up cannot leave a stale promise for the next one.
+        verifyingPromise.catch(() => {}).finally(() => {
+            if (verifyingAccounts.get(cacheKey) === verifyingPromise) verifyingAccounts.delete(cacheKey);
+        });
     }
-    return verifiedAccountsPromise;
+
+    // Share the work, but never inherit another request's clock: this waiter
+    // gives up when ITS OWN budget runs out, leaving the shared verification to
+    // finish (or not) for whoever else is waiting.
+    const remaining = remainingBudgetMs(deadline);
+    if (!Number.isFinite(remaining)) return verifyingPromise;
+    if (remaining <= 0) {
+        throw new QBBudgetExhaustedError("Route budget exhausted before the QBO account verification");
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budgetExpiry = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+            () => reject(new QBBudgetExhaustedError("Route budget exhausted while verifying QBO accounts")),
+            Math.max(1, Math.floor(remaining)),
+        );
+    });
+    try {
+        await Promise.race([verifyingPromise, budgetExpiry]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * How long one file's push may hold its lease, excluding the wait for it.
+ *
+ * The push is already bounded by its route deadline; this is the ceiling for
+ * the case where no deadline was passed at all, and it stays under the route's
+ * own 60s `maxDuration`.
+ */
+export const RECEIPT_FILE_LOCK_MAX_MS = 55_000;
+
+/**
+ * Added to the work budget to get the lease TTL.
+ *
+ * The lease must outlive the work it protects, or a slow-but-alive holder's
+ * claim expires under it and a second push starts creating in parallel. It must
+ * not outlive it by much either, since this is exactly how long a crashed
+ * holder blocks the file.
+ */
+export const RECEIPT_FILE_LEASE_GRACE_MS = 15_000;
+
+/**
+ * How long a loser waits for the holder before giving up.
+ *
+ * Waiting is what preserves the old behaviour: the loser does NOT skip, it runs
+ * once the winner commits, its DocNumber lookup finds the committed Purchase,
+ * and it takes the `alreadyExists` re-check path. Bounded so an outage-stuck
+ * holder answers 409-and-retry instead of burning the route ceiling here.
+ */
+export const RECEIPT_FILE_LEASE_MAX_WAIT_MS = 15_000;
+
+/** How often a waiter re-checks. One tiny indexed read per poll. */
+const RECEIPT_FILE_LEASE_POLL_MS = 250;
+
+/** `AutomationSetting` key namespace, keyed by the FULL Drive file id. */
+const RECEIPT_FILE_LEASE_PREFIX = "qbo-receipt-push.lease:";
+
+/**
+ * A push is already running for this file and did not finish inside our wait.
+ *
+ * Retryable, not terminal: the winner is mid-create, so the correct thing for
+ * the caller to do is come back and take the `alreadyExists` path. Name-based
+ * identity for the same cross-module reason as the rest of the QBO error
+ * vocabulary.
+ */
+export class QBReceiptPushInProgressError extends Error {
+    name = "QBReceiptPushInProgressError";
+    constructor(fileId: string) {
+        super(`Another push is already running for receipt file ${fileId}`);
+    }
+}
+
+/** Name-based, same reason as isQBTimeoutError. */
+export function isReceiptPushInProgressError(error: unknown): error is QBReceiptPushInProgressError {
+    return error instanceof Error && error.name === "QBReceiptPushInProgressError";
+}
+
+/** The row operations the lease needs from AutomationSetting. Injectable for tests. */
+export interface ReceiptLeaseStore {
+    create(key: string, value: string): Promise<void>;
+    read(key: string): Promise<string | null>;
+    /** CAS: replace `key` only while it still holds `expected`. */
+    swap(key: string, expected: string, value: string): Promise<boolean>;
+    /** CAS: delete `key` only while it still holds `expected`. */
+    release(key: string, expected: string): Promise<void>;
+}
+
+/**
+ * Prisma-backed lease store. Every method is ONE statement in its own implicit
+ * transaction — nothing here holds a connection while the caller does QBO I/O.
+ */
+export const automationSettingLeaseStore: ReceiptLeaseStore = {
+    async create(key, value) {
+        await prisma.automationSetting.create({ data: { key, value } });
+    },
+    async read(key) {
+        const row = await prisma.automationSetting.findUnique({ where: { key }, select: { value: true } });
+        return row?.value ?? null;
+    },
+    async swap(key, expected, value) {
+        const claimed = await prisma.automationSetting.updateMany({ where: { key, value: expected }, data: { value } });
+        return claimed.count === 1;
+    },
+    async release(key, expected) {
+        await prisma.automationSetting.deleteMany({ where: { key, value: expected } });
+    },
+};
+
+/** A unique-constraint collision, however the client surfaces it. */
+function isLeaseKeyCollision(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const code = (error as { code?: unknown }).code;
+    return code === "P2002" || code === "23505";
+}
+
+/** `{"t":"<token>","x":<expiry epoch ms>}` — the whole lease value. */
+function leaseValue(token: string, expiresAt: number): string {
+    return JSON.stringify({ t: token, x: expiresAt });
+}
+
+/**
+ * When the stored lease expires. An UNPARSEABLE value reads as expired: it can
+ * only have come from us, it carries no live claim anybody is honouring, and
+ * treating it as held would block the file forever with no way back.
+ */
+function leaseExpiry(raw: string | null): number {
+    if (!raw) return 0;
+    try {
+        const parsed = JSON.parse(raw) as { x?: unknown };
+        return typeof parsed.x === "number" && Number.isFinite(parsed.x) ? parsed.x : 0;
+    } catch {
+        return 0;
+    }
+}
+
+export interface ReceiptFileLeaseDeps {
+    store?: ReceiptLeaseStore;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+    /** Overridable so a test can pin the value a lease is CAS-matched on. */
+    token?: () => string;
+}
+
+/**
+ * Serialize every push of the SAME Drive file, so two concurrent deliveries
+ * cannot both take the fresh-create path.
+ *
+ * The failure this closes: two requests for one receipt both miss the opening
+ * DocNumber lookup (neither has committed yet), both call create — which QBO
+ * de-duplicates via `requestid`, handing BOTH the same Purchase — and both then
+ * upload the receipt image unconditionally, because the deterministic-FileName
+ * existence check only runs on the `alreadyExists` path. Result: one Purchase
+ * carrying the same receipt twice. DocNumber/`requestid` idempotency is
+ * QBO-side and per-call; it says nothing about what the two callers do NEXT.
+ *
+ * This used to be `pg_advisory_xact_lock` inside ONE interactive transaction
+ * wrapping the whole lookup→create→attach. That was correct, and it was also a
+ * pooled connection held for up to 55 seconds across several QuickBooks HTTP
+ * round trips — while the callback's own Prisma reads need connections from
+ * that same pool. During an Intuit outage, when every push runs to its full
+ * deadline, concurrent receipts starve the pool and take unrelated requests
+ * down with them. A session-level `pg_advisory_lock` is not an option either:
+ * `DATABASE_URL` points at pgbouncer in transaction-pooling mode, which hands
+ * out a different backend connection per statement (the same reasoning recorded
+ * in review-alert-rollout.ts).
+ *
+ * So: a DURABLE LEASE in `AutomationSetting`, keyed by the full Drive file id,
+ * claimed and released by CAS in its own tiny transaction. Nothing is held
+ * across network I/O — between acquire and release this process holds no
+ * connection at all. The trade the advisory lock did not have to make is a
+ * stale claim: a killed holder leaves its row behind, so the TTL (work budget +
+ * `RECEIPT_FILE_LEASE_GRACE_MS`) is what lets the next push through, and the
+ * deterministic-filename attachment check stays as the second layer for the
+ * window where a lease is reclaimed early.
+ *
+ * The loser of the race does NOT skip: it waits, runs once the winner is done,
+ * its DocNumber lookup now finds the committed Purchase, and it takes the
+ * `alreadyExists` path, which re-checks the attachment by deterministic
+ * FileName and returns the SAME purchase id. Only a loser still waiting when
+ * `RECEIPT_FILE_LEASE_MAX_WAIT_MS` runs out gives up, and it does so by throwing
+ * `QBReceiptPushInProgressError` — which the route answers as a retryable 409,
+ * never as a terminal fallback. Fail-closed: if the lease cannot be taken at all
+ * the error propagates and the route answers a retryable 500, rather than
+ * pushing unprotected.
+ */
+export async function withReceiptFileLease<T>(
+    fileId: string,
+    run: () => Promise<T>,
+    deadline?: RouteDeadline,
+    deps: ReceiptFileLeaseDeps = {},
+): Promise<T> {
+    const store = deps.store ?? automationSettingLeaseStore;
+    const now = deps.now ?? Date.now;
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const mintToken = deps.token ?? (() => `${now()}-${Math.random().toString(36).slice(2, 12)}`);
+
+    const remaining = remainingBudgetMs(deadline);
+    const workMs = Number.isFinite(remaining)
+        ? Math.max(1_000, Math.min(Math.floor(remaining), RECEIPT_FILE_LOCK_MAX_MS))
+        : RECEIPT_FILE_LOCK_MAX_MS;
+    const ttlMs = workMs + RECEIPT_FILE_LEASE_GRACE_MS;
+    const waitMs = Math.min(RECEIPT_FILE_LEASE_MAX_WAIT_MS, workMs);
+
+    const key = `${RECEIPT_FILE_LEASE_PREFIX}${fileId}`;
+    const waitUntil = now() + waitMs;
+    let held: string | null = null;
+
+    while (held === null) {
+        const at = now();
+        const candidate = leaseValue(mintToken(), at + ttlMs);
+        try {
+            await store.create(key, candidate);
+            held = candidate;
+            break;
+        } catch (error) {
+            // Anything but "a row is already there" is a real database failure
+            // and must not be mistaken for contention.
+            if (!isLeaseKeyCollision(error)) throw error;
+        }
+        // A row exists. Take it over ONLY if its claim has expired, and only by
+        // CAS against the exact value we read — two waiters reclaiming the same
+        // stale lease must not both win.
+        const existing = await store.read(key);
+        if (existing !== null && leaseExpiry(existing) <= at) {
+            if (await store.swap(key, existing, candidate)) {
+                held = candidate;
+                break;
+            }
+        }
+        // `existing === null` means the holder released between the failed
+        // create and this read: loop straight back round to the create.
+        if (now() >= waitUntil) throw new QBReceiptPushInProgressError(fileId);
+        await sleep(RECEIPT_FILE_LEASE_POLL_MS);
+    }
+
+    try {
+        return await run();
+    } finally {
+        // CAS-pinned to our own value: a lease that already expired and was
+        // reclaimed by somebody else must not be deleted out from under them.
+        // A failed release only costs the next push one TTL of waiting, so it
+        // must never turn a completed push into an error.
+        await store.release(key, held).catch(() => {});
+    }
 }
 
 /**
@@ -662,7 +1425,25 @@ async function verifyReceiptAccounts(
  * account-identity check fires, so a bad payload never creates or looks up
  * anything in QuickBooks beyond the initial DocNumber query.
  */
+/**
+ * Public entry point: take the per-file lock, then run the push under it.
+ *
+ * A thin wrapper rather than something folded into the body, so the lock cannot
+ * be bypassed by calling the push directly — the implementation below is not
+ * exported.
+ */
 export async function createQBReceiptPurchase(
+    tokens: QBTokens,
+    input: CreateQBReceiptPurchaseInput,
+    deps: Partial<QboReceiptPushDependencies> = {},
+    deadline?: RouteDeadline,
+): Promise<CreateQBReceiptPurchaseResult> {
+    const withFileLock: ReceiptFileLock =
+        deps.withFileLock ?? ((fileId, run) => withReceiptFileLease(fileId, run, deadline));
+    return withFileLock(input.fileId, () => createQBReceiptPurchaseUnderLock(tokens, input, deps, deadline));
+}
+
+async function createQBReceiptPurchaseUnderLock(
     tokens: QBTokens,
     input: CreateQBReceiptPurchaseInput,
     deps: Partial<QboReceiptPushDependencies> = {},
@@ -681,31 +1462,50 @@ export async function createQBReceiptPurchase(
     const ensureVendorFn = deps.ensureVendorFn ?? ((t, n) => ensureQBVendor(t, n, deadline));
     const ensureCustomerFn = deps.ensureCustomerFn ?? ((t, c) => ensureQBCustomer(t, c, deadline));
     const listProjects = deps.listProjects ?? defaultListInProgressProjects;
-    const uploadAttachment = deps.uploadAttachment ?? ((t, id, f) => defaultUploadAttachment(t, id, f, undefined, deadline));
+    const refreshTokensFn = deps.refreshTokensFn ?? (async () => {
+        const { getFreshQBTokens } = await import("./quickbooks-payments");
+        return getFreshQBTokens(deadline);
+    });
+    const uploadAttachment = deps.uploadAttachment ?? ((t, id, f) => defaultUploadAttachment(t, id, f, refreshTokensFn, deadline));
     // The QBO calls above (queries, ensures, create, upload) are all bounded by
     // `deadline`; the account-identity verify below goes through qbQueryFn, so
     // it is covered too.
 
     const docNumber = input.fileId.slice(0, 21);
     const marker = `[gtr-file:${input.fileId}]`;
+    // Read once, up here, because the idempotency branch below needs the tax
+    // account to tell a reclaimable-tax line apart from an expense line.
+    const bankAccountId = process.env.QBO_RECEIPT_BANK_ACCOUNT_ID || BANK_ACCOUNT_ID_DEFAULT;
+    const expenseAccountId = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || EXPENSE_ACCOUNT_ID_DEFAULT;
+    const taxAccountId = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || TAX_ACCOUNT_ID_DEFAULT;
 
     // Idempotency first — never re-create a Purchase for a file already
     // pushed. A DocNumber hit whose PrivateNote does NOT carry this file's
     // full marker is a genuine id collision (truncated to 21 chars — two
     // different Drive fileIds can share that prefix), not a re-send: refuse
     // rather than silently attach to the wrong Purchase.
-    const existing = await qbQueryFn<{ Id: string; PrivateNote?: string }>(
+    //
+    // `SELECT *`, not `Id, PrivateNote`. Two fields were enough to answer "is
+    // this our Purchase"; they were NOT enough to answer "does it say what this
+    // document says", and the caller went on to write an Expense from the OCR
+    // read regardless. A v1-cutover Purchase, or one posted from an earlier
+    // revision of the same Drive file, then left ProBuild's job cost carrying a
+    // number, a date or a job the books do not have. QBO cannot return a
+    // nested Line/EntityRef/TxnTaxDetail from a field list, so the whole entity
+    // is fetched — it is one row, and only on the replay path.
+    const existing = await qbQueryFn<Record<string, unknown>>(
         tokens,
-        `SELECT Id, PrivateNote FROM Purchase WHERE DocNumber = '${escapeQBString(docNumber)}'`,
+        `SELECT * FROM Purchase WHERE DocNumber = '${escapeQBString(docNumber)}'`,
     );
     if (existing.length > 0) {
-        if (existing.length > 1 || !(existing[0].PrivateNote ?? "").includes(marker)) {
+        if (existing.length > 1 || !(String(existing[0].PrivateNote ?? "")).includes(marker)) {
             return { ok: false, reason: "docnumber-conflict", docNumber };
         }
         // THE PURCHASE EXISTS. Say so before doing anything else with it: the
         // attachment re-check below is a QBO round trip that can fail, and the
         // caller still has to know a Purchase is there.
         await deps.onExistingPurchase?.();
+        const booked = compareExistingPurchase(readBookedPurchase(existing[0], taxAccountId), input);
         // The Purchase exists, but that does NOT mean the receipt file made it
         // across. The common way to reach this branch is a first attempt whose
         // Purchase response was lost (timeout/kill) AFTER QBO committed it —
@@ -714,12 +1514,21 @@ export async function createQBReceiptPurchase(
         // every retry took this same early return. Re-check and fill the gap.
         const attachment = await ensureAttachmentOnExistingPurchase(
             tokens,
-            existing[0].Id,
+            String(existing[0].Id),
             input,
             qbQueryFn,
             uploadAttachment,
+            deadline,
+            refreshTokensFn,
         );
-        return { ok: true, qbPurchaseId: existing[0].Id, docNumber, alreadyExists: true, attachment };
+        return {
+            ok: true,
+            qbPurchaseId: String(existing[0].Id),
+            docNumber,
+            alreadyExists: true,
+            attachment,
+            existing: booked,
+        };
     }
 
     const projects = await listProjects();
@@ -803,10 +1612,6 @@ export async function createQBReceiptPurchase(
         throw error;
     }
 
-    const bankAccountId = process.env.QBO_RECEIPT_BANK_ACCOUNT_ID || BANK_ACCOUNT_ID_DEFAULT;
-    const expenseAccountId = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || EXPENSE_ACCOUNT_ID_DEFAULT;
-    const taxAccountId = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || TAX_ACCOUNT_ID_DEFAULT;
-
     const refSuffix = input.invoice
         ? ` · Invoice ${input.invoice}`
         : input.checkNumber
@@ -849,7 +1654,11 @@ export async function createQBReceiptPurchase(
 
     // Once per process, before the first create — never write against a
     // misconfigured account.
-    await verifyReceiptAccounts(tokens, qbQueryFn, bankAccountId, expenseAccountId, taxAccountId);
+    // The verification is SHARED across concurrent pushes, so it runs with its
+    // own fixed budget; `deadline` below is only this waiter's patience.
+    const verifyQueryFn = deps.qbQueryFn
+        ?? (<T = any>(t: QBTokens, q: string) => qbQuery<T>(t, q, createRouteDeadline(ACCOUNT_VERIFY_BUDGET_MS)));
+    await verifyReceiptAccounts(tokens, verifyQueryFn, bankAccountId, expenseAccountId, taxAccountId, deadline);
 
     const requestId = receiptRequestId(input.fileId);
     // Last check before the write that actually posts money. Starting it with
@@ -876,7 +1685,7 @@ export async function createQBReceiptPurchase(
             // receipt forever and the existing-Purchase recovery above never
             // ran. Propagating gives the route a 503, the bot retries, and the
             // next pass finds the Purchase and attaches the file.
-            if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+            if (isQBTimeoutError(error) || isRetryableQboError(error) || isQboAttachmentAuthError(error)) throw error;
             throw new QboRetryableError(
                 `QB attachment step failed: ${error instanceof Error ? error.name : "error"}`,
             );

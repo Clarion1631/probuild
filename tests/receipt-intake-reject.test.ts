@@ -190,7 +190,16 @@ test("a losing publish cleans up its own object when the winner published a diff
         /current\?\.storagePath && current\.storagePath !== expectStoragePath/,
         "only cleans up when the winner published somewhere else",
     );
-    assert.match(conflictBranch, /deleteObjectOrRecord\(expectStoragePath, "orphaned-by-concurrent-publish"\)/);
+    // And the RESULT is checked. deleteObjectOrRecord throws when it can
+    // neither delete the object nor record it, and this branch has no
+    // transaction to roll back — so that failure has to reach the client as a
+    // retryable 503 rather than be discarded on the way to `alreadyPublished`,
+    // which a forwarder treats as permission to delete its only copy.
+    assert.match(
+        conflictBranch,
+        /deleteObjectOrRecord\(\s*\n?\s*expectStoragePath,\s*\n?\s*"orphaned-by-concurrent-publish",\s*\n?\s*\)/,
+    );
+    assert.match(conflictBranch, /reason: "storage-unavailable", retryable: true/);
     // Cleanup must happen BEFORE the idempotent success is returned — the
     // finding was specifically that the loser reported success and never
     // cleaned up its own path.
@@ -222,7 +231,13 @@ test("a heal that loses its CAS deletes the object it just uploaded", () => {
     const heal = intake.slice(intake.indexOf("const healed = await storeObject"));
     const body = heal.slice(0, heal.indexOf("return NextResponse.json({\n                ok: true, recovered: true"));
     assert.match(body, /if \(count === 0\)/);
-    assert.match(body, /deleteObjectOrRecord\(payload\.storagePath, "heal-lost-race"\)/);
+    assert.match(
+        body,
+        /deleteObjectOrRecord\(\s*\n?\s*payload\.storagePath,\s*\n?\s*"heal-lost-race",\s*\n?\s*\)/,
+    );
+    // Same rule as the publish-race drop: an unrecordable orphan is a 503, not
+    // a quiet 409 that loses the bytes.
+    assert.match(body, /reason: "storage-unavailable", retryable: true/);
     assert.match(body, /publish-conflict/);
     assert.ok(
         body.indexOf("payload.storagePath !== existing.storagePath") < body.indexOf("heal-lost-race"),
@@ -248,8 +263,83 @@ test("/start hands a recoverable park a NEW url, and asks the shared rule which 
     assert.match(body, /fileSha256: "",/, "and the stale stored hash is cleared");
     // Fenced like every other publish-path write, and a lost fence writes
     // nothing rather than pointing a live row at an empty path.
-    assert.match(body, /where: \{ id: existing\.id, \.\.\.publishFence\(existing\) \}/);
-    assert.match(body, /publish-conflict/);
+    // The fence is no longer built at the call site at all: `repathWithCleanup`
+    // takes the OBSERVED ROW and builds it from leaseFence itself, so neither
+    // /start branch can hand in half a lease identity — and the Prisma call
+    // names the builder rather than an opaque parameter, which is what makes it
+    // visible to the tripwire in receipt-intake-lease-fence.test.ts.
+    assert.match(body, /await repathWithCleanup\(\s*\n?\s*existing,/);
+    assert.match(start, /where: \{ id: existing\.id, \.\.\.leaseFence\(existing\) \},/);
+    assert.match(body, /return leaseConflict\(existing\.id\)/);
+});
+
+test("A LIVE LEASE SURVIVES A RECOVERABLE RETRY — same path, same version, no delete", () => {
+    // The re-arm below it is destructive by design (new version, new path, the
+    // old object deleted) and it used to run on EVERY /start for a parked row,
+    // including one whose signed URL was still live. Two retries for the same
+    // parked sourceRef therefore raced: the second deleted the object the first
+    // was about to PUT its bytes to. An earlier round fixed exactly this for
+    // STAGING rows and left the recovery path alone — so the rule is now ONE
+    // rule, in one module, and both callers reach it.
+    const branch = start.slice(start.indexOf("if (recoverable) {"));
+    const body = branch.slice(0, branch.indexOf("// IDENTITY MUST BE PROVEN"));
+    const reuse = body.indexOf("await reuseLiveLease(existing, ext, leaseDepsFor(deadline), {");
+    assert.ok(reuse > 0, "the recovery asks the shared rule first");
+    assert.ok(
+        reuse < body.indexOf("const nextLease = existing.uploadLeaseVersion + 1"),
+        "BEFORE it bumps the version",
+    );
+    assert.ok(
+        reuse < body.indexOf("start-rearmed-repath"),
+        "and before anything is deleted",
+    );
+    // The recovery's OWN state writes still happen -- they just land on the
+    // SAME path and lease version. Its IDENTITY writes no longer ride along:
+    // `expectedSha256` and the declared mime are part of a live lease's
+    // identity, and writing them through an extension is how two callers came
+    // to hold one generation for two different documents. The hash is passed
+    // as the rule's own argument now, and COMPARED.
+    const patch = body.slice(reuse, body.indexOf("if (keptRecovery)"));
+    assert.match(patch, /fileSha256: "",/);
+    assert.ok(
+        !/expectedSha256,\s*$/m.test(patch),
+        "the announced hash is not written through the extension",
+    );
+    assert.match(patch, /\}, expectedSha256\);/, "it is handed to the rule to check");
+    assert.ok(!/mimeType,/.test(patch), "nor the declared mime");
+    assert.ok(!/uploadLeaseVersion/.test(patch), "the version is NOT touched");
+    assert.ok(!/storagePath/.test(patch), "and neither is the path");
+});
+
+test("both /start branches take the live-lease rule from the SAME place", () => {
+    // Two copies of "may I reuse this lease" is how the STAGING path came to be
+    // fixed while the recovery path stayed broken.
+    assert.equal((start.match(/await reuseLiveLease\(/g) ?? []).length, 2, "recovery and resume");
+    assert.match(start, /import \{\s*\n\s*discardUnresumedLease,\s*\n\s*issuedLeaseIsCurrent,\s*\n\s*newLeaseNonce,\s*\n\s*reuseLiveLease,\s*\n\} from "@\/lib\/receipt-intake\/upload-lease";/);
+    // And one 409 helper, so every lost claim answers identically. SIX call
+    // sites on the existing row now: the two reuse callers, the two
+    // new-lease claims, and the two post-sign revalidations added in round
+    // 19 -- plus one on the created row, in the create branch.
+    assert.equal(
+        (start.match(/return leaseConflict\(existing\.id\)/g) ?? []).length,
+        6,
+        "reuse, new-lease claim and post-sign revalidation, on both branches",
+    );
+    // The create branch answers it twice as well, on the row it made: once
+    // when the signer-failure discard finds somebody else resumed the row
+    // (`leaseConflict(id)`, before `created` is in scope), and once when its
+    // own post-sign re-read finds the lease already superseded.
+    assert.equal(
+        (start.match(/return leaseConflict\(created\.id\)/g) ?? []).length,
+        1,
+        "the create branch revalidates its own lease before answering",
+    );
+    assert.equal(
+        (start.match(/return leaseConflict\(id\);/g) ?? []).length,
+        1,
+        "and defers to the request that resumed its row",
+    );
+    assert.match(start, /error: "publish-conflict",/, "which is still a publish-conflict");
 });
 
 test("the re-arm branch runs BEFORE the identity check, and only for a parked row", () => {
@@ -266,8 +356,16 @@ test("the re-arm branch runs BEFORE the identity check, and only for a parked ro
 test("a re-arm that changes the extension does not orphan the old object", () => {
     const branch = start.slice(start.indexOf("if (recoverable) {"));
     const body = branch.slice(0, branch.indexOf("// IDENTITY MUST BE PROVEN"));
-    assert.match(body, /retryPath !== existing\.storagePath/);
-    assert.match(body, /deleteObjectOrRecord\(existing\.storagePath, "start-rearmed-repath"\)/);
+    // Guarded, SCHEDULED and ATOMIC, all in the shared helper: an extension
+    // change is precisely the case that reaches this branch with the OLD
+    // path's signed URL still live, so the delete waits for that URL to die
+    // rather than racing a late PUT — and the queue entry that remembers the
+    // object commits with the repath rather than after it.
+    assert.match(body, /repathWithCleanup\(\s*\n?\s*existing,/);
+    assert.match(body, /"start-rearmed-repath",/);
+    const helper = start.slice(start.indexOf("async function repathWithCleanup"));
+    assert.match(helper, /nextPath !== existing\.storagePath/);
+    assert.match(helper, /cleanupNotBefore\(existing\)/);
 });
 
 // ── The sweeper rejects through the same fenced transaction ────────────────
@@ -301,14 +399,20 @@ test("the sweeper uses the fenced reject, and touches no bytes when it loses", (
     const body = fn.slice(0, fn.indexOf("loadPhases:"));
     assert.match(body, /const dropped = await rejectRowAndQueueCleanup\(/);
     assert.match(body, /if \(!dropped\.ok\) continue;/);
-    assert.match(body, /settleQueuedCleanup\(dropped\.eventId, row\.storagePath\)/);
+    // The schedule rides along even though it is always null here — the
+    // `leaseLive` guard above already refused to reject a row whose URL still
+    // works, and stating the rule beats relying on a check twenty lines up.
+    assert.match(
+        body,
+        /settleQueuedCleanup\(dropped\.eventId, row\.storagePath, cleanupNotBefore\(row\)\)/,
+    );
     // The unfenced pair this replaces.
     assert.ok(
         !/deleteMany\(\{ where: \{ id: row\.id, state: "STAGING" \} \}\)/.test(body),
         "no delete-by-id-and-state",
     );
     assert.ok(
-        body.indexOf("if (!dropped.ok) continue;") < body.indexOf("settleQueuedCleanup"),
+        body.indexOf("if (!dropped.ok) continue;") < body.lastIndexOf("settleQueuedCleanup"),
         "the object is only touched after the row is provably gone",
     );
 });
@@ -401,22 +505,198 @@ test("the sweeper and /start both fence on the lease version", () => {
     // 409 rather than a URL for a row somebody else has moved on.
     assert.equal((start.match(/uploadLeaseVersion: nextLease/g) ?? []).length, 2, "resume and re-arm");
     assert.equal((start.match(/const nextLease = existing\.uploadLeaseVersion \+ 1/g) ?? []).length, 2);
-    for (const branch of ["const rearmed = await signUpload(retryPath)", "const resumed = await signUpload(resumePath)"]) {
+    // The move now runs inside repathWithCleanup — one transaction carrying
+    // both the fenced update and the abandoned object's cleanup entry — but
+    // the ordering property is unchanged: the row moves BEFORE anything is
+    // signed, so a signer failure cannot leave a URL for a row somebody else
+    // has moved on.
+    for (const branch of ["const rearmed = await signUpload(retryPath,", "const resumed = await signUpload(resumePath,"]) {
         const at = start.indexOf(branch);
         assert.ok(at > 0, branch);
-        const update = start.lastIndexOf("await prisma.receiptIntake.updateMany(", at);
-        assert.ok(update > 0 && update < at, `${branch}: the row moves before the URL is signed`);
+        const move = start.lastIndexOf("await repathWithCleanup(", at);
+        assert.ok(move > 0 && move < at, `${branch}: the row moves before the URL is signed`);
     }
-    assert.equal((start.match(/error: "publish-conflict"/g) ?? []).length, 2, "a lost claim is a 409 on both");
+    assert.equal(
+        (start.match(/await repathWithCleanup\(/g) ?? []).length,
+        2,
+        "resume and re-arm, both through the one transactional helper",
+    );
+    // ONE 409 helper now — four call sites (the two new-lease claims and the
+    // two live-lease reuses), so a lost claim cannot answer differently
+    // depending on which branch lost it.
+    assert.equal((start.match(/error: "publish-conflict"/g) ?? []).length, 1, "one helper");
+    assert.equal(
+        (start.match(/return leaseConflict\(existing\.id\)/g) ?? []).length,
+        6,
+        "and every lost claim goes through it",
+    );
 
-    // Every destructive sweeper write carries the version it observed.
+    // Every sweeper write carries the COMPLETE observed lease identity, and
+    // gets it from the one builder. Counting hand-rolled `uploadLeaseVersion:`
+    // pins is what let three of these four fence on half the identity while
+    // the fourth (the reject) carried all of it.
     const fn = sweeper.slice(sweeper.indexOf("sweepStaleStaging: async"));
     const body = fn.slice(0, fn.indexOf("loadPhases:"));
     assert.equal(
-        (body.match(/uploadLeaseVersion: row\.uploadLeaseVersion/g) ?? []).length,
-        4,
-        "the two parks, the publish commit and the reject",
+        (body.match(/\.\.\.leaseFence\(row\)/g) ?? []).length,
+        3,
+        "the two parks and the publish commit",
     );
+    // The reject reaches the same builder through rejectRowAndQueueCleanup,
+    // which now builds its delete's where from leaseFence too.
+    assert.match(body, /cleanupNotBefore: cleanupNotBefore\(row\),/);
+    const cleanup = readFileSync(path.join(ROOT, "src/lib/receipt-intake/storage-cleanup.ts"), "utf8");
+    assert.match(cleanup, /where: \{ id: row\.id, storagePath: row\.storagePath, \.\.\.leaseFence\(row\) \}/);
+    // The remaining `uploadLeaseVersion: row.uploadLeaseVersion` in this file
+    // is the RejectFence VALUE the sweeper hands to rejectRowAndQueueCleanup,
+    // not a where clause — and its type makes the list exhaustive, so a
+    // forgotten field is a compile error rather than a half fence. The
+    // where-clause rule itself is enforced for all six files by the tripwire in
+    // tests/receipt-intake-lease-fence.test.ts.
+    assert.match(body, /state: row\.state,/, "the reject fence pins the OBSERVED state");
     // ...and the reject also re-reads the row inside the transaction.
     assert.match(body, /fresh => uploadLeaseActive\(/);
+});
+
+// ── A FAILED SIGNER MUST NOT DELETE A ROW SOMEBODY ELSE RESUMED ────────────
+
+test("/start's signer-failure cleanup is a CAS over the lease it wrote, not a delete by id", () => {
+    // The row is created BEFORE the URL is signed, so a concurrent /start for
+    // the same sourceRef can hit the unique violation, adopt the row through
+    // reuseLiveLease and be holding a working URL by the time the original's
+    // signer fails. The unconditional `delete({ where: { id } })` this replaces
+    // then removed the shared row: the retry's bytes landed at a path nothing
+    // pointed at, /finalize 404'd, and the sourceRef stopped protecting the
+    // document's identity. The behaviour is in tests/receipt-intake-upload-lease.
+    assert.ok(
+        !/receiptIntake\.delete\(/.test(start),
+        "no unconditional delete is left anywhere in the route",
+    );
+    const signedAt = start.indexOf("const signed = await signUpload(storagePath,");
+    // A -1 here would slice the LAST CHARACTER of the file and every
+    // assertion below would then be made about one stray character. Fail
+    // on the anchor instead.
+    assert.ok(signedAt > 0, "the signer call is still where this pin thinks it is");
+    const branch = start.slice(signedAt);
+    assert.match(branch, /await discardUnresumedLease\(/);
+    // The SAME values that were written to the row. A second uploadLeaseExpiry()
+    // call would compare a fresh instant against the stored one and never match,
+    // which would leak a STAGING row (and its sourceRef) on every signer fault.
+    assert.match(start, /const leaseExpiresAt = uploadLeaseExpiry\(\);/);
+    assert.match(start, /const leaseNonce = newLeaseNonce\(\);/);
+    assert.match(start, /uploadUrlExpiresAt: leaseExpiresAt,\n\s+uploadLeaseVersion: 1,\n\s+uploadLeaseNonce: leaseNonce,/);
+    // AND THE GENERATION IS IN THE CAS. Pinning the expiry alone was the hole
+    // in the previous round's own fix: an adoption computes "now + 2h" exactly
+    // as this request did, so the two can land on the same millisecond and the
+    // pin matches a row somebody else already owns.
+    const discardArgs = branch.slice(branch.indexOf("await discardUnresumedLease("));
+    for (const pinned of [
+        /id,/, /storagePath,/, /uploadLeaseVersion: 1,/,
+        /uploadUrlExpiresAt: leaseExpiresAt,/, /uploadLeaseNonce: leaseNonce,/,
+    ]) {
+        assert.match(discardArgs.slice(0, discardArgs.indexOf("prisma.receiptIntake")), pinned);
+    }
+    // A lost CAS is the idempotent conflict, never an error about a row that is
+    // alive and in somebody else's hands.
+    assert.match(branch, /if \(discarded === "resumed"\) \{/);
+    assert.match(branch, /return leaseConflict\(id\);/);
+    assert.ok(
+        branch.indexOf(`discarded === "resumed"`) < branch.indexOf(`reason: "storage-unavailable"`),
+        "the conflict is answered before the signer's own 503",
+    );
+});
+
+// ── The cutover writes are fenced on the rows they were decided about ──────
+
+test("no cutover write updates by id alone", () => {
+    // READ COMMITTED lets an admin review (or any writer that never touches the
+    // claim's advisory lock) move a parked row between the SELECT that triaged
+    // it and the UPDATE that acts on the verdict. `where: { id: { in: [...] } }`
+    // then overwrote that with a TERMINAL SHADOW_* state, or handed the row to
+    // v2 with `dryRun: false`. Behaviour: tests/receipt-intake-cutover.
+    const fn = sweeper.slice(sweeper.indexOf("async function claim("));
+    const body = fn.slice(0, fn.indexOf("const ELIGIBLE ="));
+    assert.equal(
+        (body.match(/await applyCutoverVerdict\(/g) ?? []).length,
+        3,
+        "retire, quarantine and requeue all go through the fenced write",
+    );
+    assert.ok(
+        !/tx\.receiptIntake\.updateMany\(/.test(body),
+        "and none of them writes an unfenced updateMany of its own",
+    );
+    // The rows the verdict is applied to are the ones that were triaged, not a
+    // re-derived id list — that is how the two came to disagree before.
+    assert.match(body, /const byId = new Map<string, CutoverRow>\(candidates\.map\(row => \[row\.id, row\]\)\);/);
+    assert.match(
+        body,
+        /state: true, stateReason: true, dryRun: true, claimToken: true,/,
+        "the evidence each write fences on is selected with them",
+    );
+    // Rows whose CAS lost are reported, not silently dropped.
+    assert.match(body, /shadowSkippedMoved \+= /);
+    assert.match(body, /shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved,/);
+});
+
+// ── A /start REFRESH during an in-flight REJECT (Codex round-12 item 1) ─────
+//
+// The mirror of the publish race in receipt-intake-stored-object.test.ts, on
+// the delete instead of the commit. reuseLiveLease reissues a working signed
+// URL over the same path at the same version, writing only the nonce and the
+// expiry — so a reject decided a moment earlier still matched every column the
+// old fence pinned, and destroyed the only record of a receipt whose upload
+// link had just been renewed.
+
+const REFRESHED_NONCE = "nonce-b";
+const OBSERVED_NONCE = "nonce-a";
+const EXPIRY = new Date("2026-09-03T12:00:00.000Z");
+const REFRESHED_EXPIRY = new Date(EXPIRY.getTime() + 2 * 60 * 60_000);
+
+test("REJECT vs REFRESH: a lease reissued mid-inspection saves the row", async () => {
+    // /finalize decides the object is unacceptable, and in the seconds it spent
+    // reading it a /start retry handed the client a working URL over the same
+    // path. Deleting the row now destroys the only record of an inbound receipt
+    // whose upload link is live.
+    const observed = parked({
+        uploadLeaseNonce: OBSERVED_NONCE,
+        uploadUrlExpiresAt: new Date(Date.now() + 60 * 60_000),
+    });
+    const { db, store } = client([observed], s => {
+        s.rows = [parked({
+            ...observed,
+            uploadLeaseNonce: REFRESHED_NONCE,
+            uploadUrlExpiresAt: new Date(Date.now() + 3 * 60 * 60_000),
+        })];
+    });
+
+    const dropped = await rejectRowAndQueueCleanup(observed as never, "unsupported-file-type", db);
+
+    assert.equal(dropped.ok, false, "the fence lost");
+    assert.equal(store.committed, false, "the whole transaction rolled back");
+    assert.deepEqual(store.events, [], "nothing queued against the stale expiry");
+    assert.equal(store.rows.length, 1, "and the row — the client's only record — survives");
+});
+
+test("REJECT vs REFRESH control: the lease generation is what catches it", async () => {
+    // The version, the path, the state and the reason are all UNCHANGED across
+    // a refresh, so every column the old fence pinned still matched. Asserted
+    // directly, so this cannot pass for a fence that lost for another reason.
+    const observed: Row = parked({ uploadLeaseNonce: OBSERVED_NONCE, uploadUrlExpiresAt: EXPIRY });
+    const refreshed: Row = {
+        ...observed,
+        uploadLeaseNonce: REFRESHED_NONCE,
+        uploadUrlExpiresAt: REFRESHED_EXPIRY,
+    };
+    for (const column of ["state", "stateReason", "storagePath", "uploadLeaseVersion", "claimToken"]) {
+        assert.equal(refreshed[column], observed[column], `${column} survives a refresh`);
+    }
+    assert.notEqual(refreshed.uploadLeaseNonce, observed.uploadLeaseNonce);
+    assert.notEqual(refreshed.uploadUrlExpiresAt, observed.uploadUrlExpiresAt);
+
+    // ...and an unrefreshed row still rejects, so the pin is not simply fatal.
+    const { db, store } = client([observed]);
+    const ok = await rejectRowAndQueueCleanup(observed as never, "unsupported-file-type", db);
+    assert.equal(ok.ok, true);
+    assert.deepEqual(store.rows, []);
+    assert.equal(store.events.length, 1);
 });

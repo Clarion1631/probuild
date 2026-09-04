@@ -63,7 +63,7 @@ test("an object that IS there reports its real size, not an unknown", async () =
     const { error } = await bucket.upload(path, PNG, { contentType: "image/png" });
     assert.equal(error, null);
 
-    const size = await receiptObjectSize(path, bucket as unknown as BucketLister);
+    const size = await receiptObjectSize(path, bucket as unknown as BucketLister, undefined);
     assert.deepEqual(size, { ok: true, size: PNG.length });
 });
 
@@ -79,6 +79,7 @@ test("an object that is NOT there is MISSING, never transient", async () => {
     const absent = await receiptObjectSize(
         "receipts/intake/never-uploaded.png",
         bucket as unknown as BucketLister,
+        undefined,
     );
     assert.deepEqual(absent, { ok: false, kind: "missing" });
 });
@@ -88,6 +89,7 @@ test("an EMPTY prefix is an answer, not an error", async () => {
     const empty = await receiptObjectSize(
         "receipts/intake/anything.png",
         bucket as unknown as BucketLister,
+        undefined,
     );
     assert.deepEqual(empty, { ok: false, kind: "missing" });
 });
@@ -138,13 +140,13 @@ test("a removed object goes back to MISSING", async () => {
     const path = "receipts/intake/gone.png";
     await bucket.upload(path, PNG, { contentType: "image/png" });
     assert.deepEqual(
-        await receiptObjectSize(path, bucket as unknown as BucketLister),
+        await receiptObjectSize(path, bucket as unknown as BucketLister, undefined),
         { ok: true, size: PNG.length },
     );
 
     await bucket.remove([path]);
     assert.deepEqual(
-        await receiptObjectSize(path, bucket as unknown as BucketLister),
+        await receiptObjectSize(path, bucket as unknown as BucketLister, undefined),
         { ok: false, kind: "missing" },
     );
 });

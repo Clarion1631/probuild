@@ -26,22 +26,36 @@ import {
     type WorkerDependencies,
     type WorkerRow,
     uploadLeaseActive,
+    storageTimeoutRun,
     uploadLeaseExpiry,
     SIGNED_UPLOAD_TTL_MS,
     readBudgetFor,
     READ_MIN_BUDGET_MS,
     READ_SAFETY_MARGIN_MS,
+    claimableStates,
+    eligibleClaimWhere,
+    BATCH_SIZE,
+    DRYRUN_PARK_RETRY_MS,
+    QBO_WRITING_STATES,
 } from "../src/lib/receipt-intake/worker";
+import { preservedTaxWarning } from "../src/lib/receipt-intake/route-state";
 import { normalizeDocType, READ_BUDGET_MS, type ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
 import type { CutoverRequest } from "../src/lib/receipt-intake/worker";
 import { QBTimeoutError } from "../src/lib/quickbooks";
+import {
+    downloadReceiptObject,
+    storageBudgetMs,
+    STORAGE_CALL_MAX_MS,
+} from "../src/lib/receipt-intake/bucket";
 import { QboAccountConfigError, QboPurchaseFaultError } from "../src/lib/qbo-receipt-push";
 
 import { Prisma } from "@prisma/client";
 
 const PrismaKnownError = Prisma.PrismaClientKnownRequestError;
 const NOW = new Date("2026-09-01T12:00:00.000Z");
+/** The token this pass claims with. A row carrying anything else is a successor's. */
+const LIVE_TOKEN = "claim-1";
 
 function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
     return {
@@ -75,7 +89,7 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         busyPasses: 0,
         lastError: null,
         sendAttempted: false,
-        claimToken: "claim-1",
+        claimToken: LIVE_TOKEN,
         fileSha256: "s".repeat(64),
         stateReason: null,
         ...overrides,
@@ -109,9 +123,19 @@ interface Harness {
         patch?: Partial<ReadPatch>; ownership?: { state: string; claimToken: string | null };
     }[];
     promoted: string[];
-    finished: { id: string; claimToken: string | null; stateReason: string | null }[];
+    finished: {
+        id: string;
+        claimToken: string | null;
+        stateReason: string | null;
+        /** The DURABLE marker routing wrote, distinct from the display copy. */
+        taxWarning: string | null;
+    }[];
     deferred: { id: string; busyPasses: number }[];
     retried: { id: string; attempts: number; reason: string }[];
+    releasedClaims: { id: string; nextRetryAt: Date }[];
+    releasedUnprocessed: { id: string; claimToken: string | null }[];
+    leaseAcquires: number;
+    leaseReleases: number;
     claimOpts: CutoverRequest[];
     boundary: Date | null;
     sweepCalls: number;
@@ -125,15 +149,22 @@ interface Harness {
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
     const h: Harness = {
         reads: 0, books: 0, applied: [], states: [], promoted: [], finished: [], deferred: [],
-        retried: [], claimOpts: [], sweepCalls: 0, cleanupCalls: 0, bookBudgets: [], clock: 0,
+        retried: [], releasedClaims: [], releasedUnprocessed: [], leaseAcquires: 0, leaseReleases: 0,
+        claimOpts: [], sweepCalls: 0, cleanupCalls: 0, bookBudgets: [], clock: 0,
         sendReads: [],
         boundary: new Date("2026-08-25T00:00:00.000Z"),
         deps: null as unknown as WorkerDependencies,
     };
     h.deps = {
+        // The default harness always gets the lease. The tests that care about
+        // overlap override it.
+        acquireLease: async () => {
+            h.leaseAcquires++;
+            return { release: async () => { h.leaseReleases++; } };
+        },
         claim: async opts => {
             h.claimOpts.push(opts);
-            return { rows, shadowRetired: 0, requeued: 0, shadowQuarantined: 0 };
+            return { rows, shadowRetired: 0, requeued: 0, shadowQuarantined: 0, shadowSkippedMoved: 0 };
         },
         cutoverBoundary: async () => h.boundary,
         isDryRunEnabled: () => true,
@@ -157,8 +188,8 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
             h.states.push({ id, state, reason, patch, ownership });
             return true;
         },
-        finishRouting: async (id, claimToken, stateReason) => {
-            h.finished.push({ id, claimToken, stateReason });
+        finishRouting: async (id, claimToken, stateReason, taxWarning) => {
+            h.finished.push({ id, claimToken, stateReason, taxWarning });
         },
         companyTimeZone: async () => "America/Los_Angeles",
         promoteToBooking: async id => { h.promoted.push(id); return { promoted: true }; },
@@ -168,6 +199,13 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         },
         applyBookResult: async () => {},
         deferRead: async (id, busyPasses) => { h.deferred.push({ id, busyPasses }); return true; },
+        releaseClaim: async (id, nextRetryAt) => { h.releasedClaims.push({ id, nextRetryAt }); return true; },
+        // Token-fenced in the real implementation; here it just records what
+        // was handed back, and reports the rows whose token still matches.
+        releaseUnprocessed: async released => {
+            h.releasedUnprocessed.push(...released);
+            return released.filter(r => r.claimToken === LIVE_TOKEN).length;
+        },
         retryRow: async (id, attempts, _next, reason) => { h.retried.push({ id, attempts, reason }); return true; },
         now: () => NOW,
         monotonicMs: () => h.clock,
@@ -186,7 +224,7 @@ test("DRY RUN: a received row is read, deduped and routed — and never booked",
     // The claim leaves the row RECEIVED and holding its lease; finishRouting is
     // the only thing that publishes READ, after every dedup net has answered.
     assert.equal(h.applied[0].state, "RECEIVED");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
     assert.equal(h.applied[0].vendor, "Lowes");
     assert.equal(h.applied[0].totalCents, 36498);
     assert.equal(h.applied[0].taxCents, 2920);
@@ -361,7 +399,7 @@ test("a strong-key loss to a DIFFERENT vendor is a collision, not a duplicate", 
 test("the shadow week does NOT run the cutover", async () => {
     const h = harness([workerRow({ state: "READ", dryRun: true })], { isDryRunEnabled: () => true });
     const summary = await runIntakeWorker(h.deps);
-    assert.equal(h.claimOpts[0].run, false);
+    assert.equal(h.claimOpts[0].dryRunGlobal, true);
     assert.equal(h.claimOpts[0].boundary, null, "the boundary is not even read while dry-run is on");
     assert.equal(summary.shadowRetired, undefined);
 });
@@ -379,11 +417,11 @@ test("CUTOVER: the boundary is passed to the claim so the backlog can be split",
         claim: async opts => {
             h.claimOpts.push(opts);
             // Rows BEFORE the boundary were booked by v1; rows after it by nobody.
-            return { rows: [], shadowRetired: 7, requeued: 2, shadowQuarantined: 0 };
+            return { rows: [], shadowRetired: 7, requeued: 2, shadowQuarantined: 0, shadowSkippedMoved: 0 };
         },
     });
     const summary = await runIntakeWorker(h.deps);
-    assert.equal(h.claimOpts[0].run, true);
+    assert.equal(h.claimOpts[0].dryRunGlobal, false);
     assert.equal(h.claimOpts[0].boundary?.toISOString(), boundary.toISOString());
     assert.equal(summary.shadowRetired, 7, "v1 already booked these");
     assert.equal(summary.requeued, 2, "nobody booked these — v2 must");
@@ -400,7 +438,7 @@ test("CUTOVER refuses entirely when no boundary is recorded", async () => {
         claim: async opts => {
             h.claimOpts.push(opts);
             assert.equal(opts.boundary, null);
-            return { rows: [], shadowRetired: 0, requeued: 0, shadowQuarantined: 0 };
+            return { rows: [], shadowRetired: 0, requeued: 0, shadowQuarantined: 0, shadowSkippedMoved: 0 };
         },
     });
     const summary = await runIntakeWorker(h.deps);
@@ -453,6 +491,65 @@ test("the worker stops TAKING rows at 40s and leaves the rest for the next run",
     assert.equal(summary.processed, 3, "three rows fit inside the soft deadline");
     assert.equal(summary.deferredToNextRun, 2);
     assert.equal(h.reads, 3, "the deferred rows are never read");
+
+    // ...AND THE TWO IT NEVER REACHED ARE HANDED BACK.
+    //
+    // The claim stamps all ten rows with a ten-minute lease. A row the loop
+    // never touched that keeps that lease AND its claim token is invisible to
+    // the next cron five minutes later — `eligibleClaimWhere` skips a future
+    // `nextRetryAt`, and every fenced write misses a token no live pass holds.
+    // A batch that spent its budget on row 3 sat on seven untouched receipts
+    // for the rest of the ten minutes.
+    assert.deepEqual(
+        h.releasedUnprocessed.map(r => r.id),
+        ["row-4", "row-5"],
+        "exactly the rows nothing was attempted against — the processed ones release themselves",
+    );
+    assert.equal(summary.releasedUnprocessed, 2);
+});
+
+test("the release is FENCED: a row whose token changed is handed to the release and refused by it", async () => {
+    // The fence lives in the UPDATE's where clause, so what this proves at the
+    // worker level is that the token the pass claimed with travels with the
+    // row — a release keyed on the id alone would clear a claim a successor
+    // now holds.
+    const rows = [
+        workerRow({ id: "row-1" }),
+        workerRow({ id: "row-2" }),
+        // Taken over between the claim and the deadline.
+        workerRow({ id: "row-3", claimToken: "claim-2" }),
+    ];
+    const h = harness(rows, {
+        read: async () => { h.clock += 45_000; h.reads++; return goodRead; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.processed, 1);
+    assert.deepEqual(
+        h.releasedUnprocessed,
+        [{ id: "row-2", claimToken: LIVE_TOKEN }, { id: "row-3", claimToken: "claim-2" }],
+        "the release is told each row's own token, not just its id",
+    );
+    assert.equal(summary.releasedUnprocessed, 1, "only the row this pass still owns was released");
+});
+
+test("no deadline, no release call: a batch that finishes hands nothing back", async () => {
+    const h = harness([workerRow(), workerRow({ id: "row-2" })]);
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.processed, 2);
+    assert.equal(summary.deferredToNextRun, undefined);
+    assert.deepEqual(h.releasedUnprocessed, [], "every row completed under its own transition");
+    assert.equal(summary.releasedUnprocessed, undefined);
+});
+
+test("a failing release never takes the pass down with it", async () => {
+    const rows = [1, 2, 3].map(n => workerRow({ id: `row-${n}` }));
+    const h = harness(rows, {
+        read: async () => { h.clock += 45_000; h.reads++; return goodRead; },
+        releaseUnprocessed: async () => { throw new Error("db blip"); },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.deferredToNextRun, 2, "the rows are still reported as deferred");
+    assert.equal(summary.releasedUnprocessed, undefined, "and honestly reported as NOT released");
 });
 
 // ── Weak-dedup race at the READ -> BOOKING transition (Codex blocker 5) ───────
@@ -552,6 +649,112 @@ test("a QBO fault thrown mid-row parks; a transient one past the ceiling also pa
     assert.equal(exhausted.states[0].reason, "max-retries");
 });
 
+// ── A failure AFTER the READ -> BOOKING promotion (Codex round-36 item 1) ────
+//
+// The promotion COMMITS a state change mid-row. Every recovery write is CAS'd
+// on the row's {state, claimToken}, so handing the error path the row as it was
+// CLAIMED pinned "READ" against a database that now said "BOOKING": zero rows
+// matched, `attempts` never moved, and the row came back next pass to fail the
+// same way forever without ever reaching max-retries.
+
+/**
+ * A harness whose recovery writes really evaluate the CAS, against a database
+ * state the promotion actually moves. Without that the fakes accept any
+ * ownership and the bug is invisible — which is how it survived 35 rounds.
+ */
+type Ownership = { state: string; claimToken: string | null };
+
+function promotedHarness(row: WorkerRow, thrown: unknown) {
+    const db: Ownership = { state: row.state, claimToken: row.claimToken };
+    const seen: Ownership[] = [];
+    /** What `updateMany({ where: { id, state, claimToken } })` would match. */
+    const wouldMatch = (o: Ownership) => o.state === db.state && o.claimToken === db.claimToken;
+    const cas = (ownership: Ownership) => {
+        seen.push(ownership);
+        return wouldMatch(ownership);
+    };
+    const h = harness([row], {
+        isDryRunEnabled: () => false,
+        promoteToBooking: async id => {
+            h.promoted.push(id);
+            db.state = "BOOKING";
+            return { promoted: true };
+        },
+        book: async () => { throw thrown; },
+        retryRow: async (id, attempts, _next, reason, ownership) => {
+            if (!cas(ownership)) return false;
+            h.retried.push({ id, attempts, reason });
+            return true;
+        },
+        applyState: async (id, state, reason, patch, ownership) => {
+            if (!cas(ownership!)) return false;
+            h.states.push({ id, state, reason, patch, ownership });
+            return true;
+        },
+    });
+    return { h, db, seen, wouldMatch };
+}
+
+test("a throw right after the promotion spends an attempt against the BOOKING row", async () => {
+    const row = workerRow({ state: "READ", dryRun: false, attempts: 2 });
+    const { h, db, seen, wouldMatch } = promotedHarness(row, new Error("connection reset"));
+
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { RETRY: 1 }, "retried, not silently stale");
+    assert.equal(h.retried.length, 1);
+    assert.equal(h.retried[0].attempts, 3, "the attempt actually landed");
+    assert.equal(db.state, "BOOKING", "the promotion committed");
+    assert.deepEqual(seen[0], { state: "BOOKING", claimToken: LIVE_TOKEN }, "the CAS pinned the CURRENT state");
+
+    // THE CONTROL. The old code passed the row as CLAIMED, so its CAS pinned
+    // "READ" — assert directly that such a write would have matched zero rows.
+    // Without this the assertion above would also pass for a harness that
+    // ignored the CAS entirely, which is what let the bug live for 35 rounds.
+    assert.equal(
+        wouldMatch({ state: row.state, claimToken: row.claimToken }),
+        false,
+        "the pre-promotion ownership matches nothing once the promotion has committed",
+    );
+});
+
+test("at the ceiling, a post-promotion failure PARKS instead of cycling forever", async () => {
+    // The consequence of the bug, not just its mechanism: with attempts frozen
+    // the row could never reach MAX_BOOK_ATTEMPTS, so the terminal park that
+    // puts it in front of a person was unreachable.
+    const row = workerRow({ state: "READ", dryRun: false, attempts: 19 });
+    const { h, seen } = promotedHarness(row, new Error("connection reset"));
+
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states.length, 1);
+    assert.equal(h.states[0].reason, "max-retries");
+    assert.deepEqual(seen.at(-1), { state: "BOOKING", claimToken: LIVE_TOKEN });
+});
+
+test("a CLASSIFIED QBO fault after the promotion parks under the BOOKING state too", async () => {
+    // The terminal branch takes the same row, so it needs the same fix — and a
+    // qbo-fault park is the one that must NOT be lost: it means a send happened.
+    const row = workerRow({ state: "READ", dryRun: false });
+    const { h } = promotedHarness(row, new QboAccountConfigError("bad account"));
+
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { NEEDS_REVIEW: 1 });
+    assert.match(h.states[0].reason!, /^qbo-fault:/);
+    assert.deepEqual(h.states[0].ownership, { state: "BOOKING", claimToken: LIVE_TOKEN });
+});
+
+test("a row claimed AT BOOKING is unaffected — its state never moves mid-pass", async () => {
+    // The control for the change itself: only the READ branch promotes, so the
+    // BOOKING branch must still CAS on the state it was claimed with.
+    const row = workerRow({ state: "BOOKING", dryRun: false, attempts: 0 });
+    const { h, seen } = promotedHarness(row, new Error("connection reset"));
+
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { RETRY: 1 });
+    assert.deepEqual(h.promoted, [], "no promotion happens on this branch");
+    assert.deepEqual(seen[0], { state: "BOOKING", claimToken: LIVE_TOKEN });
+});
+
 test("isUniqueViolation is about the ERROR CODE, not Prisma's meta text", () => {
     // The previous version string-matched "dedupStrongKey" inside error.meta,
     // which is version-dependent and EMPTY for a partial index on some engine
@@ -645,7 +848,7 @@ test("the strong claim is attempted with the key, before any weak lookup", async
     // The claim writes the KEYS but leaves the row RECEIVED and holding its
     // lease. READ is reached only by finishRouting, once every net has spoken.
     assert.equal(h.applied[0].state, "RECEIVED");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
 });
 
 test("the lease is held through routing and released only at the end", async () => {
@@ -750,7 +953,7 @@ test("a plausible tax is stored and the row carries no note", async () => {
     await runIntakeWorker(h.deps);
     assert.equal(h.applied[0].taxCents, 2920, "29.20 of 364.98 is ~8%");
     assert.equal(h.applied[0].stateReason, null);
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
 });
 
 test("an implausible tax nulls taxCents, notes the row, and does NOT park it", async () => {
@@ -764,7 +967,14 @@ test("an implausible tax nulls taxCents, notes the row, and does NOT park it", a
     assert.equal(h.applied[0].taxCents, null, "the bad reading is dropped, not booked");
     assert.equal(h.applied[0].totalCents, 36498, "the total is untouched");
     assert.deepEqual(summary.byState, { READ: 1 }, "READ, not NEEDS_REVIEW");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible" }]);
+    assert.deepEqual(h.finished, [{
+        id: "row-1",
+        claimToken: "claim-1",
+        stateReason: "tax-implausible",
+        // AND IN ITS OWN COLUMN. `stateReason` is a display copy that every
+        // deferred booking and every park overwrites; this one is durable.
+        taxWarning: "tax-implausible",
+    }]);
 });
 
 test("the tax note survives alongside a dedup reason", async () => {
@@ -789,7 +999,7 @@ test("the row stores only the tax BOOKING accepted, never a rejected reading", a
     await runIntakeWorker(h.deps);
     // buildGroups refuses to split tax on a check, so nothing was accepted.
     assert.equal(h.applied[0].taxCents, null);
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible" }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible", taxWarning: "tax-implausible" }]);
 });
 
 test("a check with no tax reading books clean, with no note", async () => {
@@ -801,7 +1011,7 @@ test("a check with no tax reading books clean, with no note", async () => {
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.applied[0].taxCents, null);
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
 });
 
 test("a tax equal to the total is refused end to end", async () => {
@@ -811,7 +1021,7 @@ test("a tax equal to the total is refused end to end", async () => {
     await runIntakeWorker(h.deps);
     assert.equal(h.applied[0].taxCents, null);
     assert.equal(h.applied[0].totalCents, 36498, "the total is untouched");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible" }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible", taxWarning: "tax-implausible" }]);
 });
 
 // ── Fail-closed classifier (round-5 item 4) ────────────────────────────────
@@ -878,7 +1088,7 @@ test("INTERLEAVING: a job assigned after the claim is honoured, not parked NEEDS
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { READ: 1 }, "routed, not parked");
     assert.deepEqual(h.states, [], "no NEEDS_JOB park was written");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
 });
 
 test("a row with no job at claim time AND none at routing time still parks", async () => {
@@ -890,11 +1100,46 @@ test("a row with no job at claim time AND none at routing time still parks", asy
 });
 
 test("a failing re-read falls back to the claimed value instead of losing the row", async () => {
+    // The snapshot ALREADY names a job, so the fallback asserts something the
+    // row itself recorded and a late assignment can only have refined. The
+    // routing gate asks whether a job exists at all, so the stale answer and the
+    // fresh one agree — this one may stand.
     const h = harness([workerRow({ projectId: "proj-1" })], {
         refreshProjectId: async () => { throw new Error("pool exhausted"); },
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { READ: 1 });
+});
+
+test("RACE: a DB blip during the read must not park an assigned receipt NEEDS_JOB", async () => {
+    // The interleaving: the pass claims a row with no project and spends ~25s
+    // in the reader. A person assigns the job in that window, and the re-read
+    // that would have SEEN it throws (a pool timeout, a dropped connection).
+    //
+    // Swallowing the throw turned a transient fault into a routing decision:
+    // the fallback is the CLAIMED snapshot, which by definition predates the
+    // assignment, so it asserted "still unassigned" — exactly the fact the
+    // failed call was supposed to establish — and parked the receipt NEEDS_JOB
+    // for a job it already had. The person sees their own assignment ignored,
+    // and the row waits for a human nothing will summon.
+    const h = harness([workerRow({ projectId: null })], {
+        refreshProjectId: async () => { throw new Error("pool exhausted"); },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { RETRY: 1 }, "the normal retry path, not a verdict");
+    assert.deepEqual(h.states, [], "nothing was parked");
+    assert.equal(h.retried.length, 1, "with a backoff and an attempt spent");
+    assert.equal(h.retried[0].attempts, 1);
+    assert.match(h.retried[0].reason, /project-refresh-unavailable/);
+});
+
+test("the control: a re-read that ANSWERS 'no job' still parks NEEDS_JOB", async () => {
+    // The fix must not turn every unassigned receipt into an infinite retry.
+    // An answered null is a decision; only a FAILED call is a transient.
+    const h = harness([workerRow({ projectId: null })], { refreshProjectId: async () => null });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { NEEDS_JOB: 1 });
+    assert.deepEqual(h.retried, []);
 });
 
 test("the deadline starts at invocation entry, so a slow sweep cannot overrun it", async () => {
@@ -914,7 +1159,12 @@ test("the deadline starts at invocation entry, so a slow sweep cannot overrun it
     const summary = await runIntakeWorker(h.deps);
     assert.equal(h.reads, 0, "no Gemini call after the budget is gone");
     assert.equal(summary.processed, 0);
-    assert.equal(summary.deferredToNextRun, 2, "both rows keep their lease for the next run");
+    assert.equal(summary.deferredToNextRun, 2, "neither row was reached");
+    // A deadline BEFORE the first row releases the whole batch: not one of
+    // them was looked at, so all ten minutes of their lease would otherwise be
+    // spent on rows nothing ever considered.
+    assert.deepEqual(h.releasedUnprocessed.map(r => r.id), ["row-1", "row-2"]);
+    assert.equal(summary.releasedUnprocessed, 2);
 });
 
 // ── A missing boundary halts the WHOLE pass (round-7 item 3) ───────────────
@@ -1038,7 +1288,7 @@ test("the cutover reports quarantined rows separately from retired and requeued"
         isDryRunEnabled: () => false,
         claim: async opts => {
             h.claimOpts.push(opts);
-            return { rows: [], shadowRetired: 4, requeued: 2, shadowQuarantined: 3 };
+            return { rows: [], shadowRetired: 4, requeued: 2, shadowQuarantined: 3, shadowSkippedMoved: 0 };
         },
     });
     const summary = await runIntakeWorker(h.deps);
@@ -1055,7 +1305,7 @@ test("finishRouting is handed the token the pass claimed with", async () => {
     // actually holds.
     const h = harness([workerRow({ claimToken: "token-abc" })]);
     await runIntakeWorker(h.deps);
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "token-abc", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "token-abc", stateReason: null, taxWarning: null }]);
 });
 
 // ── A successor reclaiming mid-flight (Phase 2 gate) ───────────────────────
@@ -1258,23 +1508,103 @@ test("/start stamps a lease on every url it issues, including a live-lease retry
         path.join(__dirname, "..", "src/app/api/receipts/intake/start/route.ts"),
         "utf8",
     );
-    // Four: the new row, the re-armed park, the resumed STAGING upload, AND a
-    // retry against a still-live lease. A URL handed out without a lease
-    // extension is one the sweeper cannot see coming — a resigned URL for an
-    // unexpired lease is good for a fresh ~2h window, so leaving the row's
-    // recorded expiry at its OLD value let the sweeper judge the lease dead
-    // while the client still held a perfectly live URL.
+    // Four branches, four lease stamps: the new row, the re-armed park, the
+    // resumed STAGING upload, AND a retry against a still-live lease. A URL
+    // handed out without a lease extension is one the sweeper cannot see coming
+    // — a resigned URL for an unexpired lease is good for a fresh ~2h window,
+    // so leaving the row's recorded expiry at its OLD value let the sweeper
+    // judge the lease dead while the client still held a perfectly live URL.
+    //
+    // Three of them are here; the fourth is the shared live-lease rule, which
+    // now serves BOTH resumable states from one place (upload-lease.ts) and
+    // takes the same clock as an injected dependency.
+    // The create branch holds its stamp in a const, because the signer-failure
+    // discard CASes on that EXACT value and a second uploadLeaseExpiry() call
+    // would compare a fresh instant against the stored one; the other two stamp
+    // inline.
+    assert.match(start, /const leaseExpiresAt = uploadLeaseExpiry\(\);/);
+    assert.match(start, /uploadUrlExpiresAt: leaseExpiresAt,/, "the new row still gets a lease");
     assert.equal(
         (start.match(/uploadUrlExpiresAt: uploadLeaseExpiry\(\)/g) ?? []).length,
-        4,
-        "create, re-arm, resume, and the live-lease retry all stamp the lease",
+        2,
+        "re-arm and resume stamp the lease inline",
+    );
+    assert.match(start, /expiresAt: uploadLeaseExpiry,/, "and the shared rule is given the same clock");
+    const lease = readFileSync(
+        path.join(__dirname, "..", "src/lib/receipt-intake/upload-lease.ts"),
+        "utf8",
+    );
+    assert.match(
+        lease,
+        // Through extendedExpiry, which forces the written instant PAST the
+        // one it found: an extension moves nothing else, so the expiry is
+        // the only witness the signer-failure discard has.
+        /uploadUrlExpiresAt: extendedExpiry\(observed\.uploadUrlExpiresAt, deps\.expiresAt\(\)\),/,
+        "the shared rule stamps it too",
+    );
+    // And the ADOPTION GENERATION alongside it, on every one of the four. The
+    // expiry alone cannot identify a lease -- a reuse writes the same "now + 2h"
+    // the original issue did, so the discard CAS pins this instead.
+    // Hoisted now, because /finalize requires the generation its URL was
+    // issued under and the caller has to hand it back — so the value written
+    // to the row and the value returned to the client must be the SAME draw,
+    // not two calls to the generator.
+    // AN EXTENSION KEEPS the generation it adopted -- see the round-19 note
+    // in upload-lease.ts. Only a row that never had one (a legacy row, null)
+    // draws a fresh value, and the CAS pins the null so exactly one writer
+    // mints it.
+    assert.match(lease, /const uploadLease = observed\.uploadLeaseNonce \?\? \(deps\.nonce \?\? newLeaseNonce\)\(\);/);
+    assert.match(lease, /uploadLeaseNonce: uploadLease,/);
+    assert.match(lease, /signed: \{ \.\.\.signed, uploadLease \}/);
+    // Both destructive branches still stamp a FRESH generation — hoisted into
+    // a const now, for the same reason as the reuse path: /finalize requires
+    // the generation, so the response has to echo the value that was written.
+    assert.match(start, /const rearmedLease = newLeaseNonce\(\);/);
+    assert.match(start, /const resumedLease = newLeaseNonce\(\);/);
+    assert.equal(
+        (start.match(/uploadLeaseNonce: (rearmedLease|resumedLease),/g) ?? []).length,
+        2,
+        "the re-arm and the resume each write the generation they minted",
+    );
+    assert.equal(
+        (start.match(/uploadLease: (rearmedLease|resumedLease),/g) ?? []).length,
+        2,
+        "...and each hands that same value back",
+    );
+    assert.equal(
+        (start.match(/uploadLeaseNonce: leaseNonce/g) ?? []).length,
+        2,
+        "and the create holds ITS generation in a const, because the discard CAS pins that exact value",
     );
     const signed = (start.match(/await signUpload\(/g) ?? []).length;
-    assert.equal(signed, 4, "one signUpload call per branch");
+    assert.equal(signed, 3, "one signUpload call per inline branch");
+    // ...and it is the ONE issuer that asks for an upsert-capable token, because
+    // it re-signs an EXISTING path so a client can replace its own partial
+    // upload. Every other issuer signs a path a version bump has just made new.
     assert.match(
-        start,
-        /existing\.uploadUrlExpiresAt && existing\.uploadUrlExpiresAt\.getTime\(\) > Date\.now\(\)/,
-        "the live-lease retry's CAS is gated on the lease still being live",
+        lease,
+        /await deps\.sign\(path, \{ upsert: true \}\)/,
+        "the shared rule signs the path it kept, with the overwrite capability it needs",
+    );
+    // The liveness test is its OWN predicate now, because two different
+    // answers used to collapse into liveLeasePath's null: "nothing live here,
+    // take a new lease" and "there IS a live lease, but for a different file
+    // type". The second is a refusal -- repathing it orphans an object whose
+    // URL is still in somebody's hands.
+    assert.match(
+        lease,
+        /export function hasLiveLease\(row: LeaseRow, now: number = Date\.now\(\)\): boolean \{/,
+        "the live-lease retry is gated on the lease still being live",
+    );
+    assert.match(
+        lease,
+        /return !!row\.uploadUrlExpiresAt && row\.uploadUrlExpiresAt\.getTime\(\) > now;/,
+        "and the gate is an expiry comparison, not a proxy for one",
+    );
+    assert.match(
+        lease,
+        /if \(hasLiveLease\(observed, at\)\) \{[\s\S]{0,300}?kind: \"identity-conflict\"/,
+        "a live lease this request disagrees with is refused, never repathed",
     );
 });
 
@@ -1428,4 +1758,478 @@ test("the sweep query excludes live leases and orders null-lease rows first", ()
     assert.match(query, /\{ uploadUrlExpiresAt: \{ sort: "asc", nulls: "first" \} \}/);
     assert.match(query, /\{ createdAt: "asc" \}/);
     assert.match(query, /take: STAGING_SWEEP_BATCH/);
+});
+
+// ── Dry-run ROLLBACK starvation (Codex a2998e8a, finding 1) ──────────────────
+//
+// The hole the last round left: booking learned to honour the CURRENT global
+// switch, but claim ELIGIBILITY still only excluded rows whose PERSISTED
+// dryRun was true. Flip RECEIPT_INTAKE_DRYRUN back on after a live window and
+// every row claimed during that window is still `dryRun:false`, still sitting
+// in READ/BOOKING, and still claimable — so each pass filled its ten-row batch
+// with rows it then refused to advance (without even releasing the claim), and
+// the newer RECEIVED receipts behind them were never read.
+
+test("claimable states are a function of the CURRENT switch, not the row flag", () => {
+    assert.deepEqual(
+        claimableStates(true),
+        ["RECEIVED"],
+        "under dry-run nothing whose next step is a QBO write may be claimed",
+    );
+    assert.deepEqual(claimableStates(false), ["RECEIVED", "READ", "BOOKING"]);
+    // The two lists differ by exactly the QBO-writing states — spelled out so a
+    // future state added to one list cannot silently skip the other.
+    assert.deepEqual([...QBO_WRITING_STATES], ["READ", "BOOKING"]);
+});
+
+test("the claim predicate drops the QBO-writing states while dry-run is on", () => {
+    const now = new Date("2026-09-01T12:00:00.000Z");
+
+    const dry = eligibleClaimWhere(now, true) as Record<string, unknown>;
+    assert.deepEqual(dry.state, { in: ["RECEIVED"] });
+
+    const live = eligibleClaimWhere(now, false) as Record<string, unknown>;
+    assert.deepEqual(live.state, { in: ["RECEIVED", "READ", "BOOKING"] });
+    // The shadow-week park exclusion survives the change: a dryRun=true row at
+    // READ/BOOKING is still off the list on a LIVE pass until the cutover
+    // requeues it.
+    assert.deepEqual(live.NOT, { AND: [{ dryRun: true }, { state: { in: ["READ", "BOOKING"] } }] });
+    // And the retry clause is untouched by any of it.
+    assert.deepEqual(live.OR, [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }]);
+});
+
+/**
+ * A queue with more than two full batches of OLD rows left live by a previous
+ * window, plus newer RECEIVED receipts behind them.
+ *
+ * The fake claim is deliberately built on the SHIPPED `claimableStates` rather
+ * than a hand-written state list, so this test measures the real predicate. The
+ * `states` override is what lets the same fixture reproduce the BUG (the old
+ * predicate, which ignored the switch) as a control.
+ */
+function starvationQueue(opts: { states?: (dryRunGlobal: boolean) => string[] } = {}) {
+    const pickStates = opts.states ?? claimableStates;
+    const rows: WorkerRow[] = [];
+    // 25 old rows — two and a half batches — left at READ with dryRun=false by
+    // a live window that has since been rolled back.
+    for (let i = 0; i < 25; i++) {
+        rows.push(workerRow({
+            id: "old-" + i,
+            sourceRef: "drive:OLD" + i,
+            state: "READ",
+            dryRun: false,
+            createdAt: new Date(Date.parse("2026-08-20T00:00:00.000Z") + i * 60_000),
+        }));
+    }
+    // Three receipts that arrived AFTER the rollback. These are the ones the
+    // shadow week is supposed to keep reading.
+    for (let i = 0; i < 3; i++) {
+        rows.push(workerRow({
+            id: "new-" + i,
+            sourceRef: "drive:NEW" + i,
+            state: "RECEIVED",
+            dryRun: true,
+            createdAt: new Date(Date.parse("2026-08-30T00:00:00.000Z") + i * 60_000),
+        }));
+    }
+
+    const nextRetryAt = new Map<string, number>();
+    let clock = Date.parse("2026-09-01T12:00:00.000Z");
+
+    return {
+        rows,
+        advanceMinutes(mins: number) { clock += mins * 60_000; },
+        /** The route's claim, in memory: same predicate, same oldest-first order, same lease. */
+        claim: async (o: CutoverRequest) => {
+            const eligible = new Set(pickStates(o.dryRunGlobal));
+            const due = rows
+                .filter(r => eligible.has(r.state))
+                .filter(r => (nextRetryAt.get(r.id) ?? 0) <= clock)
+                .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+                .slice(0, BATCH_SIZE);
+            // The claim bumps every taken row's nextRetryAt by the lease.
+            for (const r of due) nextRetryAt.set(r.id, clock + 10 * 60_000);
+            return { rows: due, shadowRetired: 0, requeued: 0, shadowQuarantined: 0, shadowSkippedMoved: 0 };
+        },
+        /** What the worker's own release writes back. */
+        release: async (id: string, when: Date) => { nextRetryAt.set(id, when.getTime()); return true; },
+    };
+}
+
+test("ROLLBACK: newer receipts are read on the FIRST pass, not starved behind the old backlog", async () => {
+    const q = starvationQueue();
+    const readIds: string[] = [];
+    const h = harness(q.rows, {
+        isDryRunEnabled: () => true,
+        claim: q.claim,
+        releaseClaim: q.release,
+    });
+    // Record which rows actually reach the reader.
+    h.deps.applyRead = async (id, patch) => {
+        readIds.push(id);
+        h.applied.push(patch as ReadPatch);
+        return { owned: true, strongOwner: null };
+    };
+
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(
+        readIds.slice().sort(),
+        ["new-0", "new-1", "new-2"],
+        "all three post-rollback receipts are read in the first invocation",
+    );
+    assert.equal(summary.processed, 3, "the old live rows never even occupy a batch slot");
+    assert.equal(h.books, 0, "and nothing books while the switch says dry-run");
+});
+
+test("ROLLBACK control: the OLD predicate really did starve them (two full batches deep)", async () => {
+    // Without this control the test above would pass against a queue that
+    // simply had no old rows in it. Here the ONLY difference is the predicate:
+    // the pre-fix one, which looked at the persisted flag and ignored the
+    // switch. Two invocations is already enough to prove the starvation.
+    const q = starvationQueue({ states: () => ["RECEIVED", "READ", "BOOKING"] });
+    const readIds: string[] = [];
+    const h = harness(q.rows, {
+        isDryRunEnabled: () => true,
+        claim: q.claim,
+        // The pre-fix loop skipped without releasing, so the rows kept the
+        // full ten-minute lease.
+        releaseClaim: async () => true,
+    });
+    h.deps.applyRead = async (id, patch) => {
+        readIds.push(id);
+        h.applied.push(patch as ReadPatch);
+        return { owned: true, strongOwner: null };
+    };
+
+    await runIntakeWorker(h.deps);
+    q.advanceMinutes(5);
+    await runIntakeWorker(h.deps);
+
+    assert.deepEqual(readIds, [], "twenty old rows fill both batches and no new receipt is reached");
+});
+
+test("ROLLBACK is not a black hole: going live again makes the old rows claimable", async () => {
+    // Excluding a row from the claim must not strand it. The predicate is
+    // evaluated per invocation from the current switch, so the same rows come
+    // straight back the moment the switch flips.
+    const q = starvationQueue();
+    const h = harness(q.rows, { isDryRunEnabled: () => false, claim: q.claim, releaseClaim: q.release });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.processed, BATCH_SIZE, "a live pass claims the old backlog oldest-first again");
+    assert.equal(h.books, BATCH_SIZE, "and books it");
+});
+
+test("a row the switch refuses RELEASES its claim instead of sitting on it", async () => {
+    // Belt-and-braces for the eligibility fix: if the switch is ever read as
+    // live at claim time and dry-run inside the loop, the skip must still hand
+    // the row back. A skip that kept the claim left the row owned by a pass
+    // that had finished — invisible to every fenced write until the lease
+    // lapsed, and back in the next batch to be skipped again.
+    for (const state of ["READ", "BOOKING"] as const) {
+        const h = harness([workerRow({ state, dryRun: false })], { isDryRunEnabled: () => true });
+        const summary = await runIntakeWorker(h.deps);
+        assert.equal(h.books, 0);
+        assert.deepEqual(summary.byState, { [state]: 1 }, state + " is unchanged — nothing is decided");
+        assert.equal(h.releasedClaims.length, 1, state + " hands the claim back");
+        assert.equal(
+            h.releasedClaims[0].nextRetryAt.getTime(),
+            NOW.getTime() + DRYRUN_PARK_RETRY_MS,
+            "deferred by an hour, so it stops competing for batch slots with new receipts",
+        );
+    }
+});
+
+test("a release that loses its fence reports STALE rather than claiming to have parked", async () => {
+    const h = harness([workerRow({ state: "READ", dryRun: false })], {
+        isDryRunEnabled: () => true,
+        releaseClaim: async () => false,
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { STALE: 1 });
+});
+
+// ── Whole-pass overlap lease (Codex a2998e8a, finding 4) ─────────────────────
+
+test("a second invocation that cannot take the lease does NOTHING", async () => {
+    const h = harness([workerRow()], { acquireLease: async () => null });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary, { processed: 0, byState: {}, skipped: "lease-held" });
+    assert.equal(h.claimOpts.length, 0, "no claim");
+    assert.equal(h.sweepCalls, 0, "no sweep");
+    assert.equal(h.reads, 0, "no Gemini call");
+    assert.equal(h.books, 0, "no QuickBooks call");
+});
+
+test("the lease is released on a normal pass", async () => {
+    const h = harness([workerRow()]);
+    await runIntakeWorker(h.deps);
+    assert.equal(h.leaseAcquires, 1);
+    assert.equal(h.leaseReleases, 1);
+});
+
+test("the lease is released even when the pass throws", async () => {
+    // Row errors are caught per row, but a claim/sweep failure propagates. A
+    // lease leaked there would wedge the queue for a whole TTL.
+    const h = harness([], { claim: async () => { throw new Error("prisma exploded"); } });
+    await assert.rejects(() => runIntakeWorker(h.deps), /prisma exploded/);
+    assert.equal(h.leaseReleases, 1);
+});
+
+// ── No storage call outlives its invocation (Codex round-16 item 1) ────────
+//
+// Every bucket.ts function used to `await` Supabase with no timeout and no
+// abort signal, and the worker's `shouldStop` only runs BETWEEN operations. So
+// one hung request ate the whole 60-second lifetime: the platform killed the
+// function mid-pass, the rows it had claimed never reached the release path,
+// and they sat leased for ten minutes — and because the claim is oldest-first,
+// the same object hung the next run too.
+
+test("the budget comes from the caller's deadline, and never exceeds the cap", () => {
+    // A call late in a pass gets what is actually LEFT, not a fresh fixed
+    // timeout that could straddle the platform ceiling.
+    const started = Date.now();
+    assert.equal(storageBudgetMs(undefined), STORAGE_CALL_MAX_MS, "no deadline: the cap");
+    assert.equal(
+        storageBudgetMs({ startedAt: started, budgetMs: 60_000 }),
+        STORAGE_CALL_MAX_MS,
+        "plenty left: still capped",
+    );
+    const nearlyOut = storageBudgetMs({ startedAt: started - 57_000, budgetMs: 60_000 });
+    assert.ok(nearlyOut > 0 && nearlyOut <= 3_100, `only what is left: ${nearlyOut}`);
+    assert.equal(storageBudgetMs({ startedAt: started - 61_000, budgetMs: 60_000 }), 0, "past it: none");
+});
+
+/**
+ * A Supabase that never answers. `getSupabaseWithSignal` builds its client over
+ * the global fetch, so replacing that is what makes a genuinely hung request
+ * reachable from a unit test — no network, no timers but ours.
+ */
+async function withHungStorage<T>(run: () => Promise<T>): Promise<{ out: T; aborted: boolean; fetches: number }> {
+    const realFetch = globalThis.fetch;
+    const realUrl = process.env.SUPABASE_URL;
+    const realKey = process.env.SUPABASE_SERVICE_KEY;
+    let aborted = false;
+    let fetches = 0;
+    process.env.SUPABASE_URL = "https://storage.invalid";
+    process.env.SUPABASE_SERVICE_KEY = "test-key";
+    globalThis.fetch = ((_input: unknown, init?: { signal?: AbortSignal }) => {
+        fetches++;
+        return new Promise<never>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => {
+                aborted = true;
+                reject(new Error("aborted"));
+            });
+        });
+    }) as typeof fetch;
+    try {
+        return { out: await run(), aborted, fetches };
+    } finally {
+        globalThis.fetch = realFetch;
+        if (realUrl === undefined) delete process.env.SUPABASE_URL; else process.env.SUPABASE_URL = realUrl;
+        if (realKey === undefined) delete process.env.SUPABASE_SERVICE_KEY; else process.env.SUPABASE_SERVICE_KEY = realKey;
+    }
+}
+
+test("a NEVER-SETTLING storage request returns before the deadline, and is aborted", async () => {
+    // The failure, exactly: a request that never answers. Without the guard
+    // this await would still be pending when the platform killed the function,
+    // so the pass never reached the code that releases its claimed rows.
+    const started = Date.now();
+    const { out, aborted } = await withHungStorage(() =>
+        downloadReceiptObject("receipts/intake/hung.png", { startedAt: started, budgetMs: 1_200 }));
+    const elapsed = Date.now() - started;
+
+    assert.equal(out.ok, false);
+    assert.equal((out as { kind: string }).kind, "transient", "retryable, never a verdict");
+    assert.match(String((out as { message?: string }).message), /storage-timeout/);
+    assert.ok(elapsed < 5_000, `returned in ${elapsed}ms rather than hanging`);
+    // The socket goes with the promise: a timer that only settled the await
+    // would leave the request running against the next invocation's budget.
+    assert.equal(aborted, true, "the request was actually aborted");
+});
+
+test("a call with no runway left never starts at all", async () => {
+    // Spending the pass's last milliseconds on a request whose answer it can
+    // never use is how the release path gets skipped.
+    const { out, fetches } = await withHungStorage(() =>
+        downloadReceiptObject("receipts/intake/a.png", {
+            startedAt: Date.now() - 60_000,
+            budgetMs: 60_000,
+        }));
+    assert.equal(out.ok, false);
+    assert.match(String((out as { message?: string }).message), /storage-timeout/);
+    // THE DISTINGUISHING PROPERTY: no request was made at all. Without the
+    // runway check the call is issued with a zero-millisecond timer, which
+    // rejects with the same tag — so only the absence of the request tells the
+    // two apart, and the point is not to spend the last of the budget on an
+    // answer the pass can never use.
+    assert.equal(fetches, 0, "no storage request was issued");
+});
+
+test("EVERY bucket export takes a deadline and runs under the guard", () => {
+    // The audit the finding asked for, as an assertion: a new storage call
+    // added without the guard is the same bug back.
+    const src = readFileSync(path.join(__dirname, "..", "src/lib/receipt-intake/bucket.ts"), "utf8");
+    for (const op of ["list", "download", "upload", "remove", "sign-upload", "sign-download"]) {
+        assert.ok(src.includes(`withStorageDeadline("${op}"`), `${op} is guarded`);
+    }
+    // The unsignalled singleton is unreachable from this file, so nothing here
+    // CAN make an unbounded call.
+    assert.ok(!/getSupabase\(\)/.test(src), "the unsignalled client is not reachable");
+    assert.match(src, /import \{ getSupabaseWithSignal \}/);
+    // ...and the guard aborts before it rejects, so the socket goes with it.
+    const guard = src.slice(src.indexOf("async function withStorageDeadline"));
+    const abortAt = guard.indexOf("controller.abort()");
+    const rejectAt = guard.indexOf("reject(new StorageTimeoutError");
+    assert.ok(abortAt > 0 && abortAt < rejectAt, "abort precedes the rejection");
+});
+
+test("consecutive timeouts are counted, and the run resets on any other failure", () => {
+    // The counter lives in `lastError`, so "consecutive" is a property of where
+    // it is stored: any other failure writes a different reason there.
+    assert.equal(storageTimeoutRun(null), 0);
+    assert.equal(storageTimeoutRun("worker-error: connection reset"), 0, "a different fault resets it");
+    assert.equal(storageTimeoutRun("storage-timeout:1"), 1);
+    assert.equal(storageTimeoutRun("storage-timeout:2"), 2);
+    assert.equal(storageTimeoutRun("storage:some other blip"), 0, "a non-timeout storage fault too");
+});
+
+test("a row that keeps timing out is PARKED so it stops heading the queue", async () => {
+    const hung = { ok: false as const, kind: "transient" as const, message: "storage-timeout:download" };
+
+    // First timeout: retried, and the run is recorded.
+    const first = harness([workerRow({ lastError: null })], { downloadBytes: async () => hung });
+    assert.deepEqual((await runIntakeWorker(first.deps)).byState, { RETRY: 1 });
+    assert.equal(first.retried[0].reason, "storage-timeout:1");
+
+    // Second: still retried, run of two.
+    const second = harness([workerRow({ lastError: "storage-timeout:1" })], { downloadBytes: async () => hung });
+    assert.deepEqual((await runIntakeWorker(second.deps)).byState, { RETRY: 1 });
+    assert.equal(second.retried[0].reason, "storage-timeout:2");
+
+    // Third: parked, with its OWN reason rather than a generic max-retries
+    // twenty passes later.
+    const third = harness([workerRow({ lastError: "storage-timeout:2" })], { downloadBytes: async () => hung });
+    assert.deepEqual((await runIntakeWorker(third.deps)).byState, { NEEDS_REVIEW: 1 });
+    assert.equal(third.states[0].reason, "storage-timeout");
+});
+
+test("CONTROL: an ordinary transient storage fault still gets all 20 attempts", async () => {
+    // Without this, the new ceiling could quietly apply to every storage blip
+    // and park good receipts after three.
+    const blip = { ok: false as const, kind: "transient" as const, message: "connection reset" };
+    const h = harness([workerRow({ attempts: 5, lastError: "storage:connection reset" })], {
+        downloadBytes: async () => blip,
+    });
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { RETRY: 1 });
+    assert.equal(h.retried[0].attempts, 6);
+    assert.match(h.retried[0].reason, /^storage:/);
+});
+
+test("the deadline reaches EVERY storage call, not just QuickBooks", () => {
+    // The wiring: buildDeps threads the INVOCATION's deadline into every
+    // storage call the pass makes, exactly as it does into the QBO client.
+    // They are the same deadline, so a pass that has spent fifty of its sixty
+    // seconds cannot hand the next call a fresh fifteen.
+    const cron = readFileSync(
+        path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+        "utf8",
+    );
+    assert.equal(
+        (cron.match(/downloadVerified\(storagePath, expectedSha256, invocationDeadline\)/g) ?? []).length,
+        2,
+        "both the worker's read and the booking's read",
+    );
+    // The stale-STAGING sweep's inspection and the publish's seal, too. Both
+    // used to be issued with no deadline at all.
+    assert.match(cron, /inspectStoredObject\(\s*\n\s*row\.storagePath,\s*\n\s*row\.mimeType,\s*\n\s*invocationDeadline,\s*\n\s*\)/);
+    assert.match(cron, /\}, invocationDeadline\);/, "and sealAndPublish takes it as well");
+    // ONE deadline per invocation, created once.
+    assert.equal(
+        (cron.match(/createRouteDeadline\(/g) ?? []).length,
+        1,
+        "one deadline for the pass, not one per row",
+    );
+});
+
+// -- The tax warning survives every route to BOOKED (round-20 finding 2) ----
+//
+// Routing recorded the marker in `stateReason`, and applyBookResult then
+// replaced that column with its own reason on the deferred path -- which is
+// EVERY row during the disabled-push cutover, because a disabled push is
+// exactly a defer. The BOOKED transition read the marker out of whatever the
+// column held by then, so an automatically booked receipt with a bad tax read
+// became indistinguishable from one with a clean read. The evidence has its
+// own column now.
+
+test("tax-implausible -> DEFERRED -> BOOKED keeps the marker", async () => {
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
+    });
+    await runIntakeWorker(h.deps);
+
+    // What routing durably wrote.
+    const routed = h.finished[0];
+    assert.equal(routed.taxWarning, "tax-implausible");
+
+    // The deferred booking, exactly as applyBookResult performs it: the
+    // stateReason column is replaced with the defer reason. Nothing writes
+    // taxWarning.
+    const afterDefer = {
+        taxWarning: routed.taxWarning,
+        stateReason: "push-disabled",
+    };
+
+    // ...and the BOOKED transition still finds it.
+    assert.equal(preservedTaxWarning(afterDefer), "tax-implausible");
+
+    // PRE-FIX CONTROL: reading the display copy alone, which is what shipped.
+    assert.equal(
+        preservedTaxWarning({ stateReason: afterDefer.stateReason }),
+        null,
+        "the old source of truth reports a clean tax read on a receipt that had none",
+    );
+});
+
+test("tax-implausible -> QBO REVIEW park keeps the marker too", async () => {
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
+    });
+    await runIntakeWorker(h.deps);
+    const routed = h.finished[0];
+
+    // A park writes its own reason into stateReason, the same way.
+    const parked = {
+        taxWarning: routed.taxWarning,
+        stateReason: "qbo-fault:6240",
+    };
+    assert.equal(preservedTaxWarning(parked), "tax-implausible");
+    assert.equal(preservedTaxWarning({ stateReason: parked.stateReason }), null, "the control");
+
+    // And a receipt whose tax read was CLEAN never acquires one.
+    const clean = harness([workerRow()]);
+    await runIntakeWorker(clean.deps);
+    assert.equal(clean.finished[0].taxWarning, null);
+    assert.equal(
+        preservedTaxWarning({ taxWarning: clean.finished[0].taxWarning, stateReason: "push-disabled" }),
+        null,
+    );
+});
+
+test("every routing exit carries the durable marker, not just the READ one", async () => {
+    // The gated and dedup exits go through applyState with the read patch, so
+    // the marker rides in `base` rather than being added per branch -- one
+    // place, and a new exit gets it for free.
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
+        findWeakHit: async () => ({ id: "row-twin" }),
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.states[0].reason, "weak-dup:row-twin;tax-implausible", "the display copy");
+    assert.equal(
+        (h.states[0].patch as { taxWarning?: string | null }).taxWarning,
+        "tax-implausible",
+        "and the durable one, in the same write",
+    );
 });

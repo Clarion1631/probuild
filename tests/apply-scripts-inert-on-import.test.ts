@@ -94,7 +94,7 @@ const SHARED_GUARD_MODULE = "./lib/apply-target.mjs";
 // `node:dns` is here for the shared helper, which RESOLVES `--expect-host`
 // rather than string-comparing it against an IP. Importing it runs nothing,
 // and a module-scope `dns.lookup(...)` is still rejected below as a call.
-const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto", "node:dns", SHARED_GUARD_MODULE]);
+const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto", "node:dns", "dns", SHARED_GUARD_MODULE]);
 /** Names a script may never declare itself (they would let a guard or helper be spoofed). */
 const RESERVED_NAMES = new Set(["process", "import", "pathToFileURL", "fileURLToPath", "dirname", "join", "resolve", "isMainModule"]);
 

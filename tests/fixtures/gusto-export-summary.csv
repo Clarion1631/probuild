@@ -1,0 +1,4 @@
+"Employee Name","Email","Gusto Employee ID","Regular Hours","Overtime Hours","Double Overtime Hours","PTO Hours","Sick Hours"
+"Alice Field","alice@example.com","GUSTO-1001","40.00","2.50","0.00","0.00","0.00"
+"Dana Danger","dana@example.com","","4.00","0.00","0.00","0.00","0.00"
+"Zoe Zero","zoe@example.com","","0.00","0.00","0.00","0.00","0.00"
