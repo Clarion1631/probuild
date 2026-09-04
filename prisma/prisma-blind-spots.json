@@ -163,11 +163,11 @@
       "forced": false
     },
     {
-      "name": "ChatDelivery",
+      "name": "ChangeOrderAutomationJob",
       "forced": false
     },
     {
-      "name": "ChangeOrderAutomationJob",
+      "name": "ChatDelivery",
       "forced": false
     },
     {

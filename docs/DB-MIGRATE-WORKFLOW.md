@@ -37,13 +37,22 @@ in prod and **after** the migration file is on `main`:
 $env:DIRECT_URL = "<DATABASE_URL from .env.production.local, :6543 -> :5432, ?pgbouncer=true removed>"
 $env:DATABASE_URL = $env:DIRECT_URL
 npx prisma migrate resolve --applied <migration_folder_name>
-npx prisma migrate status   # must end with "Database schema is up to date!"
+npx prisma migrate status   # no local migration may remain "not yet applied"; a DB-side row
+                            # with no local folder (e.g. PR #469's until it merges) is expected
+                            # and makes the command exit non-zero anyway
 ```
 
 `resolve --applied` only inserts a history row (name + checksum of the file);
 it runs no SQL. Never record a migration whose DDL you have not confirmed in
 prod with an `information_schema` / `pg_indexes` / `pg_constraint` query — a
-false row makes `migrate status` lie forever.
+false row keeps `migrate status` and every later audit misleading until someone
+repairs the history table by hand.
+
+Two limits worth knowing. A migration whose name sorts *before* rows already
+recorded is still pending: Prisma never infers application from timestamps, and
+a `migrate deploy` run first would execute its SQL and self-record it. And
+`IF NOT EXISTS` DDL cannot repair a partially created table, so recording such a
+migration is only safe once the *full* shape has been verified in prod.
 
 ### 2026-09-04 reconciliation
 
