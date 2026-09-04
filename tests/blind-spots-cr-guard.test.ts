@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { findCarriageReturns } from "../scripts/blind-spots-cr-guard.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const clean = {
     partialIndexes: [{ name: "idx_a", def: "CREATE UNIQUE INDEX idx_a ON t (x) WHERE y" }],
@@ -36,4 +42,18 @@ test("snapshot round-tripped through JSON keeps the carriage return, so the guar
     const poisoned = { ...clean, functions: [{ name: "f()", def: "BEGIN\r\nEND" }] };
     const roundTripped = JSON.parse(JSON.stringify(poisoned));
     assert.deepEqual(findCarriageReturns(roundTripped), ["functions f()"]);
+});
+
+// The snapshot script connects to the database at import, so the integration
+// is checked at source level: it must parse, import the guard, and call it
+// before the write. (CI's migration-history job runs the real script.)
+test("snapshot script parses, imports the guard, and calls it before writing", () => {
+    const script = path.join(root, "scripts", "snapshot-prisma-blind-spots.mjs");
+    const check = spawnSync(process.execPath, ["--check", script], { encoding: "utf8" });
+    assert.equal(check.status, 0, check.stderr);
+    const source = readFileSync(script, "utf8");
+    assert.match(source, /import \{ findCarriageReturns \} from '\.\/blind-spots-cr-guard\.mjs'/);
+    const guardAt = source.indexOf("findCarriageReturns(snapshot)");
+    const writeAt = source.indexOf("writeFileSync(OUT");
+    assert.ok(guardAt > 0 && writeAt > 0 && guardAt < writeAt, "guard must run before writeFileSync");
 });
