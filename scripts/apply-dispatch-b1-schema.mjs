@@ -110,8 +110,10 @@ const statements = [
          ON DELETE CASCADE ON UPDATE CASCADE;
      END IF;
    END $$`,
-  `CREATE INDEX IF NOT EXISTS "DispatchPublicationChange_publicationId_idx"
-     ON "DispatchPublicationChange" ("publicationId")`,
+  // RETIRED 2026-09-04: "DispatchPublicationChange_publicationId_idx" was dropped from prod as redundant
+  // (fully covered by the unique (publicationId, position); see
+  // prisma/migrations/20260904000000_drop_redundant_indexes). Recreating it here on a
+  // rerun would reintroduce schema drift. Do not restore it.
   `CREATE INDEX IF NOT EXISTS "DispatchPublicationChange_projectId_idx"
      ON "DispatchPublicationChange" ("projectId")`,
   `CREATE INDEX IF NOT EXISTS "DispatchPublicationChange_targetType_targetId_idx"
@@ -157,8 +159,10 @@ const statements = [
          ON DELETE CASCADE ON UPDATE CASCADE;
      END IF;
    END $$`,
-  `CREATE INDEX IF NOT EXISTS "ChatDelivery_publicationId_idx"
-     ON "ChatDelivery" ("publicationId")`,
+  // RETIRED 2026-09-04: "ChatDelivery_publicationId_idx" was dropped from prod as redundant
+  // (fully covered by the unique (publicationId, destination, kind); see
+  // prisma/migrations/20260904000000_drop_redundant_indexes). Recreating it here on a
+  // rerun would reintroduce schema drift. Do not restore it.
   `CREATE INDEX IF NOT EXISTS "ChatDelivery_status_createdAt_idx"
      ON "ChatDelivery" ("status", "createdAt")`,
   `CREATE INDEX IF NOT EXISTS "ChatDelivery_status_processingStartedAt_idx"
