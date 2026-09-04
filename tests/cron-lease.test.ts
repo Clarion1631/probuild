@@ -12,6 +12,9 @@ import assert from "node:assert/strict";
 import { acquireCronLease, type CronLeaseStore } from "../src/lib/cron-lease";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { leaseIsHeld } from "../src/lib/cron-lease";
 
 const KEY = "test-lease";
 
@@ -182,4 +185,94 @@ test("the lease OUTLIVES the platform ceiling — which is why nothing heartbeat
     const maxDuration = Number(workerRoute.match(/export const maxDuration = (\d+);/)?.[1]) * 1_000;
     assert.ok(Number.isFinite(ttl) && Number.isFinite(maxDuration), "both constants must be readable");
     assert.ok(ttl > maxDuration, `lease TTL ${ttl}ms must exceed the ${maxDuration}ms function ceiling`);
+});
+
+// ── THE PHASE-2 CRONS' RUN LEASE (takeLease/releaseLease/leaseIsHeld) ────────
+//
+// A second lease lives in the same module for the bank pull and the
+// missing-receipt sweep. Its decision rule and the ORDER the crons use it in
+// are pinned here, beside the mechanism tests above.
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const NOW = new Date("2026-09-02T02:00:00Z");
+
+const lease = (minutesFromNow: number) => JSON.stringify({
+    token: "abc",
+    expiresAt: new Date(NOW.getTime() + minutesFromNow * 60_000).toISOString(),
+});
+
+test("a live lease is held; an expired one is not", () => {
+    assert.equal(leaseIsHeld(lease(10), NOW), true, "another run is still going");
+    assert.equal(leaseIsHeld(lease(-1), NOW), false, "that run died; the job is up for grabs");
+    assert.equal(leaseIsHeld(lease(0), NOW), false, "exactly expired is expired");
+});
+
+test("an absent or corrupt lease is NOT held — a broken row must not wedge the cron forever", () => {
+    assert.equal(leaseIsHeld(null, NOW), false);
+    assert.equal(leaseIsHeld("", NOW), false);
+    assert.equal(leaseIsHeld("{{{", NOW), false);
+    assert.equal(leaseIsHeld(JSON.stringify({ token: "x" }), NOW), false, "no expiry is not a lease");
+    assert.equal(leaseIsHeld(JSON.stringify({ expiresAt: NOW.toISOString() }), NOW), false, "no token is not a lease");
+});
+
+test("both crons take the lease BEFORE any work and release it after", () => {
+    for (const [label, file] of [
+        ["bank pull", "src/app/api/cron/bank-register-pull/route.ts"],
+        ["receipt sweep", "src/app/api/cron/receipt-requests/route.ts"],
+    ] as const) {
+        const source = readFileSync(join(repoRoot, file), "utf8");
+        const takeAt = source.indexOf("await takeLease(");
+        const releaseAt = source.indexOf("await releaseLease(");
+        assert.ok(takeAt > 0, `${label} must take the durable lease`);
+        assert.ok(releaseAt > takeAt, `${label} must release it after the work`);
+        // The old shape said "locked"; the contract now names the condition.
+        assert.match(source, /skipped: "already-running"/, label);
+        // And the release is in a finally, so a throw cannot strand it.
+        assert.match(source, /\} finally \{\s*\n\s*await releaseLease\(/, label);
+    }
+});
+
+test("the release is token-fenced in ONE statement, not read-then-write", () => {
+    // A read-then-write release has a window: A reads "I hold it", B's claim
+    // overwrites the row, A's write then clears B's lease and two runs are live.
+    const source = readFileSync(join(repoRoot, "src/lib/cron-lease.ts"), "utf8");
+    assert.match(source, /where: \{ key, value: \{ contains: `"token":"\$\{token\}"` \} \}/);
+    assert.doesNotMatch(source, /if \(held\?\.token !== token\) return;/, "the read-then-write shape is gone");
+    // And the claim refuses when someone else holds it.
+    assert.match(source, /if \(held && new Date\(held\.expiresAt\) > now\) return null;/);
+});
+
+test("two simultaneous releases: only the token holder wins", async () => {
+    // Modelled on the fenced predicate the real release uses.
+    let stored = JSON.stringify({ token: "B", expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    const release = async (token: string) => {
+        // updateMany where key AND value contains our token.
+        if (!stored.includes(`"token":"${token}"`)) return 0;
+        stored = JSON.stringify({ token: "", expiresAt: new Date(0).toISOString() });
+        return 1;
+    };
+    const [a, b] = await Promise.all([release("A"), release("B")]);
+    assert.equal(a, 0, "A no longer holds it and must clear nothing");
+    assert.equal(b, 1, "B holds it and releases it");
+});
+
+test("the lease FAILS CLOSED: an unreadable lease means the run is skipped", () => {
+    // Two concurrent runs write contradictory verdicts, so a cron that cannot
+    // prove exclusivity must not run at all.
+    const source = readFileSync(join(repoRoot, "src/lib/cron-lease.ts"), "utf8");
+    assert.match(source, /catch \(error\) \{[\s\S]*?return null;/);
+});
+
+test("the bank pull records its last COMPLETE success, not its last run", () => {
+    // pipeline-health reads this to decide whether the chaser is being fed; a
+    // failed run that stamped the clock would keep the check green. So would a
+    // budget-truncated one, which is not a failure but read only part of one
+    // window — if truncation persists the mark goes stale and bank-pull-stale
+    // fires, which is exactly the signal wanted.
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
+    assert.match(source, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s\S]{0,140}?quarantineHeld\.length === 0 && !quarantineBlocked[\s]*&& !summary\.uncertified;/);
+    // The write itself, and the release of an owed stamp, are ONE transaction
+    // (round-37 gate, finding 2) — the ONLY place stampPending is ever cleared.
+    assert.match(source, /if \(stampWarranted\) \{[\s\S]{0,300}await commitFreshnessStamp\(/);
+    assert.match(source, /prisma\.\$transaction\([\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY[\s\S]{0,900}delete parsed\.stampPending;/);
 });

@@ -2905,12 +2905,185 @@ model ReviewAlertEpisode {
   @@index([batchId])
 }
 
+/// Durable outbox for the per-owner missing-receipt Chat digest (Phase 2 §4).
+///
+/// WHY A TABLE. The first cut wrote the day's "already asked" stamp into each
+/// issue's displayDetails AFTER posting, which meant selection and the record of
+/// selection were two separate writes with a network call between them — two
+/// concurrent runs could both select the same items and both post. The row below
+/// is created in the SAME transaction as selection and is unique on
+/// (owner, pacificDate), so the second run loses the insert and posts nothing.
+///
+/// `itemsJson` is an IMMUTABLE snapshot of the selected ReviewIssue ids in card
+/// order. It is what the numbering in the card text means, so it must not drift
+/// after the message is sent — a "sign 3" reply resolves against it.
+///
+/// Failure window, deliberately documented rather than engineered away: the post
+/// happens after commit, and `postedAt`/`threadName`/`messageName` are written
+/// after the webhook answers. A crash in between leaves a claimed-but-unposted
+/// row, and the next run re-posts it — AT MOST ONE duplicate card, never a
+/// silent miss. A webhook offers no message-level idempotency to do better with.
+model ReceiptRequestCard {
+  id          String    @id @default(cuid())
+  owner       String
+  /// YYYY-MM-DD in America/Los_Angeles — the crew's day, not UTC's.
+  pacificDate String
+  /// JSON array of ReviewIssue ids, in card order. Immutable once written.
+  itemsJson   String
+  /// Items that did not fit on this card; they are tomorrow's first candidates.
+  overflow    Int       @default(0)
+  /// Is `overflow` a TOTAL, or a floor? The selection scan can stop early, and
+  /// a retry pass does not scan at all — so this travels with the row rather
+  /// than being re-derived at post time, where a resumed card would otherwise
+  /// print "and 4 more" as though a scan that never ran had counted them.
+  overflowExact Boolean @default(true)
+  /// When a run took the post-claim, and the token identifying THAT run. Only
+  /// the holder may mark the row posted, so an overlapping run can never
+  /// complete a post it did not make. A claim older than the lease is up for
+  /// grabs again, which is what makes a crashed run recoverable.
+  claimedAt   DateTime?
+  claimToken  String?
+  /// PENDING -> POSTING -> POSTED, or UNCERTAIN.
+  ///
+  /// POSTING is written BEFORE the webhook call. Without it, a crash between
+  /// the call and the `postedAt` write was indistinguishable from a crash
+  /// before the call — so the next run either re-posted a card that had already
+  /// gone out, or dropped one that never had. A row found in POSTING means "we
+  /// asked Chat and never heard back": it is NOT reposted, it is reconciled.
+  status      String    @default("PENDING")
+  postedAt    DateTime?
+  threadName  String?
+  messageName String?
+  attempts    Int       @default(0)
+  lastError   String?
+  /// THE DAY A CARD WAS ACTUALLY DELIVERED (Codex PR #443 gate round 42, finding 4).
+  ///
+  /// `pacificDate` is the day a card was SELECTED for, and a resend deliberately
+  /// keeps its original one (its request id, and therefore its Chat thread, are
+  /// derived from it). That leaves nothing recording the day it was SENT — so the
+  /// one-message-per-owner-per-day rule, which is the whole point of the (owner,
+  /// pacificDate) key, could be broken from two directions: several queued
+  /// resends for one owner drained in the same run, and a resend drained on a day
+  /// the owner had already had their ordinary card.
+  ///
+  /// This column is the delivery-day claim, taken BEFORE the post and unique per
+  /// owner and day, so the second attempt loses on the constraint rather than on
+  /// a check somebody has to remember to write.
+  deliveredOn String?
+  /// When an operator asked for this card to be RESENT (Codex PR #443 gate
+  /// round 41, finding 3).
+  ///
+  /// Its own column because `lastError` is DIAGNOSTIC text that every later
+  /// write replaces: a queued card that Chat then rejected had its marker
+  /// overwritten with `rejected:*`, so the drain stopped selecting it and the
+  /// health probe stopped counting it — the operator's decision vanished, for
+  /// ever, without a trace. Cleared only when the card is actually posted (or
+  /// cancelled); a rejection leaves it set, which is what keeps the row
+  /// visible as `cards-queued-rejected`.
+  resendQueuedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([owner, pacificDate])
+  /// ONE DELIVERY PER OWNER PER DAY, enforced rather than remembered
+  /// (round-42 gate, finding 4).
+  ///
+  /// NULLS ARE ALREADY DISTINCT, so this needs no WHERE clause. Postgres treats
+  /// two NULLs as unequal in a unique index (the default, not NULLS NOT
+  /// DISTINCT), so every never-delivered card coexists freely under one owner
+  /// and only real delivery days collide. A partial index would say exactly the
+  /// same thing while being invisible to Prisma's diff engine, which reports it
+  /// as missing forever and needs a blind-spot entry to stay quiet — a permanent
+  /// phantom bought for no semantics at all.
+  @@unique([owner, deliveredOn])
+  @@index([pacificDate])
+  /// The drain's own lookup: queued rows, oldest first, whatever date they are
+  /// for. Partial so it stays small — a card that was never resent is not in it.
+  @@index([resendQueuedAt])
+}
+
+/// The DURABLE identity of a signed missing-receipt memo (Codex PR #443 gate
+/// round 34, finding 1).
+///
+/// WHY A TABLE AND NOT JUST `displayDetails`. A signed affidavit IS the
+/// evidence when no merchant receipt exists, so exactly two things must be true
+/// of it forever: one memo answers one charge, and one charge is answered by
+/// one memo. Both used to live only in a TEXT blob the answers route rewrote in
+/// place, which made the second one false: PDF-A recorded on issue 1, PDF-B
+/// then REPLACING it on issue 1, and PDF-A was suddenly nowhere on record — so
+/// replaying it against issue 2 passed the "already used elsewhere" scan and
+/// closed a second charge with a memo that had already been spent.
+///
+/// The two unique constraints are the two invariants, in the one place a
+/// concurrent writer cannot argue with:
+///   - `pdfId` UNIQUE           — a memo answers ONE charge.
+///   - (targetType, targetKey)  — a charge is bound to ONE memo, immutably.
+/// The route checks both first and returns typed answers; these exist because a
+/// check is a statement about the moment it ran and a constraint is a statement
+/// about the row.
+/// ONE DELIVERY PER OWNER PER DAY — AN IMMUTABLE RECORD OF AN ATTEMPT
+/// (Codex PR #443 gate round 44, finding 2).
+///
+/// `ReceiptRequestCard.deliveredOn` could not do this job. It is a column on a
+/// MUTABLE row, so the reservation and the thing being reserved shared a
+/// lifetime: `resolveUncertainCard` flips today's uncertain card back to
+/// PENDING and keeps `deliveredOn`, and re-writing `deliveredOn = today` onto
+/// the SAME row cannot violate that row's own unique key. The card posted
+/// twice, on the same day, to the same person.
+///
+/// A separate row cannot be talked out of existing. It is INSERTED inside the
+/// posting transaction and never updated, so a second attempt on the same day
+/// — a resend, a concurrent invocation, a resumed uncertain card — fails the
+/// insert and is deferred to the next delivery day.
+///
+/// The one retraction is a DEFINITE rejection: Chat provably did not take the
+/// message, so nothing is in the space and the day is genuinely still free.
+/// That deletes the row rather than updating it, and it is the only path that
+/// may. An uncertain delivery keeps it, because the card may be in the space.
+model ReceiptRequestCardDelivery {
+  id    String @id @default(cuid())
+  owner String
+  /// The Pacific day the message was SENT (YYYY-MM-DD) — not the day the card
+  /// was selected for, which is `ReceiptRequestCard.pacificDate` and which a
+  /// resend deliberately keeps so its Chat thread id stays stable.
+  deliveryDay String
+  /// The card this attempt was for. Diagnostic: the claim is (owner, day).
+  cardId    String?
+  createdAt DateTime @default(now())
+
+  @@unique([owner, deliveryDay])
+  @@index([cardId])
+}
+
+model ReceiptMemoArtifact {
+  id String @id @default(cuid())
+  /// The affidavit app's Drive file id — the memo's durable identity.
+  pdfId String @unique
+  /// The ReviewIssue this memo answers, by its natural key (always "bank-line"
+  /// today). Stored as the key rather than only the row id so the binding
+  /// survives an issue being deleted and recreated for the same bank line.
+  targetType String
+  targetKey  String
+  /// The ReviewIssue row that carried the resolution when this was written.
+  /// Diagnostic — the natural key above is the binding.
+  issueId   String
+  createdAt DateTime @default(now())
+
+  @@unique([targetType, targetKey])
+  @@index([issueId])
+}
+
 // ── Bank ledger (Receipt Automation Phase 1) ────────────────────────────────
 // docs/RECEIPT-AUTOMATION-PHASES.md, "Persistence decision" (2026-08-14) +
 // Codex peer-review round-1 amendments (2026-08-14): BankLine is the
-// canonical transaction ledger, and the bank STATEMENT is true north — a
-// canonical BankLine is only ever minted from a STATEMENT observation, never
-// from QBO. BankLineObservation holds one row per source sighting (a
+// canonical transaction ledger, and the bank STATEMENT is true north.
+// SUPERSEDED IN PART by Phase 2 (Justin, decision 3; Codex round-39 gate,
+// finding 4): a canonical BankLine is minted from a STATEMENT observation and,
+// when BANK_LINE_MINT_FROM_QBO is on, from a QuickBooks GENERAL LEDGER posting
+// QuickBooks says has cleared the bank. The statement still wins — it ADOPTS a
+// QBO-minted line when it arrives (sourceOfRecord flips QBO -> STATEMENT, never
+// back) and it remains the only source that sees a charge QuickBooks never
+// posted. BankLineObservation holds one row per source sighting (a
 // statement line, a QBO register row, ...), uniquely identified by its own
 // source locator, so two sources reporting the "same" transaction both stay
 // on record instead of one silently overwriting the other via a hash
@@ -2922,9 +3095,14 @@ model ReviewAlertEpisode {
 // carries one) — never a side effect of ingest, and never on
 // amount+date/rails alone (see the Chevron/Cash App wrong-match lesson in
 // that doc — amount+date alone is zero confidence). Immutable source
-// identity, mutable workflow state: BankLine/BankLineObservation/
-// StatementImport rows are never overwritten; BankLine.state and the
-// validation columns change as automation progresses. The /automation
+// identity, mutable workflow state: a row's source IDENTITY is never
+// rewritten — BankLine.amountCents is immutable by trigger, and an observation
+// keeps its own source locator — while workflow columns change as automation
+// progresses: BankLine.state, the validation columns, BankLine.sourceOfRecord
+// and rawDescriptor/normalizedPayee on statement adoption, and
+// BankLineObservation.clearedStatus every time QuickBooks answers the clearance
+// question (round-39 gate, finding 4: "never overwritten" was written before
+// either of those existed). The /automation
 // dashboard becomes a report over these tables instead of a live in-memory
 // merge.
 //
@@ -2974,6 +3152,17 @@ model BankLine {
   checkNumber     String?
   state           String   @default("POSTED") // POSTED, EVIDENCE_FOUND, TRANSACTION_CREATED, ATTACHMENT_CONFIRMED, MATCHED, JOB_CODED, TAX_VALIDATED, EXCEPTION
   exceptionReason String?
+  /// Which source MINTED this canonical line. "STATEMENT" is the historical and
+  /// still-preferred answer — the bank statement is true north, and the only
+  /// source that sees a charge QuickBooks has not posted. "QBO" means the
+  /// nightly register pull minted it because the QuickBooks GENERAL LEDGER had a
+  /// posted row QuickBooks said had cleared the bank, and no statement had
+  /// arrived yet (Justin, decision 3: a posted, cleared register row is good
+  /// enough to chase against). When the statement observation later lands and matches
+  /// exactly (payee+date+amount+check#), the ingest ADOPTS this line rather than
+  /// minting a second one, and flips this back to "STATEMENT". A line therefore
+  /// only ever moves QBO -> STATEMENT, never the other way.
+  sourceOfRecord  String   @default("STATEMENT")
 
   // Validation columns
   qbTxnId           String?
@@ -2994,6 +3183,11 @@ model BankLine {
   refundsAsRefund   RefundEvent[]         @relation("RefundEventRefund")
 
   @@index([account, postedDate])
+  /// Adoption and minting both look a line up by its full identity prefix.
+  /// Declared here as well as in the migration and the apply script, or
+  /// `prisma migrate diff` proposes creating it forever (CLAUDE.md: the
+  /// committed migrations must be TRUE).
+  @@index([account, postedDate, amountCents])
   @@index([qbTxnId])
 }
 
@@ -3031,6 +3225,21 @@ model BankLineObservation {
   amountCents   Int
   rawDescriptor String
   checkNumber   String?
+
+  /// What QuickBooks says about this row's BANK CLEARANCE, on QBO_REGISTER
+  /// rows: "Reconciled", "Cleared", "Uncleared" or "Unknown". Obtained from the
+  /// TransactionList report's `cleared` FILTER — it is not available as a column
+  /// on any report — and joined back on to the GL rows by transaction id. See
+  /// the honesty contract at the top of src/lib/qbo-bank-register.ts.
+  ///
+  /// MUTABLE STATE, NOT IDENTITY. Deliberately outside
+  /// computeQboLineContentHash: an uncleared row that later clears is the SAME
+  /// transaction, and hashing it would answer that ordinary transition with a
+  /// 409 restatement conflict. NULL means nobody has asked yet, which is a
+  /// different fact from "uncleared" — and neither may mint a canonical
+  /// BankLine (isClearedForMint). Always NULL on STATEMENT rows: a statement
+  /// line IS the bank's own record and has nothing left to clear.
+  clearedStatus String?
 
   // Reconciliation target (see the reconcile route). NULL until an explicit
   // reconcileObservations() link is persisted; STATEMENT rows get theirs at
@@ -3319,6 +3528,12 @@ model ReceiptIntake {
   /// the boundary, because "old" is not proof anybody booked anything.
   archivedByV1       Boolean  @default(false)
   qbPurchaseId       String?
+  /// A QuickBooks Purchase that WAS created, for a row somebody voided while
+  /// the send was in flight. Deliberately NOT `qbPurchaseId`: that column means
+  /// "this row is booked", and this row is not — the money exists in QBO and a
+  /// human has to go void it there. Paired with stateReason
+  /// "booked-after-void" so the queue surfaces it.
+  postVoidQbPurchaseId String?
   expenseId          String?   @unique
   expense            Expense?  @relation(fields: [expenseId], references: [id], onDelete: SetNull)
   archiveDriveFileId String?

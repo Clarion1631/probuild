@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { matchProjectByName, matchCostCode } from "@/lib/project-match";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -105,7 +106,9 @@ export async function POST(req: Request) {
             .filter(Boolean)
             .join("; ");
 
-        await prisma.expense.create({
+        // An Expense created WITH its receipt is evidence the sweep reads, so
+        // it queues behind the sweep (round-42 gate, finding 1).
+        await withReceiptEvidenceLock(fn => prisma.$transaction(fn), tx => tx.expense.create({
             data: {
                 estimateId,
                 costCodeId: costCode?.id ?? null,
@@ -119,7 +122,7 @@ export async function POST(req: Request) {
                     (lineSummary ? ` · ${lineSummary}` : "") +
                     ` · pending bookkeeper review`,
             },
-        });
+        }));
         created++;
     }
 

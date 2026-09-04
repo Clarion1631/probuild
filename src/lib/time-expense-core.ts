@@ -10,6 +10,7 @@ import {
     zeroRateManagerMessage,
 } from "./pay-rate-guard";
 import { withPayrollWrite, withPayrollWriteTx } from "./payroll-period";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -281,7 +282,10 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
         : null;
     if (expenseDate && Number.isNaN(expenseDate.getTime())) throw new Error("A valid expense date is required");
 
-    return prisma.expense.create({
+    // Carries a receiptUrl, so it is sweep evidence (round-42 gate, finding 1).
+    return withReceiptEvidenceLock<Awaited<ReturnType<typeof prisma.expense.create>>>(
+        fn => prisma.$transaction(fn),
+        tx => tx.expense.create({
         data: {
             estimateId,
             itemId: data.itemId || null,
@@ -295,7 +299,8 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
             changeOrderId: changeOrder?.id ?? null,
             isBillable: data.isBillable ?? Boolean(changeOrder),
         },
-    });
+        }),
+    );
 }
 
 export async function tagTimeEntriesToChangeOrderCore(
@@ -387,7 +392,9 @@ export async function tagExpensesToChangeOrderCore(
     if (rows.some((row) => row.estimate.projectId !== changeOrder.projectId)) throw new Error("All expenses must belong to the change order project");
     for (const row of rows) assertExpenseMutableOutsideQbo(row);
     if (rows.some((row) => row.invoiceId || row.invoicedAt)) throw new Error("Billed expenses cannot be retagged");
-    const result = await prisma.expense.updateMany({
+    // EVIDENCE (round-45 gate, finding 3): fenced like every other Expense
+    // write, so the epoch moves and no cycle certifies over it.
+    const result = await withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.expense.updateMany({
         where: {
             id: { in: input.ids },
             qbPurchaseId: null,
@@ -395,6 +402,6 @@ export async function tagExpensesToChangeOrderCore(
             invoicedAt: null,
         },
         data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
-    });
+    }));
     return { updated: result.count };
 }

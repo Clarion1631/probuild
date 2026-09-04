@@ -39,6 +39,7 @@ export const RECEIPT_INTAKE_LIST_SELECT = {
     dedupWeakKey: true,
     duplicateOfId: true,
     qbPurchaseId: true,
+    postVoidQbPurchaseId: true,
     expenseId: true,
     archiveDriveFileId: true,
     attempts: true,

@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 
 // Hybrid auth (web + mobile). Accepts EITHER `estimateId` (web flow — caller already
 // chose the estimate) OR `projectId` (mobile flow — server picks the project's first
@@ -95,7 +96,11 @@ export async function POST(req: NextRequest) {
             parsedDate = d;
         }
 
-        const newExpense = await prisma.expense.create({
+        // Created WITH a receiptUrl, so it is sweep evidence and queues
+        // behind the sweep (round-42 gate, finding 1).
+        const newExpense = await withReceiptEvidenceLock<{ id: string }>(
+            fn => prisma.$transaction(fn),
+            tx => tx.expense.create({
             data: {
                 estimateId,
                 itemId: itemId || null,
@@ -106,7 +111,9 @@ export async function POST(req: NextRequest) {
                 receiptUrl: receiptUrl || null,
                 status: "Pending",
             },
-        });
+            select: { id: true },
+            }),
+        );
 
         return NextResponse.json(newExpense);
     } catch (error: any) {

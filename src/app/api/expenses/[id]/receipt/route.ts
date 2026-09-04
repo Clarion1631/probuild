@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUserWithPermissions, canAccessProject } from "@/lib/permissions";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 
 const MAX_RECEIPT_BYTES = 10 * 1024 * 1024; // 10 MB
 
@@ -76,10 +77,19 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
         const publicUrl = urlData?.publicUrl || storagePath;
 
-        await prisma.expense.update({
+
+        /**
+         * EXPENSE RECEIPT LINKAGE IS EVIDENCE (Codex PR #443 gate round 42, finding 1).
+         *
+         * `receiptUrl` is one of the two things the missing-receipt sweep reads to
+         * decide a charge is answered, so setting or clearing it queues behind the same
+         * advisory lock the sweep holds across its reads and its verdicts. Held for
+         * this one write.
+         */
+        await withReceiptEvidenceLock(fn => prisma.$transaction(fn), tx => tx.expense.update({
             where: { id },
             data: { receiptUrl: publicUrl },
-        });
+        }));
 
         return NextResponse.json({ ok: true, receiptUrl: publicUrl });
     } catch (error) {

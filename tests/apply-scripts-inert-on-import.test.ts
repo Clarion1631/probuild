@@ -84,7 +84,8 @@ const ALLOWED_GLOBAL_CALLEES = new Set(["process.argv.includes", "process.argv.i
 /** The only modules an apply script may import. Anything else (a `data:` URL, `dotenv/config`, a driver) runs code on import. */
 // `node:dns` is on the list for the same reason as `node:fs`: importing it does
 // nothing at all - it opens no socket, reads no environment and starts no work.
-// apply-receipt-intake.mjs resolves --expect-host at call time, inside main().
+// apply-receipt-intake.mjs and apply-phase2-receipt-queue.mjs both resolve
+// --expect-host at call time, inside main().
 const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto", "node:dns", "dns"]);
 /** Names a script may never declare itself (they would let a guard or helper be spoofed). */
 const RESERVED_NAMES = new Set(["process", "import", "pathToFileURL", "fileURLToPath", "dirname", "join", "resolve", "isMainModule"]);

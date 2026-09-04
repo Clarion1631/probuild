@@ -16,6 +16,14 @@ import type { MergedRegisterRow } from "./register-merge";
  * evaluator this step does not build (see the step-8 report's judgment-call
  * notes). It is kept in the closed set now so a future evaluator doesn't need
  * a schema change to start emitting it.
+ *
+ * `MISSING_RECEIPT` is emitted by a DIFFERENT evaluator on a different target
+ * type: `src/lib/receipt-requests.ts` against `targetType:"bank-line"`, never
+ * by `deriveReasonCodes` (which is qbo-purchase-only). It lives in the same
+ * closed set because the set is closed by construction: `decodeReasonCodes`
+ * filters through `isReasonCode`, so a code missing from KNOWN_CODES decodes
+ * to `[]` — which the lifecycle reads as "cleared", and every issue carrying
+ * it would self-destruct on the next read.
  */
 export type ReasonCode =
     | "NO_RECEIPT"
@@ -25,7 +33,8 @@ export type ReasonCode =
     | "CLASSIFICATION_CONFLICT"
     | "UNCLASSIFIED"
     | "UNRECOGNIZED_OUTFLOW"
-    | "DUPLICATE";
+    | "DUPLICATE"
+    | "MISSING_RECEIPT";
 
 const KNOWN_CODES: ReadonlySet<ReasonCode> = new Set([
     "NO_RECEIPT",
@@ -36,6 +45,7 @@ const KNOWN_CODES: ReadonlySet<ReasonCode> = new Set([
     "UNCLASSIFIED",
     "UNRECOGNIZED_OUTFLOW",
     "DUPLICATE",
+    "MISSING_RECEIPT",
 ]);
 
 export function isReasonCode(value: unknown): value is ReasonCode {

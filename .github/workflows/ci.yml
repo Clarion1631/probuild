@@ -100,6 +100,15 @@ jobs:
         env:
           RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # The missing-receipt sweep's component transaction, at the isolation it
+      # actually runs at. Postgres SSI is the whole fence for evidence writers
+      # this PR does not own (a ReceiptIntake insert, an Expense receipt
+      # update), so it can only be asserted against a real database.
+      - name: Receipt evidence fence holds against real Postgres
+        run: npx tsx --test tests/receipt-evidence-fence-db.test.ts
+        env:
+          RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # THE APPLY SCRIPT ITSELF, run end to end the way production will run it.
       # Its exported helpers are unit-tested and its statement list is replayed
       # by the DB-gated suite, but main() is executed by nothing else: not the
@@ -399,6 +408,22 @@ jobs:
         env:
           MIGRATION_HISTORY_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # THE APPLY SCRIPT, RUN THE WAY PRODUCTION RUNS IT.
+      #
+      # main() is the one part of that script nothing else executes — the unit
+      # tests read its statement list and its guards as text — so a statement a
+      # real Postgres rejects, or one in the wrong order, would ship green. The
+      # driver builds a pre-Phase-2 database, seeds the rows the data-dependent
+      # statements need (a legacy memo-signed issue, cards carrying a
+      # deliveredOn claim), runs the script twice for idempotency, and asserts
+      # the resulting shape — columns, indexes, RLS and policies — matches a
+      # database built from the committed migration.
+      - name: Apply script end-to-end against real Postgres
+        run: node scripts/ci-apply-phase2-receipt-queue-e2e.mjs
+        env:
+          APPLY_E2E_SERVER_URL: postgresql://probuild:probuild@localhost:5432/postgres
+          APPLY_E2E_DB: probuild_apply_phase2
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest
@@ -537,6 +562,14 @@ jobs:
       # The archive mirror's key is DELIBERATELY different — the specs assert
       # that cross-use between the two capabilities is a 403.
       RECEIPT_ARCHIVE_SECRET: "e2e-ci-receipt-archive-secret"
+      # Beverly's Chat bridge key (Phase 2 §4) — a THIRD, distinct capability
+      # from the two above (src/lib/receipt-intake/intake-auth.ts). Gates
+      # /api/automation/receipt-requests/threads and .../answers; presenting
+      # either other secret there is a 403, which is exactly what e2e/
+      # receipt-requests.spec.ts's "bridge endpoints with the machine secret"
+      # suite exercises, so it needs its OWN value here, not a reuse of
+      # RECEIPT_INTAKE_SECRET.
+      RECEIPT_BRIDGE_SECRET: "e2e-ci-receipt-bridge-secret"
 
       # The deposit sweep's live-apply switch (src/lib/deposit-sweep.ts). It is
       # OFF by default — booking money on an amount-only match is Justin's

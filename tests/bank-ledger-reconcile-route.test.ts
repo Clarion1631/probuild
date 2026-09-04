@@ -150,7 +150,7 @@ test("bank-ledger reconcile: happy path", async t => {
         const { handlers, persistLinksCalls } = makeHandlers();
         const res = await handlers.POST(makeRequest({ all: true }));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], chunkErrors: [], remaining: 0 });
+        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], pairedByOrder: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 0);
     });
 
@@ -167,7 +167,7 @@ test("bank-ledger reconcile: happy path", async t => {
         });
         const res = await handlers.POST(makeRequest({ all: true }));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, proposed: 1, linked: 1, exceptions: [], ambiguous: [], chunkErrors: [], remaining: 0 });
+        assert.deepEqual(await res.json(), { ok: true, proposed: 1, linked: 1, exceptions: [], ambiguous: [], pairedByOrder: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 1);
         assert.deepEqual(persistLinksCalls[0], [{ observationId: "obs1", bankLineId: "bl1" }]);
     });
@@ -184,7 +184,7 @@ test("bank-ledger reconcile: happy path", async t => {
             }],
         });
         const res = await handlers.POST(makeRequest({ all: true }));
-        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], chunkErrors: [], remaining: 0 });
+        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], pairedByOrder: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 0);
     });
 
@@ -461,5 +461,45 @@ test("persistLinksInChunks maxChunks cap (Codex round-4 fix 3: bound one invocat
         const result = await persistLinksInChunks(links, 1, async chunk => ({ linked: chunk.map(l => l.observationId), exceptions: [] }), 1);
         assert.deepEqual(result.linked, ["o1"]);
         assert.equal(result.remaining, 3);
+    });
+});
+
+test("persistLinksInChunks stops at an absolute deadline and reports the rest", async t => {
+    const links = Array.from({ length: 10 }, (_, i) => ({ observationId: `o${i}`, bankLineId: `b${i}` }));
+
+    await t.test("un-started chunks come back as `remaining`, not as errors", async () => {
+        let clock = 1_000;
+        const ran: number[] = [];
+        const result = await persistLinksInChunks(
+            links, 2,
+            async chunk => { ran.push(chunk.length); return { linked: chunk.map(l => l.observationId), exceptions: [] }; },
+            Infinity,
+            // Two chunks fit; the third check is past the deadline.
+            { deadlineAt: 1_000 + 20, now: () => (clock += 10) - 10 },
+        );
+        assert.deepEqual(ran, [2, 2]);
+        assert.equal(result.linked.length, 4);
+        assert.equal(result.remaining, 6, "six links were never attempted");
+        assert.deepEqual(result.chunkErrors, [], "a deadline is not a failure");
+    });
+
+    await t.test("no deadline means every chunk runs, as before", async () => {
+        const result = await persistLinksInChunks(
+            links, 2,
+            async chunk => ({ linked: chunk.map(l => l.observationId), exceptions: [] }),
+        );
+        assert.equal(result.linked.length, 10);
+        assert.equal(result.remaining, 0);
+    });
+
+    await t.test("a deadline already passed attempts nothing at all", async () => {
+        const result = await persistLinksInChunks(
+            links, 2,
+            async () => { throw new Error("must not run"); },
+            Infinity,
+            { deadlineAt: 500, now: () => 1_000 },
+        );
+        assert.equal(result.linked.length, 0);
+        assert.equal(result.remaining, 10);
     });
 });

@@ -1,5 +1,6 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { CARD_RESEND_QUEUED_REASON, CARD_RESEND_STALE_HOURS } from "@/lib/receipt-request-cards";
 import { STAGING_SWEEP_MINUTES } from "./receipt-intake/worker";
 import {
     PAID_DELETION_UNRESOLVABLE,
@@ -109,7 +110,17 @@ export interface PipelineHealth {
     };
     /** receipt-push events in the last 24h, by status ("created", "fallback", ...). */
     receipts24h: CountsProbe;
-    /** Newest posted date in the bank ledger — how current the statement feed is. */
+    /**
+     * Newest posted date of a STATEMENT-sourced bank line — how current the
+     * statement import is (Codex PR #443 gate round 37, finding 1).
+     *
+     * Scoped to `sourceOfRecord: "STATEMENT"` on purpose. The nightly QBO pull
+     * mints canonical lines from the POSTED register, and counting those here
+     * meant a healthy pull could carry this date forward while the statement
+     * import — the only source that sees a bank-feed charge QuickBooks has not
+     * posted — had been stale for a week. The two sources answer different
+     * questions and only one of them can go stale unnoticed.
+     */
     bank: TimestampProbe;
     /** Automation events (ANY kind) that errored in the last 24h. */
     stuck: CountProbe;
@@ -157,6 +168,50 @@ export interface PipelineHealth {
          * eliminate.
          */
         quarantined: CountProbe;
+    };
+    /**
+     * THE REGISTER SECTION. The nightly QBO pull, and the honest residue of the
+     * clearance gate: `unclearedCount` is how many QuickBooks postings are
+     * sitting as observations because QuickBooks has not said they cleared the
+     * bank. They are not lost and they are not failures — they simply are not
+     * canonical lines yet, so nothing chases them. Reported so that number is
+     * SEEN rather than inferred from an absence of chases.
+     *
+     * OPTIONAL because `evaluatePipelineHealth` is testable with a partial
+     * snapshot and the digest only renders what it is given; `getPipelineHealth`
+     * always fills both in.
+     */
+    bankPull?: {
+        status: ProbeStatus;
+        reason?: string;
+        enabled: boolean;
+        lastSuccessAt: string | null;
+        ambiguousCount: number;
+        /** Transactions the pull could not represent and nobody has accepted. */
+        quarantinedCount?: number;
+        unclearedCount?: number;
+        /** Ambiguity from before the last pulled window: reported, never a stamp blocker. */
+        staleAmbiguous?: { count: number; keys: string[] };
+        /** Why the pull withheld its own freshness stamp, when it did. */
+        blockedReason?: string | null;
+        /** Days whose clearance was never answered, as `<from>..<to>`. */
+        uncertifiedWindow?: string | null;
+    };
+    /**
+     * Cards an operator asked to RESEND that are still unsent hours later
+     * (round-40 gate, finding 2). Optional so a caller built before the probe
+     * existed still type-checks; the health route always populates it.
+     */
+    queuedCards?: CountProbe;
+    /** Queued resends Chat rejected — never auto-retried, so a human owns them. */
+    rejectedQueuedCards?: CountProbe;
+    /** The missing-receipt sweep's marker, including why it is holding back. */
+    chaser?: {
+        status: ProbeStatus;
+        reason?: string;
+        phase: string;
+        completedAt: string | null;
+        blockedReason?: string | null;
     };
     /**
      * Events in the last 24h where QuickBooks refused the CREDENTIAL (401/403,
@@ -364,6 +419,47 @@ export function purchaseSyncStaleHours(): number {
  *  - `intuit-<indicator>` — Intuit itself reports degradation.
  *  - `errors-24h:<n>` — automation errored (any kind: a qbo-sync failure
  *    matters even on a day with no receipt traffic).
+ *  - `bank-pull-stale` — the nightly QBO register pull has not succeeded in
+ *    36h (or has never succeeded) WHILE it is enabled. The whole missing-receipt
+ *    chaser reads BankLine, so a dead pull silently starves it: every check
+ *    stays green while the queue quietly stops finding anything. Only reported
+ *    when the feature is actually on — an unset flag is not a failure.
+ *  - `bank-pull-blocked:<reason>` — the pull RAN and withheld its own freshness
+ *    stamp on purpose. Today's one reason is `cleared-probe-failed`: QuickBooks
+ *    served the register but not the clearance report, so every row is
+ *    "Unknown", nothing clearance-gated could run, and the run is not evidence
+ *    the register is current. Silent otherwise — the only other symptom is
+ *    `bank-pull-stale` 36 hours later, which reads as a dead pull when the pull
+ *    was fine and one report inside it was not.
+ *  - `bank-pull-uncertified:<from>..<to>` — a span of days whose bank clearance
+ *    was never answered and has not been re-read since. Outlives the retry
+ *    schedule (which gives up on purpose after PROBE_RETRY_LIMIT attempts) and
+ *    withholds the pull's freshness stamp until some run covers it, so without
+ *    naming it the only symptom is a stamp that quietly stops moving.
+ *  - `bank-ambiguous-stale:<n>:<keys>` — duplicate-identity groups reconcile
+ *    could not pair, from BEFORE the window the pull last read. A backlog for a
+ *    human, never a stamp blocker: gating on these meant one unresolvable pair
+ *    anywhere in history switched every owner's chase cards off for good.
+ *  - `chaser-stale:<hours>h` — the missing-receipt sweep has not COMPLETED a
+ *    cycle in over a day (or has never completed one). Everything downstream
+ *    reads its output: the Receipts tab's missing-receipt list is whatever it
+ *    last left behind, and the morning cards cron refuses to select at all
+ *    until it has finished today — answering `{skipped:"chaser-incomplete"}`
+ *    with HTTP 200, which is invisible unless somebody reads cron logs. This is
+ *    the check that makes a stalled chaser visible BEFORE the cards are due.
+ *  - `drive-not-configured` — no Google Drive credential is loadable, so the
+ *    signed-memo path cannot verify a single artifact. Every `signed:true` the
+ *    bridge sends is refused with a 503 while this holds, which is correct
+ *    (never record "verified" for something nobody could check) and completely
+ *    silent from the crew's side: they sign memos and nothing closes. It is
+ *    reported here because the failure has no other symptom.
+ *  - `cards-uncertain:<n>` — the morning Chat digest asked Google Chat to post
+ *    a card and never got a confirmed answer. Those rows are deliberately NEVER
+ *    auto-retried (a duplicate chase card teaches people the list is noise), so
+ *    nothing clears them but a human: the Receipts tab shows each one with
+ *    "mark delivered" and "resend". Left alone they are silent — the crew
+ *    simply never got asked, which is the failure mode this whole feature
+ *    exists to prevent.
  *  - `no-receipts-72h` — nothing has been booked in 72h. This used to
  *    auto-green as "a quiet week is quiet", which meant a permanently dead
  *    pipeline reported OK forever. It doesn't any more: the digest prints how
@@ -387,6 +483,60 @@ export function evaluatePipelineHealth(input: {
     intakeStuck: CountProbe;
     intakeNeedsReview: CountProbe;
     intakeUnassigned: CountProbe;
+    /**
+     * The nightly QBO register pull: whether it is switched on at all, and when
+     * it last SUCCEEDED (not merely ran).
+     *
+     * Carries a probe status like every other read here. Without one, a
+     * database that would not answer produced `{enabled:false}` — which reads
+     * as "the pull is switched off", i.e. as HEALTH — and the one check that
+     * watches the chaser's whole input went quiet exactly when it was needed.
+     */
+    bankPull: {
+        status: ProbeStatus;
+        reason?: string;
+        enabled: boolean;
+        lastSuccessAt: string | null;
+        ambiguousCount: number;
+        /** Transactions the pull could not represent and nobody has accepted. */
+        quarantinedCount?: number;
+        unclearedCount?: number;
+        staleAmbiguous?: { count: number; keys: string[] };
+        blockedReason?: string | null;
+        uncertifiedWindow?: string | null;
+    };
+    /** Chat cards whose delivery was never confirmed and which nobody has resolved. */
+    uncertainCards: CountProbe;
+    /**
+     * Cards an operator asked to RESEND that are still sitting unsent
+     * (Codex PR #443 gate round 40, finding 2).
+     *
+     * The cron drains them oldest-first, a few per run — so a count that stays
+     * above zero for hours means either the cron is not running or the backlog
+     * is deeper than the per-run limit. Both are things a human has to know:
+     * the operator already decided, and the crew is still waiting.
+     */
+    queuedCards?: CountProbe;
+    /** Queued resends Chat rejected — reported, never auto-retried. */
+    rejectedQueuedCards?: CountProbe;
+    /** Can we authenticate to Drive at all? Gates the signed-memo path. */
+    driveCredentials: { status: ProbeStatus; reason?: string; configured: boolean; source: string };
+    /**
+     * The missing-receipt sweep's own marker: which half it is in, and when it
+     * last finished a clean cycle.
+     */
+    chaser: {
+        status: ProbeStatus;
+        reason?: string;
+        phase: string;
+        completedAt: string | null;
+        /**
+         * Why the sweep is deliberately NOT stamping its completion, when that
+         * is the case. Optional: a marker written by an older build carries no
+         * such field, and absent must read as "not blocked", never as unknown.
+         */
+        blockedReason?: string | null;
+    };
     /**
      * Optional so an older caller (or a stored snapshot) still evaluates. An
      * ABSENT probe is silent; a probe that ran and found rows is a reason.
@@ -430,6 +580,12 @@ export function evaluatePipelineHealth(input: {
         ["intakeStuck", input.intakeStuck],
         ["intakeNeedsReview", input.intakeNeedsReview],
         ["intakeUnassigned", input.intakeUnassigned],
+        ["uncertainCards", input.uncertainCards],
+        ...(input.queuedCards ? [["queuedCards", input.queuedCards] as [string, { status: ProbeStatus }]] : []),
+        ...(input.rejectedQueuedCards ? [["rejectedQueuedCards", input.rejectedQueuedCards] as [string, { status: ProbeStatus }]] : []),
+        ["bankPull", input.bankPull],
+        ["driveCredentials", input.driveCredentials],
+        ["chaser", input.chaser],
         ...(input.intakeQuarantined ? [["intakeQuarantined", input.intakeQuarantined] as [string, { status: ProbeStatus }]] : []),
         ["payLinksPending", input.payLinksPending],
     ];
@@ -579,7 +735,478 @@ export function evaluatePipelineHealth(input: {
         if (stale) reasons.push("no-receipts-72h");
     }
 
+    // Only when we actually READ it — a failed probe is already reported as
+    // probe-failed:bankPull, and inventing a staleness alarm on top of it would
+    // fire for the wrong reason and teach people to ignore both.
+    if (input.bankPull.status === "ok" && input.bankPull.enabled) {
+        const at = input.bankPull.lastSuccessAt ? Date.parse(input.bankPull.lastSuccessAt) : null;
+        // Never succeeded counts as stale. "We turned it on and it has never
+        // worked" is the failure most worth catching, and a null that reads as
+        // healthy is exactly the null-means-OK trap this file already fixed
+        // elsewhere.
+        const stale = at === null || Number.isNaN(at) || input.now - at > BANK_PULL_STALE_HOURS * HOUR_MS;
+        if (stale) reasons.push("bank-pull-stale");
+    }
+
+    // Ambiguous reconcile groups are a human call, never auto-resolved (see
+    // BANK_PULL_AMBIGUOUS_KEY) — reported whenever the probe actually READ a
+    // count, independent of the staleness check above, so a backlog surfaces
+    // even on a night the pull itself is otherwise current.
+    if (input.bankPull.status === "ok" && input.bankPull.ambiguousCount > 0) {
+        reasons.push(`bank-pull-ambiguous:${input.bankPull.ambiguousCount}`);
+    }
+
+    /**
+     * TRANSACTIONS THE PULL COULD NOT REPRESENT (round-46 gate, finding 2).
+     *
+     * These are rows MISSING from the register the chaser is about to certify,
+     * so this is not a note — it is a reason, and it holds the pull's freshness
+     * stamp until somebody accepts them. Reported whatever the pull's own
+     * status, because a quarantine outlives the run that found it.
+     */
+    if ((input.bankPull.quarantinedCount ?? 0) < 0) {
+        // Unreadable, which is not the same as none — and is the state that let
+        // a run certify a ledger with rows missing.
+        reasons.push("bank-quarantine-unreadable");
+    } else if ((input.bankPull.quarantinedCount ?? 0) > 0) {
+        reasons.push(`bank-quarantine:${input.bankPull.quarantinedCount}`);
+    }
+
+    // AMBIGUITY OLDER THAN THE LAST PULLED WINDOW. Reported, and deliberately
+    // separate from the line above: it is a real backlog somebody owes an
+    // answer on, but it is NOT evidence that tonight's register is unsettled,
+    // and it no longer withholds the pull's freshness stamp. Before this split,
+    // one unresolvable duplicate pair anywhere in history suppressed every
+    // owner's chase cards for good (Codex PR #443 gate round 33, finding 2).
+    if (input.bankPull.status === "ok" && (input.bankPull.staleAmbiguous?.count ?? 0) > 0) {
+        reasons.push(staleAmbiguousReason(input.bankPull.staleAmbiguous!.count, input.bankPull.staleAmbiguous!.keys));
+    }
+
+    // THE PULL WITHHOLDING ITS OWN STAMP, said out loud. Same job as
+    // `chaser-blocked:<reason>` below: the withholding is correct, and on its
+    // own completely silent — the only other symptom is `bank-pull-stale` 36
+    // hours later, which reads as "the pull is dead" when the pull ran fine and
+    // one report inside it did not answer (round-33 gate, finding 1).
+    if (input.bankPull.status === "ok" && input.bankPull.blockedReason) {
+        reasons.push(`bank-pull-blocked:${input.bankPull.blockedReason}`);
+    }
+
+    // DAYS NOBODY EVER GOT A CLEARANCE ANSWER FOR (round-35 gate, finding 1).
+    //
+    // `bank-pull-blocked` is about the run that just ended and clears the moment
+    // one succeeds. This is about the HOLE, which outlives both the run and the
+    // retry schedule: the retry marker is dropped after PROBE_RETRY_LIMIT
+    // attempts by design, and the span it was chasing stays uncertified until
+    // some run actually re-reads it. It also withholds the freshness stamp, so
+    // without naming it the only symptom would be `bank-pull-stale` 36 hours
+    // later — which reads as a dead pull when the pull is running fine every
+    // night and refusing, correctly, to certify a week it never read.
+    if (input.bankPull.status === "ok" && input.bankPull.uncertifiedWindow) {
+        reasons.push(`bank-pull-uncertified:${input.bankPull.uncertifiedWindow}`);
+    }
+
+    // THE CHASER REFUSING TO FINISH ON PURPOSE.
+    //
+    // Distinct from `chaser-stale`, and it has to be: the sweep stops stamping
+    // its completion when the nightly register pull is not fresh (see
+    // BANK_PULL_CHASER_WINDOW_HOURS), which is correct — cards built on a stale
+    // register ask for the wrong receipts — but on its own it is SILENT. The
+    // chaser looks like it is merely slow, `bank-pull-stale` does not fire for
+    // another eleven hours (36h vs 24h), and the 14:30 UTC cards simply never
+    // go out. This says which of the two it is, immediately.
+    if (input.chaser.status === "ok" && input.chaser.blockedReason) {
+        reasons.push(`chaser-blocked:${input.chaser.blockedReason}`);
+    }
+
+    // A CHASER THAT HAS NOT FINISHED is the input every other receipt surface
+    // depends on. Reported in HOURS so the digest says how long, rather than
+    // just that something is wrong.
+    if (input.chaser.status === "ok") {
+        const at = input.chaser.completedAt ? Date.parse(input.chaser.completedAt) : null;
+        const stale = at === null || Number.isNaN(at) || input.now - at > CHASER_STALE_HOURS * HOUR_MS;
+        if (stale) {
+            const hours = at === null || Number.isNaN(at)
+                ? "never"
+                : `${Math.floor((input.now - at) / HOUR_MS)}h`;
+            reasons.push(`chaser-stale:${hours}`);
+        }
+    }
+
+    // NO DRIVE CREDENTIAL = the signed-memo path is dead, silently. Only
+    // reported when the probe actually ANSWERED: a failed probe is already
+    // `probe-failed:driveCredentials`.
+    if (input.driveCredentials.status === "ok" && !input.driveCredentials.configured) {
+        reasons.push("drive-not-configured");
+    }
+
+    // An uncertain card is an ASK THAT MAY NEVER HAVE HAPPENED. It cannot be
+    // auto-retried without risking a duplicate, so it needs a human, and until
+    // one looks the crew has silently not been asked for those receipts.
+    if (input.uncertainCards.status === "ok" && input.uncertainCards.count > 0) {
+        reasons.push(`cards-uncertain:${input.uncertainCards.count}`);
+    }
+
+    // Only the STALE ones: a resend requested five minutes ago is waiting for
+    // the next cron slot, which is the system working.
+    if (input.queuedCards?.status === "ok" && input.queuedCards.count > 0) {
+        reasons.push(`cards-queued-stale:${input.queuedCards.count}`);
+    }
+
+    // A queued resend Chat REJECTED. Never auto-retried, so it is a human's to
+    // pick up — and silently dropping it is what round-41 finding 3 was about.
+    if (input.rejectedQueuedCards?.status === "ok" && input.rejectedQueuedCards.count > 0) {
+        reasons.push(`cards-queued-rejected:${input.rejectedQueuedCards.count}`);
+    }
+
     return { ok: reasons.length === 0, reasons };
+}
+
+/**
+ * The nightly pull runs every 24h, so 36h is one missed run plus room for a
+ * late retry — long enough not to page on a single slow night, short enough
+ * that a dead pull is caught before the chaser has drifted a whole week.
+ */
+export const BANK_PULL_STALE_HOURS = 36;
+
+/**
+ * How fresh the register pull's last SUCCESS must be for the missing-receipt
+ * chaser to call its own cycle complete and release the morning cards.
+ *
+ * TIGHTER THAN THE ALARM ABOVE, and for a different job. `BANK_PULL_STALE_HOURS`
+ * asks "is the pull dead?" and is deliberately slack so one slow night does not
+ * page anybody. This asks "did the pull that feeds TODAY'S chase actually run?"
+ * and must not be slack at all.
+ *
+ * From vercel.json: `/api/cron/bank-register-pull` runs at 02:00 UTC daily and
+ * `/api/cron/receipt-requests` at 13:00 UTC, with `?continue=1` resumes every
+ * 15 minutes and the cards going out at 14:30 UTC on weekdays. So at chaser
+ * time a healthy pull is ~11h old, and last night's pull — the one that means
+ * tonight's failed — is ~35h old. 24h separates those two cleanly while still
+ * tolerating a pull that ran late.
+ */
+export const BANK_PULL_CHASER_WINDOW_HOURS = 24;
+
+/**
+ * The chaser runs a full sweep daily (plus 15-minute resume passes), so 26h is
+ * one missed night with room for a slow morning — short enough that the alarm
+ * lands BEFORE the next day's cards are due, which is the whole point of
+ * watching it.
+ */
+export const CHASER_STALE_HOURS = 26;
+
+/** Where the pull records its last SUCCESS (AutomationSetting is a KV table). */
+export const BANK_PULL_LAST_SUCCESS_KEY = "bankRegisterPullLastSuccess";
+
+/**
+ * Where the pull records how many reconcile groups came back AMBIGUOUS on its
+ * most recent completed reconcile (Codex round-31 gate, finding 2). A
+ * same-identity 2×2 (or larger) statement-first group is a human call, never
+ * auto-resolved — this is what makes that backlog visible instead of the pull
+ * silently reporting "done" over it. Overwritten every run reconcile actually
+ * completes (0 clears a resolved alarm); left untouched when reconcile itself
+ * never ran, so a missing read can never read as "zero ambiguous".
+ */
+export const BANK_PULL_AMBIGUOUS_KEY = "bankRegisterPullAmbiguousCount";
+
+/**
+ * Transactions the pull could not represent, and which are therefore MISSING
+ * from the register it just read (Codex PR #443 gate round 46, finding 2).
+ *
+ * Round 45 quarantined them and let the run certify anyway — `ok` and
+ * `complete` stayed true, the state advanced, the freshness stamp landed, and
+ * the chaser released cards over a register with rows missing. A quarantine
+ * that only writes a log line is not a quarantine.
+ *
+ * So it is durable, and it BLOCKS the stamp until a human accepts it. The value
+ * is a JSON array of `{ qbTxnId, reason, count, firstSeenAt }`; an empty array
+ * means nothing is held.
+ */
+export const BANK_PULL_QUARANTINE_KEY = "bankRegisterPullQuarantine";
+
+/**
+ * What the last pull saw for each transaction: one content hash per split, in
+ * ordinal order (round-46 gate, finding 1).
+ *
+ * It is what lets the next run tell a QuickBooks RESTATEMENT (same identity,
+ * new content — update in place) from a NEW observation, and a 1↔N split
+ * transition from either. Without it every run treats the register as if it
+ * had never seen it, which is how content-derived identities came to mint
+ * duplicates.
+ */
+export const BANK_PULL_SPLIT_MANIFEST_KEY = "bankRegisterPullSplitManifest";
+
+/**
+ * The qbTxnIds an operator has explicitly accepted as unrepresentable.
+ *
+ * A JSON array of ids. A quarantine whose id appears here stops blocking the
+ * stamp — the rows are still missing and the health probe still reports them,
+ * but the pipeline moves again on a person's say-so rather than stalling every
+ * owner's cards indefinitely. "These rows are genuinely not chaseable" is a
+ * judgement only a human can make.
+ */
+export const BANK_PULL_QUARANTINE_ACCEPTED_KEY = "bankRegisterPullQuarantineAccepted";
+
+export interface BankPullQuarantineEntry {
+    qbTxnId: string;
+    reason: string;
+    count: number;
+    firstSeenAt: string;
+    /** The last run that still saw this transaction quarantined. */
+    lastSeenAt: string;
+    /**
+     * Bumped whenever the CONDITION changes (a different reason, a different
+     * split count). An acceptance is bound to a version, so accepting a 2-split
+     * cardinality change never silently accepts the same id after it becomes a
+     * 40-split runaway (round-48 gate, finding 2).
+     */
+    version: number;
+}
+
+/**
+ * Parse the durable quarantine list.
+ *
+ * `null` means UNREADABLE, and that is not the same as empty (round-48 gate,
+ * finding 2): reading a malformed store as "nothing quarantined" let a run
+ * certify a ledger with rows missing, and then overwrite the record of what was
+ * held. Absent is `[]`; malformed is `null`, and every caller must treat it as
+ * a blocker.
+ */
+export function parseQuarantine(value: string | null | undefined): BankPullQuarantineEntry[] | null {
+    if (!value) return [];
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(value);
+    } catch {
+        return null;
+    }
+    if (!Array.isArray(parsed)) return null;
+    const out: BankPullQuarantineEntry[] = [];
+    for (const row of parsed) {
+        if (!row || typeof row !== "object") return null;
+        const entry = row as Partial<BankPullQuarantineEntry>;
+        if (typeof entry.qbTxnId !== "string" || !entry.qbTxnId) return null;
+        if (typeof entry.reason !== "string" || !entry.reason) return null;
+        if (typeof entry.count !== "number") return null;
+        out.push({
+            qbTxnId: entry.qbTxnId,
+            reason: entry.reason,
+            count: entry.count,
+            firstSeenAt: typeof entry.firstSeenAt === "string" ? entry.firstSeenAt : "",
+            lastSeenAt: typeof entry.lastSeenAt === "string" ? entry.lastSeenAt : "",
+            version: typeof entry.version === "number" ? entry.version : 1,
+        });
+    }
+    return out;
+}
+
+/**
+ * Parse the acceptance list. `null` means UNREADABLE — never "nothing
+ * accepted", which would silently re-block work a human had already cleared,
+ * and never "everything accepted", which would release it.
+ *
+ * An acceptance names an id AND the version it was granted against, so it
+ * lapses when the condition changes. A bare string is a pre-round-48
+ * acceptance and is honoured at version 1.
+ */
+export interface QuarantineAcceptance { qbTxnId: string; version: number }
+
+export function parseAcceptedQuarantine(value: string | null | undefined): QuarantineAcceptance[] | null {
+    if (!value) return [];
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(value);
+    } catch {
+        return null;
+    }
+    if (!Array.isArray(parsed)) return null;
+    const out: QuarantineAcceptance[] = [];
+    for (const row of parsed) {
+        if (typeof row === "string" && row) { out.push({ qbTxnId: row, version: 1 }); continue; }
+        if (!row || typeof row !== "object") return null;
+        const entry = row as Partial<QuarantineAcceptance>;
+        if (typeof entry.qbTxnId !== "string" || !entry.qbTxnId) return null;
+        out.push({ qbTxnId: entry.qbTxnId, version: typeof entry.version === "number" ? entry.version : 1 });
+    }
+    return out;
+}
+
+/**
+ * The quarantined transactions still holding the pipeline back.
+ *
+ * Accepted ids drop out; everything else blocks. Exported so the pull and the
+ * health probe cannot disagree about what "outstanding" means.
+ */
+export function outstandingQuarantine(
+    entries: readonly BankPullQuarantineEntry[],
+    accepted: readonly QuarantineAcceptance[],
+): BankPullQuarantineEntry[] {
+    const byId = new Map(accepted.map(a => [a.qbTxnId, a.version]));
+    // An acceptance covers the version it was granted against, and anything
+    // older. A condition that CHANGED bumps the version, so the entry becomes
+    // outstanding again and a human is asked about the new situation rather
+    // than the old one.
+    return entries.filter(entry => (byId.get(entry.qbTxnId) ?? -1) < entry.version);
+}
+
+/**
+ * Where the pull records how many QBO_REGISTER observations QuickBooks has NOT
+ * cleared, inside the mint lookback window and not yet linked to a canonical
+ * line.
+ *
+ * NOT A FAILURE, and deliberately not a `reason`. These are real postings that
+ * are honestly still in flight: an uncleared card charge, a check nobody has
+ * cashed, a manually entered journal QuickBooks classifies as neither. They
+ * stay observations — on the Bank page, out of the canonical ledger, never
+ * chased — until QuickBooks says the money moved. It is reported so the number
+ * is VISIBLE rather than inferred from the absence of chases.
+ */
+export const BANK_PULL_UNCLEARED_KEY = "bankRegisterPullUnclearedCount";
+
+/**
+ * Ambiguous reconcile groups from BEFORE the window the pull last read, as
+ * `{"count":n,"keys":[...]}` (Codex PR #443 gate round 33, finding 2).
+ *
+ * DELIBERATELY NOT A STAMP BLOCKER. Two legitimate identical purchases that
+ * reconcile cannot pair are a real backlog, but they are last month's backlog:
+ * blocking the freshness stamp on them meant one such pair anywhere in history
+ * suppressed every owner's chase cards, permanently. So the count is reported
+ * here and the stamp is decided by ambiguity inside the current window alone.
+ * The keys ride along because "three of these" without "which three" sends
+ * somebody hunting through the table.
+ */
+export const BANK_PULL_AMBIGUOUS_STALE_KEY = "bankRegisterPullAmbiguousStale";
+
+/**
+ * Why the pull withheld its own freshness stamp on its most recent run, when it
+ * did and the cause was not an outright failure. Empty means nothing is holding
+ * it back.
+ *
+ * The one case today is `cleared-probe-failed`: QuickBooks answered the register
+ * but not the clearance question, so every row is "Unknown", nothing
+ * clearance-gated could run, and the run is not proof the register is current
+ * (round-33 gate, finding 1). Without this the only symptom is `bank-pull-stale`
+ * 36 hours later, which says the pull is dead when in fact it ran fine and one
+ * report inside it did not.
+ */
+export const BANK_PULL_BLOCKED_REASON_KEY = "bankRegisterPullBlockedReason";
+
+/**
+ * The span of dates whose bank clearance was never answered, as `<from>..<to>`,
+ * or empty when there is none (Codex PR #443 gate round 35, finding 1).
+ *
+ * DIFFERENT FROM `bank-pull-blocked:cleared-probe-failed`, which is about the
+ * run that just ended. This one is about the DAYS: a probe failure whose
+ * retries are exhausted stops being a per-run event, the retry marker is
+ * dropped on purpose, and without this nothing would say the hole was still
+ * there. It is also the thing that withholds the freshness stamp, so left
+ * unreported it would look exactly like a pull that had quietly died.
+ */
+export const BANK_PULL_UNCERTIFIED_KEY = "bankRegisterPullUncertifiedWindow";
+
+/** The stored form of an uncertified span: `<from>..<to>`, or "" for none. */
+export function uncertifiedWindowValue(
+    bounds: { startDate: string; endDate: string } | null | undefined,
+): string {
+    return bounds ? `${bounds.startDate}..${bounds.endDate}` : "";
+}
+
+/**
+ * Is the nightly pull on, and when did it last SUCCEED?
+ *
+ * A read failure reports `enabled: false` rather than "enabled and stale":
+ * inventing a failure out of a probe error would fire the alarm for the wrong
+ * reason, and the probe-failure reasons above already cover "we could not read
+ * it". The flag itself is env, so it cannot fail.
+ */
+/**
+ * The pull's last-success stamp. THROWS on a read failure rather than returning
+ * a cheerful default — it runs inside `runProbe` now, which is the thing that
+ * knows how to say "we could not read this" (`probe-failed:bankPull`) and how
+ * to give up on a hung database instead of holding the whole health check open.
+ */
+/** How many stale-ambiguity group keys a single health reason will name before it truncates. */
+export const STALE_AMBIGUOUS_KEYS_IN_REASON = 3;
+
+/**
+ * The stale-ambiguity reason string: the count, then the group keys.
+ *
+ * Exported and pure so the truncation rule is testable. A reason nobody can act
+ * on is noise, and "there are four duplicate groups somewhere" is exactly that —
+ * so the keys are in the string, capped, with the overflow counted rather than
+ * silently dropped.
+ */
+export function staleAmbiguousReason(count: number, keys: readonly string[]): string {
+    const shown = keys.slice(0, STALE_AMBIGUOUS_KEYS_IN_REASON);
+    const overflow = keys.length - shown.length;
+    const suffix = shown.length > 0 ? `:${shown.join(",")}${overflow > 0 ? `,+${overflow}` : ""}` : "";
+    return `bank-ambiguous-stale:${count}${suffix}`;
+}
+
+function parseStaleAmbiguous(raw: string | null | undefined): { count: number; keys: string[] } {
+    if (!raw) return { count: 0, keys: [] };
+    try {
+        const parsed = JSON.parse(raw) as { count?: unknown; keys?: unknown };
+        const count = typeof parsed.count === "number" && Number.isFinite(parsed.count) ? parsed.count : 0;
+        const keys = Array.isArray(parsed.keys) ? parsed.keys.filter((k): k is string => typeof k === "string") : [];
+        return { count, keys };
+    } catch {
+        // An unreadable value is NOT reported as zero — that is the
+        // null-means-OK trap this file exists to avoid. The count comes from the
+        // keys we could not read, so say one thing is wrong rather than nothing.
+        return { count: 1, keys: ["unparseable"] };
+    }
+}
+
+async function readBankPullState(): Promise<{
+    enabled: boolean;
+    lastSuccessAt: string | null;
+    ambiguousCount: number;
+    quarantinedCount: number;
+    unclearedCount: number;
+    staleAmbiguous: { count: number; keys: string[] };
+    blockedReason: string | null;
+    uncertifiedWindow: string | null;
+}> {
+    // ENABLED BECAUSE THE CRON EXISTS. The previous gate keyed off
+    // BANK_LINE_MINT_FROM_QBO — an undocumented env var that controls MINTING,
+    // not the pull — so with minting off (its shipped default) the pull could
+    // be dead for weeks and health stayed green. The pull is scheduled in
+    // vercel.json unconditionally, so it is expected to run unconditionally.
+    const [successRow, ambiguousRow, quarantineRow, quarantineAcceptedRow, unclearedRow, staleAmbiguousRow, blockedRow, uncertifiedRow] = await Promise.all([
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_ACCEPTED_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_UNCLEARED_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_STALE_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_BLOCKED_REASON_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_UNCERTIFIED_KEY } }),
+    ]);
+    const parsedAmbiguous = ambiguousRow?.value ? Number.parseInt(ambiguousRow.value, 10) : 0;
+    const parsedUncleared = unclearedRow?.value ? Number.parseInt(unclearedRow.value, 10) : 0;
+    return {
+        enabled: true,
+        lastSuccessAt: successRow?.value || null,
+        ambiguousCount: Number.isFinite(parsedAmbiguous) ? parsedAmbiguous : 0,
+        // Only the OUTSTANDING ones: accepted quarantines stay in the record
+        // for history but no longer hold the pipeline (round-46, finding 2).
+        /**
+         * A store that will not parse counts as BLOCKING, not as empty
+         * (round-48 gate, finding 2). `-1` is the signal, and
+         * `evaluatePipelineHealth` renders it as `bank-quarantine-unreadable`
+         * rather than a count nobody can act on.
+         */
+        quarantinedCount: (() => {
+            const entries = parseQuarantine(quarantineRow?.value);
+            const accepted = parseAcceptedQuarantine(quarantineAcceptedRow?.value);
+            if (entries === null || accepted === null) return -1;
+            return outstandingQuarantine(entries, accepted).length;
+        })(),
+        unclearedCount: Number.isFinite(parsedUncleared) ? parsedUncleared : 0,
+        staleAmbiguous: parseStaleAmbiguous(staleAmbiguousRow?.value),
+        blockedReason: blockedRow?.value || null,
+        uncertifiedWindow: uncertifiedRow?.value || null,
+    };
 }
 
 /** A probe that has not answered within this long is treated as failed. */
@@ -746,6 +1373,28 @@ export function statementTimeoutRunner(client: typeof prisma = prisma): ProbeRun
  *
  * Exported for tests: a never-settling fake is the only way to prove this.
  */
+/**
+ * The STATEMENT import's own high-water mark (round-37 gate, finding 1).
+ *
+ * The nightly QBO pull reads the POSTED general-ledger register. A charge the
+ * bank has cleared but QuickBooks has not posted — a pending or unmatched
+ * bank-feed line — is not in that source at all and can never be minted from
+ * it, so the statement import — the daily WTB CSV — stays the only thing that sees it. That
+ * makes "how current is the statement import" a question the pull must not be
+ * able to answer, and an unfiltered `max(postedDate)` let it: one night of
+ * QBO-minted lines carried the date forward over a statement import nobody had
+ * run since July.
+ *
+ * Exported so the scoping is testable without standing up every other probe.
+ */
+export async function newestStatementPostedDate(client: Pick<typeof prisma, "bankLine">): Promise<Date | null> {
+    const newest = await client.bankLine.aggregate({
+        where: { sourceOfRecord: "STATEMENT" },
+        _max: { postedDate: true },
+    });
+    return newest._max.postedDate ?? null;
+}
+
 export async function runProbe<T>(
     name: string,
     run: (db: ProbeDb) => Promise<T>,
@@ -812,11 +1461,13 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     const probe = runProbe;
 
     const [
-        intuit, lastPurchase, purchaseSyncRun, lastPush, lastPaymentsSync, receiptRows,
-        lastBankLine, stuck,
+        intuit, lastPurchase, purchaseSyncRun, lastPush,
+        lastPaymentsSync, receiptRows, lastBankLine, stuck,
         intakeStuck, intakeNeedsReview, intakeUnassigned, intakeQuarantined,
-        qboAuth, payLinksPending,
-        payLinksMissing, parkedCreates, parkedDocumentSyncs, pendingDeletions, unreconciledMoney, maintenanceRun,
+        qboAuth, payLinksPending, payLinksMissing, parkedCreates,
+        parkedDocumentSyncs, pendingDeletions, unreconciledMoney, maintenanceRun,
+        uncertainCards, queuedCards, rejectedQueuedCards, bankPull,
+        chaser, driveCredentials,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -918,7 +1569,10 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         ),
         probe<Date | null>(
             "bank",
-            async (db) => (await db.bankLine.aggregate({ _max: { postedDate: true } }))._max.postedDate ?? null,
+            // STATEMENT-sourced lines only (Phase 2): an unfiltered max(postedDate)
+            // lets one night of QBO-minted rows carry the date forward over a
+            // statement import nobody has run since July.
+            (db) => newestStatementPostedDate(db),
             null,
         ),
         // ANY kind: a qbo-sync failure is exactly the thing this digest exists
@@ -1132,6 +1786,92 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                 )?.createdAt ?? null,
             null,
         ),
+        // Chat cards we asked for and never got a confirmed answer about. They
+        // are never auto-retried, so this count only falls when a human acts.
+        probe<number>(
+            "uncertainCards",
+            () => prisma.receiptRequestCard.count({ where: { status: "UNCERTAIN" } }),
+            0,
+        ),
+        // Resends an operator asked for that are still unsent, and have been
+        // for longer than a cron slot or two (round-40 gate, finding 2).
+        probe<number>(
+            "queuedCards",
+            () => prisma.receiptRequestCard.count({
+                where: {
+                    status: "PENDING",
+                    postedAt: null,
+                    // THE COLUMN (round-41 gate, finding 3): `lastError` is
+                    // overwritten by the next failure, so counting on it lost
+                    // every row that had been rejected once.
+                    resendQueuedAt: { not: null, lt: new Date(now - CARD_RESEND_STALE_HOURS * HOUR_MS) },
+                },
+            }),
+            0,
+        ),
+        /**
+         * Queued resends Chat REJECTED (round-41 gate, finding 3).
+         *
+         * A definitive rejection is not retried automatically — Chat declined,
+         * and re-posting the same card into the same space is how a chase list
+         * becomes noise — so these rows would sit for ever with nobody told.
+         * They keep their `resendQueuedAt`, so they are still the operator's
+         * outstanding decision, and this is what says so out loud.
+         */
+        probe<number>(
+            "rejectedQueuedCards",
+            () => prisma.receiptRequestCard.count({
+                where: {
+                    postedAt: null,
+                    resendQueuedAt: { not: null },
+                    lastError: { startsWith: "rejected:" },
+                },
+            }),
+            0,
+        ),
+        // IN the Promise.all, and probed: it used to be an unprobed `await`
+        // after it, so a hung database held the whole health check open past
+        // every other probe's deadline and then answered "switched off".
+        probe<{
+            enabled: boolean;
+            lastSuccessAt: string | null;
+            ambiguousCount: number;
+            quarantinedCount: number;
+            unclearedCount: number;
+            staleAmbiguous: { count: number; keys: string[] };
+            blockedReason: string | null;
+            uncertifiedWindow: string | null;
+        }>(
+            "bankPull",
+            readBankPullState,
+            { enabled: false, lastSuccessAt: null, ambiguousCount: 0, quarantinedCount: 0, unclearedCount: 0, staleAmbiguous: { count: 0, keys: [] }, blockedReason: null, uncertifiedWindow: null },
+        ),
+        // Can we authenticate to Drive? Asked here rather than at the moment a
+        // memo arrives, because the answer "no" produces no symptom anywhere
+        // else: memos are signed, the bridge is refused, and the queue simply
+        // never empties.
+        // The chaser's own marker. Everything on the Receipts tab and every
+        // morning card is downstream of it, and a stalled one is otherwise
+        // silent: the cards cron answers 200 with `skipped:"chaser-incomplete"`.
+        probe<{ phase: string; completedAt: string | null; blockedReason: string | null }>(
+            "chaser",
+            async () => {
+                const { SWEEP_MARKER_KEY, parseSweepMarker } = await import("./receipt-sweep-marker");
+                const row = await prisma.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } });
+                const marker = parseSweepMarker(row?.value);
+                return { phase: marker.phase, completedAt: marker.chaserCompletedAt, blockedReason: marker.blockedReason ?? null };
+            },
+            { phase: "unknown", completedAt: null, blockedReason: null },
+        ),
+        probe<{ ok: boolean; source: string }>(
+            "driveCredentials",
+            async () => {
+                const { ensureDriveAuth } = await import("./gmail-client");
+                const verdict = await ensureDriveAuth();
+                return { ok: verdict.ok, source: verdict.source };
+            },
+            { ok: false, source: "none" },
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -1179,6 +1919,45 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             reason: intakeUnassigned.reason,
             count: intakeUnassigned.value,
         },
+        uncertainCards: {
+            status: uncertainCards.status,
+            reason: uncertainCards.reason,
+            count: uncertainCards.value,
+        },
+        queuedCards: {
+            status: queuedCards.status,
+            reason: queuedCards.reason,
+            count: queuedCards.value,
+        },
+        rejectedQueuedCards: {
+            status: rejectedQueuedCards.status,
+            reason: rejectedQueuedCards.reason,
+            count: rejectedQueuedCards.value,
+        },
+        chaser: {
+            status: chaser.status,
+            reason: chaser.reason,
+            phase: chaser.value.phase,
+            completedAt: chaser.value.completedAt,
+            blockedReason: chaser.value.blockedReason,
+        },
+        driveCredentials: {
+            status: driveCredentials.status,
+            reason: driveCredentials.reason,
+            configured: driveCredentials.value.ok,
+            source: driveCredentials.value.source,
+        },
+        bankPull: {
+            status: bankPull.status,
+            reason: bankPull.reason,
+            enabled: bankPull.value.enabled,
+            lastSuccessAt: bankPull.value.lastSuccessAt,
+            ambiguousCount: bankPull.value.ambiguousCount,
+            unclearedCount: bankPull.value.unclearedCount,
+            staleAmbiguous: bankPull.value.staleAmbiguous,
+            blockedReason: bankPull.value.blockedReason,
+            uncertifiedWindow: bankPull.value.uncertifiedWindow,
+        },
         intakeQuarantined: {
             status: intakeQuarantined.status,
             reason: intakeQuarantined.reason,
@@ -1215,6 +1994,12 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             unassigned: snapshot.intakeUnassigned,
             quarantined: snapshot.intakeQuarantined,
         },
+        // The register section. `unclearedCount` is the honest residue of the
+        // clearance gate — postings QuickBooks has not cleared, which stay
+        // observations rather than becoming canonical lines — and it belongs
+        // where somebody can see it, not only in a cron log.
+        bankPull: snapshot.bankPull,
+        chaser: snapshot.chaser,
         qboAuth: snapshot.qboAuth,
         payLinksPending: snapshot.payLinksPending,
         payLinksMissing: snapshot.payLinksMissing,
@@ -1275,12 +2060,21 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
                     : ""
         }`,
         `Receipts (24h): ${receiptsLine}`,
-        `Bank ledger through: ${
+        // NAMED FOR WHAT IT MEASURES (round-37 gate, finding 1). "Bank ledger"
+        // read as every line in the ledger, QBO-minted ones included, which is
+        // exactly the reading that let a fresh pull disguise a stale statement
+        // import. The pull has its own line below.
+        `Statement ledger through: ${
             health.bank.status === "error"
                 ? "unavailable (probe failed)"
                 : health.bank.at
                     ? health.bank.at.slice(0, 10)
                     : "no lines"
+        }`,
+        `Cards queued for resend >${CARD_RESEND_STALE_HOURS}h: ${
+            health.queuedCards?.status === "error" ? "unavailable (probe failed)" : health.queuedCards?.count ?? "unavailable"
+        }${
+            (health.rejectedQueuedCards?.count ?? 0) > 0 ? ` (${health.rejectedQueuedCards?.count} rejected by Chat)` : ""
         }`,
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
         // Optional-chained on purpose: a digest that THROWS means no morning

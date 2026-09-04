@@ -80,6 +80,11 @@
       "def": "CHECK ((((source = 'STATEMENT'::text) AND (\"statementImportId\" IS NOT NULL) AND (\"bankLineId\" IS NOT NULL)) OR ((source = 'QBO_REGISTER'::text) AND (\"statementImportId\" IS NULL))))"
     },
     {
+      "name": "BankLine_sourceOfRecord_check",
+      "table": "\"BankLine\"",
+      "def": "CHECK ((\"sourceOfRecord\" = ANY (ARRAY['STATEMENT'::text, 'QBO'::text])))"
+    },
+    {
       "name": "BankLine_state_check",
       "table": "\"BankLine\"",
       "def": "CHECK ((state = ANY (ARRAY['POSTED'::text, 'EVIDENCE_FOUND'::text, 'TRANSACTION_CREATED'::text, 'ATTACHMENT_CONFIRMED'::text, 'MATCHED'::text, 'JOB_CODED'::text, 'TAX_VALIDATED'::text, 'EXCEPTION'::text])))"
@@ -123,6 +128,11 @@
       "name": "ReceiptIntake_state_check",
       "table": "\"ReceiptIntake\"",
       "def": "CHECK ((state = ANY (ARRAY['STAGING'::text, 'RECEIVED'::text, 'READ'::text, 'NEEDS_JOB'::text, 'NEEDS_REVIEW'::text, 'BOOKING'::text, 'BOOKED'::text, 'ARCHIVED'::text, 'DUPLICATE'::text, 'VOID'::text, 'NON_RECEIPT'::text, 'SHADOW_DONE'::text, 'SHADOW_QUARANTINE'::text])))"
+    },
+    {
+      "name": "ReceiptRequestCard_status_check",
+      "table": "\"ReceiptRequestCard\"",
+      "def": "CHECK ((status = ANY (ARRAY['PENDING'::text, 'POSTING'::text, 'POSTED'::text, 'UNCERTAIN'::text])))"
     },
     {
       "name": "RefundEvent_amountCents_check",
@@ -281,7 +291,19 @@
       "forced": false
     },
     {
+      "name": "ReceiptMemoArtifact",
+      "forced": false
+    },
+    {
       "name": "ReceiptObjectClaim",
+      "forced": false
+    },
+    {
+      "name": "ReceiptRequestCard",
+      "forced": false
+    },
+    {
+      "name": "ReceiptRequestCardDelivery",
       "forced": false
     },
     {

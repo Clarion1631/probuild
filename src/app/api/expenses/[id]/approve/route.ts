@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import {
@@ -18,10 +19,15 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
             select: { qbPurchaseId: true },
         });
         assertExpenseMutableOutsideQbo(expense);
-        await prisma.expense.update({
+        // EVIDENCE (round-45 gate, finding 3). Any Expense write can change what
+        // the missing-receipt sweep reads, so it goes through the shared fence:
+        // the advisory lock, and the epoch bump that stops a cycle certifying
+        // over it. Uniform on purpose — a per-field rule would need every
+        // future edit to re-derive which columns the matcher happens to read.
+        await withReceiptEvidenceLock(fn => prisma.$transaction(fn), tx => tx.expense.update({
             where: { id },
             data: { status: "Reviewed" },
-        });
+        }));
         return NextResponse.json({ success: true });
     } catch (err) {
         if (err instanceof QboManagedExpenseError) {

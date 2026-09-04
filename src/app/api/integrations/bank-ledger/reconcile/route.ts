@@ -1,7 +1,16 @@
 import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { normalizePayee, reconcileObservations, type ReconcileObservation, type ReconcileBankLine, type ReconcileLink, type ReconcileAmbiguousGroup } from "@/lib/bank-ledger";
+import {
+    normalizePayee,
+    reconcileObservations,
+    reconcileScanSince,
+    type ReconcileObservation,
+    type ReconcileBankLine,
+    type ReconcileLink,
+    type ReconcileAmbiguousGroup,
+    type ReconcilePairedGroup,
+} from "@/lib/bank-ledger";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -22,7 +31,18 @@ export const maxDuration = 60;
  * A match key shared by more than one observation and/or more than one
  * candidate BankLine is AMBIGUOUS — reconcileObservations() leaves every
  * member of that group unmatched and reports it back in `ambiguous` rather
- * than guessing a pairing by input order (Codex round-3, defect 1).
+ * than guessing a pairing by input order (Codex round-3, defect 1). The one
+ * exception is EQUAL cardinality on both sides, which is paired
+ * deterministically in sorted order and reported in `pairedByOrder` (Codex
+ * PR #443 gate round 33, finding 2 — see reconcileObservations for why that
+ * is a rule rather than a guess).
+ *
+ * THE SCAN IS BOUNDED (same gate, same finding). It used to read every
+ * unlinked observation and every candidate line in the table, so one
+ * unresolvable duplicate group from any month past blocked the nightly pull's
+ * freshness stamp permanently — and with it every owner's chase cards. The
+ * caller supplies a `ReconcileScope`: `since` bounds what is read, and
+ * `window` says which part of what came back is THIS run's responsibility.
  *
  * Persistence writes proposed links in bounded CHUNKS (Codex round-3, new
  * blocker) — the earlier implementation loaded every eligible row and ran up
@@ -122,14 +142,26 @@ export async function persistLinksInChunks(
     chunkSize: number,
     runChunk: (chunk: ReconcileLink[], chunkIndex: number) => Promise<{ linked: string[]; exceptions: ReconcileExceptionResult[] }>,
     maxChunks: number = Infinity,
+    /**
+     * `deadlineAt` is an ABSOLUTE epoch-ms instant this loop must not start a
+     * chunk after — the caller's wall clock, already reduced by its own
+     * checkpoint reserve. Un-started chunks come back in `remaining`, exactly
+     * like the `maxChunks` cap: two different reasons to stop, one honest
+     * report. Absent means no deadline, which is every caller but the cron.
+     */
+    options: { deadlineAt?: number; now?: () => number } = {},
 ): Promise<PersistedReconciliation> {
     const linked: string[] = [];
     const exceptions: ReconcileExceptionResult[] = [];
     const chunkErrors: ReconcileChunkError[] = [];
+    const now = options.now ?? (() => Date.now());
 
     let attempted = 0;
     let chunksRun = 0;
     for (let start = 0; start < links.length && chunksRun < maxChunks; start += chunkSize) {
+        // Checked BEFORE the chunk, never during: a chunk is one transaction
+        // and abandoning it half way is not a thing this can do.
+        if (options.deadlineAt !== undefined && now() >= options.deadlineAt) break;
         const chunk = links.slice(start, start + chunkSize);
         const chunkIndex = Math.floor(start / chunkSize);
         try {
@@ -150,17 +182,39 @@ export async function persistLinksInChunks(
     return { linked, exceptions, chunkErrors, remaining: links.length - attempted };
 }
 
+/**
+ * WHAT ONE RECONCILE RUN IS ALLOWED TO SEE, and which part of it is THIS run's
+ * responsibility (Codex PR #443 gate round 33, finding 2).
+ *
+ * `since` bounds the scan. Without it every run re-read the whole of history,
+ * so a single unresolvable duplicate group from any month blocked the nightly
+ * pull's freshness stamp permanently, and with it every owner's chase cards.
+ *
+ * `window` splits what comes back. Ambiguity whose postedDate falls inside the
+ * window this run just pulled is ambiguity this run created or touched, and it
+ * must block the stamp — the register really is not settled. Ambiguity older
+ * than the window is residue somebody has not resolved yet: reported, watched,
+ * and NOT a reason to withhold today's cards. `null` means "treat everything
+ * found as current", which is the honest answer for the manual POST — it has no
+ * window and stamps nothing.
+ */
+export interface ReconcileScope {
+    /** Oldest postedDate (YYYY-MM-DD) the scan may read. */
+    since: string;
+    window: { startDate: string; endDate: string } | null;
+}
+
 export interface BankLedgerReconcileHandlerDependencies {
     getIngestSecret(): string | undefined;
 
-    /** Not-yet-linked QBO_REGISTER observations, optionally scoped to one account. normalizedPayee is derived from rawDescriptor here (BankLineObservation has no stored normalizedPayee column). */
-    findUnlinkedQboObservations(account: string | null): Promise<ReconcileObservation[]>;
+    /** Not-yet-linked QBO_REGISTER observations at or after `since`, optionally scoped to one account. normalizedPayee is derived from rawDescriptor here (BankLineObservation has no stored normalizedPayee column). */
+    findUnlinkedQboObservations(account: string | null, since: string): Promise<ReconcileObservation[]>;
 
-    /** Candidate canonical BankLines with no QBO_REGISTER observation linked yet, optionally scoped to one account. */
-    findCandidateBankLines(account: string | null): Promise<ReconcileBankLine[]>;
+    /** Candidate canonical BankLines at or after `since` with no QBO_REGISTER observation linked yet, optionally scoped to one account. */
+    findCandidateBankLines(account: string | null, since: string): Promise<ReconcileBankLine[]>;
 
     /** Writes links in bounded chunks, up to RECONCILE_MAX_CHUNKS_PER_INVOCATION per call (see the module comment); a per-link unique-index conflict is caught and reported as an exception, a whole-chunk failure is reported as a chunk error, and any links past the per-invocation cap are reported in `remaining` — none of these fail the whole run. */
-    persistLinks(links: ReconcileLink[]): Promise<PersistedReconciliation>;
+    persistLinks(links: ReconcileLink[], deadlineAt?: number): Promise<PersistedReconciliation>;
 }
 
 function ambiguousForResponse(ambiguous: ReconcileAmbiguousGroup[]) {
@@ -175,8 +229,86 @@ function ambiguousForResponse(ambiguous: ReconcileAmbiguousGroup[]) {
     }));
 }
 
+/**
+ * The stable, human-readable name of one ambiguous group — the fields of its
+ * match key, in the key's own order. This is what pipeline-health reports
+ * alongside the count, so "there are three of these" comes with "and here is
+ * which three" rather than sending somebody hunting through the table.
+ */
+export function ambiguousGroupKey(group: ReconcileAmbiguousGroup): string {
+    return [group.account, group.postedDate, String(group.amountCents), group.normalizedPayee, group.checkNumber ?? "-"].join("|");
+}
+
+function pairedForResponse(paired: ReconcilePairedGroup[]) {
+    return paired.map(g => ({
+        account: g.account,
+        postedDate: g.postedDate,
+        amountCents: g.amountCents,
+        normalizedPayee: g.normalizedPayee,
+        checkNumber: g.checkNumber,
+        basis: g.basis,
+        pairs: g.pairs,
+    }));
+}
+
+/** True when a group's postedDate lies inside the window this run pulled. A null window claims everything. */
+function isInWindow(group: ReconcileAmbiguousGroup, window: ReconcileScope["window"]): boolean {
+    if (!window) return true;
+    return group.postedDate >= window.startDate && group.postedDate <= window.endDate;
+}
+
 export function createBankLedgerReconcileHandlers(dependencies: BankLedgerReconcileHandlerDependencies) {
+    /**
+     * Plan + persist for one scope. `account: null` means every account.
+     * Split out of POST so an IN-PROCESS caller (the nightly
+     * `/api/cron/bank-register-pull`) runs the SAME planning and the SAME
+     * chunked writes rather than a second implementation. POST keeps every
+     * one of its body/scope validations — this is reached only after them.
+     */
+    async function runReconcile(account: string | null, deadlineAt?: number, scope?: ReconcileScope) {
+        // No scope means a caller that did not plan a window — the manual POST,
+        // or a test. It still gets the bounded scan (an unbounded one is the
+        // defect), and every group it finds counts as current.
+        const effective: ReconcileScope = scope ?? { since: reconcileScanSince(null, new Date()), window: null };
+        const [observations, bankLines] = await Promise.all([
+            dependencies.findUnlinkedQboObservations(account, effective.since),
+            dependencies.findCandidateBankLines(account, effective.since),
+        ]);
+
+        const { links: proposed, ambiguous: allAmbiguous, pairedByOrder } = reconcileObservations(observations, bankLines);
+        const ambiguous = allAmbiguous.filter(g => isInWindow(g, effective.window));
+        const ambiguousStale = allAmbiguous.filter(g => !isInWindow(g, effective.window));
+        if (proposed.length === 0) {
+            return {
+                proposed: 0,
+                linked: 0,
+                exceptions: [] as ReconcileExceptionResult[],
+                ambiguous,
+                ambiguousStale,
+                pairedByOrder,
+                chunkErrors: [] as ReconcileChunkError[],
+                remaining: 0,
+                scannedSince: effective.since,
+            };
+        }
+
+        const result = await dependencies.persistLinks(proposed, deadlineAt);
+        return {
+            proposed: proposed.length,
+            linked: result.linked.length,
+            exceptions: result.exceptions,
+            ambiguous,
+            ambiguousStale,
+            pairedByOrder,
+            chunkErrors: result.chunkErrors,
+            remaining: result.remaining,
+            scannedSince: effective.since,
+        };
+    }
+
     return {
+        runReconcile,
+
         async POST(request: Request) {
             const secret = dependencies.getIngestSecret();
             if (!secret || request.headers.get("x-ingest-key") !== secret) {
@@ -232,23 +364,18 @@ export function createBankLedgerReconcileHandlers(dependencies: BankLedgerReconc
                 account = body.account.trim();
             }
 
-            const [observations, bankLines] = await Promise.all([
-                dependencies.findUnlinkedQboObservations(account),
-                dependencies.findCandidateBankLines(account),
-            ]);
-
-            const { links: proposed, ambiguous } = reconcileObservations(observations, bankLines);
-            if (proposed.length === 0) {
-                return NextResponse.json({ ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: ambiguousForResponse(ambiguous), chunkErrors: [], remaining: 0 });
-            }
-
-            const result = await dependencies.persistLinks(proposed);
+            const result = await runReconcile(account);
             return NextResponse.json({
                 ok: true,
-                proposed: proposed.length,
-                linked: result.linked.length,
+                proposed: result.proposed,
+                linked: result.linked,
                 exceptions: result.exceptions,
-                ambiguous: ambiguousForResponse(ambiguous),
+                ambiguous: ambiguousForResponse(result.ambiguous),
+                // Which links this run INFERRED from equal cardinality rather
+                // than proved from a unique match. Reported so an operator can
+                // see the difference; `ambiguousStale` is omitted because the
+                // manual route carries no window and so can never produce one.
+                pairedByOrder: pairedForResponse(result.pairedByOrder),
                 chunkErrors: result.chunkErrors,
                 // Codex round-4 fix 3: links not attempted this invocation
                 // because RECONCILE_MAX_CHUNKS_PER_INVOCATION was reached — the
@@ -267,10 +394,12 @@ function isUniqueConstraintError(error: unknown): boolean {
 const handlers = createBankLedgerReconcileHandlers({
     getIngestSecret: () => process.env.BANK_LEDGER_INGEST_SECRET,
 
-    findUnlinkedQboObservations: async account => {
+    findUnlinkedQboObservations: async (account, since) => {
         const rows = await prisma.bankLineObservation.findMany({
-            where: { source: "QBO_REGISTER", bankLineId: null, ...(account ? { account } : {}) },
-            select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, bankLineId: true },
+            // `postedDate` is a @db.Date at UTC midnight, so the boundary day
+            // itself is included rather than shaved off by an instant.
+            where: { source: "QBO_REGISTER", bankLineId: null, postedDate: { gte: new Date(`${since}T00:00:00Z`) }, ...(account ? { account } : {}) },
+            select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, bankLineId: true, sourceLineId: true },
         });
         return rows.map(r => ({
             id: r.id,
@@ -280,13 +409,16 @@ const handlers = createBankLedgerReconcileHandlers({
             normalizedPayee: normalizePayee(r.rawDescriptor),
             checkNumber: r.checkNumber,
             bankLineId: r.bankLineId,
+            // On a QBO_REGISTER row this IS the QuickBooks transaction id.
+            qbTxnId: r.sourceLineId,
         }));
     },
 
-    findCandidateBankLines: async account => {
+    findCandidateBankLines: async (account, since) => {
         const rows = await prisma.bankLine.findMany({
             where: {
                 ...(account ? { account } : {}),
+                postedDate: { gte: new Date(`${since}T00:00:00Z`) },
                 observations: { none: { source: "QBO_REGISTER" } },
             },
             select: { id: true, account: true, postedDate: true, amountCents: true, normalizedPayee: true, checkNumber: true },
@@ -301,7 +433,7 @@ const handlers = createBankLedgerReconcileHandlers({
         }));
     },
 
-    persistLinks: async links => {
+    persistLinks: async (links, deadlineAt) => {
         return persistLinksInChunks(links, RECONCILE_CHUNK_SIZE, async (chunk, chunkIndex) => {
             const chunkLinked: string[] = [];
             const chunkExceptions: ReconcileExceptionResult[] = [];
@@ -345,9 +477,12 @@ const handlers = createBankLedgerReconcileHandlers({
             }, { timeout: RECONCILE_TX_TIMEOUT_MS });
 
             return { linked: chunkLinked, exceptions: chunkExceptions };
-        }, RECONCILE_MAX_CHUNKS_PER_INVOCATION);
+        }, RECONCILE_MAX_CHUNKS_PER_INVOCATION, { deadlineAt });
     },
 });
+
+/** Production-wired handlers, exported for the in-process cron caller. */
+export const bankLedgerReconcileHandlers = handlers;
 
 export async function POST(request: Request) {
     return handlers.POST(request);

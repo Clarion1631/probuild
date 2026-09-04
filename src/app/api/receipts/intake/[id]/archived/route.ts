@@ -1,7 +1,22 @@
+import type { Prisma } from "@prisma/client";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
 import { SOURCE_REF_PATTERNS } from "@/lib/receipt-intake/intake-core";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+
+/**
+ * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
+ * #443 gate round 42, finding 1).
+ *
+ * The missing-receipt sweep decides from the evidence it read and holds one
+ * advisory lock across those reads AND its verdicts, so every writer of that
+ * evidence takes the same lock inside its own transaction before writing. A
+ * bare `prisma.*` call is its own implicit transaction and cannot hold an
+ * xact-scoped lock, which is why these wrappers exist. Held for one write only.
+ */
+const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
 
 export const dynamic = "force-dynamic";
 
@@ -83,7 +98,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     // Conditional on state so two mirror runs racing the same row cannot both
     // claim the transition; the loser sees 0 rows and reports 409.
-    const updated = await prisma.receiptIntake.updateMany({
+    const updated = await evidenceUpdateMany({
         where: { id, state: "BOOKED" },
         data: { state: "ARCHIVED", archiveDriveFileId: driveFileId },
     });

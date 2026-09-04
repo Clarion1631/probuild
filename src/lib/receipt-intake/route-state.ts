@@ -199,3 +199,86 @@ export function backoffMs(attempts: number): number {
     if (attempts === 3) return 60 * 60_000;
     return 6 * 60 * 60_000;
 }
+
+/**
+ * Which parked rows the Receipts tab's "Retry now" may resend, and where each
+ * goes back to. PURE, so the rule is one testable statement rather than a
+ * condition duplicated between the button and the action.
+ *
+ * The list is deliberately CLOSED. Most NEEDS_REVIEW reasons are verdicts about
+ * the DOCUMENT — `multi-doc`, `no-estimate`, `weak-dup:<id>`,
+ * `strong-dup-amount-mismatch:<id>`, `refund-or-zero` — and retrying one of
+ * those just parks it again with the same reason while spending an attempt and
+ * a QuickBooks round trip. Only reasons that describe a TRANSIENT FAILURE of
+ * something other than the document are retryable.
+ *
+ * Where a row resumes matters as much as whether it may:
+ *   - `ai-unavailable` and `file-missing` failed BEFORE the read, so they go
+ *     back to RECEIVED and get read again. Sending them to BOOKING would book a
+ *     row whose vendor/total were never extracted.
+ *   - `qbo-timeout` / `qbo-5xx` / `max-retries` failed at the SEND, with the
+ *     read already done, so they resume at BOOKING.
+ */
+export type RetryTarget = "RECEIVED" | "BOOKING";
+
+const RETRYABLE_REASONS: Array<{ test: RegExp; target: RetryTarget }> = [
+    // Gemini was down. The document was never read, so re-read it.
+    { test: /^ai-unavailable$/, target: "RECEIVED" },
+    // The upload never landed in the bucket; a human has since re-uploaded it.
+    { test: /^file-missing$/, target: "RECEIVED" },
+    // Transport-class QuickBooks failures, and the row that exhausted its
+    // budget of them. The read is done; resume at the send.
+    { test: /^qbo-timeout$/, target: "BOOKING" },
+    { test: /^qbo-5xx$/, target: "BOOKING" },
+    { test: /^qbo-fault:(?:429|5\d\d|timeout)$/i, target: "BOOKING" },
+    { test: /^max-retries$/, target: "BOOKING" },
+];
+
+/**
+ * Where a manual retry should send this row, or null when it may not be
+ * retried at all. A BOOKING row is always retryable — it is mid-flight, not
+ * parked on a verdict.
+ */
+export function retryTargetFor(state: string, stateReason: string | null): RetryTarget | null {
+    if (state === "BOOKING") return "BOOKING";
+    if (state !== "NEEDS_REVIEW") return null;
+    const reason = (stateReason ?? "").trim();
+    if (!reason) return null;
+    return RETRYABLE_REASONS.find(rule => rule.test.test(reason))?.target ?? null;
+}
+
+// ── Whether a parked row still PROVES a receipt exists ──────────────────────
+
+/**
+ * Park reasons that mean THE DOCUMENT ITSELF could not be verified.
+ *
+ * Named here rather than spelled out at each site so the writer (book.ts, which
+ * parks the row) and the reader (the missing-receipt chaser, which counts
+ * intakes as evidence) cannot drift apart. If they drift the failure is silent
+ * and one-directional: the chaser closes a chase on the strength of a receipt
+ * whose bytes are GONE, and nobody is ever asked for it again.
+ *
+ * Everything else book.ts parks — `no-estimate`, `refund-or-zero`,
+ * `invalid-date`, a QBO fault — is about the row's METADATA. The document is
+ * still in the bucket, still verified, and still proves the purchase has a
+ * receipt; it just cannot be booked yet. Those rows remain evidence.
+ */
+export const NO_ARTIFACT_PARK_REASONS = {
+    /** An affirmative 404 from storage: the object is not there. */
+    bytesMissing: "receipt-bytes-missing",
+    /** The bytes no longer hash to what was verified at intake. */
+    contentChanged: "content-changed",
+} as const;
+
+export const NO_ARTIFACT_STATE_REASONS: ReadonlySet<string> = new Set(Object.values(NO_ARTIFACT_PARK_REASONS));
+
+/**
+ * True when this row still stands behind a durable, verified receipt document.
+ *
+ * The chaser may only treat an intake as evidence when this holds: "a row
+ * exists" is not the same claim as "a receipt exists", and the two states above
+ * are exactly the cases where the row outlived its document.
+ */
+export function intakeArtifactIsVerified(stateReason: string | null | undefined): boolean {
+    return !(typeof stateReason === "string" && NO_ARTIFACT_STATE_REASONS.has(stateReason));
+}

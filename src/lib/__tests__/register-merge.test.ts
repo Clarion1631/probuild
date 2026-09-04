@@ -21,7 +21,11 @@ function row(overrides: Partial<BankRegisterRow> = {}): BankRegisterRow {
         qbTxnId: "purchase-1",
         docNum: "1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890",
         name: "Home Depot",
+        // The GL memo cell: usually the original POS descriptor. Absent here.
+        memo: null,
         amountCents: -15000,
+        // These fixtures are about merge/verdict classification, not clearance.
+        clearedStatus: "Unknown",
         ...overrides,
     };
 }

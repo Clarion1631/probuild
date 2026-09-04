@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
@@ -29,6 +29,8 @@ import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { createRouteDeadline, remainingBudgetMs, type RouteDeadline } from "@/lib/quickbooks";
 import { readReceipt } from "@/lib/receipt-intake/read";
+import { duplicateChainReason, withEvidenceAndChainLocks } from "@/lib/receipt-intake/duplicate-guard";
+import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import {
     applyCutoverVerdict,
@@ -58,6 +60,22 @@ import {
     type WorkerDependencies,
     type WorkerRow,
 } from "@/lib/receipt-intake/worker";
+
+/**
+ * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
+ * #443 gate round 42, finding 1).
+ *
+ * Every write these wrap changes what the missing-receipt sweep reads as
+ * evidence — a state transition, a booking, a row it is about to judge — so
+ * each runs behind the same advisory lock the sweep holds across its reads AND
+ * its verdicts. A bare `prisma.*` call is its own implicit transaction and
+ * cannot hold an xact-scoped lock, which is the whole reason these exist.
+ *
+ * The lock is held for this one write. Never across a Drive download, a
+ * QuickBooks call, or a read pass.
+ */
+const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -486,7 +504,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         // reject branch below already pinned the whole identity;
                         // this is the same rule, applied to the writes that
                         // forgot it.
-                        const { count: mismatchParked } = await prisma.receiptIntake.updateMany({
+                        //
+                        // Still through `evidenceUpdateMany`: a park is a
+                        // state transition the missing-receipt sweep reads, so
+                        // it takes the evidence lock like every other one.
+                        const { count: mismatchParked } = await evidenceUpdateMany({
                             where: { id: row.id, ...leaseFence(row) },
                             data: { state: "NEEDS_REVIEW", stateReason: "sha-mismatch", nextRetryAt: null },
                         });
@@ -507,6 +529,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         inShortTx,
                         seal: sealObject,
                         commit: async (tx, canonicalPath, values) => {
+                            // The settle transaction's FIRST statement, which
+                            // is where the evidence lock has to be taken: this
+                            // publish moves a STAGING row to RECEIVED, and the
+                            // sweep reads exactly that.
+                            await lockReceiptEvidence(tx);
                             const { count } = await tx.receiptIntake.updateMany({
                                 // Same complete identity as the parks. This one
                                 // publishes rather than parks, but a lease
@@ -569,7 +596,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // The complete identity again: `leaseLive` is a fact about
                     // the SELECT, and a /start retry between it and here
                     // renews the very URL this park says can no longer land.
-                    const { count: missingParked } = await prisma.receiptIntake.updateMany({
+                    const { count: missingParked } = await evidenceUpdateMany({
                         where: { id: row.id, ...leaseFence(row) },
                         data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
                     });
@@ -688,7 +715,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // reclaim a half-routed row and book it while this one was
                 // still deciding — and then this one would regress it.
                 // finishRouting()/applyState() release the lease.
-                const { count } = await prisma.receiptIntake.updateMany({
+                const { count } = await evidenceUpdateMany({
                     where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                     data: { ...patch, lastError: null },
                 });
@@ -735,13 +762,62 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             orderBy: { createdAt: "asc" },
         }),
 
-        applyState: async (rowId, state, stateReason, patch, ownership) => {
-            const { count } = await prisma.receiptIntake.updateMany({
+        /**
+         * PARK A ROUTED DUPLICATE — OR REFUSE TO — UNDER THE SHARED LOCK
+         * (round-39 gate finding 2; made transactional by round-40 gate,
+         * finding 1).
+         *
+         * The first version read the inbound references and then transitioned
+         * in a separate statement, which left the whole window between them for
+         * an admin to commit A→B: the worker then wrote B→C over a row that had
+         * just become somebody's original. `withEvidenceAndChainLocks` is the same
+         * function the admin actions take, so the two cannot diverge, and the
+         * CAS below runs inside the transaction that holds the lock.
+         *
+         * NEEDS_REVIEW rather than a throw: this is a background pass over a
+         * batch, and one row that needs a human is not a reason to abandon the
+         * rest. The reason names the rows to unmark; `duplicateOfId` is kept as
+         * the evidence for that decision.
+         *
+         * AND UNDER THE EVIDENCE LOCK (round-43 gate, finding 2). A row
+         * becoming DUPLICATE is a receipt ceasing to exist as far as the sweep
+         * is concerned, so this is an evidence write like any other — it just
+         * did not look like one, because it goes through the chain guard rather
+         * than through this file's `evidenceUpdateMany`. The wrapper takes both
+         * locks, evidence first, so there is no order left to get wrong.
+         */
+        applyDuplicateTransition: async (rowId, decision, patch, ownership) => withEvidenceAndChainLocks(
+            fn => prisma.$transaction(fn),
+            [rowId],
+            async (tx, inboundById) => {
+                const inbound = inboundById.get(rowId) ?? [];
+                const effective = inbound.length === 0
+                    ? decision
+                    : { ...decision, state: "NEEDS_REVIEW" as const, stateReason: duplicateChainReason(inbound) };
+                const { count } = await tx.receiptIntake.updateMany({
+                    where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
+                    data: {
+                        ...patch,
+                        state: effective.state,
+                        stateReason: effective.stateReason,
+                        nextRetryAt: null,
+                        ...RELEASE_CLAIM,
+                    },
+                });
+                return { owned: count > 0, state: effective.state };
+            },
+        ),
+
+        // EVIDENCE, so it takes the evidence lock (round-42 gate, finding 1):
+        // a terminal state is what the sweep reads as "this receipt exists" or
+        // "it does not".
+        applyState: async (rowId, state, stateReason, patch, ownership) => withReceiptEvidenceLock(fn => prisma.$transaction(fn), async tx => {
+            const { count } = await tx.receiptIntake.updateMany({
                 where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                 data: { ...(patch ?? {}), state, stateReason, nextRetryAt: null, ...RELEASE_CLAIM },
             });
             return count > 0;
-        },
+        }),
 
         // RECEIVED -> READ, and the ONLY place the routing lease is released.
         finishRouting: async (rowId, claimToken, stateReason, taxWarning) => {
@@ -753,7 +829,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // successor's work — including over a NEEDS_REVIEW the successor
             // had every reason to set. Matching the token makes that write
             // affect zero rows instead.
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: { id: rowId, state: "RECEIVED", claimToken },
                 data: {
                     state: "READ",
@@ -879,7 +955,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // CAS: only the CURRENT claim holder may mark a send. A zero
                 // count means this worker was superseded, and bookReceipt
                 // aborts on it before touching QuickBooks.
-                const { count } = await prisma.receiptIntake.updateMany({
+                const { count } = await evidenceUpdateMany({
                     where: { id: rowId, state: "BOOKING", claimToken },
                     data: { sendAttempted: true },
                 });
@@ -915,6 +991,20 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // A superseded worker writes NOTHING: the row belongs to whoever
             // holds the current token, and its state is theirs to set.
             if (result.outcome === "stale") return;
+            if (result.outcome === "booked-after-void") {
+                // book.ts wrote postVoidQbPurchaseId + stateReason inside its
+                // own transaction. Anything written here would move a state the
+                // human just set.
+                console.error("[cron/receipt-intake-worker] BOOKED AFTER VOID — void this Purchase in QuickBooks by hand",
+                    rowId, result.qbPurchaseId);
+                return;
+            }
+            if (result.outcome === "aborted") {
+                // A human changed the row between the claim and the send. Their
+                // decision stands; writing anything here would undo it.
+                console.log("[cron/receipt-intake-worker] send aborted", rowId, result.reason);
+                return;
+            }
             // Every write below is a CAS on the claim AND on the state.
             //
             // The token alone is not enough here: bookReceipt own commit may
@@ -924,7 +1014,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // waiting to book can be written by a booking result.
             const owns = { id: rowId, state: "BOOKING", claimToken } as const;
             if (result.outcome === "needs-review") {
-                await prisma.receiptIntake.updateMany({
+                await evidenceUpdateMany({
                     where: owns,
                     data: {
                         state: "NEEDS_REVIEW",
@@ -942,7 +1032,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             if (result.outcome === "deferred") {
                 // A switch is off: hold in BOOKING, look again in an hour, and
                 // do NOT spend an attempt — this document did nothing wrong.
-                await prisma.receiptIntake.updateMany({
+                await evidenceUpdateMany({
                     where: owns,
                     data: {
                         state: "BOOKING",
@@ -953,7 +1043,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 });
                 return;
             }
-            await prisma.receiptIntake.updateMany({
+            await evidenceUpdateMany({
                 where: owns,
                 data: {
                     state: "BOOKING",
@@ -970,7 +1060,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // costs no `attempts` — only a delay and one busy pass. Reuses the
             // booking backoff table so one outage does not hammer Gemini from
             // every row at once.
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                 data: {
                     busyPasses,
@@ -987,7 +1077,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
         // not a verdict on the document. Fenced like every other write, so a
         // superseded pass releases nothing.
         releaseClaim: async (rowId, nextRetryAt, ownership) => {
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                 data: { nextRetryAt, ...RELEASE_CLAIM },
             });
@@ -1011,7 +1101,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             }
             let released = 0;
             for (const [claimToken, ids] of byToken) {
-                const { count } = await prisma.receiptIntake.updateMany({
+                const { count } = await evidenceUpdateMany({
                     // FENCED ON THE TOKEN THIS PASS CLAIMED WITH. A row whose
                     // token changed belongs to a successor, and clearing its
                     // claim here would hand a live pass's row to a third one.
@@ -1024,7 +1114,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
         },
 
         retryRow: async (rowId, attempts, nextRetryAt, reason, ownership) => {
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                 data: { attempts, lastError: reason, nextRetryAt, ...RELEASE_CLAIM },
             });

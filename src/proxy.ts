@@ -69,10 +69,17 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // wildcard, so a future /api/receipts/intake/<id>/anything route does not
 // inherit the bypass before anyone has reviewed its gates. Everything else
 // under /api/receipts (notably /api/receipts/parse) keeps the proxy boundary.
+// api/automation/receipt-requests/threads and .../answers are the qbo-clasp
+// bridge for the missing-receipt Chat digest (Phase 2 §4). Same shape again:
+// the Apps Script mirror/forwarder self-authenticates with
+// x-receipt-intake-secret and needs a clean 401, not a /login redirect. Listed
+// EXACTLY — a future /api/automation/receipt-requests/<anything> route must not
+// inherit the bypass before its own gates have been reviewed, and the rest of
+// /api/automation (the register's mark-reviewed route) keeps the proxy boundary.
 // privacy / terms / account-deletion are static legal pages with no data access.
 // The app stores require them to be reachable by a logged-out reviewer, and Google
 // Play specifically requires a public account-deletion URL.
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|api\/receipts\/intake\/?$|api\/receipts\/intake\/start\/?$|api\/receipts\/intake\/[^/]+\/(?:archived|finalize)\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|api\/receipts\/intake\/?$|api\/receipts\/intake\/start\/?$|api\/receipts\/intake\/[^/]+\/(?:archived|finalize)\/?$|api\/automation\/receipt-requests\/(?:threads|answers)\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
 /**
  * The cookie that has to be present before a bypassed tree may dispatch a
@@ -153,6 +160,23 @@ const TEST_ONLY_DISPATCHER_PATHS = new Set([
     "/api/test-only/portal-estimate-actions",
 ]);
 
+/**
+ * True for a path that skips the proxy AND may never dispatch a Server Action.
+ *
+ * Expressed against the ALLOWLIST above rather than a list of its own. It used
+ * to be a denylist of machine endpoints, which is the wrong shape for a global
+ * action namespace — every bypassed path nobody thought to list was a live
+ * anonymous dispatcher — and keeping a second list here would reintroduce
+ * exactly that: two rules, drifting, with the safe-looking one out of date.
+ *
+ * A named export rather than an inline `.test()` so the rule can be asserted
+ * directly — a guard nobody can call is a guard nobody can prove.
+ */
+export function isMachineOnlyBypass(pathname: string) {
+    return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname)
+        && !ANONYMOUS_ACTION_PATTERN.test(pathname);
+}
+
 export function isPublicProxyBypass(pathname: string) {
     return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname);
 }
@@ -219,15 +243,29 @@ function hasNextAuthSessionCookie(req: any) {
 }
 
 export default async function proxy(req: any, event: any) {
+    const pathname = req.nextUrl?.pathname;
+    const isServerAction = isServerActionRequest(req);
+
+    // FIRST, before every other branch including the development bypass.
+    //
+    // Next's action IDs are GLOBAL, so any path the proxy waves through is a
+    // place an anonymous caller can POST a `next-action` header and have Next
+    // dispatch someone else's action — the endpoint's own shared-secret check
+    // never runs for an action dispatch, so its gate protects nothing. This has
+    // to be evaluated BEFORE any bypass returns `next()`, and the dev bypass is
+    // the earliest of those: it returns for everything, so a check placed after
+    // it is simply absent in development. Ordinary page/API Server Actions are
+    // untouched — only machine endpoints are refused.
+    if (isServerAction && typeof pathname === "string" && isMachineOnlyBypass(pathname)) {
+        return new NextResponse("Forbidden", { status: 403 });
+    }
+
     // Bypass authentication entirely during development for local testing
     if (process.env.NODE_ENV === 'development') {
         // Allow all requests to pass through without authentication in development
         // The client-side AppLayout will then mock the session.
         return NextResponse.next();
     }
-
-    const pathname = req.nextUrl?.pathname;
-    const isServerAction = isServerActionRequest(req);
 
     // Public portal routes must remain reachable without a staff session, but a
     // stale staff cookie must never use those routes to bypass the production

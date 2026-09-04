@@ -35,6 +35,8 @@ import {
     zeroRateBlocks,
     zeroRateManagerMessage,
 } from "@/lib/pay-rate-guard";
+import type { Prisma } from "@prisma/client";
+import { withReceiptEvidenceLock } from "./receipt-evidence-lock";
 
 async function assertTimeExpenseProjectAccess(projectId: string) {
     const user = await getCurrentUserWithPermissions();
@@ -81,6 +83,14 @@ async function priceEntryFromStoredRates(
 }
 
 // ─── Time Entry Actions ────────────────────────────────────────
+
+/**
+ * Deleting an Expense removes its receipt linkage, which is exactly what the
+ * missing-receipt sweep reads as "this charge is answered" — so it queues
+ * behind the sweep like every other evidence writer (round-42 gate, finding 1).
+ */
+const evidenceExpenseDeleteMany = (args: Prisma.ExpenseDeleteManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.expense.deleteMany(args));
 
 export async function createTimeEntry(data: {
     projectId: string;
@@ -348,7 +358,7 @@ export async function deleteExpense(id: string, projectId: string) {
     assertExpenseMutableOutsideQbo(expense);
     if (expense.invoiceId || expense.invoicedAt) throw new Error("Billed expenses cannot be deleted");
 
-    const deleted = await prisma.expense.deleteMany({
+    const deleted = await evidenceExpenseDeleteMany({
         where: { id, qbPurchaseId: null, invoiceId: null, invoicedAt: null },
     });
     if (deleted.count !== 1) throw new Error("Expense was billed while it was being deleted; refresh and try again");
@@ -387,7 +397,7 @@ export async function deleteExpenses(
         allowed.map(e => e.estimate!.projectId).filter(Boolean) as string[]
     );
 
-    const result = await prisma.expense.deleteMany({
+    const result = await evidenceExpenseDeleteMany({
         where: {
             id: { in: allowedIds },
             qbPurchaseId: null,

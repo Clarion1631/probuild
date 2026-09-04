@@ -8,6 +8,7 @@
 import { getQBPurchaseAttachables, qbTimedFetch, qboResponseError, type QBTokens, type RouteDeadline } from "./quickbooks";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
 import { prisma } from "./prisma";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 
 const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
 const ALLOWED_CONTENT = /^(image\/|application\/pdf)/i;
@@ -104,10 +105,15 @@ export async function attachQboReceipt(
     if (!publicUrl) throw new Error("Receipt upload produced no public URL");
 
     // Guarded: only fill an empty receiptUrl so manual uploads always win.
-    const { count } = await prisma.expense.updateMany({
-        where: { id: expense.id, receiptUrl: null },
-        data: { receiptUrl: publicUrl },
-    });
+    // Receipt linkage is sweep evidence, so this queues behind the sweep
+    // (round-42 gate, finding 1).
+    const { count } = await withReceiptEvidenceLock<{ count: number }>(
+        fn => prisma.$transaction(fn),
+        tx => tx.expense.updateMany({
+            where: { id: expense.id, receiptUrl: null },
+            data: { receiptUrl: publicUrl },
+        }),
+    );
     if (count === 0) {
         // Someone else linked a receipt first. Concurrent QBO attaches share
         // this deterministic path, so only clean up when the winner's URL is a

@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 
 const RECEIPT_PROMPT = `You are an AI receipt parser for a construction company.
 Analyze this receipt image and extract the following information as JSON:
@@ -287,7 +288,11 @@ export async function POST(req: NextRequest) {
                 expenseSkipReason = "no-estimate";
             } else {
                 const confidence = ((parsed.confidence as number || 0) * 100).toFixed(0);
-                const expense = await prisma.expense.create({
+                // Same rule: this row lands with its receipt attached
+                // (round-42 gate, finding 1).
+                const expense = await withReceiptEvidenceLock<{ id: string }>(
+                    fn => prisma.$transaction(fn),
+                    tx => tx.expense.create({
                     data: {
                         estimateId: estimate.id,
                         description: `[AI ${confidence}%] ${parsed.vendor} receipt — pending bookkeeper review`,
@@ -296,7 +301,9 @@ export async function POST(req: NextRequest) {
                         vendor: parsed.vendor as string,
                         status: "Pending",
                     },
-                });
+                    select: { id: true },
+                }),
+                );
                 expenseCreated = true;
                 expenseId = expense.id;
             }
