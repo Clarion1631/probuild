@@ -42,8 +42,9 @@ npx prisma migrate status   # no local migration may remain "not yet applied"; a
                             # and makes the command exit non-zero anyway
 ```
 
-`resolve --applied` only inserts a history row (name + checksum of the file);
-it runs no SQL. Never record a migration whose DDL you have not confirmed in
+`resolve --applied` records the migration as applied (a `_prisma_migrations`
+row carrying the file's checksum); it does not execute `migration.sql`. It exits
+non-zero (P3008) if the name is already recorded, which is a safe no-op. Never record a migration whose DDL you have not confirmed in
 prod with an `information_schema` / `pg_indexes` / `pg_constraint` query — a
 false row keeps `migrate status` and every later audit misleading until someone
 repairs the history table by hand.

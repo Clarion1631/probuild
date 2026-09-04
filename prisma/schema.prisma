@@ -723,7 +723,7 @@ model PaymentSchedule {
   qbSyncError     String? // "voided" | "notFound" — set by the sync poller when the linked QBO invoice is gone/voided; cleared on a successful re-push
 
   // NOT WIRED ON MAIN: adopted from production by PR #470; created there by PR #402
-  // (feat/co-manual-approval). Nothing on main reads or writes these fields yet, so the
+  // (feat/co-manual-approval). Nothing on main reads or writes the four qbCreate* fields yet, so the
   // behaviour described below is #402's design, not an invariant main enforces.
   // Durable QBO invoice-create lifecycle. The opaque request id/fingerprint are
   // written before the provider POST, survive an ambiguous response, and are
@@ -1661,7 +1661,7 @@ model ChangeOrder {
   totalAmount   Decimal  @default(0)
   balanceDue    Decimal  @default(0)
   // NOT WIRED ON MAIN: adopted from production by PR #470; created there by PR #402
-  // (feat/co-manual-approval). Nothing on main reads or writes these fields yet, so the
+  // (feat/co-manual-approval). Nothing on main reads or writes the `revision` field (pricingType and markupPercent below it ARE live) yet, so the
   // behaviour described below is #402's design, not an invariant main enforces.
   // Optimistic-concurrency token for approval/billing — bumped in every transaction that
   // changes billing inputs (items, schedules, pricing, status, signatures); NOT bumped by
@@ -1681,7 +1681,7 @@ model ChangeOrder {
   approvedAt         DateTime?
 
   // NOT WIRED ON MAIN: adopted from production by PR #470; created there by PR #402
-  // (feat/co-manual-approval). Nothing on main reads or writes these fields yet, so the
+  // (feat/co-manual-approval). Nothing on main reads or writes the three termsTax* fields yet, so the
   // behaviour described below is #402's design, not an invariant main enforces.
   // Customer-visible tax terms frozen at the first guarded send (or an atomic manual approval
   // directly from Draft). Sent resends, portal/manual approval, rendering, scheduling, and billing
