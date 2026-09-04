@@ -2260,7 +2260,9 @@ model DecisionTemplateItem {
   updatedAt  DateTime @default(now()) @ignore
 
   @@index([templateId, order])
-  @@index([templateId])
+  // No standalone ([templateId]) index: ([templateId, order]) leads with the same column and
+  // serves every templateId-only lookup. Dropped from prod 2026-09-04
+  // (migration 20260904000000_drop_redundant_indexes).
 }
 
 model MoodBoard {
@@ -2568,7 +2570,8 @@ model DispatchPublicationChange {
   @@unique([publicationId, kind, targetType, targetId], map: "DispatchChange_pub_target_kind_key")
   @@index([projectId])
   @@index([targetType, targetId])
-  @@index([publicationId])
+  // No standalone ([publicationId]) index: both uniques above lead with publicationId
+  // (dropped from prod 2026-09-04, migration 20260904000000_drop_redundant_indexes).
 }
 
 model ChatDelivery {
@@ -2592,7 +2595,8 @@ model ChatDelivery {
   @@unique([publicationId, destination, kind], map: "ChatDelivery_pub_dest_kind_key")
   @@index([status, createdAt])
   @@index([status, processingStartedAt])
-  @@index([publicationId])
+  // No standalone ([publicationId]) index: the unique above leads with publicationId
+  // (dropped from prod 2026-09-04, migration 20260904000000_drop_redundant_indexes).
 }
 
 model Integration {
