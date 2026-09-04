@@ -291,6 +291,23 @@ jobs:
           # pgbouncer reasoning as the rate-lock step above.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # The same actor race, on the OTHER family of writers. Every payroll
+      # mutation — the Gusto rate import, the pay-type change, the period lock,
+      # the settle button, discard and unlock — authorized its caller and only
+      # THEN opened a transaction that waits: on the payroll advisory lock, on
+      # User rows, and in the settle button's case once per deferred day. An
+      # account disabled, demoted or stripped of financialReports inside that
+      # window still committed. requireFinancialActorInTx re-decides it under
+      # the lock. Real connections, one case per vector, an ADMIN-only case,
+      # a pre-fix control that wrongly succeeds, and deadlock freedom.
+      - name: Prove a revoked payroll actor cannot finish a payroll write
+        run: npx tsx --test tests/payroll-actor-reauth-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton through payroll-period — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       # The DOCUMENTED deploy command, RUN. The PR body told Justin to export
       # PAYROLL_APPLY_EXPECT_PROJECT_REF while the script read
       # APPLY_EXPECT_PROJECT_REF, so the command in the deploy procedure could

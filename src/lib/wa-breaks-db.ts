@@ -94,7 +94,23 @@ export async function settleDay(
     dayKey: string,
     closing: { id: string; mealSkipped: unknown } | null,
     /** The zone `dayKey` was derived in. REQUIRED — see loadDayEntries. */
-    timeZone: string
+    timeZone: string,
+    /**
+     * The OPERATOR this settlement is running under, when there is one.
+     *
+     * The payroll screen's "settle deferred days" button is a payroll mutation
+     * like any other, and it authorized its caller before the loop — so an
+     * operator disabled, demoted or stripped of `financialReports` partway
+     * through still settled the remaining days (round 21, P1). Passing their id
+     * here re-decides that inside THIS day's transaction, under the payroll
+     * lock, on their own row.
+     *
+     * Omitted by the clock-out and edit paths: settlement there is a side
+     * effect of a worker's own punch, already authorized by the route that
+     * triggered it, and it is not the payroll screen acting on the company's
+     * behalf.
+     */
+    actorId?: string | null
 ): Promise<number> {
     try {
         return await prisma.$transaction(async (tx) => {
@@ -104,11 +120,27 @@ export async function settleDay(
             // waiting on payroll, against a locker holding payroll and waiting
             // on this day.
             await assertSettlementDayUnlocked(tx, dayKey, timeZone);
+            if (actorId) {
+                // TIER 2, between the payroll lock and the day lock. The day's
+                // OWNER is taken FOR SHARE in the same ascending-id sequence —
+                // settleDayInTx re-reads their rates FOR SHARE anyway, and
+                // taking both User rows here in one order is what stops this
+                // transaction and a two-row rate import from closing a cycle.
+                const { requireFinancialActorInTx } = await import("./user-mutation-guard");
+                await requireFinancialActorInTx(tx as never, actorId, {
+                    alsoLock: [{ id: userId, mode: "FOR SHARE" }],
+                });
+            }
             await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayLockKey(userId, dayKey));
             return settleDayInTx(tx, userId, dayKey, closing, timeZone, { alreadyGuarded: true });
         });
     } catch (error) {
         if (isPeriodLockedError(error)) throw error;
+        // A revoked operator is NOT a day to skip. Swallowing it would let the
+        // button report "0 settled" success while silently refusing every day,
+        // and the caller has to be able to tell the two apart.
+        const { isUserMutationActorInvalidError } = await import("./user-mutation-guard");
+        if (isUserMutationActorInvalidError(error)) throw error;
         console.error("[wa-breaks] settleDay failed", { userId, dayKey, timeZone }, error);
         return -1;
     }

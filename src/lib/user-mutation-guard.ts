@@ -12,6 +12,7 @@
 // once, and every writer calls this.
 
 import { ADMIN_ROLES } from "./access-rules";
+import { canActOnFinancials } from "./financial-access";
 import { isPayrollEligibleRole } from "./payroll-config";
 
 /** The roles a User row may hold. Same set the schema documents and the manager endpoint validated. */
@@ -273,40 +274,66 @@ type LockedUserRow = { id: string; role: string; status: string };
  * them — every one of which goes through this same guard and therefore takes
  * FOR UPDATE on that row.
  */
+/** How strongly one User row is being taken. FOR UPDATE is the stronger of the two. */
+export type UserRowLockMode = "FOR UPDATE" | "FOR SHARE";
+
+/** One row this transaction wants held while it decides or writes. */
+export type UserRowLockRequest = { id: string; mode: UserRowLockMode };
+
+/**
+ * THE only place User row locks are issued — so tier 2 of the global lock order
+ * (src/lib/payroll-period.ts) is decided once rather than per call site.
+ *
+ * ASCENDING ID, always, and the STRONGEST mode asked for a row that is named
+ * twice. Two transactions touching the same rows therefore queue instead of
+ * closing a cycle, and a transaction that will WRITE a row cannot end up
+ * holding it merely FOR SHARE because something else asked for the weaker lock
+ * first.
+ *
+ * Ordered by code unit (`Array.prototype.sort`), which is the comparison the
+ * actor/target pair has always used. Every caller has to use THIS function, not
+ * its own sort: `localeCompare` and `<` are not the same order, and two payroll
+ * paths ordering the same two ids differently is precisely the cycle the
+ * ordering exists to prevent.
+ */
+async function lockUserRowsAscending(
+    tx: GuardedUserMutationClient,
+    requests: readonly UserRowLockRequest[]
+): Promise<Map<string, LockedUserRow>> {
+    const strongest = new Map<string, UserRowLockMode>();
+    for (const request of requests) {
+        if (!request?.id) continue;
+        if (strongest.get(request.id) === "FOR UPDATE") continue;
+        strongest.set(request.id, request.mode);
+    }
+
+    const select = `SELECT "id", "role", "status" FROM "User" WHERE "id" = $1`;
+    const locked = new Map<string, LockedUserRow>();
+    for (const id of [...strongest.keys()].sort()) {
+        const rows = (await tx.$queryRawUnsafe(`${select} ${strongest.get(id)}`, id)) as LockedUserRow[];
+        if (rows[0]) locked.set(id, rows[0]);
+    }
+    return locked;
+}
+
 async function lockActorAndTarget(
     tx: GuardedUserMutationClient,
     actorId: string,
     targetId: string | null
 ): Promise<{ actor: LockedUserRow | null; target: LockedUserRow | null }> {
-    const select = `SELECT "id", "role", "status" FROM "User" WHERE "id" = $1`;
-
     if (targetId === null || targetId === actorId) {
         // ONE row. FOR UPDATE, because when they are the same row this
         // transaction may be writing it.
-        const rows = (await tx.$queryRawUnsafe(
-            `${select} FOR UPDATE`,
-            actorId
-        )) as LockedUserRow[];
-        const row = rows[0] ?? null;
+        const locked = await lockUserRowsAscending(tx, [{ id: actorId, mode: "FOR UPDATE" }]);
+        const row = locked.get(actorId) ?? null;
         return { actor: row, target: targetId === null ? null : row };
     }
 
-    const first = actorId < targetId ? actorId : targetId;
-    const second = actorId < targetId ? targetId : actorId;
-    const firstIsActor = first === actorId;
-
-    const firstRows = (await tx.$queryRawUnsafe(
-        `${select} ${firstIsActor ? "FOR SHARE" : "FOR UPDATE"}`,
-        first
-    )) as LockedUserRow[];
-    const secondRows = (await tx.$queryRawUnsafe(
-        `${select} ${firstIsActor ? "FOR UPDATE" : "FOR SHARE"}`,
-        second
-    )) as LockedUserRow[];
-
-    return firstIsActor
-        ? { actor: firstRows[0] ?? null, target: secondRows[0] ?? null }
-        : { actor: secondRows[0] ?? null, target: firstRows[0] ?? null };
+    const locked = await lockUserRowsAscending(tx, [
+        { id: actorId, mode: "FOR SHARE" },
+        { id: targetId, mode: "FOR UPDATE" },
+    ]);
+    return { actor: locked.get(actorId) ?? null, target: locked.get(targetId) ?? null };
 }
 
 /** The actor's permission row, read inside the transaction under their FOR SHARE. */
@@ -353,6 +380,90 @@ export function checkActorUsable(actor: LockedUserRow | null): UserMutationVerdi
         };
     }
     return { ok: true };
+}
+
+/**
+ * The refusal a payroll write gives when the ACTOR lost financial access while
+ * the write was queued. Named once so the actions, the tests and the UI cannot
+ * drift on it.
+ */
+export const PAYROLL_ACTOR_REVOKED =
+    "Your account no longer has payroll access. Nothing was changed.";
+
+/** The same, for the two ADMIN-only period actions (discard, unlock). */
+export const PAYROLL_ACTOR_NOT_ADMIN =
+    "Only an admin can do this, and your account is no longer one. Nothing was changed.";
+
+/**
+ * THE in-transaction re-authorization for a payroll write (round 21, P1).
+ *
+ * Every payroll mutation authorized its caller with `requirePayrollAccess()`
+ * BEFORE it opened a transaction, and then waited — on the payroll advisory
+ * lock, on User rows, on TimeEntry rows. An account disabled, demoted, or
+ * stripped of `financialReports` while that request sat in the queue still
+ * committed, with authority it no longer had. It is exactly the round-14 actor
+ * race that `withGuardedUserMutation` closed for the team editor, on the other
+ * family of writers — so it is closed the same way, by the same mechanism,
+ * rather than by a second one:
+ *
+ *   1. the caller takes the PAYROLL ADVISORY LOCK first (tier 1). This function
+ *      deliberately does not take it — a payroll writer's own lock mode
+ *      (shared for a writer, exclusive for lock creation) is the caller's
+ *      decision, and taking a second one here would put tier 1 after tier 2 for
+ *      any caller that already held it;
+ *   2. this locks the actor's row FOR SHARE — enough to hold off the UPDATE
+ *      that would demote, disable or re-permission them, because every one of
+ *      those goes through withGuardedUserMutation and therefore takes FOR
+ *      UPDATE on that row — TOGETHER WITH the rows the caller is about to
+ *      write, in one ascending-id sequence (`alsoLock`). Passing them here
+ *      rather than locking them separately is what keeps the order true: two
+ *      User rows taken in two different orders by two payroll paths is a cycle;
+ *   3. `checkActorUsable` (the account still exists and is ACTIVATED), then
+ *      `canActOnFinancials` on what the lock actually holds — the SAME
+ *      predicate requirePayrollAccess, the export endpoint, the roster endpoint
+ *      and the rates panel compose, so a revoked actor is refused by the same
+ *      rule that would have refused them at the door.
+ *
+ * Throws `UserMutationActorInvalidError`, the branch's typed refusal for
+ * exactly this, so a caller inside `try/catch` answers with its message and a
+ * caller without one fails the way `requirePayrollAccess()` already does.
+ *
+ * Returns the LOCKED actor. Hand THAT to anything downstream that asks an
+ * authority question; never the action's pre-transaction copy.
+ */
+export async function requireFinancialActorInTx(
+    tx: GuardedUserMutationClient,
+    actorId: string,
+    options: {
+        /** Rows this transaction is about to write, folded into the one ordered lock. */
+        alsoLock?: readonly UserRowLockRequest[];
+        /** For the two ADMIN-only period actions — `canActOnFinancials` admits a MANAGER. */
+        requireAdmin?: boolean;
+    } = {}
+): Promise<LockedUserActor> {
+    const locked = await lockUserRowsAscending(tx, [
+        { id: actorId, mode: "FOR SHARE" },
+        ...(options.alsoLock ?? []),
+    ]);
+    const row = locked.get(actorId) ?? null;
+
+    const usable = checkActorUsable(row);
+    if (!usable.ok) throw new UserMutationActorInvalidError(usable);
+
+    const actor: LockedUserActor = {
+        id: row!.id,
+        role: row!.role,
+        status: row!.status,
+        permissions: await readActorPermissions(tx, actorId),
+    };
+
+    if (!canActOnFinancials(actor)) {
+        throw new UserMutationActorInvalidError({ ok: false, status: 403, error: PAYROLL_ACTOR_REVOKED });
+    }
+    if (options.requireAdmin && actor.role !== "ADMIN") {
+        throw new UserMutationActorInvalidError({ ok: false, status: 403, error: PAYROLL_ACTOR_NOT_ADMIN });
+    }
+    return actor;
 }
 
 /**

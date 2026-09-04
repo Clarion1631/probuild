@@ -223,7 +223,19 @@ export async function POST(req: NextRequest) {
     return helpChatResponse({
       body: {
         request: toPublicHelpRequest(request),
-        githubIssue: ghIssue ? { number: ghIssue.number, url: ghIssue.url } : null,
+        // A LOST LEASE MEANS THIS ATTEMPT'S ISSUE IS NOT THE REPORT'S ISSUE
+        // (round 21, P1). `filed` was already read from the stored row, but the
+        // body beside it still carried the LOCAL attempt's number — so a
+        // superseded attempt answered "filed" while pointing the reporter at
+        // the losing issue, and a superseded attempt whose winner had not
+        // finished yet answered 202 while still naming an issue. When the fence
+        // says we did not record this, the whole answer comes from the re-read
+        // row: publicGithubIssue() is null until the WINNER records one.
+        githubIssue: held
+          ? ghIssue
+            ? { number: ghIssue.number, url: ghIssue.url }
+            : null
+          : publicGithubIssue(request),
         // Somebody else finished this submission while we were filing. The
         // report is real either way; this attempt just is not the one that
         // recorded it.

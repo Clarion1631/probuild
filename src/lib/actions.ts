@@ -15502,7 +15502,7 @@ export async function applyGustoRateImport(
      */
     csvText: string
 ) {
-    await requirePayrollAccess();
+    const importer = await requirePayrollAccess();
     if (typeof csvText !== "string" || !csvText.trim()) {
         return { success: false as const, error: "Re-run the preview — the file this import came from was not sent." };
     }
@@ -15599,23 +15599,30 @@ export async function applyGustoRateImport(
     const syncedAt = new Date();
     try {
         await prisma.$transaction(async (tx) => {
-            const { lockOwnerRowForUpdate } = await import("./pay-rate-guard");
             const { acquirePayrollWriteLock } = await import("./payroll-period");
             const { payrollEligibleUserWhere } = await import("./payroll-config");
+            const { requireFinancialActorInTx } = await import("./user-mutation-guard");
             // TIER 1 OF THE GLOBAL LOCK ORDER, before any row lock. Rates and
             // pay types are EXPORT INPUTS — pay type decides who is on the
             // Gusto roster at all — so this import has to serialise against a
             // period being locked, not just against another rate writer. See
             // the same lock in pay-rate-write.ts.
             await acquirePayrollWriteLock(tx as never);
-            // EXCLUSIVE row locks first, in a stable id order so two concurrent
-            // imports cannot deadlock on each other. This is the other half of
-            // settlement's FOR SHARE: a day mid-reprice holds the shared lock, so
-            // this import waits rather than changing the rate underneath it and
-            // leaving one day priced at two different rates.
-            for (const row of [...clean].sort((a, b) => a.userId.localeCompare(b.userId))) {
-                await lockOwnerRowForUpdate(tx as never, row.userId);
-            }
+            // TIER 2: the actor's row FOR SHARE and EXCLUSIVE locks on every
+            // row this import will write, taken as ONE ascending-id sequence so
+            // two concurrent imports cannot deadlock on each other. This is the
+            // other half of settlement's FOR SHARE: a day mid-reprice holds the
+            // shared lock, so this import waits rather than changing the rate
+            // underneath it and leaving one day priced at two different rates.
+            //
+            // And the AUTHORITY is re-decided here, under those locks.
+            // requirePayrollAccess() above ran before this transaction opened;
+            // an importer disabled, demoted or stripped of `financialReports`
+            // while this request waited for the payroll lock used to write
+            // anyway (round 21, P1). The refusal rolls the whole batch back.
+            await requireFinancialActorInTx(tx as never, importer.id, {
+                alsoLock: clean.map((row) => ({ id: row.userId, mode: "FOR UPDATE" as const })),
+            });
             for (const row of clean) {
                 const live = byId.get(row.userId)!;
                 // Compare-and-set on BOTH values we showed the human. Rate
@@ -15693,12 +15700,12 @@ export async function setUserPayType(
      */
     options: { historical?: boolean } = {}
 ) {
-    await requirePayrollAccess();
+    const setter = await requirePayrollAccess();
     if (payType !== "HOURLY" && payType !== "SALARY") {
         return { success: false as const, error: "Pay type must be hourly or salary." };
     }
     const { acquirePayrollWriteLock } = await import("./payroll-period");
-    const { lockOwnerRowForUpdate } = await import("./pay-rate-guard");
+    const { requireFinancialActorInTx } = await import("./user-mutation-guard");
     const { payrollEligibleUserWhere } = await import("./payroll-config");
     // A PAYROLL WRITE, not a profile edit. payType decides who appears on the
     // Gusto roster and whether their hours are summarised, so this is an input
@@ -15709,7 +15716,14 @@ export async function setUserPayType(
     // comes after, same order as every other rate writer (pay-rate-write.ts).
     const updated = await prisma.$transaction(async (tx) => {
         await acquirePayrollWriteLock(tx as never);
-        await lockOwnerRowForUpdate(tx as never, userId);
+        // TIER 2, and the authority with it. requirePayrollAccess() above ran
+        // before this transaction opened; re-decide it on the actor's row as
+        // this transaction's locks actually hold it, and take the EXCLUSIVE
+        // lock on the member being written in the same ascending-id sequence
+        // (round 21, P1). Refusal throws, exactly as the pre-check does.
+        await requireFinancialActorInTx(tx as never, setter.id, {
+            alsoLock: [{ id: userId, mode: "FOR UPDATE" }],
+        });
         return tx.user.updateMany({
             // ...and only on a STAFF account. A pay type on a portal CLIENT is
             // what puts a customer on the Gusto roster (round 8, finding 2);
@@ -15887,6 +15901,17 @@ export async function lockPayrollPeriod(
             // FOR UPDATE cannot lock a row nobody has inserted yet.
             await acquirePayrollLockCreationLock(tx as never);
 
+            // TIER 2, before any other row this transaction touches: the
+            // locker's own authority, re-decided on their row as this
+            // transaction holds it. requirePayrollAccess() ran before the
+            // pre-check pass, and this transaction then waits for the exclusive
+            // payroll lock behind every in-flight hours writer — a locker
+            // disabled, demoted or stripped of `financialReports` in that gap
+            // used to freeze the period anyway, under their name (round 21,
+            // P1). The throw rolls the whole lock back.
+            const { requireFinancialActorInTx } = await import("./user-mutation-guard");
+            await requireFinancialActorInTx(tx as never, user.id);
+
             // LOCKED overlaps only. An unlocked row is not a claim on anything —
             // it is a leftover from an unlock or a range somebody typed wrong —
             // and treating it as a conflict made a typo permanent: the wrong
@@ -16052,7 +16077,7 @@ export async function lockPayrollPeriod(
  * never settles a day inside a locked period.
  */
 export async function settleDeferredDaysForPeriod(periodStartKey: string, periodEndKey: string) {
-    await requirePayrollAccess();
+    const settler = await requirePayrollAccess();
     const { resolveCompanyTimeZone } = await import("./company-timezone");
     const { startOfDateInTimeZone } = await import("./tz-date");
     const { dayKeyInTimeZone } = await import("./tz-date");
@@ -16127,11 +16152,18 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
     let settled = 0;
     for (const item of plan) {
         try {
-            const result = await settleDay(item.userId, item.dayKey, null, timeZone);
+            // The operator's id travels INTO the per-day transaction: settleDay
+            // re-decides their payroll authority there, under the payroll lock,
+            // for every day (round 21, P1). This loop is long — one transaction
+            // per deferred day — so "authorized once, before the loop" was the
+            // widest version of the stale-authorization hole on this surface.
+            const result = await settleDay(item.userId, item.dayKey, null, timeZone, settler.id);
             if (result >= 0) settled += 1;
         } catch (error) {
             // A day that became locked mid-run is skipped, not fatal — the
-            // remaining days are still worth settling.
+            // remaining days are still worth settling. A REVOKED OPERATOR is
+            // not skippable: settleDay rethrows that, and it propagates out of
+            // this action exactly as the pre-check's refusal would have.
             if (!isPeriodLockedError(error)) throw error;
         }
     }
@@ -16188,6 +16220,15 @@ export async function discardPayrollPeriod(periodStartKey: string, periodEndKey:
         // retire a period that had just been locked.
         const { acquirePayrollLockCreationLock } = await import("./payroll-period");
         await acquirePayrollLockCreationLock(tx as never);
+
+        // TIER 2: the actor's own row, and the ADMIN check re-run on what it
+        // holds. The pre-check above read their role before this transaction
+        // opened and before it queued behind the exclusive payroll lock, so an
+        // admin demoted or disabled in that gap still retired a period (round
+        // 21, P1). requireAdmin because canActOnFinancials admits a MANAGER and
+        // this action does not.
+        const { requireFinancialActorInTx } = await import("./user-mutation-guard");
+        await requireFinancialActorInTx(tx as never, user.id, { requireAdmin: true });
 
         // lockedAt IS NULL in the WHERE, not just checked beforehand: the guard
         // and the write have to be the same statement.
@@ -16273,6 +16314,15 @@ export async function unlockPayrollPeriod(
         // snapshot the check never saw.
         const { acquirePayrollLockCreationLock } = await import("./payroll-period");
         await acquirePayrollLockCreationLock(tx as never);
+
+        // TIER 2, and the ADMIN check with it, on the row this transaction
+        // holds rather than on the pre-transaction read above. Unlock is the
+        // most destructive action on this surface — it drops the frozen CSV
+        // snapshots — and it was authorized against a role that could have
+        // changed while this transaction queued for the exclusive payroll lock
+        // (round 21, P1).
+        const { requireFinancialActorInTx } = await import("./user-mutation-guard");
+        await requireFinancialActorInTx(tx as never, user.id, { requireAdmin: true });
 
         // Unlock deletes the snapshot: the period is editable again, so a frozen
         // CSV would immediately stop describing it. The row and its exportHash

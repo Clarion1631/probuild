@@ -312,7 +312,10 @@ test("the deferred-settlement action derives its day keys from the RESOLVED zone
 
     assert.match(code, /const timeZone = await resolveCompanyTimeZone\(\)/);
     assert.match(code, /const dayKey = \(instant: Date\) => dayKeyInTimeZone\(instant, timeZone\)/);
-    assert.match(code, /settleDay\(item\.userId, item\.dayKey, null, timeZone\)/);
+    // Round 21 added a fifth argument, the operator whose payroll authority
+    // settleDay re-decides inside each per-day transaction. The zone is still
+    // the fourth, and still the resolved one — which is what this pins.
+    assert.match(code, /settleDay\(item\.userId, item\.dayKey, null, timeZone, settler\.id\)/);
     assert.match(code, /startOfDateInTimeZone\(key, timeZone\), \{ timeZone \}/);
     assert.ok(!/toCompanyDayKey\(/.test(code), "toCompanyDayKey is Pacific-only and must not be called here");
     assert.ok(!/COMPANY_TIME_ZONE/.test(code), "nor the constant behind it");

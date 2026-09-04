@@ -18,6 +18,7 @@ import {
   submissionMarker,
   SUBMISSION_KEY_CONFLICT,
   SUBMISSION_KEY_CONFLICT_MESSAGE,
+  publicGithubIssue,
   toPublicHelpRequest,
 } from "@/lib/help-chat/submission-guard";
 import { findIssueByMarker } from "@/lib/help-chat/github";
@@ -209,7 +210,11 @@ export async function POST(req: NextRequest) {
       return helpChatResponse({
         body: {
           request: toPublicHelpRequest(saved),
-          githubIssue: null,
+          // Same rule as the filed branch below and as /api/help-chat/request:
+          // once the fence says we did not record this, the answer is the
+          // stored row's. "We got no issue back" is a fact about THIS attempt,
+          // and the winner may well have filed one.
+          githubIssue: held ? null : publicGithubIssue(saved),
           ...(held ? {} : { superseded: true }),
         },
         // The STORED state decides, not "we got no issue back": a superseded
@@ -229,11 +234,32 @@ export async function POST(req: NextRequest) {
     });
     const request = await prisma.helpRequest.findUnique({ where: { id: requestId } });
 
-    return NextResponse.json({
-      request: toPublicHelpRequest(request),
-      issueNumber: ghIssue.number,
-      issueUrl: ghIssue.url,
-      ...(held ? {} : { superseded: true }),
+    // TWO THINGS THIS USED TO GET WRONG (round 21, P1). It answered 200
+    // unconditionally — even when the fence said this attempt recorded nothing
+    // and the winner had not finished, which is the 202 "we have it, GitHub
+    // does not have it yet" case the rest of the contract already speaks. And
+    // it named THIS attempt's issue whether or not the row points at it, so a
+    // superseded reporter was sent to the losing issue.
+    //
+    // So: the status code comes from the stored providerState (helpChatResponse,
+    // same as every other exit here and on /api/help-chat/request), and once the
+    // lease is lost the issue comes from the re-read row and nowhere else.
+    const issue: { number: number; url: string | null } | null = held
+      ? { number: ghIssue.number, url: ghIssue.url }
+      : publicGithubIssue(request);
+    return helpChatResponse({
+      body: {
+        request: toPublicHelpRequest(request),
+        // The widget reads these two names (src/components/HelpChatWidget.tsx);
+        // `githubIssue` is what the no-issue branch above and /request speak.
+        // Both are emitted from the SAME value so they cannot disagree.
+        issueNumber: issue?.number ?? null,
+        issueUrl: issue?.url ?? null,
+        githubIssue: issue,
+        ...(held ? {} : { superseded: true }),
+      },
+      filed: request?.providerState === "created",
+      submissionId,
     });
   } catch (error) {
     console.error("Bug fix submission error:", error);

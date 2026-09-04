@@ -102,11 +102,30 @@ let issueCounter = 0;
 
 const CONVERSATION_ID = "conv-1";
 
+/**
+ * The SUPERSEDED race, staged (round 21, P1).
+ *
+ * `completeUnderLease` is fenced on the lease token: a second attempt that
+ * stole the lease while GitHub was slow makes this attempt's UPDATE match zero
+ * rows, and `held` comes back false. That is not a hypothetical — the lease has
+ * an expiry precisely so a stuck attempt can be taken over.
+ *
+ * Setting this makes the fixture's completion behave the way the database does
+ * in that race: our UPDATE matches nothing, and the row already holds the
+ * WINNER's outcome. "created" is a winner that filed its own, different issue;
+ * "incomplete" is a winner that has claimed the lease and not finished yet.
+ */
+let lostLease: null | { winner: "created" | "incomplete" } = null;
+
+/** The issue the WINNING attempt filed. Deliberately not a number our own fake provider can mint. */
+const WINNER_ISSUE = { number: 999, url: "https://github.test/probuild/issues/999" };
+
 function resetStore() {
     store.rows = [];
     store.nextId = 1;
     issueCounter = 0;
     filedIssues.length = 0;
+    lostLease = null;
 }
 
 /**
@@ -211,6 +230,7 @@ const fakePrisma = {
             ];
             const row = store.rows.find((r) => r.id === requestId);
             if (!row) return 0;
+            if (lostLease) return supersede(row);
             Object.assign(row, {
                 status,
                 changeLocation: issueUrl,
@@ -224,6 +244,7 @@ const fakePrisma = {
             const [status, requestId] = values as [string, string];
             const row = store.rows.find((r) => r.id === requestId);
             if (!row) return 0;
+            if (lostLease) return supersede(row);
             Object.assign(row, { status, providerState: "pending" });
             return 1;
         }
@@ -231,6 +252,25 @@ const fakePrisma = {
         return 1;
     },
 };
+
+/**
+ * What the row actually looks like when this attempt's fenced UPDATE loses:
+ * zero rows matched, and the row carries whatever the WINNER did to it.
+ */
+function supersede(row: FakeRow): number {
+    if (lostLease?.winner === "created") {
+        Object.assign(row, {
+            status: "submitted",
+            changeLocation: WINNER_ISSUE.url,
+            externalIssueRef: `github-issue:${WINNER_ISSUE.number}`,
+            providerIssueRef: String(WINNER_ISSUE.number),
+            providerState: "created",
+        });
+    }
+    // "incomplete": the winner holds the lease and has not finished, so the row
+    // is untouched — still 'submitting', providerState still null.
+    return 0;
+}
 
 /**
  * The GitHub side, faked at the module boundary so a filed report can exist
@@ -613,6 +653,133 @@ test("/bug-fix: the same key rule, on the other route", async () => {
         assert.equal(replay.res.status, 200);
         assert.equal(replay.body.duplicate, true);
         assert.equal(filedIssues.length, 1);
+    } finally {
+        if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+        else process.env.GITHUB_TOKEN = originalGithubToken;
+    }
+});
+
+// ── a SUPERSEDED attempt answers from the row, not from itself (round 21, P1) ─
+//
+// `completeUnderLease` is fenced on the lease token, so an attempt whose lease
+// was stolen while GitHub was slow updates nothing and gets `held === false`.
+// Both routes already read `filed` from the stored providerState — and then
+// handed back THIS attempt's issue anyway. So a superseded reporter was told
+// "filed" and pointed at the losing issue, and /bug-fix answered 200 even when
+// the winning attempt had not finished and the row said nothing was filed.
+//
+// The fix: once the fence says we did not record this, the whole answer comes
+// from the re-read row.
+
+/** A first-time report that reaches the provider and then loses its lease. */
+async function postSuperseded(
+    route: "request" | "bug-fix",
+    key: string,
+    winner: "created" | "incomplete"
+) {
+    resetStore();
+    const originalGithubToken = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "test-token";
+    try {
+        lostLease = { winner };
+        const result =
+            route === "request"
+                ? await postWithKey(key, MOBILE_PAYLOAD)
+                : await postBugFix(key, {
+                      title: "Save does nothing",
+                      description: "Tapped Save and nothing happened",
+                  });
+        // The control that makes the assertions below mean something: this
+        // attempt really did file an issue of its own, and it is not the
+        // winner's.
+        assert.equal(filedIssues.length, 1, "this attempt called the provider");
+        assert.equal(issueCounter, 1, "and got issue #1 back");
+        assert.notEqual(issueCounter, WINNER_ISSUE.number);
+        return result;
+    } finally {
+        if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+        else process.env.GITHUB_TOKEN = originalGithubToken;
+    }
+}
+
+test("/request: a LOST lease answers with the WINNER's issue, never this attempt's", async () => {
+    const { res, body } = await postSuperseded("request", "superseded-1", "created");
+
+    assert.equal(res.status, 200, "the row says 'created', so this IS filed");
+    assert.equal(body.status, "filed");
+    assert.equal(body.superseded, true, "and this attempt is not the one that recorded it");
+    assert.deepEqual(
+        body.githubIssue,
+        WINNER_ISSUE,
+        "the issue must come from the stored row — the local attempt's #1 is the losing one"
+    );
+    assert.equal(store.rows.length, 1, "one report, whoever filed it");
+});
+
+test("/request: a LOST lease whose winner has NOT finished answers 202 with no issue", async () => {
+    const { res, body } = await postSuperseded("request", "superseded-2", "incomplete");
+
+    assert.equal(res.status, 202, "the row does not say 'created', so nothing is filed yet");
+    assert.equal(body.status, "pending");
+    assert.equal(body.superseded, true);
+    assert.equal(
+        body.githubIssue,
+        null,
+        "a 202 that names an issue is the contradiction this fix exists to remove"
+    );
+    assert.equal(typeof body.submissionId, "string", "and the client is told how to retry");
+});
+
+test("/bug-fix: a LOST lease answers with the WINNER's issue", async () => {
+    const { res, body } = await postSuperseded("bug-fix", "superseded-3", "created");
+
+    assert.equal(res.status, 200);
+    assert.equal(body.status, "filed");
+    assert.equal(body.superseded, true);
+    // The widget reads `issueNumber` (src/components/HelpChatWidget.tsx); the
+    // sibling route speaks `githubIssue`. Both must be the winner's.
+    assert.equal(body.issueNumber, WINNER_ISSUE.number);
+    assert.equal(body.issueUrl, WINNER_ISSUE.url);
+    assert.deepEqual(body.githubIssue, WINNER_ISSUE);
+});
+
+test("/bug-fix: a LOST lease whose winner has NOT finished answers 202, not 200", async () => {
+    // This is the half /bug-fix got most wrong: it returned 200 unconditionally,
+    // so a report the database says is still un-filed read as terminal — and the
+    // crew app discards its local draft on a terminal answer.
+    const { res, body } = await postSuperseded("bug-fix", "superseded-4", "incomplete");
+
+    assert.equal(res.status, 202);
+    assert.equal(body.status, "pending");
+    assert.equal(body.superseded, true);
+    assert.equal(body.issueNumber, null, "never this attempt's issue");
+    assert.equal(body.issueUrl, null);
+    assert.equal(body.githubIssue, null);
+});
+
+test("WON lease: both routes still answer 200 with their OWN issue", async () => {
+    // The control. Without it every assertion above could be satisfied by a
+    // route that never reports an issue at all.
+    resetStore();
+    const originalGithubToken = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "test-token";
+    try {
+        const request = await postWithKey("won-1", MOBILE_PAYLOAD);
+        assert.equal(request.res.status, 200);
+        assert.equal(request.body.status, "filed");
+        assert.equal(request.body.superseded, undefined, "nothing superseded this attempt");
+        assert.equal(request.body.githubIssue.number, 1, "its own issue");
+        assert.equal(store.rows[0].providerIssueRef, "1", "and the row points at it");
+
+        const bugFix = await postBugFix("won-2", {
+            title: "Save does nothing",
+            description: "Tapped Save and nothing happened",
+        });
+        assert.equal(bugFix.res.status, 200);
+        assert.equal(bugFix.body.status, "filed");
+        assert.equal(bugFix.body.superseded, undefined);
+        assert.equal(bugFix.body.issueNumber, 2, "its own issue, in the name the widget reads");
+        assert.deepEqual(bugFix.body.githubIssue, { number: 2, url: "https://github.test/probuild/issues/2" });
     } finally {
         if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
         else process.env.GITHUB_TOKEN = originalGithubToken;

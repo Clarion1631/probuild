@@ -184,19 +184,19 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     // longer runs.
 
     // ---- the settlement protocol -------------------------------------------
-    "lib/wa-breaks-db.ts:320::update": {
+    "lib/wa-breaks-db.ts:352::update": {
         kind: "guarded",
         why: "settleDayInTx's re-plan of one entry's shift/meal/cost fields, run inside the caller's already-locked payroll transaction (every caller takes the payroll lock before the day lock)",
     },
-    "lib/wa-breaks-db.ts:393::delete": {
+    "lib/wa-breaks-db.ts:425::delete": {
         kind: "guarded",
         why: "deleteEntryAndSettle, whose guard hook runs the payroll assertion before anything is removed",
     },
-    "lib/wa-breaks-db.ts:426::update": {
+    "lib/wa-breaks-db.ts:458::update": {
         kind: "exempt",
         why: "flagSettlementFailed's already-flagged branch: only ADDS needsReview, which blocks the export rather than letting bad numbers through. Deliberately outside the payroll lock — it must still run when the surrounding settlement transaction has rolled back, which is precisely the failure it exists to flag",
     },
-    "lib/wa-breaks-db.ts:429::update": {
+    "lib/wa-breaks-db.ts:461::update": {
         kind: "exempt",
         why: "flagSettlementFailed's first-flag branch — same reasoning as the already-flagged branch above: best-effort, ADDS-only, and must survive the surrounding transaction rolling back",
     },

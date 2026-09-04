@@ -178,12 +178,25 @@ test("the rate import locks every affected row, in a stable order", () => {
     const actions = readFileSync(path.join(process.cwd(), "src/lib/actions.ts"), "utf8");
     const fn = actions.slice(actions.indexOf("export async function applyGustoRateImport"));
     const body = fn.slice(0, fn.indexOf("\nexport "));
-    assert.match(body, /lockOwnerRowForUpdate\(tx as never, row\.userId\)/);
+    // Round 21: the row locks moved INTO the actor guard. The import now takes
+    // the IMPORTER's row and every affected member's row as ONE ascending-id
+    // sequence, because a second hand-rolled ordering beside the guard's is
+    // exactly the cycle this assertion exists to prevent.
+    assert.match(body, /requireFinancialActorInTx\(tx as never, importer\.id, \{/);
+    assert.match(
+        body,
+        /alsoLock: clean\.map\(\(row\) => \(\{ id: row\.userId, mode: "FOR UPDATE" as const \}\)\)/,
+        "every affected row must still be locked FOR UPDATE, and named to the guard"
+    );
+    assert.ok(!/lockOwnerRowForUpdate/.test(body), "one row-lock path in this action, not two");
     // Sorted, or two concurrent imports touching the same two people in
-    // different orders deadlock on each other.
-    assert.match(body, /\[\.\.\.clean\]\.sort\(\(a, b\) => a\.userId\.localeCompare\(b\.userId\)\)/);
+    // different orders deadlock on each other. The sort lives in the shared
+    // locker now, so it is pinned where it actually runs.
+    const guard = readFileSync(path.join(process.cwd(), "src/lib/user-mutation-guard.ts"), "utf8");
+    const locker = guard.slice(guard.indexOf("async function lockUserRowsAscending"));
+    assert.match(locker.slice(0, locker.indexOf("\nasync function ")), /\[\.\.\.strongest\.keys\(\)\]\.sort\(\)/);
     // Locks first, then the compare-and-set writes.
-    assert.ok(body.indexOf("lockOwnerRowForUpdate") < body.indexOf("tx.user.updateMany"));
+    assert.ok(body.indexOf("requireFinancialActorInTx") < body.indexOf("tx.user.updateMany"));
 });
 
 test("a pay-type-only write through the user PATCH route's shape leaves lastRateSyncAt alone and advances payrollRevision", async () => {
