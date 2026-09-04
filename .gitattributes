@@ -1,0 +1,16 @@
+# Line endings for the files CI's "Migrations reproduce production" job hashes
+# or compares byte-for-byte. `prisma migrate deploy` checksums each
+# migration.sql, and PostgreSQL stores a plpgsql body exactly as written, so a
+# CRLF checkout (core.autocrlf=true on Windows) puts \r inside function bodies
+# and makes scripts/check-migrations-match.mjs report definitions that differ
+# from prisma/prisma-blind-spots.json while looking identical. CI on ubuntu
+# checks out LF and never sees this. Pin LF so every machine matches CI.
+#
+# Scoped deliberately: everything listed here is already committed LF, so this
+# renormalises nothing. Do not widen to `*.sql` or `*`: three legacy
+# migrations/*.sql files, prisma/schema.prisma.tmp and package-lock.json are
+# committed CRLF today and a blanket rule would rewrite them wholesale.
+prisma/migrations/**/*.sql     text eol=lf
+prisma/PRISMA_PHANTOM_DIFF.sql text eol=lf
+prisma/prisma-blind-spots.json text eol=lf
+prisma/schema.prisma           text eol=lf
