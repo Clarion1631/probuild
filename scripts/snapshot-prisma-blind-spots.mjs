@@ -98,6 +98,18 @@ const snapshot = {
   triggers,
 }
 
+const carriageReturns = findCarriageReturns(snapshot)
+if (carriageReturns.length) {
+  console.error(
+    'snapshot-prisma-blind-spots: refusing to write, definitions contain carriage returns ' +
+      '(database built from CRLF migration files? see PR #471):
+  ' +
+      carriageReturns.join('
+  '),
+  )
+  process.exit(1)
+}
+
 if (process.argv.includes('--write')) {
   writeFileSync(OUT, JSON.stringify(snapshot, null, 2) + '\n', 'utf8')
   console.log(`wrote ${OUT}`)
