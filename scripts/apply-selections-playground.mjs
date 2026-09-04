@@ -140,24 +140,14 @@ const statements = [
   // convention in scripts/apply-product-library.mjs.
   `ALTER TABLE "Decision" ENABLE ROW LEVEL SECURITY`,
 
-  // ── Pre-remap snapshot ────────────────────────────────────────────────────
-  // Prod check (2026-07-28): Hoppe has 13 SelectionProposal rows, all
-  // 'Pending', added today and the client is still actively adding — she's
-  // mid-flight. This captures the exact pre-migration status of every row
-  // before the remap below touches anything, so any remap is reversible
-  // precisely (UPDATE "SelectionProposal" sp SET status = b.status FROM
-  // "_SelectionProposalStatusBackup" b WHERE b.id = sp.id). ON CONFLICT DO
-  // NOTHING makes this safe to re-run — only the FIRST capture per row
-  // sticks, so a second run can't overwrite a true pre-migration snapshot
-  // with an already-remapped status. Never dropped by this script.
-  `CREATE TABLE IF NOT EXISTS "_SelectionProposalStatusBackup" (
-     "id" TEXT PRIMARY KEY,
-     "status" TEXT NOT NULL,
-     "capturedAt" TIMESTAMPTZ NOT NULL DEFAULT now()
-   )`,
-  `INSERT INTO "_SelectionProposalStatusBackup" ("id", "status")
-     SELECT "id", "status" FROM "SelectionProposal"
-     ON CONFLICT ("id") DO NOTHING`,
+  // ── Pre-remap snapshot (RETIRED) ──────────────────────────────────────────
+  // This block used to CREATE TABLE IF NOT EXISTS "_SelectionProposalStatusBackup"
+  // and snapshot every SelectionProposal status before the remap below. That
+  // one-time capture served its purpose; #379 dropped the table from production
+  // and removed it from prisma/schema.prisma. Leaving the statements here would
+  // turn a rerun of this script into a fabricator: it would recreate the table,
+  // fill it with ALREADY-REMAPPED statuses (useless as a rollback snapshot), and
+  // reintroduce schema drift. Same failure class #379 fixed. Do not restore it.
 
   // ── Status remap: SelectionProposal legacy → playground statuses ────────
   // "Nothing was rejected" per the spec — this is a rename, not a re-decide.
