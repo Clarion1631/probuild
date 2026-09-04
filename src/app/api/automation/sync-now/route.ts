@@ -57,6 +57,12 @@ export async function POST() {
             imported: result.imported,
             updated: result.updated,
             deactivated: result.removed,
+            // Rows a write-time attribution race left incomplete: a create
+            // that never happened (round 31, item 2), or an existing row whose
+            // catch-up fill was refused so it is still on no job (round 33,
+            // item 3). Distinct from "skipped", which is decided before the
+            // write is even attempted.
+            attributionRaceSkipped: result.attributionRaceSkipped,
             skipped: result.skipped.length,
         };
         // A run that could not land every receipt did not finish cleanly.
@@ -66,7 +72,7 @@ export async function POST() {
             status: incomplete ? "partial" : "ok",
             reason: incomplete ? "attachments-incomplete" : undefined,
             source,
-            detail: { mode: "incremental", since: since.toISOString().slice(0, 10), imported: result.imported, updated: result.updated, deactivated: result.removed, by: user.name || user.email || undefined, ...skippedAuditSummary(result.skipped) },
+            detail: { mode: "incremental", since: since.toISOString().slice(0, 10), imported: result.imported, updated: result.updated, deactivated: result.removed, attributionRaceSkipped: result.attributionRaceSkipped, by: user.name || user.email || undefined, ...skippedAuditSummary(result.skipped) },
         });
         return NextResponse.json({
             // A run that left receipts unlanded did not finish cleanly, and the

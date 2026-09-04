@@ -7,6 +7,10 @@
       "def": "CREATE UNIQUE INDEX \"BankImage_driveFileId_key\" ON public.\"BankImage\" USING btree (\"driveFileId\") WHERE (\"driveFileId\" IS NOT NULL)"
     },
     {
+      "name": "Expense_sourceFileId_sourceGroupIndex_key",
+      "def": "CREATE UNIQUE INDEX \"Expense_sourceFileId_sourceGroupIndex_key\" ON public.\"Expense\" USING btree (\"sourceFileId\", \"sourceGroupIndex\") WHERE (\"sourceFileId\" IS NOT NULL)"
+    },
+    {
       "name": "BankLineObservation_source_bankLineId_key",
       "def": "CREATE UNIQUE INDEX \"BankLineObservation_source_bankLineId_key\" ON public.\"BankLineObservation\" USING btree (source, \"bankLineId\") WHERE (\"bankLineId\" IS NOT NULL)"
     },
@@ -45,11 +49,6 @@
   ],
   "checkConstraints": [
     {
-      "name": "BankImageMatch_target_present",
-      "table": "\"BankImageMatch\"",
-      "def": "CHECK (((\"bankLineId\" IS NOT NULL) OR (\"qbTxnId\" IS NOT NULL)))"
-    },
-    {
       "name": "BankImage_amountCents_check",
       "table": "\"BankImage\"",
       "def": "CHECK (((\"amountCents\" IS NULL) OR (\"amountCents\" >= 0)))"
@@ -65,6 +64,16 @@
       "def": "CHECK ((kind = ANY (ARRAY['CHECK_FRONT'::text, 'CHECK_BACK'::text, 'DEPOSIT_SLIP'::text, 'DEPOSIT_PHOTO'::text])))"
     },
     {
+      "name": "BankImageMatch_target_present",
+      "table": "\"BankImageMatch\"",
+      "def": "CHECK (((\"bankLineId\" IS NOT NULL) OR (\"qbTxnId\" IS NOT NULL)))"
+    },
+    {
+      "name": "BankLine_state_check",
+      "table": "\"BankLine\"",
+      "def": "CHECK ((state = ANY (ARRAY['POSTED'::text, 'EVIDENCE_FOUND'::text, 'TRANSACTION_CREATED'::text, 'ATTACHMENT_CONFIRMED'::text, 'MATCHED'::text, 'JOB_CODED'::text, 'TAX_VALIDATED'::text, 'EXCEPTION'::text])))"
+    },
+    {
       "name": "BankLineItem_source_check",
       "table": "\"BankLineItem\"",
       "def": "CHECK ((source = ANY (ARRAY['RECEIPT_AI'::text, 'LOWES_CSV'::text, 'AMAZON_APP'::text, 'MANUAL'::text])))"
@@ -78,6 +87,26 @@
       "name": "BankLineObservation_source_shape_check",
       "table": "\"BankLineObservation\"",
       "def": "CHECK ((((source = 'STATEMENT'::text) AND (\"statementImportId\" IS NOT NULL) AND (\"bankLineId\" IS NOT NULL)) OR ((source = 'QBO_REGISTER'::text) AND (\"statementImportId\" IS NULL))))"
+    },
+    {
+      "name": "chk_client_message_one_owner",
+      "table": "\"ClientMessage\"",
+      "def": "CHECK (((((\"leadId\" IS NOT NULL))::integer + ((\"projectId\" IS NOT NULL))::integer) = 1))"
+    },
+    {
+      "name": "Expense_taxAtSource_check",
+      "table": "\"Expense\"",
+      "def": "CHECK ((\"taxAtSource\" = ((\"taxAmount\" IS NOT NULL) AND (\"taxAmount\" <> (0)::numeric))))"
+    },
+    {
+      "name": "Expense_taxAmount_check",
+      "table": "\"Expense\"",
+      "def": "CHECK (((\"taxAmount\" IS NULL) OR (\"taxAmount\" = (0)::numeric) OR ((sign(\"taxAmount\") = sign(amount)) AND (abs(\"taxAmount\") <= abs(amount)))))"
+    },
+    {
+      "name": "Expense_taxDeductibleBase_check",
+      "table": "\"Expense\"",
+      "def": "CHECK (((\"taxDeductibleBase\" IS NULL) OR (\"taxDeductibleBase\" = (0)::numeric) OR ((sign(\"taxDeductibleBase\") = sign(amount)) AND (abs(\"taxDeductibleBase\") <= abs((amount - COALESCE(\"taxAmount\", (0)::numeric)))))))"
     },
     {
       "name": "BankLine_sourceOfRecord_check",

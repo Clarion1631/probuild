@@ -1,10 +1,38 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
+import { lockEstimateAttribution } from "@/lib/expense-attribution";
+import { resolveProjectPhaseCodes } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { matchProjectByName, matchCostCode } from "@/lib/project-match";
-import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
+
+/**
+ * Namespace for the per-Drive-file ingest lock. Prefixed so it cannot collide
+ * with `expenseLockKey`'s per-row keys or the QBO sync's per-Purchase ones —
+ * different scopes, and two of them can be held at once.
+ */
+const RECEIPT_INGEST_LOCK_PREFIX = "receipt-ingest:";
+/**
+ * The SECOND identity, for a document whose url carries no Drive id (round 49,
+ * item 2).
+ *
+ * The drain-window trigger cannot always derive a file id — a shortened link, a
+ * re-hosted copy, a `/uc?export=download` form — and until it had this key it
+ * simply took no lock in that case, which left an old instance's in-flight
+ * insert invisible to this route rather than merely uncommitted. Both sides
+ * hash the same normalised string, so the same document serialises whether or
+ * not anyone can parse an id out of it.
+ */
+const RECEIPT_INGEST_URL_LOCK_PREFIX = "receipt-ingest-url:";
+/** Normalised exactly as the trigger normalises it: `lower(btrim(url))`. */
+function urlLockKey(receiptUrl: string): string {
+    return `${RECEIPT_INGEST_URL_LOCK_PREFIX}${receiptUrl.trim().toLowerCase()}`;
+}
 
 /**
  * Receipt/check ingest from the "GOLDEN TOUCH — RECEIPT + CHECK AUTOMATION"
@@ -35,6 +63,40 @@ interface IngestPayload {
     groups: IngestGroup[];
 }
 
+/**
+ * WHICH GROUPS OF THIS DOCUMENT ARE NOT IN THE TABLE YET (round 49, item 1).
+ *
+ * A partial delivery is a real state, not a theoretical one: the deployed old
+ * handler writes one autocommit INSERT per group, so a crash — or a lost
+ * response — after group one leaves exactly one row behind. The old rule
+ * ("any row for this file means the document is done") then answered
+ * `alreadyIngested` to the retry and the remaining groups were dropped for
+ * good, which is money missing from a receipt the archive says was imported.
+ *
+ * So the answer is per GROUP, keyed on the ordinal the row carries: the
+ * trigger numbers an old handler's rows 0, 1, 2... in arrival order, and this
+ * route writes its own group index, so the two agree by construction.
+ *
+ * A row with a NULL ordinal is the one shape that cannot be reasoned about
+ * positionally — it predates the trigger, and nothing says which group it was.
+ * That case answers "nothing is missing", which is the conservative direction:
+ * a possible duplicate is refused at the cost of a possible gap, and the gap is
+ * visible to a human on the expense list while a duplicate quietly doubles a
+ * job's cost.
+ */
+export function missingGroupIndexes(
+    rows: { sourceGroupIndex: number | null }[],
+    groupCount: number,
+): number[] {
+    if (rows.some(row => row.sourceGroupIndex === null)) return [];
+    const taken = new Set(rows.map(row => row.sourceGroupIndex));
+    const missing: number[] = [];
+    for (let index = 0; index < groupCount; index++) {
+        if (!taken.has(index)) missing.push(index);
+    }
+    return missing;
+}
+
 export async function POST(req: Request) {
     const secret = process.env.RECEIPT_INGEST_SECRET;
     if (!secret || req.headers.get("x-ingest-key") !== secret) {
@@ -53,13 +115,58 @@ export async function POST(req: Request) {
 
     const receiptUrl = body.fileUrl || `https://drive.google.com/file/d/${body.fileId}/view`;
 
-    // Dedupe: this Drive file was already ingested (the file id is stable across
-    // the script's archive move, so re-runs and re-sends are safe).
-    const existing = await prisma.expense.findFirst({
-        where: { receiptUrl: { contains: body.fileId } },
-        select: { id: true },
+    // THE DEDUPE KEY IS THE FILE ID, NOT A SUBSTRING OF A URL THE CALLER CHOSE
+    // (round 34, item 1 — the failure mode this replaces).
+    //
+    // `receiptUrl` is `body.fileUrl` when the caller supplies one, and only
+    // falls back to a url built from the id. The dedupe asked
+    // `receiptUrl contains fileId`, so it was asking whether a value the
+    // CALLER controls happens to embed the identity. Two ways that is wrong,
+    // and neither is hypothetical — the Apps Script sends whatever Drive
+    // returned for the file:
+    //
+    //   * a `fileUrl` that does NOT contain the id (a shortened link, a
+    //     `/uc?export=...` form, a re-hosted copy) matches nothing, so every
+    //     re-delivery of that document — a retry after a lost response, a
+    //     re-run over the same folder — inserted the whole receipt again. The
+    //     advisory lock below does not help: both deliveries agree there is no
+    //     prior row, because there is no prior row the QUERY can see.
+    //   * `contains` is a SUBSTRING test, so file id "abc" matches a stored
+    //     url carrying "abcd". Two unrelated documents dedupe against each
+    //     other and the second one is silently dropped.
+    //
+    // So the identity is stored in its own column, exactly as received, and
+    // compared with `equals`. `receiptUrl` goes on being the human link.
+    //
+    // FAST PATH ONLY. This read takes no lock and is not the decision: the
+    // authoritative check is the identical query repeated inside the write
+    // transaction, underneath the per-file advisory lock. It stays here
+    // because it also short-circuits the project match below — a re-delivery
+    // of a file whose Drive folder has since been renamed used to answer
+    // `alreadyIngested`, and must keep doing so rather than suddenly
+    // reporting `project-not-matched`.
+    // ...AND A LEGACY ROW IS STILL THIS FILE (round 48, item 1).
+    //
+    // During the rollout, old instances insert rows with `sourceFileId` NULL —
+    // their Prisma client predates the column — so a dedupe on that column
+    // alone cannot see them, and a delivery retried against a new instance
+    // inserts the whole receipt again. The drain-window trigger
+    // (`probuild_expense_source_file_bridge`) stamps those rows on INSERT and
+    // serializes them against this route's advisory lock; this OR is the second
+    // half of the same fix, for a row whose `receiptUrl` the trigger could not
+    // parse an id out of. `receiptUrl` is exact-matched, never `contains` —
+    // that substring test is what round 34 removed.
+    const alreadyIngestedWhere = {
+        OR: [
+            { sourceFileId: body.fileId },
+            { AND: [{ sourceFileId: null }, { receiptUrl }] },
+        ],
+    };
+    const existing = await prisma.expense.findMany({
+        where: alreadyIngestedWhere,
+        select: { sourceGroupIndex: true },
     });
-    if (existing) {
+    if (existing.length && missingGroupIndexes(existing, body.groups.length).length === 0) {
         return NextResponse.json({ ok: true, alreadyIngested: true, created: 0 });
     }
 
@@ -79,55 +186,331 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: false, reason: "project-has-no-estimate", projectId: project.id });
     }
 
-    const costCodes = await prisma.costCode.findMany({
-        where: { isActive: true },
-        select: { id: true, code: true, name: true },
-    });
+    // The PROJECT's phases, not every active company code. Matching a Gemini
+    // category string against the whole company list let a Drive import book a
+    // phase that exists only on some other job — and this path writes the code
+    // straight onto the expense.
+    const costCodes = (await resolveProjectPhaseCodes(prismaPhaseDataSource, project.id))
+        .map((phase) => ({ id: phase.id, code: phase.code, name: phase.name }));
 
     const isCheck = String(body.docType || "receipt").toLowerCase() === "check";
     const docRef = isCheck
         ? `Check #${body.checkNumber || "?"}${body.memo ? ` — "${body.memo}"` : ""}`
         : (body.invoice && body.invoice !== "NoInv" ? `Invoice ${body.invoice}` : "Receipt");
-    const date = body.date && /^\d{4}-\d{2}-\d{2}$/.test(body.date) ? new Date(`${body.date}T12:00:00`) : new Date();
+    // `T12:00:00` with no zone is the SERVER's noon, not the company's — on a
+    // UTC host that is 05:00 Pacific, still the right day, but it is the right
+    // answer by luck rather than by rule. The shared parser makes it a company
+    // calendar day like every other writer.
+    const companyTimeZone = await resolveCompanyTimeZone();
+    // OMITTED IS NOT THE SAME AS WRONG (round 47, item 2). This used to be one
+    // ternary: anything that did not match YYYY-MM-DD became `new Date()`, so
+    // `07/14/2026` booked the receipt on the day it happened to be imported —
+    // possibly in the wrong quarter, with nothing in the response saying the
+    // date had been replaced. And a well-shaped impossible day (`2026-02-31`,
+    // the shape a bad OCR read produces most often) passed that test, reached
+    // the parser, and threw: a 500 for a caller error.
+    const verdict = classifyCalendarDate(body.date);
+    if (verdict.kind === "invalid") {
+        return NextResponse.json(
+            { ok: false, reason: "invalid-date", date: verdict.value, detail: `date ${verdict.reason}` },
+            { status: 400 },
+        );
+    }
+    const date = verdict.kind === "valid" ? dateOnlyInTimeZone(verdict.date, companyTimeZone) : new Date();
+    // Said out loud, in the response and the log: a row dated today because
+    // nobody sent a date is a fact the archive step and any audit need.
+    const dateSource = verdict.kind === "valid" ? "supplied" : "defaulted-today";
 
-    const warnings: string[] = [];
-    let created = 0;
-
-    for (const group of body.groups) {
-        const amount = Math.round(Number(group.amount) * 100) / 100;
-        if (!Number.isFinite(amount) || amount === 0) continue;
-
-        const costCode = matchCostCode(group.category || "", costCodes);
-        if (!costCode) warnings.push(`No cost code matched "${group.category}" — expense created without a phase`);
-
-        const lineSummary = (group.lines || [])
-            .slice(0, 6)
-            .map(l => l.desc)
-            .filter(Boolean)
-            .join("; ");
-
-        // An Expense created WITH its receipt is evidence the sweep reads, so
-        // it queues behind the sweep (round-42 gate, finding 1).
-        await withReceiptEvidenceLock(fn => prisma.$transaction(fn), tx => tx.expense.create({
-            data: {
-                estimateId,
-                costCodeId: costCode?.id ?? null,
-                amount,
-                vendor: body.vendor || "Unknown",
-                date,
-                status: "Pending",
-                receiptUrl,
-                description:
-                    `[Drive import] ${docRef} · ${group.category}` +
-                    (lineSummary ? ` · ${lineSummary}` : "") +
-                    ` · pending bookkeeper review`,
+    // EVERY GROUP IS VALIDATED BEFORE ANY OF THEM IS INSERTED (round 33,
+    // item 2 — the failure mode this replaces).
+    //
+    // The loop below used to `continue` past a group whose amount was not a
+    // finite number, or was zero, from INSIDE the transaction that was meant
+    // to make the receipt atomic. Its valid siblings committed, the response
+    // said `ok: true` with a `created` count that looked right, and the
+    // file-level dedupe then matched those siblings on every retry — so the
+    // malformed group could never be re-offered, and its money silently left
+    // the books. "Atomic" was true of the statements and false of the
+    // document.
+    //
+    // A document is now accepted whole or refused whole. One bad group
+    // refuses all of them with a non-2xx naming the offending INDICES and
+    // reasons, so the Apps Script does not archive the file, the same bytes
+    // re-send, and a corrected payload ingests every group.
+    //
+    // There is no intake row to quarantine it on: this leg writes Expenses
+    // straight from the Apps Script and owns no `ReceiptIntake` row (that is
+    // the v2 pipeline's table, reached through a different route). The failure
+    // is surfaced the two ways this route has: a structured server-log line,
+    // and a response the caller cannot mistake for success.
+    const invalidGroups = body.groups.flatMap((group, index) => {
+        const category = typeof group?.category === "string" ? group.category : null;
+        const amount = Number(group?.amount);
+        if (!Number.isFinite(amount)) {
+            return [{ index, category, reason: "amount is not a finite number" }];
+        }
+        if (Math.round(amount * 100) / 100 === 0) {
+            return [{ index, category, reason: "amount rounds to zero" }];
+        }
+        return [];
+    });
+    if (invalidGroups.length > 0) {
+        console.error(
+            "[receipt-ingest] invalid-group: refusing the whole document",
+            JSON.stringify({ fileId: body.fileId, projectId: project.id, invalidGroups }),
+        );
+        return NextResponse.json(
+            {
+                ok: false,
+                reason: "invalid-group",
+                retryable: true,
+                fileId: body.fileId,
+                invalidGroups,
             },
-        }));
-        created++;
+            { status: 422 },
+        );
     }
 
-    if (created === 0) {
-        return NextResponse.json({ ok: false, reason: "no-valid-groups" });
+    // ONE TRANSACTION FOR THE WHOLE RECEIPT (round 31, item 1 — the failure
+    // mode this replaces).
+    //
+    // Each group used to commit through its own `prisma.$transaction`, so an
+    // attribution race on group 2 left group 1 already written: a receipt
+    // that arrived as one document ended up split, with `created > 0` telling
+    // the caller it succeeded and a retry then reporting `alreadyIngested`
+    // (the dedupe at the top keys on the whole file, not on which groups
+    // actually landed) — a permanently lost group with no path back.
+    //
+    // Every group's insert now runs inside ONE transaction: either the whole
+    // receipt lands or none of it does. A group that cannot be attributed
+    // ABORTS the transaction — it does not skip past its own group and leave
+    // the rest committed — and the caller gets a retryable failure, never a
+    // partial success.
+    class AttributionRaceError extends Error {}
+
+    type GroupResult = {
+        category: string;
+        phaseId: string | null;
+        costCode: { id: string; code: string; name: string } | null;
+    };
+
+    let created = 0;
+    const warnings: string[] = [];
+
+    try {
+        const outcome = await prisma.$transaction(async tx => {
+            // EVIDENCE (PR #443 gate round 42, finding 1). Every Expense here
+            // lands WITH its receipt, which is what the missing-receipt sweep
+            // reads as "this charge is answered". THE OUTERMOST LOCK, taken
+            // before the attribution parents below (receipt-evidence-lock.ts)
+            // and directly rather than through `withReceiptEvidenceLock`,
+            // because this route owns the whole-document transaction.
+            await lockReceiptEvidence(tx);
+            await bumpReceiptEvidenceEpoch(tx);
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+
+            // ONE DELIVERY AT A TIME, PER DRIVE FILE (round 33, item 1 — the
+            // failure mode this replaces).
+            //
+            // The dedupe above ran BEFORE the transaction. Two concurrent
+            // deliveries of the same file — the Apps Script retrying a request
+            // whose response was lost, or two runs overlapping — both read
+            // "no expense carries this file id", and both then inserted every
+            // group. The receipt was booked twice, on the same job, with
+            // nothing in the data to tell the copies apart.
+            //
+            // `pg_advisory_xact_lock` serialises them on the file's identity
+            // for the rest of the transaction (it releases at COMMIT or
+            // ROLLBACK, so there is no unlock to forget), and the dedupe is
+            // re-asked underneath it. The loser now reads the winner's
+            // committed rows and returns the idempotent answer instead of a
+            // second copy.
+            //
+            // `hashtextextended` for the same reason `lockExpense` uses it: it
+            // returns the bigint the lock function wants, and collides far
+            // less often than the 32-bit `hashtext`. A collision only makes
+            // two unrelated files serialise, which costs nothing here.
+            //
+            // AND A UNIQUE INDEX NOW BACKS IT UP. The previous round said
+            // plainly that nothing did, because every group of one receipt
+            // shared the same `receiptUrl` and there was no per-group
+            // ordinal to key on. Both of those columns exist now
+            // (`sourceFileId`, `sourceGroupIndex`), so the partial unique
+            // index `Expense_sourceFileId_sourceGroupIndex_key` refuses a
+            // second copy of a group even from a writer that never takes this
+            // lock. A violation aborts the whole transaction — the document is
+            // written whole or not at all — and the retry then reads the
+            // winner's committed rows and answers `alreadyIngested`.
+            // BOTH IDENTITIES, IN A FIXED ORDER (round 49, item 2): the file
+            // id first, then the normalised url. The trigger takes exactly one
+            // of the two — whichever the row it is stamping can be identified
+            // by — so it can never hold one and wait for the other, and this
+            // pair cannot cycle against it. Taking both here is what makes an
+            // old insert of a SHORTENED url block this read instead of being
+            // invisible to it.
+            for (const key of [`${RECEIPT_INGEST_LOCK_PREFIX}${body.fileId}`, urlLockKey(receiptUrl)]) {
+                await raw.$queryRawUnsafe(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))::text AS lock_result",
+                    key,
+                );
+            }
+            const present = await tx.expense.findMany({
+                // The same predicate as the fast path, including the legacy
+                // `receiptUrl` arm — this is the authoritative one, taken under
+                // the advisory locks the drain-window trigger takes too, so an
+                // old instance's in-flight insert is either already visible
+                // here or still blocking this read.
+                where: alreadyIngestedWhere,
+                select: { sourceGroupIndex: true },
+            });
+            // RESUME, DO NOT REPORT DONE. A partial old-handler delivery leaves
+            // some of the groups behind; this delivery lands exactly the ones
+            // that are missing, and answers `alreadyIngested` only when there
+            // is genuinely nothing left to write.
+            const missing = present.length ? missingGroupIndexes(present, body.groups.length) : null;
+            if (missing !== null && missing.length === 0) return null;
+            const wanted = missing === null ? null : new Set(missing);
+
+            // THE WHOLE LOCK SET, IN THE CANONICAL ORDER, BEFORE THE LOOP
+            // (round 37, item 3): Project -> Estimate -> EstimateItem, then
+            // each group's CostCode inside `assertPhaseOfProjectTx`.
+            //
+            // Per group this used to reach `lockEstimateAttribution` (the
+            // Estimate) before `assertPhaseOfProjectTx` (the Project), which
+            // is a deadlock cycle against a job editor holding its Project row
+            // FOR UPDATE. Hoisted out of the loop because the set is the same
+            // for every group of one document, and because the FIRST lock this
+            // transaction takes on these tables is the one that fixes the
+            // order for the rest of it.
+            await lockAttributionParents(raw, { projectId: project.id, estimateId });
+
+            const outcomes: GroupResult[] = [];
+            for (const [groupIndex, group] of body.groups.entries()) {
+                // Already landed by the delivery this one is resuming.
+                if (wanted && !wanted.has(groupIndex)) continue;
+                // Finite and non-zero by the validation above, which refuses
+                // the whole document rather than letting this loop skip a
+                // group out of a transaction that then reports success.
+                const amount = Math.round(Number(group.amount) * 100) / 100;
+
+                const costCode = matchCostCode(group.category || "", costCodes);
+                const lineSummary = (group.lines || [])
+                    .slice(0, 6)
+                    .map(l => l.desc)
+                    .filter(Boolean)
+                    .join("; ");
+
+                // THE PAIR, RE-READ UNDER LOCK (round 21, item 1). `estimateId`
+                // was the project's latest estimate as of a query taken before
+                // the phase lookup, the date resolution and every earlier
+                // group in this loop. An estimate moved to another job in that
+                // window would be written next to the OLD project — one
+                // expense on two jobs, which no report can be right about. A
+                // mismatch aborts the WHOLE transaction (round 31) rather than
+                // skipping just this group, since the groups sharing this
+                // window's outcome share the same receipt.
+                const pair = await lockEstimateAttribution(raw, estimateId);
+                if (!pair || pair.projectId !== project.id) {
+                    throw new AttributionRaceError(
+                        "This job's estimate moved to another job while the receipt was being imported",
+                    );
+                }
+
+                // A MATCHED PHASE IS STILL A CLAIM ABOUT THIS JOB (round 18,
+                // item 4). `matchCostCode` is a string match over the
+                // company's codes; it knows nothing about which phases this
+                // job carries. The invariant locks the four tables it rests on
+                // and answers on this same transaction; a code that is not (or
+                // no longer) a phase of this job is dropped rather than
+                // posted, with the same warning an unmatched category already
+                // produces.
+                let phaseId = costCode?.id ?? null;
+                if (phaseId) {
+                    // Asked about the LOCKED job, like everything else past
+                    // this point. It equals `project.id` by the check above;
+                    // naming the locked value keeps that true if the check
+                    // ever moves.
+                    const verdict = await assertPhaseOfProjectTx(raw, pair.projectId, phaseId);
+                    if (!verdict.ok) phaseId = null;
+                }
+                await tx.expense.create({
+                    data: {
+                        // ONE PAIR, from one locked read.
+                        estimateId: pair.estimateId,
+                        projectId: pair.projectId,
+                        costCodeId: phaseId,
+                        // THE SOURCE DOCUMENT'S IDENTITY, ON EVERY GROUP. The
+                        // id exactly as the caller sent it — the dedupe above
+                        // compares it with `equals`, so anything derived from
+                        // it (a url, a normalised form) would reintroduce the
+                        // mismatch this replaces. The ordinal is what makes
+                        // the pair unique per row: the file id alone repeats
+                        // across every group of one receipt.
+                        sourceFileId: body.fileId,
+                        sourceGroupIndex: groupIndex,
+                        // The category came from the Apps Script's Gemini
+                        // read, not from a person — "ai", never "capture", so
+                        // nothing downstream treats it as a human's answer.
+                        // No confidence: matchCostCode is a string match and
+                        // has no score to report, and inventing one would be
+                        // a guess presented as a measurement.
+                        costCodeSource: phaseId ? "ai" : null,
+                        costCodeConfidence: null,
+                        amount,
+                        vendor: body.vendor || "Unknown",
+                        date,
+                        status: "Pending",
+                        receiptUrl,
+                        description:
+                            `[Drive import] ${docRef} · ${group.category}` +
+                            (lineSummary ? ` · ${lineSummary}` : "") +
+                            ` · pending bookkeeper review`,
+                    },
+                });
+                outcomes.push({ category: group.category, phaseId, costCode });
+            }
+            return outcomes;
+        });
+
+        // The lock's loser: the winner's rows are committed and visible, so
+        // this delivery has nothing to add. Byte-identical to the fast path's
+        // answer above, because it is the same fact.
+        if (outcome === null) {
+            return NextResponse.json({ ok: true, alreadyIngested: true, created: 0 });
+        }
+
+        for (const result of outcome) {
+            if (!result.costCode) {
+                warnings.push(`No cost code matched "${result.category}" — expense created without a phase`);
+            } else if (result.phaseId === null) {
+                warnings.push(
+                    `"${result.category}" matched ${result.costCode.code}, which is not a phase of this job — expense created without one`,
+                );
+            }
+            created++;
+        }
+    } catch (error) {
+        if (error instanceof AttributionRaceError) {
+            // Retryable, not a normal failure shape: the Apps Script's
+            // archive move must NOT happen on this response, so the same
+            // Drive file re-sends and re-attempts against the estimate's
+            // current project.
+            return NextResponse.json(
+                { ok: false, reason: "attribution-race", retryable: true },
+                { status: 409 },
+            );
+        }
+        throw error;
     }
-    return NextResponse.json({ ok: true, created, projectId: project.id, projectName: project.name, warnings });
+
+    // No `no-valid-groups` answer any more: an empty `groups` array is already
+    // a 400 at the top, and a group that would have produced it is now the 422
+    // above — which, unlike the old 200-with-`ok: false`, cannot be read as
+    // "handled, archive the file".
+    // `dateSource` is part of the answer, not decoration: "defaulted-today"
+    // is the one outcome a caller cannot infer from its own payload.
+    if (dateSource === "defaulted-today") {
+        warnings.push("No date was supplied, so these expenses are dated today.");
+    }
+    return NextResponse.json({ ok: true, created, projectId: project.id, projectName: project.name, dateSource, warnings });
 }

@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { resolveExpenseProjectId, resolveExpenseProjectLabel } from "@/lib/expense-attribution";
 import { Prisma } from "@prisma/client";
 import { withTxRetry } from "./tx-retry";
 import { ScheduleTaskValidationError } from "./schedule-task-result";
@@ -1993,6 +1994,9 @@ export async function getCalendarOverlays(
             orderBy: { date: "asc" },
             select: {
                 id: true, amount: true, vendor: true, date: true,
+                // BOTH sides — the digest names the job the money is on.
+                projectId: true,
+                project: { select: { id: true, name: true } },
                 estimate: { select: { projectId: true, project: { select: { id: true, name: true } } } },
             },
         }),
@@ -2031,8 +2035,9 @@ export async function getCalendarOverlays(
             amount: Number(e.amount),
             vendor: e.vendor,
             date: e.date!.toISOString(),
-            projectId: e.estimate?.project?.id ?? null,
-            projectName: e.estimate?.project?.name ?? null,
+            // Resolved, not read off the estimate — a re-attributed expense
+            // must be reported under the job it is actually on.
+            ...resolveExpenseProjectLabel(e),
         })),
         hours: hours.map(h => ({
             id: h.id,
@@ -2224,7 +2229,9 @@ async function getProjectMonthStrip(from: Date, to: Date, coRows: OverlayChangeO
         }),
         prisma.expense.findMany({
             where: { date: { gte: from, lt: to } },
-            select: { amount: true, estimate: { select: { projectId: true } } },
+            // BOTH sides: the roll-up must count an expense against the job
+            // it is actually on, not the one its estimate names.
+            select: { amount: true, projectId: true, estimate: { select: { projectId: true } } },
         }),
         prisma.timeEntry.findMany({
             where: { startTime: { gte: from, lt: to } },
@@ -2265,7 +2272,7 @@ async function getProjectMonthStrip(from: Date, to: Date, coRows: OverlayChangeO
         row(pid).received += Number(m.amount);
     }
     for (const e of expenseRows) {
-        const pid = e.estimate?.projectId;
+        const pid = resolveExpenseProjectId(e);
         if (!pid || !nameOf.has(pid)) continue;
         row(pid).expenses += Number(e.amount);
     }

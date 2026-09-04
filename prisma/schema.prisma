@@ -400,6 +400,7 @@ model Project {
   permits                 Permit[]
   inspections             Inspection[]
   receiptIntakes          ReceiptIntake[]
+  expenses                Expense[]
 
   // ── Percent complete (earned revenue / earned margin) ──────────────────────
   // percentComplete is the EFFECTIVE value every screen shows; percentCompleteAuto
@@ -700,8 +701,23 @@ model EstimateItem {
 
 model Expense {
   id            String        @id @default(cuid())
-  estimateId    String
-  estimate      Estimate      @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  /// NULLABLE, AND SET NULL ON DELETE (Codex round 42, item 4b).
+  ///
+  /// It was NOT NULL with onDelete: Cascade, so deleting an estimate DELETED
+  /// the spend booked through it -- including spend a bookkeeper had since
+  /// re-attributed to another job, which is reported under that job and has a
+  /// QuickBooks Purchase behind it. Destroying money history to tidy up a
+  /// superseded estimate is never the right trade.
+  ///
+  /// SET NULL rather than RESTRICT: the row keeps its `projectId`, which is the
+  /// primary attribution every reader already prefers, so the spend simply
+  /// stays on its job with no estimate behind it -- a shape
+  /// `resolveExpenseProjectId` has always handled. RESTRICT would preserve the
+  /// cost too, but it would also block deleting a PROJECT (Project cascades to
+  /// its Estimates, which would then be refused), and `Invoice.estimateId` and
+  /// `Takeoff.estimateId` already take the SET NULL stance in this schema.
+  estimateId    String?
+  estimate      Estimate?     @relation(fields: [estimateId], references: [id], onDelete: SetNull)
   itemId        String?
   item          EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
   costCodeId    String?
@@ -725,10 +741,117 @@ model Expense {
   invoicedAt    DateTime?
   status        String        @default("Pending") // Pending, Reviewed
 
+  /// ── Phase 3 attribution (docs/plans/PHASE-3-ATTRIBUTION-SPEC.md §2) ───────
+  /// Born-with-a-job. `projectId` is the denormalized truth every money-path
+  /// reader resolves through src/lib/expense-attribution.ts. Nullable because
+  /// it was backfilled onto 562 existing rows — a NULL here still resolves via
+  /// the estimate, which is why the resolver exists. `estimateId` (above) is
+  /// NOT the required parent this comment once described: round 42, item 4b
+  /// made it nullable with `onDelete: SetNull`, precisely so deleting an
+  /// estimate can no longer delete the spend `projectId` has already anchored
+  /// to a job — see the doc comment on `estimateId` itself.
+  projectId           String?
+  project             Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  /// Sales tax read off the receipt. `Expense.amount` stays the GROSS total
+  /// paid (Phase 1's decision), so pre-tax = amount - taxAmount.
+  taxAmount           Decimal?
+  /// WA excise "tax paid at source": GTR paid sales tax at the register on
+  /// material it resold as part of customer work.
+  taxAtSource         Boolean   @default(false)
+  /// null = NOBODY HAS SAID. Only an explicit TRUE is deductible on the excise
+  /// return: WAC 458-20-102(12)(b) allows the cost of the articles actually
+  /// resold, so an unanswered receipt must never be claimed. Defaulting this
+  /// from the project (a real job => true) was wrong and was removed — a job
+  /// receipt can still be consumables, tools, or services.
+  installedAtCustomer Boolean?
+  /// The portion of this receipt that was actually resold to the customer,
+  /// when it is LESS than the whole pre-tax total (a mixed receipt: some
+  /// material installed, some shop consumables). Null means "the whole pre-tax
+  /// total", which is only reached once installedAtCustomer is an explicit
+  /// true. Set by a bookkeeper on the expense edit route.
+  taxDeductibleBase   Decimal?
+  /// Who decided `taxAmount` on this row: "ocr" (read off the receipt by the
+  /// intake pipeline), "manual" (a bookkeeper supplied a figure, through PATCH
+  /// on the expense route) or "manual-none" (a bookkeeper looked and said this
+  /// receipt carries no sales tax). Booking never overwrites either human
+  /// state - including "there is NO tax", which is a null taxAmount and so
+  /// cannot be told from "nobody has looked" without this column.
+  ///
+  /// `taxAmount` ONLY. The deduction base has its own column below, because
+  /// the two figures are decided separately and by different parties.
+  taxSource           String?
+  /// Who decided `taxDeductibleBase`: "manual" (a bookkeeper, through PATCH)
+  /// or "ocr" if an automated pass ever supplies one. Split out from
+  /// `taxSource` because the pair is genuinely mixable and the single column
+  /// could not say so: a base-only PATCH deliberately leaves `taxSource`
+  /// alone (so a later OCR read may still fill the tax), and booking then
+  /// stamps `taxSource: "ocr"` for the tax it filled - which, while one column
+  /// governed both figures, made the row claim a machine had decided a base a
+  /// person had entered by hand.
+  taxDeductibleBaseSource String?
+  /// Set by the one-off UTC re-anchor in the Phase 3 rollout script. A row that
+  /// carries it has already had its `date` moved from UTC midnight to the
+  /// company's calendar day, so a re-run skips it — the predicate alone cannot
+  /// tell a re-anchored row from one legitimately written at local midnight.
+  attributionAnchoredAt DateTime?
+  /// A re-sync changed the gross out from under a tax classification a human
+  /// had made, so the tax fields were cleared and this row needs a person to
+  /// look at it again. Additive and default-false; `queryTaxAtSourceRows`
+  /// (src/lib/tax-at-source-report.ts) filters it OUT with `needsTaxReview:
+  /// false` — a row flagged here is excluded from the excise deduction even
+  /// when its remaining figures would otherwise qualify, not merely a row
+  /// that "drops out on its own" for having no tax left — and the correction
+  /// UI surfaces it for a bookkeeper to clear.
+  needsTaxReview      Boolean   @default(false)
+  /// capture | ai | manual | manual-none | backfill. Precedence: capture =
+  /// manual = manual-none > ai = backfill > null. "manual-none" is a human
+  /// DECISION — a bookkeeper deliberately clearing the phase — not an
+  /// absence, and is never rewritten by an automated pass: see
+  /// HUMAN_COST_CODE_SOURCES in src/lib/expense-attribution.ts.
+  costCodeSource      String?
+  costCodeConfidence  Decimal?
+
+  /// THE SOURCE DOCUMENT'S OWN IDENTITY — the Drive file id, stored exactly as
+  /// the ingest received it. `receiptUrl` cannot serve as this: it is built
+  /// from a CALLER-SUPPLIED `fileUrl` that need not contain the id at all, so
+  /// the dedupe that asked `receiptUrl contains fileId` matched nothing when a
+  /// custom URL omitted it, and every re-delivery booked the receipt again. It
+  /// also matched by SUBSTRING, so a file id that is a prefix of another ("abc"
+  /// vs "abcd") deduped two unrelated documents against each other. Written by
+  /// the Drive ingest, and compared by EQUALITY.
+  sourceFileId        String?
+  /// Which group of that document this row is. A receipt is AI-split into
+  /// category groups and each becomes its own Expense, so the file id alone is
+  /// not a per-row identity. Together with `sourceFileId` it is the identity the
+  /// partial unique index `Expense_sourceFileId_sourceGroupIndex_key` enforces
+  /// (SQL-only: Prisma cannot express a partial index — see
+  /// prisma/prisma-blind-spots.json, and the same reason BankImage.driveFileId
+  /// is not marked @unique here either).
+  ///
+  /// NULL on every row backfilled from an existing `receiptUrl`: those predate
+  /// the column and nothing can say which group they were. A btree unique index
+  /// treats NULLs as distinct, so those rows neither collide with each other
+  /// nor gain the constraint's protection — the file-level dedupe still finds
+  /// them, which is what idempotency actually needs.
+  sourceGroupIndex    Int?
+
   purchaseOrderId String?
   purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
 
   createdAt DateTime @default(now())
+  /// Row version. Exists so the tax PATCH can COMPARE-AND-SET against the exact
+  /// row it authorized and validated against — attribution included. Without
+  /// it the CAS could only name the money columns, and a re-attribution
+  /// landing in the gap would slip past a check that had already decided who
+  /// was allowed to make it.
+  ///
+  /// `@default(now())` is load-bearing for the DEPLOY, not for the model. The
+  /// apply script runs against production BEFORE the build that knows about
+  /// this column, so for that window the OLD app is still inserting Expenses
+  /// without it. A NOT NULL column with no default would make every one of
+  /// those inserts fail — receipts, manual entries, the QBO sync, all of it —
+  /// for as long as the window lasts.
+  updatedAt DateTime @default(now()) @updatedAt
 
   /// Back-relation for ReceiptIntake.expenseId. Declared here rather than left
   /// SQL-only because `prisma migrate diff` WOULD see a foreign key that
@@ -738,6 +861,8 @@ model Expense {
 
   @@index([estimateId])
   @@index([changeOrderId])
+  @@index([projectId])
+  @@index([sourceFileId])
 }
 
 model Invoice {
@@ -3462,6 +3587,19 @@ model ReceiptIntake {
   costCode            CostCode? @relation(fields: [costCodeId], references: [id])
   suggestedCostCodeId String?
   suggestedConfidence Float?
+  /// Phase 3: did this material get installed at a customer job (deductible on
+  /// the WA excise return) or consumed by the shop? null = unknown; only TRUE
+  /// counts, so a missing answer never inflates the deduction. Set at capture
+  /// (the mobile toggle) and copied onto the Expense at booking.
+  installedAtCustomer Boolean?
+  /// WHO supplied `costCodeId` on this row: "user" (a signed-in person
+  /// through the app or the mobile capture screen) or "machine" (a
+  /// shared-secret forwarder resolving it from a Drive folder or a mail
+  /// rule). Booking copies the distinction onto the Expense, because a
+  /// machine's phase is a guess a later pass may correct and a person's
+  /// is not. Nullable: rows captured before this column existed say
+  /// nothing, and "nothing" is treated as a machine guess.
+  costCodeSource String?
   createdById         String?
   createdBy           User?     @relation(fields: [createdById], references: [id], onDelete: SetNull)
 
@@ -3506,6 +3644,10 @@ model ReceiptIntake {
   txnDate    DateTime? @db.Date
   totalCents Int?
   taxCents   Int?
+  /// Phase 3: the read found sales tax GTR paid at the register. Set by the
+  /// READ step (`taxCents > 0`) for the drive/email/chat sources, and copied
+  /// onto the Expense at booking.
+  taxAtSource Boolean @default(false)
   docType    String? // receipt | check | multi | non_receipt
   refNumber  String? // cleaned invoice #, or "Check<num>" for checks
   memo       String?

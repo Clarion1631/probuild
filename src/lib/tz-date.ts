@@ -158,6 +158,66 @@ function instantForWallClock(
 }
 
 /** Store date-only business values at local noon to preserve their calendar date. */
+/**
+ * THREE ANSWERS, NOT TWO (Codex round 47, item 2).
+ *
+ * Every intake that accepts a calendar day had the same two-branch shape:
+ * "matches YYYY-MM-DD" or "everything else", where everything else silently
+ * became `new Date()` — today. So a receipt whose date arrived as `07/14/2026`
+ * or `Jul 14 2026` was BOOKED ON THE DAY IT WAS IMPORTED, in whatever quarter
+ * that fell in, with nothing in the response saying so. And a value that
+ * passes the shape but is not a real day — `2026-02-31`, the shape a bad OCR
+ * read produces most often — reached the parser, which threw, and the route
+ * answered 500.
+ *
+ * Those are three different situations and they need three different answers:
+ *
+ *   * OMITTED — no date was sent. Defaulting to today is legitimate, but the
+ *     caller has to be TOLD, which is why this is a distinct verdict rather
+ *     than folded in with the failures.
+ *   * VALID — a real calendar day, ready for `dateOnlyInTimeZone`.
+ *   * INVALID — something was sent and it is not a date. That is a caller bug
+ *     and belongs in a 400 naming the offending value, never a guess and never
+ *     a stack trace.
+ *
+ * The calendar check is a `Date.UTC` round trip, the same one `dateParts` uses:
+ * JavaScript rolls `2026-02-31` forward to 3 March rather than rejecting it, so
+ * "did the day I put in come back out" is the question that actually detects it.
+ */
+/**
+ * The two ways a supplied value fails, named so a caller can tell them apart
+ * without re-implementing the regex. The distinction matters: a value that is
+ * not YYYY-MM-DD at all may still be a legitimate full TIMESTAMP, and callers
+ * that accept both try that next. A value that IS YYYY-MM-DD but names no real
+ * day must never be retried as an instant — `new Date("2026-02-31")` does not
+ * fail, it rolls forward to 3 March, which is how an impossible date became a
+ * silently wrong one.
+ */
+export const CALENDAR_DATE_BAD_SHAPE = "must use YYYY-MM-DD";
+export const CALENDAR_DATE_NOT_REAL = "is not a real calendar date";
+
+export type CalendarDateVerdict =
+    | { kind: "omitted" }
+    | { kind: "valid"; date: string }
+    | { kind: "invalid"; value: string; reason: string };
+
+export function classifyCalendarDate(value: unknown): CalendarDateVerdict {
+    if (value === null || value === undefined) return { kind: "omitted" };
+    if (typeof value !== "string") {
+        return { kind: "invalid", value: String(value), reason: "must be a string in YYYY-MM-DD form" };
+    }
+    const trimmed = value.trim();
+    if (trimmed === "") return { kind: "omitted" };
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+    if (!match) return { kind: "invalid", value: trimmed, reason: CALENDAR_DATE_BAD_SHAPE };
+    const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+    const check = new Date(Date.UTC(year, month - 1, day));
+    if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) {
+        return { kind: "invalid", value: trimmed, reason: CALENDAR_DATE_NOT_REAL };
+    }
+    return { kind: "valid", date: trimmed };
+}
+
 export function dateOnlyInTimeZone(date: string, timeZone: string): Date {
     return instantForWallClock(date, timeZone, 12, 0, 0, 0, "date");
 }

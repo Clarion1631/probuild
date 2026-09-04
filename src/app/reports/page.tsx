@@ -59,6 +59,11 @@ const REPORT_SECTIONS = [
                 description: "Cash or accrual basis sales tax report. Filter by date range, client, project, and payment method with CSV export for your bookkeeper.",
                 href: "/reports/sales-tax",
             },
+            {
+                title: "Tax Paid at Source",
+                description: "Sales tax paid at the register on material installed at a customer job — the WA excise deduction, per month and per job, with the CSV your bookkeeper already expects.",
+                href: "/reports/tax-paid-at-source",
+            },
         ],
     },
     {

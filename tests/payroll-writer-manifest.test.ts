@@ -145,23 +145,23 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "guarded",
         why: "logistics routing: routing an entry to a new project, wrapped in withPayrollWrite for the same reason as the restore above",
     },
-    "lib/time-expense-core.ts:187::create": {
+    "lib/time-expense-core.ts:208::create": {
         kind: "guarded",
         why: "createTimeEntryCore, wrapped in withPayrollWriteTx — the canonical manual create every server action funnels through",
     },
-    "lib/time-expense-core.ts:355::updateMany": {
+    "lib/time-expense-core.ts:457::updateMany": {
         kind: "guarded",
         why: "tagTimeEntriesToChangeOrder, wrapped in withPayrollWrite — retagging changes which change order the hours bill against. The change order and the rows are re-read INSIDE the lock and projectId is pinned in the WHERE, so an entry rerouted to another job between the pre-check and the write cannot pick up this project's change order",
     },
-    "lib/time-expense-actions.ts:191::updateMany": {
+    "lib/time-expense-actions.ts:189::updateMany": {
         kind: "guarded",
         why: "the manual edit, wrapped in withPayrollWriteTx with the row re-read under FOR UPDATE",
     },
-    "lib/time-expense-actions.ts:236::deleteMany": {
+    "lib/time-expense-actions.ts:234::deleteMany": {
         kind: "guarded",
         why: "deleteTimeEntry (single delete), wrapped in withPayrollWriteTx over the one affected row id",
     },
-    "lib/time-expense-actions.ts:289::deleteMany": {
+    "lib/time-expense-actions.ts:287::deleteMany": {
         kind: "guarded",
         why: "deleteTimeEntries (bulk delete), wrapped in withPayrollWriteTx over every affected row id",
     },

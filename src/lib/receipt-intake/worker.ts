@@ -33,7 +33,7 @@ import {
     type BookableRow,
     type BookResult,
 } from "./book";
-import { QBTimeoutError } from "@/lib/quickbooks";
+import { isQBTimeoutError } from "@/lib/quickbooks";
 import {
     QboAccountConfigError,
     QboPurchaseFaultError,
@@ -526,6 +526,8 @@ export interface ReadPatch {
     txnDate: Date | null;
     totalCents: number | null;
     taxCents: number | null;
+    /** Phase 3: `taxCents > 0` — a positive read, never a present-but-zero one. */
+    taxAtSource: boolean;
     docType: string | null;
     refNumber: string | null;
     memo: string | null;
@@ -981,7 +983,11 @@ async function applyRoutedState(
 
 /** QBTimeoutError is deliberately NOT here — a timeout is transport, not a verdict. */
 export function isTerminalQboFault(error: unknown): boolean {
-    if (error instanceof QBTimeoutError) return false;
+    // NAME-BASED (round 40, item 4): Node 20 + tsx can load quickbooks.ts
+    // twice under different specifiers, and an `instanceof` that answers false
+    // for a timeout the QBO client itself threw would classify it as a
+    // TERMINAL fault  parking a row that only needed a retry.
+    if (isQBTimeoutError(error)) return false;
     return (
         error instanceof QboPurchaseFaultError ||
         error instanceof QboAccountConfigError ||
@@ -1105,6 +1111,11 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         txnDate: dateOnly(keys.dateStr, timeZone),
         totalCents,
         taxCents,
+        // Phase 3: the receipt carried sales tax GTR paid at the register. An
+        // ABSENT tax read and a ZERO one are the same answer here — neither is
+        // evidence that tax was paid — so this is derived from `taxCents` being
+        // a positive number, never from the field merely existing.
+        taxAtSource: taxCents !== null && taxCents > 0,
         docType: read.docType || null,
         refNumber: keys.ref,
         memo: read.memo || null,

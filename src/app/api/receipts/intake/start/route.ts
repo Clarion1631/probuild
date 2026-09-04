@@ -3,6 +3,9 @@ import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { userCanAccessProject } from "@/lib/mobile-auth";
+import { captureActorSource, optionalBool } from "@/lib/receipt-capture-validation";
+import { SECURE_BUCKET } from "@/lib/secure-storage";
+import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME } from "@/lib/receipt-intake/file-type";
 import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
@@ -258,6 +261,10 @@ export async function POST(req: Request) {
                 dryRun: process.env.RECEIPT_INTAKE_DRYRUN !== "false",
                 projectId,
                 costCodeId,
+                costCodeSource: costCodeId ? captureActorSource(auth.via) : null,
+                // Tri-state, and nothing defaults it: silence is "nobody said",
+                // which is never claimed on the excise return.
+                installedAtCustomer: optionalBool(body.installedAtCustomer),
                 createdById: auth.via === "session" ? auth.user.id : null,
                 // Forwarder-only, same as the single-shot path: this is the
                 // claim that v1 already booked the document.

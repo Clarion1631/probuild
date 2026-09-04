@@ -117,8 +117,11 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         dryRun: false,
         projectId: "proj-1",
         costCodeId: null,
+        costCodeSource: null,
         suggestedCostCodeId: "cc-plumb",
         suggestedConfidence: 0.82,
+        taxAtSource: true,
+        installedAtCustomer: true,
         storagePath: "receipts/intake/intake-1.jpg",
         fileName: "receipt.jpg",
         mimeType: "image/jpeg",
@@ -149,8 +152,38 @@ interface Recorder {
     lockCalls: string[];
     epochBumps: string[];
     events: any[];
-    /** Every qbPurchaseId the shared advisory lock was taken on. */
+    /**
+     * Every advisory-lock key this transaction took, IN ORDER: the
+     * qbPurchaseId first (`lockQboExpense`), then `expense:<id>`
+     * (`lockExpense`). The order is the invariant — the Expense is the child
+     * and is always last — so it is recorded rather than ignored.
+     */
     locks: string[];
+    existingExpense: any;
+    /**
+     * The world the IN-TRANSACTION phase invariant reads (round 17, item 5):
+     * the job's status, whether the cost code is still active, and what the
+     * locked estimate says its job is. A test that models an archive, a
+     * deactivation or a reassignment moves these.
+     */
+    state: {
+        existingExpense: any;
+        projectStatus: string;
+        costCodeActive: boolean;
+        estimateProjectId: string | null;
+    };
+}
+
+/**
+ * Everything the guarded fills actually WROTE, merged into one object.
+ *
+ * The fill is several `updateMany`s rather than one `update`, because each
+ * field has its own predicate and a single one would make one field's
+ * contention veto another's legitimate fill. So "what did the fill do" is the
+ * union of their payloads, not `expenseUpdates[0]`.
+ */
+function fillData(rec: Recorder): Record<string, any> {
+    return Object.assign({}, ...rec.expenseUpdates.map((u: any) => u.data ?? u));
 }
 
 function recorder(
@@ -171,6 +204,21 @@ function recorder(
     const lockCalls: string[] = [];
     const epochBumps: string[] = [];
     const locks: string[] = [];
+    const state: {
+        existingExpense: any;
+        projectStatus: string;
+        costCodeActive: boolean;
+        estimateProjectId: string | null;
+    } = {
+        // Set by a test to model a Purchase that is ALREADY booked.
+        existingExpense: opts.existingExpense ?? null,
+        // What the locked estimate says its job is. A test that models a
+        // reassignment moves this.
+        estimateProjectId: "proj-1",
+        // What the phase invariant reads back for this job and code.
+        projectStatus: "In Progress",
+        costCodeActive: true,
+    };
 
     const tx = {
         project: {
@@ -181,9 +229,50 @@ function recorder(
             }),
         },
         expense: {
-            findUnique: async () => (opts.existingExpense ?? null),
+            findUnique: async () => state.existingExpense,
             create: async (args: any) => { expenses.push(args.data); return { id: `exp-${expenses.length}` }; },
-            update: async (args: any) => { expenseUpdates.push(args.data); return {}; },
+            update: async (args: any) => { expenseUpdates.push(args); return {}; },
+            // Models the PREDICATE. Each guarded fill has to be able to match
+            // ZERO rows, because that is the whole guarantee it buys.
+            updateMany: async (args: any) => {
+                expenseUpdates.push(args);
+                const cur = state.existingExpense ?? {};
+                const eq = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
+                for (const key of ["costCodeId", "taxAmount", "installedAtCustomer", "receiptUrl", "vendor", "date"]) {
+                    if (key in args.where && !eq(cur[key], args.where[key])) return { count: 0 };
+                }
+                // `projectId` is pinned in every fill predicate to the
+                // attribution the decision was made under; the pair fill
+                // itself pins NULL.
+                if ("projectId" in args.where) {
+                    const want = args.where.projectId;
+                    const have = cur.projectId ?? null;
+                    if (want === null ? have !== null : !(have === null || have === want)) {
+                        return { count: 0 };
+                    }
+                }
+                // OR branches, evaluated with SQL's NULL rules: `NOT IN` and
+                // `<> x` are both NULL (i.e. NOT a match) for a NULL column,
+                // which is exactly why every guard here carries an explicit
+                // `{ column: null }` branch. Modelling that is the only way a
+                // test can catch a guard that silently drops legacy rows.
+                if (Array.isArray(args.where.OR)) {
+                    const branchMatches = (branch: any) =>
+                        Object.entries(branch).every(([key, want]: [string, any]) => {
+                            const have = cur[key] ?? null;
+                            if (want && typeof want === "object" && "notIn" in want) {
+                                return have !== null && !want.notIn.includes(have);
+                            }
+                            if (want && typeof want === "object" && "not" in want) {
+                                return have !== null && have !== want.not;
+                            }
+                            return (want ?? null) === have;
+                        });
+                    if (!args.where.OR.some(branchMatches)) return { count: 0 };
+                }
+                if (state.existingExpense) Object.assign(state.existingExpense, args.data);
+                return { count: 1 };
+            },
         },
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
@@ -213,11 +302,33 @@ function recorder(
             epochBumps.push(`${query.join("?")}|${values.join(",")}`);
             return [{ value: "1" }];
         },
-        // The shared per-qbPurchaseId advisory lock. Recorded rather than
-        // ignored: taking it is the whole point of the fix, so a version that
-        // stopped taking it must fail a test.
-        $queryRawUnsafe: async (_sql: string, ...values: unknown[]) => {
-            locks.push(String(values[0]));
+        // TWO jobs. The advisory locks (the shared per-qbPurchaseId one and
+        // the per-expense one) are RECORDED — taking them, in that order, is
+        // the whole point — and the phase invariant's questions are ANSWERED
+        // from the same injected `isCostCodeAllowed` rule every test already
+        // sets, so a test writes one rule and the pre-send checks and the
+        // in-transaction one both obey it.
+        $queryRawUnsafe: async (query: string, ...args: any[]) => {
+            if (query.includes("pg_advisory_xact_lock")) {
+                locks.push(String(args[0]));
+                return [{ lock_result: null }];
+            }
+            // The attribution PAIR is re-read from the locked estimate before
+            // it is written (round 20, item 3).
+            if (/FROM "Estimate" WHERE id/.test(query) && /"projectId"/.test(query)) {
+                return [{ projectId: state.estimateProjectId }];
+            }
+            if (/FROM "Project" WHERE id/.test(query) && /status/.test(query)) {
+                return [{ id: args[0], status: state.projectStatus }];
+            }
+            if (/FROM "CostCode" WHERE id/.test(query)) {
+                return state.costCodeActive
+                    ? [{ id: args[0], code: "03-PLUMB", isActive: true }]
+                    : [{ id: args[0], code: "03-PLUMB", isActive: false }];
+            }
+            if (/FROM "EstimateItem"/.test(query) && /LIMIT 1/.test(query)) {
+                return (await deps.isCostCodeAllowed(args[0], args[1])) ? [{ ok: 1 }] : [];
+            }
             return [];
         },
         $transaction: async (fn: any) => fn(tx),
@@ -241,7 +352,12 @@ function recorder(
         markSendAttempted: async id => { sendMarks.push(id); return true; },
         ...overrides,
     };
-    return { deps, sendMarks, purchaseCalls, expenses, expenseUpdates, intakeUpdates, events, lockCalls, epochBumps, locks };
+    return {
+        deps, sendMarks, purchaseCalls, expenses, expenseUpdates, intakeUpdates, events,
+        lockCalls, epochBumps, locks, state,
+        set existingExpense(value: any) { state.existingExpense = value; },
+        get existingExpense() { return state.existingExpense; },
+    };
 }
 
 test("a taxed receipt splits into a pre-tax line and a sales-tax line that reconstruct the total", () => {
@@ -767,7 +883,10 @@ test("an existing Expense for the same Purchase is reused, never duplicated", as
     const result = await bookReceipt(row(), r.deps);
     assert.equal((result as any).expenseId, "exp-existing");
     assert.equal(r.expenses.length, 0, "no second Expense row");
-    assert.deepEqual(r.locks, ["QB-1"], "and the shared per-Purchase lock was taken first");
+    // THE LOCK ORDER, in one assertion: the shared per-Purchase advisory lock
+    // (the identity of the document) and only then the per-Expense one. The
+    // Expense is the child and is always last.
+    assert.deepEqual(r.locks, ["QB-1", "expense:exp-existing"]);
 });
 
 test("IMPORTER WINS: the receipt fills the attribution the sync could not know", async () => {
@@ -781,13 +900,17 @@ test("IMPORTER WINS: the receipt fills the attribution the sync could not know",
     assert.equal(result.outcome, "booked");
     assert.equal((result as any).expenseId, "exp-existing");
     assert.equal(r.expenses.length, 0, "still no duplicate");
-    assert.equal(r.expenseUpdates.length, 1, "the existing row was completed, not replaced");
-    assert.equal(r.expenseUpdates[0].costCodeId, "cc-plumb");
-    assert.match(String(r.expenseUpdates[0].receiptUrl), /FILE123/);
-    // Money and identity agreed, so nothing there was touched.
-    for (const field of ["estimateId", "amount", "vendor", "date"]) {
-        assert.ok(!(field in r.expenseUpdates[0]), `${field} is not rewritten`);
+    assert.ok(r.expenseUpdates.length > 0, "the existing row was completed, not replaced");
+    const filled = fillData(r);
+    assert.equal(filled.costCodeId, "cc-plumb");
+    assert.match(String(filled.receiptUrl), /FILE123/);
+    // Money and identity agreed, so nothing there was touched. `estimateId`
+    // rides along with the attribution PAIR (the importer's row carries no
+    // projectId), and it is written as the value it already holds.
+    for (const field of ["amount", "vendor", "date"]) {
+        assert.ok(!(field in filled), `${field} is not rewritten`);
     }
+    assert.equal(filled.estimateId, "est-1", "the pair is written from the locked read, unchanged");
 });
 
 test("the two date ANCHORS are not a conflict — same day, different midnight", async () => {
@@ -809,14 +932,16 @@ test("the two date ANCHORS are not a conflict — same day, different midnight",
 test("a human's cost code is never overwritten by the receipt's suggestion", async () => {
     // costCodeId and receiptUrl are fill-only. The importer cannot write either
     // column, so a value there came from a person or an earlier receipt — and
-    // theirs is the answer that stands. There is no provenance column and no
-    // `notHumanCodedExpenseWhere` helper in this codebase; "the importer could
-    // not have written this" is the honest predicate.
+    // theirs is the answer that stands. On THIS schema there IS a provenance
+    // column and a `notHumanCodedExpenseWhere` helper, and the guarded write
+    // below pins both — but a populated `costCodeId` never reaches it at all,
+    // whoever wrote it.
     const r = recorder({}, { existingExpense: importedExpense({ costCodeId: "cc-electrical" }) });
     const result = await bookReceipt(row(), r.deps);
     assert.equal(result.outcome, "booked");
-    const patch = r.expenseUpdates[0] ?? {};
+    const patch = fillData(r);
     assert.ok(!("costCodeId" in patch), "the human's phase stands");
+    assert.ok(!("costCodeSource" in patch), "and its provenance with it");
     assert.match(String(patch.receiptUrl), /FILE123/, "but the missing receipt link is still filled");
 });
 
@@ -854,7 +979,10 @@ test("reconcile: the truth table, field by field", () => {
     assert.deepEqual(base().conflicts, [], "the expected importer row is not a conflict");
     assert.deepEqual(
         Object.keys(base().fill).sort(),
-        ["costCodeId", "receiptUrl"],
+        // The phase is filled as a TRIO — the id, who chose it, and how sure
+        // they were. `receiptValues()` supplies no job, no tax and no excise
+        // answer, so none of the other Phase 3 fills is even asked for.
+        ["costCodeConfidence", "costCodeId", "costCodeSource", "receiptUrl"],
         "only what the importer could not know",
     );
 
@@ -1788,7 +1916,7 @@ test("IMPORTER WINS on VENDOR SPELLING: canonical vs OCR recovers, not parks", a
     // identified an existing Purchase — nothing rewrites the books, but job
     // cost must not carry a spelling QuickBooks does not use.
     assert.ok(
-        !r.expenseUpdates.some(u => "vendor" in u),
+        !("vendor" in fillData(r)),
         "the importer's canonical spelling stands",
     );
 });
@@ -1835,7 +1963,7 @@ test("a preserved human phase is what the booking event reports", async () => {
     assert.equal(result.outcome, "booked");
     const detail = r.events[0].detail;
     assert.equal(detail.costCodeId, "cc-electrical", "the persisted phase, not the worker's");
-    assert.equal(detail.costCodeSource, "existing");
+    assert.equal(detail.costCodeOrigin, "existing");
     assert.equal(detail.phasePreserved, true, "and it says so explicitly");
     // CONTROL: the worker really did pick something else, so this cannot pass
     // for an event that simply echoed whatever the row already had.
@@ -1852,7 +1980,7 @@ test("an unclaimed phase is FILLED, and reported as the receipt's", async () => 
     await bookReceipt(row(), r.deps);
     const detail = r.events[0].detail;
     assert.equal(detail.costCodeId, "cc-plumb");
-    assert.equal(detail.costCodeSource, "receipt");
+    assert.equal(detail.costCodeOrigin, "receipt");
     assert.equal(detail.phasePreserved, undefined, "nothing was displaced");
     assert.equal(detail.suggestedConfidence, 0.82, "and the confidence still rides along");
 });
@@ -1875,7 +2003,7 @@ test("reconcile reports the effective attribution, three ways", () => {
         receiptValues(),
     );
     assert.deepEqual(withHuman.attribution, {
-        costCodeId: "cc-electrical", costCodeSource: "existing", preserved: true,
+        costCodeId: "cc-electrical", costCodeOrigin: "existing", preserved: true,
     });
     // No contest: the receipt had nothing to offer.
     const noSuggestion = reconcileExistingExpense(
@@ -1886,7 +2014,7 @@ test("reconcile reports the effective attribution, three ways", () => {
     // Filled from the receipt.
     const filled = reconcileExistingExpense(importedExpense() as never, receiptValues());
     assert.deepEqual(filled.attribution, {
-        costCodeId: "cc-plumb", costCodeSource: "receipt", preserved: false,
+        costCodeId: "cc-plumb", costCodeOrigin: "receipt", preserved: false,
     });
     // Neither side has one.
     const neither = reconcileExistingExpense(
@@ -1894,7 +2022,7 @@ test("reconcile reports the effective attribution, three ways", () => {
         { ...receiptValues(), costCodeId: null },
     );
     assert.deepEqual(neither.attribution, {
-        costCodeId: null, costCodeSource: "none", preserved: false,
+        costCodeId: null, costCodeOrigin: "none", preserved: false,
     });
 });
 
@@ -1994,4 +2122,755 @@ test("readJson is NEVER rewritten, so the OCR original stays auditable", async (
     for (const update of r.intakeUpdates) {
         assert.ok(!("readJson" in update), "no booking write touches the raw read");
     }
+});
+
+// ── PHASE 3: the already-booked Purchase still needs its attribution ───────
+//
+// Everything below drives the SAME `bookReceipt`, through the same recorder,
+// against the Phase 3 columns: the job pair, the phase and its provenance, the
+// two tax figures and their provenance, and the excise answer. The fills are
+// several guarded `updateMany`s rather than one `update` — the predicate IS
+// the guarantee — so what landed is asserted on the row, not on the statement.
+
+/**
+ * An existing Expense in the PHASE 3 shape: the money-and-identity columns a
+ * real row always has (without them the reconcile reads every fixture as an
+ * `amount` conflict, which is true of a real row too) plus the attribution
+ * columns booking fills.
+ */
+function phase3Expense(over: Record<string, unknown> = {}) {
+    return {
+        id: "expense-1",
+        estimateId: "est-1",
+        amount: 364.98,
+        vendor: "Lowes",
+        // The importer's UTC-midnight marker for the same calendar day.
+        date: new Date("2026-08-03T00:00:00.000Z"),
+        costCodeId: null,
+        receiptUrl: null,
+        projectId: null,
+        costCodeSource: null,
+        taxAmount: null,
+        taxAtSource: false,
+        taxSource: null,
+        installedAtCustomer: null,
+        estimate: { projectId: null },
+        ...over,
+    };
+}
+
+/** The same row, already on this job — so only the empty columns are in play. */
+const onThisJob = (over: Record<string, unknown> = {}) =>
+    phase3Expense({ projectId: "proj-1", estimate: { projectId: "proj-1" }, ...over });
+
+test("an alreadyExists row is FILLED, not left blank", async () => {
+    // `alreadyExists` covers the lost-response retry AND a row v1 created
+    // before this pipeline existed. Returning it untouched left projectId, the
+    // phase, the provenance and the tax columns NULL forever on exactly the
+    // receipts the tax report is made of.
+    const rec = recorder();
+    rec.existingExpense = phase3Expense();
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "booked");
+    const fill = fillData(rec);
+    assert.equal(fill.projectId, "proj-1");
+    assert.equal(fill.installedAtCustomer, true);
+    assert.ok("taxAmount" in fill, "the tax the booking validated lands too");
+});
+
+test("the fill writes the phase's PROVENANCE with the phase, never the id alone", async () => {
+    // ROUND 24 DECISION 2. A `costCodeId` with no `costCodeSource` reads as a
+    // legacy row that any later automated pass may overwrite, and the
+    // confidence belongs to the same decision. One statement, three columns,
+    // behind the ONE shared human-source predicate.
+    const rec = recorder();
+    rec.existingExpense = phase3Expense();
+    await bookReceipt(row(), rec.deps);
+    const write = rec.expenseUpdates.find((u: any) => "costCodeId" in (u.data ?? {}));
+    assert.ok(write, "the phase was filled");
+    assert.deepEqual(Object.keys(write.data).sort(), ["costCodeConfidence", "costCodeId", "costCodeSource"]);
+    assert.equal(write.data.costCodeId, "cc-plumb");
+    assert.equal(write.data.costCodeSource, "ai", "the model's suggestion, correctable by a later pass");
+    assert.equal(write.data.costCodeConfidence, 0.82);
+    // ...and the predicate carries the shared definition of "a human chose
+    // this", with its explicit NULL branch, not a list restated here.
+    assert.equal(write.where.costCodeId, null);
+    assert.deepEqual(
+        write.where.OR,
+        [{ costCodeSource: null }, { costCodeSource: { notIn: ["capture", "manual", "manual-none"] } }],
+    );
+    assert.equal(rec.existingExpense.costCodeSource, "ai", "and it landed");
+});
+
+test("a human's decisions on an existing row are never overwritten", async () => {
+    const rec = recorder();
+    rec.existingExpense = onThisJob({
+        costCodeId: "cc-human", costCodeSource: "manual",
+        taxAmount: 9.99, taxAtSource: true, installedAtCustomer: false,
+    });
+    await bookReceipt(row(), rec.deps);
+    // Nothing a human owns may be written — the guarded predicates are what
+    // enforce it, so assert on what actually LANDED, not on what was attempted.
+    const after = rec.existingExpense;
+    assert.equal(after.costCodeId, "cc-human", "a manual phase is untouchable");
+    assert.equal(after.taxAmount, 9.99, "a recorded tax outranks a re-read");
+    assert.equal(after.installedAtCustomer, false, "an answered tax question is a human's");
+    assert.ok(rec.expenseUpdates.every((u: any) => u.where.id === "expense-1"));
+});
+
+test("a bookkeeper's CLEARED phase survives an intake retry", async () => {
+    // ROUND 37, ITEM 1 — the recovery this guard exists for, end to end.
+    //
+    // A bookkeeper opens a booked receipt, decides the machine's phase is
+    // wrong, and clears it. That writes `costCodeId: null` with
+    // `costCodeSource: "manual-none"` — a DECISION, not an absence (see
+    // HUMAN_COST_CODE_SOURCES). Booking's fill predicate used to spell its own
+    // exclusion list as ["capture", "manual"], so "manual-none" fell straight
+    // through it: the next retry of the SAME document — a lost QBO response, a
+    // re-delivery, a worker re-run — matched the row (its code IS null) and
+    // wrote the machine's suggestion back on top. The clear was undone within
+    // minutes and nothing recorded that it had happened.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({
+        costCodeId: null, costCodeSource: "manual-none",
+        taxAmount: 9.99, taxAtSource: true, installedAtCustomer: false,
+    });
+    const result = await bookReceipt(row({ costCodeId: "cc-demo", costCodeSource: "user" }), rec.deps);
+    assert.equal(result.outcome, "booked");
+    const after = rec.existingExpense;
+    assert.equal(after.costCodeId, null, "the cleared phase stays cleared");
+    assert.equal(after.costCodeSource, "manual-none", "and so does the person's provenance");
+    // AND THE AUDIT SAYS SO. A "manual-none" row is a human's answer even
+    // though the column is null, so the event must not report the phase this
+    // pass picked — that would assert a cost code applied to nothing.
+    const detail = rec.events[0].detail;
+    assert.equal(detail.costCodeId, null);
+    assert.equal(detail.costCodeOrigin, "existing");
+    assert.equal(detail.phasePreserved, true);
+});
+
+test("a PATCH landing between the read and the fill is not overrun", async () => {
+    // The read happens inside the transaction and inside the per-expense lock,
+    // but a writer that does not take that lock can still commit before these
+    // writes. Deciding from the read and writing unconditionally would overrun
+    // exactly the authority this fill must respect; the predicate is what
+    // makes the gap safe.
+    const rec = recorder();
+    rec.existingExpense = phase3Expense();
+    const seenByBooking = { ...rec.existingExpense };
+    let reads = 0;
+    (rec.deps.db as any).expense.findUnique = async () => {
+        reads += 1;
+        // Read 1 is the id lookup that the lock is taken on. Read 2 is the one
+        // every decision is made from — hand it the PRE-patch snapshot, and let
+        // the PATCH land in the same breath. Later reads (the post-fill
+        // attribution check) see the row as it really is.
+        if (reads === 1) return { id: "expense-1" };
+        if (reads > 2) return rec.existingExpense;
+        rec.existingExpense = {
+            ...rec.existingExpense,
+            costCodeId: "cc-human",
+            costCodeSource: "manual",
+            installedAtCustomer: false,
+        };
+        return seenByBooking;
+    };
+
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(rec.existingExpense.costCodeId, "cc-human", "the human's phase survives");
+    assert.equal(rec.existingExpense.costCodeSource, "manual");
+    assert.equal(rec.existingExpense.installedAtCustomer, false, "and their tax answer");
+    // ...while the field nobody contended for is still filled.
+    assert.equal(rec.existingExpense.projectId, "proj-1");
+});
+
+test("a Purchase already on ANOTHER job parks instead of booking", async () => {
+    // ROUND 24 DECISION 1. Filling would be guessing which job is right;
+    // overwriting would silently move real money between jobs. It is ONE MORE
+    // ENTRY in the reconcile's conflicts list, so it raises the same
+    // ExpenseConflictError every other disagreement does — with its own reason.
+    const rec = recorder();
+    rec.existingExpense = phase3Expense({
+        projectId: "some-other-job", estimate: { projectId: "some-other-job" },
+    });
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "expense-conflict:attribution");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
+    assert.equal(rec.expenses.length, 0, "nothing written");
+    assert.equal(rec.expenseUpdates.length, 0, "and no fill was even attempted");
+    assert.ok(!rec.intakeUpdates.some((u: any) => u.state === "BOOKED"));
+});
+
+test("the JOB fallback is the estimate, when the column is null", async () => {
+    // CONTROL for the check above: `resolveExpenseProjectId` prefers the
+    // column and falls back through the estimate, so a row with no
+    // `projectId` but an estimate on another job is the same conflict.
+    const rec = recorder();
+    rec.existingExpense = phase3Expense({
+        projectId: null, estimate: { projectId: "some-other-job" },
+    });
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") assert.equal(result.reason, "expense-conflict:attribution");
+});
+
+// ── the CREATE path re-reads the pair too (round 21, item 1) ───────────────
+
+test("a NEW expense is created from the LOCKED pair, not the pre-transaction one", async () => {
+    // The estimate was chosen before the QBO Purchase round trip. This is the
+    // control: nothing moved, so the pair is written unchanged.
+    const rec = recorder();
+    await bookReceipt(row(), rec.deps);
+    assert.equal(rec.expenses[0].projectId, "proj-1");
+    assert.equal(rec.expenses[0].estimateId, "est-1");
+});
+
+test("an estimate MOVED before the create parks instead of splitting the job", async () => {
+    // The fill path already refused this shape; the create path wrote
+    // `row.projectId` beside an estimate nobody had looked at since it was
+    // picked, producing a brand-new expense on two jobs at once.
+    const rec = recorder();
+    rec.state.estimateProjectId = "another-job";
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "expense-conflict:attribution");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
+    assert.equal(rec.expenses.length, 0, "nothing was written on either job");
+    // The BOOKED write is Phase 2's VOID FENCE and now runs BEFORE the fills
+    // and the create, inside the same transaction as the throw — so a real
+    // Postgres rolls it back with everything else. The fake `$transaction`
+    // has no rollback, which is why the assertion is on what a rolled-back
+    // transaction can still be seen NOT to have done: no Expense, and no
+    // booking in the audit register.
+    assert.equal(rec.events.length, 0, "and nothing is logged as booked");
+});
+
+test("an estimate that lost its project before the create parks too", async () => {
+    // Half a pair is the same bug reached the other way: `projectId` set, the
+    // estimate on no job at all.
+    const rec = recorder();
+    rec.state.estimateProjectId = null;
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") assert.equal(result.reason, "expense-conflict:attribution");
+    assert.equal(rec.expenses.length, 0);
+});
+
+// ── tax provenance and the post-fill attribution check ─────────────────────
+
+test("a bookkeeper's NO-TAX decision is not overwritten by an OCR re-read", async () => {
+    // The case a null taxAmount cannot express on its own: a person looked at
+    // this receipt, concluded there is no sales tax on it, and left the column
+    // NULL. Without `taxSource` that is indistinguishable from "nobody has
+    // looked", and the next booking writes an OCR figure over their answer.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({ taxSource: "manual" });
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(rec.existingExpense.taxAmount, null, "their answer stands");
+    assert.equal(rec.existingExpense.taxSource, "manual");
+    // ...while the excise question, which they did NOT answer, is still filled
+    // from the capture. `taxSource` governs the tax figures only; the
+    // installed-at-customer answer is its own evidence (round 16, item 1).
+    assert.equal(rec.existingExpense.installedAtCustomer, true);
+});
+
+test("a legacy row with no provenance IS filled, and stamped ocr", async () => {
+    // The control for the test above: `taxSource` NULL is "nobody has looked",
+    // and SQL's `<> 'manual'` would drop exactly these rows without the
+    // explicit NULL branch in the guard.
+    const rec = recorder();
+    rec.existingExpense = onThisJob();
+    await bookReceipt(row(), rec.deps);
+    assert.ok(Number(rec.existingExpense.taxAmount) > 0, "the validated tax lands");
+    assert.equal(rec.existingExpense.taxSource, "ocr");
+    assert.equal(rec.existingExpense.taxAtSource, true);
+});
+
+test("a newly created Expense records where its tax came from", async () => {
+    const rec = recorder();
+    await bookReceipt(row(), rec.deps);
+    assert.equal(rec.expenses[0].taxSource, "ocr");
+    assert.ok(rec.expenses[0].taxAmount > 0);
+    // And says nothing about a base it never wrote. Booking does not split a
+    // receipt into a resold portion, so both the base and its provenance start
+    // empty and wait for a person (round 33, item 4).
+    assert.equal(rec.expenses[0].taxDeductibleBase, undefined);
+    assert.equal(rec.expenses[0].taxDeductibleBaseSource, undefined);
+});
+
+test("MIXED PROVENANCE: a manual base survives an OCR tax fill with its own source", async () => {
+    // Round 33, item 4 — the state one column could not represent.
+    //
+    // A bookkeeper sets `taxDeductibleBase` and says nothing about the tax, so
+    // the PATCH deliberately leaves `taxSource` NULL (the row stays open to an
+    // automated read). Booking then fills `taxAmount` and stamps
+    // `taxSource: "ocr"`. While `taxSource` governed BOTH figures, the row
+    // came out of that sequence claiming OCR had decided a base a person had
+    // typed — the value was theirs and the provenance said machine.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({
+        amount: 100, taxDeductibleBase: 20, taxDeductibleBaseSource: "manual",
+    });
+    const result = await bookReceipt(row({ totalCents: 10_000, taxCents: 900 }), rec.deps);
+    assert.equal(result.outcome, "booked");
+    assert.ok(Number(rec.existingExpense.taxAmount) > 0, "the OCR tax fills the gap it found");
+    assert.equal(rec.existingExpense.taxSource, "ocr", "and claims only the figure it read");
+    assert.equal(rec.existingExpense.taxDeductibleBase, 20, "the human base is untouched");
+    assert.equal(
+        rec.existingExpense.taxDeductibleBaseSource,
+        "manual",
+        "and still says a person decided it",
+    );
+});
+
+test("no tax means no provenance, so a bookkeeper can still answer", async () => {
+    const rec = recorder();
+    await bookReceipt(row({ taxCents: 0 }), rec.deps);
+    assert.equal(rec.expenses[0].taxAmount, null);
+    assert.equal(rec.expenses[0].taxSource, null, "nobody has decided anything yet");
+});
+
+test("an Expense re-attributed DURING the fill parks instead of booking", async () => {
+    // The pre-fill conflict check passed, the guarded fills ran, and a
+    // re-attribution committed underneath. Marking the intake row BOOKED here
+    // would tie this receipt to an Expense on somebody else's job.
+    const rec = recorder();
+    rec.existingExpense = phase3Expense();
+    let reads = 0;
+    (rec.deps.db as any).expense.findUnique = async () => {
+        reads += 1;
+        if (reads === 1) return { id: "expense-1" };
+        if (reads === 2) return rec.existingExpense;
+        // The post-fill re-read: somebody moved it.
+        return { projectId: "another-job", estimate: { projectId: "another-job" } };
+    };
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "expense-conflict:attribution");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
+    // Nothing was booked: the throw rolled the whole transaction back.
+    // The BOOKED write is Phase 2's VOID FENCE and now runs BEFORE the fills
+    // and the create, inside the same transaction as the throw — so a real
+    // Postgres rolls it back with everything else. The fake `$transaction`
+    // has no rollback, which is why the assertion is on what a rolled-back
+    // transaction can still be seen NOT to have done: no Expense, and no
+    // booking in the audit register.
+    assert.equal(rec.expenses.length, 0, "no Expense on a row that ended up on another job");
+    assert.equal(rec.events.length, 0, "and nothing is logged as booked");
+});
+
+test("the locks are taken in one order: the Purchase, the parents, then the Expense", async () => {
+    // ROUND 24 DECISION 3, asserted on the call order of the fake tx.
+    //
+    // Reading first and locking second leaves the decision resting on a value
+    // from before the lock, which is the race the lock exists to close — and
+    // taking the Expense before its parents is a cycle against every other
+    // writer of expense attribution.
+    const rec = recorder();
+    rec.existingExpense = onThisJob();
+    const trace: string[] = [];
+    const realFind = (rec.deps.db as any).expense.findUnique;
+    (rec.deps.db as any).expense.findUnique = async (args: any) => {
+        trace.push("read");
+        return realFind(args);
+    };
+    const realQuery = (rec.deps.db as any).$queryRawUnsafe;
+    (rec.deps.db as any).$queryRawUnsafe = async (query: string, ...args: any[]) => {
+        trace.push(
+            query.includes("pg_advisory_xact_lock") ? "lock"
+                : query.includes("FOR SHARE") ? "phase-share"
+                    : "phase-read",
+        );
+        return realQuery(query, ...args);
+    };
+    await bookReceipt(row(), rec.deps);
+
+    // 1. the per-Purchase advisory lock, before ANYTHING is read;
+    assert.equal(trace[0], "lock", "the Purchase's own lock comes first");
+    // 2. the attribution parents, before the id lookup;
+    const idReadAt = trace.indexOf("read");
+    assert.ok(idReadAt > 0, "something is read");
+    assert.ok(
+        trace.slice(0, idReadAt).filter(entry => entry === "phase-share").length >= 4,
+        "Project, Estimate, EstimateItem and CostCode are all held first",
+    );
+    // 3. the Expense last, and the decisive read INSIDE it.
+    const expenseLockAt = trace.lastIndexOf("lock");
+    assert.ok(expenseLockAt > idReadAt, "the id lookup, then its lock");
+    assert.ok(
+        trace.lastIndexOf("read") > expenseLockAt,
+        "and the decisive read happens INSIDE the per-expense lock",
+    );
+    assert.deepEqual(
+        rec.locks,
+        ["QB-1", "expense:expense-1"],
+        "the two advisory keys, purchase first and expense last",
+    );
+});
+
+// ── an implausible OCR tax is flagged, never booked (round 15, item 1) ─────
+
+test("$90 of tax on a $100 receipt is NOT booked as tax paid at source", async () => {
+    // buildGroups only rejects tax >= total, which leaves a wide band of
+    // nonsense: this satisfies every check the pipeline had and would land on a
+    // state excise return as a $90 deduction nobody looked at.
+    const rec = recorder();
+    const result = await bookReceipt(row({ totalCents: 10_000, taxCents: 9_000 }), rec.deps);
+    assert.equal(result.outcome, "booked", "the Purchase is real; only the tax read is wrong");
+    const created = rec.expenses[0];
+    assert.equal(created.taxAmount, null, "nothing implausible reaches the report");
+    assert.equal(created.taxAtSource, false);
+    assert.equal(created.needsTaxReview, true, "a person is asked instead");
+    assert.equal(created.taxSource, "ocr", "a machine DID look — that is what needs replacing");
+    assert.match(created.description, /needs review/);
+    assert.doesNotMatch(created.description, /incl\. \$90/);
+});
+
+test("a believable tax on the same receipt is booked normally", async () => {
+    // The control: same shape, a figure inside the bound.
+    const rec = recorder();
+    await bookReceipt(row({ totalCents: 10_000, taxCents: 900 }), rec.deps);
+    const created = rec.expenses[0];
+    assert.equal(created.taxAmount, 9);
+    assert.equal(created.taxAtSource, true);
+    assert.equal(created.needsTaxReview, false);
+    assert.equal(created.taxSource, "ocr");
+});
+
+test("an implausible read FILLS nothing on an already-booked Purchase", async () => {
+    // Worse here than on a new row: this one may already sit in a filing period
+    // somebody has reconciled.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({ amount: 100 });
+    await bookReceipt(row({ totalCents: 10_000, taxCents: 9_000 }), rec.deps);
+    assert.equal(rec.existingExpense.taxAmount, null);
+    assert.equal(rec.existingExpense.taxAtSource, false);
+    assert.equal(rec.existingExpense.needsTaxReview, true);
+});
+
+test("a manual deduction base that no longer fits a fresh OCR tax is flagged, not overwritten", async () => {
+    // scripts/apply-expense-attribution.mjs's Expense_taxDeductibleBase_check:
+    // base <= amount - COALESCE(taxAmount, 0). A bookkeeper's PATCH can set
+    // taxDeductibleBase while leaving taxAmount (and taxSource) null — the
+    // exact case from the finding: { amount: 100, taxAmount: null,
+    // taxDeductibleBase: 100, taxSource: null }. Writing an OCR taxAmount on
+    // top of that, unguarded, would shrink the ceiling below the base and
+    // violate the CHECK on every retry of this already-booked Purchase.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({ amount: 100, taxDeductibleBase: 100 });
+    const result = await bookReceipt(row({ totalCents: 10_000, taxCents: 900 }), rec.deps);
+    assert.equal(result.outcome, "booked", "the Purchase is real; the conflict is only about the tax fill");
+    assert.equal(rec.existingExpense.taxAmount, null, "an OCR figure that would break the CHECK is never written");
+    assert.equal(rec.existingExpense.taxAtSource, false);
+    assert.equal(rec.existingExpense.taxSource, null, "provenance is untouched — nothing was decided");
+    assert.equal(rec.existingExpense.taxDeductibleBase, 100, "the human's base stands");
+    assert.equal(rec.existingExpense.needsTaxReview, true, "a person resolves the conflict instead");
+});
+
+test("an OCR tax that fits inside a manual deduction base's ceiling is booked normally", async () => {
+    // The control for the test above: same manually-set base, but small
+    // enough that amount - taxAmount never dips below it.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({ amount: 100, taxDeductibleBase: 50, needsTaxReview: false });
+    const result = await bookReceipt(row({ totalCents: 10_000, taxCents: 900 }), rec.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(rec.existingExpense.taxAmount, 9);
+    assert.equal(rec.existingExpense.taxAtSource, true);
+    assert.equal(rec.existingExpense.taxSource, "ocr");
+    assert.equal(rec.existingExpense.taxDeductibleBase, 50, "the base is untouched by this write");
+    assert.equal(rec.existingExpense.needsTaxReview, false);
+});
+
+// ── the two provenances do not gate each other (round 16, item 1) ──────────
+
+test("an ANSWERED installedAtCustomer is never overwritten, whatever taxSource says", async () => {
+    // Its own value is the evidence: non-null means a person answered. This is
+    // the "no" case, which is the one that costs money if it is flipped — a
+    // false reads as "not resold" and keeps the receipt off the excise return.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({ installedAtCustomer: false });
+    await bookReceipt(row({ installedAtCustomer: true }), rec.deps);
+    assert.equal(rec.existingExpense.installedAtCustomer, false, "their answer stands");
+});
+
+test("a manual TAX figure does not block the capture's excise answer", async () => {
+    // The cross-field regression: `taxSource: "manual"` guards taxAmount and
+    // taxDeductibleBase. Letting it also guard installedAtCustomer meant a
+    // bookkeeper correcting a tax figure silently stopped every later capture
+    // from answering a question they never touched.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({ taxAmount: 16.55, taxAtSource: true, taxSource: "manual" });
+    await bookReceipt(row(), rec.deps);
+    assert.equal(rec.existingExpense.installedAtCustomer, true, "the capture answers it");
+    assert.equal(rec.existingExpense.taxAmount, 16.55, "and their figure is untouched");
+    assert.equal(rec.existingExpense.taxSource, "manual");
+});
+
+// ── the phase is held still across the money write (round 16, item 2) ──────
+
+test("a phase REMOVED between the read and the write parks, it does not book", async () => {
+    // Deterministic interleaving on the window that matters. The code was a
+    // phase of this job at both earlier checks; a person deletes it from the
+    // estimate while the booking transaction runs.
+    //
+    // Booking it would post money to a line the job no longer has. Booking it
+    // UNCODED would silently discard a phase a person captured. Neither is this
+    // pipeline's call, and the Purchase already exists — so the row parks.
+    let asked = 0;
+    const rec = recorder({
+        isCostCodeAllowed: async () => {
+            asked += 1;
+            return asked < 3; // valid before the send and after it, gone by the write
+        },
+    });
+    const result = await bookReceipt(row({ costCodeId: "cc-demo" }), rec.deps);
+
+    assert.equal(asked, 3, "asked again inside the transaction");
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        // Its OWN reason, not an expense-conflict: nothing about the existing
+        // Expense is wrong, and the fix is a person re-phasing the row.
+        assert.equal(result.reason, "phase-changed:not-a-phase");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
+    assert.equal(rec.expenses.length, 0, "no Expense was written");
+    assert.equal(
+        rec.intakeUpdates.filter((update: any) => update.state === "BOOKED").length, 0,
+        "and nothing was marked BOOKED",
+    );
+});
+
+test("the in-transaction check happens AFTER the phase rows are locked", async () => {
+    // Asking before the lock answers about a moment the lock then fails to
+    // preserve — the whole point of taking it.
+    const order: string[] = [];
+    const rec = recorder({
+        isCostCodeAllowed: async () => {
+            order.push("ask");
+            return true;
+        },
+    });
+    const passThrough = (rec.deps.db as any).$queryRawUnsafe;
+    (rec.deps.db as any).$queryRawUnsafe = async (query: string, ...args: any[]) => {
+        // The PHASE locks specifically. The attribution pair takes its own
+        // FOR SHARE on the estimate at the create site (round 21, item 1),
+        // which is a different question and must not be counted as one of
+        // these.
+        if (query.includes("FOR SHARE") && !/FROM "Estimate" WHERE id = \$1 FOR SHARE/.test(query)) {
+            order.push("phase-share");
+        }
+        return passThrough(query, ...args);
+    };
+    await bookReceipt(row({ costCodeId: "cc-demo" }), rec.deps);
+    // ask (pre-send), ask (post-create), then the share locks, and only then
+    // the question that decides the write.
+    assert.deepEqual(order.slice(0, 2), ["ask", "ask"]);
+    const lastShare = order.lastIndexOf("phase-share");
+    assert.ok(lastShare > 1, "the locks come after the two stateless checks");
+    assert.equal(order[order.length - 1], "ask", "and the decisive question comes last");
+    assert.equal(
+        order.filter(entry => entry === "ask").length, 3,
+        "asked once more, inside the transaction",
+    );
+});
+
+test("a row with NO phase is not parked by this check", async () => {
+    // Nothing to revalidate, so the extra question is not even asked — and an
+    // uncoded receipt still books, exactly as before.
+    let asked = 0;
+    const rec = recorder({
+        isCostCodeAllowed: async () => {
+            asked += 1;
+            return false; // the captured code was never a phase of this job
+        },
+    });
+    const result = await bookReceipt(row({ costCodeId: "cc-from-another-job" }), rec.deps);
+    assert.equal(result.outcome, "booked", "it books UNCODED, as it always did");
+    assert.equal(asked, 2, "no third question once there is no code left to check");
+    assert.equal(rec.expenses[0].costCodeId, null);
+});
+
+// ── a machine's capture is not a human's (round 18, item 3) ────────────────
+
+test("a phase captured by a PERSON books as untouchable 'capture'", async () => {
+    const rec = recorder();
+    await bookReceipt(row({ costCodeId: "cc-demo", costCodeSource: "user" }), rec.deps);
+    assert.equal(rec.expenses[0].costCodeId, "cc-demo");
+    assert.equal(rec.expenses[0].costCodeSource, "capture");
+});
+
+test("a phase captured by a FORWARDER books as correctable 'machine'", async () => {
+    // A Drive folder name is a guess. Booking it as "capture" gave it exactly
+    // the authority of a person who picked it, and froze it against every later
+    // pass that could have corrected it.
+    const rec = recorder();
+    await bookReceipt(row({ costCodeId: "cc-demo", costCodeSource: "machine" }), rec.deps);
+    assert.equal(rec.expenses[0].costCodeId, "cc-demo");
+    assert.equal(rec.expenses[0].costCodeSource, "machine");
+});
+
+test("a row captured before the column existed is treated as a machine guess", async () => {
+    // The safe direction: it leaves the phase correctable rather than freezing
+    // an unattributed guess in place forever.
+    const rec = recorder();
+    await bookReceipt(row({ costCodeId: "cc-demo", costCodeSource: null }), rec.deps);
+    assert.equal(rec.expenses[0].costCodeSource, "machine");
+});
+
+// ── a recovered row gets its receipt link (round 18, item 6) ───────────────
+
+test("an existing Expense with NO receiptUrl is given one", async () => {
+    // v1 created plenty of these, and a crash between the Purchase and the
+    // commit leaves one too. A receipt nobody can open is the difference
+    // between a defensible deduction and a number in a spreadsheet.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({ receiptUrl: null });
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "booked");
+    assert.ok(rec.existingExpense.receiptUrl, "the link is filled");
+});
+
+test("an EXISTING receiptUrl is never replaced", async () => {
+    // Somebody may have fixed it by hand, or an earlier pass wrote a better
+    // one. The guard is the predicate, so a value that appears between the read
+    // and the write survives as well.
+    const rec = recorder();
+    rec.existingExpense = onThisJob({
+        receiptUrl: "https://drive.google.com/file/d/HAND-FIXED/view",
+    });
+    await bookReceipt(row(), rec.deps);
+    assert.equal(
+        rec.existingExpense.receiptUrl,
+        "https://drive.google.com/file/d/HAND-FIXED/view",
+        "the existing link stands",
+    );
+});
+
+// ── the attribution is filled as a PAIR (round 20, item 3) ─────────────────
+
+test("an alreadyExists row gets BOTH halves of the attribution", async () => {
+    // Writing `projectId` alone onto a row whose `estimateId` came from v1 (or
+    // an estimate deletion) leaves an expense claiming two jobs: the column
+    // says one thing, every join through the estimate says another.
+    //
+    // A row pointing at a DIFFERENT estimate does not reach here at all — that
+    // is `expense-conflict:estimate`, above — so the pair fill is for the row
+    // that has NO estimate to disagree with, which is what `onDelete: SetNull`
+    // leaves behind.
+    const rec = recorder();
+    rec.existingExpense = phase3Expense({ estimateId: null });
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "booked");
+    const fill = fillData(rec);
+    assert.equal(fill.projectId, "proj-1");
+    assert.equal(fill.estimateId, "est-1", "the estimate this booking resolved");
+    // ONE statement, both columns — never one without the other.
+    const pairWrite = rec.expenseUpdates.find((u: any) => "projectId" in (u.data ?? {}));
+    assert.ok(pairWrite && "estimateId" in pairWrite.data, "the pair moves together");
+    assert.equal(pairWrite.where.projectId, null, "and only onto a row that has no job yet");
+});
+
+test("an estimate REASSIGNED under the fill parks instead of half-writing", async () => {
+    // The locked read is the first thing that can see the move. Filling
+    // `projectId` from the intake row while the estimate now belongs elsewhere
+    // is the two-jobs-at-once state, so nobody is booked.
+    const rec = recorder();
+    rec.state.estimateProjectId = "another-job";
+    rec.existingExpense = phase3Expense();
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "expense-conflict:attribution");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists");
+    }
+    // The BOOKED write is Phase 2's VOID FENCE and now runs BEFORE the fills
+    // and the create, inside the same transaction as the throw — so a real
+    // Postgres rolls it back with everything else. The fake `$transaction`
+    // has no rollback, which is why the assertion is on what a rolled-back
+    // transaction can still be seen NOT to have done: no Expense, and no
+    // booking in the audit register.
+    assert.equal(rec.expenses.length, 0, "no Expense was written");
+    assert.equal(rec.events.length, 0, "and nothing is logged as booked");
+});
+
+test("a phase CLEARED between the read and the fill is not overrun either", async () => {
+    // THE SQL GUARD ON ITS OWN. The reconcile refuses to offer a phase for a
+    // row whose READ already said "a human decided" — but the read is not the
+    // last word: a bookkeeper can clear the phase in the gap between it and
+    // the write. Then the decision was made from a legacy-looking row and only
+    // `notHumanCodedExpenseWhere()` in the predicate stands between the
+    // machine's suggestion and the person's clear.
+    const rec = recorder();
+    rec.existingExpense = onThisJob();
+    const seenByBooking = { ...rec.existingExpense };
+    let reads = 0;
+    (rec.deps.db as any).expense.findUnique = async () => {
+        reads += 1;
+        if (reads === 1) return { id: "expense-1" };
+        if (reads > 2) return rec.existingExpense;
+        // The PATCH lands: the phase is cleared, deliberately, by a person.
+        rec.existingExpense = {
+            ...rec.existingExpense,
+            costCodeId: null,
+            costCodeSource: "manual-none",
+        };
+        return seenByBooking;
+    };
+
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "booked");
+    // The fill WAS attempted from the stale read — that is the premise — and
+    // the predicate is what made it match zero rows.
+    const attempted = rec.expenseUpdates.find((u: any) => "costCodeId" in (u.data ?? {}));
+    assert.ok(attempted, "the write was issued");
+    assert.equal(rec.existingExpense.costCodeId, null, "and the clear survived it");
+    assert.equal(rec.existingExpense.costCodeSource, "manual-none");
+});
+
+test("the post-fill attribution check runs even when there was nothing to fill", async () => {
+    // ROUND 24: Phase 2's void fence made the fills conditional, and the
+    // re-attribution check must NOT become conditional with them. An empty
+    // `fill` means every column this pass had an opinion about was already
+    // answered — it does not mean the row cannot move. The writer that moves
+    // it does not take the per-expense lock, so it can commit between the
+    // reconcile's read and this commit on a row this pass never wrote to.
+    const rec = recorder();
+    // Fully answered: no phase fill (a human's), no tax fill, no excise fill,
+    // no receipt-link fill, no pair fill. `fill` comes back empty.
+    rec.existingExpense = onThisJob({
+        costCodeId: "cc-human", costCodeSource: "manual",
+        taxAmount: 9.99, taxAtSource: true, taxSource: "manual",
+        installedAtCustomer: false,
+        receiptUrl: "https://drive.google.com/file/d/HAND-FIXED/view",
+    });
+    let reads = 0;
+    (rec.deps.db as any).expense.findUnique = async () => {
+        reads += 1;
+        if (reads === 1) return { id: "expense-1" };
+        if (reads === 2) return rec.existingExpense;
+        // The post-fill re-read: somebody moved it while this pass wrote
+        // nothing at all.
+        return { projectId: "another-job", estimate: { projectId: "another-job" } };
+    };
+
+    const result = await bookReceipt(row(), rec.deps);
+
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "expense-conflict:attribution");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
+    // CONTROL: this pass really did have nothing to write, so the check cannot
+    // be passing because a guarded fill happened to run.
+    assert.equal(rec.expenseUpdates.length, 0, "no fill was issued");
+    assert.equal(rec.events.length, 0, "and nothing is logged as booked");
 });

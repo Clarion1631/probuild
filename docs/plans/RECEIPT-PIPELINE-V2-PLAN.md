@@ -125,7 +125,7 @@ Tabs by state: Needs job, Needs review, Booking (with reason), Booked today, Mis
 
 ### Tax paid at source (decision 7)
 
-- Gemini already extracts `taxAmount`. Store it. Crew/Marge flag `installedAtCustomer` (default true for job-folder receipts, false for Shop).
+- Gemini already extracts `taxAmount`. Store it. Crew/Marge flag `installedAtCustomer` — **nothing defaults it** (superseded during PR #442: an earlier build defaulted it to true for any non-overhead job, which claims a deduction nobody looked at; WAC 458-20-102(12)(b) allows the cost of the articles actually RESOLD, and a receipt coded to a live job is just as likely to be consumables, tools, fuel or dump fees). A NULL is "nobody said" and the report skips it.
 - `/reports/tax-paid-at-source`: per period, per job, the deductible amount for the WA excise return "taxable amount for tax paid at source" line. This is the first bookkeeper task ProBuild absorbs. Others (month close, sales tax filing prep) get scoped after we list what Vanessa actually does each month.
 
 ### Gusto (decision 6)

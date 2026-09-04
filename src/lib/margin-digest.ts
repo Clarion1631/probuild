@@ -166,13 +166,16 @@ export async function biggestUnattributedCost(projectId: string): Promise<Unattr
         select: {
             amount: true, vendor: true, date: true, description: true,
             costCodeId: true,
+            // See resolveActualCostCodeId: "manual-none" is a person saying
+            // there is no phase, and it must stop the item fallback here too.
+            costCodeSource: true,
             item: { select: { costCodeId: true } },
         },
     });
 
     let worst: UnattributedCost | null = null;
     for (const row of rows) {
-        if (resolveActualCostCodeId(row.costCodeId, row.item?.costCodeId) !== null) continue;
+        if (resolveActualCostCodeId(row.costCodeId, row.item?.costCodeId, row.costCodeSource) !== null) continue;
         const amount = Number(row.amount) || 0;
         if (worst === null || Math.abs(amount) > Math.abs(worst.amount)) {
             worst = { vendor: row.vendor, amount, date: row.date, description: row.description };

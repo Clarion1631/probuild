@@ -5,6 +5,7 @@ import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
 import { geocodeJobSiteAddress } from "@/lib/geocode";
 import { assertLeadAccess } from "@/lib/lead-access";
+import { isEstimateAttributionPairConflict } from "@/lib/expense-attribution";
 
 // Shared geofence-field parsing for POST — used by both the lead-linked and
 // plain creation paths below. Returns an error NextResponse to short-circuit
@@ -172,6 +173,18 @@ export async function POST(req: Request) {
             const result = await convertLeadToProjectCore(leadId);
             projectId = result.id;
         } catch (e: any) {
+            // The lead carries an estimate whose expenses are still pinned to
+            // another job (Codex round 32). Moving the estimate would strand
+            // them there while everything else followed the new project, so the
+            // conversion refuses — a CONFLICT, not a server error, and the
+            // message names the estimates and jobs the operator has to
+            // re-attribute first.
+            if (isEstimateAttributionPairConflict(e)) {
+                return NextResponse.json(
+                    { error: e.message, conflicts: e.conflicts },
+                    { status: 409 }
+                );
+            }
             // Two concurrent requests can both pass the precheck above; the loser
             // hits Project.leadId's unique constraint inside the conversion's
             // transaction. Map that race to the same 409 the precheck returns.

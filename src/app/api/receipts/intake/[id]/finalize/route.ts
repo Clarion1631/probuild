@@ -4,7 +4,9 @@ import { prisma } from "@/lib/prisma";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
 import { userCanAccessProject } from "@/lib/mobile-auth";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { captureActorSource, optionalBool } from "@/lib/receipt-capture-validation";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import {
     declaredShaConflict,
@@ -125,7 +127,23 @@ async function applyLateFields(
     const denial = await reconcileLateFields(id, lateFields, {
         read: rowId => prisma.receiptIntake.findUnique({
             where: { id: rowId },
-            select: { costCodeId: true, projectId: true, state: true, claimToken: true },
+            // `installedAtCustomer` rides the same null-or-equal,
+            // only-before-routed, unclaimed rule as the two ids.
+            //
+            // `costCodeSource` MUST be here. This route adds it to `lateFields`
+            // whenever a phase is supplied (it is derived from the caller, not
+            // read off the body), so it is a key the rules reconcile — and a
+            // reconciled key that is not SELECTed comes back `undefined`, which
+            // the null-or-equal test scores as "already carries a different
+            // value". Every finalize carrying a costCodeId 409'd with
+            // `late-fields-conflict` on a field the caller never sent, and the
+            // phase was never applied (e2e/receipt-intake.spec.ts rounds 9+10).
+            // `reconcileLateFields` now throws rather than silently refusing if
+            // this drifts again.
+            select: {
+                costCodeId: true, costCodeSource: true, projectId: true,
+                installedAtCustomer: true, state: true, claimToken: true,
+            },
         }),
         applyIfNull: async (rowId, state, toApply) => {
             const { count } = await evidenceUpdateMany({
@@ -155,7 +173,10 @@ async function applyLateFields(
  * Without the second, a cost code from another job rides into the Expense and
  * every variance report reads it as overspend on a line nobody budgeted.
  */
-async function authorizeFinalization(
+/** Exported for tests/finalize-late-field-authz.test.ts — the project-access
+ *  half of this is the only thing standing between a late `projectId` and a
+ *  job the caller cannot see. */
+export async function authorizeFinalization(
     auth: Extract<IntakeAuth, { ok: true }>,
     rowProjectId: string | null,
     lateFields: LateFields,
@@ -222,6 +243,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         uploadLease?: unknown;
         costCodeId?: unknown;
         projectId?: unknown;
+        installedAtCustomer?: unknown;
     } = {};
     const rawBody = await req.text();
     if (rawBody.trim()) {
@@ -253,15 +275,26 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // disagree — silently overwriting a value a human already set is the one
     // outcome that loses information nobody can recover.
     //
-    // NOTE: Phase 3's `installedAtCustomer` does not exist on this model; the
-    // same rule will apply to it when it lands.
+    // Phase 3's `installedAtCustomer` rides the same rule. It is a TRI-STATE,
+    // so "the caller did not say" (null) is excluded from the set below exactly
+    // like an absent id — silence is never an answer, and never overwrites one.
     const lateInput = {
         costCodeId: typeof body.costCodeId === "string" && body.costCodeId.trim() ? body.costCodeId.trim() : null,
         projectId: typeof body.projectId === "string" && body.projectId.trim() ? body.projectId.trim() : null,
+        installedAtCustomer: optionalBool(body.installedAtCustomer),
     };
     const lateFields = Object.fromEntries(
         Object.entries(lateInput).filter(([, v]) => v !== null),
-    ) as Partial<{ costCodeId: string; projectId: string }>;
+    ) as LateFields;
+    // A LATE PHASE CARRIES THE SAME PROVENANCE A CAPTURED ONE DOES.
+    //
+    // Derived from the CALLER, never read off the body: a signed-in person
+    // answering is "user", a shared-secret forwarder resolving the job from a
+    // Drive folder is "machine". Booking makes the first untouchable and leaves
+    // the second correctable, which is the whole point of recording it.
+    if (lateFields.costCodeId) {
+        lateFields.costCodeSource = captureActorSource(auth.via);
+    }
 
     const row = await prisma.receiptIntake.findUnique({
         where: { id },
@@ -269,6 +302,21 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             id: true, source: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
             mimeType: true, projectId: true, costCodeId: true, dryRun: true, createdById: true,
             fileSha256: true, expectedSha256: true, uploadLeaseVersion: true,
+            // Part of the merge and the publish CAS for the same reason
+            // `installedAtCustomer` is: a captured field this read omits is a
+            // field `mergeCapturedFields` sees as null and overwrites. /start
+            // stamps this from ITS caller, so leaving it out let a machine
+            // finalize relabel a person's phase as machine-set — and booking
+            // treats a user-set phase as untouchable and a machine-set one as
+            // correctable.
+            costCodeSource: true,
+            // A CAPTURED TAX ANSWER, and therefore part of the merge and the
+            // publish CAS. Leaving it out of this read made the publish the one
+            // path that could overwrite it: `mergeCapturedFields` saw no stored
+            // value, so a late `false` landed on a row that already said `true`
+            // and the excise report changed answer with nothing recording that
+            // the first one existed.
+            installedAtCustomer: true,
             // Read for ONE reason: the signed upload URL this row was given is
             // a write capability that outlives every decision below, so every
             // object deletion on this path has to be scheduled for after it
@@ -561,7 +609,12 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // the job at /start and sent a different one at finalize simply won, and
     // nothing recorded that the first answer had ever existed.
     const merged = mergeCapturedFields(
-        { projectId: row.projectId, costCodeId: row.costCodeId },
+        {
+            projectId: row.projectId,
+            costCodeId: row.costCodeId,
+            costCodeSource: row.costCodeSource,
+            installedAtCustomer: row.installedAtCustomer,
+        },
         lateFields,
     );
     if ("status" in merged) return NextResponse.json(merged.body, { status: merged.status });
@@ -599,6 +652,10 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     // ONE shared seal-and-publish, also used by the worker's stale-STAGING
     // sweep, so the two publishers cannot diverge on ordering or fencing.
+    // Set by the commit below when the phase stopped being one while we were
+    // publishing. Distinct from a lost CAS, which means somebody else moved the
+    // row — this means the row is fine and the world changed around it.
+    let phaseRejectedAtPublish: string | null = null;
     const outcome = await sealAndPublish(row.storagePath, id, row.uploadLeaseVersion, check, {
         inShortTx,
         seal: sealObject,
@@ -607,6 +664,24 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             // state transition the missing-receipt sweep reads, so it takes
             // the evidence lock like every other evidence write here.
             await lockReceiptEvidence(tx);
+            // THE PHASE ANSWER THAT COUNTS (round 17, item 5).
+            //
+            // `authorizePhase` above ran on the global client and held nothing.
+            // This one locks the four tables the answer rests on and reads them
+            // on the transaction that is about to publish, so an estimate
+            // archived or reassigned, or a code deactivated, in that window
+            // cannot be published onto the row.
+            if (merged.resulting.costCodeId) {
+                const verdict = await assertPhaseOfProjectTx(
+                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                    merged.resulting.projectId,
+                    merged.resulting.costCodeId,
+                );
+                if (!verdict.ok) {
+                    phaseRejectedAtPublish = verdict.reason;
+                    return 0;
+                }
+            }
             const { count } = await tx.receiptIntake.updateMany({
                 // Fenced on the EXACT state and reason observed, on the row
                 // being unclaimed, and on every captured value this publish was
@@ -652,6 +727,18 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     if (!outcome) {
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
+    // Checked BEFORE the lost-CAS branch: nothing was published, and answering
+    // "already finalized" would be a lie the client acts on.
+    if (phaseRejectedAtPublish) {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "phase-not-on-project",
+                reason: `the phase stopped being one of this job's phases while publishing (${phaseRejectedAtPublish})`,
+            },
+            { status: 409 },
+        );
+    }
     if (!outcome.published) {
         // The CAS lost — which is now TWO different things. Either another
         // publisher moved the row (the caller's answer is "already finalized"),
@@ -672,7 +759,11 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // only with these exact bytes.
         const current = await prisma.receiptIntake.findUnique({
             where: { id },
-            select: { state: true, sourceRef: true, projectId: true, dryRun: true, storagePath: true, fileSha256: true },
+            select: {
+                state: true, sourceRef: true, projectId: true, dryRun: true,
+                storagePath: true, fileSha256: true,
+                costCodeId: true, installedAtCustomer: true,
+            },
         });
         const positivelyPublished = !!current
             && current.state !== "STAGING"

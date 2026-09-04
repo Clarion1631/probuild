@@ -99,6 +99,12 @@ export async function resolveReceiptUrl(
  * Every reader that renders `receiptUrl` as an href — the bookkeeper queue,
  * the project expenses tab — must resolve it first: the column stores the
  * stable reference book.ts writes, not a link a browser can open.
+ *
+ * ONE COPY, because there are two doors onto the same tab: the page's initial
+ * server render and the client refresh after a save. The refresh returned the
+ * raw column, so every `receipt-intake://…` receipt stopped opening the moment
+ * a bookkeeper edited a tax figure — the row was there, the link was a scheme
+ * the browser has never heard of.
  */
 export async function resolveReceiptUrls<T extends { receiptUrl: string | null }>(
     rows: T[],

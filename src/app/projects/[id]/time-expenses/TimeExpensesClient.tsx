@@ -19,11 +19,15 @@ interface Props {
     };
     currentUser: { id: string; role: string; name: string };
     companyTimeZone: string;
+    /** This project's phases, for the Tax & phase panel. */
+    phases?: { id: string; code: string; name: string }[];
+    /** `financialReports` — gates that panel. */
+    canEditTax?: boolean;
 }
 
 type Tab = "time" | "expenses";
 
-export default function TimeExpensesClient({ project, data, currentUser, companyTimeZone }: Props) {
+export default function TimeExpensesClient({ project, data, currentUser, companyTimeZone, phases = [], canEditTax = false }: Props) {
     const [activeTab, setActiveTab] = useState<Tab>("time");
     const [showTimeModal, setShowTimeModal] = useState(false);
     const [showExpenseModal, setShowExpenseModal] = useState(false);
@@ -88,6 +92,8 @@ export default function TimeExpensesClient({ project, data, currentUser, company
                     onAddNew={() => setShowExpenseModal(true)}
                     currentUser={currentUser}
                     changeOrders={data.changeOrders}
+                    phases={phases}
+                    canEditTax={canEditTax}
                 />
             )}
 
@@ -107,7 +113,18 @@ export default function TimeExpensesClient({ project, data, currentUser, company
                 <NewExpenseEntryModal
                     projectId={project.id}
                     estimates={data.estimates}
-                    costCodes={data.costCodes}
+                    // THIS JOB'S PHASES, not every active cost code in the
+                    // company (round 19, item 5). The form offered all of them
+                    // and the server then refused anything that is not a phase
+                    // of this job — a picker whose options were mostly errors,
+                    // and an invitation to pick one.
+                    //
+                    // No fallback to the company list when a job has no phases
+                    // yet: the server refuses every code in that case, so
+                    // offering them would only reproduce the same dead end.
+                    // "None" is always available, and an expense with no phase
+                    // is a normal, correctable row.
+                    costCodes={phases.map(phase => ({ id: phase.id, name: phase.name, code: phase.code }))}
                     costTypes={data.costTypes}
                     companyTimeZone={companyTimeZone}
                     changeOrders={data.changeOrders}

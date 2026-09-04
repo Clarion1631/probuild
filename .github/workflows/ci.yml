@@ -100,6 +100,87 @@ jobs:
         env:
           RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # The phase invariant's PHANTOM hole. Everything else in that suite runs
+      # against a scripted fake, which has no lock manager and so cannot tell a
+      # verdict that holds its rows from one that merely read them.
+      - name: Phase-invariant proof-query lock against real Postgres
+        run: npx tsx --test tests/phase-invariant-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # The deploy bridge's TRIGGERS. Every other test of them reads the SQL as
+      # text; only a real server can say whether a BEFORE UPDATE trigger
+      # actually keeps an old writer's amount change from leaving a stale tax
+      # classification — or from failing the CHECK constraints outright.
+      - name: Expense attribution compatibility triggers against real Postgres
+        run: npx tsx --test tests/expense-attribution-triggers-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # The Project/Estimate acquisition order, both ways round. Carries its own
+      # pre-fix CONTROL: the old Estimate-then-Project sequence really does
+      # raise 40P01 against a Project-first editor, so the tests that follow are
+      # measuring the fix rather than an interleaving that never collided.
+      - name: Attribution lock order against real Postgres
+        run: npx tsx --test tests/attribution-lock-order-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # THE MIXED-VERSION DRAIN WINDOW. An old instance's INSERT is raw SQL that
+      # names neither new column -- a shape today's Prisma client cannot express --
+      # and the fix is a trigger that stamps it and takes the route's advisory lock.
+      # Neither half exists outside a real server.
+      - name: Receipt-ingest drain-window bridge against real Postgres
+        run: npx tsx --test tests/receipt-ingest-drain-window-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # The backfill's coverage headline against the report it claims to describe,
+      # on one seeded database. A hand-built fixture cannot catch the two readers
+      # drifting apart, because the fixture is written by whoever wrote the code.
+      - name: Backfill coverage parity with the variance report
+        run: npx tsx --test tests/backfill-coverage-parity-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # An index can EXIST and enforce nothing. A failed CREATE INDEX
+      # CONCURRENTLY leaves the index behind with the right name and
+      # `indisvalid = false`; the planner ignores it, a UNIQUE one guards
+      # nothing, and `IF NOT EXISTS` then matches the name forever. Only a real
+      # server can produce that state, so only a real server can prove the
+      # verifier notices it and rebuilds it.
+      - name: Apply-script index validity against real Postgres
+        run: npx tsx --test tests/apply-script-index-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # The excise deduction's FILTER, against the real planner. A relation
+      # filter like `{ estimate: { projectId: null } }` compiles to an EXISTS,
+      # so it silently excludes rows with no estimate at all -- the shape
+      # ON DELETE SET NULL creates. Only a real database can answer that.
+      - name: Tax-at-source report filter against real Postgres
+        run: npx tsx --test tests/tax-at-source-report-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # THE APPLY SCRIPT, RUN FOR REAL (round 46, item 0).
+      #
+      # Every other test in this repo imports the script's CONSTANTS and checks
+      # their text. `main()` -- the part that connects, runs the phases and
+      # VERIFIES the result -- had never executed in CI, and it was broken: the
+      # CHECK-constraint comparison used regexes that do not match Postgres 16's
+      # rendering, so the script exited 1 on a database it had just built
+      # correctly. A deploy blocker no amount of source-text testing could see.
+      #
+      # The driver builds a PRE-PHASE-3 database (the phase-3 migration is moved
+      # aside), so this is a genuine from-scratch apply, then runs pre-deploy,
+      # post-deploy, and pre-deploy again for idempotency.
+      - name: Apply script end-to-end against real Postgres
+        run: node scripts/ci-apply-expense-attribution-e2e.mjs
+        env:
+          APPLY_E2E_SERVER_URL: postgresql://probuild:probuild@localhost:5432/postgres
+          APPLY_E2E_DB: probuild_apply
+
       # The missing-receipt sweep's component transaction, at the isolation it
       # actually runs at. Postgres SSI is the whole fence for evidence writers
       # this PR does not own (a ReceiptIntake insert, an Expense receipt

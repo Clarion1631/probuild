@@ -230,15 +230,40 @@ test("the Expense writes round 45 found are all fenced now", () => {
      * prisma CLIENT"). This pins the five specific sites, so a future edit that
      * reverts one is named rather than merely counted.
      */
+    // ROUND 24 OF PR #442: four of the five now sit inside a transaction this
+    // branch already owned (a locked, guarded delete; a locked expense edit; a
+    // locked approve; a per-row locked change-order retag), so they take
+    // `lockReceiptEvidence(tx)` as that transaction's FIRST statement instead
+    // of going through the `withReceiptEvidenceLock` wrapper. The wrapper is
+    // for a BARE single write; the fence is the same lock either way, and this
+    // now checks the fence rather than the spelling.
     const sites: Array<[string, RegExp]> = [
-        ["src/lib/actions.ts", /withReceiptEvidenceLock\(fn => prisma\.\$transaction\(fn\),\s*\n\s*tx => tx\.expense\.deleteMany\(\{ where: \{ estimateId \} \}\)\)/],
-        ["src/app/api/expenses/[id]/route.ts", /tx => tx\.expense\.deleteMany\(\{ where: \{ id, qbPurchaseId: null \} \}\)\)/],
-        ["src/app/api/expenses/[id]/route.ts", /withReceiptEvidenceLock\(fn => prisma\.\$transaction\(fn\), tx => tx\.expense\.update\(\{/],
-        ["src/app/api/expenses/[id]/approve/route.ts", /withReceiptEvidenceLock\(fn => prisma\.\$transaction\(fn\), tx => tx\.expense\.update\(\{/],
-        ["src/lib/time-expense-core.ts", /withReceiptEvidenceLock<\{ count: number \}>\(fn => prisma\.\$transaction\(fn\), tx => tx\.expense\.updateMany\(\{/],
+        ["src/lib/actions.ts", /tx => tx\.expense\.deleteMany\(\{ where: \{ estimateId \} \}\)\)/],
+        ["src/app/api/expenses/[id]/route.ts", /tx\.expense\.deleteMany\(\{[\s\S]{0,40}?where: \{/],
+        ["src/app/api/expenses/[id]/route.ts", /await tx\.expense\.updateMany\(\{/],
+        ["src/app/api/expenses/[id]/approve/route.ts", /const result = await tx\.expense\.updateMany\(\{/],
+        ["src/lib/time-expense-core.ts", /await tx\.expense\.updateMany\(\{/],
     ];
     for (const [file, pattern] of sites) {
-        assert.match(read(file), pattern, `${file} still writes Expense evidence outside the fence`);
+        const source = read(file);
+        const match = pattern.exec(source);
+        assert.ok(match, `${file} no longer contains the write this pins`);
+        // THE FENCE, not the spelling: the transaction this write is inside
+        // must have taken the evidence lock before reaching it. `lastIndexOf`
+        // from the write walks back to the enclosing transaction, and the lock
+        // has to sit between the two.
+        const writeAt = match.index;
+        const txAt = Math.max(
+            source.lastIndexOf("$transaction(async tx => {", writeAt),
+            source.lastIndexOf("withReceiptEvidenceLock(", writeAt),
+        );
+        assert.ok(txAt > 0, `${file}: the write is not inside a transaction at all`);
+        const lockAt = source.indexOf("await lockReceiptEvidence(tx);", txAt);
+        const wrapped = source.slice(txAt, writeAt).includes("withReceiptEvidenceLock(");
+        assert.ok(
+            wrapped || (lockAt > txAt && lockAt < writeAt),
+            `${file} still writes Expense evidence outside the fence`,
+        );
     }
 });
 

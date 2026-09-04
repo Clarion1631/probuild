@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere, resolveExpenseProjectId } from "@/lib/expense-attribution";
 import {
     formatLocalDateString,
     defaultMonthRange,
@@ -111,10 +112,17 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
                         { date: { gte: filters.from, lt: filters.to } },
                         { AND: [{ date: null }, { createdAt: { gte: filters.from, lt: filters.to } }] },
                     ],
-                    ...(filters.projectId ? { estimate: { projectId: filters.projectId } } : {}),
+                    // Nested under AND, never spread — the date coalesce above
+                    // already owns this object's only `OR` key.
+                    ...(filters.projectId
+                        ? { AND: [expenseForProjectWhere(filters.projectId)] }
+                        : {}),
                 },
                 include: {
-                    estimate: { select: { project: { select: { id: true, name: true } } } },
+                    // BOTH sides — see payouts-report: a row must be labelled
+                    // by the project the filter selected it by.
+                    project: { select: { id: true, name: true } },
+                    estimate: { select: { projectId: true, project: { select: { id: true, name: true } } } },
                 },
                 orderBy: { date: "desc" },
             })
@@ -174,8 +182,8 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
             description: exp.description ?? exp.vendor ?? "Expense",
             type: "Expense",
             amount: Number(exp.amount),
-            projectName: exp.estimate.project?.name ?? "No Project",
-            projectId: exp.estimate.project?.id ?? null,
+            projectName: exp.project?.name ?? exp.estimate?.project?.name ?? "No Project",
+            projectId: resolveExpenseProjectId(exp),
             category: "Expense",
         });
     }

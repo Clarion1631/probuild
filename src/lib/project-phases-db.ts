@@ -25,6 +25,14 @@ export const prismaPhaseDataSource: PhaseDataSource = {
             where: {
                 estimate: { projectId, ...PHASE_ELIGIBLE_ESTIMATE_WHERE },
                 costCodeId: { not: null },
+                // A DEACTIVATED code is not a phase anybody may post to. It was
+                // read through and handed back with `isActive: false` attached,
+                // which every caller then had to remember to check — and the
+                // validation path did not, so a code retired company-wide still
+                // passed "is this a phase of this job?". The Safety phase has
+                // always been filtered this way (getSafetyCostCode returns null
+                // for an inactive row); this makes the estimate half agree.
+                costCode: { isActive: true },
             },
             select: { costCode: { select: { id: true, code: true, name: true, description: true, isActive: true } } },
             distinct: ["costCodeId"],

@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere, resolveExpenseProjectId } from "@/lib/expense-attribution";
 import {
     formatLocalDateString,
     defaultMonthRange,
@@ -61,11 +62,21 @@ export async function queryPayoutsData(filters: PayoutsFilters): Promise<{
                         { date: { gte: filters.from, lt: filters.to } },
                         { AND: [{ date: null }, { createdAt: { gte: filters.from, lt: filters.to } }] },
                     ],
-                    // Expense → Project via estimate.projectId
-                    ...(filters.projectId ? { estimate: { projectId: filters.projectId } } : {}),
+                    // Expense → Project BOTH ways (Phase 3). Nested under AND,
+                    // never spread: this `where` already owns an `OR` key for
+                    // the date coalesce, and spreading a second one would
+                    // silently replace it and drop the date window entirely.
+                    ...(filters.projectId
+                        ? { AND: [expenseForProjectWhere(filters.projectId)] }
+                        : {}),
                 },
                 include: {
-                    estimate: { select: { project: { select: { id: true, name: true } } } },
+                    // BOTH sides, so the row can be LABELLED by the same
+                    // project the filter above selected it by. Labelling off
+                    // the estimate while filtering on the resolver would list a
+                    // re-attributed expense under the job it used to be on.
+                    project: { select: { id: true, name: true } },
+                    estimate: { select: { projectId: true, project: { select: { id: true, name: true } } } },
                     purchaseOrder: { select: { code: true } },
                 },
                 orderBy: { date: "desc" },
@@ -100,8 +111,8 @@ export async function queryPayoutsData(filters: PayoutsFilters): Promise<{
             vendorName: exp.vendor ?? "Unknown Vendor",
             type: "Expense",
             amount: Number(exp.amount),
-            projectName: exp.estimate.project?.name ?? "No Project",
-            projectId: exp.estimate.project?.id ?? null,
+            projectName: exp.project?.name ?? exp.estimate?.project?.name ?? "No Project",
+            projectId: resolveExpenseProjectId(exp),
             reference: exp.purchaseOrder?.code ?? null,
         });
     }

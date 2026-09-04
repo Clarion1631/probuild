@@ -5,6 +5,8 @@ import { prisma } from "@/lib/prisma";
 import { userCanAccessProject } from "@/lib/mobile-auth";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { captureActorSource, optionalBool } from "@/lib/receipt-capture-validation";
+import { resolveInstalledAtCustomer } from "@/lib/expense-attribution";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { uploadReceiptObject } from "@/lib/receipt-intake/bucket";
 import { getSupabase } from "@/lib/supabase";
@@ -102,6 +104,13 @@ interface ParsedBody {
     uploadId: string | null;
     projectId: string | null;
     costCodeId: string | null;
+    /**
+     * Phase 3: did this material get installed at a customer job? Tri-state on
+     * purpose — `null` means the caller did not say, which is NOT the same as
+     * "no" and must not be recorded as one. `resolveInstalledAtCustomer` fills
+     * a default only when the caller stayed silent.
+     */
+    installedAtCustomer: boolean | null;
     threadName: string | null;
     /** The forwarder reporting that v1 already booked and archived this file. */
     archivedByV1: boolean;
@@ -179,6 +188,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
             uploadId: str(form.get("uploadId")),
             projectId: str(form.get("projectId")),
             costCodeId: str(form.get("costCodeId")),
+            installedAtCustomer: optionalBool(form.get("installedAtCustomer")),
             threadName: str(form.get("threadName")),
             archivedByV1: form.get("archivedByV1") === "true",
         };
@@ -211,6 +221,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
         uploadId: str(json.uploadId),
         projectId: str(json.projectId),
         costCodeId: str(json.costCodeId),
+        installedAtCustomer: optionalBool(json.installedAtCustomer),
         threadName: str(json.threadName),
         // Strict === true: only an explicit boolean may mark a row as already
         // booked by v1, because that flag is what excuses v2 from booking it.
@@ -319,6 +330,10 @@ export async function POST(req: Request) {
                 dryRun: process.env.RECEIPT_INTAKE_DRYRUN !== "false",
                 projectId: parsed.projectId,
                 costCodeId: parsed.costCodeId,
+                // Only meaningful when a phase was actually supplied; a row
+                // with no captured code has no captured provenance either.
+                costCodeSource: parsed.costCodeId ? captureActorSource(auth.via) : null,
+                installedAtCustomer: resolveInstalledAtCustomer(parsed.installedAtCustomer),
                 createdById: auth.via === "session" ? auth.user.id : null,
                 // Only a shared-secret forwarder may assert this: it is the
                 // claim that v1 already put this document in the books, and it

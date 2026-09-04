@@ -283,18 +283,28 @@ test("ChangeOrderItem is FLAT — no section-header exclusion is applied to it",
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// EXPENSE REACHES A PROJECT THROUGH ITS ESTIMATE
+// EXPENSE REACHES A PROJECT TWO WAYS (Phase 3)
 // ════════════════════════════════════════════════════════════════════════════
 
-test("expenses are queried through the estimate relation, NOT expense.projectId", async () => {
-    // Expense has no projectId column. `where: { projectId }` throws
-    // PrismaClientValidationError and once made a job's expenses read $0.
+test("expenses are queried BOTH ways: the new column and the estimate relation", async () => {
+    // Before Phase 3 this asserted `{ estimate: { projectId } }` and that
+    // Expense had no projectId column at all. The column exists now, and it is
+    // NULLABLE and backfilled — so a query using only the column would drop
+    // every row the backfill had not reached, and one using only the relation
+    // would drop every row a future writer stamps directly. Both branches, one
+    // OR key, and the shape comes from the shared helper rather than being
+    // spelled out twice.
     fixture.estimates = [estimateWith([{ id: "i1", total: 10000 }])];
     await loadProjectVariance();
 
     const where = recorded.expense[0].where;
-    assert.deepEqual(where, { estimate: { projectId: "p1" } });
-    assert.ok(!("projectId" in where), "expense.projectId does not exist and throws at runtime");
+    assert.deepEqual(where, {
+        OR: [
+            { projectId: "p1" },
+            { projectId: null, estimate: { projectId: "p1" } },
+        ],
+    });
+    assert.deepEqual(Object.keys(where), ["OR"], "one OR key — a second would clobber it");
 });
 
 test("expenses are DELIBERATELY not filtered by estimate status", async () => {

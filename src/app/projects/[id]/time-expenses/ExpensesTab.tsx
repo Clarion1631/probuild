@@ -3,6 +3,7 @@
 import { useMemo, useState, useCallback, useRef } from "react";
 import { toast } from "sonner";
 import { deleteExpense, deleteExpenses, getExpenses, tagExpensesToChangeOrder } from "@/lib/time-expense-actions";
+import TaxPhaseModal, { type PhaseOption, type TaxPhaseExpense } from "./TaxPhaseModal";
 
 interface Expense {
     id: string;
@@ -22,6 +23,13 @@ interface Expense {
     invoiceId?: string | null;
     invoicedAt?: string | Date | null;
     isBillable?: boolean;
+    // Phase 3 — the WA "tax paid at source" fields the Tax & phase panel edits.
+    taxAmount?: unknown;
+    taxAtSource?: boolean;
+    installedAtCustomer?: boolean | null;
+    taxDeductibleBase?: unknown;
+    needsTaxReview?: boolean;
+    taxSource?: string | null;
 }
 
 interface Props {
@@ -30,6 +38,10 @@ interface Props {
     onAddNew: () => void;
     currentUser: { id: string; role: string; name: string };
     changeOrders: { id: string; code: string; title: string }[];
+    /** This project's phases — the only codes the Tax & phase panel may offer. */
+    phases?: PhaseOption[];
+    /** `financialReports`. Without it the panel is not offered at all. */
+    canEditTax?: boolean;
 }
 
 function num(v: unknown): number {
@@ -44,7 +56,8 @@ function fmtMoney(v: number): string {
     return "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export default function ExpensesTab({ projectId, expenses: initialExpenses, onAddNew, currentUser, changeOrders }: Props) {
+export default function ExpensesTab({ projectId, expenses: initialExpenses, onAddNew, currentUser, changeOrders, phases = [], canEditTax = false }: Props) {
+    const [taxTarget, setTaxTarget] = useState<TaxPhaseExpense | null>(null);
     const [expenses, setExpenses] = useState<Expense[]>(initialExpenses);
     const [filter, setFilter] = useState("");
     const [statusFilter, setStatusFilter] = useState<"all" | "Pending" | "Reviewed">("all");
@@ -385,7 +398,39 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                                 </button>
                                             </div>
                                         </td>
-                                        <td className="px-4 py-3 text-right">
+                                        <td className="px-4 py-3 text-right whitespace-nowrap">
+                                            {canEditTax && (
+                                                // Offered on QBO-managed rows too — those ARE the
+                                                // receipts the tax report is made of, and the PATCH
+                                                // behind this panel only touches ProBuild-only
+                                                // columns, so it cannot desynchronise a Purchase.
+                                                <button
+                                                    onClick={() => setTaxTarget({
+                                                        id: expense.id,
+                                                        vendor: expense.vendor,
+                                                        description: expense.description,
+                                                        amount: num(expense.amount),
+                                                        taxAmount: expense.taxAmount === null || expense.taxAmount === undefined
+                                                            ? null
+                                                            : num(expense.taxAmount),
+                                                        taxAtSource: Boolean(expense.taxAtSource),
+                                                        installedAtCustomer: expense.installedAtCustomer ?? null,
+                                                        taxDeductibleBase: expense.taxDeductibleBase === null || expense.taxDeductibleBase === undefined
+                                                            ? null
+                                                            : num(expense.taxDeductibleBase),
+                                                        needsTaxReview: Boolean(expense.needsTaxReview),
+                                                        // Which of the four states the row is in, so
+                                                        // the panel can tell "no tax here" from
+                                                        // "nobody has read it yet".
+                                                        taxSource: expense.taxSource ?? null,
+                                                        costCodeId: expense.costCode?.id ?? null,
+                                                    })}
+                                                    className={`mr-3 text-xs underline transition ${expense.needsTaxReview ? "text-amber-600 font-semibold" : "text-slate-400 hover:text-hui-primary"}`}
+                                                    title="Edit the tax-paid-at-source details and the phase"
+                                                >
+                                                    {expense.needsTaxReview ? "Tax needs review" : "Tax & phase"}
+                                                </button>
+                                            )}
                                             {!expense.qbPurchaseId && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
                                                 <button onClick={() => handleDelete(expense.id)} className="text-slate-400 hover:text-red-500 transition" title="Delete">
                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
@@ -400,6 +445,21 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                         </table>
                     </div>
                 </div>
+            )}
+
+            {taxTarget && (
+                <TaxPhaseModal
+                    expense={taxTarget}
+                    phases={phases}
+                    onClose={() => setTaxTarget(null)}
+                    onSaved={async () => {
+                        setTaxTarget(null);
+                        // Re-read rather than patching local state: the server
+                        // may have refused part of the change, and a hopeful
+                        // local update would show an edit that did not happen.
+                        setExpenses(await getExpenses(projectId) as unknown as Expense[]);
+                    }}
+                />
             )}
         </div>
     );

@@ -1,5 +1,17 @@
 import { prisma } from "./prisma";
-import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
+import { resolveCostCode } from "./cost-coding";
+import { prismaCostCodingDataSource } from "./cost-coding-db";
+import { isCostCodeAllowedForProject } from "./project-phases";
+import { assertPhaseOfProjectTx, lockAttributionParents } from "./phase-invariant";
+import {
+    expenseStillOnProjectWhere,
+    itemBelongsToEstimateTx,
+    lockEstimateAttribution,
+    resolveExpenseProjectId,
+    resolveExpenseProjectUnderLock,
+} from "./expense-attribution";
+import { prismaPhaseDataSource } from "./project-phases-db";
+import { CALENDAR_DATE_NOT_REAL, classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
 import { assertExpenseMutableOutsideQbo } from "./qbo-expense-guard";
@@ -10,7 +22,7 @@ import {
     zeroRateManagerMessage,
 } from "./pay-rate-guard";
 import { withPayrollWrite, withPayrollWriteTx } from "./payroll-period";
-import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -122,8 +134,17 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
     if (data.burdenCost != null && (!Number.isFinite(data.burdenCost) || data.burdenCost < 0)) {
         throw new Error("Burden cost cannot be negative");
     }
-    const startTime = /^\d{4}-\d{2}-\d{2}$/.test(data.date)
-        ? dateOnlyInTimeZone(data.date, await resolveCompanyTimeZone())
+    // The shared validator, so an impossible day (`2026-02-31`) is refused by
+    // the same rule everywhere rather than throwing out of the parser with a
+    // different message (round 47, item 2).
+    const startVerdict = classifyCalendarDate(data.date);
+    // An impossible day is refused here rather than retried as an instant:
+    // `new Date("2026-02-31")` rolls forward to 3 March instead of failing.
+    if (startVerdict.kind === "invalid" && startVerdict.reason === CALENDAR_DATE_NOT_REAL) {
+        throw new Error("A valid time-entry date is required");
+    }
+    const startTime = startVerdict.kind === "valid"
+        ? dateOnlyInTimeZone(startVerdict.date, await resolveCompanyTimeZone())
         : new Date(data.date);
     if (Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
 
@@ -264,6 +285,31 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
         }
     }
 
+    // A cost code arriving here used to be stored verbatim and stamped
+    // "manual" — permanently outranking every automated pass — without anyone
+    // checking it belonged to this job. "The cost code exists" is not a
+    // permission (src/lib/cost-coding.ts SCOPE note): both checks, or a form
+    // post can pin another project's phase onto this expense forever.
+    let costCodeId = data.costCodeId || null;
+    let costTypeId = data.costTypeId || null;
+    if (costCodeId) {
+        const resolved = await resolveCostCode(prismaCostCodingDataSource, { costCodeId });
+        if (!resolved.ok) throw new Error(resolved.error);
+        const onProject = await isCostCodeAllowedForProject(
+            prismaPhaseDataSource,
+            estimate.projectId,
+            resolved.costCodeId,
+        );
+        if (!onProject) {
+            throw new Error("That cost code isn't one of this project's phases.");
+        }
+        costCodeId = resolved.costCodeId;
+        // Only an estimate item knows whether the money is Labor or Material,
+        // so an explicit code carries no cost type of its own — keep the
+        // caller's when it gave one, rather than inventing a guess.
+        costTypeId = costTypeId ?? resolved.costTypeId;
+    }
+
     let receiptUrl = data.receiptUrl?.trim() || null;
     if (data.receiptFileId) {
         const receipt = await prisma.projectFile.findUnique({
@@ -275,22 +321,78 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
         }
         receiptUrl = receipt.url;
     }
-    const expenseDate = data.date
-        ? /^\d{4}-\d{2}-\d{2}$/.test(data.date)
-            ? dateOnlyInTimeZone(data.date, await resolveCompanyTimeZone())
-            : new Date(data.date)
-        : null;
+    // Same rule as every other intake. `omitted` keeps the existing "no date"
+    // behaviour (null, not today); `invalid` falls through to the instant
+    // parse, and an unparseable value is refused rather than stored as an
+    // Invalid Date.
+    const expenseVerdict = classifyCalendarDate(data.date);
+    if (expenseVerdict.kind === "invalid" && expenseVerdict.reason === CALENDAR_DATE_NOT_REAL) {
+        throw new Error("A valid expense date is required");
+    }
+    const expenseDate = expenseVerdict.kind === "omitted"
+        ? null
+        : expenseVerdict.kind === "valid"
+            ? dateOnlyInTimeZone(expenseVerdict.date, await resolveCompanyTimeZone())
+            : new Date(data.date as string);
     if (expenseDate && Number.isNaN(expenseDate.getTime())) throw new Error("A valid expense date is required");
 
-    // Carries a receiptUrl, so it is sweep evidence (round-42 gate, finding 1).
-    return withReceiptEvidenceLock<Awaited<ReturnType<typeof prisma.expense.create>>>(
-        fn => prisma.$transaction(fn),
-        tx => tx.expense.create({
-        data: {
+    // THE PHASE ANSWER THAT COUNTS, taken with the write (round 18, item 4).
+    // The check above answers on the global client and holds nothing; this one
+    // locks the four tables it rests on and reads them on the transaction that
+    // inserts the row.
+    return prisma.$transaction(async tx => {
+        // EVIDENCE (PR #443 gate rounds 42/45). An Expense write changes what
+        // the missing-receipt sweep reads, so it queues behind the sweep and
+        // moves the evidence epoch. THE OUTERMOST LOCK, before the attribution
+        // parents below (receipt-evidence-lock.ts); taken directly rather than
+        // through `withReceiptEvidenceLock` because this path owns a
+        // transaction of its own.
+        await lockReceiptEvidence(tx);
+        await bumpReceiptEvidenceEpoch(tx);
+        const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        // THE WHOLE LOCK SET, IN THE CANONICAL ORDER, FIRST (round 37, item 3):
+        // Project -> Estimate -> EstimateItem -> CostCode. Same reason as the
+        // POST route — the three helpers below take slices of this set, and on
+        // their own they reach the Estimate before the Project, which is a
+        // deadlock cycle against a Project-first job editor.
+        await lockAttributionParents(raw, {
+            projectId: estimate.projectId,
             estimateId,
             itemId: data.itemId || null,
-            costCodeId: data.costCodeId || null,
-            costTypeId: data.costTypeId || null,
+            costCodeId,
+        });
+        // THE PAIR, RE-READ UNDER LOCK (round 20, item 3): same reason as the
+        // POST route. The estimate's project was resolved before the cost-code
+        // and receipt-file lookups; writing it now without re-reading can put
+        // an expense on a job its own estimate has left.
+        const pair = await lockEstimateAttribution(raw, estimateId);
+        if (!pair) throw new Error("Estimate must belong to a project");
+        if (pair.projectId !== estimate.projectId) {
+            throw new Error("This estimate moved to another job while the expense was being created");
+        }
+        if (data.itemId && !(await itemBelongsToEstimateTx(raw, data.itemId, estimateId))) {
+            throw new Error("Line item must belong to the resolved estimate");
+        }
+        if (costCodeId) {
+            const verdict = await assertPhaseOfProjectTx(
+                tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                estimate.projectId,
+                costCodeId,
+            );
+            if (!verdict.ok) throw new Error("That cost code isn't one of this project's phases.");
+        }
+        return tx.expense.create({
+            data: {
+            // ONE PAIR, from one locked read.
+            estimateId: pair.estimateId,
+            projectId: pair.projectId,
+            itemId: data.itemId || null,
+            costCodeId,
+            costTypeId,
+            // Every caller of this core is a human picking a code in a web form
+            // or a CO flow, so a code here is "manual" and is off limits to the
+            // sync and the backfill.
+            costCodeSource: costCodeId ? "manual" : null,
             amount: dollars(data.amount),
             vendor: data.vendor?.trim() || null,
             date: expenseDate,
@@ -298,9 +400,9 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
             receiptUrl,
             changeOrderId: changeOrder?.id ?? null,
             isBillable: data.isBillable ?? Boolean(changeOrder),
-        },
-        }),
-    );
+            },
+        });
+    });
 }
 
 export async function tagTimeEntriesToChangeOrderCore(
@@ -380,28 +482,84 @@ export async function tagExpensesToChangeOrderCore(
     const changeOrder = await resolveChangeOrder(input.changeOrderId);
     const rows = await prisma.expense.findMany({
         where: { id: { in: input.ids } },
+        // ASCENDING ID, because this is a BATCH (round 46, item 3). Two tag
+        // requests over overlapping selections lock the same Expense rows; an
+        // unordered `findMany` lets the server hand them back in different
+        // orders, and two transactions locking shared rows in opposite orders
+        // deadlock with no parent table involved. The loop below preserves
+        // this order.
+        orderBy: { id: "asc" },
         select: {
             id: true,
             qbPurchaseId: true,
+            projectId: true,
+            estimateId: true,
             estimate: { select: { projectId: true } },
             invoiceId: true,
             invoicedAt: true,
         },
     });
     if (rows.length !== new Set(input.ids).size) throw new Error("One or more expenses were not found");
-    if (rows.some((row) => row.estimate.projectId !== changeOrder.projectId)) throw new Error("All expenses must belong to the change order project");
+    // Resolved, not read off the estimate. A re-attributed expense belongs to
+    // the job its `projectId` names — checking the estimate would let it be
+    // tagged to a change order on the job it USED to be on, and would refuse a
+    // legitimate tag on the job it is actually on now.
+    if (rows.some((row) => resolveExpenseProjectId(row) !== changeOrder.projectId)) {
+        throw new Error("All expenses must belong to the change order project");
+    }
     for (const row of rows) assertExpenseMutableOutsideQbo(row);
     if (rows.some((row) => row.invoiceId || row.invoicedAt)) throw new Error("Billed expenses cannot be retagged");
-    // EVIDENCE (round-45 gate, finding 3): fenced like every other Expense
-    // write, so the epoch moves and no cycle certifies over it.
-    const result = await withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.expense.updateMany({
-        where: {
-            id: { in: input.ids },
-            qbPurchaseId: null,
-            invoiceId: null,
-            invoicedAt: null,
-        },
-        data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
-    }));
-    return { updated: result.count };
+    // ONE ROW PER STATEMENT, under a locked re-resolve (round 20, item 4).
+    //
+    // Tagging an expense to a change order says "this money belongs to that
+    // job's CO". The rows were checked against the CO's project and then
+    // updated as a set, with nothing holding the answer still — so a
+    // fallback-attributed row whose estimate moved got billed to a change order
+    // on a job it had already left.
+    //
+    // A row that moved is skipped, not fatal: the count tells the caller.
+    let updated = 0;
+    await prisma.$transaction(async tx => {
+        // EVIDENCE (PR #443 gate rounds 42/45). An Expense write changes what
+        // the missing-receipt sweep reads, so it queues behind the sweep and
+        // moves the evidence epoch. THE OUTERMOST LOCK, before the attribution
+        // parents below (receipt-evidence-lock.ts); taken directly rather than
+        // through `withReceiptEvidenceLock` because this path owns a
+        // transaction of its own.
+        await lockReceiptEvidence(tx);
+        await bumpReceiptEvidenceEpoch(tx);
+        const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        // EVERY PARENT FIRST, THEN THE ROWS (round 46, item 3). The loop below
+        // locked row 1's parents, updated row 1 — taking that Expense
+        // exclusively and, through the foreign keys, a KEY SHARE on its
+        // Project and Estimate — and only then reached for row 2's parents:
+        // Expense -> Estimate, the declared order backwards. One call up front
+        // takes the batch's whole parent set in the canonical order before any
+        // Expense is touched; the per-row re-resolve below then re-acquires
+        // share locks this transaction already holds, which is free.
+        await lockAttributionParents(raw, {
+            projectId: changeOrder.projectId,
+            projectIds: rows.map(row => row.projectId),
+            estimateIds: rows.map(row => row.estimateId),
+        });
+        for (const row of rows) {
+            const locked = await resolveExpenseProjectUnderLock(raw, {
+                projectId: row.projectId,
+                estimateId: row.estimateId,
+            });
+            if (locked !== changeOrder.projectId) continue;
+            const { count } = await tx.expense.updateMany({
+                where: {
+                    id: row.id,
+                    qbPurchaseId: null,
+                    invoiceId: null,
+                    invoicedAt: null,
+                    ...expenseStillOnProjectWhere(row, locked),
+                },
+                data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
+            });
+            updated += count;
+        }
+    });
+    return { updated };
 }

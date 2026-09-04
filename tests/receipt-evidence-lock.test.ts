@@ -38,6 +38,10 @@ const ALLOWED: Array<{ file: string; because: string }> = [
         file: "src/lib/billing-core.ts",
         because: "stamps invoiceId/invoicedAt on already-billed expenses; it never touches receipt linkage, which is the only Expense column the sweep reads",
     },
+    {
+        file: "src/lib/qbo-expense-sync.ts",
+        because: "same reason as billing-core: its Expense writes are the QBO import's own columns and the cost-code SUGGESTION (costCodeId/costCodeSource/costCodeConfidence), never receipt linkage. `receiptUrl` appears in this file only in two comments explaining that the import deliberately does NOT write it, which is what this scan's file-level heuristic matched on",
+    },
 ];
 
 const WRITE_SHAPES = /\b(?:prisma|tx|db|client)\.(receiptIntake|expense)\.(create|createMany|update|updateMany|upsert|delete|deleteMany)\(/;

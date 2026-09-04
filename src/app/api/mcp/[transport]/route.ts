@@ -10,6 +10,7 @@ import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 import { createExpenseCore, createTimeEntryFromStoredRatesCore, findCrewMatches } from "@/lib/time-expense-core";
+import { resolveExpenseProjectId } from "@/lib/expense-attribution";
 import { downloadDocBytes, resolveDocUrl, isSecureRef, secureRefPath } from "@/lib/secure-storage";
 import { logActivity } from "@/lib/activity-log";
 import {
@@ -1390,8 +1391,18 @@ function createHandler(actor: RouteMcpActor) {
                 }
                 try {
                     const expense = await createExpenseCore({ changeOrderId, estimateId, amount, vendor, date, description, receiptFileId, isBillable: Boolean(changeOrderId) }, "ChatGPT connector");
-                    const estimate = await prisma.estimate.findUnique({ where: { id: expense.estimateId }, select: { projectId: true } });
-                    return textResult({ id: expense.id, changeOrderId: expense.changeOrderId, amount: Number(expense.amount), receiptUrl: expense.receiptUrl, url: estimate?.projectId ? `https://probuild.goldentouchremodeling.com/projects/${estimate.projectId}/time-expenses` : null });
+                    // THE RESOLVED ATTRIBUTION, NOT AN ESTIMATE LOOKUP (Codex
+                    // round 15, item 4). `createExpenseCore` already stamps
+                    // `projectId` from the locked pair it wrote, so reading it
+                    // straight off the returned row is both simpler and
+                    // correct where a second estimate query is not: with
+                    // `Expense_estimateId_fkey` now `ON DELETE SET NULL`
+                    // (round 42, item 4b), an estimate deleted between the
+                    // create and this lookup would leave `estimate` null and
+                    // silently drop a valid link, despite `projectId` still
+                    // being right there on the row.
+                    const projectId = resolveExpenseProjectId(expense);
+                    return textResult({ id: expense.id, changeOrderId: expense.changeOrderId, amount: Number(expense.amount), receiptUrl: expense.receiptUrl, url: projectId ? `https://probuild.goldentouchremodeling.com/projects/${projectId}/time-expenses` : null });
                 } catch (err: any) {
                     return { ...textResult({ error: err?.message || "Expense could not be logged" }), isError: true };
                 }

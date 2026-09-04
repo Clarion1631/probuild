@@ -1,6 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { validTimeZone, DEFAULT_COMPANY_TIME_ZONE } from "./tz-date";
+export type { CalendarDateVerdict } from "./tz-date";
 
 // Pure date/time-zone primitives live in tz-date.ts (no prisma import, so
 // they stay importable from anything that must be unit-testable without a
@@ -10,7 +11,10 @@ import { validTimeZone, DEFAULT_COMPANY_TIME_ZONE } from "./tz-date";
 // startOfDateInTimeZone / endOfDateInTimeZone / dateInputInTimeZone don't
 // need to change their import path.
 export {
+    CALENDAR_DATE_BAD_SHAPE,
+    CALENDAR_DATE_NOT_REAL,
     DEFAULT_COMPANY_TIME_ZONE,
+    classifyCalendarDate,
     dateOnlyInTimeZone,
     startOfDateInTimeZone,
     endOfDateInTimeZone,

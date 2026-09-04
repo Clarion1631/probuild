@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { expenseHasAnyProjectWhere, resolveExpenseProjectId } from "@/lib/expense-attribution";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { redirect } from "next/navigation";
@@ -74,9 +75,11 @@ export default async function ProfitabilityPage({ searchParams }: { searchParams
             orderBy: { createdAt: "desc" },
         }),
         prisma.expense.findMany({
-            where: { estimate: { projectId: { not: null } } },
+            // "attributable to SOME job", both ways round (Phase 3).
+            where: expenseHasAnyProjectWhere(),
             select: {
                 amount: true, date: true, createdAt: true, vendor: true, description: true, status: true,
+                projectId: true,
                 estimate: { select: { projectId: true } },
             },
         }),
@@ -85,7 +88,7 @@ export default async function ProfitabilityPage({ searchParams }: { searchParams
 
     const expensesByProject = new Map<string, typeof expenses>();
     for (const e of expenses) {
-        const pid = e.estimate.projectId;
+        const pid = resolveExpenseProjectId(e);
         if (!pid) continue;
         if (!expensesByProject.has(pid)) expensesByProject.set(pid, []);
         expensesByProject.get(pid)!.push(e);

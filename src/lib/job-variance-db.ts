@@ -1,11 +1,15 @@
 // Server-side data loading for the variance report. Kept out of the page
 // component so the page stays presentational and this stays swappable.
 //
-// Expense has NO projectId column — it reaches a project through its estimate
-// (`where: { estimate: { projectId } }`). Querying expense.projectId throws
-// PrismaClientValidationError, which once made a job's expenses look like $0.
+// Expense reaches a project TWO ways since Phase 3: its own denormalized
+// `projectId` (new, nullable, backfilled) or its estimate's. Never hand-roll
+// either — `expenseForProjectWhere` covers both in one OR key, and it is what
+// keeps this report's numbers identical to the pre-Phase-3 traversal. (The
+// header used to say the column does not exist; that stopped being true the
+// moment scripts/apply-expense-attribution.mjs ran.)
 
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere } from "@/lib/expense-attribution";
 import { isEstimateSectionRow } from "@/lib/estimate-item-payload";
 import { computeProjectVariance, type ProjectVariance, type VarianceEstimateItem } from "@/lib/job-variance";
 import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
@@ -188,8 +192,11 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
                 // with no matching budget, it surfaces honestly as an unbudgeted
                 // phase or in the unattributed bucket — visible, not silently
                 // dropped.
-                where: { estimate: { projectId: project.id } },
-                select: { costCodeId: true, itemId: true, amount: true },
+                where: expenseForProjectWhere(project.id),
+                // costCodeSource: a person's explicit "no phase" suppresses the
+                // item fallback (round 42, item 2). A rule that depends on a
+                // column nobody selected is a rule that does not exist.
+                select: { costCodeId: true, costCodeSource: true, itemId: true, amount: true },
             }),
         ]);
 
@@ -207,6 +214,16 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
                 })),
                 expenses: expenseRows.map((e) => ({
                     costCodeId: e.costCodeId,
+                    // ...AND IT IS PASSED THROUGH (round 48, item 2). The
+                    // select above has carried this column since round 42 and
+                    // this mapper dropped it, so every row reached
+                    // `computeProjectVariance` with `costCodeSource:
+                    // undefined` — which reads as "nobody has spoken" and runs
+                    // the item fallback. A bookkeeper's explicit "no phase"
+                    // (`manual-none`) therefore kept charging the phase its
+                    // line item names, on the one report that decision exists
+                    // to correct. Selecting a column is not using it.
+                    costCodeSource: e.costCodeSource,
                     itemId: e.itemId,
                     amount: Number(e.amount ?? 0),
                 })),

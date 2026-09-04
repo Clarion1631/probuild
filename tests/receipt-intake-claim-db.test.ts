@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { PrismaClient, Prisma } from "@prisma/client";
 import { CLAIM_LOCK_KEY, eligibleClaimWhere } from "../src/lib/receipt-intake/worker";
 import { lockQboExpense } from "../src/lib/qbo-expense-sync";
+import { expenseLockKey, lockExpense } from "../src/lib/expense-lock";
 import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
 import { statements, verifyColumnDefaults } from "../scripts/apply-receipt-intake.mjs";
 import {
@@ -392,6 +393,43 @@ test("the per-Purchase lock is SHARED, and it really serializes", { skip }, asyn
         return row.locked;
     });
     assert.equal(other, true);
+});
+
+test("booking takes BOTH advisory locks, in order, and they are different keys", { skip }, async () => {
+    // The two locks the booking transaction now holds at once: the PURCHASE's
+    // identity first, the EXPENSE row second (the child is always last). They
+    // are hashed into the SAME advisory-lock space, so the only thing keeping
+    // them from aliasing is `expenseLockKey`'s `expense:` prefix — and an
+    // alias would silently turn the pair into one lock, which is a correctness
+    // change nothing else in this repo would notice.
+    const purchaseId = `${EXPENSE_PREFIX}both-1`;
+    const expenseId = `${EXPENSE_PREFIX}both-1`; // deliberately the SAME string
+    assert.notEqual(expenseLockKey(expenseId), purchaseId, "the namespaces must not collide");
+
+    const held = await db!.$transaction(async tx => {
+        // Booking's order, verbatim.
+        await lockQboExpense(tx, purchaseId);
+        await lockExpense(tx, expenseId);
+        const [purchase] = await db!.$queryRaw<{ locked: boolean }[]>(
+            Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${purchaseId}, 0)) AS locked`,
+        );
+        const [expense] = await db!.$queryRaw<{ locked: boolean }[]>(
+            Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${expenseLockKey(expenseId)}, 0)) AS locked`,
+        );
+        return { purchase: purchase.locked, expense: expense.locked };
+    });
+    assert.deepEqual(
+        held,
+        { purchase: false, expense: false },
+        "one transaction holds both keys, and each excludes its own second holder",
+    );
+
+    // ...and neither is held once the transaction ends — `pg_advisory_xact_lock`
+    // releases at COMMIT, which is what makes the pair safe to take here at all.
+    const [after] = await db!.$queryRaw<{ locked: boolean }[]>(
+        Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${purchaseId}, 0)) AS locked`,
+    );
+    assert.equal(after.locked, true);
 });
 
 test("IMPORTER WINS: the retry reconciles a real imported Expense", { skip }, async () => {

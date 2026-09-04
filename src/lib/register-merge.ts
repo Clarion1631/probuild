@@ -1,3 +1,4 @@
+import { resolveExpenseProjectLabel } from "@/lib/expense-attribution";
 import type { BankRegisterRow } from "./qbo-bank-register";
 import { isPurchaseType, isMoneyInType } from "./register-types";
 
@@ -42,6 +43,9 @@ export interface DecimalLike {
 /** Minimal Expense projection needed for the job-cost / amount edges. */
 export interface RegisterMergeExpense {
     qbPurchaseId: string | null;
+    /** Phase 3: the denormalized job. Optional so older callers still typecheck. */
+    projectId?: string | null;
+    project?: { id?: string | null; name: string | null } | null;
     /** Prisma Decimal arrives as a Decimal-like object, not a plain string —
      * accept the real shape, plus a plain string for tests and any
      * already-serialized callers. */
@@ -324,8 +328,9 @@ export function mergeRegister(
                 amount: jc.amount,
             };
             if (jc.expense) {
-                projectId = jc.expense.estimate?.project?.id ?? null;
-                projectName = jc.expense.estimate?.project?.name ?? null;
+                // Resolved, not read off the estimate — a re-attributed expense
+                // must be shown under the job it is actually on.
+                ({ projectId, projectName } = resolveExpenseProjectLabel(jc.expense));
                 receiptUrl = jc.expense.receiptUrl ?? null;
             }
 

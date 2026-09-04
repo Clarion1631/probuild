@@ -8,6 +8,20 @@ export class QboManagedExpenseError extends Error {
     }
 }
 
+/**
+ * Identity by NAME, not `instanceof` (the same rule
+ * `isEstimateAttributionPairConflict` states in expense-attribution.ts).
+ * Node 20 + tsx can load this module twice under different specifiers, which
+ * makes `instanceof` false for an error this very file threw — and a handler
+ * that misses it answers 500 instead of the 409 the caller can act on.
+ */
+export function isQboManagedExpenseError(error: unknown): error is QboManagedExpenseError {
+    return (
+        error instanceof QboManagedExpenseError ||
+        (error instanceof Error && error.name === "QboManagedExpenseError")
+    );
+}
+
 export function assertExpenseMutableOutsideQbo(
     expense: { qbPurchaseId?: string | null } | null,
 ): void {

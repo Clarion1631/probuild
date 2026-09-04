@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { percentCompleteNeedsReview } from "@/lib/percent-complete";
+import { expenseForProjectWhere } from "@/lib/expense-attribution";
 
 // Single source of truth for "how much has this project billed, collected,
 // and cost" — used by the per-project Financial Overview API route
@@ -118,7 +119,7 @@ export async function computeProjectFinancials(
             select: { id: true, status: true, totalAmount: true, balanceDue: true, archivedAt: true },
         }),
         prisma.retainer.findMany({ where: { projectId, status: { in: validRetainerStatuses } } }),
-        prisma.expense.findMany({ where: { estimate: { projectId } } }),
+        prisma.expense.findMany({ where: expenseForProjectWhere(projectId) }),
         prisma.purchaseOrder.findMany({ where: { projectId } }),
         prisma.timeEntry.findMany({ where: { projectId } }),
         // Percent complete is READ here, never computed. The nightly recalc cron

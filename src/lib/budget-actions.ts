@@ -1,6 +1,7 @@
 "use server";
 
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere } from "@/lib/expense-attribution";
 import { isEstimateSectionRow } from "@/lib/estimate-item-payload";
 import { toNum } from "@/lib/prisma-helpers";
 import { canAccessProject, canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
@@ -42,7 +43,7 @@ export async function getBudgetData(projectId: string) {
     });
 
     const expenses = await prisma.expense.findMany({
-        where: { estimate: { is: { projectId } } },
+        where: expenseForProjectWhere(projectId),
         include: { costCode: true, costType: true, item: true },
     });
 

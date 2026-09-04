@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import { acquireCronLease } from "@/lib/cron-lease";
 import { logAutomationEvent } from "@/lib/automation-events";
@@ -37,8 +39,6 @@ import {
     driveFileIdOf,
     triageCutoverRows, resolveCutoverBoundary, type CutoverRow } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
-import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
-import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { bookReceipt, type BookPrismaClient } from "@/lib/receipt-intake/book";
 import { backoffMs } from "@/lib/receipt-intake/route-state";
 import {
@@ -120,6 +120,8 @@ const WORKER_ROW_SELECT = {
     projectId: true, costCodeId: true, suggestedCostCodeId: true,
     storagePath: true, fileName: true, mimeType: true, fileSize: true,
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
+    // Phase 3 attribution — booking copies these straight onto the Expense.
+    taxAtSource: true, installedAtCustomer: true,
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
     suggestedConfidence: true, sendAttempted: true, claimToken: true, fileSha256: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true, stateReason: true,

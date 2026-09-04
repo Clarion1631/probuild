@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import Anthropic from "@anthropic-ai/sdk";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
-import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+import { createParsedReceiptExpense } from "@/lib/receipt-parse-expense";
+
 
 const RECEIPT_PROMPT = `You are an AI receipt parser for a construction company.
 Analyze this receipt image and extract the following information as JSON:
@@ -269,8 +271,24 @@ export async function POST(req: NextRequest) {
         // Always tell the caller whether the expense was created and why not, so a
         // mobile UI can show the right toast (vs silently assuming success).
         let expenseCreated = false;
+        // The model returned something in the date field that is not a date
+        // (round 47, item 2). The row is still created — this is a
+        // convenience row — but dated TODAY rather than on a guess, and the
+        // caller is told, because "the date on screen is not the one on the
+        // receipt" is not something it can work out for itself.
+        let dateUnreadable: string | undefined;
         let expenseId: string | undefined;
-        let expenseSkipReason: "no-project" | "forbidden" | "no-estimate" | "incomplete-parse" | undefined;
+        let expenseSkipReason:
+            | "no-project"
+            | "forbidden"
+            | "no-estimate"
+            | "incomplete-parse"
+            // The estimate this parse resolved left the job while the model was
+            // reading the image. Nothing is written — see the locked re-read
+            // below — and the caller is told plainly rather than shown a row on
+            // a job nobody chose.
+            | "estimate-moved"
+            | undefined;
 
         if (!projectId) {
             expenseSkipReason = "no-project";
@@ -288,24 +306,42 @@ export async function POST(req: NextRequest) {
                 expenseSkipReason = "no-estimate";
             } else {
                 const confidence = ((parsed.confidence as number || 0) * 100).toFixed(0);
-                // Same rule: this row lands with its receipt attached
-                // (round-42 gate, finding 1).
-                const expense = await withReceiptEvidenceLock<{ id: string }>(
-                    fn => prisma.$transaction(fn),
-                    tx => tx.expense.create({
-                    data: {
-                        estimateId: estimate.id,
-                        description: `[AI ${confidence}%] ${parsed.vendor} receipt — pending bookkeeper review`,
-                        amount: parsed.total as number,
-                        date: parsed.date ? new Date(parsed.date as string) : new Date(),
-                        vendor: parsed.vendor as string,
-                        status: "Pending",
-                    },
-                    select: { id: true },
-                }),
-                );
-                expenseCreated = true;
-                expenseId = expense.id;
+                // A COMPANY CALENDAR DAY, like every other writer. The model
+                // returns a bare "2026-07-01", and `new Date()` on that is UTC
+                // midnight — which reads as 30 June in Pacific and files the
+                // receipt in the wrong quarter. Resolved BEFORE the transaction
+                // so a settings read never holds the estimate lock open.
+                // AND THE MODEL'S DATE IS NOT TRUSTED TO BE A DATE (round 47,
+                // item 2). `2026-02-31` is a shape a bad OCR read produces
+                // often, it passed the old regex, and the parser threw on it —
+                // a 500 for a model misread. Here an unusable answer is
+                // treated as NO answer (today, the convenience row's default),
+                // and the warning below says the date was not the model's.
+                const dateVerdict = classifyCalendarDate(parsed.date);
+                if (dateVerdict.kind === "invalid") dateUnreadable = dateVerdict.value;
+                const expenseDate = dateVerdict.kind === "valid"
+                    ? dateOnlyInTimeZone(dateVerdict.date, await resolveCompanyTimeZone())
+                    : new Date();
+                // THE PAIR, RE-READ UNDER LOCK (round 21, item 1). The estimate
+                // was picked before an image upload, an access check and a
+                // model call; if it moved to another job in that window,
+                // writing `projectId` next to it would put the expense on two
+                // jobs at once. Nothing is created on a disagreement — this is
+                // a convenience row and a wrong one costs more than none.
+                const expense = await createParsedReceiptExpense(prisma, {
+                    projectId,
+                    estimateId: estimate.id,
+                    description: `[AI ${confidence}%] ${parsed.vendor} receipt — pending bookkeeper review`,
+                    amount: parsed.total as number,
+                    date: expenseDate,
+                    vendor: parsed.vendor as string,
+                });
+                if (!expense) {
+                    expenseSkipReason = "estimate-moved";
+                } else {
+                    expenseCreated = true;
+                    expenseId = expense.id;
+                }
             }
         }
 
@@ -321,6 +357,7 @@ export async function POST(req: NextRequest) {
             expenseCreated,
             ...(expenseId ? { expenseId } : {}),
             ...(expenseSkipReason ? { expenseSkipReason } : {}),
+            ...(dateUnreadable ? { dateUnreadable, dateSource: "defaulted-today" } : {}),
         });
     } catch (err) {
         await cleanupUpload();
