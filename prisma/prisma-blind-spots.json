@@ -163,6 +163,10 @@
       "forced": false
     },
     {
+      "name": "ChangeOrderAutomationJob",
+      "forced": false
+    },
+    {
       "name": "ChatDelivery",
       "forced": false
     },
@@ -204,6 +208,10 @@
     },
     {
       "name": "Inspection",
+      "forced": false
+    },
+    {
+      "name": "InvoiceEmailAttempt",
       "forced": false
     },
     {
