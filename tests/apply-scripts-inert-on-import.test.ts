@@ -91,7 +91,10 @@ const ALLOWED_GLOBAL_CALLEES = new Set(["process.argv.includes", "process.argv.i
  * would reopen exactly the hole this allowlist exists to close.
  */
 const SHARED_GUARD_MODULE = "./lib/apply-target.mjs";
-const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto", SHARED_GUARD_MODULE]);
+// `node:dns` is here for the shared helper, which RESOLVES `--expect-host`
+// rather than string-comparing it against an IP. Importing it runs nothing,
+// and a module-scope `dns.lookup(...)` is still rejected below as a call.
+const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto", "node:dns", SHARED_GUARD_MODULE]);
 /** Names a script may never declare itself (they would let a guard or helper be spoofed). */
 const RESERVED_NAMES = new Set(["process", "import", "pathToFileURL", "fileURLToPath", "dirname", "join", "resolve", "isMainModule"]);
 
@@ -645,9 +648,11 @@ test("the shared target helper has no side effects and no entrypoint", () => {
     assert.deepEqual(report.violations, [], report.violations.join("; "));
     assert.equal(report.hasMain, false, "a shared helper must not declare main()");
     assert.equal(report.guardIfs, 0, "...and must not carry an entrypoint guard");
-    // The one import it is allowed is node:fs, for reading .env.production.local
-    // when a caller asks it to. Nothing that runs code on import.
+    // Its only imports are node:fs, for reading .env.production.local when a
+    // caller asks it to, and node:dns, for resolving the expected host name.
+    // Neither runs code on import; both are used only inside functions.
     assert.match(text, /^import fs from "node:fs";$/m);
+    assert.match(text, /^import dns from "node:dns";$/m);
     assert.doesNotMatch(text, /^import .*@prisma\/client/m, "it must not construct a client");
 });
 

@@ -14,6 +14,7 @@
 // (scripts/apply-*.mjs is checked for its entrypoint guard; this file is
 // checked for having no entrypoint at all).
 import fs from "node:fs";
+import dns from "node:dns";
 
 /**
  * WHICH DATABASE, SAID OUT LOUD (cross-PR rule, round 46).
@@ -201,14 +202,111 @@ export function maskUrl(url) {
 }
 
 /**
+ * THE CONNECTED ADDRESS, IN A FORM THAT CAN BE COMPARED.
+ *
+ * `host(inet_server_addr())` answers with an ADDRESS. A dual-stack socket that
+ * reached an IPv4 server can report it in the IPv4-mapped spelling
+ * (`::ffff:10.0.0.5`), which is the same machine as `10.0.0.5` and must not
+ * read as a different one.
+ */
+export function normalizeServerAddress(address) {
+    const value = String(address ?? "").trim();
+    const mapped = /^::ffff:((?:\d{1,3}\.){3}\d{1,3})$/i.exec(value);
+    return (mapped ? mapped[1] : value).toLowerCase();
+}
+
+/**
+ * Loopback is answered WITHOUT a lookup: `localhost` is how the throwaway CI
+ * container is dialled, and resolving it would make the guard depend on
+ * whatever /etc/hosts happens to say on the runner.
+ */
+const LOOPBACK_ADDRESSES = ["127.0.0.1", "::1"];
+
+/** The default resolver: real DNS, asked for EVERY address of the name. */
+function lookupAddresses(hostname) {
+    return dns.promises.lookup(hostname, { all: true });
+}
+
+/** The URL's own hostname, or null if it is not a URL. */
+function hostnameFromUrl(url) {
+    try {
+        return new URL(url).hostname;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * DOES THE SERVER WE ARE CONNECTED TO ANSWER TO THE NAME THE OPERATOR TYPED?
+ *
+ * The comment above `targetHostVerdict` has always said the identity cannot
+ * rest on `inet_server_addr()`, because that is an ADDRESS while
+ * `--expect-host` is a NAME. The check underneath compared the two as strings
+ * anyway, so on production — where the pooler answers as an IPv6 literal like
+ * `2600:1f13:...` and the operator types `aws-0-us-west-2.pooler.supabase.com`
+ * — it could never pass, and it refused every real run (the sibling
+ * apply-receipt-intake printed exactly that refusal on 2026-09-04).
+ *
+ * So the NAME is RESOLVED and the connected address has to be one of the
+ * answers. `resolve` is a parameter so tests never touch the network, and a
+ * name that cannot be resolved is a REFUSAL: an unanswerable question is not a
+ * yes. This does not loosen the identity — the pooler host is shared
+ * regionally either way, and the PROJECT REF check above is what tells
+ * production from a staging clone. It is untouched.
+ */
+export async function targetHostMatches(actualHost, expectHost, resolve = lookupAddresses) {
+    const actual = String(actualHost ?? "");
+    const expected = String(expectHost ?? "").trim();
+    // (a) The operator typed the address itself — nothing to resolve.
+    if (actual !== "" && actual === expected) return { ok: true, how: "exact", addresses: [] };
+    // An empty server address is the unix-socket case, which only the caller
+    // can judge (it is the one holding the URL); an empty expectation is never
+    // a match, because `lookup("")` answers with loopback on some platforms.
+    if (actual === "") return { ok: false, how: "no-address", addresses: [] };
+    if (expected === "") return { ok: false, how: "no-expectation", addresses: [] };
+    const wanted = normalizeServerAddress(actual);
+    if (expected.toLowerCase() === "localhost") {
+        return { ok: LOOPBACK_ADDRESSES.includes(wanted), how: "loopback", addresses: [...LOOPBACK_ADDRESSES] };
+    }
+    let addresses;
+    try {
+        const answer = await resolve(expected);
+        addresses = (Array.isArray(answer) ? answer : [answer])
+            .map(entry => (typeof entry === "string" ? entry : entry?.address))
+            .filter(Boolean)
+            .map(normalizeServerAddress);
+    } catch (error) {
+        return {
+            ok: false,
+            how: "unresolvable",
+            addresses: [],
+            detail: `"${expected}" did not resolve (${error?.message ?? error})`,
+        };
+    }
+    return { ok: addresses.includes(wanted), how: "dns", addresses };
+}
+
+/**
+ * The DATABASE-NAME half, still EXACT and still the same rule. Split out only
+ * so `targetMatches` and `verifyTargetIdentity` cannot drift on it.
+ */
+export function targetDbMatches(actual, expectDb) {
+    if (!actual || typeof actual !== "object") return false;
+    return String(actual.db ?? "") === String(expectDb ?? "");
+}
+
+/**
  * Pure comparison, exported for unit testing without a live DB. Compares BOTH
  * database name and server host, and both EXACTLY — same rule and same reason
  * as apply-receipt-intake.mjs: a guard that accepts a substring gets looser the
  * shorter the operator's input is.
+ *
+ * This is the EXACT case only, and it stays synchronous on purpose. When the
+ * operator names a HOST rather than an address, the identity check calls
+ * `targetHostMatches`, which resolves it — see there for why.
  */
 export function targetMatches(actual, expectDb, expectHost) {
-    if (!actual || typeof actual !== "object") return false;
-    if (String(actual.db ?? "") !== String(expectDb ?? "")) return false;
+    if (!targetDbMatches(actual, expectDb)) return false;
     return String(actual.host ?? "") === String(expectHost ?? "");
 }
 
@@ -224,19 +322,50 @@ export function targetMatches(actual, expectDb, expectHost) {
  *
  * `prisma` is any client with `$queryRawUnsafe`; the backfill passes its own.
  */
-export async function verifyTargetIdentity(prisma, { target, url, from, expectDb, expectHost }) {
+export async function verifyTargetIdentity(prisma, { target, url, from, expectDb, expectHost, resolve }) {
     const [actual] = await prisma.$queryRawUnsafe(
         `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
     );
     const banner = targetBanner(target, { url, from, db: actual?.db, host: actual?.host });
-    if (!targetMatches(actual, expectDb, expectHost)) {
-        return {
-            ok: false,
-            banner,
-            error:
-                `REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to ` +
-                `db="${actual?.db}" host="${actual?.host}".`,
-        };
+    const notes = [];
+    const refuse = detail => ({
+        ok: false,
+        banner,
+        notes: [],
+        error:
+            `REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to ` +
+            `db="${actual?.db}" host="${actual?.host}".` + (detail ? ` ${detail}` : ""),
+    });
+    // The database NAME is still compared exactly.
+    if (!targetDbMatches(actual, expectDb)) return refuse();
+    const actualHost = String(actual?.host ?? "");
+    if (actualHost === "") {
+        // A UNIX-SOCKET connection: `inet_server_addr()` is NULL, so the server
+        // has no address to compare. The only thing left that names the machine
+        // is the host we dialled, and it has to be the one the operator
+        // expected. Recorded in the notes rather than passed silently, because
+        // this is the one branch where the server did not corroborate it.
+        const urlHost = hostnameFromUrl(url);
+        if (!urlHost || urlHost !== String(expectHost ?? "")) {
+            return refuse(
+                `The server reported no address (a local socket) and the connection URL names ` +
+                `${urlHost ? `"${urlHost}"` : "no host"}.`,
+            );
+        }
+        notes.push(`the server reported no address (local socket); accepted because the URL dials ${urlHost}`);
+    } else {
+        const host = await targetHostMatches(actualHost, expectHost, resolve);
+        if (!host.ok) {
+            return refuse(
+                host.how === "unresolvable"
+                    ? `${host.detail}.`
+                    : `"${expectHost}" resolves to ${host.addresses?.length ? host.addresses.join(", ") : "no address"}, ` +
+                      `which does not include the connected server.`,
+            );
+        }
+        if (host.how !== "exact") {
+            notes.push(`verified the connected server ${actualHost} is one of the addresses "${expectHost}" answers to`);
+        }
     }
     if (APPLY_TARGETS[target]?.requireBaseline) {
         const baseline = await prisma.$queryRawUnsafe(
@@ -248,14 +377,15 @@ export async function verifyTargetIdentity(prisma, { target, url, from, expectDb
             return {
                 ok: false,
                 banner,
+                notes: [],
                 error:
                     `REFUSING: this database has no applied ${PRODUCTION_BASELINE_MIGRATION} row, ` +
                     `so it is not the baselined production database.`,
             };
         }
-        return { ok: true, banner, notes: [`verified baseline ${PRODUCTION_BASELINE_MIGRATION} is applied here`] };
+        notes.push(`verified baseline ${PRODUCTION_BASELINE_MIGRATION} is applied here`);
     }
-    return { ok: true, banner, notes: [] };
+    return { ok: true, banner, notes };
 }
 
 /**

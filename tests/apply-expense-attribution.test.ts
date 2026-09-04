@@ -18,7 +18,12 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
-import { resolveTargetOrRefuse } from "../scripts/lib/apply-target.mjs";
+import {
+    normalizeServerAddress,
+    resolveTargetOrRefuse,
+    targetHostMatches,
+    verifyTargetIdentity,
+} from "../scripts/lib/apply-target.mjs";
 import {
     APPLY_TARGETS,
     PRODUCTION_BASELINE_MIGRATION,
@@ -307,6 +312,137 @@ test("the target guard compares database AND host, both exactly", () => {
     assert.equal(targetMatches({ db: "postgres", host: "10.0.0.5" }, "postgres", "10"), false);
     assert.equal(targetMatches({ db: "other", host: "10.0.0.5" }, "postgres", "10.0.0.5"), false);
     assert.equal(targetMatches(null, "postgres", "10.0.0.5"), false);
+});
+
+// ── the expected HOST is a NAME; the server answers with an ADDRESS ─────────
+
+/** What `verifyTargetIdentity` hands back; the .mjs helper carries no types. */
+type Identity = { ok: boolean; banner: string; error?: string; notes?: string[] };
+
+/** A server that answers the identity query with the row it is handed. */
+function fakeServer(row: { db: string; host: string }, baseline = true) {
+    return {
+        $queryRawUnsafe: async (sql: string) =>
+            /current_database\(\)/.test(sql) ? [row] : baseline ? [{ present: 1 }] : [],
+    };
+}
+
+const POOLER_HOST = "aws-0-us-west-2.pooler.supabase.com";
+const POOLER_V6 = "2600:1f13:838:6e45:7ee0:268:15b9:d263";
+
+test("the expected host is RESOLVED, because the server answers with an address", async () => {
+    // THE BUG. `--expect-host aws-0-us-west-2.pooler.supabase.com` was compared
+    // as a string against `host(inet_server_addr())`, which through the pooler
+    // is an IPv6 literal, so the guard refused every production run — the
+    // sibling apply-receipt-intake printed exactly that refusal on 2026-09-04.
+    const asked: string[] = [];
+    const resolve = async (hostname: string) => {
+        asked.push(hostname);
+        return [{ address: POOLER_V6, family: 6 }, { address: "52.10.20.30", family: 4 }];
+    };
+    assert.equal((await targetHostMatches(POOLER_V6, POOLER_HOST, resolve)).ok, true);
+    assert.deepEqual(asked, [POOLER_HOST], "the operator's name is what gets resolved, once");
+
+    // PRE-FIX CONTROL: the exact string compare this rested on says no, which
+    // is the refusal itself. `targetMatches` still answers the exact question.
+    assert.equal(targetMatches({ db: "postgres", host: POOLER_V6 }, "postgres", POOLER_HOST), false);
+});
+
+test("an IPv4-mapped address is the same machine as its IPv4 spelling", async () => {
+    const resolve = async () => [{ address: "10.0.0.5", family: 4 }];
+    assert.equal(normalizeServerAddress("::ffff:10.0.0.5"), "10.0.0.5");
+    assert.equal((await targetHostMatches("::ffff:10.0.0.5", "db.example.com", resolve)).ok, true);
+    // ...and the mapping is not a wildcard: a neighbour still refuses.
+    assert.equal((await targetHostMatches("::ffff:10.0.0.6", "db.example.com", resolve)).ok, false);
+});
+
+test("a connected address the name does not answer to is a refusal", async () => {
+    const elsewhere = async () => [{ address: "203.0.113.9", family: 4 }];
+    assert.equal((await targetHostMatches("10.0.0.5", "db.example.com", elsewhere)).ok, false);
+    // A name that will not resolve is a refusal too: an unanswerable question
+    // is not a yes.
+    const dead = async () => {
+        throw new Error("ENOTFOUND");
+    };
+    assert.equal((await targetHostMatches("10.0.0.5", "db.example.com", dead)).ok, false);
+    // ...and an empty expectation never matches, because a real lookup("")
+    // answers with loopback on some platforms.
+    assert.equal((await targetHostMatches("127.0.0.1", "", elsewhere)).ok, false);
+});
+
+test("a literal --expect-host is compared exactly, with NO lookup at all", async () => {
+    let calls = 0;
+    const resolve = async () => {
+        calls += 1;
+        return [];
+    };
+    assert.equal((await targetHostMatches("10.0.0.5", "10.0.0.5", resolve)).ok, true);
+    // The CI driver's own shape: it reads the address off the server and hands
+    // it straight back as --expect-host. Loopback needs no network either.
+    assert.equal((await targetHostMatches("127.0.0.1", "127.0.0.1", resolve)).ok, true);
+    assert.equal((await targetHostMatches("127.0.0.1", "localhost", resolve)).ok, true);
+    assert.equal((await targetHostMatches("::1", "localhost", resolve)).ok, true);
+    assert.equal((await targetHostMatches("10.0.0.5", "localhost", resolve)).ok, false);
+    assert.equal(calls, 0, "none of those may depend on DNS");
+});
+
+test("the production pooler passes the identity check that always refused it", async () => {
+    const args = {
+        target: "prod",
+        url: `postgresql://postgres.ghzdbzdnwjxazvmcefbh:sup3rs3cret@${POOLER_HOST}:6543/postgres?pgbouncer=true`,
+        from: ".env.production.local",
+        expectDb: "postgres",
+        expectHost: POOLER_HOST,
+        resolve: async () => [{ address: POOLER_V6, family: 6 }],
+    };
+    const identity: Identity = await verifyTargetIdentity(fakeServer({ db: "postgres", host: POOLER_V6 }), args);
+    assert.equal(identity.ok, true, identity.error);
+    assert.doesNotMatch(identity.banner, /sup3rs3cret/, "the banner is still redacted");
+    const notes = (identity.notes ?? []).join("\n");
+    assert.ok(notes.includes(POOLER_V6), "the address it accepted is said out loud");
+    assert.match(notes, /baseline 20260814000000_baseline_production is applied here/, "the baseline note survives");
+
+    // EVERY OTHER HALF OF THE GUARD IS UNTOUCHED.
+    const wrongDb: Identity = await verifyTargetIdentity(fakeServer({ db: "staging", host: POOLER_V6 }), args);
+    assert.equal(wrongDb.ok, false, "the database name is still exact");
+    assert.match(wrongDb.error ?? "", /expected db="postgres"/);
+
+    const elsewhere: Identity = await verifyTargetIdentity(fakeServer({ db: "postgres", host: "203.0.113.9" }), args);
+    assert.equal(elsewhere.ok, false, "a server the name does not answer to is refused");
+    assert.match(elsewhere.error ?? "", /REFUSING/);
+
+    const noBaseline: Identity = await verifyTargetIdentity(fakeServer({ db: "postgres", host: POOLER_V6 }, false), args);
+    assert.equal(noBaseline.ok, false, "the baseline row is still required");
+    assert.match(noBaseline.error ?? "", /no applied 20260814000000_baseline_production row/);
+});
+
+test("a unix-socket server has no address, so the URL's own host is what is checked", async () => {
+    const args = {
+        target: "ci",
+        url: "postgresql://u:p@db.internal:5432/probuild",
+        from: "process.env.DATABASE_URL",
+        expectDb: "probuild",
+        resolve: async () => {
+            throw new Error("the resolver must not be reached");
+        },
+    };
+    const identity: Identity = await verifyTargetIdentity(fakeServer({ db: "probuild", host: "" }), {
+        ...args,
+        expectHost: "db.internal",
+    });
+    assert.equal(identity.ok, true, identity.error);
+    assert.match(
+        (identity.notes ?? []).join("\n"),
+        /local socket/,
+        "and it is recorded, because the server itself did not corroborate it",
+    );
+    // Not a free pass: a URL naming a different host still refuses.
+    const wrong: Identity = await verifyTargetIdentity(fakeServer({ db: "probuild", host: "" }), {
+        ...args,
+        expectHost: "somewhere.else",
+    });
+    assert.equal(wrong.ok, false);
+    assert.match(wrong.error ?? "", /local socket/);
 });
 
 // ── the legacy date re-anchor (Codex round 6, item 1) ──────────────────────
