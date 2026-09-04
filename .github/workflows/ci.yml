@@ -66,6 +66,283 @@ jobs:
       # The focused integration regression deliberately drifts the disposable
       # database's function and trigger after proving the checker recognizes
       # the production snapshot. It therefore runs last in this job.
+      # Two REAL connections contending on a User row. Every other concurrency
+      # proof in the suite is an injected sequence, which shows the branch exists
+      # but not that PostgreSQL serializes the way the code assumes. Runs BEFORE
+      # the drift test below, which deliberately mutates this database.
+      # Production received this migration on 2026-09-02, so the documented
+      # deploy command must be a safe no-op against an already-applied database
+      # and --dry-run must execute nothing. Proven here, never against prod.
+      # Mutation tests for the VERIFIER: break one thing at a time (RLS off, a
+      # policy added, wrong index columns, a weakened CHECK, an FK back to
+      # CASCADE, a decoy in another schema, a lost NOT NULL) and assert each is
+      # reported. A verifier that cannot fail is not a verifier.
+      - name: Prove the schema-drift verifier reports each kind of drift
+        run: npx tsx --test tests/payroll-schema-drift-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # Concurrent reassignment of a time entry, on two real connections.
+      - name: Prove a reassigned time entry is refused by the conditional writes
+        run: npx tsx --test tests/time-entry-reassign-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Imports the app's prisma singleton via wa-breaks-db — see the note
+          # on the rate-lock step below.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # The change-order tag racing a logistics reroute, both orders, on real
+      # connections. tests/time-expense-core-guards.test.ts pins the SHAPE of
+      # that fix from the source; only this step shows PostgreSQL actually
+      # serializes the two the way the code assumes, and that a refused tag
+      # leaves nothing behind.
+      - name: Prove the change-order tag and a logistics reroute cannot both win
+        run: npx tsx --test tests/change-order-tag-race-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Runs the real tagTimeEntriesToChangeOrderCore, which reaches the
+          # app's prisma singleton — see the note on the rate-lock step below.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # The $0-rate guard through the real create core, then the ROW read back:
+      # the regression it replaced was a completed, unflagged, $0 TimeEntry row,
+      # which no predicate test can see.
+      - name: Prove the $0-rate guard refuses, flags and exempts the right rows
+        run: npx tsx --test tests/zero-rate-create-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      - name: Prove the apply script is idempotent and --dry-run is read-only
+        run: npx tsx --test tests/payroll-apply-idempotent-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      - name: Prove settlement's FOR SHARE blocks a concurrent rate write
+        run: npx tsx --test tests/payroll-rate-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # This test imports the app's prisma singleton, which REFUSES a
+          # DATABASE_URL without pgbouncer=true. That guard is production safety,
+          # not a nuisance: without the flag the Supabase transaction pooler
+          # returns 42P05 "prepared statement already exists" and the site goes
+          # down (CLAUDE.md). It is satisfied here rather than weakened — the
+          # same thing the Playwright job below already does for its own
+          # localhost URL. On a direct connection the flag only tells Prisma to
+          # skip prepared statements, which is harmless.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # The payroll export's OTHER inputs — the company time zone and the Gusto
+      # employee mappings. Those two reads used to go out on the GLOBAL prisma
+      # client from inside the lock's transaction, so a zone or mapping edit
+      # could land between them and the entry read and be hashed into a frozen
+      # pay period. The fake-client test pins which client each read uses; only
+      # this step shows PostgreSQL actually holds the writer off.
+      - name: Prove the export's FOR SHARE blocks a zone or mapping change
+        run: npx tsx --test tests/payroll-settings-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton (saveGustoSettings) — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # payType and hourlyRate are EXPORT INPUTS: pay type decides who is on the
+      # Gusto file at all, and lockPayrollPeriod hashes the roster and freezes
+      # it. Neither the export's roster read nor the rate writers held anything
+      # against the other, so a pay type could change between the lock's
+      # "confirmed" recompute and its COMMIT. The fake-client test pins which
+      # lock is taken and in what order; only this step shows PostgreSQL
+      # actually holds each side off.
+      - name: Prove a pay-type change cannot land while a pay period is being locked
+        run: npx tsx --test tests/payroll-paytype-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Imports the app's prisma singleton via pay-rate-write — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # ACTIVATION is the other half of the Gusto roster predicate
+      # ("(ACTIVATED and HOURLY) or punched"), and no activation writer took the
+      # payroll advisory lock — so a sign-in could add somebody to a pay
+      # period's file between the lock's roster read and its COMMIT. The export
+      # cannot defend itself there: FOR SHARE can only lock rows its own
+      # predicate returned. The manifest test pins WHICH call sites are wrapped;
+      # only this step shows PostgreSQL holds the writer off.
+      - name: Prove an activation cannot land while a pay period is being locked
+        run: npx tsx --test tests/payroll-activation-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton through payroll-period — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # A LOCKED period that has lost its frozen CSVs used to fall through to a
+      # freshly recomputed LIVE csv — the one case where live data is definitely
+      # the wrong answer, because the file was built from mutable inputs and
+      # cannot be reproduced. Two defences, both proven here on a real database:
+      # the CHECK constraint makes the row unrepresentable, and the endpoint
+      # refuses (409) if one exists anyway.
+      - name: Prove a locked period with no snapshot fails closed
+        run: npx tsx --test tests/payroll-locked-snapshot-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Drives the real export endpoint, which reaches the app's prisma
+          # singleton — same pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # WA meal settlement is a per-DAY rule, and every day key on that path used
+      # to come from a helper hardcoded to America/Los_Angeles while the payroll
+      # window around it used the CONFIGURED zone. For a non-Pacific company a
+      # 00:30 Monday punch settled as a Pacific Sunday and the rule was computed
+      # over two local days at once, which changes what comes off a paycheque.
+      # Two zones, both boundaries, real rows, each with a pre-fix control.
+      - name: Prove settlement uses the company time zone, not Pacific
+        run: npx tsx --test tests/payroll-settlement-zone-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # settleDay reaches the app's prisma singleton — same pgbouncer
+          # reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # A portal CLIENT account is not an employee. The rates panel, the CSV
+      # importer, the rate writer and the export roster all used to ask only
+      # whether an account was ACTIVATED, so a customer who had signed in once
+      # could be given a pay type and then appear on every pay period's file.
+      - name: Prove a customer account can never reach payroll
+        run: npx tsx --test tests/payroll-staff-only-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # GET /api/time-entries served the whole Prisma model plus the owner as a
+      # complete User row, so field crew received their own pinCode BCRYPT HASH
+      # and pay rates, and a manager received everybody's. Real requests with
+      # real mobile tokens, asserted as an allowlist.
+      - name: Prove the time-entry response is an allowlist per audience
+        run: npx tsx --test tests/time-entries-projection-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # Project.name and CostCode.code are columns of the detail CSV, so they are
+      # inputs to the frozen hash - and neither row was held by anything, so a
+      # rename could land between the export read and the lock COMMIT. Two real
+      # connections, both renames, each with a pre-fix control.
+      #
+      # FOR SHARE holds off a rename, but not a DELETE that committed before it,
+      # and TimeEntry.costCodeId is ON DELETE SET NULL - so the export re-reads
+      # the entries' foreign keys under those locks and refuses if anything
+      # moved or went missing. Staged on two connections at the exact instant
+      # between the entry read and the locks, with the FK actions the reasoning
+      # rests on asserted against the live catalog.
+      - name: Prove a rename or a deletion cannot land while a period is frozen
+        run: npx tsx --test tests/payroll-label-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # PUT/PATCH /api/users/[id], PATCH /api/users and PATCH
+      # /api/manager/employees/[id] all authorized against a User.role read
+      # taken BEFORE the write transaction opened, then wrote without checking
+      # again — an admin promotion committing in that gap let a manager's
+      # already-in-flight request act on the now-admin account. Two real
+      # connections: a promotion staged mid-transaction genuinely blocks the
+      # guarded write on the row lock, and once it commits the write is
+      # refused against the row it actually holds — for a status change, a
+      # delete and a permission grant, each with an ADMIN control and a
+      # pre-fix control reproducing the old vulnerable ordering verbatim.
+      - name: Prove an admin promotion cannot land mid-flight under a manager's user write
+        run: npx tsx --test tests/user-mutation-target-race-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # THE GLOBAL LOCK ORDER: payroll advisory lock, then the User row. The
+      # guard decided whether to take the advisory lock from the Prisma `data`
+      # payload alone, but the rate fields travel separately to the rate writer,
+      # which takes the same lock itself — so a rate-only edit took the ROW
+      # first and asked for the lock second, and deadlocked against a period
+      # being locked. One predicate now answers for the whole request. Real
+      # connections, both orders, an interleave staged at the exact instant the
+      # old code deadlocked, and the inverted sequence written out beside it
+      # showing PostgreSQL really does report 40P01. The same step covers the
+      # apply script's payType seed, which now takes the shared lock and bumps
+      # payrollRevision only for rows it actually changes.
+      - name: Prove a rate edit and a period lock cannot invert the lock order
+        run: npx tsx --test tests/payroll-lock-order-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton through payroll-period — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # Round 12 locked the TARGET of a user mutation and re-read it inside the
+      # transaction. The ACTOR was still taken from a query the route ran BEFORE
+      # the transaction opened, so a manager demoted, disabled or stripped of
+      # financialReports a millisecond earlier still wrote — and creation sat
+      # outside the guard entirely. Both rows are now locked in ascending id
+      # order and every check re-runs against them. Real connections, one case
+      # per vector, a pre-fix control that wrongly succeeds, and a deadlock-
+      # freedom case (two managers editing each other at once).
+      - name: Prove a demoted or disabled actor cannot finish a user write
+        run: npx tsx --test tests/user-mutation-actor-race-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton through payroll-period — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # The same actor race, on the OTHER family of writers. Every payroll
+      # mutation — the Gusto rate import, the pay-type change, the period lock,
+      # the settle button, discard and unlock — authorized its caller and only
+      # THEN opened a transaction that waits: on the payroll advisory lock, on
+      # User rows, and in the settle button's case once per deferred day. An
+      # account disabled, demoted or stripped of financialReports inside that
+      # window still committed. requireFinancialActorInTx re-decides it under
+      # the lock. Real connections, one case per vector, an ADMIN-only case,
+      # a pre-fix control that wrongly succeeds, and deadlock freedom.
+      - name: Prove a revoked payroll actor cannot finish a payroll write
+        run: npx tsx --test tests/payroll-actor-reauth-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton through payroll-period — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # The DOCUMENTED deploy command, RUN. The PR body told Justin to export
+      # PAYROLL_APPLY_EXPECT_PROJECT_REF while the script read
+      # APPLY_EXPECT_PROJECT_REF, so the command in the deploy procedure could
+      # not have succeeded and the refusal would have named the variable he was
+      # looking at (round 16, finding 1). This parses the invocation out of the
+      # script's own exported constant and runs it, with only `prod` swapped for
+      # `ci`, so the documentation cannot drift away from something that works.
+      - name: Prove the documented deploy command actually runs
+        run: npx tsx --test tests/payroll-apply-target.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # THE SCRIPT ITSELF, run end to end — the one thing nothing else did.
+      #
+      # The parity test reads it as text, the drift tests import its pure
+      # helpers, and the idempotency test runs it only against a database
+      # `migrate deploy` has ALREADY brought to the final shape, which is the one
+      # state where its whole DDL body is a no-op. So every statement that
+      # actually CREATES something had never been executed by anything but
+      # production. This builds the two states production has really been in —
+      # pre-Phase-5, and the "accidentally applied on 2026-09-02" shape with
+      # `payrollRevision` and the snapshot CHECK removed — and over each one:
+      # apply, `--dry-run` must exit 0 with zero drift, apply again for
+      # idempotency. `--target ci` takes the ambient URL, skips the production
+      # baseline and project-ref checks, and REFUSES any Supabase host, so this
+      # cannot reach a hosted database even by accident.
+      #
+      # Runs on its OWN database (probuild_apply_payroll) and last in the job, so
+      # it cannot disturb the steps above.
+      - name: Apply script end-to-end against real Postgres
+        run: node scripts/ci-apply-payroll-phase5-e2e.mjs
+        env:
+          APPLY_E2E_SERVER_URL: postgresql://probuild:probuild@localhost:5432/postgres
+          APPLY_E2E_DB: probuild_apply_payroll
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

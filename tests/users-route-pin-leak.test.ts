@@ -58,9 +58,50 @@ const fakePrisma = {
     },
     userPermission: {
         create: async (args: Row) => ({ userId: args.data.userId, autoGrantNewProjects: false }),
+        upsert: async (args: Row) => ({ userId: args.where.userId, ...args.update }),
     },
     project: { findMany: async () => [] },
-    projectAccess: { createMany: async () => ({ count: 0 }) },
+    projectAccess: { createMany: async () => ({ count: 0 }), deleteMany: async () => ({ count: 0 }) },
+
+    // The phase-5 guard reads the ACTOR and the TARGET back inside the write
+    // transaction, under FOR UPDATE / FOR SHARE, and re-runs the authority
+    // check against what it locked. It also takes the payroll advisory lock.
+    // This fake answers those from the same `state.users` the queries above
+    // read, so the guard sees a consistent world rather than a phantom row.
+    $queryRawUnsafe: async (query: string, ...values: unknown[]) => {
+        const id = String(values[0]);
+        // The actor's permission row. Nothing in these cases grants one.
+        if (/UserPermission/.test(query)) return [];
+        const u = state.users.find((x) => x.id === id);
+        return u ? [{ id: u.id, role: u.role, status: u.status }] : [];
+    },
+    $executeRawUnsafe: async () => 0,
+    $transaction: async (fn: (tx: Row) => Promise<unknown>) => fn(txClient),
+};
+
+/** The interactive-transaction client: the same fakes, minus $transaction. */
+const txClient: Row = {
+    user: {
+        findUnique: (args: Row) => fakePrisma.user.findUnique(args),
+        findUniqueOrThrow: async (args: Row) => {
+            const u = await fakePrisma.user.findUnique(args);
+            if (!u) throw new Error("findUniqueOrThrow: no such user");
+            return u;
+        },
+        update: (args: Row) => fakePrisma.user.update(args),
+        create: (args: Row) => fakePrisma.user.create(args),
+        delete: async (args: Row) => {
+            const at = state.users.findIndex((x) => x.id === args.where.id);
+            return at === -1 ? null : state.users.splice(at, 1)[0];
+        },
+    },
+    userPermission: { upsert: (args: Row) => fakePrisma.userPermission.upsert(args) },
+    projectAccess: {
+        createMany: () => fakePrisma.projectAccess.createMany(),
+        deleteMany: () => fakePrisma.projectAccess.deleteMany(),
+    },
+    $queryRawUnsafe: (query: string, ...values: unknown[]) => fakePrisma.$queryRawUnsafe(query, ...values),
+    $executeRawUnsafe: () => fakePrisma.$executeRawUnsafe(),
 };
 
 let GET_LIST: (req: Request) => Promise<Response>;

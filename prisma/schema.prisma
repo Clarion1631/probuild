@@ -16,6 +16,28 @@ model User {
   status                    String                   @default("PENDING") // PENDING, ACTIVATED, DISABLED
   hourlyRate                Decimal                  @default(0)
   burdenRate                Decimal                  @default(0)
+  /// How Gusto pays this member: "HOURLY" or "SALARY". NULL means nobody has
+  /// said yet, which is deliberately NOT the same as "hourly" — the payroll
+  /// export refuses to run while an in-period worker is null, because guessing
+  /// either way is a wrong paycheque. The env list PAYROLL_SALARIED_EMAILS is
+  /// only a fallback for rows this column has not answered.
+  payType                   String?
+  /// Last time this member's pay rate was CONFIRMED — set by the Gusto rate
+  /// import and by a manual hourlyRate/burdenRate edit. Null means "never
+  /// confirmed since this column shipped", which the Payroll rates panel
+  /// shows in red. It is not a rate-change log; it is a staleness marker.
+  /// Timestamptz to match the migration and every other timestamp added by
+  /// Phase 5 — a bare DateTime maps to TIMESTAMP(3), which the
+  /// migrations-reproduce-production check correctly flags as drift.
+  lastRateSyncAt            DateTime?                @db.Timestamptz(6)
+  /// Monotonic counter, bumped on EVERY payroll-affecting write to this row
+  /// (a rate confirmation OR a pay-type-only change) — replay protection for
+  /// the Gusto rate-import preview/apply signature. lastRateSyncAt cannot do
+  /// this job: it means "a rate was actually confirmed", so a pay-type-only
+  /// write must NOT move it (round-31 gate finding) — but that leaves a
+  /// concurrent pay-type change undetectable by a signature keyed on
+  /// lastRateSyncAt alone. This value has no other meaning; never displayed.
+  payrollRevision           Int                      @default(0)
   mealWaiverSignedAt        DateTime? // signed WA meal-period waiver on file (skip-lunch approval precondition)
   showOnDispatch            Boolean                  @default(false) // Appears on the dispatch board bench/grid. Owner-controlled on Company → Team members.
   pinCode                   String? // Used for mobile app quick login
@@ -47,6 +69,74 @@ model User {
   mcpKeys                   McpKey[]
   createdInspections        Inspection[]              @relation("InspectionCreator")
   percentCompleteUpdates    Project[]                 @relation("PercentCompleteUpdatedBy")
+  lockedPayrollPeriods      PayrollPeriod[]           @relation("PayrollPeriodLocker")
+}
+
+/// A pay period that has been reviewed and exported to Gusto.
+///
+/// The range is HALF-OPEN, [periodStart, periodEnd): an entry belongs to the
+/// period whose start is <= its startTime and whose end is > its startTime, so
+/// two adjacent periods can never both claim the same punch.
+///
+/// A row exists only once a human has looked at the period on
+/// /manager/payroll-export. `lockedAt` is what actually freezes the period —
+/// unlocking clears it but keeps the row and the hash, so the audit trail of
+/// "this is what we exported" survives an unlock. `exportHash` is the sha256
+/// of the SUMMARY csv as it stood at lock time; a later download that hashes
+/// differently means the underlying entries moved after the lock.
+model PayrollPeriod {
+  id          String    @id @default(cuid())
+  /// STABLE IDENTITY. The company-local calendar days the period covers,
+  /// half-open, as YYYY-MM-DD. The timestamps below are derived from these in
+  /// the zone recorded in `timeZone`, so they MOVE if CompanySettings.timeZone
+  /// changes — which made an exact timestamp lookup miss its own locked row
+  /// (downloads fell back to live CSV, unlock updated zero rows and still
+  /// reported success). Look periods up by these keys; use the timestamps only
+  /// for range/overlap queries.
+  periodStartKey String?
+  periodEndKey   String?
+  periodStart DateTime  @db.Timestamptz(6)
+  periodEnd   DateTime  @db.Timestamptz(6)
+  lockedAt    DateTime? @db.Timestamptz(6)
+  lockedById  String?
+  lockedBy    User?     @relation("PayrollPeriodLocker", fields: [lockedById], references: [id], onDelete: SetNull)
+  exportHash  String?
+  /// IANA zone the period was LOCKED in. Enforcement reads it back rather than
+  /// resolving the company zone fresh: the workweek envelope is computed from a
+  /// time zone, so if CompanySettings.timeZone ever changes, re-deriving it
+  /// would silently move the boundaries of a period that was already paid.
+  /// Null on rows written before this column existed — those fall back to the
+  /// resolved company zone.
+  timeZone    String?
+  /// THE EXPORT, FROZEN. Written at lock time and served verbatim afterwards.
+  /// Recomputing a locked period is not reproducible: the CSVs are built from
+  /// mutable inputs (a member's name, email, payType, the Gusto employee-id
+  /// mapping, a punch's project/cost code after logistics recoding), so the
+  /// same locked period could render differently tomorrow than the file that
+  /// was actually sent to payroll. Unlock deletes both columns.
+  summaryCsvSnapshot String?
+  detailCsvSnapshot  String?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  /// SOFT DELETE. A period created over the wrong range cannot simply be
+  /// removed — unlocking leaves the row behind, and every overlap check then
+  /// refuses the corrected range forever. Discarding retires the row instead:
+  /// it stays for the audit trail (see AuditLog entity "PayrollPeriod", action
+  /// "discard") and every reader ignores it. Only an UNLOCKED row may be
+  /// discarded; frozen hours are never retired this way.
+  ///
+  /// Note the unique on (periodStartKey, periodEndKey) still applies to
+  /// discarded rows, so discarding does NOT free the same range to be created
+  /// again — it frees the OVERLAPPING ranges around it. Re-locking the exact
+  /// same period is what unlockPayrollPeriod is for.
+  discardedAt     DateTime? @db.Timestamptz(6)
+  discardedById   String?
+  discardedReason String?
+
+  @@unique([periodStart, periodEnd])
+  @@unique([periodStartKey, periodEndKey])
+  @@index([lockedAt])
+  @@index([lockedById])
+  @@index([discardedAt])
 }
 
 model Client {
@@ -900,9 +990,14 @@ model CostType {
 model TimeEntry {
   id         String    @id @default(cuid())
   userId     String
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// RESTRICT, not CASCADE. Deleting a person or a job used to silently destroy
+  /// their payroll history — including hours inside a LOCKED period that had
+  /// already been exported and paid, leaving nothing to reconcile a Gusto run
+  /// against. The delete paths now remove the entries explicitly, under the
+  /// payroll lock, and refuse outright when any of them are frozen.
+  user       User      @relation(fields: [userId], references: [id], onDelete: Restrict)
   projectId  String
-  project    Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project    Project   @relation(fields: [projectId], references: [id], onDelete: Restrict)
   costCodeId String?
   costCode   CostCode? @relation(fields: [costCodeId], references: [id])
   costTypeId String?
@@ -992,6 +1087,10 @@ model TimeEntry {
   @@index([estimateItemId])
   @@index([scheduleTaskId])
   @@index([changeOrderId])
+  /// Every payroll read is a startTime RANGE scan (the export fetches whole
+  /// workweeks, the lock check and the settlement planner both scan a period),
+  /// and none of the FK indexes above help a bare range predicate.
+  @@index([startTime])
 }
 
 model Contract {
@@ -2660,10 +2759,46 @@ model HelpRequest {
   changeLocation    String?
   externalIssueRef  String?
   conversationId    String?
+  /// Client-supplied idempotency key, unique PER USER. Not globally unique:
+  /// one user's key would then collide with another's and hand back somebody
+  /// else's report, so the uniqueness and every lookup are scoped by userId.
+  submissionId      String?
+  /// GitHub issue reference for this report, and whether it has been created
+  /// yet. `providerState` is 'pending' until the issue exists and 'created'
+  /// afterwards, so a resumed submission knows whether to call GitHub at all —
+  /// status alone could not tell "never tried" from "tried and finished".
+  providerIssueRef  String?
+  providerState     String?   @default("pending")
+  /// Compare-and-set lease over the provider call. Two attempts can reach the
+  /// GitHub step at once (a double-tap, or a retry overlapping the first
+  /// request) and both would file — the marker search cannot help, because
+  /// neither issue exists yet when they both look.
+  providerLeaseToken     String?
+  providerLeaseExpiresAt DateTime? @db.Timestamptz(6)
   createdAt         DateTime? @default(now()) @db.Timestamptz(6)
 
+  @@unique([userId, submissionId])
   @@index([conversationId])
   @@index([externalIssueRef])
+  /// The throttle counts a user's submissions in the last hour.
+  @@index([userId, createdAt])
+}
+
+/// Per-user, per-hour submission counter for the help widget.
+///
+/// The count lives in its own row so the limit can be enforced by a single
+/// conditional UPDATE (`SET count = count + 1 WHERE count < limit RETURNING`).
+/// Counting rows in HelpRequest was a read-then-write: concurrent requests all
+/// read the same number and all inserted.
+model HelpSubmissionQuota {
+  id         String   @id @default(cuid())
+  userId     String
+  /// Truncated hour, e.g. 2026-09-02T14:00:00Z — the window this count covers.
+  hourBucket DateTime @db.Timestamptz(6)
+  count      Int      @default(0)
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([userId, hourBucket])
 }
 
 model RolloutGate {

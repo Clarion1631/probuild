@@ -15,6 +15,25 @@ import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timez
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
+import {
+    assertBulkDeletable,
+    assertManualEntryDelete,
+    reassertManualEntryInTx,
+    assertManualEntryWrite,
+    assertNotClockGeneratedEntry,
+    assertNotLegacyUnitEntry,
+    assertUsableDuration,
+    canWriteHoursFor,
+} from "@/lib/manual-time-entry-auth";
+import { withPayrollWriteTx } from "@/lib/payroll-period";
+import { toNum } from "@/lib/prisma-helpers";
+import {
+    appendZeroRateReview,
+    canAcknowledgeZeroRate,
+    readOwnerRatesForUpdate,
+    zeroRateBlocks,
+    zeroRateManagerMessage,
+} from "@/lib/pay-rate-guard";
 
 async function assertTimeExpenseProjectAccess(projectId: string) {
     const user = await getCurrentUserWithPermissions();
@@ -22,6 +41,42 @@ async function assertTimeExpenseProjectAccess(projectId: string) {
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
     if (user.role !== "FINANCE" && !canAccessProject(user, projectId)) throw new Error("Forbidden");
+}
+
+/**
+ * Price an entry from the member's STORED rates, applying the same $0-rate
+ * policy as every other write path.
+ *
+ * Read inside the caller's transaction and row-locked: a rate import committing
+ * between a pre-read and this write would otherwise price the shift from a
+ * value that is no longer true.
+ *
+ * This is always an office action, so it follows the MANAGER branch — refused
+ * by default, allowed only on an explicit acknowledgement, and then flagged so
+ * the payroll export refuses to run past it.
+ */
+async function priceEntryFromStoredRates(
+    tx: { $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown> },
+    userId: string,
+    durationHours: number,
+    acknowledgeZeroRate: boolean
+): Promise<{ laborCost: number; burdenCost: number; needsReview?: boolean; reviewReason?: string }> {
+    const member = await readOwnerRatesForUpdate(tx, userId, toNum);
+    if (!member) throw new Error("Crew member not found");
+
+    const zeroRate = zeroRateBlocks({
+        role: member.role,
+        email: member.email,
+        payType: member.payType,
+        hourlyRate: member.hourlyRate,
+    });
+    if (zeroRate && !acknowledgeZeroRate) throw new Error(zeroRateManagerMessage(member.name));
+
+    return {
+        laborCost: durationHours * member.hourlyRate,
+        burdenCost: durationHours * member.burdenRate,
+        ...(zeroRate ? appendZeroRateReview(null) : {}),
+    };
 }
 
 // ─── Time Entry Actions ────────────────────────────────────────
@@ -39,8 +94,19 @@ export async function createTimeEntry(data: {
 }) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
-    await assertTimeExpenseProjectAccess(data.projectId);
-    await createTimeEntryFromStoredRatesCore(data, session.user.email);
+    // Crew write their OWN hours; only the office writes somebody else's.
+    const actor = await assertManualEntryWrite(data.projectId, data.userId);
+    const durationHours = assertUsableDuration(data.durationHours);
+    await createTimeEntryFromStoredRatesCore(
+        {
+            ...data,
+            durationHours,
+            acknowledgeZeroRate:
+                (data as { acknowledgeZeroRate?: boolean }).acknowledgeZeroRate === true &&
+                canAcknowledgeZeroRate(actor, data.userId),
+        },
+        session.user.email
+    );
 
     revalidatePath(`/projects/${data.projectId}/time-expenses`);
     revalidatePath(`/projects/${data.projectId}/budget`);
@@ -54,14 +120,11 @@ export async function updateTimeEntry(
         costCodeId: string | null;
         date: string;
         durationHours: number;
-        laborCost: number;
+        /** Deliberate "book it at $0 and flag it for payroll" — never the default. */
+        acknowledgeZeroRate?: boolean;
     }
 ) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
-    if (!Number.isFinite(data.durationHours) || data.durationHours <= 0) throw new Error("Hours must be greater than zero");
-    if (!Number.isFinite(data.laborCost) || data.laborCost < 0) throw new Error("Labor cost cannot be negative");
+    const durationHours = assertUsableDuration(data.durationHours);
     // Date-only input goes through the company-timezone helper, not new Date():
     // new Date("2026-07-27") is UTC midnight, which is the 26th in company time,
     // so a plain parse silently moves the entry back a day. createTimeEntryCore
@@ -69,9 +132,24 @@ export async function updateTimeEntry(
     const timeZone = await resolveCompanyTimeZone();
     const startTime = dateInputInTimeZone(data.date, timeZone, "Time entry date");
     if (!startTime || Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
-    const current = await prisma.timeEntry.findUnique({ where: { id }, select: { projectId: true, invoiceId: true, invoicedAt: true, estimateItemId: true } });
-    if (!current || current.projectId !== data.projectId || !canAccessProject(user, current.projectId)) throw new Error("Forbidden");
+    const current = await prisma.timeEntry.findUnique({
+        where: { id },
+        select: {
+            projectId: true, userId: true, startTime: true, endTime: true, invoiceId: true, invoicedAt: true,
+            estimateItemId: true, durationHours: true, laborCost: true,
+        },
+    });
+    if (!current || current.projectId !== data.projectId) throw new Error("Forbidden");
+    // Authorized against the STORED row's project and owner, and against the
+    // person this edit would move it to.
+    assertNotLegacyUnitEntry(current);
+    assertNotClockGeneratedEntry(current);
+    const actor = await assertManualEntryWrite(current.projectId, current.userId);
+    await assertManualEntryWrite(current.projectId, data.userId);
     if (current.invoiceId || current.invoicedAt) throw new Error("Billed time entries cannot be edited");
+    const acknowledgeZeroRate =
+        (data as { acknowledgeZeroRate?: boolean }).acknowledgeZeroRate === true &&
+        canAcknowledgeZeroRate(actor, data.userId);
 
     // Re-bind against the STORED row: this action never writes projectId, so a
     // client-supplied one could attach another project's task, and dropping the
@@ -83,16 +161,45 @@ export async function updateTimeEntry(
         estimateItemId: current.estimateItemId,
     });
 
-    const updated = await prisma.timeEntry.updateMany({
-        where: { id, invoiceId: null, invoicedAt: null },
-        data: {
-            userId: data.userId,
-            costCodeId: data.costCodeId,
-            startTime,
-            scheduleTaskId,
-            durationHours: data.durationHours,
-            laborCost: data.laborCost,
-        },
+    // Lock check and write in ONE transaction, under the shared payroll
+    // advisory lock (src/lib/payroll-period.ts). This action writes startTime
+    // AND durationHours, so it can edit hours already paid or move hours into a
+    // period that was already exported. The row's STORED startTime is re-read
+    // and row-locked inside the transaction — the value captured above is not
+    // trusted, because another writer may have moved the row since.
+    // No settlement here, deliberately. settleDayInTx only ever plans rows with
+    // a real endTime, and assertNotClockGeneratedEntry above guarantees this row
+    // has none — so a settle call would take locks and re-plan a day this write
+    // cannot have changed. The clocked paths (PUT /api/time-entries and
+    // PATCH /api/time-entries/[id]) are where settlement belongs.
+    const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, async (tx) => {
+        // The row is FOR UPDATE now. Everything above was authorized from a read
+        // taken before that lock existed, so it is re-checked here against what
+        // the row actually is.
+        await reassertManualEntryInTx(tx as never, id, current);
+        const result = await (tx as unknown as typeof prisma).timeEntry.updateMany({
+            where: { id, invoiceId: null, invoicedAt: null },
+            data: {
+                userId: data.userId,
+                costCodeId: data.costCodeId,
+                startTime,
+                scheduleTaskId,
+                durationHours,
+                // Cost and burden are DERIVED, inside this transaction, from the
+                // member's stored rates. They used to be parameters: a server
+                // action's arguments are an HTTP body, so a caller could post
+                // any cost against any worker, straight into payroll and job
+                // costing. Recomputed here (not before the transaction) so a
+                // concurrent rate change cannot land in between.
+                ...(await priceEntryFromStoredRates(
+                    tx as never,
+                    data.userId,
+                    durationHours,
+                    acknowledgeZeroRate
+                )),
+            },
+        });
+        return result;
     });
     if (updated.count !== 1) throw new Error("Time entry was billed while it was being edited; refresh and try again");
 
@@ -101,15 +208,24 @@ export async function updateTimeEntry(
 }
 
 export async function deleteTimeEntry(id: string) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
-    const entry = await prisma.timeEntry.findUnique({ where: { id } });
-    if (!entry) throw new Error("Not found");
-    if (!canAccessProject(user, entry.projectId)) throw new Error("Forbidden");
+    // Authorized against the STORED row: its project AND its owner.
+    const { entry } = await assertManualEntryDelete(id);
+    assertNotClockGeneratedEntry(entry);
     if (entry.invoiceId || entry.invoicedAt) throw new Error("Billed time entries cannot be deleted");
 
-    const deleted = await prisma.timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } });
+    // Deleting a punch out of an exported period changes hours that were paid —
+    // check and delete in one transaction under the shared advisory lock.
+    // No settlement here, deliberately. settleDayInTx only ever plans rows with
+    // a real endTime, and assertNotClockGeneratedEntry above guarantees this row
+    // has none — so a settle call would take locks and re-plan a day this write
+    // cannot have changed. The clocked paths (PUT /api/time-entries and
+    // PATCH /api/time-entries/[id]) are where settlement belongs.
+    const deleted = await withPayrollWriteTx({ entryIds: [id] }, async (tx) => {
+        await reassertManualEntryInTx(tx as never, id, entry);
+        return (tx as unknown as typeof prisma).timeEntry.deleteMany({
+            where: { id, invoiceId: null, invoicedAt: null },
+        });
+    });
     if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
 
     revalidatePath(`/projects/${entry.projectId}/time-expenses`);
@@ -126,20 +242,46 @@ export async function deleteTimeEntries(
 
     const entries = await prisma.timeEntry.findMany({
         where: { id: { in: ids } },
-        select: { id: true, projectId: true, invoiceId: true, invoicedAt: true },
+        select: {
+            id: true, projectId: true, userId: true, startTime: true, endTime: true,
+            invoiceId: true, invoicedAt: true,
+        },
     });
 
-    const allowed = entries.filter(
-        e => !e.invoiceId && !e.invoicedAt && canAccessProject(user, e.projectId)
-    );
-    if (!allowed.length) return { deleted: 0 };
+    // REFUSED, not filtered. This used to silently drop every row the caller
+    // could not delete and report success for the rest — so a FIELD_CREW member
+    // selecting a colleague's clocked punch alongside their own manual rows was
+    // told the whole batch was deleted. Worse, the same silent filter was the
+    // only thing standing between the bulk path and the two guards the singular
+    // path enforces, so a clocked punch could be destroyed here that
+    // deleteTimeEntry(id) would have refused.
+    assertBulkDeletable(user, entries, canAccessProject);
+    const allowedIds = entries.map(e => e.id);
+    const projectIds = new Set(entries.map(e => e.projectId));
 
-    const allowedIds = allowed.map(e => e.id);
-    const projectIds = new Set(allowed.map(e => e.projectId));
-
-    const result = await prisma.timeEntry.deleteMany({
-        where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
+    // EVERY row, not a sample: a bulk delete that silently skipped the locked
+    // ones would be worse than refusing outright, because the caller would be
+    // told it succeeded.
+    const result = await withPayrollWriteTx({ entryIds: allowedIds }, async (tx) => {
+        // Re-authorized against the rows as they stand under the FOR UPDATE that
+        // withPayrollWriteTx just took. The read above is outside the
+        // transaction: between it and here, another writer can reassign a row to
+        // a different project or owner, or an invoice run can claim it.
+        const locked = await (tx as unknown as typeof prisma).timeEntry.findMany({
+            where: { id: { in: allowedIds } },
+            select: {
+                id: true, projectId: true, userId: true, endTime: true,
+                invoiceId: true, invoicedAt: true,
+            },
+        });
+        assertBulkDeletable(user, locked, canAccessProject);
+        return (tx as unknown as typeof prisma).timeEntry.deleteMany({
+            where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
+        });
     });
+    if (result.count !== allowedIds.length) {
+        throw new Error("Some of those entries were billed while they were being deleted; refresh and try again");
+    }
 
     for (const projectId of projectIds) {
         revalidatePath(`/projects/${projectId}/time-expenses`);

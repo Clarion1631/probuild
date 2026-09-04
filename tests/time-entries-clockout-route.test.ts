@@ -13,7 +13,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { ClockOutDependencies, ClockOutTimeEntryRow } from "../src/app/api/time-entries/route";
+import { TIME_ENTRY_CREW_SELECT } from "../src/lib/time-entry-projection";
+import type { ClockOutDependencies, ClockOutStoredSnapshot, ClockOutTimeEntryRow } from "../src/app/api/time-entries/route";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-time-entries-route-tests";
 
@@ -38,32 +39,96 @@ function baseEntry(overrides: Partial<ClockOutTimeEntryRow> = {}): ClockOutTimeE
     };
 }
 
+/**
+ * The row as the close transaction re-reads it under FOR UPDATE — the real
+ * dependency selects every one of these columns, because every clock-out
+ * decision is made from this snapshot and not from the pre-transaction read.
+ */
+function snapshotOf(entry: ClockOutTimeEntryRow): ClockOutStoredSnapshot {
+    return {
+        id: entry.id,
+        userId: entry.userId,
+        projectId: entry.projectId,
+        startTime: entry.startTime,
+        endTime: entry.endTime,
+        notes: entry.notes,
+        reviewReason: entry.reviewReason,
+        mealSkipStatus: entry.mealSkipStatus ?? null,
+        updatedAt: entry.updatedAt ?? new Date(0),
+    };
+}
+
 function createDeps(overrides: {
     role?: string;
     authOk?: boolean;
     entry?: ClockOutTimeEntryRow | null;
+    /**
+     * The row the CLOSE TRANSACTION finds, when a concurrent writer changed it
+     * after the handler's first read. Defaults to `entry` (nothing moved).
+     */
+    storedEntry?: ClockOutTimeEntryRow;
     isLogistics?: boolean;
-    ownerRates?: { hourlyRate: number; burdenRate: number } | null;
+    /** Per-project logistics flags, for tests where the entry moves between projects. */
+    logisticsProjects?: string[];
+    ownerRates?: { hourlyRate: number; burdenRate: number; role: string; name: string | null; email: string; payType: string | null } | null;
+    /** Locked pay periods the PUT handler must refuse to write into (src/lib/payroll-period.ts). */
+    lockedPeriods?: import("../src/lib/payroll-period").LockedPeriodRow[];
     /** Simulate a concurrent PUT winning the atomic close guard first. */
     closeRaceLost?: boolean;
     dayEntries?: import("../src/lib/wa-breaks").DayEntry[];
+    /** The response audience: false is a FIELD_CREW viewer (round 9, finding 2). */
+    canReadPay?: boolean;
 } = {}) {
     const updateCalls: Array<{ id: string; userId: string; data: Record<string, unknown> }> = [];
+    /** Times the close TRANSACTION was entered — a refusal inside it still counts. */
+    const closeCalls: string[] = [];
     const dependencies: ClockOutDependencies = {
         authenticate: async () =>
             overrides.authOk === false
                 ? { ok: false, status: 401, error: "Unauthorized" }
-                : { ok: true, user: { id: "u1", role: overrides.role ?? "FIELD_CREW", hourlyRate: 20, burdenRate: 5 } },
+                : { ok: true, user: { id: "u1", role: overrides.role ?? "FIELD_CREW", email: "u1@example.com", payType: "HOURLY", hourlyRate: 20, burdenRate: 5 } },
+        // ONE resolution per request; every day key in the close path comes
+        // from it (round 7, finding 1).
+        resolveTimeZone: async () => "America/Los_Angeles",
+        // The response audience (round 9, finding 2). Overridable, so the
+        // crew-projection cases below can ask for the other one.
+        canReadPay: async () => overrides.canReadPay ?? true,
         findTimeEntry: async () => (overrides.entry !== undefined ? overrides.entry : baseEntry()),
-        findProjectIsLogistics: async () => overrides.isLogistics ?? false,
+        findProjectIsLogistics: async (projectId) =>
+            overrides.logisticsProjects
+                ? overrides.logisticsProjects.includes(projectId)
+                : overrides.isLogistics ?? false,
         findOwnerRates: async () =>
-            overrides.ownerRates !== undefined ? overrides.ownerRates : { hourlyRate: 20, burdenRate: 5 },
+            overrides.ownerRates !== undefined
+                ? overrides.ownerRates
+                : { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" },
+        loadLockedPeriods: async () => overrides.lockedPeriods ?? [],
         // No other entries on the day unless a test says so — the WA meal rule
         // (src/lib/wa-breaks.ts) then sees only the closing entry.
         findDayEntries: async () => overrides.dayEntries ?? [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
-        closeTimeEntry: async (id, userId, data) => {
+        closeTimeEntry: async (id, userId, buildData, guard) => {
+            // The real dependency re-reads the WHOLE row under FOR UPDATE and
+            // decides the close from it. `storedEntry` is how a test stages a
+            // concurrent write landing in that window.
+            void guard;
+            closeCalls.push(id);
+            // The real dependency reads these FOR UPDATE inside the close
+            // transaction and prices from them; the fixture owner never changes.
+            // The real dependency hands buildData the whole row-locked owner —
+            // buildData re-runs the $0 check on it, so name/role/email/payType
+            // all matter, not just the numbers.
+            const lockedOwner = overrides.ownerRates ?? {
+                hourlyRate: 20,
+                burdenRate: 5,
+                role: "FIELD_CREW",
+                name: "Owner",
+                email: "owner@example.com",
+                payType: "HOURLY",
+            };
+            const stored = snapshotOf(overrides.storedEntry ?? overrides.entry ?? baseEntry());
+            const data = await buildData(stored, lockedOwner);
             updateCalls.push({ id, userId, data });
             if (overrides.closeRaceLost) {
                 const current = baseEntry({ endTime: new Date("2026-08-10T19:00:00.000Z") });
@@ -72,7 +137,7 @@ function createDeps(overrides: {
             return { ok: true, entry: { id, userId, ...data } };
         },
     };
-    return { dependencies, updateCalls };
+    return { dependencies, updateCalls, closeCalls };
 }
 
 // Tests that don't care about the clock-out instant get a same-day endTime
@@ -299,7 +364,7 @@ test("computes durationHours/laborCost/burdenCost from the OWNER's rates, not th
     const { dependencies, updateCalls } = createDeps({
         role: "MANAGER",
         entry: baseEntry({ userId: "owner-1", startTime: new Date("2026-08-10T15:00:00.000Z") }),
-        ownerRates: { hourlyRate: 50, burdenRate: 10 },
+        ownerRates: { hourlyRate: 50, burdenRate: 10, role: "FIELD_CREW", name: "Owner One", email: "owner1@example.com", payType: "HOURLY" },
     });
     // requester (u1, MANAGER) has hourlyRate 20/burdenRate 5 per createDeps default auth — must not be used.
     const { createClockOutHandler } = await routeModulePromise;
@@ -535,6 +600,126 @@ test("REVIEW #2 (route): an 8h auto-deduction WITH a 'took lunch' answer (mealSk
     assert.notEqual(data.needsReview, true);
 });
 
+// ── TOCTOU: the row moves between the handler's read and the write ─────────
+// The transaction locks the entry, but the handler used to re-read only
+// `startTime` from it — meal status, review state, project, notes and
+// ownership all came from the copy read BEFORE the transaction. A manager
+// moving an open punch to a logistics project in that window closed it with no
+// notes at all, because the requirement had been decided against the project
+// the punch used to be on. Every decision now derives from the locked snapshot.
+
+test("TOCTOU: a concurrent move to a LOGISTICS project after the first read refuses the clock-out — never a silent success", async () => {
+    const { dependencies, updateCalls, closeCalls } = createDeps({
+        // The handler's first read: an ordinary project, no notes needed.
+        entry: baseEntry({ projectId: "p-normal", notes: null }),
+        // A manager's PATCH lands in the window: same punch, logistics job now.
+        storedEntry: baseEntry({ projectId: "p-logistics", notes: null }),
+        logisticsProjects: ["p-logistics"],
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1" }));
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "LOGISTICS_NOTES_REQUIRED");
+    // The pre-transaction check PASSED (p-normal is not logistics) and the
+    // close transaction was entered — so only the in-transaction recompute can
+    // be what caught this. And nothing was written.
+    assert.equal(closeCalls.length, 1, "the close must have reached the transaction to be a real TOCTOU");
+    assert.equal(updateCalls.length, 0, "no update may be issued once the rule refuses");
+});
+
+test("TOCTOU: the same move with notes supplied in THIS request still closes — the rule is satisfied, not just tripped", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ projectId: "p-normal", notes: null }),
+        storedEntry: baseEntry({ projectId: "p-logistics", notes: null }),
+        logisticsProjects: ["p-logistics"],
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", notes: "  Dump run  " }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls[0].data.notes, "Dump run");
+});
+
+test("TOCTOU: a concurrent move OFF a logistics project stops demanding notes", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ projectId: "p-logistics", notes: "Shop time" }),
+        storedEntry: baseEntry({ projectId: "p-normal", notes: null }),
+        logisticsProjects: ["p-logistics"],
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1" }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls.length, 1);
+});
+
+test("TOCTOU: an APPROVED meal skip landing after the first read is honoured (no review flag)", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ startTime: new Date("2026-08-10T14:00:00.000Z"), mealSkipStatus: "PENDING" }),
+        storedEntry: baseEntry({ startTime: new Date("2026-08-10T14:00:00.000Z"), mealSkipStatus: "APPROVED" }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T22:00:00.000Z", mealSkipped: true }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    assert.equal(data.mealOutcome, "WAIVED_APPROVED");
+    assert.notEqual(data.needsReview, true);
+});
+
+test("TOCTOU: a reviewReason composed onto the row after the first read is appended to, not clobbered", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ reviewReason: null }),
+        storedEntry: baseEntry({ reviewReason: "Flagged for missing GPS ping" }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", mealSkipped: true, endTime: new Date(START.getTime() + 8 * 3_600_000).toISOString() }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls[0].data.reviewReason, `Flagged for missing GPS ping; ${WAIVER_NOTE}`);
+});
+
+test("TOCTOU: a reassignment landing after the first read re-decides authorization on the locked row (403, nothing written)", async () => {
+    // u1 owned the punch when the handler read it, so the up-front ownership
+    // check passed. By the time the transaction holds the row it belongs to
+    // someone else and u1 is plain FIELD_CREW — the close must be refused.
+    const { dependencies } = createDeps({
+        role: "FIELD_CREW",
+        entry: baseEntry({ userId: "u1" }),
+        storedEntry: baseEntry({ userId: "someone-else" }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1" }));
+    assert.equal(res.status, 403);
+});
+
+test("TOCTOU: a reassignment to the CLOSER makes the attestations theirs again", async () => {
+    // Read as someone else's punch (a MANAGER close — attestations scrubbed),
+    // reassigned to the manager themselves before the write.
+    const { dependencies, updateCalls } = createDeps({
+        role: "MANAGER",
+        entry: baseEntry({ userId: "owner-1", startTime: new Date("2026-08-10T14:00:00.000Z") }),
+        storedEntry: baseEntry({ userId: "u1", startTime: new Date("2026-08-10T14:00:00.000Z") }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T22:00:00.000Z", mealSkipped: true }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    // Their own word, honoured — and no manager-edit stamp, because on the
+    // locked row the closer IS the owner.
+    assert.equal(data.mealSkipped, true);
+    assert.equal(data.mealOutcome, "WORKED_THROUGH");
+    assert.equal("editedByManagerId" in data, false);
+});
+
+// The matching drift guard on the REAL SQL (every snapshot column selected,
+// compare-and-set on the row version) lives in tests/payroll-period-lock.test.ts
+// — "the close is decided from the STORED row and compare-and-set on its
+// version" — next to the rest of the close-transaction shape assertions.
+
 test("a clock-out that would make the punch longer than 24h is rejected with SHIFT_TOO_LONG (forgotten clock-out, not a shift)", async () => {
     const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date("2026-08-08T14:00:00.000Z") }) });
     const { createClockOutHandler } = await routeModulePromise;
@@ -543,4 +728,94 @@ test("a clock-out that would make the punch longer than 24h is rejected with SHI
     assert.equal(res.status, 400);
     assert.equal((await res.json()).code, "SHIFT_TOO_LONG");
     assert.equal(updateCalls.length, 0);
+});
+
+// ── Every clock-out exit is projected for its audience (round 9, finding 2) ──
+//
+// The successful PUT returned the settled row verbatim, and both
+// ALREADY_CLOCKED_OUT conflict bodies embedded one, so a crew member received
+// laborCost, burdenCost, the invoice linkage and the QuickBooks activity id
+// every time they clocked out — or every time they retried a clock-out that had
+// already happened. The GET projection did not cover any of that: it is a
+// different handler, and these were whole Prisma rows handed straight to
+// NextResponse.json.
+
+/** An entry that CARRIES money, so "the crew body has none" is about the projection. */
+function pricedEntry(overrides: Partial<ClockOutTimeEntryRow> = {}) {
+    return {
+        ...baseEntry(overrides),
+        // Not on ClockOutTimeEntryRow: the DI type is the narrow shape the
+        // handler REASONS about, while the real dependency reads a whole row
+        // and it is the whole row that reaches the response.
+        laborCost: 240,
+        burdenCost: 40,
+        invoiceId: "inv-1",
+        invoicedAt: new Date("2026-08-11T00:00:00.000Z"),
+        qbTimeActivityId: "qb-1",
+    } as unknown as ClockOutTimeEntryRow;
+}
+
+const END = new Date("2026-08-10T23:00:00.000Z");
+
+const MONEY_KEYS = ["laborCost", "burdenCost", "invoiceId", "invoicedAt", "qbTimeActivityId"];
+
+test("a FIELD_CREW clock-out response carries no money", async () => {
+    const { dependencies } = createDeps({ entry: pricedEntry(), canReadPay: false });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: END.toISOString() }));
+    assert.equal(res.status, 200);
+    const entry = (await res.json()) as Record<string, unknown>;
+
+    for (const key of MONEY_KEYS) {
+        assert.ok(!(key in entry), `${key} must not reach a crew clock-out response`);
+    }
+    // ALLOWLIST, not a denylist: every key present has to be one the crew
+    // projection names, so the next column added to TimeEntry cannot ship by
+    // default the way these five did.
+    const allowed = new Set(Object.keys(TIME_ENTRY_CREW_SELECT));
+    assert.deepEqual(Object.keys(entry).filter((key) => !allowed.has(key)), []);
+    // ...and the row really did carry them — the control.
+    assert.equal((pricedEntry() as unknown as Record<string, unknown>).laborCost, 240);
+});
+
+test("an ADMIN clock-out response still carries the money — the audiences differ", async () => {
+    const { dependencies } = createDeps({ entry: pricedEntry(), role: "ADMIN", canReadPay: true });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: END.toISOString() }));
+    assert.equal(res.status, 200);
+    const entry = (await res.json()) as Record<string, unknown>;
+    assert.equal(entry.laborCost, 240);
+    assert.equal(entry.qbTimeActivityId, "qb-1");
+});
+
+test("the up-front ALREADY_CLOCKED_OUT body is projected too", async () => {
+    // This body exists so a client that lost the response to a successful
+    // clock-out can reconcile against it — which means it is the SAME row, and
+    // it leaked the same five fields.
+    const closed = pricedEntry({ endTime: END });
+    const { dependencies } = createDeps({ entry: closed, canReadPay: false });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: END.toISOString() }));
+    assert.equal(res.status, 409);
+    const parsed = (await res.json()) as { code: string; entry: Record<string, unknown> };
+    assert.equal(parsed.code, "ALREADY_CLOCKED_OUT");
+    for (const key of MONEY_KEYS) assert.ok(!(key in parsed.entry), key);
+    assert.equal(parsed.entry.id, "te1", "the control: it is still the entry, just projected");
+});
+
+test("the RACED ALREADY_CLOCKED_OUT body is projected too", async () => {
+    // The other conflict path: a concurrent PUT won the atomic close, and the
+    // loser answers with the row as it now stands.
+    const { dependencies } = createDeps({ entry: pricedEntry(), closeRaceLost: true, canReadPay: false });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: END.toISOString() }));
+    assert.equal(res.status, 409);
+    const parsed = (await res.json()) as { code: string; entry: Record<string, unknown> | null };
+    assert.equal(parsed.code, "ALREADY_CLOCKED_OUT");
+    assert.ok(parsed.entry, "the loser is told what the row looks like now");
+    for (const key of MONEY_KEYS) assert.ok(!(key in (parsed.entry as Record<string, unknown>)), key);
 });

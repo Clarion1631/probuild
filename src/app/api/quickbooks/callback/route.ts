@@ -1,8 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
 import { exchangeQBCode } from "@/lib/quickbooks";
 import { saveQBSettings } from "@/lib/integration-store";
+import { requireIntegrationAccess } from "@/lib/integration-access";
 
 export async function GET(req: NextRequest) {
+    // The state cookie proves the flow started here; it does not prove WHO is
+    // finishing it. This writes the company QuickBooks tokens, so it asks the
+    // same question /auth does (review round 10). A redirect rather than JSON:
+    // this endpoint is reached by the browser following Intuit, and a bare 403
+    // body there is a dead end.
+    const gate = await requireIntegrationAccess();
+    if ("response" in gate) {
+        const base = process.env.NEXTAUTH_URL || "http://localhost:3000";
+        return NextResponse.redirect(`${base}/settings/integrations/quickbooks?error=forbidden`);
+    }
+
     const { searchParams } = new URL(req.url);
     const code = searchParams.get("code");
     const realmId = searchParams.get("realmId");

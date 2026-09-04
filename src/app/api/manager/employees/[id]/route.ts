@@ -4,9 +4,14 @@ import { after } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
-
-const VALID_ROLES = new Set(["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]);
-const VALID_STATUSES = new Set(["PENDING", "ACTIVATED", "DISABLED"]);
+import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
+import { touchesPayrollRateState, withPayrollUserWrite } from "@/lib/payroll-period";
+import {
+    isUserMutationActorInvalidError,
+    isUserMutationRefusedError,
+    isUserMutationTargetNotFoundError,
+    withGuardedUserMutation,
+} from "@/lib/user-mutation-guard";
 
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
     const auth = await authenticateMobileOrSession(req);
@@ -27,64 +32,99 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
     }
 
-    // Guard the role/status enums on the server — we never want a typo from the mobile
-    // app to land an invalid value in the DB. Treat unknown values as 400, not silent drop.
-    if (typeof body.role === "string" && !VALID_ROLES.has(body.role)) {
-        return NextResponse.json({ error: `Invalid role: ${body.role}` }, { status: 400 });
-    }
-    if (typeof body.status === "string" && !VALID_STATUSES.has(body.status)) {
-        return NextResponse.json({ error: `Invalid status: ${body.status}` }, { status: 400 });
-    }
-
-    // Privilege rules:
-    //   - Only ADMINs may grant the ADMIN role.
-    //   - MANAGERs cannot modify ADMIN users at all (would let a manager demote/disable
-    //     an admin and hijack the org). ADMINs can edit anyone, including themselves,
-    //     but the lone-admin recovery case is the org's responsibility.
-    if (typeof body.role === "string" && body.role === "ADMIN" && user.role !== "ADMIN") {
-        return NextResponse.json({ error: "Only admins can grant the ADMIN role" }, { status: 403 });
-    }
-
-    const target = await prisma.user.findUnique({
-        where: { id },
-        select: { id: true, role: true },
+    // applyRateChange asks whether this caller has financialReports, not just
+    // whether they are a manager, so the permissions row has to be loaded.
+    const rateActor = await prisma.user.findUnique({
+        where: { id: user.id },
+        select: { role: true, permissions: true },
     });
-    if (!target) return NextResponse.json({ error: "User not found" }, { status: 404 });
-
-    if (target.role === "ADMIN" && user.role !== "ADMIN") {
-        return NextResponse.json(
-            { error: "Only admins can modify an ADMIN user" },
-            { status: 403 }
-        );
-    }
 
     const data: Record<string, unknown> = {};
     if (typeof body.role === "string") data.role = body.role;
     if (typeof body.status === "string") data.status = body.status;
-    if (typeof body.hourlyRate === "number" && Number.isFinite(body.hourlyRate) && body.hourlyRate >= 0) {
-        data.hourlyRate = body.hourlyRate;
-    }
-    if (typeof body.burdenRate === "number" && Number.isFinite(body.burdenRate) && body.burdenRate >= 0) {
-        data.burdenRate = body.burdenRate;
-    }
-
-    if (Object.keys(data).length === 0) {
+    // ONE rate payload, handed BOTH to the guard (which uses it to decide that
+    // the payroll advisory lock must be taken before the target row lock) and to
+    // the rate writer itself, and asked with the SAME predicate the writer uses.
+    const rateChange = { hourlyRate: body.hourlyRate, burdenRate: body.burdenRate, payType: body.payType };
+    const touchesRates = touchesPayrollRateState(rateChange);
+    if (Object.keys(data).length === 0 && !touchesRates) {
         return NextResponse.json({ error: "No mutable fields supplied" }, { status: 400 });
     }
 
-    const updated = await prisma.user.update({
-        where: { id },
-        data,
-        select: {
-            id: true,
-            email: true,
-            name: true,
-            role: true,
-            status: true,
-            hourlyRate: true,
-            burdenRate: true,
-        },
-    });
+    // Profile fields and rates commit TOGETHER. Rates go through the one
+    // validated path (payroll permission, exact decimal, lastRateSyncAt); a
+    // refusal rolls the profile half back rather than leaving a half-applied
+    // update behind.
+    //
+    // THE shared rules (src/lib/user-mutation-guard.ts). They were written HERE
+    // and nowhere else, which is how three browser routes ended up with none at
+    // all: a manager could promote themselves to ADMIN, grant themselves every
+    // permission, or disable the real admins through any of them (round 9,
+    // finding 1). Enum validation, the admin-only role change, and "a manager
+    // cannot touch an admin" now all come from one function — and, since round
+    // 12, that function is re-run inside the transaction against the row
+    // withGuardedUserMutation just locked with FOR UPDATE, not against a role
+    // read taken before the transaction opened (round 12, finding 2).
+    let updated;
+    try {
+        updated = await prisma.$transaction(async (tx) => {
+            return withGuardedUserMutation(
+                tx,
+                {
+                    actorId: user.id,
+                    targetId: id,
+                    changes: { role: body.role, status: body.status },
+                    data,
+                    rateChange,
+                },
+                async (_target, actor) => {
+                    // The LOCKED actor, not the pre-transaction read: canWriteRates
+                    // asks for financialReports, and a revocation that committed
+                    // a moment ago used to be invisible here (round 14,
+                    // finding 3).
+                    const rateResult = await applyRateChangeInTx(tx, actor, id, rateChange);
+                    if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
+
+                    if (Object.keys(data).length === 0) {
+                        return tx.user.findUniqueOrThrow({
+                            where: { id },
+                            select: {
+                                id: true, email: true, name: true, role: true, status: true,
+                                hourlyRate: true, burdenRate: true,
+                            },
+                        });
+                    }
+                    // The mobile manager screen can activate or disable somebody,
+                    // and status is half of the Gusto roster predicate. Same tier-1
+                    // payroll lock as every other export-input writer.
+                    return withPayrollUserWrite(tx, data, () =>
+                        tx.user.update({
+                            where: { id },
+                            data,
+                            select: {
+                                id: true, email: true, name: true, role: true, status: true,
+                                hourlyRate: true, burdenRate: true,
+                            },
+                        })
+                    );
+                }
+            );
+        });
+    } catch (error) {
+        if (error instanceof RateChangeError) {
+            return NextResponse.json({ error: error.message }, { status: error.status });
+        }
+        // An actor demoted, disabled or de-permissioned mid-flight is
+        // refused the same way a bad target is — the verdict carries the
+        // status (round 14, finding 3).
+        if (isUserMutationRefusedError(error) || isUserMutationActorInvalidError(error)) {
+            return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
+        }
+        if (isUserMutationTargetNotFoundError(error)) {
+            return NextResponse.json({ error: "User not found" }, { status: 404 });
+        }
+        throw error;
+    }
 
     // Newly ACTIVATED FIELD_CREW (or CJ) joins every "In Progress" project.
     // Fail-soft inside the helper; never blocks the save.

@@ -3,8 +3,17 @@
  * Stores OAuth tokens and settings for QB, Gusto, etc. securely.
  * Utilizes a Prisma transaction and AES-256-GCM encryption.
  */
+import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { encryptObject, decryptObject } from "./crypto";
+
+/**
+ * Either the base client or a transaction client. The payroll export reads the
+ * Gusto employee mappings through its OWN transaction, so the row it hashes is
+ * the row its FOR SHARE lock is holding — a read on the global client would be
+ * a second connection outside that transaction and could see a different blob.
+ */
+export type IntegrationClient = typeof prisma | Prisma.TransactionClient;
 
 export interface QBSettings {
     connected: boolean;
@@ -33,38 +42,72 @@ export interface IntegrationSettings {
 // Single row ID for storing all system integrations safely
 const INTEGRATION_ROW_ID = "system_settings";
 
-async function readSettings(): Promise<IntegrationSettings> {
-    try {
-        const row = await prisma.integration.findUnique({
-            where: { id: INTEGRATION_ROW_ID }
-        });
-        if (!row || !row.settings) return {};
-        return decryptObject(row.settings) as IntegrationSettings;
-    } catch (err) {
-        console.error("Error reading integration settings:", err);
-        return {};
-    }
+/**
+ * Advisory-lock key for read-modify-write of the integration blob.
+ *
+ * `SELECT ... FOR UPDATE` alone is not enough: on a fresh install the row does
+ * not exist yet, and FOR UPDATE cannot lock a row nobody has inserted — two
+ * concurrent first-time connects would both read "no row" and both insert. The
+ * advisory lock covers the row's ABSENCE as well as its presence, exactly like
+ * acquirePayrollLockCreationLock in payroll-period.ts. Both are taken.
+ */
+export const INTEGRATION_LOCK_KEY = `integration:${INTEGRATION_ROW_ID}`;
+
+/**
+ * Take that advisory lock on the CALLER's transaction.
+ *
+ * Exported because the payroll export has to take THE SAME ONE. It reads the
+ * Gusto employee mappings under `SELECT ... FOR SHARE` on the Integration row,
+ * which is a real fence only while the row EXISTS — and on a database that has
+ * never saved an integration it does not. FOR SHARE then locks nothing at all,
+ * a save can insert the first mapping between the export's read and its COMMIT,
+ * and lockPayrollPeriod freezes a hash computed without a mapping that was
+ * committed before it. Locking the row's ABSENCE is exactly what the advisory
+ * lock is for (see INTEGRATION_LOCK_KEY), so the reader takes it too.
+ *
+ * `pg_advisory_xact_lock` releases at COMMIT or ROLLBACK — it cannot outlive
+ * the transaction even if the caller throws.
+ *
+ * LOCK ORDER: the export takes this AFTER the payroll advisory lock and BEFORE
+ * the two settings rows. Nothing that holds this key ever goes on to wait for a
+ * payroll lock (updateIntegrationSettings takes this key and then the
+ * Integration row, and nothing else), so no cycle is introduced.
+ */
+export async function acquireIntegrationSettingsLock(
+    tx: { $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number> }
+): Promise<void> {
+    await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, INTEGRATION_LOCK_KEY);
 }
 
-async function writeSettings(settings: IntegrationSettings): Promise<void> {
-    const encrypted = encryptObject(settings);
-    try {
-        await prisma.integration.upsert({
-            where: { id: INTEGRATION_ROW_ID },
-            create: { id: INTEGRATION_ROW_ID, settings: encrypted },
-            update: { settings: encrypted }
-        });
-    } catch (err) {
-        console.error("Error writing integration settings:", err);
-    }
+/**
+ * Read the decrypted blob.
+ *
+ * A DATABASE failure PROPAGATES. It used to be swallowed into `{}`, which every
+ * caller then read as "nothing is connected": the QuickBooks rail reported
+ * itself disconnected during a transient outage, and — the payroll case — the
+ * Gusto export built a CSV with every gustoEmployeeId blank, hashed it, and was
+ * ready to freeze a pay period around it. An empty answer and an unavailable
+ * one are not the same fact and must not share a return value.
+ *
+ * An UNDECRYPTABLE blob is still tolerated, because that is a different
+ * question: a row written under a rotated INTEGRATION key is unreadable
+ * forever, and treating it as fatal would brick every read and every save (this
+ * exact failure blocked the first QuickBooks OAuth connect, Jun 2026).
+ */
+async function readSettings(client: IntegrationClient = prisma): Promise<IntegrationSettings> {
+    const row = await client.integration.findUnique({
+        where: { id: INTEGRATION_ROW_ID }
+    });
+    if (!row || !row.settings) return {};
+    return decryptOrReset(row.settings);
 }
 
-export async function getIntegrationSettings(): Promise<IntegrationSettings> {
-    return readSettings();
+export async function getIntegrationSettings(client: IntegrationClient = prisma): Promise<IntegrationSettings> {
+    return readSettings(client);
 }
 
-export async function getQBSettings(): Promise<QBSettings> {
-    const settings = await readSettings();
+export async function getQBSettings(client: IntegrationClient = prisma): Promise<QBSettings> {
+    const settings = await readSettings(client);
     return settings.quickbooks || { connected: false };
 }
 
@@ -80,18 +123,47 @@ function decryptOrReset(ciphertext: string): IntegrationSettings {
     }
 }
 
-export async function saveQBSettings(qb: Partial<QBSettings>): Promise<void> {
-    // Safe transaction to prevent race conditions during concurrent token updates
+/**
+ * SERIALIZED read-modify-write of the one encrypted blob.
+ *
+ * QuickBooks and Gusto share a single row, so every save rewrites the WHOLE
+ * document — including the other integration's fields. Read-then-upsert without
+ * a lock loses one of two concurrent writes outright: both transactions read the
+ * same blob, both merge their own patch into it, and the second upsert
+ * overwrites the first with a document derived from a value that is already
+ * stale. Under READ COMMITTED the upsert's row lock does not save it — it
+ * serialises the WRITES, not the read the writes were computed from. A Gusto
+ * OAuth callback landing next to a QuickBooks token refresh could therefore
+ * disconnect QuickBooks, silently.
+ *
+ * The lock is taken BEFORE the read, so the read is inside the critical section.
+ *
+ * NOTHING is caught here. A save that could not persist must not return, because
+ * every caller treats "returned" as "committed" and answers the user with a
+ * success (the mapping endpoint's `{ success: true }`, the OAuth callback's
+ * `?success=1`). A silent failure there means the mapping deciding whose hours
+ * are filed under which Gusto employee looks saved and is not.
+ */
+async function updateIntegrationSettings(
+    apply: (current: IntegrationSettings) => IntegrationSettings
+): Promise<void> {
     await prisma.$transaction(async (tx) => {
-        const row = await tx.integration.findUnique({
-            where: { id: INTEGRATION_ROW_ID }
-        });
-        const settings: IntegrationSettings = row && row.settings
-            ? decryptOrReset(row.settings)
-            : {};
+        // Covers the row's absence (see INTEGRATION_LOCK_KEY). Through the
+        // shared helper, because the payroll export takes the SAME key and the
+        // two must not be able to drift onto different statements...
+        await acquireIntegrationSettingsLock(tx);
+        // ...and the row itself. Stated precisely, because it is easy to
+        // overclaim: the advisory lock above already serialises every writer
+        // that comes through HERE, and the upsert below already conflicts with
+        // the payroll export's FOR SHARE on this row all by itself. This line is
+        // defence in depth — it makes the read-modify-write atomic against any
+        // writer that ever touches "Integration" directly instead of through
+        // this function, and it loses such a race BEFORE the merge is computed
+        // rather than at the upsert, with the stale document already built.
+        await tx.$queryRawUnsafe(`SELECT "id" FROM "Integration" WHERE "id" = $1 FOR UPDATE`, INTEGRATION_ROW_ID);
 
-        settings.quickbooks = { ...(settings.quickbooks || { connected: false }), ...qb };
-        const encrypted = encryptObject(settings);
+        const settings = await readSettings(tx);
+        const encrypted = encryptObject(apply(settings));
 
         await tx.integration.upsert({
             where: { id: INTEGRATION_ROW_ID },
@@ -101,28 +173,21 @@ export async function saveQBSettings(qb: Partial<QBSettings>): Promise<void> {
     });
 }
 
-export async function getGustoSettings(): Promise<GustoSettings> {
-    const settings = await readSettings();
+export async function saveQBSettings(qb: Partial<QBSettings>): Promise<void> {
+    await updateIntegrationSettings((settings) => ({
+        ...settings,
+        quickbooks: { ...(settings.quickbooks || { connected: false }), ...qb },
+    }));
+}
+
+export async function getGustoSettings(client: IntegrationClient = prisma): Promise<GustoSettings> {
+    const settings = await readSettings(client);
     return settings.gusto || { connected: false };
 }
 
 export async function saveGustoSettings(gusto: Partial<GustoSettings>): Promise<void> {
-    // Safe transaction to prevent race conditions during concurrent token updates
-    await prisma.$transaction(async (tx) => {
-        const row = await tx.integration.findUnique({
-            where: { id: INTEGRATION_ROW_ID }
-        });
-        const settings: IntegrationSettings = row && row.settings
-            ? decryptOrReset(row.settings)
-            : {};
-
-        settings.gusto = { ...(settings.gusto || { connected: false }), ...gusto };
-        const encrypted = encryptObject(settings);
-        
-        await tx.integration.upsert({
-            where: { id: INTEGRATION_ROW_ID },
-            create: { id: INTEGRATION_ROW_ID, settings: encrypted },
-            update: { settings: encrypted }
-        });
-    });
+    await updateIntegrationSettings((settings) => ({
+        ...settings,
+        gusto: { ...(settings.gusto || { connected: false }), ...gusto },
+    }));
 }
