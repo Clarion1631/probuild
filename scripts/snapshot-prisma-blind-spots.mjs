@@ -25,6 +25,7 @@
 import { writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import { findCarriageReturns } from './blind-spots-cr-guard.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const OUT = path.join(ROOT, 'prisma', 'prisma-blind-spots.json')
@@ -96,6 +97,16 @@ const snapshot = {
   policies,
   functions,
   triggers,
+}
+
+const carriageReturns = findCarriageReturns(snapshot)
+if (carriageReturns.length) {
+  console.error(
+    'snapshot-prisma-blind-spots: refusing to emit snapshot, definitions contain carriage returns ' +
+      '(database built from CRLF migration files? see PR #471):\n  ' +
+      carriageReturns.join('\n  '),
+  )
+  process.exit(1)
 }
 
 if (process.argv.includes('--write')) {
