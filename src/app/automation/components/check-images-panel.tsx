@@ -60,7 +60,7 @@ function SuggestionList({ title, matches, hrefBase }: {
 }
 
 function ImageCard({ row }: { row: CheckImagePanelRow }) {
-    const kindLabel = KIND_LABELS[row.kind] ?? row.kind;
+    const kindLabel = row.incomingEvidence ? "Incoming check" : KIND_LABELS[row.kind] ?? row.kind;
     const hasSuggestions = row.payerMatches.length > 0 || row.memoMatches.length > 0;
 
     return (
@@ -83,7 +83,16 @@ function ImageCard({ row }: { row: CheckImagePanelRow }) {
                             {formatCurrency(row.amountCents / 100)}
                         </span>
                     )}
-                    {row.driveFileId && (
+                    {row.imageUrl ? (
+                        <a
+                            href={row.imageUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs font-medium text-hui-primary hover:underline"
+                        >
+                            Redacted image ↗
+                        </a>
+                    ) : row.driveFileId && (
                         <a
                             href={`https://drive.google.com/file/d/${encodeURIComponent(row.driveFileId)}/view`}
                             target="_blank"
@@ -97,7 +106,9 @@ function ImageCard({ row }: { row: CheckImagePanelRow }) {
             </div>
 
             {/* Extraction evidence */}
-            {!row.extracted ? (
+            {row.incomingEvidence ? (
+                <p className="text-sm text-hui-textMuted italic">Read-only incoming evidence. It is excluded from automated matching and confirmation.</p>
+            ) : !row.extracted ? (
                 <p className="text-sm text-hui-textMuted italic">Not yet extracted — run the check-payer extraction to read this image.</p>
             ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -166,8 +177,7 @@ export function CheckImagesPanel({ rows, totalImages }: { rows: CheckImagePanelR
             <div>
                 <h2 className="text-base font-semibold text-hui-textMain">Check images</h2>
                 <p className="text-sm text-hui-textMuted mt-1">
-                    Who actually paid us, straight from the check — the bank line alone doesn&apos;t say. Extracted payer
-                    and memo are evidence; the matches below are suggestions until a human confirms them.
+                    Check and deposit images with payee and memo details. Suggested matches need your review.
                     {totalImages > rows.length && ` Showing the ${rows.length} most recent of ${totalImages} images.`}
                 </p>
             </div>
