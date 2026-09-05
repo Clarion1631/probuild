@@ -1001,8 +1001,8 @@ test("round 38: probes never exceed the concurrency cap, and none is failed for 
         }
     };
 
-    // Nine probes, the real number getPipelineHealth fires, each slower than
-    // the others can start. A short per-probe budget is deliberate: a probe
+    // Nine probes across multiple waves, each slower than the others can
+    // start. A short per-probe budget is deliberate: a probe
     // that WAITED for a slot must not be marked timed out for it, which is why
     // the slot is taken before the timer starts.
     const results = await Promise.all(
@@ -1014,6 +1014,63 @@ test("round 38: probes never exceed the concurrency cap, and none is failed for 
     assert.ok(peak > 1, "and it really did run them in parallel, or this proves nothing");
     assert.deepEqual(results.map((r) => r.status), Array(9).fill("ok"));
     assert.deepEqual(results.map((r) => r.value), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+});
+
+test("a full health sweep runs every healthy probe across seven database waves", async () => {
+    const limiter = createLimiter(PROBE_CONCURRENCY);
+    let inFlight = 0;
+    let peak = 0;
+    const runner: ProbeRunner = async <T,>(_ms: number, fn: (db: any) => Promise<T>) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        try {
+            // A healthy query can still wait on several database round trips.
+            // Twenty-five probes need seven waves; the last waves must not be
+            // skipped just because their cumulative queue time exceeds 2s.
+            await new Promise((resolve) => setTimeout(resolve, 450));
+            return await fn({} as any);
+        } finally {
+            inFlight--;
+        }
+    };
+
+    const results = await Promise.all(
+        Array.from({ length: 25 }, (_, i) =>
+            runProbe(`health-${i}`, async () => i, -1, undefined, { withDb: runner, limiter })),
+    );
+
+    assert.ok(peak <= PROBE_CONCURRENCY, `at most ${PROBE_CONCURRENCY} queries at once, saw ${peak}`);
+    assert.ok(peak > 1, "the healthy sweep still runs queries concurrently");
+    assert.deepEqual(results.map((result) => result.status), Array(25).fill("ok"));
+    assert.deepEqual(results.map((result) => result.value), Array.from({ length: 25 }, (_, i) => i));
+});
+
+test("the default queue wait still fails closed within the health response budget", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const limiter = createLimiter(1);
+    const release = await limiter.acquire();
+    assert.ok(release);
+    let started = false;
+    const pending = runProbe("saturated", async () => { started = true; return 1; }, -1,
+        undefined, { withDb: passThrough, limiter });
+
+    try {
+        // Keep the slot occupied past the entire 25s collection allowance.
+        // A removed/unbounded acquisition timeout would leave this unresolved.
+        t.mock.timers.tick(25_000);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const result = await Promise.race([pending, Promise.resolve(null)]);
+        assert.deepEqual(result, { status: "error", reason: "skipped", value: -1 });
+        assert.equal(started, false, "saturation never bypasses the concurrency limit");
+        const verdict = evaluatePipelineHealth(snapshot({
+            stuck: { status: result.status, reason: result.reason, count: result.value },
+        }));
+        assert.equal(verdict.ok, false);
+        assert.ok(verdict.reasons.includes("probe-failed:stuck"));
+    } finally {
+        release();
+        await pending;
+    }
 });
 
 test("round 43: a timed-out probe KEEPS its slot until the query settles", async () => {
