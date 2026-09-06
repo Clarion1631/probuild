@@ -143,6 +143,21 @@ test("text with long numeric identifiers or URLs is withheld without changing st
     assert.doesNotMatch(JSON.stringify(body), /123-456-789|example\.test\/private/);
 });
 
+test("legacy eight-digit identifiers and MICR glyphs are withheld; calendar dates survive unchanged", async () => {
+    for (const value of ["12-34-56-78", "A1B2C3D4E5F6G7H8", "12/34/5678", "payer \u2446", "memo \u2447", "\u2448", "\u2449"]) {
+        const row = { ...base, evidence: { ...base.evidence, payerName: value, memoText: value, extractionModel: value } };
+        const body = await (await harness(row).handler(request())).json();
+        for (const field of ["payerName", "memoText", "extractionModel"]) assert.equal(body.evidence[field], null, value);
+        assert.deepEqual(body.evidence.withheldFields, ["payerName", "memoText", "extractionModel"]);
+        assert.equal(row.evidence.memoText, value);
+    }
+    for (const value of ["Paid 2026-08-13", "Paid 8/13/2026", "  Paid 08-13-2026  "]) {
+        const body = await (await harness({ ...base, evidence: { ...base.evidence, memoText: value } }).handler(request())).json();
+        assert.equal(body.evidence.memoText, value);
+        assert.deepEqual(body.evidence.withheldFields, []);
+    }
+});
+
 test("production evidence reads share one snapshot and format timestamps in PostgreSQL", () => {
     const src = readFileSync("src/app/api/integrations/bank-images/diagnostic/route.ts", "utf8");
     assert.match(src, /RepeatableRead/); assert.match(src, /to_char/); assert.match(src, /HH24:MI:SS.US/);

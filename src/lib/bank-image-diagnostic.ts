@@ -33,7 +33,13 @@ function evidenceProjection(evidence: BankImageDiagnosticEvidence) {
         const value = evidence[field];
         // Existing OCR is normally scrubbed at ingestion. This read projection
         // also withholds suspicious text; it never rewrites the stored evidence.
-        if (value && (value.replace(/\D/g, "").length >= 9 || /https?:\/\//i.test(value) || value.length > 500)) {
+        // Same plausible-date exemptions and MICR boundary as scrubField in
+        // scripts/extract-check-payers.mjs. Count all remaining digits (even
+        // across separators); never normalize the evidence returned to callers.
+        const dateless = value?.replace(/\b(?:19|20)\d{2}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])\b/g, " ")
+            .replace(/\b(?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])[/-](?:19|20)?\d{2}\b/g, " ");
+        if (value && ((dateless?.replace(/\D/g, "").length ?? 0) >= 8 || /[\u2446\u2447\u2448\u2449]/.test(value)
+            || /https?:\/\//i.test(value) || value.length > 500)) {
             withheldFields.push(field);
             return null;
         }
