@@ -2,11 +2,12 @@ export interface BuildPdfOptions {
     bannerText?: string;
     pixelRatio?: number;
     quality?: number;
+    captureWidth?: number;
 }
 
-export async function buildPdf(
+async function renderPdf(
     element: HTMLElement,
-    options: BuildPdfOptions = {}
+    options: BuildPdfOptions
 ): Promise<import("jspdf").jsPDF> {
     const { toJpeg } = await import("html-to-image");
     const { jsPDF } = await import("jspdf");
@@ -178,4 +179,44 @@ export async function buildPdf(
     }
 
     return pdf;
+}
+
+// Signing happens at whatever width the customer's screen renders the element —
+// on a phone that's ~360px, and cssToMm inside renderPdf stretches that width to
+// fill the full A4 page, blowing every font and line up ~2.3x. Force a
+// desktop-equivalent width (A4 at 96dpi) for the capture so phone-signed PDFs
+// match desktop-signed ones, restoring whatever inline sizing the element had.
+export async function buildPdf(
+    element: HTMLElement,
+    options: BuildPdfOptions = {}
+): Promise<import("jspdf").jsPDF> {
+    const { captureWidth = 794 } = options;
+
+    // Only widen: a desktop element already wider than this keeps its current output.
+    const prevWidth = element.style.width;
+    const prevMaxWidth = element.style.maxWidth;
+    const prevMinWidth = element.style.minWidth;
+    const prevBoxSizing = element.style.boxSizing;
+    const prevFlexShrink = element.style.flexShrink;
+    const widened = element.offsetWidth > 0 && element.offsetWidth < captureWidth;
+    if (widened) {
+        element.style.width = `${captureWidth}px`;
+        element.style.maxWidth = "none";
+        element.style.minWidth = "0";
+        element.style.boxSizing = "border-box"; // offsetWidth === captureWidth regardless of padding/border
+        element.style.flexShrink = "0";         // a flex parent must not shrink it back to the viewport
+        void element.offsetWidth; // force reflow before measuring rows below
+    }
+
+    try {
+        return await renderPdf(element, options);
+    } finally {
+        if (widened) {
+            element.style.width = prevWidth;
+            element.style.maxWidth = prevMaxWidth;
+            element.style.minWidth = prevMinWidth;
+            element.style.boxSizing = prevBoxSizing;
+            element.style.flexShrink = prevFlexShrink;
+        }
+    }
 }
