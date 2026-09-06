@@ -6,7 +6,16 @@ const BANK_REFERENCE = "26225018006376";
 const SOURCE = "WTB_ONLINE";
 const PRIVATE_FRONT = new RegExp(`^secure:(bank-images/wtb-online/${BANK_REFERENCE}/front-redacted-[a-f0-9]{64}\\.jpg)$`);
 
-export type BankImageDiagnosticRow = Omit<StoredBankImage, "id">;
+export type BankImageDiagnosticEvidence = {
+    capturedAtExact: string;
+    updatedAtExact: string;
+    payerName: string | null;
+    memoText: string | null;
+    extractedAtExact: string | null;
+    extractionModel: string | null;
+    matchCount: number;
+};
+export type BankImageDiagnosticRow = Omit<StoredBankImage, "id"> & { evidence: BankImageDiagnosticEvidence };
 export type StoragePresence = "present" | "missing" | "unavailable";
 type Dependencies = {
     secret(): string | undefined;
@@ -16,6 +25,26 @@ type Dependencies = {
 
 function json(body: unknown, status = 200) {
     return Response.json(body, { status, headers: { "cache-control": "private, no-store" } });
+}
+
+function evidenceProjection(evidence: BankImageDiagnosticEvidence) {
+    const withheldFields: string[] = [];
+    const safeText = (field: "payerName" | "memoText" | "extractionModel") => {
+        const value = evidence[field];
+        // Existing OCR is normally scrubbed at ingestion. This read projection
+        // also withholds suspicious text; it never rewrites the stored evidence.
+        if (value && (value.replace(/\D/g, "").length >= 9 || /https?:\/\//i.test(value) || value.length > 500)) {
+            withheldFields.push(field);
+            return null;
+        }
+        return value;
+    };
+    return {
+        capturedAtExact: evidence.capturedAtExact, updatedAtExact: evidence.updatedAtExact,
+        payerName: safeText("payerName"), memoText: safeText("memoText"),
+        extractedAtExact: evidence.extractedAtExact, extractionModel: safeText("extractionModel"),
+        matchCount: evidence.matchCount, withheldFields,
+    };
 }
 
 /** A read-only incident diagnostic. No caller-selected source, ID, or storage path. */
@@ -40,8 +69,8 @@ export function createBankImageDiagnosticHandler(deps: Dependencies) {
                 try { presence = await deps.storagePresence(match[1]); }
                 catch { presence = "unavailable"; }
             }
-            // Explicit projection: never return the stored link, OCR, internal ID,
-            // image bytes, storage path, or backend error text.
+            // Explicit projection: never return stored links, unselected OCR,
+            // internal IDs, image bytes, storage paths, or backend error text.
             return json({
                 metadata: {
                     kind: row.kind, source: row.source, sourceExternalId: row.sourceExternalId,
@@ -51,6 +80,7 @@ export function createBankImageDiagnosticHandler(deps: Dependencies) {
                     normalizedCheckNumber: row.normalizedCheckNumber, amountCents: row.amountCents,
                 },
                 storage: { referenceKind, presence },
+                evidence: evidenceProjection(row.evidence),
             });
         } catch {
             return json({ error: "bank image diagnostic unavailable" }, 503);
