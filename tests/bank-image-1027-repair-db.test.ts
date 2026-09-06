@@ -41,7 +41,10 @@ test("real PostgreSQL preserves microseconds, rolls audit failure back, and fenc
         const locked = deferred(); const release = deferred(); let matchFinished = false;
         const holder = bankImage1027Transaction(db, async tx => { await tx.lock(); locked.resolve(); await release.promise; });
         await locked.promise;
-        const match = db.bankImageMatch.create({ data: { id: `${id}-match`, bankImageId: id, confirmedBy: "test-only" } }).then(() => { matchFinished = true; });
+        const match = db.bankImageMatch.create({ data: { id: `${id}-match`, bankImageId: id, qbType: "Purchase", qbTxnId: "test-only", confirmedBy: "test-only" } }).then(() => { matchFinished = true; });
+        // Attach rejection handling immediately while the lock assertion waits.
+        // Awaiting match below still propagates any failure to the test.
+        void match.catch(() => {});
         try { await new Promise(r => setTimeout(r, 200)); assert.equal(matchFinished, false, "FOR UPDATE must block the FK insert"); }
         finally { release.resolve(); await holder; }
         await match;
