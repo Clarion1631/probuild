@@ -6,6 +6,8 @@ import {
     type BankImageLine,
 } from "@/lib/bank-image";
 import { suggestMatches, type MatchSuggestion } from "@/lib/check-payer-match";
+import { isSecureRef, resolveDocUrl } from "@/lib/secure-storage";
+import { isIncomingEvidenceSource } from "@/lib/bank-image-sources";
 
 /**
  * Data for the Automation page's "Check images" panel — the human worklist
@@ -50,9 +52,13 @@ export interface CheckImageProposedLine {
 export interface CheckImagePanelRow {
     id: string;
     kind: string;
+    source: string;
+    incomingEvidence: boolean;
     sourceExternalId: string;
     fileName: string;
     driveFileId: string | null;
+    /** Short-lived private-storage URL for a redacted front, when present. */
+    imageUrl: string | null;
     /** ISO timestamp */
     capturedAt: string;
     /** YYYY-MM-DD */
@@ -111,7 +117,7 @@ export async function fetchCheckImagePanelData(): Promise<{ rows: CheckImagePane
     })).filter((line) => line.postedDate !== "");
 
     const matchableImages: BankImageCandidate[] = images
-        .filter((img) => IMAGE_KINDS.has(img.kind))
+        .filter((img) => IMAGE_KINDS.has(img.kind) && !isIncomingEvidenceSource(img.source))
         .map((img) => ({
             id: img.id,
             kind: img.kind as BankImageKind,
@@ -131,11 +137,12 @@ export async function fetchCheckImagePanelData(): Promise<{ rows: CheckImagePane
     const unmatchedByImage = new Map(unmatched.map((u) => [u.bankImageId, u]));
     const lineById = new Map(candidateLines.map((line) => [line.id, line]));
 
-    const rows: CheckImagePanelRow[] = images.map((img) => {
+    const rows: CheckImagePanelRow[] = await Promise.all(images.map(async (img) => {
         // bankImageId is @unique on BankImageMatch, so 0 or 1 rows.
         const match = img.matches[0] ?? null;
         const extracted = img.extractedAt !== null;
-        const suggestions = extracted
+        const incomingEvidence = isIncomingEvidenceSource(img.source);
+        const suggestions = extracted && !incomingEvidence
             ? suggestMatches({ payerName: img.payerName, memoText: img.memoText }, clients, projects)
             : { payerMatches: [], memoMatches: [] };
         const proposal = proposalByImage.get(img.id) ?? null;
@@ -144,9 +151,12 @@ export async function fetchCheckImagePanelData(): Promise<{ rows: CheckImagePane
         return {
             id: img.id,
             kind: img.kind,
+            source: img.source,
+            incomingEvidence,
             sourceExternalId: img.sourceExternalId,
             fileName: img.fileName,
             driveFileId: img.driveFileId,
+            imageUrl: isSecureRef(img.driveFileId) ? await resolveDocUrl(img.driveFileId) : null,
             capturedAt: img.capturedAt.toISOString(),
             documentDate: toDateOnly(img.documentDate),
             amountCents: img.amountCents,
@@ -180,7 +190,7 @@ export async function fetchCheckImagePanelData(): Promise<{ rows: CheckImagePane
                 }
                 : null,
         };
-    });
+    }));
 
     return { rows, totalImages };
 }

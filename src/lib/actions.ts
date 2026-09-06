@@ -48,6 +48,7 @@ import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNu
 import { logActivity } from "./activity-log";
 import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { isIncomingEvidenceSource } from "./bank-image-sources";
 
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
 import { appendPunchItemsInTransaction } from "./punch-items";
@@ -15356,10 +15357,11 @@ export async function confirmBankImageMatch(input: {
     const note = (input.note ?? "").trim().slice(0, 500) || null;
 
     const [image, line] = await Promise.all([
-        prisma.bankImage.findUnique({ where: { id: bankImageId }, select: { id: true, sourceExternalId: true } }),
+        prisma.bankImage.findUnique({ where: { id: bankImageId }, select: { id: true, sourceExternalId: true, source: true } }),
         prisma.bankLine.findUnique({ where: { id: bankLineId }, select: { id: true } }),
     ]);
     if (!image) return { success: false, error: "That image no longer exists" };
+    if (isIncomingEvidenceSource(image.source)) return { success: false, error: "Incoming evidence cannot be matched or confirmed" };
     if (!line) return { success: false, error: "That bank line no longer exists" };
 
     const confirmedBy = user.email ?? user.name ?? "staff";
