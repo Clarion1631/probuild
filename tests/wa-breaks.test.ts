@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+    MEAL_REVIEW_NOTE,
+    MEAL_CONFIRMED_NOTE,
     exceedsMaxShift,
     OVERLAP_NOTE,
     overlappingEntryIds,
@@ -37,7 +39,7 @@ test("mealsRequiredForDay: >5h needs one, >11h needs two, 5:00 exactly needs non
     assert.equal(mealsRequiredForDay(11.5), 2);
 });
 
-test("countPunchedMeals: a ≥25-min gap counts, a short gap or overlap does not, order does not matter", () => {
+test("countPunchedMeals: a ≥30-min candidate gap counts, a short gap or overlap does not, order does not matter", () => {
     assert.equal(countPunchedMeals([span("07:00", "12:00"), span("12:30", "16:00")]), 1);
     assert.equal(countPunchedMeals([span("12:30", "16:00"), span("07:00", "12:00")]), 1);
     assert.equal(countPunchedMeals([span("07:00", "12:00"), span("12:10", "16:00")]), 0);
@@ -53,17 +55,17 @@ test("short day: no meal required, full pay", () => {
     assert.equal(r.shiftHours, 4.5);
 });
 
-test("5h59m single entry EXPECTS a meal and is auto-deducted 30 min with no attestation", () => {
+test("5h59m single entry EXPECTS a meal and is paid for review 30 min with no attestation", () => {
     const r = computeMealDeduction({ dayEntries: [], closing: span("07:00", "12:59"), mealSkipped: undefined, mealSkipStatus: null });
-    assert.equal(r.outcome, "AUTO_DEDUCTED");
-    assert.equal(r.mealDeductionHours, 0.5);
-    assert.ok(Math.abs(r.paidHours - (5 + 59 / 60 - 0.5)) < 1e-9);
+    assert.equal(r.outcome, "MEAL_REVIEW");
+    assert.equal(r.mealDeductionHours, 0);
+    assert.ok(Math.abs(r.paidHours - (5 + 59 / 60)) < 1e-9);
 });
 
-test("8h day, no punch, no attestation → auto-deducted; laborable hours are 7.5", () => {
+test("8h day, no punch, no attestation → paid for review; paid hours are 8", () => {
     const r = computeMealDeduction({ dayEntries: [], closing: span("07:00", "15:00"), mealSkipped: undefined, mealSkipStatus: null });
-    assert.equal(r.outcome, "AUTO_DEDUCTED");
-    assert.equal(r.paidHours, 7.5);
+    assert.equal(r.outcome, "MEAL_REVIEW");
+    assert.equal(r.paidHours, 8);
 });
 
 test("8h day, worker attests worked-through → no deduction (paid), outcome WORKED_THROUGH", () => {
@@ -75,14 +77,14 @@ test("8h day, worker attests worked-through → no deduction (paid), outcome WOR
 
 test("8h day, manager-approved skip → no deduction, WAIVED_APPROVED, and approval outranks attestation", () => {
     const r = computeMealDeduction({ dayEntries: [], closing: span("07:00", "15:00"), mealSkipped: true, mealSkipStatus: "APPROVED" });
-    assert.equal(r.outcome, "WAIVED_APPROVED");
+    assert.equal(r.outcome, "WORKED_THROUGH");
     assert.equal(r.paidHours, 8);
 });
 
-test("PENDING or DENIED request does NOT excuse the deduction", () => {
+test("PENDING or DENIED request with no meal answer remains paid for review", () => {
     for (const status of ["PENDING", "DENIED"]) {
         const r = computeMealDeduction({ dayEntries: [], closing: span("07:00", "15:00"), mealSkipped: undefined, mealSkipStatus: status });
-        assert.equal(r.outcome, "AUTO_DEDUCTED", status);
+        assert.equal(r.outcome, "MEAL_REVIEW", status);
     }
 });
 
@@ -90,7 +92,7 @@ test("punched meal (gap ≥25 min between the day's entries) satisfies the meal 
     const r = computeMealDeduction({
         dayEntries: [span("07:00", "12:00")],
         closing: span("12:30", "16:00"),
-        mealSkipped: undefined,
+        mealSkipped: false,
         mealSkipStatus: null,
     });
     assert.equal(r.outcome, "PUNCHED");
@@ -102,7 +104,7 @@ test("Switch Task split (4h + 4h, 10-min gap) still owes ONE meal, deducted on t
     const r = computeMealDeduction({
         dayEntries: [span("07:00", "11:00")],
         closing: span("11:10", "15:10"),
-        mealSkipped: undefined,
+        mealSkipped: false,
         mealSkipStatus: null,
     });
     assert.equal(r.outcome, "AUTO_DEDUCTED");
@@ -114,37 +116,37 @@ test("a deduction already taken on an earlier entry today is not taken twice", (
     const r = computeMealDeduction({
         dayEntries: [span("07:00", "13:00", 0.5)],
         closing: span("13:05", "16:00"),
-        mealSkipped: undefined,
+        mealSkipped: false,
         mealSkipStatus: null,
     });
     assert.equal(r.outcome, "PUNCHED");
     assert.equal(r.mealDeductionHours, 0);
 });
 
-test("11.5h day owes a SECOND meal; with one punched, the second is auto-deducted", () => {
+test("11.5h day with one gap remains paid pending additional-meal review", () => {
     const r = computeMealDeduction({
         dayEntries: [span("06:00", "12:00")],
         closing: span("12:30", "18:00"),
         mealSkipped: undefined,
         mealSkipStatus: null,
     });
-    assert.equal(r.outcome, "AUTO_DEDUCTED");
-    assert.equal(r.mealDeductionHours, 0.5);
-    assert.equal(r.paidHours, 5);
+    assert.equal(r.outcome, "MEAL_REVIEW");
+    assert.equal(r.mealDeductionHours, 0);
+    assert.equal(r.paidHours, 5.5);
 });
 
-test("11.5h in ONE entry, nothing punched → both meals (1.0h) deducted", () => {
+test("11.5h in ONE entry remains paid pending additional-meal review", () => {
     const r = computeMealDeduction({ dayEntries: [], closing: span("06:00", "17:30"), mealSkipped: undefined, mealSkipStatus: null });
-    assert.equal(r.outcome, "AUTO_DEDUCTED");
-    assert.equal(r.mealDeductionHours, 1);
-    assert.equal(r.paidHours, 10.5);
+    assert.equal(r.outcome, "MEAL_REVIEW");
+    assert.equal(r.mealDeductionHours, 0);
+    assert.equal(r.paidHours, 11.5);
 });
 
 test("deduction is capped at the closing entry's own length — a 10-min closing punch never goes negative", () => {
     const r = computeMealDeduction({
         dayEntries: [span("07:00", "13:00")],
         closing: span("13:02", "13:12"),
-        mealSkipped: undefined,
+        mealSkipped: false,
         mealSkipStatus: null,
     });
     assert.equal(r.outcome, "AUTO_DEDUCTED");
@@ -154,7 +156,7 @@ test("deduction is capped at the closing entry's own length — a 10-min closing
 
 test("non-boolean mealSkipped is ignored (treated as no attestation)", () => {
     const r = computeMealDeduction({ dayEntries: [], closing: span("07:00", "15:00"), mealSkipped: "true", mealSkipStatus: null });
-    assert.equal(r.outcome, "AUTO_DEDUCTED");
+    assert.equal(r.outcome, "MEAL_REVIEW");
 });
 
 test("paidHoursAfterEdit keeps the stored deduction and never goes negative", () => {
@@ -164,19 +166,19 @@ test("paidHoursAfterEdit keeps the stored deduction and never goes negative", ()
 });
 
 test("REVIEW #1: 'Clock out for lunch' at 5.5h is an intermediate close — DEFERRED, nothing deducted; the resumed half sees a PUNCHED meal", () => {
-    const first = computeMealDeduction({ dayEntries: [], closing: span("06:30", "12:00"), mealSkipped: undefined, mealSkipStatus: null, deferMeal: true });
+    const first = computeMealDeduction({ dayEntries: [], closing: span("06:30", "12:00"), mealSkipped: false, mealSkipStatus: null, deferMeal: true });
     assert.equal(first.outcome, "DEFERRED");
     assert.equal(first.mealDeductionHours, 0);
     assert.equal(first.paidHours, 5.5);
-    const second = computeMealDeduction({ dayEntries: [span("06:30", "12:00", 0)], closing: span("12:30", "16:00"), mealSkipped: undefined, mealSkipStatus: null });
+    const second = computeMealDeduction({ dayEntries: [span("06:30", "12:00", 0)], closing: span("12:30", "16:00"), mealSkipped: false, mealSkipStatus: null });
     assert.equal(second.outcome, "PUNCHED");
     assert.equal(second.paidHours, 3.5);
 });
 
 test("REVIEW #1: Switch Task at 5h+ is DEFERRED; the final close settles the whole day (attestation honored)", () => {
-    const mid = computeMealDeduction({ dayEntries: [], closing: span("07:00", "12:30"), mealSkipped: undefined, mealSkipStatus: null, deferMeal: true });
+    const mid = computeMealDeduction({ dayEntries: [], closing: span("07:00", "12:30"), mealSkipped: false, mealSkipStatus: null, deferMeal: true });
     assert.equal(mid.outcome, "DEFERRED");
-    const finalAuto = computeMealDeduction({ dayEntries: [span("07:00", "12:30", 0)], closing: span("12:32", "15:30"), mealSkipped: undefined, mealSkipStatus: null });
+    const finalAuto = computeMealDeduction({ dayEntries: [span("07:00", "12:30", 0)], closing: span("12:32", "15:30"), mealSkipped: false, mealSkipStatus: null });
     assert.equal(finalAuto.outcome, "AUTO_DEDUCTED");
     assert.equal(finalAuto.mealDeductionHours, 0.5);
     const finalAttested = computeMealDeduction({ dayEntries: [span("07:00", "12:30", 0)], closing: span("12:32", "15:30"), mealSkipped: true, mealSkipStatus: null });
@@ -188,18 +190,18 @@ test("REVIEW #4: overlapping duplicate punches are merged — an 8h day with a d
     assert.equal(unionHours([span("07:00", "15:00"), span("07:00", "15:00")]), 8);
     assert.equal(unionHours([span("07:00", "12:00"), span("11:00", "15:00")]), 8);
     assert.equal(unionHours([span("07:00", "12:00"), span("12:30", "15:00")]), 7.5);
-    const r = computeMealDeduction({ dayEntries: [span("07:00", "15:00", 0.5)], closing: span("07:00", "15:00"), mealSkipped: undefined, mealSkipStatus: null });
+    const r = computeMealDeduction({ dayEntries: [span("07:00", "15:00", 0.5)], closing: span("07:00", "15:00"), mealSkipped: false, mealSkipStatus: null });
     assert.equal(r.outcome, "PUNCHED");
     assert.equal(r.mealDeductionHours, 0);
 });
 
 test("REVIEW #5: a deduction capped short by a tiny close leaves a REMAINDER, not a fresh full 30 minutes", () => {
-    const tiny = computeMealDeduction({ dayEntries: [span("07:00", "13:00", 0)], closing: span("13:02", "13:12"), mealSkipped: undefined, mealSkipStatus: null });
+    const tiny = computeMealDeduction({ dayEntries: [span("07:00", "13:00", 0)], closing: span("13:02", "13:12"), mealSkipped: false, mealSkipStatus: null });
     assert.ok(Math.abs(tiny.mealDeductionHours - 10 / 60) < 1e-9);
     const next = computeMealDeduction({
         dayEntries: [span("07:00", "13:00", 0), span("13:02", "13:12", 10 / 60)],
         closing: span("13:15", "16:00"),
-        mealSkipped: undefined,
+        mealSkipped: false,
         mealSkipStatus: null,
     });
     assert.equal(next.outcome, "AUTO_DEDUCTED");
@@ -211,7 +213,7 @@ test("REVIEW #2 belt-and-braces: an AUTO_DEDUCTED close with no yes/no captured 
     assert.deepEqual(first, { needsReview: true, reviewReason: NO_ATTESTATION_NOTE });
     const again = applyNoAttestationNotice({ outcome: "AUTO_DEDUCTED", mealSkipped: undefined, existingReviewReason: NO_ATTESTATION_NOTE });
     assert.deepEqual(again, { needsReview: true });
-    assert.deepEqual(applyNoAttestationNotice({ outcome: "AUTO_DEDUCTED", mealSkipped: false, existingReviewReason: null }), {});
+    assert.deepEqual(applyNoAttestationNotice({ outcome: "AUTO_DEDUCTED", mealSkipped: false, existingReviewReason: null }), { reviewReason: MEAL_CONFIRMED_NOTE });
     assert.deepEqual(applyNoAttestationNotice({ outcome: "PUNCHED", mealSkipped: undefined, existingReviewReason: null }), {});
 });
 
@@ -285,7 +287,7 @@ const E = (id: string, from: string, to: string, extra: Partial<{ mealOutcome: s
 
 test("settleDayPlan: single 8h entry, took lunch → AUTO_DEDUCTED 0.5 on it, paid 7.5, no flag", () => {
     const plan = settleDayPlan({ entries: [E("a", "07:00", "15:00")], closing: { id: "a", mealSkipped: false } });
-    assert.deepEqual(plan, [{ id: "a", shiftHours: 8, mealDeductionHours: 0.5, paidHours: 7.5, mealOutcome: "AUTO_DEDUCTED" }]);
+    assert.deepEqual(plan, [{ id: "a", shiftHours: 8, mealDeductionHours: 0.5, paidHours: 7.5, mealOutcome: "AUTO_DEDUCTED", reviewReason: MEAL_CONFIRMED_NOTE }]);
 });
 
 test("settleDayPlan: REFUND — an earlier row deducted at its close is refunded once a later punched meal covers the day", () => {
@@ -299,10 +301,10 @@ test("settleDayPlan: REFUND — an earlier row deducted at its close is refunded
 test("settleDayPlan: Switch Task day (3h + 3h, 5-min gap) owes one meal on the LAST row; unanswered → flagged there", () => {
     const plan = settleDayPlan({ entries: [E("a", "07:00", "10:00"), E("b", "10:05", "13:05")], closing: { id: "b", mealSkipped: undefined } });
     const b = plan.find((u) => u.id === "b")!;
-    assert.equal(b.mealOutcome, "AUTO_DEDUCTED");
-    assert.equal(b.mealDeductionHours, 0.5);
+    assert.equal(b.mealOutcome, "MEAL_REVIEW");
+    assert.equal(b.mealDeductionHours, 0);
     assert.equal(b.needsReview, true);
-    assert.ok(b.reviewReason?.includes("no lunch answer"));
+    assert.ok(b.reviewReason?.includes(MEAL_REVIEW_NOTE));
     assert.equal(plan.find((u) => u.id === "a")!.mealDeductionHours, 0);
 });
 
@@ -330,10 +332,10 @@ test("settleDayPlan: a short last row spills the deduction backwards; a sibling 
     assert.deepEqual(shrunk.map((u) => [u.id, u.mealDeductionHours, u.mealOutcome]), [["a", 0, "DEFERRED"], ["b", 0, "NOT_REQUIRED"]]);
 });
 
-test("settleDayPlan: 11.5h with one punched meal owes the second on the last row", () => {
+test("settleDayPlan: 11.5h with a gap is not charged another meal", () => {
     const plan = settleDayPlan({ entries: [E("a", "06:00", "12:00"), E("b", "12:30", "18:00")], closing: { id: "b", mealSkipped: false } });
-    assert.equal(plan.find((u) => u.id === "b")!.mealDeductionHours, 0.5);
-    assert.equal(plan.find((u) => u.id === "b")!.paidHours, 5);
+    assert.equal(plan.find((u) => u.id === "b")!.mealDeductionHours, 0);
+    assert.equal(plan.find((u) => u.id === "b")!.paidHours, 5.5);
 });
 
 test("settleDayPlan (r3): a closing answer for a row NOT on this day is ignored — the day's last row still gets the no-answer flag", () => {
@@ -363,14 +365,14 @@ test("staleDeferredReview (codex r3 #3): a DEFERRED close on a DIFFERENT company
     assert.deepEqual(staleDeferredReview({ latest: late, now, latestDayKey: "2026-08-10", todayKey: "2026-08-11" }), { needsReview: true, reviewReason: STALE_DEFERRED_NOTE });
 });
 
-test("settleDayPlan (codex r3 #5): two rows ending at the same instant — flag and deduction land on the SAME row", () => {
+test("settleDayPlan (codex r3 #5): two rows ending at the same instant put missing-evidence review on one deterministic row", () => {
     const plan = settleDayPlan({ entries: [E("a", "07:00", "15:00"), E("b", "14:00", "15:00")], closing: null });
-    // Both rows overlap (so both carry OVERLAP_NOTE); the NO-ANSWER note and the deduction must share one row.
-    const flagged = plan.filter((u) => (u.reviewReason ?? "").includes(NO_ATTESTATION_NOTE));
+    // Both rows overlap; missing-evidence review has one deterministic owner and no deduction.
+    const flagged = plan.filter((u) => (u.reviewReason ?? "").includes(MEAL_REVIEW_NOTE));
     const deducted = plan.filter((u) => u.mealDeductionHours > 0);
     assert.equal(flagged.length, 1);
-    assert.equal(deducted.length, 1);
-    assert.equal(flagged[0].id, deducted[0].id);
+    assert.equal(deducted.length, 0);
+    assert.equal(flagged[0].id, "b");
 });
 
 test("codex r6 #1: overlapping duplicate rows are BOTH flagged with the overlap note; abutting rows are not", () => {

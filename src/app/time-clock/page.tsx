@@ -19,6 +19,8 @@ export default function TimeClockPage() {
     const [status, setStatus] = useState<"Clocked Out" | "Clocked In">("Clocked Out");
     const [currentTimeEntryId, setCurrentTimeEntryId] = useState<string | null>(null);
     const [location, setLocation] = useState<{ lat: number, lng: number } | null>(null);
+    const [mealAnswer, setMealAnswer] = useState("");
+    const [restAnswer, setRestAnswer] = useState("");
     const [error, setError] = useState<string>("");
 
     const [projects, setProjects] = useState<any[]>([]);
@@ -83,6 +85,8 @@ export default function TimeClockPage() {
             .then(data => {
                 const active = data.find((te: any) => !te.endTime);
                 if (active) {
+                    setMealAnswer("");
+                    setRestAnswer("");
                     setStatus("Clocked In");
                     setCurrentTimeEntryId(active.id);
                     setSelectedProject(active.projectId);
@@ -230,6 +234,8 @@ export default function TimeClockPage() {
             const data = await res.json();
             if (data.error) throw new Error(data.error);
 
+            setMealAnswer("");
+            setRestAnswer("");
             setStatus("Clocked In");
             setCurrentTimeEntryId(data.id);
             if (phaseId !== selectedPhase) setSelectedPhase(phaseId);
@@ -287,6 +293,8 @@ export default function TimeClockPage() {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         id: currentTimeEntryId,
+                        mealSkipped: mealAnswer === "taken" ? false : mealAnswer === "worked" ? true : undefined,
+                        restBreaksMissed: restAnswer === "missed" ? true : restAnswer === "taken" ? false : undefined,
                         latitude: loc?.lat,
                         longitude: loc?.lng
                     })
@@ -296,6 +304,8 @@ export default function TimeClockPage() {
 
                 setStatus("Clocked Out");
                 setCurrentTimeEntryId(null);
+                setMealAnswer("");
+                setRestAnswer("");
                 setSelectedProject("");
                 setSelectedPhase("");
                 setLogisticsDump("");
@@ -414,6 +424,29 @@ export default function TimeClockPage() {
                                 </div>
                             )}
                         </div>
+                    </div>
+                )}
+
+                {status === "Clocked In" && (
+                    <div className="mb-6 space-y-4 text-left">
+                        <label className="block text-sm font-medium">
+                            Meal break today
+                            <select className="hui-input mt-2 w-full" value={mealAnswer} onChange={e => setMealAnswer(e.target.value)}>
+                                <option value="">Unsure / needs review</option>
+                                <option value="taken">I took an uninterrupted, duty-free meal of at least 30 minutes</option>
+                                <option value="worked">I worked through, missed, or had an interrupted meal</option>
+                            </select>
+                        </label>
+                        <p className="text-sm text-hui-textMuted">Work and interrupted meals stay paid. A confirmed meal may deduct 30 minutes if it was inside your punch. Unclear answers go to review.</p>
+                        <label className="block text-sm font-medium">
+                            Paid rest breaks today
+                            <select className="hui-input mt-2 w-full" value={restAnswer} onChange={e => setRestAnswer(e.target.value)}>
+                                <option value="">Unsure / no answer</option>
+                                <option value="taken">I took my rest breaks</option>
+                                <option value="missed">I missed one or more rest breaks</option>
+                            </select>
+                        </label>
+                        <p className="text-sm text-hui-textMuted">Rest breaks are paid and already included in your clocked time.</p>
                     </div>
                 )}
 
