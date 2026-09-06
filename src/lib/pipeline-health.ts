@@ -1224,8 +1224,8 @@ export interface ProbeResult<T> {
  * The pool this shares with the rest of the app is small (a connection limit of 5 in
  * the Prisma client). Firing every probe at once meant the health check
  * could take the whole pool for itself — so a slow database turned "report on
- * the app" into "stall the app". Four at a time still finishes a nine-probe
- * sweep in three waves.
+ * the app" into "stall the app". Four at a time leaves one connection for
+ * application work; the current 25-probe sweep takes seven waves.
  */
 export const PROBE_CONCURRENCY = 4;
 
@@ -1248,8 +1248,14 @@ export interface Limiter {
  * their slots until their queries actually settle, so without a bound the ones
  * behind would queue until the platform killed the whole request. Reporting a
  * skipped probe is strictly better than reporting nothing at all.
+ *
+ * This must cover multiple healthy waves, not just one query. A 2s wait made
+ * later probes skip while the earlier queries were still completing normally.
+ * Allow 20s for the queue plus the 5s execution deadline: at most 25s per probe,
+ * leaving 5s of the health route's 30s budget for auth and response handling.
+ * Queries still retain their slots until they actually settle.
  */
-export const PROBE_ACQUIRE_TIMEOUT_MS = 2_000;
+export const PROBE_ACQUIRE_TIMEOUT_MS = 20_000;
 
 export function createLimiter(limit: number): Limiter {
     let inFlight = 0;
