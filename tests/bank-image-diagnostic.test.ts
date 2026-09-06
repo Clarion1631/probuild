@@ -11,6 +11,11 @@ const base = {
     documentDate: new Date("2026-08-13T00:00:00Z"), fileName: "original.jpg",
     mime: "image/jpeg", byteSize: 174152, normalizedCheckNumber: "1027", amountCents: null,
     driveFileId: null as string | null,
+    evidence: {
+        capturedAtExact: "2026-08-19T10:12:41.451000Z", updatedAtExact: "2026-08-20T12:00:00.123456Z",
+        payerName: "Golden Touch Remodeling", memoText: "Hoppe flooring",
+        extractedAtExact: "2026-08-20T12:00:00.123456Z", extractionModel: "test-model", matchCount: 0,
+    },
 };
 const storagePath = `bank-images/wtb-online/${reference}/front-redacted-${"a".repeat(64)}.jpg`;
 function request(query = `bankReference=${reference}`, headers: Record<string, string> = { "x-ingest-key": secret }, method = "GET") {
@@ -60,7 +65,7 @@ test("metadata comparison projection excludes links, extra fields and image byte
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("cache-control"), "private, no-store");
     const body = await res.json();
-    const { driveFileId: _omitted, ...expected } = base;
+    const { driveFileId: _omitted, evidence: _evidence, ...expected } = base;
     assert.deepEqual(body.metadata, { ...expected, capturedAt: base.capturedAt.toISOString(), documentDate: base.documentDate.toISOString() });
     assert.deepEqual(body.storage, { referenceKind: "legacy", presence: "not_checked" });
     assert.deepEqual(h.reads, [["WTB_ONLINE", `${reference}:front`]]);
@@ -121,4 +126,41 @@ test("production route exposes only GET and wires only a unique metadata read pl
     assert.match(src, /\.info\(path\)/);
     assert.doesNotMatch(src, /\.(create|update|delete|upsert|upload|download|getPublicUrl|createSignedUrl|findMany)\s*\(/);
     assert.doesNotMatch(src, /export (?:async function|const) (?:POST|PUT|PATCH|DELETE)/);
+});
+
+test("evidence projection preserves full timestamp precision and reports stored OCR and match count", async () => {
+    const h = harness(); const body = await (await h.handler(request())).json();
+    assert.deepEqual(body.evidence, { ...base.evidence, withheldFields: [] });
+    const matched = harness({ ...base, evidence: { ...base.evidence, matchCount: 1 } });
+    assert.equal((await (await matched.handler(request())).json()).evidence.matchCount, 1);
+});
+
+test("text with long numeric identifiers or URLs is withheld without changing storage", async () => {
+    const h = harness({ ...base, evidence: { ...base.evidence, payerName: "123-456-789", memoText: "https://example.test/private" } });
+    const body = await (await h.handler(request())).json();
+    assert.equal(body.evidence.payerName, null); assert.equal(body.evidence.memoText, null);
+    assert.deepEqual(body.evidence.withheldFields, ["payerName", "memoText"]);
+    assert.doesNotMatch(JSON.stringify(body), /123-456-789|example\.test\/private/);
+});
+
+test("legacy eight-digit identifiers and MICR glyphs are withheld; calendar dates survive unchanged", async () => {
+    for (const value of ["12-34-56-78", "A1B2C3D4E5F6G7H8", "12/34/5678", "payer \u2446", "memo \u2447", "\u2448", "\u2449"]) {
+        const row = { ...base, evidence: { ...base.evidence, payerName: value, memoText: value, extractionModel: value } };
+        const body = await (await harness(row).handler(request())).json();
+        for (const field of ["payerName", "memoText", "extractionModel"]) assert.equal(body.evidence[field], null, value);
+        assert.deepEqual(body.evidence.withheldFields, ["payerName", "memoText", "extractionModel"]);
+        assert.equal(row.evidence.memoText, value);
+    }
+    for (const value of ["Paid 2026-08-13", "Paid 8/13/2026", "  Paid 08-13-2026  "]) {
+        const body = await (await harness({ ...base, evidence: { ...base.evidence, memoText: value } }).handler(request())).json();
+        assert.equal(body.evidence.memoText, value);
+        assert.deepEqual(body.evidence.withheldFields, []);
+    }
+});
+
+test("production evidence reads share one snapshot and format timestamps in PostgreSQL", () => {
+    const src = readFileSync("src/app/api/integrations/bank-images/diagnostic/route.ts", "utf8");
+    assert.match(src, /RepeatableRead/); assert.match(src, /to_char/); assert.match(src, /HH24:MI:SS.US/);
+    assert.match(src, /_count:[\s\S]*matches/);
+    assert.doesNotMatch(src, /\$executeRaw|FOR UPDATE|\.updateMany\(/);
 });
