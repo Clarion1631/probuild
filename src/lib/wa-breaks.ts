@@ -1,25 +1,6 @@
-// Washington meal/rest-break rules for the time clock — the AUTOMATIC-BREAK
-// model (owner decision 2026-08-28): the crew no longer has to punch breaks.
-//
-//   Meal: 30 min UNPAID, required once the day's work passes 5 hours, a second
-//         once it passes 11. Deducted AUTOMATICALLY at clock-out — UNLESS the
-//         worker punched a real meal break (a ≥25-minute gap between entries),
-//         a manager APPROVED a skip in advance (worker has a signed waiver on
-//         file), or the worker attests at clock-out that they worked through
-//         it. Worked-through time is PAID and flagged for manager review.
-//         Auto-deduction is only lawful WITH that attestation escape hatch —
-//         a silent deduction with no way to say "I worked through it" is the
-//         classic wage-claim loser — so the clock-out question is not optional.
-//   Rest: 10 min PAID per 4 hours. NEVER waivable, never deducted, never
-//         offered as a skip. A missed rest break is pure documentation: paid
-//         in full, flagged for the manager.
-//
-// Pure functions, no Prisma/Next imports (same convention as
-// src/lib/logistics-time-entry.ts and src/lib/overtime.ts) — the routes fetch
-// the day's entries and pass them in. `durationHours` on a TimeEntry is the
-// PAID hours (every downstream consumer — Gusto export, pay-period summary,
-// manager tables, variance — reads it as such); `shiftHours` is the raw
-// clock-in→clock-out span; `mealDeductionHours` is the difference.
+// Meal deductions require an explicit uninterrupted, duty-free meal answer.
+// Missing/unclear answers stay paid for review. Rest breaks remain included in paid time.
+// durationHours is paid time; shiftHours is the raw punch span.
 
 /**
  * No single punch is longer than a day. A span past this means the end landed
@@ -36,15 +17,16 @@ export function exceedsMaxShift(start: Date, end: Date): boolean {
 export const MEAL_REQUIRED_AFTER_HOURS = 5;
 export const SECOND_MEAL_AFTER_HOURS = 11;
 export const MEAL_DEDUCTION_HOURS = 0.5;
-/** A gap this long between two of the day's entries counts as a punched (real) meal break. */
-export const PUNCHED_MEAL_GAP_MINUTES = 25;
+/** A candidate meal gap; an affirmative meal answer is still required. */
+export const PUNCHED_MEAL_GAP_MINUTES = 30;
 
 export type MealSkipStatus = "PENDING" | "APPROVED" | "DENIED";
 
 export type MealOutcome =
+    | "MEAL_REVIEW" // no deduction; missing evidence or additional-meal review
     | "NOT_REQUIRED" // day's work ≤ 5h — nothing to deduct
     | "PUNCHED" // the worker actually took a meal break (gap between entries)
-    | "AUTO_DEDUCTED" // 30 min deducted, no attestation to the contrary
+    | "AUTO_DEDUCTED" // 30 min deducted, affirmative uninterrupted-meal answer
     | "WORKED_THROUGH" // worker attested at clock-out — paid, flagged for review
     | "WAIVED_APPROVED" // manager approved the skip in advance — paid, not flagged
     | "DEFERRED"; // an INTERMEDIATE close (meal break, Switch Task) — the day settles on the final clock-out
@@ -119,7 +101,7 @@ export function unionHours(entries: { startTime: Date; endTime: Date }[]): numbe
     return total / 3_600_000;
 }
 
-/** How many meals a day of `workedHours` requires under WA rules. */
+/** Existing screening thresholds. A result above one routes to review, not another deduction. */
 export function mealsRequiredForDay(workedHours: number): number {
     if (workedHours > SECOND_MEAL_AFTER_HOURS) return 2;
     if (workedHours > MEAL_REQUIRED_AFTER_HOURS) return 1;
@@ -151,11 +133,9 @@ export function countPunchedMeals(entries: { startTime: Date; endTime: Date }[])
  * can never decide this — a crew member who switches jobs at 4h and 8h would
  * otherwise dodge every deduction.
  *
- * Precedence when a meal is still owed:
- *   1. a manager-approved skip           → WAIVED_APPROVED (paid, no flag)
- *   2. the worker says they worked through → WORKED_THROUGH (paid, flagged by
- *      applyMealSkippedWaiver in the route — this module never sets flags)
- *   3. otherwise                          → AUTO_DEDUCTED
+ * Worked-through answers stay paid regardless of approval. Additional-meal
+ * complexity and missing evidence stay paid for review. Only an affirmative
+ * meal answer can produce a deduction; a qualifying gap avoids deducting twice.
  * Deduction is capped at the closing entry's own length: a 10-minute closing
  * punch on an 8-hour day cannot go negative.
  */
@@ -174,21 +154,24 @@ export function computeMealDeduction(input: MealDeductionInput): MealDeductionRe
         return { outcome: "NOT_REQUIRED", mealDeductionHours: 0, shiftHours, paidHours: shiftHours };
     }
 
-    // Everything is in HOURS, not rounded meal counts: a deduction capped short
-    // by a tiny closing punch leaves a remainder that the next close owes —
-    // never a fresh full 30 minutes on top of it.
-    const alreadyDeductedHours = others.reduce((sum, entry) => sum + (entry.mealDeductionHours ?? 0), 0);
-    const punchedHours = countPunchedMeals([...others, input.closing]) * MEAL_DEDUCTION_HOURS;
-    const owedHours = required * MEAL_DEDUCTION_HOURS - alreadyDeductedHours - punchedHours;
-    if (owedHours <= 1e-9) {
-        return { outcome: "PUNCHED", mealDeductionHours: 0, shiftHours, paidHours: shiftHours };
+    if (input.mealSkipped === true) {
+        return { outcome: "WORKED_THROUGH", mealDeductionHours: 0, shiftHours, paidHours: shiftHours };
     }
-
+    if (required > 1) {
+        return { outcome: "MEAL_REVIEW", mealDeductionHours: 0, shiftHours, paidHours: shiftHours };
+    }
     if (input.mealSkipStatus === "APPROVED") {
         return { outcome: "WAIVED_APPROVED", mealDeductionHours: 0, shiftHours, paidHours: shiftHours };
     }
-    if (input.mealSkipped === true) {
-        return { outcome: "WORKED_THROUGH", mealDeductionHours: 0, shiftHours, paidHours: shiftHours };
+    if (input.mealSkipped !== false) {
+        return { outcome: "MEAL_REVIEW", mealDeductionHours: 0, shiftHours, paidHours: shiftHours };
+    }
+    const alreadyDeductedHours = others.reduce((sum, entry) => sum + (entry.mealDeductionHours ?? 0), 0);
+    // A qualifying gap avoids deducting twice ONLY with an affirmative meal answer.
+    const punchedHours = countPunchedMeals([...others, input.closing]) * MEAL_DEDUCTION_HOURS;
+    const owedHours = MEAL_DEDUCTION_HOURS - alreadyDeductedHours - punchedHours;
+    if (owedHours <= 1e-9) {
+        return { outcome: "PUNCHED", mealDeductionHours: 0, shiftHours, paidHours: shiftHours };
     }
 
     const mealDeductionHours = Math.min(owedHours, shiftHours);
@@ -201,6 +184,9 @@ export function computeMealDeduction(input: MealDeductionInput): MealDeductionRe
 }
 
 /** Sentinel — an automatic deduction that the worker was never asked about is visible to the manager, never silent. */
+export const MEAL_REVIEW_NOTE = "Meal evidence missing or additional meal requires review — no meal deducted";
+export const MEAL_CONFIRMED_NOTE = "Worker confirmed an uninterrupted duty-free meal at clock-out";
+// Keep the legacy sentinel unchanged: stored rows use it as missing-answer evidence.
 export const NO_ATTESTATION_NOTE = "Meal auto-deducted with no lunch answer captured at clock-out";
 /** Sentinel — a mid-day (DEFERRED) close that turned out to be the last close of its day: the meal was never settled. */
 export const STALE_DEFERRED_NOTE = "Mid-day close was the last of its day — meal never settled (worker did not clock back in)";
@@ -247,6 +233,14 @@ export function applyNoAttestationNotice(input: {
     mealSkipped: unknown;
     existingReviewReason: string | null | undefined;
 }): { needsReview?: boolean; reviewReason?: string } {
+    if (input.outcome === "MEAL_REVIEW") {
+        const parts = reviewReasonParts(input.existingReviewReason);
+        return { needsReview: true, reviewReason: [...new Set([...parts, MEAL_REVIEW_NOTE])].join("; ") };
+    }
+    if (input.mealSkipped === false && ["PUNCHED", "AUTO_DEDUCTED", "WAIVED_APPROVED"].includes(input.outcome)) {
+        const parts = reviewReasonParts(input.existingReviewReason);
+        return { reviewReason: [...new Set([...parts, MEAL_CONFIRMED_NOTE])].join("; ") };
+    }
     if (input.outcome !== "AUTO_DEDUCTED") return {};
     if (input.mealSkipped === true || input.mealSkipped === false) return {};
     const parts = reviewReasonParts(input.existingReviewReason);
@@ -414,8 +408,8 @@ export interface SettleDayUpdate {
  * edit that moved the row) must not erase the record that its old day failed;
  * only "Mark reviewed" (stripSettlementNotes) retires it.
  */
-const SETTLEMENT_NOTES = [NO_ATTESTATION_NOTE, STALE_DEFERRED_NOTE, OVERLAP_NOTE];
-/** Everything settlement owns — what "Mark reviewed" clears so a re-plan cannot re-flag a reviewed row. */
+const SETTLEMENT_NOTES = [NO_ATTESTATION_NOTE, MEAL_REVIEW_NOTE, STALE_DEFERRED_NOTE, OVERLAP_NOTE];
+/** Legacy settlement-note inventory; missing-answer evidence must survive generic review. */
 export const ALL_SETTLEMENT_NOTES = [NO_ATTESTATION_NOTE, STALE_DEFERRED_NOTE, OVERLAP_NOTE, SETTLEMENT_FAILED_NOTE];
 
 /** Ids of rows whose interval intersects another row's (open-interval test; abutting rows do not overlap). */
@@ -434,9 +428,9 @@ export function overlappingEntryIds(entries: { id: string; startTime: Date; endT
     return out;
 }
 
-/** Drop settlement-owned notes from a reviewReason (a manager reviewed the row — a later re-plan must not re-flag it). */
+/** Retire operational notes, preserving meal-answer evidence for future settlement. */
 export function stripSettlementNotes(reviewReason: string | null | undefined): string {
-    return reviewReasonParts(reviewReason).filter((part) => !ALL_SETTLEMENT_NOTES.includes(part)).join("; ");
+    return reviewReasonParts(reviewReason).filter((part) => (part === NO_ATTESTATION_NOTE || !ALL_SETTLEMENT_NOTES.includes(part))).join("; ");
 }
 
 /**
@@ -458,7 +452,7 @@ function dayAttestation(entries: SettleDayEntry[]): { workedThrough: boolean; an
         if (entry.mealOutcome === "WORKED_THROUGH") {
             workedThrough = true;
             answered = true;
-        } else if (entry.mealOutcome === "AUTO_DEDUCTED" && !reviewReasonParts(entry.reviewReason).includes(NO_ATTESTATION_NOTE)) {
+        } else if (reviewReasonParts(entry.reviewReason).includes(MEAL_CONFIRMED_NOTE) || (entry.mealOutcome === "AUTO_DEDUCTED" && !reviewReasonParts(entry.reviewReason).includes(NO_ATTESTATION_NOTE))) {
             answered = true;
         }
     }
@@ -511,9 +505,11 @@ export function settleDayPlan(input: {
     let dayOutcome: MealOutcome;
     let owedHours = 0;
     if (required === 0) dayOutcome = "NOT_REQUIRED";
-    else if (required * MEAL_DEDUCTION_HOURS - punchedHours <= 1e-9) dayOutcome = "PUNCHED";
-    else if (facts.approved) dayOutcome = "WAIVED_APPROVED";
     else if (workedThrough) dayOutcome = "WORKED_THROUGH";
+    else if (required > 1) dayOutcome = "MEAL_REVIEW";
+    else if (facts.approved) dayOutcome = "WAIVED_APPROVED";
+    else if (!answered) dayOutcome = "MEAL_REVIEW";
+    else if (MEAL_DEDUCTION_HOURS - punchedHours <= 1e-9) dayOutcome = "PUNCHED";
     else {
         dayOutcome = "AUTO_DEDUCTED";
         owedHours = required * MEAL_DEDUCTION_HOURS - punchedHours;
@@ -549,13 +545,18 @@ export function settleDayPlan(input: {
         // Settlement-owned notes wanted on this row right now; everything else
         // on the row (GPS, waiver, failed-settle…) is preserved verbatim.
         const wanted: string[] = [];
-        if (isLast && dayOutcome === "AUTO_DEDUCTED" && !answered) wanted.push(NO_ATTESTATION_NOTE);
+        if (isLast && dayOutcome === "MEAL_REVIEW") wanted.push(MEAL_REVIEW_NOTE);
+        // Keep affirmative evidence on the row that captured it, rather than
+        // copying a derived day answer onto every later row (which could move days).
+        const capturedHere = input.closing?.id === entry.id && input.closing.mealSkipped === false;
+        const legacyAnswerHere = entry.mealOutcome === "AUTO_DEDUCTED" && !reviewReasonParts(entry.reviewReason).includes(NO_ATTESTATION_NOTE);
+        if (capturedHere || legacyAnswerHere) wanted.push(MEAL_CONFIRMED_NOTE);
         if (overlapping.has(entry.id)) wanted.push(OVERLAP_NOTE);
         const parts = reviewReasonParts(entry.reviewReason);
         const others = parts.filter((part) => !SETTLEMENT_NOTES.includes(part));
-        const desired = [...others, ...wanted];
+        const desired = [...new Set([...others, ...wanted])];
         const unchanged = desired.length === parts.length && desired.every((part, i) => part === parts[i]);
-        if (wanted.length > 0) {
+        if (wanted.some((note) => note !== MEAL_CONFIRMED_NOTE)) {
             update.needsReview = true;
             if (!unchanged) update.reviewReason = desired.join("; ");
         } else if (!unchanged) {

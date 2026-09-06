@@ -331,6 +331,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                     {e.mealOutcome === 'AUTO_DEDUCTED' ? <span className="text-hui-textMuted" title={`${Math.round((e.mealDeductionHours ?? 0.5) * 60)} min unpaid meal deducted automatically`}>−{Math.round((e.mealDeductionHours ?? 0.5) * 60)}m</span>
                                                         : e.mealOutcome === 'DEFERRED' ? <span className="text-hui-textMuted" title="Mid-day close (lunch / task switch) — the day settles on the final clock-out">mid-day</span>
                                                         : e.mealOutcome === 'PUNCHED' ? <span className="text-hui-textMuted" title="Worker clocked out for a meal">taken</span>
+                                                        : e.mealOutcome === 'MEAL_REVIEW' ? <span className="text-amber-700" title="Meal evidence needs review; no meal deducted">paid / review</span>
                                                         : e.mealOutcome === 'WORKED_THROUGH' ? <span className="text-red-700" title="Worker reported working through lunch — paid, needs review">worked thru</span>
                                                         : e.mealOutcome === 'WAIVED_APPROVED' ? <span className="text-green-700" title="Skip approved in advance by a manager">approved skip</span>
                                                         : e.mealOutcome === 'NOT_REQUIRED' ? <span className="text-hui-textMuted">—</span>
