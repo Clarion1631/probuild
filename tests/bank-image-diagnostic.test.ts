@@ -146,6 +146,6 @@ test("text with long numeric identifiers or URLs is withheld without changing st
 test("production evidence reads share one snapshot and format timestamps in PostgreSQL", () => {
     const src = readFileSync("src/app/api/integrations/bank-images/diagnostic/route.ts", "utf8");
     assert.match(src, /RepeatableRead/); assert.match(src, /to_char/); assert.match(src, /HH24:MI:SS.US/);
-    assert.match(src, /_count:.*matches/s);
+    assert.match(src, /_count:[\s\S]*matches/);
     assert.doesNotMatch(src, /\$executeRaw|FOR UPDATE|\.updateMany\(/);
 });
