@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "@/lib/prisma";
@@ -18,7 +20,7 @@ export async function POST(req: NextRequest) {
                     task: {
                         include: {
                             project: { select: { name: true } },
-                            timeEntries: { select: { startTime: true, endTime: true, durationHours: true } },
+                            timeEntries: { where: nonVoidedTimeEntryWhere(), select: { startTime: true, endTime: true, durationHours: true } },
                         },
                     },
                 },

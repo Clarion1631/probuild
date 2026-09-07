@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { prisma } from "@/lib/prisma";
 import { expenseHasAnyProjectWhere, resolveExpenseProjectId } from "@/lib/expense-attribution";
 import { getServerSession } from "next-auth";
@@ -70,7 +72,7 @@ export default async function ProfitabilityPage({ searchParams }: { searchParams
                         },
                     },
                 },
-                timeEntries: { select: { durationHours: true, laborCost: true, burdenCost: true, startTime: true } },
+                timeEntries: { where: nonVoidedTimeEntryWhere(), select: { durationHours: true, laborCost: true, burdenCost: true, startTime: true } },
             },
             orderBy: { createdAt: "desc" },
         }),

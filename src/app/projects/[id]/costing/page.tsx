@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
@@ -51,7 +53,7 @@ export default async function JobCostingPage({
         }),
         // Fetch Actuals: Time Entries
         prisma.timeEntry.findMany({
-            where: { projectId },
+            where: nonVoidedTimeEntryWhere({ projectId }),
             include: { costCode: true }
         }),
         // Fetch Actuals: Expenses

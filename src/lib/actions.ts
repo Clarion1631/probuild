@@ -1,4 +1,6 @@
 "use server";
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
+
 
 import type { Prisma } from "@prisma/client";
 
@@ -7575,7 +7577,7 @@ export async function getScheduleTasks(projectId: string) {
             children: true,
             dependencies: { include: { predecessor: true } },
             dependents: { include: { dependent: true } },
-            timeEntries: { select: { durationHours: true } },
+            timeEntries: { where: nonVoidedTimeEntryWhere(), select: { durationHours: true } },
             assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
             subAssignments: { include: { subcontractor: true } },
             estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true, quantity: true, budgetUnit: true } },
@@ -7684,7 +7686,7 @@ export async function getScheduleTaskDetail(taskId: string) {
         include: {
             dependencies: true,
             dependents: true,
-            timeEntries: { select: { durationHours: true } },
+            timeEntries: { where: nonVoidedTimeEntryWhere(), select: { durationHours: true } },
             assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
             subAssignments: { include: { subcontractor: { select: { id: true, companyName: true, email: true, trade: true } } } },
             estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true, quantity: true, budgetUnit: true } },
@@ -7849,7 +7851,7 @@ export async function getScheduleTasksForSub(projectId: string, subcontractorId:
         include: {
             dependencies: true,
             comments: { include: { user: { select: { id: true, name: true, email: true } } }, orderBy: { createdAt: "asc" } },
-            timeEntries: { select: { durationHours: true } },
+            timeEntries: { where: nonVoidedTimeEntryWhere(), select: { durationHours: true } },
             assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
             subAssignments: { include: { subcontractor: true } },
             estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true, quantity: true, budgetUnit: true } },
@@ -8118,7 +8120,7 @@ export async function getTaskTimeEntries(taskId: string) {
     await assertActiveStaff();
     const [entries, total] = await Promise.all([
         prisma.timeEntry.findMany({
-            where: { scheduleTaskId: taskId },
+            where: nonVoidedTimeEntryWhere({ scheduleTaskId: taskId }),
             orderBy: { startTime: "desc" },
             take: 50,
             select: {
@@ -8129,7 +8131,7 @@ export async function getTaskTimeEntries(taskId: string) {
                 costCode: { select: { id: true, code: true, name: true } },
             },
         }),
-        prisma.timeEntry.count({ where: { scheduleTaskId: taskId } }),
+        prisma.timeEntry.count({ where: nonVoidedTimeEntryWhere({ scheduleTaskId: taskId }) }),
     ]);
     return { entries, total };
 }
@@ -8552,7 +8554,7 @@ export async function getAllScheduleTasks() {
             assignments: {
                 include: { user: { select: { id: true, name: true, email: true } } },
             },
-            timeEntries: { select: { durationHours: true } },
+            timeEntries: { where: nonVoidedTimeEntryWhere(), select: { durationHours: true } },
         },
     });
 }
@@ -9611,7 +9613,7 @@ export async function getChangeOrder(id: string) {
             estimate: { select: { title: true, code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { orderBy: { order: "asc" } },
             paymentSchedules: { orderBy: { order: "asc" } },
-            timeEntries: { include: { user: { select: { name: true, email: true } } }, orderBy: { startTime: "desc" } },
+            timeEntries: { where: nonVoidedTimeEntryWhere(), include: { user: { select: { name: true, email: true } } }, orderBy: { startTime: "desc" } },
             expenses: { orderBy: { createdAt: "desc" } },
             billings: { include: { paymentSchedule: { select: { id: true, name: true, amount: true, status: true } } }, orderBy: { createdAt: "desc" } },
         }
@@ -17327,11 +17329,11 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
     const envelope = payrollLockEnvelope(periodStart, periodEnd, timeZone);
 
     const unsettled = await prisma.timeEntry.findMany({
-        where: {
+        where: nonVoidedTimeEntryWhere({
             startTime: { gte: envelope.start, lt: envelope.end },
             mealOutcome: "DEFERRED",
             endTime: { not: null },
-        },
+        }),
         select: { userId: true, startTime: true },
     });
     if (unsettled.length === 0) return { success: true as const, settled: 0, skipped: 0 };
@@ -17343,7 +17345,7 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
     // never be cleared from either end.
     const { isOpenEntry } = await import("./gusto-export-core");
     const openCandidates = await prisma.timeEntry.findMany({
-        where: { endTime: null, userId: { in: affectedUserIds } },
+        where: nonVoidedTimeEntryWhere({ endTime: null, userId: { in: affectedUserIds } }),
         select: { userId: true, startTime: true, endTime: true, durationHours: true },
     });
     const openRows = openCandidates.filter((row) => isOpenEntry(row));

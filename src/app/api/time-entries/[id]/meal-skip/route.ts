@@ -1,3 +1,4 @@
+import { timeEntryVoidedResponse } from "@/lib/time-entry-void";
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
@@ -59,6 +60,7 @@ async function POSTHandler(req: Request, { params }: { params: Promise<{ id: str
     const entry = await prisma.timeEntry.findUnique({
         where: { id },
         select: {
+            voidedAt: true,
             id: true,
             userId: true,
             endTime: true,
@@ -71,6 +73,7 @@ async function POSTHandler(req: Request, { params }: { params: Promise<{ id: str
     // Only the worker asks for their own lunch — a manager who wants to waive
     // for someone uses the approval side, which leaves their name on it.
     if (entry.userId !== user.id) return NextResponse.json({ error: "Not your time entry" }, { status: 403 });
+    if (entry.voidedAt) return timeEntryVoidedResponse();
     if (entry.endTime != null) {
         return NextResponse.json({ error: "Shift is already closed", code: "ENTRY_CLOSED" }, { status: 409 });
     }
@@ -130,10 +133,11 @@ async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: st
 
     const entry = await prisma.timeEntry.findUnique({
         where: { id },
-        select: { id: true, endTime: true, mealSkipStatus: true, user: { select: { mealWaiverSignedAt: true } } },
+        select: { voidedAt: true, id: true, endTime: true, mealSkipStatus: true, user: { select: { mealWaiverSignedAt: true } } },
     });
     if (!entry) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
 
+    if (entry.voidedAt) return timeEntryVoidedResponse();
     const check = checkMealSkipDecision({
         decision,
         currentStatus: entry.mealSkipStatus,

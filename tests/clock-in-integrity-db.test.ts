@@ -9,8 +9,10 @@ const url = process.env.CLOCK_IN_TEST_URL;
 test("real Postgres serializes retries, guards all writers, retains tombstones and refuses locked periods", { skip: !url && "requires explicit disposable local PostgreSQL" }, async () => {
     assert.ok(url); assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(new URL(url).hostname));
     process.env.DATABASE_URL = url; process.env.NEXTAUTH_SECRET = "local-clock-in-test-token-secret";
-    const { applyClockInIntegrity } = await import("../scripts/apply-clock-in-integrity.mjs");
+    const { applyClockInIntegrity: applyOriginalClockIn } = await import("../scripts/apply-clock-in-integrity.mjs");
     const db = new PrismaClient({ datasources: { db: { url } } });
+    const newerSchema = await db.$queryRawUnsafe<Array<unknown>>(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'TimeEntry' AND column_name = 'voidedAt'`);
+    const applyClockInIntegrity = newerSchema.length ? (await import("../scripts/apply-time-entry-void.mjs")).applyTimeEntryVoid : applyOriginalClockIn;
     const stamp = Date.now().toString(); const startTime = new Date("2034-01-10T15:00:00Z");
     const user = await db.user.create({ data: { name: "Clock-in test", email: `clock-in-${stamp}@example.test`, role: "FIELD_CREW", status: "ACTIVATED" } });
     const otherUser = await db.user.create({ data: { name: "Other clock-in test", email: `clock-in-other-${stamp}@example.test`, role: "FIELD_CREW" } });

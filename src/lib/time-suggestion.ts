@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isTaskActiveOnDay } from "@/app/company-dashboard/schedule-board/dispatch-exceptions";
@@ -420,12 +422,12 @@ async function suggestInferredTaskForClockIn(
     // 4 — the user's most recent closed entry on this project, if its task still qualifies.
     const historyCutoff = new Date(now.getTime() - HISTORY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
     const lastEntry = await db.timeEntry.findFirst({
-        where: {
+        where: nonVoidedTimeEntryWhere({
             userId,
             projectId,
             endTime: { not: null, gte: historyCutoff },
             scheduleTaskId: { not: null },
-        },
+        }),
         orderBy: { endTime: "desc" },
         select: { scheduleTaskId: true },
     });

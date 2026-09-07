@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
@@ -41,7 +43,7 @@ export default async function TimeClockPage({
 
     // Fetch required data for client
     const timeEntries = await prisma.timeEntry.findMany({
-        where: { projectId },
+        where: nonVoidedTimeEntryWhere({ projectId }),
         include: {
             user: { select: { id: true, name: true, email: true } },
             costCode: { select: { id: true, name: true, code: true } }

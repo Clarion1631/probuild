@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { prisma } from "@/lib/prisma";
 import { resolveExpenseProjectId, resolveExpenseProjectLabel } from "@/lib/expense-attribution";
 import { Prisma } from "@prisma/client";
@@ -2001,7 +2003,7 @@ export async function getCalendarOverlays(
             },
         }),
         prisma.timeEntry.findMany({
-            where: { startTime: { gte: from, lt: to } },
+            where: nonVoidedTimeEntryWhere({ startTime: { gte: from, lt: to } }),
             orderBy: { startTime: "asc" },
             select: {
                 id: true, userId: true, startTime: true, durationHours: true,
@@ -2234,7 +2236,7 @@ async function getProjectMonthStrip(from: Date, to: Date, coRows: OverlayChangeO
             select: { amount: true, projectId: true, estimate: { select: { projectId: true } } },
         }),
         prisma.timeEntry.findMany({
-            where: { startTime: { gte: from, lt: to } },
+            where: nonVoidedTimeEntryWhere({ startTime: { gte: from, lt: to } }),
             select: { projectId: true, durationHours: true, laborCost: true, burdenCost: true },
         }),
         prisma.scheduleTask.findMany({
@@ -2424,7 +2426,7 @@ export async function getCompanyDashboardData(
         // ── Evidence aggregates (3 queries, batched — never per chip) ──
         prisma.timeEntry.groupBy({
             by: ["scheduleTaskId"],
-            where: { projectId: { in: rowIds }, scheduleTaskId: { not: null } },
+            where: nonVoidedTimeEntryWhere({ projectId: { in: rowIds }, scheduleTaskId: { not: null } }),
             _max: { startTime: true },
         }),
         prisma.taskPunchItem.groupBy({
@@ -2442,11 +2444,11 @@ export async function getCompanyDashboardData(
         // number — it's meant to show evidence we're losing NOW.
         prisma.timeEntry.groupBy({
             by: ["projectId"],
-            where: {
+            where: nonVoidedTimeEntryWhere({
                 projectId: { in: rowIds },
                 scheduleTaskId: null,
                 startTime: { gte: new Date(Date.now() - 14 * 86_400_000) },
-            },
+            }),
             _count: { id: true },
         }),
     ]);

@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 // The one Prisma-backed reader/writer for src/lib/wa-breaks.ts — both clock-out
 // paths (PUT /api/time-entries and PATCH /api/time-entries/[id]) must see the
 // SAME "rest of the day", so they share this rather than each hand-rolling it.
@@ -36,7 +38,7 @@ export async function settlementCandidateIds(
 ): Promise<string[]> {
     const window = dayWindow(dayKey);
     const rows = (await tx.$queryRawUnsafe(
-        `SELECT "id" FROM "TimeEntry" WHERE "userId" = $1 AND "endTime" IS NOT NULL AND "startTime" >= $2 AND "startTime" < $3`,
+        `SELECT "id" FROM "TimeEntry" WHERE "userId" = $1 AND "voidedAt" IS NULL AND "endTime" IS NOT NULL AND "startTime" >= $2 AND "startTime" < $3`,
         userId,
         window.gte,
         window.lt
@@ -66,7 +68,7 @@ export async function loadDayEntries(
     timeZone: string
 ): Promise<DayEntry[]> {
     const rows = await prisma.timeEntry.findMany({
-        where: { userId, id: { not: excludeEntryId }, endTime: { not: null }, startTime: dayWindow(dayKey) },
+        where: nonVoidedTimeEntryWhere({ userId, id: { not: excludeEntryId }, endTime: { not: null }, startTime: dayWindow(dayKey) }),
         select: { startTime: true, endTime: true, mealDeductionHours: true },
     });
     return rows
@@ -281,7 +283,7 @@ async function settleDayInTx(
             // the owner read, removes that cycle.
             const window = dayWindow(dayKey);
             await tx.$queryRawUnsafe(
-                `SELECT "id" FROM "TimeEntry" WHERE "userId" = $1 AND "endTime" IS NOT NULL AND "startTime" >= $2 AND "startTime" < $3 ORDER BY "id" FOR UPDATE`,
+                `SELECT "id" FROM "TimeEntry" WHERE "userId" = $1 AND "voidedAt" IS NULL AND "endTime" IS NOT NULL AND "startTime" >= $2 AND "startTime" < $3 ORDER BY "id" FOR UPDATE`,
                 userId,
                 window.gte,
                 window.lt
@@ -312,7 +314,7 @@ async function settleDayInTx(
             });
 
             const rows = await tx.timeEntry.findMany({
-                where: { userId, endTime: { not: null }, startTime: window },
+                where: nonVoidedTimeEntryWhere({ userId, endTime: { not: null }, startTime: window }),
                 select: {
                     id: true, startTime: true, endTime: true, mealOutcome: true, mealSkipStatus: true, reviewReason: true,
                     shiftHours: true, mealDeductionHours: true, durationHours: true, needsReview: true,
@@ -439,7 +441,7 @@ export async function latestClosedEntryIdOnDay(
     timeZone: string
 ): Promise<string | null> {
     const rows = await prisma.timeEntry.findMany({
-        where: { userId, endTime: { not: null }, startTime: dayWindow(dayKey) },
+        where: nonVoidedTimeEntryWhere({ userId, endTime: { not: null }, startTime: dayWindow(dayKey) }),
         select: { id: true, startTime: true, endTime: true },
     });
     const day = rows.filter((row) => row.endTime != null && dayKeyInTimeZone(row.startTime, timeZone) === dayKey);

@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 // Server-side data loading for the variance report. Kept out of the page
 // component so the page stays presentational and this stays swappable.
 //
@@ -171,7 +173,7 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
 
         const [timeRows, expenseRows] = await Promise.all([
             prisma.timeEntry.findMany({
-                where: { projectId: project.id },
+                where: nonVoidedTimeEntryWhere({ projectId: project.id }),
                 select: { costCodeId: true, estimateItemId: true, laborCost: true, burdenCost: true },
             }),
             prisma.expense.findMany({

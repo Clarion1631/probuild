@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 export const dynamic = "force-dynamic";
 import { prisma } from "@/lib/prisma";
 import { getSessionOrDev } from "@/lib/auth";
@@ -31,10 +33,10 @@ export default async function ManagerLogisticsPage({ searchParams }: Props) {
 
     const [entries, jobs] = await Promise.all([
         prisma.timeEntry.findMany({
-            where: {
+            where: nonVoidedTimeEntryWhere({
                 startTime: { gte: since },
                 OR: [{ project: { isLogistics: true } }, { routedFromProjectId: { not: null } }],
-            },
+            }),
             include: { user: { select: { name: true, email: true } }, project: { select: { id: true, name: true, isLogistics: true } } },
             orderBy: { startTime: "desc" },
             take: 300,

@@ -1,3 +1,6 @@
+import { isTimeEntryVoidedError, timeEntryVoidedResponse } from "@/lib/time-entry-void";
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 export const dynamic = 'force-dynamic';
 import { NextResponse } from "next/server";
 import { computeAssignedPlanForUser } from "@/lib/time-suggestion";
@@ -73,7 +76,7 @@ export async function GET(req: Request) {
     const canSeePay = canActOnFinancials({ role: user.role, permissions: viewerPermissions });
 
     const timeEntries = await prisma.timeEntry.findMany({
-        where: whereClause,
+        where: nonVoidedTimeEntryWhere(whereClause),
         select: {
             ...timeEntrySelect(canSeePay),
             // Explicit select — a full Project row would serialize
@@ -155,7 +158,7 @@ export async function POST(req: Request) {
     // blocks the clock-in.
     try {
         const latest = await prisma.timeEntry.findFirst({
-            where: { userId: user.id, endTime: { not: null } },
+            where: nonVoidedTimeEntryWhere({ userId: user.id, endTime: { not: null } }),
             orderBy: { endTime: "desc" },
             select: { id: true, mealOutcome: true, startTime: true, endTime: true, needsReview: true, reviewReason: true },
         });
@@ -373,6 +376,7 @@ export async function POST(req: Request) {
             })), requestIdentity)
         );
     } catch (error) {
+        if (isTimeEntryVoidedError(error)) return timeEntryVoidedResponse();
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
         if (error instanceof ClockInConflict) return NextResponse.json({
             error: error.message, code: error.code,
@@ -401,6 +405,7 @@ type ClockOutAuthResult =
     | { ok: false; status: number; error: string };
 
 export interface ClockOutTimeEntryRow {
+    voidedAt?: Date | null;
     id: string;
     userId: string;
     projectId: string;
@@ -598,6 +603,7 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             if (existing.userId !== user.id && user.role !== "MANAGER" && user.role !== "ADMIN") {
                 return NextResponse.json({ error: "Unauthorized to edit this entry" }, { status: 403 });
             }
+            if (existing.voidedAt) return timeEntryVoidedResponse();
             const preMealSkipped: unknown = existing.userId === user.id ? body.mealSkipped : undefined;
 
             // A closed entry can never be re-closed via PUT — the client must
@@ -904,6 +910,7 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     settle: deferMeal !== true ? { closing: settleClosing } : null,
                 });
             } catch (error) {
+                if (isTimeEntryVoidedError(error)) return timeEntryVoidedResponse();
                 if (error instanceof ClockOutInputError) {
                     return NextResponse.json(
                         { error: error.message, ...(error.code ? { code: error.code } : {}) },

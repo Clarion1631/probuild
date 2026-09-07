@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { expenseForProjectWhere } from "@/lib/expense-attribution";
@@ -24,7 +26,7 @@ export async function POST(req: NextRequest) {
             },
         }),
         prisma.timeEntry.findMany({
-            where: { projectId },
+            where: nonVoidedTimeEntryWhere({ projectId }),
             select: { durationHours: true, laborCost: true, burdenCost: true },
         }),
         prisma.expense.findMany({

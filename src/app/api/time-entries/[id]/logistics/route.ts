@@ -1,3 +1,4 @@
+import { timeEntryVoidedResponse } from "@/lib/time-entry-void";
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
@@ -41,7 +42,7 @@ async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: st
     const entry = await prisma.timeEntry.findUnique({
         where: { id },
         select: {
-            id: true, userId: true, projectId: true, routedFromProjectId: true, rawNote: true, notes: true,
+            voidedAt: true, id: true, userId: true, projectId: true, routedFromProjectId: true, rawNote: true, notes: true,
             invoiceId: true, invoicedAt: true, endTime: true, routedAt: true, routedById: true,
             changeOrderId: true,
             project: { select: { isLogistics: true } },
@@ -51,6 +52,8 @@ async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: st
     const isOwner = entry.userId === user.id;
     const isPrivileged = user.role === "MANAGER" || user.role === "ADMIN";
     if (!isOwner && !isPrivileged) return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
+
+    if (entry.voidedAt) return timeEntryVoidedResponse();
 
     // Provenance: the first route remembers the Logistics job it came from;
     // later re-routes keep that origin so "back to overhead" always works.

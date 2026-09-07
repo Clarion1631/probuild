@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getAnthropicText } from "@/lib/anthropic";
@@ -29,7 +31,7 @@ export async function POST(req: NextRequest) {
             select: { stage: true, targetRevenue: true, createdAt: true },
         }),
         prisma.timeEntry.findMany({
-            where: { startTime: { gte: thirtyDaysAgo } },
+            where: nonVoidedTimeEntryWhere({ startTime: { gte: thirtyDaysAgo } }),
             select: { durationHours: true, laborCost: true, burdenCost: true },
         }),
         prisma.expense.findMany({
