@@ -7,7 +7,7 @@ import { createBankImage1027RepairHandler, verifyRepairStorage, LEGACY_1027, REP
 const key = "local-test-dedicated-key";
 const bytes = Buffer.from("test-front");
 function snapshot(): RepairSnapshot {
-    return { row: { id: "image", ...LEGACY_1027, capturedAt: "2026-08-19T10:12:41.451123+00:00", createdAt: "2026-08-19T10:12:42.123456+00:00", updatedAt: "2026-08-19T10:12:42.123456+00:00", payerName: null, memoText: null, extractedAt: null, extractionModel: null }, capturedAtExact: "2026-08-19T10:12:41.451123Z", matchCount: 0 };
+    return { row: { id: "image", ...LEGACY_1027, capturedAt: "2026-08-19T10:12:41.451+00:00", createdAt: "2026-08-19T10:12:42.123456+00:00", updatedAt: "2026-08-28T20:45:46.494+00:00", payerName: "GOLDEN TOUCH RMEODELING LLC", memoText: "HOPPE VANITY CONTRACT 4152", extractedAt: "2026-08-22T08:13:57.755670+00:00", extractionModel: "gemini-3-flash-preview" }, capturedAtExact: "2026-08-19T10:12:41.451000Z", updatedAtExact: "2026-08-28T20:45:46.494000Z", extractedAtExact: "2026-08-22T08:13:57.755670Z", matchCount: 0 };
 }
 function prepared() {
     return { ok: true as const, row: { ...REPLACEMENT_1027, kind: "CHECK_FRONT" as const, capturedAt: new Date(REPLACEMENT_1027.capturedAt), documentDate: new Date(REPLACEMENT_1027.documentDate) }, sha256: "c6c6b519a214b8d82a2619ca694465fd9813e0fe521751e87feedf6fe2695432", storagePath: "bank-images/wtb-online/26225018006376/front-redacted-c6c6b519a214b8d82a2619ca694465fd9813e0fe521751e87feedf6fe2695432.jpg", secureRef: "secure:bank-images/wtb-online/26225018006376/front-redacted-c6c6b519a214b8d82a2619ca694465fd9813e0fe521751e87feedf6fe2695432.jpg", storageMetadata: { redaction_source_sha256: "591feb1fcbed8ac9d0611935b18d5a7e9538a42029a2e94dad3e06e6a560553b", redaction_status: "passed" } };
@@ -41,7 +41,9 @@ test("dry-run emits before comparison and token with zero writes or uploads", as
     const h = harness(); const res = await h.request("dry-run"); const body = await res.json();
     assert.equal(res.status, 200); assert.equal(body.status, "ready");
     assert.match(body.preflightToken, /^[a-f0-9]{64}$/);
-    assert.equal(body.before.capturedAtExact, "2026-08-19T10:12:41.451123Z");
+    assert.equal(body.before.capturedAtExact, "2026-08-19T10:12:41.451000Z");
+    assert.equal(body.before.extractedAtExact, "2026-08-22T08:13:57.755670Z");
+    assert.equal(body.before.payerName, "GOLDEN TOUCH RMEODELING LLC");
     assert.deepEqual(h.counts(), { writes: 0, uploads: 0, audits: 0 });
 });
 test("commit requires the unchanged preflight snapshot including microseconds", async () => {
@@ -55,8 +57,10 @@ test("refuses any legacy fingerprint, match, link or extraction change", async (
     const mutations: ((s: RepairSnapshot) => void)[] = [
         s => { s.row.amountCents = 603715; }, s => { s.row.fileName = "other.jpg"; },
         s => { s.capturedAtExact = "2026-08-19T10:12:41.451124Z"; },
-        s => { s.matchCount = 1; }, s => { s.row.driveFileId = "legacy-link"; },
-        ...["payerName", "memoText", "extractedAt", "extractionModel"].map(field => (s: RepairSnapshot) => { s.row[field] = "present"; }),
+        s => { s.extractedAtExact = "2026-08-22T08:13:57.755671Z"; },
+        s => { s.updatedAtExact = "2026-08-28T20:45:46.494001Z"; },
+        s => { s.extractedAtExact = null; }, s => { s.matchCount = 1; }, s => { s.row.driveFileId = "legacy-link"; },
+        ...["payerName", "memoText", "extractionModel"].map(field => (s: RepairSnapshot) => { s.row[field] = "present"; }),
     ];
     for (const mutate of mutations) { const h = harness(); h.mutate(mutate); assert.equal((await h.request("dry-run")).status, 409); assert.deepEqual(h.counts(), { writes: 0, uploads: 0, audits: 0 }); }
 });
@@ -69,7 +73,7 @@ test("commit audits complete before/after with machine identity and preserves un
     assert.deepEqual(audit.before, before); assert.deepEqual(audit.after, h.current().row);
     assert.equal(audit.credentialLabel, "BANK_IMAGE_INGEST_SECRET");
     assert.equal(h.current().row.createdAt, before.createdAt);
-    assert.equal(h.current().row.payerName, null);
+    for (const field of ["payerName", "memoText", "extractedAt", "extractionModel"]) assert.equal(h.current().row[field], before[field]);
     assert.equal((await h.request("commit", token)).status, 409);
 });
 test("audit failure rolls back metadata and leaves only the verified retry-safe object", async () => {
