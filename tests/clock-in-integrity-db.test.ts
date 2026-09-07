@@ -68,6 +68,21 @@ test("real Postgres serializes retries, guards all writers, retains tombstones a
         const period = await db.payrollPeriod.create({ data: { periodStartKey: "2034-01-09", periodEndKey: "2034-01-16", periodStart: new Date("2034-01-09T00:00:00Z"), periodEnd: new Date("2034-01-16T00:00:00Z"), lockedAt: new Date(), timeZone: "UTC", exportHash: "test", summaryCsvSnapshot: "test", detailCsvSnapshot: "test" } });
         periodId = period.id;
         assert.equal((await punch("locked-replay-1234")).id, retained.id, "locked-period replay is a read of the original punch");
+        // A saved request remains a read after its plan/phase disappears. This
+        // exercises the real merged POST ordering, not just the guard helper.
+        const oldPlanBody = {projectId:project.id,startTime:startTime.toISOString(),requestId:'old-plan-replay-1234',
+            costCodeId:'removed-phase',estimateItemId:'removed-item',suggestionSource:'dispatch',
+            suggestedScheduleTaskId:'removed-plan',suggestedCostCodeId:'removed-phase',suggestionOverridden:false};
+        const oldPlanIdentity = clockInIdentity(oldPlanBody)!;
+        await db.clockInRequest.create({data:{userId:user.id,...oldPlanIdentity,timeEntryId:retained.id}});
+        const oldPlanResponse = await POST(new Request('https://example.test/api/time-entries',{
+            method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},body:JSON.stringify(oldPlanBody),
+        }));
+        assert.equal(oldPlanResponse.status,200,'replay precedes removed plan/phase and locked-period validation');
+        const oldPlanEntry = await oldPlanResponse.json();
+        assert.equal(oldPlanEntry.id,retained.id);
+        assert.ok(oldPlanEntry.endTime,'a historical replay is not reopened');
+        assert.ok(!('laborCost' in oldPlanEntry));
         await assert.rejects(punch("locked-intent-1234"), /locked/i);
         assert.equal(await db.timeEntry.count({ where: { userId: user.id } }), 1);
         assert.equal(await db.clockInRequest.count({ where: { userId: user.id, requestId: "locked-intent-1234" } }), 0);
