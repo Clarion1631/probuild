@@ -7,7 +7,7 @@ const { JSDOM } = require("jsdom") as { JSDOM: new (html: string, options: { url
 
 test("manager confirms the exact rendered entry; invalid, pending and failed requests stay safe", async () => {
     const dom = new JSDOM("<!doctype html><div id='root'></div>", { url: "https://example.test" });
-    const globals = ["window", "document", "HTMLElement", "HTMLDialogElement", "FormData", "IS_REACT_ACT_ENVIRONMENT"];
+    const globals = ["window", "document", "navigator", "HTMLElement", "HTMLDialogElement", "FormData", "IS_REACT_ACT_ENVIRONMENT"];
     const saved = new Map(globals.map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
     for (const key of globals) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value: key === "IS_REACT_ACT_ENVIRONMENT" ? true : (dom.window as any)[key] });
     dom.window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
