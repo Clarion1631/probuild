@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { prisma } from "@/lib/prisma";
 import { getParam, getAllParams, type SearchParamMap } from "@/lib/report-utils";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
@@ -308,10 +310,10 @@ export async function getCompanyFinancialsChartData(
             },
         }),
         prisma.timeEntry.findMany({
-            where: {
+            where: nonVoidedTimeEntryWhere({
                 projectId: { in: projectIds },
                 ...(from ? { startTime: { gte: from, lt: to } } : {}),
-            },
+            }),
             select: { laborCost: true, burdenCost: true, startTime: true },
         }),
         includeOverhead
@@ -326,10 +328,10 @@ export async function getCompanyFinancialsChartData(
         // Overhead must match the page's own definition: Shop expenses + Shop labor.
         includeOverhead
             ? prisma.timeEntry.findMany({
-                  where: {
+                  where: nonVoidedTimeEntryWhere({
                       projectId: OVERHEAD_PROJECT_ID,
                       ...(from ? { startTime: { gte: from, lt: to } } : {}),
-                  },
+                  }),
                   select: { laborCost: true, burdenCost: true, startTime: true },
               })
             : Promise.resolve([] as { laborCost: unknown; burdenCost: unknown; startTime: Date }[]),

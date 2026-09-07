@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { revalidatePath as nextRevalidatePath } from "next/cache";
 import { createHash, randomUUID } from "crypto";
 import type { Prisma } from "@prisma/client";
@@ -1244,7 +1246,9 @@ type CostPlusActuals = {
     }>;
 };
 
-async function loadCostPlusActuals(
+// Shared internal reader, exported so database tests exercise the exact billing
+// selection and row locks rather than a copied query.
+export async function loadCostPlusActuals(
     tx: Prisma.TransactionClient,
     changeOrderId: string,
     endAt: Date,
@@ -1260,6 +1264,7 @@ async function loadCostPlusActuals(
         const timeLocks = await tx.$queryRaw<Array<{ id: string }>>`
             SELECT "id" FROM "TimeEntry"
             WHERE "changeOrderId" = ${changeOrderId}
+              AND "voidedAt" IS NULL
               AND "isBillable" = true
               AND "invoiceId" IS NULL
               AND "invoicedAt" IS NULL
@@ -1278,9 +1283,9 @@ async function loadCostPlusActuals(
     }
     const [timeRows, expenseRows] = await Promise.all([
         tx.timeEntry.findMany({
-            where: lockRows
+            where: nonVoidedTimeEntryWhere(lockRows
                 ? { id: { in: lockedTimeIds ?? [] }, invoiceId: null, invoicedAt: null }
-                : { changeOrderId, isBillable: true, invoiceId: null, invoicedAt: null, startTime: { lte: endAt } },
+                : { changeOrderId, isBillable: true, invoiceId: null, invoicedAt: null, startTime: { lte: endAt } }),
             select: {
                 id: true,
                 startTime: true,

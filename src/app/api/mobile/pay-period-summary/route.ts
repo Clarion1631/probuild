@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
@@ -37,7 +39,7 @@ const handlers = createPayPeriodSummaryHandlers({
     },
     getTimeEntries: async (userId, rangeStart, rangeEnd) => {
         const entries = await prisma.timeEntry.findMany({
-            where: { userId, startTime: { gte: rangeStart, lt: rangeEnd } },
+            where: nonVoidedTimeEntryWhere({ userId, startTime: { gte: rangeStart, lt: rangeEnd } }),
             select: { startTime: true, durationHours: true, laborCost: true, burdenCost: true },
             orderBy: { startTime: "asc" },
         });

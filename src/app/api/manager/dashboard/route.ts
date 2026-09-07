@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
@@ -76,7 +78,7 @@ export async function GET(req: Request) {
     // -------- Pull data in parallel. --------
     const [activeEntries, weeklyEntries, projects, employees, dayEntries] = await Promise.all([
         prisma.timeEntry.findMany({
-            where: { endTime: null },
+            where: nonVoidedTimeEntryWhere({ endTime: null }),
             include: {
                 user: { select: { id: true, name: true, email: true } },
                 project: { select: { id: true, name: true, locationLat: true, locationLng: true } },
@@ -85,7 +87,7 @@ export async function GET(req: Request) {
             orderBy: { startTime: "desc" },
         }),
         prisma.timeEntry.findMany({
-            where: { startTime: { gte: weekStart, lt: weekEnd } },
+            where: nonVoidedTimeEntryWhere({ startTime: { gte: weekStart, lt: weekEnd } }),
             select: {
                 id: true,
                 userId: true,
@@ -117,7 +119,7 @@ export async function GET(req: Request) {
         // table to keep in sync. Edits show up because `isEdited=true` rows get an extra
         // event entry below.
         prisma.timeEntry.findMany({
-            where: {
+            where: nonVoidedTimeEntryWhere({
                 AND: [
                     userIdFilter ? { userId: userIdFilter } : {},
                     {
@@ -128,7 +130,7 @@ export async function GET(req: Request) {
                         ],
                     },
                 ],
-            },
+            }),
             include: {
                 user: { select: { id: true, name: true } },
                 project: { select: { name: true } },
@@ -328,7 +330,7 @@ export async function GET(req: Request) {
 
     const dayProjectGroups = await prisma.timeEntry.groupBy({
         by: ["projectId"],
-        where: { startTime: { gte: dayStart, lt: dayEnd } },
+        where: nonVoidedTimeEntryWhere({ startTime: { gte: dayStart, lt: dayEnd } }),
     });
     const dayProjectIds = new Set(dayProjectGroups.map((g) => g.projectId));
     const eligibleProjects = projects.filter((p) => dayProjectIds.has(p.id));

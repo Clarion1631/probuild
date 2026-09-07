@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 // Gusto hours export — prisma wiring (Phase 5 spec G3).
 //
 // The arithmetic lives in gusto-export-core.ts; this module only fetches the
@@ -637,7 +639,7 @@ export async function loadGustoExport(
     );
 
     const rows = await client.timeEntry.findMany({
-        where: { startTime: { gte: queryStart, lt: queryEnd } },
+        where: nonVoidedTimeEntryWhere({ startTime: { gte: queryStart, lt: queryEnd } }),
         select: {
             id: true,
             userId: true,
@@ -691,7 +693,7 @@ export async function loadGustoExport(
         const current = (entryIds.length === 0
             ? []
             : ((await tx.$queryRawUnsafe(
-                  `SELECT "id", "projectId", "costCodeId" FROM "TimeEntry" WHERE "id" = ANY($1::text[])`,
+                  `SELECT "id", "projectId", "costCodeId" FROM "TimeEntry" WHERE "id" = ANY($1::text[]) AND "voidedAt" IS NULL`,
                   entryIds
               )) as Array<{ id: string; projectId: string | null; costCodeId: string | null }>)) as Array<{
             id: string;

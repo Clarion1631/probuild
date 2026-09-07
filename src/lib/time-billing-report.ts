@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { prisma } from "@/lib/prisma";
 import {
     formatLocalDateString,
@@ -40,11 +42,11 @@ export function stringifyTimeBillingFilters(f: Partial<TimeBillingFilters>): str
 
 export async function queryTimeBillingData(filters: TimeBillingFilters) {
     return prisma.timeEntry.findMany({
-        where: {
+        where: nonVoidedTimeEntryWhere({
             startTime: { gte: filters.from, lt: filters.to },
             ...(filters.userId ? { userId: filters.userId } : {}),
             ...(filters.projectId ? { projectId: filters.projectId } : {}),
-        },
+        }),
         include: {
             user: { select: { id: true, name: true } },
             project: { select: { id: true, name: true } },

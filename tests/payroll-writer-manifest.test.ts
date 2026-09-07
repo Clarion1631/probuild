@@ -82,66 +82,70 @@ function findWriters(): string[] {
  *              deliberately few and each one is an argument, not a shrug.
  */
 const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
+    "lib/time-entry-void-db.ts:53::updateMany": {
+        kind: "guarded",
+        why: "audited void holds payroll/day/row locks, refuses export and billing linkage, preserves source fields and settles remaining entries atomically",
+    },
     // ---- the payroll write paths -------------------------------------------
-    "app/api/time-entries/route.ts:354::create": {
+    "app/api/time-entries/route.ts:357::create": {
         kind: "guarded",
         why: "clock-in create, wrapped in withPayrollWriteTx (startTime is client-supplied, so it can aim at a locked period)",
     },
-    "app/api/time-entries/route.ts:173::updateMany": {
+    "app/api/time-entries/route.ts:176::updateMany": {
         kind: "guarded",
         why: "the stale-DEFERRED review flag, wrapped in withPayrollWrite — it sets needsReview, which gates the export",
     },
-    "app/api/time-entries/route.ts:1098::updateMany": {
+    "app/api/time-entries/route.ts:1105::updateMany": {
         kind: "guarded",
         why: "the clock-out claim, inside closeTimeEntry's locked transaction with a compare-and-set on startTime AND on updatedAt, so any concurrent write to the row the close was decided from fails it closed",
     },
-    "app/api/time-entries/route.ts:1123::update": {
+    "app/api/time-entries/route.ts:1130::update": {
         kind: "guarded",
         why: "settlement-failure flag, written inside the same locked transaction as the close it belongs to",
     },
-    "app/api/time-entries/[id]/route.ts:178::updateMany": {
+    "app/api/time-entries/[id]/route.ts:180::updateMany": {
         kind: "guarded",
         why: "the geofence telemetry branch — offsiteMs/isOffsite/lastLocationCheck touch no hours, cost or readiness flag, but it is still routed through withPayrollWriteTx (entryIds: [id]) so it cannot become a hole later without someone deliberately removing the wrapper",
     },
-    "app/api/time-entries/[id]/route.ts:601::updateMany": {
+    "app/api/time-entries/[id]/route.ts:604::updateMany": {
         kind: "guarded",
         why: "the PATCH edit claim, inside withPayrollWriteTx with a compare-and-set on updatedAt",
     },
-    "app/api/time-entries/[id]/route.ts:621::update": {
+    "app/api/time-entries/[id]/route.ts:624::update": {
         kind: "guarded",
         why: "the settlement-failure flag, written inside the same locked edit transaction",
     },
-    "app/api/time-entries/[id]/meal-skip/route.ts:86::updateMany": {
+    "app/api/time-entries/[id]/meal-skip/route.ts:89::updateMany": {
         kind: "guarded",
         why: "the skip REQUEST, wrapped in withPayrollWrite — it sets mealSkipStatus, which changes what the day's settlement owes",
     },
-    "app/api/time-entries/[id]/meal-skip/route.ts:157::updateMany": {
+    "app/api/time-entries/[id]/meal-skip/route.ts:161::updateMany": {
         kind: "guarded",
         why: "the skip DECISION (approve/deny), wrapped in withPayrollWrite for the same reason as the request above",
     },
-    "app/api/time-entries/[id]/logistics/route.ts:159::updateMany": {
+    "app/api/time-entries/[id]/logistics/route.ts:162::updateMany": {
         kind: "guarded",
         why: "voice-dump formalize and re-code, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs. Routing refuses a change-order-tagged entry and pins changeOrderId: null in the WHERE, so the tag cannot be left pointing at a job the entry has left",
     },
 
     // ---- server actions -----------------------------------------------------
-    "lib/actions.ts:3711::updateMany": {
+    "lib/actions.ts:3713::updateMany": {
         kind: "exempt",
         why: "createInvoiceFromTimeEntries's claim: stamps invoiceId/invoicedAt only inside the invoice-creation transaction. Same reasoning as lib/billing-core.ts's exemption below — it changes no hours, no cost and no readiness flag, and every payroll writer already refuses an entry once it is billed",
     },
-    "lib/actions.ts:15467::updateMany": {
+    "lib/actions.ts:15469::updateMany": {
         kind: "guarded",
         why: "markTimeEntryReviewed's reprice-and-stamp claim, wrapped in withPayrollWrite with a compare-and-set on updatedAt",
     },
-    "lib/actions.ts:15655::updateMany": {
+    "lib/actions.ts:15657::updateMany": {
         kind: "guarded",
         why: "the meal-skip decision, wrapped in withPayrollWrite — it changes what the day's settlement owes",
     },
-    "lib/actions.ts:15729::updateMany": {
+    "lib/actions.ts:15731::updateMany": {
         kind: "guarded",
         why: "logistics routing: restoring an entry to its prior project, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs",
     },
-    "lib/actions.ts:15742::updateMany": {
+    "lib/actions.ts:15744::updateMany": {
         kind: "guarded",
         why: "logistics routing: routing an entry to a new project, wrapped in withPayrollWrite for the same reason as the restore above",
     },
@@ -153,15 +157,15 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "guarded",
         why: "tagTimeEntriesToChangeOrder, wrapped in withPayrollWrite — retagging changes which change order the hours bill against. The change order and the rows are re-read INSIDE the lock and projectId is pinned in the WHERE, so an entry rerouted to another job between the pre-check and the write cannot pick up this project's change order",
     },
-    "lib/time-expense-actions.ts:189::updateMany": {
+    "lib/time-expense-actions.ts:191::updateMany": {
         kind: "guarded",
         why: "the manual edit, wrapped in withPayrollWriteTx with the row re-read under FOR UPDATE",
     },
-    "lib/time-expense-actions.ts:234::deleteMany": {
+    "lib/time-expense-actions.ts:236::deleteMany": {
         kind: "guarded",
         why: "deleteTimeEntry (single delete), wrapped in withPayrollWriteTx over the one affected row id",
     },
-    "lib/time-expense-actions.ts:287::deleteMany": {
+    "lib/time-expense-actions.ts:289::deleteMany": {
         kind: "guarded",
         why: "deleteTimeEntries (bulk delete), wrapped in withPayrollWriteTx over every affected row id",
     },
@@ -184,25 +188,25 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     // longer runs.
 
     // ---- the settlement protocol -------------------------------------------
-    "lib/wa-breaks-db.ts:352::update": {
+    "lib/wa-breaks-db.ts:354::update": {
         kind: "guarded",
         why: "settleDayInTx's re-plan of one entry's shift/meal/cost fields, run inside the caller's already-locked payroll transaction (every caller takes the payroll lock before the day lock)",
     },
-    "lib/wa-breaks-db.ts:425::delete": {
+    "lib/wa-breaks-db.ts:427::delete": {
         kind: "guarded",
         why: "deleteEntryAndSettle, whose guard hook runs the payroll assertion before anything is removed",
     },
-    "lib/wa-breaks-db.ts:458::update": {
+    "lib/wa-breaks-db.ts:460::update": {
         kind: "exempt",
         why: "flagSettlementFailed's already-flagged branch: only ADDS needsReview, which blocks the export rather than letting bad numbers through. Deliberately outside the payroll lock — it must still run when the surrounding settlement transaction has rolled back, which is precisely the failure it exists to flag",
     },
-    "lib/wa-breaks-db.ts:461::update": {
+    "lib/wa-breaks-db.ts:463::update": {
         kind: "exempt",
         why: "flagSettlementFailed's first-flag branch — same reasoning as the already-flagged branch above: best-effort, ADDS-only, and must survive the surrounding transaction rolling back",
     },
 
     // ---- billing ------------------------------------------------------------
-    "lib/billing-core.ts:1469::updateMany": {
+    "lib/billing-core.ts:1474::updateMany": {
         kind: "exempt",
         why: "the invoice claim: stamps invoiceId/invoicedAt inside the billing transaction. It changes no hours, no cost and no readiness flag, and every payroll writer already refuses an entry once it is billed",
     },
@@ -254,6 +258,12 @@ test("every exemption states a reason, and guarded files import the helper", () 
     );
     for (const file of guardedFiles) {
         const source = readFileSync(path.join(SRC, ...file.split("/")), "utf8");
+        if (file === "lib/time-entry-void-db.ts") {
+            assert.match(source, /await acquirePayrollLocks\(/);
+            assert.match(source, /await assertPeriodUnlockedInTx\(/);
+            assert.match(source, /await settleDayWithinTx\(/);
+            continue;
+        }
         assert.match(
             source,
             /withPayrollWrite|assertEntriesUnlockedInTx|assertDayUnlockedInTx|settleDayInTx|deleteEntryAndSettle/,
