@@ -82,7 +82,7 @@ function findWriters(): string[] {
  *              deliberately few and each one is an argument, not a shrug.
  */
 const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
-    "lib/time-entry-void-db.ts:47::updateMany": {
+    "lib/time-entry-void-db.ts:53::updateMany": {
         kind: "guarded",
         why: "audited void holds payroll/day/row locks, refuses export and billing linkage, preserves source fields and settles remaining entries atomically",
     },

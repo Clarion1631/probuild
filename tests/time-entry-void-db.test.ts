@@ -148,6 +148,40 @@ test("void preserves paid source evidence, settles meals, excludes payroll/billi
         await new Promise(r => setTimeout(r, 120)); assert.equal(attempted, false); releasePayroll.resolve(); await freezing; assert.equal(await duringFreeze, false);
         await db.payrollPeriod.update({ where: { id: periods[0] }, data: { lockedAt: null } });
         await assert.rejects(perform(neighbor.id), /export evidence/, "retained exported period remains protected after unlock");
+
+        // The UTC lock window includes Sunday, but Monday settlement cannot
+        // change it. Cross the company workweek boundary so Sunday payroll
+        // evidence does not legitimately freeze Monday's overtime envelope.
+        for (const [date, previousMonday, mode] of [
+            ["2034-02-06", "2034-01-30", "linked"],
+            ["2034-02-13", "2034-02-06", "locked"],
+            ["2034-02-20", "2034-02-13", "exported"],
+        ] as const) {
+            const midnight = new Date(`${date}T08:00:00Z`);
+            const adjacent = await create("08:00:00", "14:00:00", {
+                startTime: new Date(midnight.getTime() - 3600000), endTime: midnight,
+                ...(mode === "linked" ? { invoiceId: "adjacent-day-link" } : {}),
+            });
+            const target = await create("08:00:00", "14:00:00", { startTime: midnight, endTime: new Date(midnight.getTime() + 6 * 3600000) });
+            const sameDay = await create("14:15:00", "17:15:00", { startTime: new Date(midnight.getTime() + 7 * 3600000), endTime: new Date(midnight.getTime() + 10 * 3600000) });
+            if (mode !== "linked") {
+                const period = await db.payrollPeriod.create({ data: {
+                    periodStartKey: previousMonday, periodEndKey: date,
+                    periodStart: new Date(`${previousMonday}T08:00:00Z`), periodEnd: midnight,
+                    timeZone: "America/Los_Angeles", lockedAt: mode === "locked" ? new Date() : null,
+                    exportHash: "adjacent-export", summaryCsvSnapshot: "test", detailCsvSnapshot: "test",
+                } });
+                periods.push(period.id);
+            }
+            const adjacentBefore = await raw(adjacent.id);
+            await voidTimeEntry(db, { id: target.id, actorId: actor.id, reason: "Company day boundary test", expectedUpdatedAt: target.updatedAt, timeZone: "America/Los_Angeles" });
+            assert.deepEqual(await raw(adjacent.id), adjacentBefore, `${mode}: adjacent day remains byte-for-byte unchanged`);
+            assert.equal((await db.timeEntry.findUniqueOrThrow({ where: { id: sameDay.id } })).durationHours, 3);
+            const boundaryAudit = await db.auditLog.findFirstOrThrow({ where: { entityId: target.id, action: "VOID" } });
+            for (const field of ["affectedEntriesBefore", "affectedEntriesAfter"]) {
+                assert.deepEqual((boundaryAudit.snapshot as any)[field].map((entry: any) => entry.id).sort(), [target.id, sameDay.id].sort(), `${mode}: audit includes only the settlement day and target`);
+            }
+        }
     } finally {
         // Disposable fixture cleanup only. ACCESS EXCLUSIVE is held until the
         // immutable trigger is re-enabled, so no other connection sees it off.
