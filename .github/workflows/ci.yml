@@ -92,7 +92,7 @@ jobs:
       - name: Verify clock-in uniqueness and request replay against Postgres
         run: npx tsx --test tests/clock-in-integrity.test.ts tests/clock-in-integrity-db.test.ts
         env:
-          CLOCK_IN_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          CLOCK_IN_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
       # The gap-file steps that sat here are gone with the file: this branch's
       # migration closes the recorded gap, so `migrate deploy` now reproduces
