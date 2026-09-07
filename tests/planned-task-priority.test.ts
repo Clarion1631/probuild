@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { suggestTaskForClockIn } from '../src/lib/time-suggestion';
+import { suggestTaskForClockIn, computeAssignedPlanForUser } from '../src/lib/time-suggestion';
+import { acceptedSuggestionConflictsWithPlan } from '../src/lib/dispatch-suggestion-audit';
 
 const now = new Date('2026-09-08T15:00:00Z');
 const task = (id: string, assigned = false, item: string | null = id) => ({
@@ -72,4 +73,25 @@ test('assignment query scopes the plan to the authenticated user on this project
         return original(query);
     };
     assert.equal((await suggestTaskForClockIn({userId:'crew',projectId:'job',now}, db)).suggestion?.source, 'dispatch');
+});
+
+test('a log suggestion fetched before an office assignment is rejected against the new plan at acceptance', async () => {
+    const tasks = [task('log-task')];
+    const db = fixture(tasks);
+    const displayed = (await suggestTaskForClockIn({userId:'crew',projectId:'job',now}, db)).suggestion!;
+    assert.equal(displayed.source,'daily_log');
+    tasks.push(task('new-office-plan',true));
+    const current = await computeAssignedPlanForUser('crew','job','2026-09-08',db);
+    assert.equal(current.assignmentCount,1);
+    assert.equal(current.winner?.taskId,'new-office-plan');
+    assert.equal(acceptedSuggestionConflictsWithPlan(displayed.source,false,displayed.scheduleTaskId,displayed.costCodeId,displayed.clockInEstimateItemId,current),true);
+});
+
+test('assignment read distinguishes no plan, ambiguous plans and a sole uncosted plan', async () => {
+    const read = (tasks:ReturnType<typeof task>[]) => computeAssignedPlanForUser('crew','job','2026-09-08',fixture(tasks));
+    assert.deepEqual(await read([task('unassigned')]),{assignmentCount:0,winner:null});
+    assert.deepEqual(await read([task('one',true),task('two',true)]),{assignmentCount:2,winner:null});
+    const uncosted = await read([task('one',true,null)]);
+    assert.equal(uncosted.assignmentCount,1);
+    assert.equal(uncosted.winner?.chargeable,false);
 });

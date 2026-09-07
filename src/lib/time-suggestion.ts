@@ -465,9 +465,9 @@ async function assignedPlan(userId: string, projectId: string, dayKey: string, d
     return { active, task, target };
 }
 
-export async function computeDispatchWinnerForUser(userId: string, projectId: string, dayKey: string, db: DbClient = prisma) {
-    const { task, target } = await assignedPlan(userId, projectId, dayKey, db);
-    return task ? { taskId: task.id, chargeable: !!target?.costCodeId && !!target.costCode, costCodeId: target?.costCodeId ?? null, estimateItemId: target?.id ?? null } : null;
+export async function computeAssignedPlanForUser(userId: string, projectId: string, dayKey: string, db: DbClient = prisma) {
+    const { active, task, target } = await assignedPlan(userId, projectId, dayKey, db);
+    return { assignmentCount: active.length, winner: task ? { taskId: task.id, chargeable: !!target?.costCodeId && !!target.costCode, costCodeId: target?.costCodeId ?? null, estimateItemId: target?.id ?? null } : null };
 }
 
 export async function suggestTaskForClockIn(
