@@ -5,11 +5,20 @@ import type { PrivateImageStorage } from "./bank-image-ingest";
 
 const HASH = "c6c6b519a214b8d82a2619ca694465fd9813e0fe521751e87feedf6fe2695432";
 const SOURCE_HASH = "591feb1fcbed8ac9d0611935b18d5a7e9538a42029a2e94dad3e06e6a560553b";
-const REPAIR_ID = "wtb-check-1027-redacted-front-v1";
+const REPAIR_ID = "wtb-check-1027-redacted-front-v2-preserve-ocr";
 export const LEGACY_1027 = {
     source: "WTB_ONLINE", sourceExternalId: "26225018006376:front", kind: "CHECK_FRONT", account: "WTB-0723",
     documentDate: "2026-08-13", fileName: "08-13-2026_CHECK_6037.15_26225018006376_front.jpg",
     mime: "image/jpeg", byteSize: 174152, normalizedCheckNumber: "1027", amountCents: null, driveFileId: null,
+};
+export const LEGACY_1027_EXTRACTION = {
+    payerName: "GOLDEN TOUCH RMEODELING LLC", memoText: "HOPPE VANITY CONTRACT 4152",
+    extractionModel: "gemini-3-flash-preview",
+};
+const LEGACY_EXACT = {
+    capturedAtExact: "2026-08-19T10:12:41.451000Z",
+    updatedAtExact: "2026-08-28T20:45:46.494000Z",
+    extractedAtExact: "2026-08-22T08:13:57.755670Z",
 };
 export const REPLACEMENT_1027 = {
     source: LEGACY_1027.source, sourceExternalId: LEGACY_1027.sourceExternalId, kind: "CHECK_FRONT", account: "WTB-0723",
@@ -19,7 +28,7 @@ export const REPLACEMENT_1027 = {
 };
 // PostgreSQL JSON retains timestamps to microsecond precision; never round-trip
 // these snapshots through JS Date before comparison, token generation, or audit.
-export type RepairSnapshot = { row: Record<string, unknown>; capturedAtExact: string; matchCount: number };
+export type RepairSnapshot = { row: Record<string, unknown>; capturedAtExact: string; updatedAtExact: string; extractedAtExact: string | null; matchCount: number };
 export type RepairTransaction = {
     lock(): Promise<RepairSnapshot | null>;
     replace(before: RepairSnapshot, next: PrivateBankImageRow, secureRef: string): Promise<Record<string, unknown>>;
@@ -40,9 +49,9 @@ function stable(value: unknown): string {
 }
 function legacyMismatch(s: RepairSnapshot): string[] {
     const fields = Object.entries(LEGACY_1027).filter(([k,v]) => s.row[k] !== v).map(([k]) => k);
-    if (s.capturedAtExact !== "2026-08-19T10:12:41.451123Z") fields.push("capturedAtExact");
+    for (const [field, expected] of Object.entries(LEGACY_EXACT)) if (s[field as keyof typeof LEGACY_EXACT] !== expected) fields.push(field);
     if (s.matchCount !== 0) fields.push("matches");
-    for (const field of ["payerName", "memoText", "extractedAt", "extractionModel"]) if (s.row[field] !== null) fields.push(field);
+    for (const [field, expected] of Object.entries(LEGACY_1027_EXTRACTION)) if (s.row[field] !== expected) fields.push(field);
     if (typeof s.row.id !== "string" || !s.row.id) fields.push("id");
     return fields;
 }
@@ -79,7 +88,7 @@ export function createBankImage1027RepairHandler(deps: Dependencies) {
                 const mismatches = legacyMismatch(before);
                 if (mismatches.length) return json({ error: "legacy state differs; no repair performed", mismatches, capturedAtExact: before.capturedAtExact }, 409);
                 const token = createHmac("sha256", secret!).update(stable({ repairId: REPAIR_ID, before, replacement: prepared.row, hash: HASH, redactionReview: prepared.storageMetadata })).digest("hex");
-                if (body.mode === "dry-run") return json({ status: "ready", repairId: REPAIR_ID, before: { ...LEGACY_1027, capturedAtExact: before.capturedAtExact }, after: REPLACEMENT_1027, sha256: HASH, preflightToken: token });
+                if (body.mode === "dry-run") return json({ status: "ready", repairId: REPAIR_ID, before: { ...LEGACY_1027, ...LEGACY_1027_EXTRACTION, ...LEGACY_EXACT }, after: { ...REPLACEMENT_1027, ...LEGACY_1027_EXTRACTION, extractedAtExact: before.extractedAtExact }, sha256: HASH, preflightToken: token });
                 if (!isValidBankImageIngestKey(body.preflightToken, token)) return json({ error: "fresh dry-run preflight token required" }, 409);
                 await deps.verifyStorage(prepared, bytes);
                 const after = await tx.replace(before, prepared.row, prepared.secureRef);

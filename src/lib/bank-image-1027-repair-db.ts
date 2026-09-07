@@ -7,9 +7,11 @@ export function bankImage1027Transaction<T>(db: PrismaClient, run: (tx: RepairTr
             // FOR UPDATE fences both extraction/ingest updates and a match INSERT's
             // foreign-key KEY SHARE lock. Count matches in a second READ COMMITTED
             // statement so a match that committed while this lock waited is seen.
-            const rows = await tx.$queryRaw<Array<{ row: Record<string, unknown>; capturedAtExact: string }>>(Prisma.sql`
+            const rows = await tx.$queryRaw<Array<{ row: Record<string, unknown>; capturedAtExact: string; updatedAtExact: string; extractedAtExact: string | null }>>(Prisma.sql`
                 SELECT to_jsonb(b) AS row,
-                    to_char(b."capturedAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "capturedAtExact"
+                    to_char(b."capturedAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "capturedAtExact",
+                    to_char(b."updatedAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "updatedAtExact",
+                    to_char(b."extractedAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "extractedAtExact"
                 FROM "BankImage" b
                 WHERE b.source = ${LEGACY_1027.source} AND b."sourceExternalId" = ${LEGACY_1027.sourceExternalId}
                 FOR UPDATE
