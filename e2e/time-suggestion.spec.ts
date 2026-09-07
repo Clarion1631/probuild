@@ -32,6 +32,8 @@ const TSUG_CLIENT_X_ID = `e2e-tsug-clix-${RUN}`;
 const TSUG_ESTIMATE_X_ID = `e2e-tsug-estx-${RUN}`;
 const TSUG_ITEM_X_ID = `e2e-tsug-itemx-${RUN}`;
 const DAILYLOG_MARKER = `misc-e2e-tsug-${RUN}`;
+const INFERENCE_USER_ID = `e2e-tsug-user-${RUN}`;
+const INFERENCE_USER_EMAIL = `tsug-${RUN}@test.local`;
 
 const prisma = new PrismaClient();
 
@@ -61,6 +63,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
     let api: APIRequestContext;
     let fieldCrewToken: string;
     let fieldCrewId: string;
+    let inferenceToken: string;
     // Every entry id this file creates via POST — the afterAll safety net
     // deletes exactly these, nothing broader.
     const createdEntryIds = new Set<string>();
@@ -70,9 +73,18 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         fieldCrewToken = await mobileLogin(api, FIELD_CREW_EMAIL, FIELD_CREW_PIN);
         const fieldCrew = await prisma.user.findUniqueOrThrow({
             where: { email: FIELD_CREW_EMAIL },
-            select: { id: true },
+            select: { id: true, pinCode: true },
         });
         fieldCrewId = fieldCrew.id;
+        // A separate unassigned reader exercises inference without removing the
+        // real office assignment shared by other mobile specs.
+        await prisma.user.create({ data: {
+            id: INFERENCE_USER_ID, email: INFERENCE_USER_EMAIL,
+            name: "E2E Unassigned Suggestion Reader", role: "FIELD_CREW",
+            status: "ACTIVATED", pinCode: fieldCrew.pinCode,
+        } });
+        await prisma.projectAccess.create({ data: { userId: INFERENCE_USER_ID, projectId: PROJECT_ID } });
+        inferenceToken = await mobileLogin(api, INFERENCE_USER_EMAIL, FIELD_CREW_PIN);
     });
 
     test.afterAll(async () => {
@@ -102,19 +114,54 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         await prisma.estimate.deleteMany({ where: { id: TSUG_ESTIMATE_X_ID } });
         await prisma.project.deleteMany({ where: { id: TSUG_PROJECT_X_ID } });
         await prisma.client.deleteMany({ where: { id: TSUG_CLIENT_X_ID } });
+        await prisma.projectAccess.deleteMany({ where: { userId: INFERENCE_USER_ID } });
+        await prisma.user.deleteMany({ where: { id: INFERENCE_USER_ID } });
 
         await api.dispose();
         await prisma.$disconnect();
     });
 
-    test("1. stored AI pick wins over everything else", async () => {
+    test("0. office assignment outranks a conflicting stored AI pick", async () => {
+        await prisma.scheduleTask.create({ data: {
+            id: TSUG_TASK2_ID, projectId: PROJECT_ID, name: "Demo phase task",
+            type: "task", status: "In Progress", startDate: daysAgo(3),
+            endDate: daysFromNow(4), estimateItemId: MOBILE_ITEM_DEMO_ID,
+        } });
+        await prisma.dailyLog.update({ where: { id: MOBILE_DAILYLOG_ID }, data: {
+            aiSuggestedTaskId: TSUG_TASK2_ID, aiSuggestionReason: "Conflicting AI pick",
+        } });
+        const res = await api.get(`/api/mobile/time-suggestion?projectId=${PROJECT_ID}`, {
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+        expect(res.ok(), await res.text()).toBeTruthy();
+        const { suggestion } = await res.json();
+        expect(suggestion).toMatchObject({ source: "dispatch", scheduleTaskId: MOBILE_TASK_DRYW_ID,
+            clockInEstimateItemId: MOBILE_ITEM_DRYW_ID, costCodeId: COST_CODE_DRYW_ID });
+        const staleAcceptance = await api.post("/api/time-entries", {
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+            data: { projectId: PROJECT_ID, estimateItemId: MOBILE_ITEM_DEMO_ID,
+                costCodeId: COST_CODE_DEMO_ID, suggestedScheduleTaskId: TSUG_TASK2_ID,
+                suggestedCostCodeId: COST_CODE_DEMO_ID, suggestionSource: "daily_log",
+                suggestionOverridden: false },
+        });
+        const staleBody = await staleAcceptance.json();
+        if (staleAcceptance.ok() && typeof staleBody.id === "string") createdEntryIds.add(staleBody.id);
+        expect(staleAcceptance.status(), await staleAcceptance.text()).toBe(400);
+        expect(staleBody).toMatchObject({ code: "PLAN_CHANGED" });
+        await prisma.dailyLog.update({ where: { id: MOBILE_DAILYLOG_ID }, data: {
+            aiSuggestedTaskId: null, aiSuggestionReason: null,
+        } });
+        await prisma.scheduleTask.delete({ where: { id: TSUG_TASK2_ID } });
+    });
+
+    test("1. stored AI pick wins inference when no office assignment exists", async () => {
         await prisma.dailyLog.update({
             where: { id: MOBILE_DAILYLOG_ID },
             data: { aiSuggestedTaskId: MOBILE_TASK_DRYW_ID, aiSuggestionReason: "Stored pick from AI" },
         });
 
         const res = await api.get(`/api/mobile/time-suggestion?projectId=${PROJECT_ID}`, {
-            headers: { authorization: `Bearer ${fieldCrewToken}` },
+            headers: { authorization: `Bearer ${inferenceToken}` },
         });
         expect(res.ok(), await res.text()).toBeTruthy();
         const { suggestion } = await res.json();
@@ -156,7 +203,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         });
 
         const res = await api.get(`/api/mobile/time-suggestion?projectId=${PROJECT_ID}`, {
-            headers: { authorization: `Bearer ${fieldCrewToken}` },
+            headers: { authorization: `Bearer ${inferenceToken}` },
         });
         expect(res.ok(), await res.text()).toBeTruthy();
         const { suggestion } = await res.json();
@@ -179,7 +226,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         // score of 6 against the project's only candidate — an unambiguous, high
         // confidence keyword hit.
         const res = await api.get(`/api/mobile/time-suggestion?projectId=${PROJECT_ID}`, {
-            headers: { authorization: `Bearer ${fieldCrewToken}` },
+            headers: { authorization: `Bearer ${inferenceToken}` },
         });
         expect(res.ok(), await res.text()).toBeTruthy();
         const { suggestion } = await res.json();
