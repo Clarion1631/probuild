@@ -91,10 +91,11 @@ const ALLOWED_GLOBAL_CALLEES = new Set(["process.argv.includes", "process.argv.i
  * would reopen exactly the hole this allowlist exists to close.
  */
 const SHARED_GUARD_MODULE = "./lib/apply-target.mjs";
+const TIME_ENTRY_GUARD_MODULE = "./lib/time-entry-apply.mjs";
 // `node:dns` is here for the shared helper, which RESOLVES `--expect-host`
 // rather than string-comparing it against an IP. Importing it runs nothing,
 // and a module-scope `dns.lookup(...)` is still rejected below as a call.
-const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto", "node:dns", "dns", SHARED_GUARD_MODULE]);
+const ALLOWED_IMPORTS = new Set(["@prisma/client", "dotenv", "node:fs", "fs", "node:url", "url", "node:path", "path", "node:crypto", "crypto", "node:dns", "dns", SHARED_GUARD_MODULE, TIME_ENTRY_GUARD_MODULE]);
 /** Names a script may never declare itself (they would let a guard or helper be spoofed). */
 const RESERVED_NAMES = new Set(["process", "import", "pathToFileURL", "fileURLToPath", "dirname", "join", "resolve", "isMainModule"]);
 
@@ -121,7 +122,8 @@ function analyse(name: string, text: string): SourceReport {
         if (ts.isImportDeclaration(st)) {
             const spec = ts.isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : "";
             if (!st.importClause) bad(st, `side-effect-only import "${spec}" at module scope`);
-            if (!ALLOWED_IMPORTS.has(spec)) bad(st, `import from "${spec}" is not on the allowlist (${[...ALLOWED_IMPORTS].join(", ")})`);
+            const siblingGuard = name === "lib/time-entry-apply.mjs" && spec === "./apply-target.mjs";
+            if (!ALLOWED_IMPORTS.has(spec) && !siblingGuard) bad(st, `import from "${spec}" is not on the allowlist (${[...ALLOWED_IMPORTS].join(", ")})`);
             const clause = st.importClause;
             if (clause?.name) importBindings.set(clause.name.text, spec);
             if (clause?.namedBindings) {
@@ -662,5 +664,19 @@ test("runtime: importing the shared target helper opens no DB connection and exi
     const seen = connections - before;
     assert.equal(seen, 0, `import attempted ${seen} DB connection(s)`);
     assert.equal(result.code, 0, `import did not exit cleanly: ${result.stderr}`);
+    assert.doesNotMatch(result.stdout + result.stderr, /applied|verified|Refusing|DATABASE_URL/i);
+});
+
+test("time-entry target wrapper is inert and has no entrypoint", async () => {
+    const file = path.join(scriptsDir, "lib", "time-entry-apply.mjs");
+    const text = readFileSync(file, "utf8");
+    const report = analyse("lib/time-entry-apply.mjs", text);
+    assert.deepEqual(report.violations, []);
+    assert.equal(report.hasMain, false); assert.equal(report.guardIfs, 0);
+    assert.match(text, /from "\.\/apply-target\.mjs"/);
+    const before = connections;
+    const result = await importInChild(pathToFileURL(file).href);
+    assert.equal(connections - before, 0);
+    assert.equal(result.code, 0, result.stderr);
     assert.doesNotMatch(result.stdout + result.stderr, /applied|verified|Refusing|DATABASE_URL/i);
 });

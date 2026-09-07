@@ -1,3 +1,4 @@
+import { isTimeEntryVoidedError, timeEntryVoidedResponse } from "@/lib/time-entry-void";
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
@@ -99,6 +100,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         return NextResponse.json({ error: "Unauthorized to edit this entry" }, { status: 403 });
     }
 
+    if (existing.voidedAt) return timeEntryVoidedResponse();
     const body = await req.json();
 
     // -------- Branch detection. We refuse to mix the two flows in one request because
@@ -181,7 +183,8 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 });
             });
         } catch (error) {
-            if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
+            if (isTimeEntryVoidedError(error)) return timeEntryVoidedResponse();
+        if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
             throw error;
         }
         if (claimed.count !== 1) {
@@ -624,6 +627,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             }
         );
     } catch (error) {
+        if (isTimeEntryVoidedError(error)) return timeEntryVoidedResponse();
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
         if (error instanceof EntryMovedError) {
             return NextResponse.json(
@@ -670,6 +674,7 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
 
     const existing = await prisma.timeEntry.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
+    if (existing.voidedAt) return timeEntryVoidedResponse();
 
     // Delete + re-plan the day in one transaction under the day lock — a
     // concurrent edit that moved this row is seen inside the lock and its new
@@ -767,6 +772,7 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
             );
         }
     } catch (error) {
+        if (isTimeEntryVoidedError(error)) return timeEntryVoidedResponse();
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
         if (error instanceof EntryMovedError) {
             return NextResponse.json(

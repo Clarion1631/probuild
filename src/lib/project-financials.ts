@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { prisma } from "@/lib/prisma";
 import { percentCompleteNeedsReview } from "@/lib/percent-complete";
 import { expenseForProjectWhere } from "@/lib/expense-attribution";
@@ -121,7 +123,7 @@ export async function computeProjectFinancials(
         prisma.retainer.findMany({ where: { projectId, status: { in: validRetainerStatuses } } }),
         prisma.expense.findMany({ where: expenseForProjectWhere(projectId) }),
         prisma.purchaseOrder.findMany({ where: { projectId } }),
-        prisma.timeEntry.findMany({ where: { projectId } }),
+        prisma.timeEntry.findMany({ where: nonVoidedTimeEntryWhere({ projectId }) }),
         // Percent complete is READ here, never computed. The nightly recalc cron
         // (/api/cron/percent-complete-recalc) is the only writer — page renders
         // must not run the per-project variance load that the formula needs.

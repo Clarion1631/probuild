@@ -89,10 +89,22 @@ jobs:
         env:
           BANK_IMAGE_REPAIR_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      - name: Verify time-entry migration CLI targets against disposable Postgres
+        run: |
+          node scripts/apply-clock-in-integrity.mjs --target ci
+          node scripts/apply-time-entry-void.mjs --target ci
+        env:
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Verify clock-in uniqueness and request replay against Postgres
         run: npx tsx --test tests/clock-in-integrity.test.ts tests/clock-in-integrity-db.test.ts
         env:
           CLOCK_IN_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      - name: Verify audited void source preservation and payroll billing meal races
+        run: npx tsx --test tests/time-entry-void.test.ts tests/time-entry-void-db.test.ts
+        env:
+          TIME_ENTRY_VOID_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
       # The gap-file steps that sat here are gone with the file: this branch's
       # migration closes the recorded gap, so `migrate deploy` now reproduces
