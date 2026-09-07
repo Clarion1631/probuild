@@ -1,5 +1,7 @@
 export const dynamic = 'force-dynamic';
 import { NextResponse } from "next/server";
+import { computeAssignedPlanForUser } from "@/lib/time-suggestion";
+import { resolveDispatchSuggestionAudit, acceptedSuggestionConflictsWithPlan } from "@/lib/dispatch-suggestion-audit";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
@@ -299,6 +301,16 @@ export async function POST(req: Request) {
     const validSources = ["daily_log", "today_schedule", "user_history"];
 
     const entryStartTime = startTime ? new Date(startTime) : new Date();
+    const currentPlan = suggestionSource === "dispatch" || (suggestionOverridden !== true && validSources.includes(suggestionSource))
+        ? await computeAssignedPlanForUser(
+            user.id, projectId, dayKeyInTimeZone(entryStartTime, companyTimeZone),
+        )
+        : { assignmentCount: 0, winner: null };
+    const dispatchAudit = suggestionSource === "dispatch" ? resolveDispatchSuggestionAudit(auditSuggestedTaskId, currentPlan.winner) : null;
+    if (acceptedSuggestionConflictsWithPlan(suggestionSource, suggestionOverridden,
+        auditSuggestedTaskId, resolvedCostCodeId, resolvedEstimateItemId, currentPlan)) {
+        return NextResponse.json({error: "That planned task changed. Refresh your plan and choose the work you are starting.", code: "PLAN_CHANGED"}, {status: 400});
+    }
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
         userId: user.id,
         projectId,
@@ -336,8 +348,8 @@ export async function POST(req: Request) {
             scheduleTaskId,
             suggestedScheduleTaskId: auditSuggestedTaskId,
             suggestedTaskName: auditSuggestedTaskName,
-            suggestedCostCodeId: typeof suggestedCostCodeId === "string" ? suggestedCostCodeId : null,
-            suggestionSource: validSources.includes(suggestionSource) ? suggestionSource : null,
+            suggestedCostCodeId: dispatchAudit ? dispatchAudit.costCodeId : typeof suggestedCostCodeId === "string" ? suggestedCostCodeId : null,
+            suggestionSource: dispatchAudit ? dispatchAudit.source : validSources.includes(suggestionSource) ? suggestionSource : null,
             suggestionOverridden: suggestionOverridden === true,
         }
             })
