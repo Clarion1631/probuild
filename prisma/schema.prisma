@@ -1132,6 +1132,7 @@ model CostType {
 }
 
 model TimeEntry {
+  clockInRequests ClockInRequest[]
   id         String    @id @default(cuid())
   userId     String
   /// RESTRICT, not CASCADE. Deleting a person or a job used to silently destroy
@@ -1235,6 +1236,20 @@ model TimeEntry {
   /// workweeks, the lock check and the settlement planner both scan a period),
   /// and none of the FK indexes above help a bare range predicate.
   @@index([startTime])
+}
+
+// The retained request survives deletion of its entry: retries must not mint a
+// replacement punch. userId is immutable request ownership, not a cascading FK.
+model ClockInRequest {
+  id String @id @default(cuid())
+  userId String
+  requestId String
+  requestHash String
+  timeEntryId String?
+  timeEntry TimeEntry? @relation(fields: [timeEntryId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+  @@unique([userId, requestId])
+  @@index([timeEntryId])
 }
 
 model Contract {

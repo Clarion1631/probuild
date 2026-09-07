@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import { computeAssignedPlanForUser } from "@/lib/time-suggestion";
 import { resolveDispatchSuggestionAudit, acceptedSuggestionConflictsWithPlan } from "@/lib/dispatch-suggestion-audit";
 import { prisma } from "@/lib/prisma";
+import { clockInGuarded, clockInIdentity, ClockInConflict, resolveClockInReplay } from "@/lib/clock-in-integrity";
+import { clockInStore, readClockInReplay } from "@/lib/clock-in-integrity-db";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
@@ -131,6 +133,21 @@ export async function POST(req: Request) {
 
     const fail = await assertProjectAccess(user, projectId);
     if (fail) return fail;
+
+    let requestIdentity;
+    try { requestIdentity = clockInIdentity(body); }
+    catch (error) { return NextResponse.json({ error: (error as Error).message }, { status: 400 }); }
+    // A committed retry is a read, even after the original entry was closed or
+    // its payroll period locked. Validate ownership/access before returning it.
+    if (requestIdentity) {
+        try {
+            const replay = resolveClockInReplay(await readClockInReplay(prisma, user.id, requestIdentity.requestId), requestIdentity);
+            if (replay) return NextResponse.json(serializeTimeEntryJson(replay as never, canSeePay));
+        } catch (error) {
+            if (error instanceof ClockInConflict) return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+            throw error;
+        }
+    }
 
     // A mid-day (DEFERRED) close that was never followed by a clock-in is the
     // end of that day with no meal settled — flag it now that the worker is
@@ -332,7 +349,8 @@ export async function POST(req: Request) {
     // transaction under the shared advisory lock (src/lib/payroll-period.ts).
     let timeEntry;
     try {
-        timeEntry = await withPayrollWriteTx({ instants: [entryStartTime] }, (tx) =>
+        timeEntry = await withPayrollWriteTx({}, (tx) =>
+            clockInGuarded(clockInStore(tx, user.id, entryStartTime, companyTimeZone, () =>
             (tx as unknown as typeof prisma).timeEntry.create({
         data: {
             userId: user.id,
@@ -352,10 +370,19 @@ export async function POST(req: Request) {
             suggestionSource: dispatchAudit ? dispatchAudit.source : validSources.includes(suggestionSource) ? suggestionSource : null,
             suggestionOverridden: suggestionOverridden === true,
         }
-            })
+            })), requestIdentity)
         );
     } catch (error) {
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
+        if (error instanceof ClockInConflict) return NextResponse.json({
+            error: error.message, code: error.code,
+            ...(error.entry ? { entry: serializeTimeEntryJson(error.entry as never, canSeePay) } : {}),
+        }, { status: 409 });
+        // The partial DB index also guards a concurrent reassignment/reopen
+        // from another writer that does not take the clock-in advisory lock.
+        if ((error as { code?: string })?.code === "P2002") return NextResponse.json({
+            error: "Your time entries changed during clock-in. Refresh before trying again.", code: "CLOCK_IN_CONFLICT",
+        }, { status: 409 });
         throw error;
     }
 
