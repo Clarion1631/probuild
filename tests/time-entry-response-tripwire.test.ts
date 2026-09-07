@@ -170,32 +170,40 @@ function isProvablySafe(arg: string): boolean {
  *                must appear in the same file.
  */
 const MANIFEST: Record<string, { kind: "serializer" | "select" | "no-entry"; via: string; why: string }> = {
-    "app/api/time-entries/route.ts:869": {
+    "app/api/time-entries/route.ts:143": {
+        kind: "serializer", via: "serializeTimeEntryJson",
+        why: "POST: retained request replay uses the same audience projection as a created entry",
+    },
+    "app/api/time-entries/route.ts:365": {
+        kind: "serializer", via: "serializeTimeEntryJson",
+        why: "POST: existing-open conflict embeds only a projected entry",
+    },
+    "app/api/time-entries/route.ts:896": {
         kind: "no-entry",
         via: "error.message",
         why: "a ClockOutInputError body; the spread only folds in `code`, which is why it needs saying rather than being obvious to the scanner",
     },
-    "app/api/time-entries/route.ts:91": {
+    "app/api/time-entries/route.ts:93": {
         kind: "select",
         via: "timeEntrySelect(canSeePay)",
         why: "GET: the list query itself is projected per audience",
     },
-    "app/api/time-entries/route.ts:350": {
+    "app/api/time-entries/route.ts:377": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "POST: the created row, projected at the boundary",
     },
-    "app/api/time-entries/route.ts:573": {
+    "app/api/time-entries/route.ts:600": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "PUT: the up-front ALREADY_CLOCKED_OUT body embeds the entry",
     },
-    "app/api/time-entries/route.ts:892": {
+    "app/api/time-entries/route.ts:919": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "PUT: the raced ALREADY_CLOCKED_OUT body embeds the entry",
     },
-    "app/api/time-entries/route.ts:910": {
+    "app/api/time-entries/route.ts:937": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "PUT: the settled row after a successful clock-out",
