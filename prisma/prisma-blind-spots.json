@@ -48,7 +48,7 @@
     },
     {
       "name": "TimeEntry_one_open_per_user",
-      "def": "CREATE UNIQUE INDEX \"TimeEntry_one_open_per_user\" ON public.\"TimeEntry\" USING btree (\"userId\") WHERE ((\"endTime\" IS NULL) AND (\"durationHours\" IS NULL))"
+      "def": "CREATE UNIQUE INDEX \"TimeEntry_one_open_per_user\" ON public.\"TimeEntry\" USING btree (\"userId\") WHERE ((\"endTime\" IS NULL) AND (\"durationHours\" IS NULL) AND (\"voidedAt\" IS NULL))"
     }
   ],
   "checkConstraints": [
@@ -196,6 +196,11 @@
       "name": "StatementImport_status_check",
       "table": "\"StatementImport\"",
       "def": "CHECK ((status = ANY (ARRAY['PENDING'::text, 'FINALIZED'::text, 'FAILED'::text])))"
+    },
+    {
+      "name": "TimeEntry_void_metadata_complete",
+      "table": "\"TimeEntry\"",
+      "def": "CHECK ((((\"voidedAt\" IS NULL) AND (\"voidedById\" IS NULL) AND (\"voidReason\" IS NULL)) OR ((\"voidedAt\" IS NOT NULL) AND (\"voidedById\" IS NOT NULL) AND (\"voidReason\" IS NOT NULL) AND ((length(btrim(\"voidReason\")) >= 1) AND (length(btrim(\"voidReason\")) <= 1000)))))"
     },
     {
       "name": "User_payType_check",
@@ -391,6 +396,10 @@
     {
       "name": "check_refund_event_signs()",
       "def": "CREATE OR REPLACE FUNCTION public.check_refund_event_signs()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n     DECLARE\n       orig_amount INTEGER;\n       refund_amount INTEGER;\n     BEGIN\n       IF NEW.\"originalBankLineId\" IS NOT NULL THEN\n         SELECT \"amountCents\" INTO orig_amount FROM \"BankLine\" WHERE \"id\" = NEW.\"originalBankLineId\";\n         IF orig_amount IS NOT NULL AND orig_amount >= 0 THEN\n           RAISE EXCEPTION 'RefundEvent.originalBankLineId must reference a debit BankLine (amountCents < 0), got %', orig_amount;\n         END IF;\n       END IF;\n       IF NEW.\"refundBankLineId\" IS NOT NULL THEN\n         SELECT \"amountCents\" INTO refund_amount FROM \"BankLine\" WHERE \"id\" = NEW.\"refundBankLineId\";\n         IF refund_amount IS NOT NULL AND refund_amount <= 0 THEN\n           RAISE EXCEPTION 'RefundEvent.refundBankLineId must reference a credit BankLine (amountCents > 0), got %', refund_amount;\n         END IF;\n       END IF;\n       RETURN NEW;\n     END;\n     $function$\n"
+    },
+    {
+      "name": "preserve_voided_time_entry()",
+      "def": "CREATE OR REPLACE FUNCTION public.preserve_voided_time_entry()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  IF OLD.\"voidedAt\" IS NOT NULL THEN\n    RAISE EXCEPTION 'TIME_ENTRY_VOIDED: retained voided evidence is immutable';\n  END IF;\n  IF TG_OP = 'UPDATE' AND NEW.\"voidedAt\" IS NOT NULL AND\n    (to_jsonb(NEW) - ARRAY['voidedAt','voidedById','voidReason','updatedAt']) IS DISTINCT FROM\n    (to_jsonb(OLD) - ARRAY['voidedAt','voidedById','voidReason','updatedAt']) THEN\n    RAISE EXCEPTION 'TIME_ENTRY_VOIDED: void cannot alter source punches or money';\n  END IF;\n  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;\n  RETURN NEW;\nEND;\n$function$\n"
     }
   ],
   "triggers": [
@@ -403,6 +412,11 @@
       "table": "RefundEvent",
       "name": "refund_event_signs_trigger",
       "def": "CREATE TRIGGER refund_event_signs_trigger BEFORE INSERT OR UPDATE ON public.\"RefundEvent\" FOR EACH ROW EXECUTE FUNCTION check_refund_event_signs()"
+    },
+    {
+      "table": "TimeEntry",
+      "name": "TimeEntry_preserve_voided",
+      "def": "CREATE TRIGGER \"TimeEntry_preserve_voided\" BEFORE DELETE OR UPDATE ON public.\"TimeEntry\" FOR EACH ROW EXECUTE FUNCTION preserve_voided_time_entry()"
     }
   ]
 }

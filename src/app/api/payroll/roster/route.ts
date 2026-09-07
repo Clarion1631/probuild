@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
@@ -48,13 +50,13 @@ export async function GET(_req: Request) {
         const { startOfDateInTimeZone } = await import("@/lib/tz-date");
         const timeZone = await resolveCompanyTimeZone();
         const rows = await prisma.timeEntry.findMany({
-            where: {
+            where: nonVoidedTimeEntryWhere({
                 startTime: {
                     gte: startOfDateInTimeZone(from, timeZone),
                     lt: startOfDateInTimeZone(to, timeZone),
                 },
                 user: { status: "DISABLED" },
-            },
+            }),
             select: { userId: true },
             distinct: ["userId"],
         });

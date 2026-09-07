@@ -110,11 +110,11 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "guarded",
         why: "THE rate/payType writer — takes acquirePayrollWriteLock and then the owner row lock, in the global order",
     },
-    "lib/actions.ts:16844::updateMany": {
+    "lib/actions.ts:16846::updateMany": {
         kind: "guarded",
         why: "applyGustoRateImport, inside a transaction that takes acquirePayrollWriteLock before any row lock",
     },
-    "lib/actions.ts:16938::updateMany": {
+    "lib/actions.ts:16940::updateMany": {
         kind: "guarded",
         why: "setUserPayType, taking the same lock in the same order",
     },
@@ -140,11 +140,11 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "exempt",
         why: "connects In-Progress projects to a just-activated member; it touches assignedProjects and nothing else",
     },
-    "lib/actions.ts:8232::update": {
+    "lib/actions.ts:8234::update": {
         kind: "exempt",
         why: "markFieldUpdatesSeen writes fieldUpdatesSeenAt, a per-user UI timestamp that reaches no export",
     },
-    "lib/actions.ts:15683::update": {
+    "lib/actions.ts:15685::update": {
         kind: "exempt",
         why: "the WA meal-waiver signature stamp — it changes what settlement owes, which is a TimeEntry write, not a roster or CSV column",
     },

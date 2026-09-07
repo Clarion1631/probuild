@@ -21,6 +21,9 @@
  */
 export const TIME_ENTRY_CREW_SELECT = {
     id: true,
+    voidedAt: true,
+    voidedById: true,
+    voidReason: true,
     userId: true,
     projectId: true,
     costCodeId: true,

@@ -81,6 +81,7 @@ import { NextResponse } from "next/server";
 import { COMPANY_TIME_ZONE } from "./company-day";
 import { dayKeyInTimeZone, addDaysToKey, startOfDateInTimeZone } from "./tz-date";
 import { payrollLockEnvelope, type PayrollWeekStart } from "./payroll-config";
+import { isTimeEntryVoidedError, timeEntryVoidedResponse, TimeEntryVoidError } from "./time-entry-void";
 
 export type LockedPeriodRow = {
     id: string;
@@ -436,6 +437,10 @@ export async function assertEntriesUnlockedInTx(
     if (ids.length === 0 && extra.length === 0 && dayKeys.length === 0) return;
 
     const stored = await acquirePayrollLocks(tx, { dayKeys, entryIds: ids, instants: extra });
+    if (ids.length) {
+        const voided = await tx.$queryRawUnsafe(`SELECT "voidedAt" FROM "TimeEntry" WHERE id = ANY($1::text[]) AND "voidedAt" IS NOT NULL`, ids) as Array<{ voidedAt: Date }>;
+        if (voided.some(row => row.voidedAt)) throw new TimeEntryVoidError("This entry was voided and cannot be changed.");
+    }
 
     const periods = await loadLockedPeriodsTx(tx);
     if (periods.length === 0) return;
@@ -604,6 +609,7 @@ export async function withPeriodLockedRoute(run: () => Promise<NextResponse>): P
     try {
         return await run();
     } catch (error) {
+        if (isTimeEntryVoidedError(error)) return timeEntryVoidedResponse();
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
         throw error;
     }

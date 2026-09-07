@@ -1,4 +1,6 @@
 "use server";
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
+
 
 import { prisma } from "@/lib/prisma";
 import { expenseForProjectWhere } from "@/lib/expense-attribution";
@@ -48,7 +50,7 @@ export async function getBudgetData(projectId: string) {
     });
 
     const timeEntries = await prisma.timeEntry.findMany({
-        where: { projectId },
+        where: nonVoidedTimeEntryWhere({ projectId }),
         include: { costCode: true, costType: true, estimateItem: true, user: { select: { name: true } } },
     });
 

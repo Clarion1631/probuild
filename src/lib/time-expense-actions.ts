@@ -1,4 +1,6 @@
 "use server";
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
+
 
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
@@ -538,7 +540,7 @@ export async function getTimeEntries(projectId: string) {
     await assertTimeExpenseProjectAccess(projectId);
 
     return prisma.timeEntry.findMany({
-        where: { projectId },
+        where: nonVoidedTimeEntryWhere({ projectId }),
         include: {
             user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
             costCode: { select: { id: true, name: true, code: true } },
@@ -575,7 +577,7 @@ export async function getExpenses(projectId: string) {
 export async function getTimeExpenseData(projectId: string) {
     await assertTimeExpenseProjectAccess(projectId);
     const timeEntries = await prisma.timeEntry.findMany({
-        where: { projectId },
+        where: nonVoidedTimeEntryWhere({ projectId }),
         include: {
             user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
             costCode: { select: { id: true, name: true, code: true } },

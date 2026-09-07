@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { createMcpHandler } from "mcp-handler";
 import { revalidatePath } from "next/cache";
@@ -1269,7 +1271,7 @@ function createHandler(actor: RouteMcpActor) {
                     orderBy: { createdAt: "desc" },
                     include: {
                         items: { orderBy: { order: "asc" }, select: { id: true, name: true, description: true, type: true, quantity: true, unitCost: true, total: true, costCode: { select: { code: true } } } },
-                        timeEntries: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { durationHours: true, laborCost: true, burdenCost: true } },
+                        timeEntries: { where: nonVoidedTimeEntryWhere({ isBillable: true, invoiceId: null, invoicedAt: null }), select: { durationHours: true, laborCost: true, burdenCost: true } },
                         expenses: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { amount: true } },
                         billings: { select: { totalCents: true, laborCents: true, expenseCents: true, markupCents: true, taxCents: true } },
                         paymentSchedules: { orderBy: { order: "asc" }, select: { id: true, name: true, amount: true, dueDate: true } },

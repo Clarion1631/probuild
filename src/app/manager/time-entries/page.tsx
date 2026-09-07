@@ -1,3 +1,5 @@
+
+import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 export const dynamic = "force-dynamic";
 import { prisma } from "@/lib/prisma";
 import { authOptions, getSessionOrDev } from "@/lib/auth";
@@ -39,7 +41,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
 
     const [entries, allUsers, allProjects, pendingSkips] = await Promise.all([
         prisma.timeEntry.findMany({
-            where,
+            where: tab === 'voided' ? { ...where, voidedAt: { not: null } } : nonVoidedTimeEntryWhere(where),
             include: { user: true, project: true, costCode: true, estimateItem: true },
             orderBy: { startTime: 'desc' },
             take: 250,
@@ -49,7 +51,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
         // Skip-lunch requests waiting on an approver — always shown, regardless
         // of the filters, because a worker is standing on a job site waiting.
         prisma.timeEntry.findMany({
-            where: { mealSkipStatus: 'PENDING', endTime: null },
+            where: nonVoidedTimeEntryWhere({ mealSkipStatus: 'PENDING', endTime: null }),
             select: {
                 id: true, startTime: true, mealSkipRequestedAt: true,
                 user: { select: { id: true, name: true, email: true, mealWaiverSignedAt: true } },
@@ -60,10 +62,11 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
     ]);
     const viewerCanApprove = !!user && canApproveMealSkip({ role: user.role, email: user.email });
 
-    const flaggedCount = entries.filter(e => e.needsReview).length;
-    const totalHours = entries.reduce((acc, e) => acc + (e.durationHours || 0), 0);
-    const totalCost = entries.reduce((acc, e) => acc + toNum(e.laborCost) + toNum(e.burdenCost), 0);
-    const totalBillable = entries.reduce((acc, e) => acc + toNum(e.laborCost), 0);
+    const operational = entries.filter(e => !e.voidedAt);
+    const flaggedCount = operational.filter(e => e.needsReview).length;
+    const totalHours = operational.reduce((acc, e) => acc + (e.durationHours || 0), 0);
+    const totalCost = operational.reduce((acc, e) => acc + toNum(e.laborCost) + toNum(e.burdenCost), 0);
+    const totalBillable = operational.reduce((acc, e) => acc + toNum(e.laborCost), 0);
 
     // Group by project
     const grouped = entries.reduce((map, e) => {
@@ -173,6 +176,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
 
             {/* Tabs */}
             <div className="flex border-b border-hui-border gap-0">
+                <Link href={tabLink('voided')} className={`px-5 py-2.5 text-sm font-medium border-b-2 ${tab === 'voided' ? 'border-hui-primary text-hui-primary' : 'border-transparent text-hui-textMuted'}`}>Voided history</Link>
                 <Link
                     href={tabLink('time')}
                     className={`px-5 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors ${tab === 'time' ? 'border-hui-primary text-hui-primary' : 'border-transparent text-hui-textMuted hover:text-hui-textMain'}`}
@@ -252,6 +256,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
             </div>
 
             {/* Content */}
+            {tab === 'voided' && <p className="text-sm text-hui-textMuted">Original punches and amounts are retained below for review. Voided entries are excluded from payroll and operational totals.</p>}
             {tab === 'expenses' ? (
                 <div className="hui-card p-12 text-center text-hui-textMuted">
                     <p className="font-medium text-hui-textMain mb-2">Expense tracking coming soon</p>
@@ -265,8 +270,8 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                 </div>
             ) : (
                 Array.from(grouped.values()).map(({ project, entries: pEntries }) => {
-                    const pHours = pEntries.reduce((a, e) => a + (e.durationHours || 0), 0);
-                    const pCost = pEntries.reduce((a, e) => a + toNum(e.laborCost) + toNum(e.burdenCost), 0);
+                    const pHours = pEntries.filter(e => !e.voidedAt).reduce((a, e) => a + (e.durationHours || 0), 0);
+                    const pCost = pEntries.filter(e => !e.voidedAt).reduce((a, e) => a + toNum(e.laborCost) + toNum(e.burdenCost), 0);
                     return (
                         <div key={project.id} className="hui-card overflow-hidden">
                             <div className="flex justify-between items-center px-6 py-3 bg-slate-50 border-b border-hui-border">
@@ -345,7 +350,9 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                     {formatCurrency(total)}
                                                 </td>
                                                 <td className="px-5 py-3 text-center text-xs">
-                                                    {e.needsReview ? (
+                                                    {e.voidedAt ? (
+                                                        <span className="text-hui-textMuted" title={`Voided by ${e.voidedById} at ${new Date(e.voidedAt).toISOString()}`}>Voided: {e.voidReason}</span>
+                                                    ) : e.needsReview ? (
                                                         <div className="flex flex-col items-center gap-1">
                                                             <span
                                                                 className="text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200"

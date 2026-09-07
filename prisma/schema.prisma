@@ -1133,6 +1133,10 @@ model CostType {
 
 model TimeEntry {
   clockInRequests ClockInRequest[]
+  // Retained source punches; void changes only these fields and updatedAt.
+  voidedAt DateTime? @db.Timestamp(6)
+  voidedById String?
+  voidReason String?
   id         String    @id @default(cuid())
   userId     String
   /// RESTRICT, not CASCADE. Deleting a person or a job used to silently destroy

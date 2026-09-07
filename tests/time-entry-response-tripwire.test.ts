@@ -170,65 +170,69 @@ function isProvablySafe(arg: string): boolean {
  *                must appear in the same file.
  */
 const MANIFEST: Record<string, { kind: "serializer" | "select" | "no-entry"; via: string; why: string }> = {
-    "app/api/time-entries/route.ts:143": {
+    "app/api/time-entries/[id]/void/route.ts:17": {
+        kind: "serializer", via: "serializeTimeEntryJson",
+        why: "audited void and its replay return the retained source through the crew-safe projection with pay fields masked",
+    },
+    "app/api/time-entries/route.ts:146": {
         kind: "serializer", via: "serializeTimeEntryJson",
         why: "POST: retained request replay uses the same audience projection as a created entry",
     },
-    "app/api/time-entries/route.ts:365": {
+    "app/api/time-entries/route.ts:369": {
         kind: "serializer", via: "serializeTimeEntryJson",
         why: "POST: existing-open conflict embeds only a projected entry",
     },
-    "app/api/time-entries/route.ts:896": {
+    "app/api/time-entries/route.ts:903": {
         kind: "no-entry",
         via: "error.message",
         why: "a ClockOutInputError body; the spread only folds in `code`, which is why it needs saying rather than being obvious to the scanner",
     },
-    "app/api/time-entries/route.ts:93": {
+    "app/api/time-entries/route.ts:96": {
         kind: "select",
         via: "timeEntrySelect(canSeePay)",
         why: "GET: the list query itself is projected per audience",
     },
-    "app/api/time-entries/route.ts:377": {
+    "app/api/time-entries/route.ts:381": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "POST: the created row, projected at the boundary",
     },
-    "app/api/time-entries/route.ts:600": {
+    "app/api/time-entries/route.ts:606": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "PUT: the up-front ALREADY_CLOCKED_OUT body embeds the entry",
     },
-    "app/api/time-entries/route.ts:919": {
+    "app/api/time-entries/route.ts:926": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "PUT: the raced ALREADY_CLOCKED_OUT body embeds the entry",
     },
-    "app/api/time-entries/route.ts:937": {
+    "app/api/time-entries/route.ts:944": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "PUT: the settled row after a successful clock-out",
     },
-    "app/api/time-entries/[id]/route.ts:197": {
+    "app/api/time-entries/[id]/route.ts:200": {
         kind: "select",
         via: "responseSelect",
         why: "PATCH telemetry branch: re-read with the audience projection",
     },
-    "app/api/time-entries/[id]/route.ts:650": {
+    "app/api/time-entries/[id]/route.ts:654": {
         kind: "select",
         via: "responseSelect",
         why: "PATCH edit branch: re-read with the audience projection",
     },
-    "app/api/time-entries/[id]/logistics/route.ts:181": {
+    "app/api/time-entries/[id]/logistics/route.ts:184": {
         kind: "select",
         via: "resultSelect",
         why: "already-applied body, read with a narrow explicit select",
     },
-    "app/api/time-entries/[id]/logistics/route.ts:184": {
+    "app/api/time-entries/[id]/logistics/route.ts:187": {
         kind: "select",
         via: "resultSelect",
         why: "routed entry, read with the same narrow select",
     },
-    "app/api/time-entries/[id]/meal-skip/route.ts:184": {
+    "app/api/time-entries/[id]/meal-skip/route.ts:188": {
         kind: "select",
         via: "mealSkipStatus: true",
         why: "five skip-decision columns, never a row",
