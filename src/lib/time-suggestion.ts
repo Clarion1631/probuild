@@ -16,7 +16,7 @@ import { toCompanyDayKey, daysBetweenDayKeys } from "@/lib/company-day";
 // cost code disagrees with the bucket that would actually be charged — is
 // worse than none, so those are excluded rather than approximated.
 
-export type TimeSuggestionSource = "daily_log" | "today_schedule" | "user_history";
+export type TimeSuggestionSource = "dispatch" | "daily_log" | "today_schedule" | "user_history";
 
 export interface TimeSuggestion {
     scheduleTaskId: string;
@@ -28,6 +28,8 @@ export interface TimeSuggestion {
     source: TimeSuggestionSource;
     confidence: "high" | "medium" | "low";
     reason: string | null;
+    note?: string | null;
+    plannedByOffice?: boolean;
 }
 
 // Statuses under which an estimate's items appear in the clock-in picker
@@ -319,7 +321,7 @@ export async function loadSuggestableTasks(
 
 // ── Ranking ─────────────────────────────────────────────────────────────────
 
-export async function suggestTaskForClockIn(
+async function suggestInferredTaskForClockIn(
     input: { userId: string; projectId: string; now?: Date },
     db: DbClient = prisma,
 ): Promise<TimeSuggestion | null> {
@@ -435,4 +437,54 @@ export async function suggestTaskForClockIn(
     }
 
     return null;
+}
+
+export interface TimeSuggestionResult {
+    suggestion: TimeSuggestion | null;
+    uncostedPlannedTask: { id: string; name: string; note: string | null } | null;
+    plannedTaskChoiceRequired?: boolean;
+}
+
+/** Persisted individual assignments are the office plan. Project crew membership
+ * alone is not dispatch. Multiple assignments require a choice, never a guessed winner. */
+async function assignedPlan(userId: string, projectId: string, dayKey: string, db: DbClient) {
+    const [tasks, { targetByItemId }] = await Promise.all([
+        db.scheduleTask.findMany({ where: { projectId }, select: {
+            id: true, name: true, parentId: true, type: true, status: true,
+            startDate: true, endDate: true, estimateItemId: true, doneWhen: true,
+            assignments: { where: { userId }, select: { id: true } },
+        } }),
+        resolveChargeableItems(projectId, db),
+    ]);
+    const parentIds = new Set(tasks.map(t => t.parentId).filter(Boolean));
+    const active = tasks.filter(t => t.type === 'task' && t.status !== 'Complete'
+        && t.assignments.length > 0 && !parentIds.has(t.id)
+        && isTaskActiveOnDay({ startDate: t.startDate.toISOString(), endDate: t.endDate.toISOString(), type: t.type }, dayKey));
+    const task = active.length === 1 ? active[0] : null;
+    const target = task?.estimateItemId ? targetByItemId.get(task.estimateItemId) : null;
+    return { active, task, target };
+}
+
+export async function computeDispatchWinnerForUser(userId: string, projectId: string, dayKey: string, db: DbClient = prisma) {
+    const { task, target } = await assignedPlan(userId, projectId, dayKey, db);
+    return task ? { taskId: task.id, chargeable: !!target?.costCodeId && !!target.costCode, costCodeId: target?.costCodeId ?? null, estimateItemId: target?.id ?? null } : null;
+}
+
+export async function suggestTaskForClockIn(
+    input: { userId: string; projectId: string; now?: Date }, db: DbClient = prisma,
+): Promise<TimeSuggestionResult> {
+    const { active, task, target } = await assignedPlan(input.userId, input.projectId, toCompanyDayKey(input.now ?? new Date()), db);
+    if (active.length > 1) return { suggestion: null, uncostedPlannedTask: null, plannedTaskChoiceRequired: true };
+    if (task) {
+        if (!target?.costCodeId || !target.costCode) return {
+            suggestion: null, uncostedPlannedTask: { id: task.id, name: task.name, note: task.doneWhen },
+        };
+        return { suggestion: {
+            scheduleTaskId: task.id, clockInEstimateItemId: target.id, costCodeId: target.costCodeId,
+            costCodeLabel: `${target.costCode.code} — ${target.costCode.name}`, taskName: task.name,
+            source: 'dispatch', confidence: 'high', reason: 'Assigned to you today',
+            plannedByOffice: true, note: task.doneWhen,
+        }, uncostedPlannedTask: null };
+    }
+    return { suggestion: await suggestInferredTaskForClockIn(input, db), uncostedPlannedTask: null };
 }

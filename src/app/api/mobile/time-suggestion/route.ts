@@ -23,8 +23,8 @@ export async function GET(req: Request) {
     if (fail) return fail;
 
     try {
-        const suggestion = await suggestTaskForClockIn({ userId: user.id, projectId });
-        return NextResponse.json({ suggestion });
+        const result = await suggestTaskForClockIn({ userId: user.id, projectId });
+        return NextResponse.json(result);
     } catch (error) {
         // A suggestion fault must never break the clock-in screen.
         console.error("[time-suggestion] failed", { projectId, error });

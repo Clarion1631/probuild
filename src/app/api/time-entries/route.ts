@@ -1,5 +1,7 @@
 export const dynamic = 'force-dynamic';
 import { NextResponse } from "next/server";
+import { computeDispatchWinnerForUser } from "@/lib/time-suggestion";
+import { resolveDispatchSuggestionAudit, dispatchAcceptanceIsCurrent } from "@/lib/dispatch-suggestion-audit";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
@@ -299,6 +301,16 @@ export async function POST(req: Request) {
     const validSources = ["daily_log", "today_schedule", "user_history"];
 
     const entryStartTime = startTime ? new Date(startTime) : new Date();
+    const dispatchWinner = suggestionSource === "dispatch"
+        ? await computeDispatchWinnerForUser(
+            user.id, projectId, dayKeyInTimeZone(entryStartTime, companyTimeZone),
+        )
+        : null;
+    const dispatchAudit = suggestionSource === "dispatch" ? resolveDispatchSuggestionAudit(auditSuggestedTaskId, dispatchWinner) : null;
+    if (suggestionSource === "dispatch" && suggestionOverridden !== true
+        && !dispatchAcceptanceIsCurrent(auditSuggestedTaskId, resolvedCostCodeId, resolvedEstimateItemId, dispatchWinner)) {
+        return NextResponse.json({error: "That planned task changed. Refresh your plan and choose the work you are starting.", code: "PLAN_CHANGED"}, {status: 400});
+    }
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
         userId: user.id,
         projectId,
@@ -336,8 +348,8 @@ export async function POST(req: Request) {
             scheduleTaskId,
             suggestedScheduleTaskId: auditSuggestedTaskId,
             suggestedTaskName: auditSuggestedTaskName,
-            suggestedCostCodeId: typeof suggestedCostCodeId === "string" ? suggestedCostCodeId : null,
-            suggestionSource: validSources.includes(suggestionSource) ? suggestionSource : null,
+            suggestedCostCodeId: dispatchAudit ? dispatchAudit.costCodeId : typeof suggestedCostCodeId === "string" ? suggestedCostCodeId : null,
+            suggestionSource: dispatchAudit ? dispatchAudit.source : validSources.includes(suggestionSource) ? suggestionSource : null,
             suggestionOverridden: suggestionOverridden === true,
         }
             })
