@@ -217,7 +217,7 @@ const MANIFEST: Record<string, { kind: "serializer" | "select" | "no-entry"; via
         via: "responseSelect",
         why: "PATCH telemetry branch: re-read with the audience projection",
     },
-    "app/api/time-entries/[id]/route.ts:654": {
+    "app/api/time-entries/[id]/route.ts:648": {
         kind: "select",
         via: "responseSelect",
         why: "PATCH edit branch: re-read with the audience projection",

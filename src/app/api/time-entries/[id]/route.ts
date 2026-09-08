@@ -12,7 +12,7 @@ import { timeEntryScalarSelect } from "@/lib/time-entry-projection";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx, settlementCandidateIds } from "@/lib/wa-breaks-db";
-import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
+import { recordedMealAnswer } from "@/lib/wa-breaks";
 import {
     assertEntriesUnlockedInTx,
     assertPeriodUnlocked,
@@ -326,14 +326,8 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // nothing (an OPEN entry's stored `mealSkipped` is just the column default
     // — the worker was never asked, and the notice below must say so).
     // Only the OWNER's answer counts; a closed row's durable answer is read
-    // off its outcome (WORKED_THROUGH = "worked through"; AUTO_DEDUCTED without
-    // the no-answer note = "took lunch"), never off the column default.
-    const storedAnswer: boolean | undefined =
-        existing.mealOutcome === "WORKED_THROUGH"
-            ? true
-            : existing.mealOutcome === "AUTO_DEDUCTED" && !(existing.reviewReason ?? "").includes(NO_ATTESTATION_NOTE)
-              ? false
-              : undefined;
+    // from row-local evidence, never a derived sibling outcome or column default.
+    const storedAnswer = recordedMealAnswer(existing);
     const mealSkippedForEdit: boolean | undefined =
         isOwner && typeof body.mealSkipped === "boolean" ? body.mealSkipped : storedAnswer;
     if (newEnd) {
