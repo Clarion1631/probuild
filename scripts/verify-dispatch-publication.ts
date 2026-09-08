@@ -429,6 +429,9 @@ async function main() {
 
     // 10. Multiple changed tasks for one user collapse into one delivery.
     await withFixture("10-recipient-dedupe", async fixture => {
+        await prisma.scheduleTask.update({ where: { id: fixture.taskA.id }, data: {
+            doneWhen: "Frame per approved plan; photograph anchors", blockedReason: "Await lumber", scheduledTime: "08:00",
+        } });
         const intents = [
             await taskDatesIntent(fixture.taskA.id, dayKey(1), dayKey(4)),
             await taskDatesIntent(fixture.taskB.id, dayKey(5), dayKey(7)),
@@ -439,6 +442,16 @@ async function main() {
             where: { publicationId: result.publicationId! },
         });
         assert.deepEqual(deliveries.map(row => row.destination), [`user:${fixture.crewA.id}`]);
+        const payload = deliveries[0].payload as any;
+        const taskSnapshot = payload.tasks.find((task: any) => task.id === fixture.taskA.id);
+        assert.equal(taskSnapshot.projectName, fixture.project.name);
+        assert.equal(taskSnapshot.doneWhen, "Frame per approved plan; photograph anchors");
+        assert.equal(taskSnapshot.blockedReason, "Await lumber");
+        assert.equal(taskSnapshot.scheduledTime, "08:00");
+        assert.equal(taskSnapshot.startDate, dayKey(1));
+        await prisma.scheduleTask.update({ where: { id: fixture.taskA.id }, data: { doneWhen: "Revised later" } });
+        const saved = await prisma.chatDelivery.findUniqueOrThrow({ where: { id: deliveries[0].id } });
+        assert.equal((saved.payload as any).tasks.find((task: any) => task.id === fixture.taskA.id).doneWhen, taskSnapshot.doneWhen);
     });
 
     // 11. Removed assignees receive the cancellation digest.
