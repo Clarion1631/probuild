@@ -2,7 +2,7 @@ import type { Prisma } from "@prisma/client";
 
 import { runAfterRequest } from "./after-request";
 import { postDailyLogSummary } from "./chat-webhook";
-import { createDailyLogCore } from "./daily-log-core";
+import { createDailyLogCore, normalizeDailyLogChatMessage, assertDailyLogChatProject } from "./daily-log-core";
 import { runDailyLogTaskMatch } from "./daily-log-task-match";
 import {
     executeConfirmed,
@@ -466,6 +466,7 @@ type CreateDailyLogInput = {
     issues?: string;
     nextSteps?: string;
     photos?: Array<{ fileId: string; caption?: string }>;
+    chatMessageName?: string;
     confirmToken?: string;
 };
 
@@ -512,6 +513,7 @@ export async function createDailyLogWithConfirmation(
     if (!workPerformed) throw new Error("workPerformed is required");
     const photos = input.photos ?? [];
     const args = {
+        chatMessageName: normalizeDailyLogChatMessage(input.chatMessageName) ?? undefined,
         projectId: input.projectId,
         date: input.date,
         weather: input.weather?.trim() || undefined,
@@ -528,25 +530,28 @@ export async function createDailyLogWithConfirmation(
     if (!input.confirmToken) {
         const project = await prisma.project.findUnique({
             where: { id: input.projectId },
-            select: { name: true },
+            select: { name: true, googleChatSpaceId: true },
         });
         if (!project) throw new Error("Project not found");
+        assertDailyLogChatProject(args.chatMessageName ?? null, project.googleChatSpaceId);
         const resolvedPhotos = await resolveDailyLogPhotos(prisma, input.projectId, args.photos);
         return issueConfirmation(
             "create_daily_log",
             args,
-            `Create the ${input.date} daily log on "${project.name}" with ${resolvedPhotos.length} photo${resolvedPhotos.length === 1 ? "" : "s"}: ${workPerformed}${args.nextSteps ? ` Next steps: ${args.nextSteps}` : ""}`,
+            `Create the ${input.date} daily log on "${project.name}" with ${resolvedPhotos.length} photo${resolvedPhotos.length === 1 ? "" : "s"}: ${workPerformed}${args.nextSteps ? ` Next steps: ${args.nextSteps}` : ""}${args.chatMessageName ? ` Source Google Chat message: ${args.chatMessageName}.` : ""}`,
             actor.actorLabel,
         );
     }
     const result = await executePmConfirmed("create_daily_log", args, input.confirmToken, actor, async tx => {
         const project = await tx.project.findUnique({
             where: { id: input.projectId },
-            select: { id: true, name: true },
+            select: { id: true, name: true, googleChatSpaceId: true },
         });
         if (!project) throw new Error("Project not found");
+        assertDailyLogChatProject(args.chatMessageName ?? null, project.googleChatSpaceId);
         const resolvedPhotos = await resolveDailyLogPhotos(tx, input.projectId, args.photos);
         const log = await createDailyLogCore({
+            chatMessageName: args.chatMessageName,
             projectId: input.projectId,
             actorUserId: actor.actorUserId!,
             date: args.date,

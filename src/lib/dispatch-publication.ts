@@ -344,6 +344,29 @@ async function applyPlan(
                         name: input.actor.name,
                     },
                     publishedAt: publication.publishedAt.toISOString(),
+                    // Freeze the reviewed task context; delivery must not read
+                    // mutable task notes after publication.
+                    tasks: [...new Set(relevantTaskChanges.map(change => change.targetId))].map(taskId => {
+                        const task = tasksById.get(taskId)!;
+                        const dates = plan.finalTasks[taskId];
+                        return {
+                            id: task.id,
+                            projectId: task.projectId,
+                            projectName: projectsById.get(task.projectId)!.name,
+                            name: task.name,
+                            type: task.type,
+                            status: task.status,
+                            doneWhen: task.doneWhen ?? null,
+                            blockedReason: task.blockedReason ?? null,
+                            scheduledTime: task.scheduledTime ?? null,
+                            startDate: dates?.startDate ?? task.startDate.slice(0, 10),
+                            endDate: dates?.endDate ?? task.endDate.slice(0, 10),
+                            assignments: (plan.finalAssignments[taskId] ?? task.assignments).map(assignment => ({
+                                userId: assignment.userId, role: assignment.role,
+                            })),
+                            reviewedUpdatedAt: task.updatedAt,
+                        };
+                    }),
                     changes: payloadChanges.map(change => ({
                         projectId: change.projectId,
                         targetType: change.targetType,
@@ -482,6 +505,9 @@ export async function publishDispatch(
                         projectId: true,
                         name: true,
                         type: true,
+                        doneWhen: true,
+                        blockedReason: true,
+                        scheduledTime: true,
                         status: true,
                         startDate: true,
                         endDate: true,
@@ -526,6 +552,9 @@ export async function publishDispatch(
                     projectId: task.projectId,
                     name: task.name,
                     type: task.type,
+                    doneWhen: task.doneWhen,
+                    blockedReason: task.blockedReason,
+                    scheduledTime: task.scheduledTime,
                     status: task.status,
                     startDate: task.startDate.toISOString(),
                     endDate: task.endDate.toISOString(),

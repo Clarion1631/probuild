@@ -80,6 +80,9 @@ export interface DispatchTaskSnapshot {
     endDate: string;
     updatedAt: string;
     assignments: DispatchAssignment[];
+    doneWhen?: string | null;
+    blockedReason?: string | null;
+    scheduledTime?: string | null;
 }
 
 export interface DispatchUserSnapshot {

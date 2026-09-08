@@ -1950,6 +1950,7 @@ function createHandler(actor: RouteMcpActor) {
                     "Attach photos by ProjectFile id after upload_files—bytes are not re-sent. Every photo must be an image on the same project. " +
                     "TWO-STEP, SINGLE-USE: preview first, show the user, then repeat the exact arguments with confirmToken after approval.",
                 inputSchema: {
+                    chatMessageName: z.string().max(500).optional().describe("Exact source Chat message resource name (spaces/{space}/messages/{message}), when ingesting a message from the project's linked Chat space. Omit for manual logs. Reusing a message is rejected; never invent an identity."),
                     projectId: z.string().max(50),
                     date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD"),
                     weather: z.string().max(300).optional(),
