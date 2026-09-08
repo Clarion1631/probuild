@@ -572,6 +572,7 @@ test("round 39: `false` from the delete is CONFIRMED ABSENCE, so the row still u
         createRouteDeadline(30_000),
         {
             db: db as any,
+            cursorStore: { get: async () => null, set: async () => {} },
             deleteInvoice: async (_t, qbId) => qbId === "qb-1",
             unlink: async (id) => {
                 unlinked.push(id);
@@ -605,6 +606,7 @@ test("round 39: a REFUSAL throws, and that row stays linked and parked", async (
         createRouteDeadline(30_000),
         {
             db: db as any,
+            cursorStore: { get: async () => null, set: async () => {} },
             deleteInvoice: async (_t, qbId) => {
                 if (qbId === "qb-2") throw new Error("QuickBooks refused: payment attached");
                 return true;
@@ -639,6 +641,7 @@ test("round 38: the deadline stops the sweep, and the rows it never reached stay
         spent,
         {
             db: db as any,
+            cursorStore: { get: async () => null, set: async () => {} },
             deleteInvoice: async (_t, qbId) => { deleted.push(qbId); return true; },
             unlink: async () => true,
         },

@@ -1429,29 +1429,37 @@ test("the whole push, end to end, stops before the route ceiling", async () => {
     assert.ok(vendorCalls <= 1);
 });
 
-test("a budget already spent at entry refuses the push before any QBO call", async () => {
+test("a budget already spent at entry refuses the push before a Purchase write", async () => {
     const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
     const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
 
     let queries = 0;
+    let creates = 0;
     const spent = createRouteDeadline(2_000, Date.now() - 12_000);
     const error = await createQBReceiptPurchase(
         TOKENS,
         baseInput({ ...FILE_INPUT }),
         {
-            qbQueryFn: async () => {
+            qbQueryFn: async (_tokens, query) => {
                 queries++;
-                return [] as never[];
+                return defaultAccountRow(query) as never[];
             },
+            withFileLock: INLINE_LOCK,
+            listProjects: async () => [PROJECT],
+            ensureVendorFn: async () => "vendor-1",
+            ensureCustomerFn: async () => "customer-1",
+            qbCreateFn: async () => { creates++; return { id: "unexpected-purchase" }; },
+            uploadAttachment: async () => "attached",
         },
         spent,
     ).then(() => null, (e: unknown) => e as Error);
 
     // qbQueryFn is injected here so it does not go through qbTimedFetch; the
-    // guard that matters is the one before the Purchase create.
+    // require a budget guard to stop the push before the Purchase create.
     assert.ok(error, "must not post a Purchase on an exhausted budget");
-    assert.ok(isQBBudgetExhaustedError(error) || error instanceof Error);
-    assert.ok(queries >= 0);
+    assert.ok(isQBBudgetExhaustedError(error), `expected the budget guard, got ${error}`);
+    assert.ok(queries > 0, "exercise the push, not a failed database lease");
+    assert.equal(creates, 0, "an exhausted request must never post money");
 });
 
 test("route: a budget exhausted during the token fetch is a 503 retry", async () => {
