@@ -196,9 +196,7 @@ test("the manual paths do NOT settle — a manual row has no endTime to plan", (
     }
 });
 
-test("deleting one of two shifts drops the meal deduction the day no longer earns", () => {
-    // Two shifts, 4h and 3h, on one day: 7h worked, which is over the WA
-    // threshold, so the day carries a meal deduction.
+test("removing a shift preserves full pay without meal evidence and retires an evidenced deduction below the threshold", () => {
     const day = (id: string, from: string, to: string) => ({
         id,
         startTime: new Date(from),
@@ -207,16 +205,19 @@ test("deleting one of two shifts drops the meal deduction the day no longer earn
         mealSkipStatus: null,
         reviewReason: null,
     });
-    const both = settleDayPlan({
-        entries: [
-            // A SHORT gap: anything over PUNCHED_MEAL_GAP_MINUTES would count
-            // as the break already taken, and the day would owe nothing.
+    const entries = [
+            // A short gap does not establish a meal; an answer is still needed.
             day("a", "2026-09-01T15:00:00Z", "2026-09-01T19:00:00Z"),
             day("b", "2026-09-01T19:10:00Z", "2026-09-01T22:10:00Z"),
-        ],
-    });
+        ];
+    const unanswered = settleDayPlan({ entries });
+    assert.equal(unanswered.reduce((sum, row) => sum + row.mealDeductionHours, 0), 0);
+    assert.equal(unanswered.reduce((sum, row) => sum + row.paidHours, 0), 7);
+    assert.equal(unanswered[1].mealOutcome, "MEAL_REVIEW");
+    assert.equal(unanswered[1].needsReview, true);
+    const both = settleDayPlan({ entries, closing: { id: "b", mealSkipped: false } });
     const deductedTogether = both.reduce((sum, row) => sum + row.mealDeductionHours, 0);
-    assert.ok(deductedTogether > 0, "7 worked hours earn a meal deduction");
+    assert.equal(deductedTogether, 0.5, "affirmative meal evidence permits the deduction");
 
     // Now shift "b" is deleted. What is LEFT is 4 hours, under the threshold —
     // so the deduction must come off. Without a re-settle the surviving row

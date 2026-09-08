@@ -937,10 +937,23 @@ test("the collection order alternates so neither side starves", async () => {
 
 test("a cursor store that fails never breaks the run", async () => {
     const { automationSettingCursorStore } = await import("../src/lib/quickbooks-payments");
-    // No database in unit tests: the real store must swallow that and report
-    // "no cursor" rather than throwing into the sync.
-    assert.equal(await automationSettingCursorStore.get("nope"), null);
-    await automationSettingCursorStore.set("nope", "value"); // must not throw
+    // Explicitly fail both persistence operations: a reachable developer/test
+    // database must not turn this outage test into a real read and write.
+    const previous = (globalThis as any).prisma;
+    const calls: string[] = [];
+    (globalThis as any).prisma = {
+        automationSetting: {
+            findUnique: async () => { calls.push("get"); throw new Error("test database unavailable"); },
+            upsert: async () => { calls.push("set"); throw new Error("test database unavailable"); },
+        },
+    };
+    try {
+        assert.equal(await automationSettingCursorStore.get("nope"), null);
+        await automationSettingCursorStore.set("nope", "value");
+        assert.deepEqual(calls, ["get", "set"]);
+    } finally {
+        (globalThis as any).prisma = previous;
+    }
 });
 
 

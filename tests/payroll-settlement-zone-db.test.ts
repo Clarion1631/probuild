@@ -29,6 +29,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
+import { MEAL_CONFIRMED_NOTE } from "../src/lib/wa-breaks";
 
 const databaseUrl = process.env.PAYROLL_LOCK_TEST_URL;
 const skip = !databaseUrl && "set PAYROLL_LOCK_TEST_URL to a disposable PostgreSQL URL";
@@ -64,12 +65,9 @@ const FIXTURES = [
         outOfPeriodLocalDay: "2026-08-23",
         outOfPeriodHours: 8,
         localSettled: { mealOutcome: "AUTO_DEDUCTED", durationHours: 7.5, mealDeductionHours: 0.5 },
-        // COINCIDENCE, recorded on purpose. The 1-hour gap between 23:30 and
-        // 00:30 reads as a punched meal, so the wider Pacific day happens to owe
-        // the same half hour. The rows it was computed from are still the wrong
-        // set — see the loadDayEntries test — and the next fixture is the same
-        // boundary with a gap too short to be a meal, where the money moves.
-        pacificSettled: { mealOutcome: "AUTO_DEDUCTED", durationHours: 7.5, mealDeductionHours: 0.5 },
+        // The incorrect zone combines sixteen hours and triggers additional-meal
+        // review. A long day must not manufacture a second automatic deduction.
+        pacificSettled: { mealOutcome: "MEAL_REVIEW", durationHours: 8, mealDeductionHours: 0 },
     },
     {
         name: "America/New_York, 00:30 Monday with no punched-meal gap before it",
@@ -82,9 +80,9 @@ const FIXTURES = [
         outOfPeriodLocalDay: "2026-08-23",
         outOfPeriodHours: 8,
         localSettled: { mealOutcome: "AUTO_DEDUCTED", durationHours: 7.5, mealDeductionHours: 0.5 },
-        // THE MONEY. Sixteen hours in one Pacific "day" owes a SECOND meal
-        // period, so the worker is docked a full hour instead of half of one.
-        pacificSettled: { mealOutcome: "AUTO_DEDUCTED", durationHours: 7, mealDeductionHours: 1 },
+        // Even with a short gap, sixteen merged hours require review, not an
+        // automatic second deduction. The correct local day remains eight hours.
+        pacificSettled: { mealOutcome: "MEAL_REVIEW", durationHours: 8, mealDeductionHours: 0 },
     },
     {
         name: "Asia/Tokyo, 00:30 Monday against a punch ending 23:30 Sunday",
@@ -106,7 +104,7 @@ const FIXTURES = [
 
 type Fixture = (typeof FIXTURES)[number];
 
-async function seed(db: PrismaClient, suffix: string, fixture: Fixture) {
+async function seed(db: PrismaClient, suffix: string, fixture: Fixture, mealConfirmed = false) {
     const email = `settle-zone-${suffix}@example.test`;
     await db.user.deleteMany({ where: { email } });
     const user = await db.user.create({
@@ -155,14 +153,15 @@ async function seed(db: PrismaClient, suffix: string, fixture: Fixture) {
         ] as const) {
             await db.$executeRawUnsafe(
                 `INSERT INTO "TimeEntry"
-                   ("id","userId","projectId","startTime","endTime","durationHours","shiftHours","mealOutcome","updatedAt")
-                 VALUES ($1,$2,$3,$4::timestamptz,$5::timestamptz,$6,$6,'DEFERRED',now())`,
+                   ("id","userId","projectId","startTime","endTime","durationHours","shiftHours","mealOutcome","reviewReason","updatedAt")
+                 VALUES ($1,$2,$3,$4::timestamptz,$5::timestamptz,$6,$6,'DEFERRED',$7,now())`,
                 id,
                 user.id,
                 projectId,
                 start,
                 end,
-                hours(start, end)
+                hours(start, end),
+                mealConfirmed && id === inPeriodId ? MEAL_CONFIRMED_NOTE : null
             );
         }
     };
@@ -225,11 +224,13 @@ for (const fixture of FIXTURES) {
         );
     });
 
-    test(`settlement uses the company zone — ${fixture.name}`, { skip }, async () => {
+    for (const mealConfirmed of [false, true]) {
+    test(`settlement uses the company zone with ${mealConfirmed ? "affirmative" : "missing"} meal evidence — ${fixture.name}`, { skip }, async () => {
         const { settleDay } = await import("../src/lib/wa-breaks-db");
         const { dayKeyInTimeZone } = await import("../src/lib/tz-date");
         const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
-        const seeded = await seed(db, `f${(suffixSeq += 1)}`, fixture);
+        const seeded = await seed(db, `f${(suffixSeq += 1)}`, fixture, mealConfirmed);
+        const fullPayReview = { mealOutcome: "MEAL_REVIEW", durationHours: 8, mealDeductionHours: 0 };
 
         try {
             const localKey = dayKeyInTimeZone(new Date(fixture.inPeriodStart), fixture.zone);
@@ -243,9 +244,11 @@ for (const fixture of FIXTURES) {
             );
             assert.deepEqual(
                 await seeded.read(seeded.inPeriodId),
-                fixture.localSettled,
+                mealConfirmed ? fixture.localSettled : fullPayReview,
                 "the Monday punch is settled over the Monday alone"
             );
+            const localRow = await db.timeEntry.findUniqueOrThrow({ where: { id: seeded.inPeriodId }, select: { needsReview: true } });
+            assert.equal(localRow.needsReview, !mealConfirmed, "missing evidence is paid and flagged; an affirmative meal is settled");
             const outAfterFix = await seeded.read(seeded.outOfPeriodId);
             assert.equal(outAfterFix.mealOutcome, "DEFERRED", "and the Sunday punch is not touched at all");
             assert.equal(outAfterFix.durationHours, fixture.outOfPeriodHours, "its paid hours are exactly as seeded");
@@ -255,7 +258,7 @@ for (const fixture of FIXTURES) {
             await settleDay(seeded.user.id, pacificKey, null, PACIFIC);
             assert.deepEqual(
                 await seeded.read(seeded.inPeriodId),
-                fixture.pacificSettled,
+                mealConfirmed ? fixture.pacificSettled : fullPayReview,
                 "settling under the Pacific key computes the WA meal rule over both local days"
             );
         } finally {
@@ -263,6 +266,7 @@ for (const fixture of FIXTURES) {
             await db.$disconnect().catch(() => {});
         }
     });
+    }
 
     test(`loadDayEntries sees one local day — ${fixture.name}`, { skip }, async () => {
         // The other zone-sensitive filter on this path: at clock-out the meal

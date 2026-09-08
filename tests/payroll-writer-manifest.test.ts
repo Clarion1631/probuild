@@ -107,11 +107,11 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "guarded",
         why: "the geofence telemetry branch — offsiteMs/isOffsite/lastLocationCheck touch no hours, cost or readiness flag, but it is still routed through withPayrollWriteTx (entryIds: [id]) so it cannot become a hole later without someone deliberately removing the wrapper",
     },
-    "app/api/time-entries/[id]/route.ts:604::updateMany": {
+    "app/api/time-entries/[id]/route.ts:598::updateMany": {
         kind: "guarded",
         why: "the PATCH edit claim, inside withPayrollWriteTx with a compare-and-set on updatedAt",
     },
-    "app/api/time-entries/[id]/route.ts:624::update": {
+    "app/api/time-entries/[id]/route.ts:618::update": {
         kind: "guarded",
         why: "the settlement-failure flag, written inside the same locked edit transaction",
     },
