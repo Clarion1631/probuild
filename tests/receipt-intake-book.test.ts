@@ -652,6 +652,23 @@ test("QBO business-rule faults are TERMINAL, never retried", async () => {
     }
 });
 
+test("duplicate candidate parks v2 with QBO ids, no sent mark and no Expense", async () => {
+    const r = recorder({createPurchase: async () => ({ok:false,reason:"duplicate-purchase-review",
+        candidates:[{id:"6761",date:"2024-09-08",amount:575,vendor:"Bigfoot",match:"same-month-day-other-year"}],
+        attachment:"already-attached"})});
+    assert.deepEqual(await bookReceipt(row(),r.deps), {
+        outcome:"needs-review",reason:"qbo-duplicate:6761:already-attached",releaseStrongKey:true,
+    });
+    assert.deepEqual(r.sendMarks,[]);
+    assert.deepEqual(r.expenses,[]);
+});
+
+test("unknown earlier create parks v2 with source ids without attempting another send", async () => {
+    const r = recorder({createPurchase:async()=>({ok:false,reason:"duplicate-create-pending",pendingFileIds:["capture-A"]})});
+    assert.deepEqual(await bookReceipt(row(),r.deps),{outcome:"needs-review",reason:"qbo-create-pending:capture-A",releaseStrongKey:true});
+    assert.deepEqual(r.sendMarks,[]);assert.deepEqual(r.expenses,[]);
+});
+
 test("EVERY ok:false happens before the create, so all of them RELEASE the key", async () => {
     // The list is exhaustive on purpose: project-not-matched, missing-vendor,
     // invalid-date, amount-mismatch, duplicate-name and the overhead cases are

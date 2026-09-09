@@ -696,7 +696,12 @@ function processSingleFile(file, ctx, archive, needsReview) {
           // attachment, bank-match ready). Falls back to the legacy email send
           // internally on any terminal decline; throws on transient failures so
           // this pass retries — see sendToQBOviaAPI.js.
-          sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment, fresh);
+          const pushOutcome = sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment, fresh);
+          if (pushOutcome && pushOutcome.parked) {
+            const reviewMsg = parkAlertMessage_("qboDuplicate", file, fresh, ctx, originalName, aiData);
+            parkWithAlert_(file, fresh, "qboDuplicate", reviewMsg.subject, reviewMsg.body, needsReview);
+            return; // The hold must not become emailed=true or enter the archive.
+          }
 
           fresh.emailed = true;
           setState(file, fresh);
@@ -812,6 +817,22 @@ function parkWithAlert_(file, state, reasonKey, subject, body, needsReview) {
  */
 function parkAlertMessage_(reasonKey, file, state, ctx, fileName, aiData) {
   const d = aiData || state.data || {};
+
+  if (reasonKey === "qboDuplicate") {
+    const review = state.qboDuplicateReview || {};
+    const candidates = (review.candidates || []).map(function(c) {
+      return "Purchase " + c.id + " | " + c.date + " | $" + Number(c.amount).toFixed(2);
+    }).join("\n");
+    return {
+      subject: "Receipt bot: possible QuickBooks duplicate — " + fileName,
+      body: '"' + fileName + '" (' + ctx.projectName + ') was held for review. No new Purchase was created.\n' +
+        "QuickBooks candidates (same amount and nearby date, or same month/day in another year):\n" + candidates + "\n" +
+        ((review.pendingFileIds || []).length ? "An earlier create has an UNKNOWN outcome; reconcile source file(s): " + review.pendingFileIds.join(", ") + "\n" : "") +
+        "Receipt attachment: " + (review.attachment || "not confirmed") + "\n" +
+        "Do not forward or enter this receipt again until these purchases have been reviewed.\n" +
+        'The file was moved to "' + NEEDS_REVIEW_NAME + '".'
+    };
+  }
 
   if (reasonKey === PARK_ZERO_TOTAL) {
     const zeroAiDate = normalizeDateStr(d.date);

@@ -77,6 +77,50 @@ test("a delivered digest returns 200 with the health payload", async () => {
     });
 });
 
+test("the daily digest delivers possible duplicate purchase IDs to email and Chat", async () => {
+    await withCronSecret(async () => {
+        const health: PipelineHealth = {
+            ...HEALTH,
+            ok: false,
+            reasons: ["possible-duplicate-purchases:1"],
+            qbo: {
+                ...HEALTH.qbo,
+                duplicatePurchases: {
+                    status: "ok",
+                    pairs: [{
+                        ids: ["6608", "6632"],
+                        amount: 1974.76,
+                        dates: ["2026-08-13", "2026-08-19"],
+                        vendors: ["Les Schwab <manual>", "Les Schwab"],
+                        match: "within-7-days",
+                    }],
+                },
+            },
+        };
+        let emailText = "";
+        let emailHtml = "";
+        let chatText = "";
+        const { GET } = handlers({
+            getHealth: async () => health,
+            getChatWebhook: () => "https://chat.example.test/fixture",
+            sendEmail: async (_to, subject, html, text) => {
+                assert.equal(subject, "Pipeline NEEDS ATTENTION");
+                emailText = text;
+                emailHtml = html;
+                return { success: true };
+            },
+            postChat: async (_webhook, text) => { chatText = text; return { sent: true }; },
+        });
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).ok, false);
+        assert.match(emailText, /Possible duplicate: QBO 6608.*QBO 6632.*\$1974\.76/);
+        assert.match(emailText, /same amount within 7 days/);
+        assert.match(emailHtml, /Les Schwab &lt;manual&gt;/);
+        assert.equal(chatText, emailText);
+    });
+});
+
 test("an unaccepted email is a 500 with reason email-not-accepted", async () => {
     await withCronSecret(async () => {
         const { GET } = handlers({ sendEmail: async () => ({ success: false }) });

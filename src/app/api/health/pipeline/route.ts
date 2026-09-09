@@ -4,7 +4,9 @@ import { getPipelineHealth } from "@/lib/pipeline-health";
 import { hasCronSecret } from "@/lib/cron-auth";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 30;
+// Auth runs before the health sweep; its bounded QBO probe may use 30s.
+// Leave room for the probe to return "unavailable" before the platform stops us.
+export const maxDuration = 60;
 
 /**
  * On-demand pipeline health: Intuit's status, how current the QBO sync and

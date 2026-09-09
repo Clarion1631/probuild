@@ -644,6 +644,17 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     }
 
     if (!result.ok) {
+        if (result.reason === "duplicate-create-pending") {
+            return {outcome:"needs-review",reason:`qbo-create-pending:${result.pendingFileIds.join(",")}`.slice(0,400),
+                releaseStrongKey:mayReleaseStrongKey(row,sent)};
+        }
+        if (result.reason === "duplicate-purchase-review") {
+            return {
+                outcome: "needs-review",
+                reason: `qbo-duplicate:${result.candidates.map(c => c.id).join(",")}:${result.attachment}`.slice(0, 400),
+                releaseStrongKey: mayReleaseStrongKey(row, sent),
+            };
+        }
         // Every ok:false reason is a deterministic refusal, and — this is the
         // part that was wrong — EVERY one of them is decided BEFORE qbCreateFn
         // runs: project-not-matched, missing-vendor, invalid-date,

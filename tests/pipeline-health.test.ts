@@ -20,6 +20,8 @@ import {
     runProbe,
     createLimiter,
     statementTimeoutRunner,
+    probeDuplicatePurchases,
+    QBO_DUPLICATE_PROBE_TIMEOUT_MS,
     PROBE_CONCURRENCY,
     BOOKED_PUSH_STATUSES,
     type PipelineHealth,
@@ -28,6 +30,7 @@ import {
     INTAKE_STAGING_STUCK_MINUTES,
     type ProbeRunner,
 } from "../src/lib/pipeline-health";
+import { QBBudgetExhaustedError, type QBTokens, type RouteDeadline } from "../src/lib/quickbooks";
 
 const NOW = Date.parse("2026-09-01T14:00:00.000Z");
 
@@ -74,6 +77,168 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
 
 test("a healthy snapshot is ok with no reasons", () => {
     assert.deepEqual(evaluatePipelineHealth(snapshot()), { ok: true, reasons: [] });
+});
+
+const possibleReceiptDuplicate = {
+    ids: ["6772", "6761"] as [string, string],
+    amount: 575,
+    dates: ["2026-09-08", "2024-09-08"] as [string, string],
+    vendors: ["Bigfoot Construction", "Bigfoot Concrete Pumping"] as [string, string],
+    match: "same-month-day-other-year" as const,
+};
+
+test("possible duplicate QBO purchases make pipeline health require review", () => {
+    const result = evaluatePipelineHealth(snapshot({
+        duplicatePurchases: { status: "ok", pairs: [possibleReceiptDuplicate] },
+    }));
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.reasons, ["possible-duplicate-purchases:1"]);
+});
+
+test("a failed duplicate purchase probe cannot masquerade as zero duplicates", () => {
+    const result = evaluatePipelineHealth(snapshot({
+        duplicatePurchases: { status: "error", reason: "timeout", pairs: [] },
+    }));
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.reasons, ["probe-failed:duplicatePurchases"]);
+});
+
+test("the digest lists both QBO IDs, dates and vendors as possible duplicates", () => {
+    const base = sampleHealth();
+    const { text } = formatPipelineDigest({
+        ...base,
+        qbo: { ...base.qbo, duplicatePurchases: { status: "ok", pairs: [possibleReceiptDuplicate] } },
+    });
+    assert.match(text, /Possible duplicate QBO purchases: 1/);
+    assert.match(text, /6772.*2026-09-08.*Bigfoot Construction/);
+    assert.match(text, /6761.*2024-09-08.*Bigfoot Concrete Pumping/);
+    assert.match(text, /\$575\.00/);
+    assert.match(text, /same month\/day in different years/);
+    assert.match(text, /Bookkeeper review required; no QBO transactions changed/);
+});
+
+test("the digest marks a failed duplicate probe unavailable and omits zero", () => {
+    const base = sampleHealth();
+    const { text } = formatPipelineDigest({
+        ...base,
+        qbo: { ...base.qbo, duplicatePurchases: { status: "error", reason: "timeout", pairs: [] } },
+    });
+    assert.match(text, /Possible duplicate QBO purchases: unavailable \(probe failed: timeout\)/);
+    assert.doesNotMatch(text, /Possible duplicate QBO purchases: 0/);
+});
+
+test("an unreadable duplicate vendor label cannot prevent the daily digest", () => {
+    const base = sampleHealth();
+    const { text } = formatPipelineDigest({
+        ...base,
+        qbo: {
+            ...base.qbo,
+            duplicatePurchases: {
+                status: "ok",
+                pairs: [{ ...possibleReceiptDuplicate, vendors: [42 as unknown as string, null] }],
+            },
+        },
+    });
+    assert.match(text, /QBO 6772.*vendor unavailable/);
+    assert.match(text, /QBO 6761.*vendor unavailable/);
+});
+
+const duplicateProbeTokens: QBTokens = { accessToken: "fixture", refreshToken: "fixture", realmId: "fixture" };
+
+test("duplicate probe uses fresh credentials and the same deadline for every QBO query", async () => {
+    let authDeadline: RouteDeadline | undefined;
+    let queries = 0;
+    const result = await probeDuplicatePurchases(new Date("2026-09-09T18:00:00Z"), {
+        getTokens: async deadline => { authDeadline = deadline; return duplicateProbeTokens; },
+        query: async <T,>(tokens: QBTokens, sql: string, deadline?: RouteDeadline): Promise<T[]> => {
+            queries++;
+            assert.strictEqual(tokens, duplicateProbeTokens);
+            assert.strictEqual(deadline, authDeadline);
+            assert.match(sql, /^SELECT .* FROM Purchase /i);
+            return [];
+        },
+    });
+    assert.equal(authDeadline?.budgetMs, 30_000);
+    assert.ok(queries > 0);
+    assert.deepEqual(result, { status: "ok", pairs: [] });
+});
+
+test("duplicate probe returns unavailable on auth failure without reading QBO", async () => {
+    let queries = 0;
+    const result = await probeDuplicatePurchases(new Date(), {
+        getTokens: async () => { throw new Error("auth unavailable"); },
+        query: async () => { queries++; return []; },
+    });
+    assert.equal(queries, 0);
+    assert.deepEqual(result, { status: "error", reason: "error", pairs: [] });
+});
+
+test("a hung auth probe times out and a late response cannot start a QBO read", async () => {
+    let finishAuth!: (tokens: QBTokens) => void;
+    let queries = 0;
+    const result = await probeDuplicatePurchases(new Date(), {
+        getTokens: () => new Promise(resolve => { finishAuth = resolve; }),
+        query: async () => { queries++; return []; },
+        timeoutMs: 10,
+    });
+    assert.deepEqual(result, { status: "error", reason: "timeout", pairs: [] });
+    finishAuth(duplicateProbeTokens);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(queries, 0);
+});
+
+test("a hung QBO duplicate query cannot hang the health endpoint", async () => {
+    const result = await probeDuplicatePurchases(new Date(), {
+        getTokens: async () => duplicateProbeTokens,
+        query: () => new Promise(() => {}),
+        timeoutMs: 20,
+    });
+    assert.deepEqual(result, { status: "error", reason: "timeout", pairs: [] });
+});
+
+test("a QBO duplicate query deadline failure is reported as timeout, not clean", async () => {
+    const result = await probeDuplicatePurchases(new Date(), {
+        getTokens: async () => duplicateProbeTokens,
+        query: async () => { throw new QBBudgetExhaustedError(); },
+    });
+    assert.deepEqual(result, { status: "error", reason: "timeout", pairs: [] });
+});
+
+test("health probe identifies the reported vendor/year drifts and the six-day Les Schwab bridge", async () => {
+    const purchase = (Id: string, TxnDate: string, TotalAmt: number, vendor: string, marked = true) => ({
+        Id, TxnDate, TotalAmt, EntityRef: { name: vendor }, PrivateNote: marked ? `[gtr-file:fixture-${Id}]` : "manual",
+    });
+    const rows = [
+        purchase("6729", "2026-09-03", 575, "Bigfoot Construction"),
+        purchase("6728", "2026-09-03", 575, "Bigfoot Concrete Pumping"),
+        purchase("6772", "2026-09-08", 575, "Bigfoot Construction"),
+        purchase("6761", "2024-09-08", 575, "Bigfoot Concrete Pumping"),
+        purchase("6555", "2026-07-30", 1974.76, "Les Schwab"),
+        purchase("6632", "2026-08-19", 1974.76, "Les Schwab"),
+        purchase("6608", "2026-08-13", 1974.76, "Les Schwab", false),
+        purchase("6718", "2026-08-19", 585, "BIA of Clark County", false),
+        purchase("6717", "2026-08-19", 585, "BIA of Washington"),
+    ];
+    const result = await probeDuplicatePurchases(new Date("2026-09-09T18:00:00Z"), {
+        getTokens: async () => duplicateProbeTokens,
+        query: async <T,>(_tokens: QBTokens, sql: string): Promise<T[]> => {
+            assert.match(sql, /^SELECT .* FROM Purchase /i);
+            const from = sql.match(/TxnDate >= '([^']+)'/)?.[1];
+            const to = sql.match(/TxnDate <= '([^']+)'/)?.[1];
+            assert.ok(from && to);
+            return rows.filter(row => row.TxnDate >= from && row.TxnDate <= to) as T[];
+        },
+    });
+    assert.equal(result.status, "ok");
+    const pairs = result.pairs.map(pair => pair.ids.join("/"));
+    for (const pair of ["6728/6729", "6761/6772", "6608/6632", "6717/6718"]) assert.ok(pairs.includes(pair), pair);
+    assert.ok(!pairs.includes("6555/6632"), "the 20-day pair is outside the specified rule");
+});
+
+test("health route gives the duplicate probe time to return its failure verdict", async () => {
+    const route = await import("../src/app/api/health/pipeline/route");
+    assert.ok(route.maxDuration * 1000 >= QBO_DUPLICATE_PROBE_TIMEOUT_MS + 10_000,
+        "platform timeout must leave time for authentication and serializing the probe result");
 });
 
 // ─── False green from a failed probe ────────────────────────────────────────

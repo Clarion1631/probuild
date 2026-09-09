@@ -935,7 +935,9 @@ export async function qbFetch(
 }
 
 /** Run a QBO SQL-ish query (https://developer.intuit.com/.../data-queries) */
-export async function qbQuery<T = any>(tokens: QBTokens, query: string, deadline?: RouteDeadline): Promise<T[]> {
+export async function qbQuery<T = any>(tokens: QBTokens, query: string, deadline?: RouteDeadline,
+    options: { expectedEntity?: string } = {},
+): Promise<T[]> {
     const url = `${QB_API_BASE}/${tokens.realmId}/query?query=${encodeURIComponent(query)}&minorversion=73`;
     const res = await qbTimedFetch(url, {
         qbDeadline: deadline,
@@ -946,6 +948,36 @@ export async function qbQuery<T = any>(tokens: QBTokens, query: string, deadline
     });
     if (!res.ok) throw await qboResponseError(res, "QB query");
     const data = await res.json();
+    if (options.expectedEntity) {
+        const response = data?.QueryResponse;
+        const entity = options.expectedEntity;
+        if (data?.Fault || !response || typeof response !== "object" || Array.isArray(response)) {
+            throw new QboMalformedResponseError("QBO query response is unreadable");
+        }
+        if (Object.keys(response).some(key => ![entity, "startPosition", "maxResults", "totalCount"].includes(key))) {
+            throw new QboMalformedResponseError("QBO query returned an unexpected collection");
+        }
+        if (Object.prototype.hasOwnProperty.call(response, entity)) {
+            if (!Array.isArray(response[entity])) throw new QboMalformedResponseError("QBO entity collection is unreadable");
+            const count = response[entity].length;
+            const requestedStart = Number(query.match(/\bSTARTPOSITION\s+(\d+)/i)?.[1] ?? 1);
+            const requestedSize = Number(query.match(/\bMAXRESULTS\s+(\d+)/i)?.[1] ?? 100);
+            if ((response.maxResults !== undefined && response.maxResults !== count) ||
+                (response.startPosition !== undefined && response.startPosition !== requestedStart) ||
+                (response.totalCount !== undefined && (!Number.isSafeInteger(response.totalCount) ||
+                    response.totalCount < requestedStart - 1 + count ||
+                    (count < requestedSize && response.totalCount > requestedStart - 1 + count)))) {
+                throw new QboMalformedResponseError("QBO query count does not match its entity collection");
+            }
+            return response[entity];
+        }
+        // QBO's empty result is QueryResponse: {} (possibly with zero counts).
+        // A missing collection alongside a positive/invalid count is NOT empty.
+        if ([response.maxResults, response.totalCount].some(n => n !== undefined && n !== 0)) {
+            throw new QboMalformedResponseError("QBO query omitted its entity collection");
+        }
+        return [];
+    }
     const response = data.QueryResponse || {};
     const key = Object.keys(response).find(k => Array.isArray(response[k]));
     return key ? response[key] : [];
