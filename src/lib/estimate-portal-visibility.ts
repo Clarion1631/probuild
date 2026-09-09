@@ -50,6 +50,13 @@ export function portalVisibleEstimateWhere(): Prisma.EstimateWhereInput {
     };
 }
 
+// There is deliberately no in-memory twin of this predicate. An earlier version
+// shipped one and it was already out of lockstep: SQL's three-valued logic makes
+// `privacy <> 'Private'` false for a NULL privacy, so the query hides such a row
+// while a JavaScript `!== "Private"` check would have shown it. Two copies of an
+// authorization rule that disagree on an edge case is how this gate got written
+// twice in the first place. Every call site composes the where-clause above.
+
 /**
  * The WRITE that makes the predicate above say yes.
  *
@@ -75,14 +82,7 @@ export function portalVisibleEstimateWhere(): Prisma.EstimateWhereInput {
 export function sentEstimateUpdateData(status: string): {
     sentAt: Date;
     status: string;
-    privacy: string;
+    privacy: "Shared";
 } {
     return { sentAt: new Date(), status, privacy: "Shared" };
 }
-
-// There is deliberately no in-memory twin of this predicate. An earlier version
-// shipped one and it was already out of lockstep: SQL's three-valued logic makes
-// `privacy <> 'Private'` false for a NULL privacy, so the query hides such a row
-// while a JavaScript `!== "Private"` check would have shown it. Two copies of an
-// authorization rule that disagree on an edge case is how this gate got written
-// twice in the first place. Every call site composes the where-clause above.
