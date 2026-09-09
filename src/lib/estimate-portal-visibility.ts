@@ -50,6 +50,36 @@ export function portalVisibleEstimateWhere(): Prisma.EstimateWhereInput {
     };
 }
 
+/**
+ * The WRITE that makes the predicate above say yes.
+ *
+ * Lives here, next to the gate, because the two are one rule read from opposite
+ * ends and they had already drifted: `sendEstimateToClient` stamped `sentAt` and
+ * the status and never touched `privacy`, while the AI estimate creator
+ * (lib/gpt-estimate.ts) deliberately writes new estimates as `privacy:
+ * "Private"` so AI pricing stays out of the portal until a human reviews it.
+ * Sending IS that review — it is the contractor choosing to share — but because
+ * "Private" is an absolute override up there, the "View & Sign Estimate" link in
+ * the email we had just sent landed on notFound() for the client. That is
+ * EST-00514, 2026-09-09: it reached a real client, five prod estimates were
+ * sitting in the same state, and no UI anywhere exposes a privacy toggle, so the
+ * contractor could not fix it either.
+ *
+ * So the send-stamp is one value, not three fields a caller assembles by hand:
+ * anything that marks an estimate as sent must also mark it as shared.
+ *
+ * `status` is passed in rather than computed here — the caller decides whether
+ * this send is a first send ("Sent") or a resend that must not walk an
+ * already-Approved/Invoiced estimate backwards.
+ */
+export function sentEstimateUpdateData(status: string): {
+    sentAt: Date;
+    status: string;
+    privacy: string;
+} {
+    return { sentAt: new Date(), status, privacy: "Shared" };
+}
+
 // There is deliberately no in-memory twin of this predicate. An earlier version
 // shipped one and it was already out of lockstep: SQL's three-valued logic makes
 // `privacy <> 'Private'` false for a NULL privacy, so the query hides such a row

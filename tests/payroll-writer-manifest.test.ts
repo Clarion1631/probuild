@@ -133,19 +133,19 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "exempt",
         why: "createInvoiceFromTimeEntries's claim: stamps invoiceId/invoicedAt only inside the invoice-creation transaction. Same reasoning as lib/billing-core.ts's exemption below — it changes no hours, no cost and no readiness flag, and every payroll writer already refuses an entry once it is billed",
     },
-    "lib/actions.ts:15469::updateMany": {
+    "lib/actions.ts:15476::updateMany": {
         kind: "guarded",
         why: "markTimeEntryReviewed's reprice-and-stamp claim, wrapped in withPayrollWrite with a compare-and-set on updatedAt",
     },
-    "lib/actions.ts:15657::updateMany": {
+    "lib/actions.ts:15664::updateMany": {
         kind: "guarded",
         why: "the meal-skip decision, wrapped in withPayrollWrite — it changes what the day's settlement owes",
     },
-    "lib/actions.ts:15731::updateMany": {
+    "lib/actions.ts:15738::updateMany": {
         kind: "guarded",
         why: "logistics routing: restoring an entry to its prior project, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs",
     },
-    "lib/actions.ts:15744::updateMany": {
+    "lib/actions.ts:15751::updateMany": {
         kind: "guarded",
         why: "logistics routing: routing an entry to a new project, wrapped in withPayrollWrite for the same reason as the restore above",
     },
