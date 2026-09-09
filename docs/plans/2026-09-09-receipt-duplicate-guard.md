@@ -42,7 +42,13 @@ historical Purchase to a particular caller.
    an attachment. Attach only with exactly one candidate and no existing
    Purchase attachment. Unreadable attachment rows/references or an incomplete
    lookup leave the image unconfirmed and do not upload. Multiple candidates
-   require human selection. No existing
+   require human selection. Matching unresolved create intents are checked even
+   when candidates are visible; either another source's pending create or this
+   source's unresolved create makes automatic attachment unsafe. Review and dry
+   run results retain both candidate QBO IDs and pending source IDs. The guard
+   saves complete compact ID lists in linked audit chunks, each below the audit
+   serializer's size limit; every chunk must persist before returning the hold.
+   No existing
    Purchase fields, accounting lines, dates, or vendors are changed.
 5. Return HTTP 409 to legacy callers so their 200/ok:false email fallback cannot
    double-book the held receipt. The Apps Script companion persists qboDuplicate,
@@ -107,7 +113,7 @@ Purchases are the same receipt. Repeated legitimate amounts also need review.
   build, the required independent codex-peer-review, and repository CI (including
   money-pipeline browser tests against disposable Postgres with QBO mocked).
 
-## Local verification results
+## Initial implementation verification (520c7cb0)
 
 - All four fixture dry runs held the receipt with zero write-side effects.
 - 485 focused tests passed. The final identity-query refusal correction also
@@ -123,3 +129,26 @@ Purchases are the same receipt. Repeated legitimate amounts also need review.
   contested findings remain. Final independent closure passed 16 mock-only
   checks, and the reviewer reran 28 guard/Apps Script tests successfully.
 - No live QBO transaction or attachment was created, edited, or deleted.
+
+## Review corrections
+
+The GitHub review found that visible QBO candidates suppressed the unresolved
+create-intent lookup. The guard now combines both sources of evidence and holds
+without attaching whenever a matching create is unresolved. Legacy responses,
+Apps Script parking, and v2 review reasons retain both kinds of identifier.
+
+Independent review also reproduced an audit-size boundary: rich candidate data
+could exceed the generic serializer's 4,000-character budget. The guard now saves
+complete compact identifier lists in linked chunks of at most 3,500 characters,
+with a review ID, chunk index/count, and total candidate/pending counts. Every
+chunk must persist before a hold returns or an attachment is attempted. A failed
+chunk aborts safely; v2 retains its complete queue reason whenever it fits.
+
+- 457 focused producer, intake, legacy, health, and digest tests passed with no
+  skips. Regressions include the actual audit serializer and a later-chunk write
+  failure; all external services are mocked.
+- Standalone TypeScript checking passed.
+- Production build passed after the final source change, using only test values
+  and an unreachable dummy database.
+- Independent CLI closure completed successfully, including 188 isolated tests
+  and audit-boundary checks. No critical, important, or contested findings remain.

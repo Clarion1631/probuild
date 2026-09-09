@@ -645,7 +645,15 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
 
     if (!result.ok) {
         if (result.reason === "duplicate-create-pending") {
-            return {outcome:"needs-review",reason:`qbo-create-pending:${result.pendingFileIds.join(",")}`.slice(0,400),
+            const pendingIds = result.pendingFileIds.join(",");
+            const candidateIds = result.candidates.map(c => c.id).join(",");
+            // Keep both kinds of evidence visible within the queue reason's limit.
+            // The durable guard event retains the complete lists.
+            const completeReason = `qbo-create-pending:${pendingIds}${candidateIds ? `;qbo-duplicate:${candidateIds}` : ""}`;
+            const reason = completeReason.length > 400 && candidateIds
+                ? `qbo-create-pending:${pendingIds.slice(0,180)};qbo-duplicate:${candidateIds.slice(0,180)}`
+                : completeReason;
+            return {outcome:"needs-review",reason:reason.slice(0,400),
                 releaseStrongKey:mayReleaseStrongKey(row,sent)};
         }
         if (result.reason === "duplicate-purchase-review") {

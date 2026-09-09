@@ -95,3 +95,17 @@ test("a definite first-attempt refusal retains the existing email route", () => 
     assert.equal(h.state().qboRoute, "email");
     assert.equal(h.state().parkReason, undefined);
 });
+
+test("a mixed duplicate hold preserves both kinds of evidence in state and the review notice", () => {
+    const h=harness();
+    h.context.UrlFetchApp.fetch=()=>({getResponseCode:()=>409,getContentText:()=>JSON.stringify({
+        ok:false,reason:"duplicate-create-pending",reviewRequired:true,pendingFileIds:["capture-A"],
+        candidates:[{id:"6761",date:"2024-09-08",amount:575}],
+    })});
+    assert.equal(h.send().parked,true);
+    assert.deepEqual(Array.from(h.state().qboDuplicateReview.pendingFileIds),["capture-A"]);
+    assert.equal(h.state().qboDuplicateReview.candidates[0].id,"6761");
+    h.context.processSingleFile(h.file,{projectName:"Test"},"archive","review");
+    assert.match(h.effects.notices[0],/Purchase 6761/);assert.match(h.effects.notices[0],/UNKNOWN outcome.*capture-A/);
+    assert.deepEqual(h.effects.moves,["review"]);assert.equal(h.effects.emails,0);assert.equal(h.state().emailed,undefined);
+});

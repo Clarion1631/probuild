@@ -316,3 +316,109 @@ test("unreadable attachment rows cannot prove a candidate has no image", async (
    assert.equal(effects.uploads,0);
  }
 });
+
+test("visible candidates never receive an attachment while a matching create is unresolved", async () => {
+ for (const fileId of ["capture-A", input().fileId]) {
+   const {deps,effects}=setup([candidate()]);
+   const pending={fileId,date:"2026-09-08",amountCents:57500};
+   await deps.createIntents!.put(tokens.realmId,pending);
+   const result=await createQBReceiptPurchase(tokens,input(),deps);
+   assert.equal(effects.uploads,0,"an unresolved create makes the visible candidate an unsafe attachment destination");
+   assert.ok(!result.ok&&result.reason==="duplicate-create-pending");
+   assert.deepEqual(result.pendingFileIds,[fileId]);
+   assert.deepEqual((result as any).candidates.map((c:any)=>c.id),["6761"]);
+   assert.deepEqual(effects.reviews[0].pendingFileIds,[fileId]);
+   assert.deepEqual(effects.reviews[0].candidates.map((c:any)=>c.id),["6761"]);
+   assert.deepEqual(await deps.createIntents!.list(tokens.realmId),[pending]);
+   assert.equal(effects.creates+effects.ensures,0);
+   assert.equal(effects.queries.some(q=>/FROM attachable/i.test(q)),false);
+ }
+});
+
+test("mixed duplicate dry run preserves visible and pending evidence without writes", async () => {
+ for (const fileId of ["capture-A",input().fileId]) {
+   const {deps,effects}=setup([candidate()]);
+   await deps.createIntents!.put(tokens.realmId,{fileId,date:"2026-09-08",amountCents:57500});
+   const result=await createQBReceiptPurchase(tokens,input({dryRun:true}),deps);
+   assert.ok(!result.ok&&result.reason==="dry-run"&&result.action==="needs-review");
+   assert.deepEqual(result.pendingFileIds,[fileId]);
+   assert.deepEqual(result.candidates.map(c=>c.id),["6761"]);
+   assert.equal(effects.creates+effects.uploads+effects.ensures+effects.reviews.length+effects.locks.length,0);
+   assert.equal((await deps.createIntents!.list(tokens.realmId)).length,1);
+ }
+});
+
+test("legacy mixed duplicate hold and audit retain both QBO and unresolved source ids", async () => {
+ const {deps,effects}=setup([candidate()]);
+ await deps.createIntents!.put(tokens.realmId,{fileId:"capture-A",date:"2026-09-08",amountCents:57500});
+ const events:any[]=[];
+ const h=createQboReceiptCreateHandlers({getIngestSecret:()=>"secret",isPushEnabled:()=>true,isPushPaused:async()=>false,
+   getFreshTokens:async()=>tokens,logEvent:async e=>{events.push(e)},createPurchase:async(t,i,d)=>createQBReceiptPurchase(t,i,deps,d)});
+ const res=await h.POST(new Request("http://test",{method:"POST",headers:{"x-ingest-key":"secret"},body:JSON.stringify(input())}));
+ assert.equal(res.status,409);const body=await res.json();
+ assert.equal(body.reviewRequired,true);assert.equal(body.retry,false);
+ assert.deepEqual(body.pendingFileIds,["capture-A"]);
+ assert.deepEqual(body.candidates.map((c:any)=>c.id),["6761"]);
+ assert.deepEqual(events[0].detail.pendingFileIds,["capture-A"]);
+ assert.deepEqual(events[0].detail.candidates.map((c:any)=>c.id),["6761"]);
+ assert.equal(effects.creates+effects.uploads+effects.ensures,0);
+});
+
+test("an unreadable intent store cannot be skipped merely because a candidate is visible", async () => {
+ const {deps,effects}=setup([candidate()]);
+ deps.createIntents!.list=async()=>{throw new Error("intent evidence unavailable")};
+ await assert.rejects(createQBReceiptPurchase(tokens,input(),deps),/intent evidence unavailable/);
+ assert.equal(effects.creates+effects.uploads+effects.ensures+effects.reviews.length,0);
+});
+
+test("an unrelated pending create does not prevent attaching to a sole visible candidate", async () => {
+ const {deps,effects}=setup([candidate()]);
+ const pending={fileId:"unrelated-source",date:"2026-06-01",amountCents:57500};
+ await deps.createIntents!.put(tokens.realmId,pending);
+ const result=await createQBReceiptPurchase(tokens,input(),deps);
+ assert.ok(!result.ok&&result.reason==="duplicate-purchase-review");
+ assert.equal(result.attachment,"attached");assert.equal(effects.uploads,1);assert.equal(effects.creates,0);
+ assert.deepEqual(await deps.createIntents!.list(tokens.realmId),[pending]);
+});
+
+test("mixed review audit keeps every candidate and pending id through the real serializer", async () => {
+ for (const [candidateCount,pendingCount] of [[40,1],[100,80]]) {
+   const rows=Array.from({length:candidateCount},(_,i)=>candidate(String(800000000+i)));
+   const {deps,effects}=setup(rows);
+   const pendingIds=Array.from({length:pendingCount},(_,i)=>`pending-source-${i.toString().padStart(3,"0")}-${"x".repeat(30)}`);
+   for (const fileId of pendingIds) await deps.createIntents!.put(tokens.realmId,{fileId,date:"2026-09-08",amountCents:57500});
+   delete deps.recordDuplicateReview;
+   const saved:any[]=[];
+   const original=(globalThis as any).prisma;
+   (globalThis as any).prisma={automationEvent:{create:async(args:any)=>{saved.push(args.data);return args.data}}};
+   try { await createQBReceiptPurchase(tokens,input(),deps); }
+   finally { (globalThis as any).prisma=original; }
+   const details=saved.map(event=>JSON.parse(event.detail));
+   const persistedCandidates=details.flatMap(d=>d.candidateIds??(Array.isArray(d.candidates)?d.candidates.map((c:any)=>c.id):[]));
+   const persistedPending=details.flatMap(d=>Array.isArray(d.pendingFileIds)?d.pendingFileIds:[]);
+   assert.deepEqual(persistedCandidates,rows.map(r=>r.Id),"every candidate id must remain structured and recoverable");
+   assert.deepEqual(persistedPending,pendingIds,"every pending source id must remain recoverable");
+   assert.equal(new Set(details.map(d=>d.reviewId)).size,1);
+   assert.ok(details[0].reviewId);
+   assert.deepEqual(details.map(d=>d.chunkIndex),details.map((_d:any,i:number)=>i+1));
+   assert.ok(details.every(d=>d.chunkCount===details.length&&d.candidateCount===candidateCount&&d.pendingCount===pendingCount));
+   assert.ok(saved.every(event=>event.detail.length<=4000));
+   assert.equal(effects.creates+effects.uploads+effects.ensures,0);
+ }
+});
+
+test("failure to persist a later evidence chunk prevents the review response", async () => {
+ const {deps,effects}=setup([candidate()]);
+ for(let i=0;i<100;i++)await deps.createIntents!.put(tokens.realmId,{fileId:`source-${i}-${"x".repeat(40)}`,date:"2026-09-08",amountCents:57500});
+ delete deps.recordDuplicateReview;
+ let writes=0;
+ const original=(globalThis as any).prisma;
+ (globalThis as any).prisma={automationEvent:{create:async(args:any)=>{
+   if(++writes===2)throw new Error("second chunk unavailable");
+   return args.data;
+ }}};
+ try { await assert.rejects(createQBReceiptPurchase(tokens,input(),deps),/second chunk unavailable/); }
+ finally { (globalThis as any).prisma=original; }
+ assert.equal(writes,2);
+ assert.equal(effects.creates+effects.uploads+effects.ensures,0);
+});

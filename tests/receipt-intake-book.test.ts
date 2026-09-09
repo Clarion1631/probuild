@@ -664,9 +664,31 @@ test("duplicate candidate parks v2 with QBO ids, no sent mark and no Expense", a
 });
 
 test("unknown earlier create parks v2 with source ids without attempting another send", async () => {
-    const r = recorder({createPurchase:async()=>({ok:false,reason:"duplicate-create-pending",pendingFileIds:["capture-A"]})});
+    const r = recorder({createPurchase:async()=>({ok:false,reason:"duplicate-create-pending",pendingFileIds:["capture-A"],candidates:[]})});
     assert.deepEqual(await bookReceipt(row(),r.deps),{outcome:"needs-review",reason:"qbo-create-pending:capture-A",releaseStrongKey:true});
     assert.deepEqual(r.sendMarks,[]);assert.deepEqual(r.expenses,[]);
+});
+
+test("mixed duplicate review keeps visible QBO ids and pending source ids in the v2 reason", async () => {
+    const r = recorder({createPurchase:async()=>({ok:false,reason:"duplicate-create-pending",pendingFileIds:["capture-A"],
+        candidates:[{id:"6761",date:"2024-09-08",amount:575,vendor:"Bigfoot",match:"same-month-day-other-year"}]})});
+    const result=await bookReceipt(row(),r.deps);
+    assert.equal(result.outcome,"needs-review");
+    if(result.outcome!=="needs-review")return;
+    assert.match(result.reason,/capture-A/);assert.match(result.reason,/6761/);
+    assert.deepEqual(r.sendMarks,[]);assert.deepEqual(r.expenses,[]);
+});
+
+test("a mixed review reason uses its full budget before shortening candidate evidence", async () => {
+    const candidates=Array.from({length:40},(_,i)=>({id:String(10000+i),date:"2026-08-03",amount:364.98,
+        vendor:"Bigfoot Concrete Pumping",match:"within-7-days" as const}));
+    const r=recorder({createPurchase:async()=>({ok:false,reason:"duplicate-create-pending",pendingFileIds:["capture-A"],candidates})});
+    const result=await bookReceipt(row(),r.deps);
+    assert.equal(result.outcome,"needs-review");
+    if(result.outcome!=="needs-review")return;
+    assert.ok(result.reason.length<=400);
+    for(const candidate of candidates)assert.ok(result.reason.includes(candidate.id),`${candidate.id} fits in the queue reason`);
+    assert.match(result.reason,/capture-A/);
 });
 
 test("EVERY ok:false happens before the create, so all of them RELEASE the key", async () => {

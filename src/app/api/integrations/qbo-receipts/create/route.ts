@@ -340,7 +340,7 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 }
                 if (!result.ok && result.reason === "duplicate-create-pending") {
                     await logEvent(pushEventFromOutcome(input,{status:"needs-review",reason:result.reason},
-                        {pendingFileIds:result.pendingFileIds}));
+                        {pendingFileIds:result.pendingFileIds,candidates:result.candidates}));
                     return NextResponse.json({...result,reviewRequired:true,retry:false},{status:409});
                 }
                 if (!result.ok && result.reason === "duplicate-purchase-review") {

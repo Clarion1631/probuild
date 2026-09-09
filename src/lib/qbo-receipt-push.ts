@@ -20,7 +20,7 @@
  * the Vendor entity. createQBReceiptPurchase's dependency-injection shape
  * mirrors syncQboExpenses in ./qbo-expense-sync.ts.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { prisma } from "./prisma";
 import { automationEventData } from "./automation-events";
 import { findPurchaseDuplicateCandidates, matchDates, type DuplicatePurchaseCandidate } from "./qbo-purchase-duplicates";
@@ -311,7 +311,7 @@ export interface ExistingPurchaseCheck {
 }
 
 export type CreateQBReceiptPurchaseResult =
-    | { ok: false; reason: "duplicate-create-pending"; pendingFileIds: string[] }
+    | { ok: false; reason: "duplicate-create-pending"; pendingFileIds: string[]; candidates: DuplicatePurchaseCandidate[] }
     | { ok: false; reason: "duplicate-purchase-review"; candidates: DuplicatePurchaseCandidate[]; attachment: ReceiptAttachmentStatus }
     | { ok: false; reason: "dry-run"; action: "would-create" | "already-exists" | "needs-review"; candidates: DuplicatePurchaseCandidate[]; pendingFileIds?: string[] }
     | {
@@ -343,11 +343,56 @@ export interface QboReceiptProjectCandidate {
     name: string;
 }
 
+interface ReceiptDuplicateReview {
+    fileId: string;
+    realmId: string;
+    candidates: DuplicatePurchaseCandidate[];
+    pendingFileIds?: string[];
+}
+
+/** Keep identifiers below the audit serializer's 4,000-character clipping limit. */
+function duplicateReviewDetails(record: ReceiptDuplicateReview) {
+    const pendingFileIds = record.pendingFileIds ?? [];
+    const base = {
+        fileId: record.fileId, realmId: record.realmId, reviewId: randomUUID(),
+        candidateCount: record.candidates.length, pendingCount: pendingFileIds.length,
+    };
+    const emptyChunk = () => ({
+        ...base, chunkIndex: Number.MAX_SAFE_INTEGER, chunkCount: Number.MAX_SAFE_INTEGER,
+        candidateIds: [] as string[], pendingFileIds: [] as string[],
+    });
+    const chunks: ReturnType<typeof emptyChunk>[] = [];
+    let chunk = emptyChunk();
+    // Reserve room for linkage/counts while calculating boundaries. Replacing
+    // the placeholder numbers with actual indices only makes each chunk smaller.
+    for (const [field, ids] of [
+        ["candidateIds", record.candidates.map(c => c.id)],
+        ["pendingFileIds", pendingFileIds],
+    ] as const) {
+        for (const id of ids) {
+            chunk[field].push(id);
+            if (JSON.stringify(chunk).length <= 3500) continue;
+            chunk[field].pop();
+            if (!chunk.candidateIds.length && !chunk.pendingFileIds.length) {
+                throw new QboRetryableError("Receipt review identifiers exceed audit storage budget");
+            }
+            chunks.push(chunk);
+            chunk = emptyChunk();
+            chunk[field].push(id);
+            if (JSON.stringify(chunk).length > 3500) {
+                throw new QboRetryableError("Receipt review identifiers exceed audit storage budget");
+            }
+        }
+    }
+    chunks.push(chunk);
+    return chunks.map((part, index) => ({...part, chunkIndex:index+1, chunkCount:chunks.length}));
+}
+
 export interface QboReceiptPushDependencies {
     createIntents?: ReceiptCreateIntentStore;
     now?: () => Date;
     /** Durable evidence must land BEFORE attempting an attachment on a possible duplicate. */
-    recordDuplicateReview?: (record: { fileId: string; realmId: string; candidates: DuplicatePurchaseCandidate[]; pendingFileIds?: string[] }) => Promise<void>;
+    recordDuplicateReview?: (record: ReceiptDuplicateReview) => Promise<void>;
     qbQueryFn: <T = any>(tokens: QBTokens, query: string) => Promise<T[]>;
     qbCreateFn: (tokens: QBTokens, payload: Record<string, unknown>, requestId: string) => Promise<{ id: string }>;
     /**
@@ -1629,11 +1674,14 @@ async function createQBReceiptPurchaseUnderLock(
         throw error;
     }
     const receiptDate = input.date;
-    const unresolved = candidates.length ? [] : await intents.list(tokens.realmId);
+    // A visible Purchase does not resolve an unknown create for another capture.
+    // Read both evidence sources before choosing any attachment destination.
+    const unresolved = await intents.list(tokens.realmId);
     const ownIntent = unresolved.find(p => p.fileId === input.fileId);
     const pendingFileIds = unresolved
         .filter(p => p.fileId === input.fileId
-            ? p.amountCents !== totalCents || p.date !== receiptDate // Changed OCR cannot replay an unknown create.
+            ? candidates.length > 0 || p.amountCents !== totalCents || p.date !== receiptDate
+              // Changed OCR or another visible candidate makes a same-source replay ambiguous.
             : p.amountCents === totalCents && matchDates(receiptDate,p.date,deps.now?.() ?? new Date()))
         .map(p => p.fileId);
     if (input.dryRun === true) {
@@ -1641,18 +1689,25 @@ async function createQBReceiptPurchaseUnderLock(
             candidates, ...(pendingFileIds.length ? {pendingFileIds} : {}) };
     }
     if (candidates.length || pendingFileIds.length) {
-        const reason = candidates.length ? "duplicate-purchase-review" : "duplicate-create-pending";
+        const reason = pendingFileIds.length ? "duplicate-create-pending" : "duplicate-purchase-review";
         const record = { fileId: input.fileId, realmId: tokens.realmId, candidates, pendingFileIds };
         if (deps.recordDuplicateReview) await deps.recordDuplicateReview(record);
-        else await prisma.automationEvent.create({ data: automationEventData({
-            kind: "receipt-push", status: "needs-review", reason,
-            source: "purchase-guard", vendor: input.vendor, projectName: input.projectName,
-            amountCents: totalCents, docNumber, fileName: input.fileName, detail: record,
-        }) });
+        else {
+            // Every linked chunk must persist before the hold or an attachment.
+            // Rich candidate metadata can exceed the generic audit serializer's
+            // budget; these compact ID lists remain complete and machine-readable.
+            for (const detail of duplicateReviewDetails(record)) {
+                await prisma.automationEvent.create({ data: automationEventData({
+                    kind: "receipt-push", status: "needs-review", reason,
+                    source: "purchase-guard", vendor: input.vendor, projectName: input.projectName,
+                    amountCents: totalCents, docNumber, fileName: input.fileName, detail,
+                }) });
+            }
+        }
         console.warn("[receipt-duplicate-guard] held for review", {
             fileId: input.fileId, candidateIds: candidates.map(c => c.id), pendingFileIds,
         });
-        if (pendingFileIds.length) return {ok:false,reason:"duplicate-create-pending",pendingFileIds};
+        if (pendingFileIds.length) return {ok:false,reason:"duplicate-create-pending",pendingFileIds,candidates};
         let attachment: ReceiptAttachmentStatus = "skipped";
         // Same amount/date identifies CANDIDATES, not identity. Never select one
         // from multiple hits or create a second Purchase. No Purchase fields change.
