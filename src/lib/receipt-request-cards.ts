@@ -166,7 +166,7 @@ export function cardText(
         "Reply *in this thread*:",
         "• send a *photo* of the receipt",
         `• reply *"${example} Mueller Remodel"* to name the job for item ${example}`,
-        `• reply *"sign ${example}"* to sign a memo instead`,
+        `• type *@*, pick *Beverly* from the list, then *sign ${example}* to get a memo form to sign here (a typed @Beverly that is not picked from the list does not reach her)`,
         "",
     ];
     for (const item of items) {
