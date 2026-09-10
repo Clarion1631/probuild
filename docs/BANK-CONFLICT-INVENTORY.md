@@ -4,6 +4,12 @@ GET /api/integrations/bank-ledger/conflict-inventory requires the existing CRON_
 
 It compares exact canonical converter output for date, descriptor, cents and check number. Changed linked rows are separate. Duplicate IDs, missing source identity, missing observations, unconvertible rows, stored-only in-window rows and unsupported types (including unchanged unsupported types) are explicit. Missing GL identity rows include their row index/type/date/cents. Counts are source-specific and categories may describe overlapping evidence; do not sum them into a business denominator. The scope is parsed QBO GL, not complete bank eligibility or bank-side evidence. No row is classified safe to repair; no write, source entity read, job or notification occurs.
 
-Implemented by actual Fable 5.1, then Astra reviewed. Review converted unsupported test framework to repository node:test, made missing clearance fail closed, added missing-identity row details, explicit GL coverage wording and null counts on upstream failures. Model evidence and logs are private in beverly-live-handoff-20260909/deposit-implementation. The original larger Deposit implementation request timed out after 240 seconds without output; no Deposit repair code is included in this commit. Obtain actual full Deposit evidence before selecting that extension.
+## Validation
 
-Verification: 53 hermetic tests passed (12 inventory plus converter/diagnostic regressions). Shared root dependency client's generated Prisma schema is stale, so whole-repository tsc reports existing missing model/field errors; integration must run its normal build with freshly generated isolated client. No service/route type errors appeared in that run; test assertion typing was corrected afterwards. Root owns final integration build and deployment. No live reads or writes were performed by this worktree.
+Run the focused inventory and converter/diagnostic regressions:
+
+```sh
+npx tsx --test tests/bank-register-conflict-inventory.test.ts tests/bank-register-pull.test.ts tests/bank-conflict-diagnostic.test.ts
+```
+
+Run the standard unit suite and production build before deployment. Inventory is included in the standard unit runner. An authenticated GET verifies the deployed read path; it does not execute a refresh or financial job. Inspect `status`, source timestamps, coverage and every exception category before selecting a separately reviewed repair.
