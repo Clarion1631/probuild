@@ -6,8 +6,10 @@ import {
     type BankLedgerReconcileHandlerDependencies,
     type PersistedReconciliation,
     type ReconcileExceptionResult,
+    runReconcileChunk,
 } from "../src/app/api/integrations/bank-ledger/reconcile/route";
 import type { ReconcileLink } from "../src/lib/bank-ledger";
+import type { GuardedReconcileLink } from "../src/lib/bank-reconcile-guard";
 
 const SECRET = "test-secret";
 
@@ -509,5 +511,103 @@ test("persistLinksInChunks stops at an absolute deadline and reports the rest", 
         );
         assert.equal(result.linked.length, 0);
         assert.equal(result.remaining, 10);
+    });
+});
+
+test("runReconcileChunk: bank ledger epoch bumps BEFORE any row lock or link mutation, in the chunk's own transaction", async t => {
+    type GuardResult = { ok: true } | { ok: false; reason: string };
+
+    function fakeChunkEnv(guardResults: GuardResult[], options: { throwOnGuard?: unknown } = {}) {
+        const calls: string[] = [];
+        const tx = {
+            async $executeRawUnsafe(query: string) {
+                calls.push(query);
+                return 0;
+            },
+        };
+        let guardIndex = 0;
+        const io = {
+            async lockBankLineIdentity(t: typeof tx) {
+                assert.equal(t, tx, "same transaction");
+                calls.push("lockBankLineIdentity");
+            },
+            async bumpBankLedgerEpoch(t: typeof tx) {
+                assert.equal(t, tx, "the bump must be in the same transaction");
+                calls.push("bumpBankLedgerEpoch");
+            },
+            async guardAndLinkObservation(t: typeof tx, link: GuardedReconcileLink): Promise<GuardResult> {
+                assert.equal(t, tx);
+                calls.push(`guard:${link.observationId}`);
+                if (options.throwOnGuard !== undefined) throw options.throwOnGuard;
+                return guardResults[guardIndex++];
+            },
+            isUniqueConstraintError: (error: unknown) => error instanceof Error && error.message === "P2002",
+        };
+        return { calls, tx, io };
+    }
+
+    function links(...ids: string[]): GuardedReconcileLink[] {
+        return ids.map(id => ({ observationId: `o${id}`, bankLineId: `b${id}` })) as unknown as GuardedReconcileLink[];
+    }
+
+    await t.test("exact order: identity lock, epoch bump, then per-link savepoint/guard/release", async () => {
+        const env = fakeChunkEnv([{ ok: true }, { ok: true }]);
+        const result = await runReconcileChunk(env.tx, links("1", "2"), 3, env.io);
+        assert.deepEqual(env.calls, [
+            "lockBankLineIdentity",
+            "bumpBankLedgerEpoch",
+            'SAVEPOINT "bank_ledger_reconcile_3_0"',
+            "guard:o1",
+            'RELEASE SAVEPOINT "bank_ledger_reconcile_3_0"',
+            'SAVEPOINT "bank_ledger_reconcile_3_1"',
+            "guard:o2",
+            'RELEASE SAVEPOINT "bank_ledger_reconcile_3_1"',
+        ]);
+        assert.deepEqual(result, { linked: ["o1", "o2"], exceptions: [] });
+    });
+
+    await t.test("an all-refused chunk still bumps exactly once, before the first guard, and rolls each link back to its savepoint", async () => {
+        const env = fakeChunkEnv([{ ok: false, reason: "stale-reconcile-plan" }, { ok: false, reason: "stale-reconcile-plan" }]);
+        const result = await runReconcileChunk(env.tx, links("1", "2"), 0, env.io);
+        assert.deepEqual(env.calls.filter(c => c === "bumpBankLedgerEpoch"), ["bumpBankLedgerEpoch"]);
+        assert.equal(env.calls.indexOf("bumpBankLedgerEpoch"), 1);
+        assert.ok(env.calls.indexOf("bumpBankLedgerEpoch") < env.calls.indexOf("guard:o1"));
+        assert.deepEqual(env.calls.slice(2), [
+            'SAVEPOINT "bank_ledger_reconcile_0_0"',
+            "guard:o1",
+            'ROLLBACK TO SAVEPOINT "bank_ledger_reconcile_0_0"',
+            'RELEASE SAVEPOINT "bank_ledger_reconcile_0_0"',
+            'SAVEPOINT "bank_ledger_reconcile_0_1"',
+            "guard:o2",
+            'ROLLBACK TO SAVEPOINT "bank_ledger_reconcile_0_1"',
+            'RELEASE SAVEPOINT "bank_ledger_reconcile_0_1"',
+        ]);
+        assert.deepEqual(result.linked, []);
+        assert.deepEqual(result.exceptions.map(e => e.reason), ["stale-reconcile-plan", "stale-reconcile-plan"]);
+    });
+
+    await t.test("a unique-index conflict rolls back only that link and is reported as bank-line-already-claimed", async () => {
+        const env = fakeChunkEnv([], { throwOnGuard: new Error("P2002") });
+        const result = await runReconcileChunk(env.tx, links("1"), 0, env.io);
+        assert.deepEqual(env.calls, [
+            "lockBankLineIdentity",
+            "bumpBankLedgerEpoch",
+            'SAVEPOINT "bank_ledger_reconcile_0_0"',
+            "guard:o1",
+            'ROLLBACK TO SAVEPOINT "bank_ledger_reconcile_0_0"',
+            'RELEASE SAVEPOINT "bank_ledger_reconcile_0_0"',
+        ]);
+        assert.deepEqual(result, { linked: [], exceptions: [{ observationId: "o1", bankLineId: "b1", reason: "bank-line-already-claimed" }] });
+    });
+
+    await t.test("any other error propagates so the whole chunk transaction (bump included) rolls back", async () => {
+        const env = fakeChunkEnv([], { throwOnGuard: new Error("transaction timeout") });
+        await assert.rejects(runReconcileChunk(env.tx, links("1"), 0, env.io), /transaction timeout/);
+        assert.deepEqual(env.calls, [
+            "lockBankLineIdentity",
+            "bumpBankLedgerEpoch",
+            'SAVEPOINT "bank_ledger_reconcile_0_0"',
+            "guard:o1",
+        ]);
     });
 });

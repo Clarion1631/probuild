@@ -28,6 +28,7 @@ import { dateOnlyInTimeZone } from "./tz-date";
 import { resolveCompanyTimeZone } from "./company-timezone";
 import { isCostCodeAllowedForProject } from "./project-phases";
 import { lockExpense } from "./expense-lock";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "./receipt-evidence-lock";
 import {
     assertPhaseOfProjectTx,
     lockAttributionParents,
@@ -545,6 +546,11 @@ export interface QboExpenseWrite {
 
 type ExpenseTransaction = {
     $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
+    // Structural (not Prisma metadata types) so the canonical helpers in
+    // receipt-evidence-lock.ts — `lockReceiptEvidence` ($executeRaw) and
+    // `bumpReceiptEvidenceEpoch` ($queryRaw) — accept this client as-is.
+    $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<unknown>;
+    $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>;
     expense: {
         findUnique(args: {
             where: { qbPurchaseId: string };
@@ -980,7 +986,22 @@ export async function upsertQboExpense(
     write: QboExpenseWrite,
 ): Promise<QboExpenseUpsertResult> {
     return client.$transaction(async transaction => {
+        // The receipt-evidence lock is the OUTERMOST lock (see
+        // receipt-evidence-lock.ts): taken FIRST, before the per-purchase lock.
+        // An Expense row is receipt evidence the missing-receipt sweep reads.
+        await lockReceiptEvidence(transaction);
         await lockQboExpense(transaction, write.qbPurchaseId);
+        // Bumped AT MOST ONCE per transaction, and only after a write that
+        // actually changed the Expense (a create, a successful fill, or a
+        // CAS/retry that matched). A refused fill, a zero-row CAS, a missing
+        // row and a no-op plan never bump. An exception after a bump rolls the
+        // bump back with the write, because both live in this transaction.
+        let mutated = false;
+        const noteExpenseMutated = async () => {
+            if (mutated) return;
+            mutated = true;
+            await bumpReceiptEvidenceEpoch(transaction);
+        };
         const existing = await transaction.expense.findUnique({
             where: { qbPurchaseId: write.qbPurchaseId },
             select: {
@@ -1100,6 +1121,7 @@ export async function upsertQboExpense(
             await transaction.expense.create({
                 data: { ...write, projectId: pair.projectId },
             });
+            await noteExpenseMutated();
             return "imported";
         }
 
@@ -1163,10 +1185,13 @@ export async function upsertQboExpense(
                 );
                 attributionFillSkipped = true;
             } else {
-                await transaction.expense.updateMany({
+                const filled = await transaction.expense.updateMany({
                     where: { id: existing.id, projectId: null },
                     data: { projectId: pair.projectId, estimateId: pair.estimateId },
                 });
+                // A successful fill IS a mutation, even if the tax/amount CAS
+                // below goes on to match zero rows.
+                if (filled.count > 0) await noteExpenseMutated();
             }
         }
         // CAS when the client supports it: a tax correction committing between
@@ -1178,7 +1203,10 @@ export async function upsertQboExpense(
             where: casWhere(existing),
             data: plan.data,
         });
-        if (cas.count > 0) return settled("updated");
+        if (cas.count > 0) {
+            await noteExpenseMutated();
+            return settled("updated");
+        }
 
         // The row moved between the read and the write despite the lock — i.e.
         // a writer that does NOT take it (a script, a migration, a path nobody
@@ -1203,6 +1231,7 @@ export async function upsertQboExpense(
         });
         // Still contended. Leaving it is correct: the sync's facts are
         // recoverable on the next run, a discarded tax correction is not.
+        if (retry.count > 0) await noteExpenseMutated();
         return settled(retry.count > 0 ? "updated" : "unchanged");
     });
 }
@@ -1221,6 +1250,8 @@ export async function deactivateQboExpense(
     removal: QboExpenseRemovalWrite,
 ): Promise<QboExpenseRemovalResult> {
     return client.$transaction(async transaction => {
+        // Outermost lock first — same order as upsertQboExpense.
+        await lockReceiptEvidence(transaction);
         await lockQboExpense(transaction, removal.qbPurchaseId);
         const existing = await transaction.expense.findUnique({
             where: { qbPurchaseId: removal.qbPurchaseId },
@@ -1307,6 +1338,9 @@ export async function deactivateQboExpense(
                 needsTaxReview: false,
             },
         });
+        // The row changed under the evidence lock; the sweep must re-read.
+        // Every early return above is a no-op and does not bump.
+        await bumpReceiptEvidenceEpoch(transaction);
         return "removed";
     });
 }

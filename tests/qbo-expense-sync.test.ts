@@ -647,9 +647,16 @@ function createFakePrisma(
         },
     };
     let lockTail: Promise<void> = Promise.resolve();
+    // Every advisory lock and epoch bump, in the order the sync issued them:
+    // "receipt-evidence", "advisory:<key>", "epoch-bump".
+    const lockLog: string[] = [];
+    // The fake receiptEvidenceEpoch row (AutomationSetting).
+    const epoch = { value: 0 };
 
     return {
         rows,
+        lockLog,
+        epoch,
         // Exposed so a test can model a concurrent writer landing between
         // the read and the write.
         expense,
@@ -657,8 +664,14 @@ function createFakePrisma(
             async $transaction<T>(callback: (tx: {
                 expense: typeof expense;
                 $queryRawUnsafe: (query: string, qbPurchaseId: string) => Promise<unknown>;
+                $executeRaw: (query: TemplateStringsArray, ...values: unknown[]) => Promise<unknown>;
+                $queryRaw: <R = unknown>(query: TemplateStringsArray, ...values: unknown[]) => Promise<R>;
             }) => Promise<T>) {
                 let releaseLock: (() => void) | undefined;
+                // Rollback modelling: a thrown callback restores rows AND the
+                // epoch, exactly as the real transaction would.
+                const rowsBefore = new Map([...rows].map(([key, row]) => [key, { ...row }]));
+                const epochBefore = epoch.value;
                 // RE-ENTRANT, like the real thing. `pg_advisory_xact_lock` is
                 // held for the whole transaction and taking it again inside the
                 // same one returns immediately — the sync now takes two (per
@@ -668,7 +681,27 @@ function createFakePrisma(
                 // have.
                 let heldByThisTransaction = false;
                 const transactionLock = {
+                    // `lockReceiptEvidence` — the canonical helper uses a tagged
+                    // template through $executeRaw.
+                    async $executeRaw(query: TemplateStringsArray, ..._values: unknown[]) {
+                        if (/pg_advisory_xact_lock\(hashtext\(/.test(query.join("?"))) {
+                            lockLog.push("receipt-evidence");
+                        }
+                        return 0;
+                    },
+                    // `bumpReceiptEvidenceEpoch` — the canonical upsert.
+                    async $queryRaw<R = unknown>(query: TemplateStringsArray, ..._values: unknown[]) {
+                        if (/INSERT INTO "AutomationSetting"/.test(query.join("?"))) {
+                            epoch.value += 1;
+                            lockLog.push("epoch-bump");
+                            return [{ value: String(epoch.value) }] as R;
+                        }
+                        return [] as R;
+                    },
                     async $queryRawUnsafe(query: string, ...args: unknown[]) {
+                        if (/pg_advisory_xact_lock/.test(query)) {
+                            lockLog.push(`advisory:${String(args[0])}`);
+                        }
                         // The estimate reads `lockEstimateAttribution` makes.
                         // The FOR SHARE row lock returns nothing; the read
                         // after it answers.
@@ -692,6 +725,11 @@ function createFakePrisma(
                 };
                 try {
                     return await callback({ expense, ...transactionLock });
+                } catch (error) {
+                    rows.clear();
+                    for (const [key, row] of rowsBefore) rows.set(key, row);
+                    epoch.value = epochBefore;
+                    throw error;
                 } finally {
                     releaseLock?.();
                 }
@@ -712,6 +750,112 @@ const WRITE: QboExpenseWrite = {
     description: "[QuickBooks import] Rough plumbing",
     status: "Reviewed",
 };
+
+test("upsert takes the receipt-evidence lock FIRST, before the per-purchase lock", async () => {
+    const fake = createFakePrisma();
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "imported");
+    assert.equal(fake.lockLog[0], "receipt-evidence");
+    assert.equal(fake.lockLog[1], "advisory:purchase-1");
+    // The create is a mutation: exactly one bump, after the locks.
+    assert.deepEqual(fake.lockLog.filter(entry => entry === "epoch-bump"), ["epoch-bump"]);
+    assert.equal(fake.epoch.value, 1);
+});
+
+test("upsert bumps the receipt-evidence epoch once per mutating transaction and never for a no-op", async () => {
+    const fake = createFakePrisma();
+    await upsertQboExpense(fake.client, WRITE);
+    assert.equal(fake.epoch.value, 1);
+
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "unchanged");
+    assert.equal(fake.epoch.value, 1, "a no-op plan does not bump");
+
+    const drifted = fake.rows.get("purchase-1")!;
+    fake.rows.set("purchase-1", { ...drifted, amount: 999 });
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "updated");
+    assert.equal(fake.epoch.value, 2, "a matched CAS bumps exactly once");
+});
+
+test("upsert does not bump when the CAS and its retry both match zero rows", async () => {
+    const fake = createFakePrisma([{ ...WRITE, id: "expense-1", amount: 999, receiptUrl: null }]);
+    // A writer that does not take the lock keeps moving the row: every
+    // predicate write misses.
+    fake.expense.updateMany = async () => ({ count: 0 });
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "unchanged");
+    assert.equal(fake.epoch.value, 0);
+    assert.equal(fake.rows.get("purchase-1")?.amount, 999);
+});
+
+test("upsert does not bump when the create is refused by the attribution race", async () => {
+    const fake = createFakePrisma([], new Map([["estimate-1", "project-2"]]));
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "skipped-attribution-race");
+    assert.equal(fake.epoch.value, 0);
+    assert.equal(fake.rows.size, 0);
+});
+
+test("upsert bumps once for a successful attribution fill even when the tax/amount CAS then matches nothing", async () => {
+    const fake = createFakePrisma([{ ...WRITE, id: "expense-1", projectId: null, receiptUrl: null }]);
+    const realUpdateMany = fake.expense.updateMany;
+    fake.expense.updateMany = async (args: Parameters<typeof realUpdateMany>[0]) => {
+        if ("projectId" in args.where) return realUpdateMany(args);
+        return { count: 0 };
+    };
+    const result = await upsertQboExpense(fake.client, WRITE);
+    assert.equal(fake.rows.get("purchase-1")?.projectId, "project-1", "the fill landed");
+    assert.equal(fake.epoch.value, 1, "the fill is a mutation: one bump, no more");
+    assert.equal(result, "unchanged", "the CAS outcome is unchanged: outcomes are not altered by the bump");
+});
+
+test("upsert bumps only once when the fill AND the CAS both land", async () => {
+    const fake = createFakePrisma([{ ...WRITE, id: "expense-1", projectId: null, amount: 999, receiptUrl: null }]);
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "updated");
+    assert.equal(fake.rows.get("purchase-1")?.projectId, "project-1");
+    assert.equal(fake.rows.get("purchase-1")?.amount, 125.5);
+    assert.equal(fake.epoch.value, 1);
+});
+
+test("an exception after the fill rolls the bump back with the write", async () => {
+    const fake = createFakePrisma([{ ...WRITE, id: "expense-1", projectId: null, amount: 999, receiptUrl: null }]);
+    const realUpdateMany = fake.expense.updateMany;
+    fake.expense.updateMany = async (args: Parameters<typeof realUpdateMany>[0]) => {
+        if ("projectId" in args.where) return realUpdateMany(args);
+        throw new Error("connection lost mid-transaction");
+    };
+    await assert.rejects(upsertQboExpense(fake.client, WRITE), /connection lost/);
+    assert.equal(fake.epoch.value, 0, "the bump rolled back with the transaction");
+    assert.equal(fake.rows.get("purchase-1")?.projectId, null, "so did the fill");
+    assert.equal(fake.rows.get("purchase-1")?.amount, 999);
+});
+
+test("deactivate takes the receipt-evidence lock first, bumps once on a retirement, and never on a no-op", async () => {
+    const { deactivateQboExpense } = await import("../src/lib/qbo-expense-sync");
+    const fake = createFakePrisma([{ ...WRITE, id: "expense-1", receiptUrl: null }]);
+    const removal = {
+        qbPurchaseId: "purchase-1",
+        qbSyncToken: "1",
+        reason: "deleted",
+        qbSyncedAt: new Date("2026-07-30T00:00:00.000Z"),
+    };
+    assert.equal(await deactivateQboExpense(fake.client, removal), "removed");
+    assert.equal(fake.lockLog[0], "receipt-evidence");
+    assert.equal(fake.lockLog[1], "advisory:purchase-1");
+    assert.equal(fake.lockLog[fake.lockLog.length - 1], "epoch-bump");
+    assert.equal(fake.epoch.value, 1);
+    assert.equal(fake.rows.get("purchase-1")?.amount, 0);
+
+    // Already retired: no write, no bump.
+    const row = fake.rows.get("purchase-1")!;
+    fake.rows.set("purchase-1", {
+        ...row,
+        taxAmount: null, taxAtSource: false, installedAtCustomer: null, taxDeductibleBase: null,
+        needsTaxReview: false, taxSource: null, taxDeductibleBaseSource: null,
+    } as typeof row);
+    assert.equal(await deactivateQboExpense(fake.client, removal), "unchanged");
+    assert.equal(fake.epoch.value, 1);
+
+    // Missing row: no bump either.
+    assert.equal(await deactivateQboExpense(fake.client, { ...removal, qbPurchaseId: "purchase-missing" }), "unchanged");
+    assert.equal(fake.epoch.value, 1);
+});
 
 test("upsert is idempotent, restores same-token drift, and ignores stale tokens", async () => {
     const fake = createFakePrisma();
@@ -2815,4 +2959,34 @@ test("attachables that exist but cannot be fetched are unavailable, not absent",
     assert.equal(isAttachmentFailure("attached"), false);
     assert.equal(isAttachmentFailure("already-linked"), false);
     assert.equal(isAttachmentFailure("no-expense"), false);
+});
+
+
+test("an in-flight receipt review fences the importer before any Expense read or mutation", async () => {
+    const fake = createFakePrisma();
+    let entered!: () => void, release!: () => void;
+    const enteredLock = new Promise<void>(resolve => { entered = resolve; });
+    const reviewCommitted = new Promise<void>(resolve => { release = resolve; });
+    let reads = 0;
+    const find = fake.expense.findUnique;
+    fake.expense.findUnique = async args => { reads++; return find(args); };
+    const client = {
+        $transaction: <T>(body: (tx: any) => Promise<T>): Promise<T> => fake.client.$transaction(async tx => {
+            const execute = tx.$executeRaw;
+            tx.$executeRaw = async (...args) => {
+                entered();
+                await reviewCommitted;
+                return execute(...args);
+            };
+            return body(tx);
+        }),
+    };
+    const pending = upsertQboExpense(client, WRITE);
+    await enteredLock;
+    assert.equal(reads, 0);
+    assert.equal(fake.rows.size, 0);
+    assert.equal(fake.epoch.value, 0);
+    release();
+    assert.equal(await pending, "imported");
+    assert.equal(fake.epoch.value, 1, "the next page/certification sees changed receipt evidence");
 });
