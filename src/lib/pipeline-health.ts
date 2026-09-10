@@ -484,6 +484,18 @@ export function purchaseSyncStaleHours(): number {
  *    long it has actually been and a human decides whether the silence is
  *    expected.
  */
+type ReceiptStatusGroup = { status: string; source: string | null; _count: { _all: number } };
+
+/** Linked guard evidence is audit detail, not another receipt outcome. */
+export function summarizeReceiptStatusCounts(rows: ReceiptStatusGroup[]): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const row of rows) {
+        if (row.source === "purchase-guard") continue;
+        counts[row.status] = (counts[row.status] ?? 0) + row._count._all;
+    }
+    return counts;
+}
+
 export function evaluatePipelineHealth(input: {
     intuit: IntuitProbe;
     lastPurchaseSync: TimestampProbe;
@@ -1646,11 +1658,11 @@ export async function getPipelineHealth(deps: {
             },
             { createdAt: null, latestStatus: null },
         ),
-        probe<Array<{ status: string; _count: { _all: number } }>>(
+        probe<ReceiptStatusGroup[]>(
             "receipts24h",
             async (db) => {
                 const rows = await db.automationEvent.groupBy({
-                    by: ["status"],
+                    by: ["status", "source"],
                     where: { kind: "receipt-push", createdAt: { gte: since24h } },
                     _count: { _all: true },
                 });
@@ -1966,8 +1978,7 @@ export async function getPipelineHealth(deps: {
         probeDuplicatePurchases(new Date(now), deps.duplicatePurchaseProbe),
     ]);
 
-    const counts: Record<string, number> = {};
-    for (const row of receiptRows.value) counts[row.status] = row._count._all;
+    const counts = summarizeReceiptStatusCounts(receiptRows.value);
 
     const snapshot = {
         intuit,

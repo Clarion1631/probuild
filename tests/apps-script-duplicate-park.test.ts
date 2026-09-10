@@ -4,10 +4,12 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
 function harness(pending = false) {
-    const effects = { emails: 0, fetches: 0, moves: [] as string[], notices: [] as string[] };
+    const effects = { emails: 0, fetches: 0, moves: [] as string[], notices: [] as string[], beacons: [] as string[] };
     let persisted: any = { qboRoute: "api" };
     const blob = { getBytes: () => [1], getName: () => "receipt.png", getContentType: () => "image/png" };
     const file = { getId: () => "new-capture", getName: () => "receipt.png", getBlob: () => blob,
+        getDescription: () => JSON.stringify(persisted),
+        setDescription: (value: string) => {persisted=JSON.parse(value)},
         moveTo: (where: string) => effects.moves.push(where) };
     const context = vm.createContext({
         Session: { getEffectiveUser: () => ({getEmail: () => "test@example.com"}) },
@@ -25,7 +27,12 @@ function harness(pending = false) {
     Object.assign(context, { getState: () => structuredClone(persisted),
         setState: (_file: unknown, state: unknown) => { persisted = structuredClone(state); },
         sendToQBO: () => { effects.emails++; }, cleanMoney: () => 0,
-        reportStageBeacon_: () => {}, displayCategory: () => "" });
+        reportStageBeacon_: (_file: unknown, stage: string, status: string, reason: string) => {
+            if (status !== "parked") return;
+            assert.equal(persisted.parkReason, reason);
+            assert.ok(effects.moves.includes("review"), "beacon follows the durable park and move");
+            effects.beacons.push([stage, status, reason].join(":"));
+        }, displayCategory: () => "" });
     const send = () => context.sendReceiptToQuickBooksViaAPI(file, {projectName: "Test"}, {vendor: "Bigfoot"},
         false, 575, "2026-09-08", "", "", "NoInv", false, blob, persisted);
     return { context, file, effects, send, state: () => persisted, reset: () => { persisted = {}; } };
@@ -49,6 +56,53 @@ test("legacy bot persists duplicate review, never emails it, and only retries al
     assert.equal(h.effects.fetches, 1);
 });
 
+test("a pre-persisted duplicate hold emits its park beacon once after recovery", () => {
+    for (const pending of [false, true]) {
+        const h = harness(pending);
+        h.send();
+        const sendAlert = h.context.MailApp.sendEmail;
+        h.context.MailApp.sendEmail = () => { throw new Error("temporary alert failure"); };
+        h.context.processSingleFile(h.file, {projectName: "Test"}, "archive", "review");
+        assert.deepEqual(h.effects.beacons, []);
+        h.context.MailApp.sendEmail = sendAlert;
+        h.context.processSingleFile(h.file, {projectName: "Test"}, "archive", "review");
+        assert.deepEqual(h.effects.beacons, ["read:parked:qboDuplicate"]);
+        h.context.processSingleFile(h.file, {projectName: "Test"}, "archive", "review");
+        assert.equal(h.effects.beacons.length, 1);
+        assert.equal(h.effects.fetches, 1);
+        assert.equal(h.effects.emails, 0);
+    }
+});
+
+test("manual and automatic outage requeues allow a fresh beacon on the next park", () => {
+    for (const helper of ["requeueParkedReceipts", "selfHeal"]) {
+        const h=harness();
+        vm.runInContext(readFileSync(`docs/apps-script/${helper}.gs`,"utf8"),h.context);
+        const iterator=(items:any[])=>{let index=0;return{hasNext:()=>index<items.length,next:()=>items[index++]}};
+        const folder={getName:()=>"_Needs Review",getFiles:()=>iterator([h.file])};
+        Object.assign(h.context,{
+            DriveApp:{getFoldersByName:()=>iterator([folder]),getFolderById:()=>"inbox"},
+            getOrCreateFolder:()=>folder,
+            PropertiesService:{getScriptProperties:()=>({setProperty:()=>{}})},
+            checkVisionModels_:()=>[{ok:true}],selfHealAlert_:()=>{},
+        });
+        const park=()=>h.context.parkWithAlert_(h.file,h.context.getState(h.file),"aiUnavailable","subject","body","review");
+        park();park();
+        assert.equal(h.effects.beacons.length,1,"a replay without requeue does not repeat the attempt");
+        if(helper==="selfHeal")h.context.pipelineSelfHeal();
+        else {
+            h.context.previewParkedReceipts();
+            assert.equal(h.state().parkBeaconAttemptedReason,"aiUnavailable","preview cannot reset the attempt");
+            h.context.requeueParkedReceipts();
+        }
+        assert.equal(h.state().parkReason,undefined);
+        assert.equal(h.state().qboRoute,"api","unrelated routing evidence survives requeue");
+        park();
+        assert.deepEqual(h.effects.beacons,["read:parked:aiUnavailable","read:parked:aiUnavailable"],helper);
+        assert.equal(h.effects.fetches+h.effects.emails,0);
+    }
+});
+
 test("failed review alert retains the hold and retries without sending a receipt", () => {
     const h = harness();
     h.send();
@@ -65,7 +119,7 @@ test("an earlier unknown create parks with the source id instead of inventing a 
     assert.equal(h.send().parked,true);
     h.context.processSingleFile(h.file,{projectName:"Test"},"archive","review");
     assert.deepEqual(h.effects.moves,["review"]);
-    assert.match(h.effects.notices[0],/UNKNOWN outcome.*unresolved-source/);
+    assert.match(h.effects.notices[0],/outcome unresolved or Purchase not yet visible.*unresolved-source/);
     assert.equal(h.effects.emails,0);
     assert.equal(h.state().emailed,undefined);
 });
@@ -106,6 +160,6 @@ test("a mixed duplicate hold preserves both kinds of evidence in state and the r
     assert.deepEqual(Array.from(h.state().qboDuplicateReview.pendingFileIds),["capture-A"]);
     assert.equal(h.state().qboDuplicateReview.candidates[0].id,"6761");
     h.context.processSingleFile(h.file,{projectName:"Test"},"archive","review");
-    assert.match(h.effects.notices[0],/Purchase 6761/);assert.match(h.effects.notices[0],/UNKNOWN outcome.*capture-A/);
+    assert.match(h.effects.notices[0],/Purchase 6761/);assert.match(h.effects.notices[0],/outcome unresolved or Purchase not yet visible.*capture-A/);
     assert.deepEqual(h.effects.moves,["review"]);assert.equal(h.effects.emails,0);assert.equal(h.state().emailed,undefined);
 });

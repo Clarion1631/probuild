@@ -164,7 +164,7 @@ function pipelineSelfHeal() {
     const v = victims[i];
     const next = {};
     for (const k in v.state) {
-      if (["attempts", "runs", "busyPasses", "parkReason", "parkAlerted",
+      if (["attempts", "runs", "busyPasses", "parkReason", "parkAlerted", "parkBeaconAttemptedReason",
            "lastError", "lastErrorAt"].indexOf(k) === -1) next[k] = v.state[k];
     }
     next.autoRequeues = Number(v.state.autoRequeues || 0) + 1;

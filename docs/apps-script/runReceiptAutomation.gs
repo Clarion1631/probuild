@@ -803,7 +803,14 @@ function parkWithAlert_(file, state, reasonKey, subject, body, needsReview) {
   // Beacon LAST: the park (state + alert + move) must complete even if the
   // Command Center endpoint is stalled — a blocked fetch here could otherwise
   // burn the execution budget before the file was actually parked.
-  if (firstParkForReason) reportStageBeacon_(file, "read", "parked", reasonKey);
+  // The API helper persists parkReason before returning a duplicate hold.
+  // Track the attempt separately so safe early persistence cannot hide it.
+  // The existing helper is best effort and does not acknowledge delivery.
+  if (state.parkBeaconAttemptedReason !== reasonKey) {
+    reportStageBeacon_(file, "read", "parked", reasonKey);
+    state.parkBeaconAttemptedReason = reasonKey;
+    setState(file, state);
+  }
 }
 
 /**
@@ -827,7 +834,7 @@ function parkAlertMessage_(reasonKey, file, state, ctx, fileName, aiData) {
       subject: "Receipt bot: possible QuickBooks duplicate — " + fileName,
       body: '"' + fileName + '" (' + ctx.projectName + ') was held for review. No new Purchase was created.\n' +
         "QuickBooks candidates (same amount and nearby date, or same month/day in another year):\n" + candidates + "\n" +
-        ((review.pendingFileIds || []).length ? "An earlier create has an UNKNOWN outcome; reconcile source file(s): " + review.pendingFileIds.join(", ") + "\n" : "") +
+        ((review.pendingFileIds || []).length ? "An earlier create needs reconciliation (outcome unresolved or Purchase not yet visible to duplicate scans); source file(s): " + review.pendingFileIds.join(", ") + "\n" : "") +
         "Receipt attachment: " + (review.attachment || "not confirmed") + "\n" +
         "Do not forward or enter this receipt again until these purchases have been reviewed.\n" +
         'The file was moved to "' + NEEDS_REVIEW_NAME + '".'

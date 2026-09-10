@@ -37,6 +37,103 @@ function setup(rows: any[] = [], attachments: any[] = []) {
  return {deps,effects};
 }
 const candidate = (id="6761",date="2024-09-08") => ({Id:id,TxnDate:date,TotalAmt:575,EntityRef:{name:"Bigfoot Concrete Pumping"}});
+
+test("an acknowledged create remains protected until a subsequent QBO query can see it", async () => {
+ const rows:any[]=[];
+ const {deps,effects}=setup(rows);
+ const first=await createQBReceiptPurchase(tokens,input({fileId:"capture-A"}),deps);
+ assert.equal(first.ok,true);
+ const held=await createQBReceiptPurchase(tokens,input({fileId:"capture-B",vendor:"Other OCR"}),deps);
+ assert.ok(!held.ok&&held.reason==="duplicate-create-pending");
+ assert.deepEqual(held.pendingFileIds,["capture-A"]);
+ assert.equal(effects.creates,1);assert.equal(effects.uploads,1);
+ const replay=await createQBReceiptPurchase(tokens,input({fileId:"capture-A"}),deps);
+ assert.ok(!replay.ok&&replay.reason==="duplicate-create-pending");
+ assert.equal(effects.creates,1,"a known id does not need another create before query visibility");
+ rows.push({...candidate("9000","2026-09-08"),PrivateNote:"[gtr-file:capture-A]"});
+ const dry=await createQBReceiptPurchase(tokens,input({fileId:"capture-C",dryRun:true}),deps);
+ assert.ok(!dry.ok&&dry.reason==="dry-run");
+ assert.equal(dry.pendingFileIds,undefined);
+ assert.equal((await deps.createIntents!.list(tokens.realmId)).length,1,"dry run must not retire intents");
+ const visible=await createQBReceiptPurchase(tokens,input({fileId:"capture-C"}),deps);
+ assert.ok(!visible.ok&&visible.reason==="duplicate-purchase-review");
+ assert.deepEqual(visible.candidates.map(p=>p.id),["9000"]);
+ assert.deepEqual(await deps.createIntents!.list(tokens.realmId),[]);
+ assert.equal(effects.creates,1);
+});
+
+test("DocNumber visibility cannot clear protection while the duplicate-candidate query still lags", async () => {
+ const {deps,effects}=setup();
+ const query=deps.qbQueryFn!;
+ let committed=false;
+ deps.qbCreateFn=async()=>{committed=true;effects.creates++;return{id:"9000"}};
+ deps.qbQueryFn=async<T,>(t:typeof tokens,q:string)=>q.includes(`DocNumber = '${input().fileId.slice(0,21)}'`)&&committed
+   ? [{Id:"9000",PrivateNote:`[gtr-file:${input().fileId}]`}] as T[] : query<T>(t,q);
+ await deps.createIntents!.put(tokens.realmId,{fileId:"unknown-other-day",date:"2026-06-01",amountCents:57500});
+ assert.equal((await createQBReceiptPurchase(tokens,input(),deps)).ok,true);
+ assert.equal((await createQBReceiptPurchase(tokens,input(),deps)).ok,true);
+ assert.deepEqual((await deps.createIntents!.list(tokens.realmId)).map(p=>p.fileId),["unknown-other-day",input().fileId]);
+ const result=await createQBReceiptPurchase(tokens,input({fileId:"capture-B"}),deps);
+ assert.ok(!result.ok&&result.reason==="duplicate-create-pending");
+ assert.deepEqual(result.pendingFileIds,[input().fileId]);
+ assert.equal(effects.creates,1);
+});
+
+test("successful creation adds no visibility round trip and retains the acknowledged id", async () => {
+ const {deps,effects}=setup();
+ const query=deps.qbQueryFn!;
+ let committed=false, postCreateReads=0;
+ deps.qbCreateFn=async()=>{committed=true;effects.creates++;return{id:"9000"}};
+ deps.qbQueryFn=async(t,q)=>{
+   if(committed){postCreateReads++;throw qboErrorFromStatus(400,"read unavailable","QB query")}
+   return query(t,q);
+ };
+ const result=await createQBReceiptPurchase(tokens,input(),deps);
+ assert.ok(result.ok&&result.qbPurchaseId==="9000"&&result.attachment==="attached");
+ assert.equal((await deps.createIntents!.list(tokens.realmId)).length,1);
+ assert.equal(effects.creates,1);assert.equal(effects.uploads,1);
+ assert.equal(postCreateReads,0);
+});
+
+test("acknowledgment storage failure retains the unknown create and prevents another capture", async () => {
+ const {deps,effects}=setup();
+ deps.createIntents!.acknowledge=async()=>{throw new Error("acknowledgment unavailable")};
+ await assert.rejects(createQBReceiptPurchase(tokens,input({fileId:"capture-A"}),deps),/acknowledgment unavailable/);
+ assert.deepEqual(await deps.createIntents!.list(tokens.realmId),[{fileId:"capture-A",date:"2026-09-08",amountCents:57500}]);
+ const held=await createQBReceiptPurchase(tokens,input({fileId:"capture-B"}),deps);
+ assert.ok(!held.ok&&held.reason==="duplicate-create-pending");
+ assert.deepEqual(held.pendingFileIds,["capture-A"]);
+ assert.equal(effects.creates,1);assert.equal(effects.uploads,0);
+});
+
+test("identity replay acknowledges a lost response without assuming the date query is current", async () => {
+ const {deps,effects}=setup();const query=deps.qbQueryFn!;
+ const source=input().fileId;
+ await deps.createIntents!.put(tokens.realmId,{fileId:source,date:"2026-09-08",amountCents:57500});
+ deps.qbQueryFn=async<T,>(t:typeof tokens,q:string)=>q.includes(`DocNumber = '${source.slice(0,21)}'`)
+   ? [{Id:"9000",PrivateNote:`[gtr-file:${source}]`}] as T[] : query<T>(t,q);
+ assert.equal((await createQBReceiptPurchase(tokens,input(),deps)).ok,true);
+ assert.equal((await deps.createIntents!.list(tokens.realmId))[0].qbPurchaseId,"9000");
+ const held=await createQBReceiptPurchase(tokens,input({fileId:"capture-B"}),deps);
+ assert.ok(!held.ok&&held.reason==="duplicate-create-pending");
+ assert.equal(effects.creates,0);
+});
+
+test("known-Purchase hook and ownership fence precede fallible intent reconciliation", async () => {
+ for (const failure of ["list", "acknowledge", "fence"]) {
+   const {deps,effects}=setup();let known=false,intentReads=0;
+   await deps.createIntents!.put(tokens.realmId,{fileId:input().fileId,date:"2026-09-08",amountCents:57500});
+   deps.qbQueryFn=async<T,>()=>[{Id:"9000",PrivateNote:`[gtr-file:${input().fileId}]`}] as T[];
+   const list=deps.createIntents!.list;
+   deps.createIntents!.list=async realm=>{intentReads++;assert.equal(known,true);if(failure==="list")throw new Error("intent unavailable");return list(realm)};
+   deps.createIntents!.acknowledge=async()=>{assert.equal(known,true);throw new Error("intent unavailable")};
+   deps.onExistingPurchase=async()=>{known=true;if(failure==="fence")throw new Error("claim lost")};
+   await assert.rejects(createQBReceiptPurchase(tokens,input(),deps),failure==="fence"?/claim lost/:/intent unavailable/);
+   assert.equal(known,true);
+   assert.equal(intentReads,failure==="fence"?0:1);
+   assert.equal(effects.creates+effects.uploads,0);
+ }
+});
 test("different file/vendor/year is held before create, recorded, and missing image attached",async()=>{
  const {deps,effects}=setup([candidate()]);
  const r=await createQBReceiptPurchase(tokens,input(),deps);
@@ -212,14 +309,16 @@ test("lost create response leaves a durable hold for other captures, but same-fi
  const recovered=await createQBReceiptPurchase(tokens,input({fileId:"capture-A"}),deps);
  assert.equal(recovered.ok,true);assert.equal(sends,2);
  assert.equal(ids[0],ids[1],"same-file replay retains QBO request id");
- assert.deepEqual(await deps.createIntents!.list(tokens.realmId),[]);
+ assert.deepEqual(await deps.createIntents!.list(tokens.realmId),[
+   {fileId:"capture-A",date:"2026-09-08",amountCents:57500,qbPurchaseId:"9000"},
+ ]);
 });
 
 test("unrelated dates remain usable and cannot overwrite an unresolved earlier intent", async () => {
  const {deps}=setup();
  await deps.createIntents!.put(tokens.realmId,{fileId:"old-capture",date:"2026-06-01",amountCents:57500});
  assert.equal((await createQBReceiptPurchase(tokens,input(),deps)).ok,true);
- assert.deepEqual((await deps.createIntents!.list(tokens.realmId)).map(p=>p.fileId),["old-capture"]);
+ assert.deepEqual((await deps.createIntents!.list(tokens.realmId)).map(p=>p.fileId),["old-capture",input().fileId]);
  const held=await createQBReceiptPurchase(tokens,input({fileId:"another-capture",date:"2024-06-01"}),deps);
  assert.ok(!held.ok&&held.reason==="duplicate-create-pending");
 });

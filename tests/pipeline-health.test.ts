@@ -20,6 +20,7 @@ import {
     runProbe,
     createLimiter,
     statementTimeoutRunner,
+    summarizeReceiptStatusCounts,
     probeDuplicatePurchases,
     QBO_DUPLICATE_PROBE_TIMEOUT_MS,
     PROBE_CONCURRENCY,
@@ -33,6 +34,20 @@ import {
 import { QBBudgetExhaustedError, type QBTokens, type RouteDeadline } from "../src/lib/quickbooks";
 
 const NOW = Date.parse("2026-09-01T14:00:00.000Z");
+
+test("receipt totals count route outcomes, excluding linked guard evidence chunks", () => {
+    const counts = summarizeReceiptStatusCounts([
+        {status:"needs-review",source:"purchase-guard",_count:{_all:101}},
+        {status:"needs-review",source:"api",_count:{_all:1}},
+        {status:"created",source:"api",_count:{_all:3}},
+        {status:"created",source:null,_count:{_all:2}},
+        {status:"created",source:"receipt-intake",_count:{_all:4}},
+    ]);
+    assert.deepEqual(counts, {"needs-review":1,created:9});
+    const digest = formatPipelineDigest(sampleHealth({receipts24h:{status:"ok",counts}}));
+    assert.match(digest.text, /needs-review 1\b/);
+    assert.doesNotMatch(digest.text, /needs-review 102\b/);
+});
 
 /**
  * The probe runner, without a database.

@@ -35,7 +35,9 @@ historical Purchase to a particular caller.
    Same-file retries keep their original QBO request ID. A first attempt that
    definitively never created a Purchase can clear its intent; a retry's refusal
    or failed ownership fence cannot clear evidence of an earlier unknown outcome.
-   An acknowledged create or observed same-file Purchase resolves that evidence.
+   Acknowledged creates retain their QBO ID in the intent until the duplicate
+   candidate query actually observes that ID. DocNumber visibility alone does
+   not prove that the date query is current. Unknown outcomes remain protected.
    Changed amount/date on the original source requires review. No TTL guesses
    away an unknown create, and unrelated dates do not overwrite its evidence.
 4. Persist an AutomationEvent review hold with candidate IDs before attempting
@@ -96,8 +98,11 @@ Purchases are the same receipt. Repeated legitimate amounts also need review.
 
 - Do not merge or deploy as part of this investigation. Existing transactions
   stay untouched; Vanessa handles the supplied duplicate CSV.
-- Once approved for release, deploy the ProBuild change, then update both tracked
-  Apps Script companion files in the active receipt bot. Deploying ProBuild alone
+- Once approved for release, deploy the ProBuild change, then update the four
+  tracked Apps Script files in the active receipt bot: `sendToQBOviaAPI.gs`,
+  `runReceiptAutomation.gs`, `requeueParkedReceipts.gs`, and `selfHeal.gs`.
+  The requeue helpers reset the per-park beacon attempt marker so a new park is
+  observable after recovery. Deploying ProBuild alone
   blocks new duplicate holds with HTTP 409, which the old API client retries.
   The companion update is also required to protect committed API retries from
   early terminal declines (paused/disabled/validation) before the writer runs.
@@ -109,6 +114,13 @@ Purchases are the same receipt. Repeated legitimate amounts also need review.
   deterministic QBO request. Other captures remain in review. If that original
   is unavailable, a bookkeeper must establish its QBO outcome before an operator
   clears its `qbo-receipt-push.intent:` setting; elapsed time is not proof of failure.
+  A setting with `qbPurchaseId` records a known create whose date-query visibility
+  has not yet been confirmed. A later matching duplicate scan clears it after
+  observing that ID. There is no TTL or added post-create query; acknowledged
+  settings for dates/amounts never scanned again can remain until reviewed.
+  Pending alerts identify the source files; support can recover any known QBO
+  ID from that source's `qbPurchaseId` in the durable intent. These alerts cover
+  both an unknown create outcome and a known create awaiting query visibility.
 - Verification: focused producer/intake/legacy/health suites, TypeScript, production
   build, the required independent codex-peer-review, and repository CI (including
   money-pipeline browser tests against disposable Postgres with QBO mocked).
@@ -152,3 +164,24 @@ chunk aborts safely; v2 retains its complete queue reason whenever it fits.
   and an unreachable dummy database.
 - Independent CLI closure completed successfully, including 188 isolated tests
   and audit-boundary checks. No critical, important, or contested findings remain.
+
+## Fable review follow-up
+
+Acknowledged creates now retain their durable intent until the duplicate date
+query observes the acknowledged QBO ID. Same-source identity recovery records
+the known-Purchase hook and ownership fence before any fallible intent storage.
+Receipt totals exclude linked guard audit chunks. Parked receipts attempt their
+beacon after the durable park, and both requeue helpers reset that attempt marker
+for the next park. Alerts distinguish unresolved outcomes from query visibility.
+
+- 468 focused tests passed, with zero failures or skips. Regressions cover lagging
+  date queries despite visible DocNumber results, acknowledgment storage failure,
+  actual-store compare-and-set behavior, hook ordering, count aggregation, and
+  both real Apps Script requeue helpers.
+- Production build passed after the final TypeScript behavior change. Final
+  typechecking and the eight Apps Script tests passed after the companion changes.
+- Fable review and final supplements used verified `claude-fable-5-1` and returned
+  clear verdicts. These were static reviews with tools disabled.
+- Targeted `codex-peer-review` completed two blind-debate rounds; both accepted
+  findings were fixed and independently verified, with no new or contested issues.
+- No live QBO/DB operations, merge, or deployment were performed for this follow-up.

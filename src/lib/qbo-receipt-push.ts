@@ -1588,12 +1588,15 @@ async function createQBReceiptPurchaseUnderLock(
             return { ok: false, reason: "docnumber-conflict", docNumber };
         }
         if (input.dryRun === true) return { ok: false, reason: "dry-run", action: "already-exists", candidates: [] };
-        // The exact full marker proves this source's earlier create completed.
-        await intents.remove(tokens.realmId, input.fileId);
-        // THE PURCHASE EXISTS. Say so before doing anything else with it: the
-        // attachment re-check below is a QBO round trip that can fail, and the
-        // caller still has to know a Purchase is there.
+        // Fence ownership and record that a Purchase is known BEFORE any other
+        // fallible work, including durable intent reads or acknowledgments.
         await deps.onExistingPurchase?.();
+        // DocNumber proves identity, but need not share the date query's index.
+        // Remember its acknowledged ID without clearing the guard's protection.
+        const priorIntent = (await intents.list(tokens.realmId)).find(p => p.fileId === input.fileId);
+        if (priorIntent && !priorIntent.qbPurchaseId) {
+            await intents.acknowledge(tokens.realmId, priorIntent, String(existing[0].Id ?? ""));
+        }
         const booked = compareExistingPurchase(readBookedPurchase(existing[0], taxAccountId), input);
         // The Purchase exists, but that does NOT mean the receipt file made it
         // across. The common way to reach this branch is a first attempt whose
@@ -1676,11 +1679,20 @@ async function createQBReceiptPurchaseUnderLock(
     const receiptDate = input.date;
     // A visible Purchase does not resolve an unknown create for another capture.
     // Read both evidence sources before choosing any attachment destination.
-    const unresolved = await intents.list(tokens.realmId);
+    const storedIntents = await intents.list(tokens.realmId);
+    // Only an acknowledged ID observed by this strict query resolves an intent.
+    // An unrelated visible candidate never settles an unknown create outcome.
+    const visibleIds = new Set(candidates.map(candidate => candidate.id));
+    const observedIntents = storedIntents.filter(p => p.qbPurchaseId && visibleIds.has(p.qbPurchaseId));
+    if (input.dryRun !== true) {
+        for (const observed of observedIntents) await intents.remove(tokens.realmId, observed.fileId);
+    }
+    const observedSources = new Set(observedIntents.map(p => p.fileId));
+    const unresolved = storedIntents.filter(p => !observedSources.has(p.fileId));
     const ownIntent = unresolved.find(p => p.fileId === input.fileId);
     const pendingFileIds = unresolved
         .filter(p => p.fileId === input.fileId
-            ? candidates.length > 0 || p.amountCents !== totalCents || p.date !== receiptDate
+            ? !!p.qbPurchaseId || candidates.length > 0 || p.amountCents !== totalCents || p.date !== receiptDate
               // Changed OCR or another visible candidate makes a same-source replay ambiguous.
             : p.amountCents === totalCents && matchDates(receiptDate,p.date,deps.now?.() ?? new Date()))
         .map(p => p.fileId);
@@ -1827,7 +1839,8 @@ async function createQBReceiptPurchaseUnderLock(
     // Persist BEFORE issuing the create. A timeout, process death, or unknown
     // response leaves this intent intact after the short amount lease expires.
     const newIntent = !ownIntent;
-    if (newIntent && !await intents.put(tokens.realmId, {fileId:input.fileId,date:input.date,amountCents:totalCents})) {
+    const createIntent = ownIntent ?? {fileId:input.fileId,date:input.date,amountCents:totalCents};
+    if (newIntent && !await intents.put(tokens.realmId, createIntent)) {
         throw new QboRetryableError("Receipt create intent changed; retry the original source");
     }
     try { await deps.onBeforeCreate?.(); }
@@ -1850,7 +1863,9 @@ async function createQBReceiptPurchaseUnderLock(
         }
         throw error;
     }
-    await intents.remove(tokens.realmId,input.fileId); // Acknowledged QBO Purchase id.
+    // The create acknowledgment is not proof that QBO queries can see it yet.
+    // Keep the source protected while that visibility catches up.
+    await intents.acknowledge(tokens.realmId, createIntent, created.id);
 
     let attachment: ReceiptAttachmentStatus = "skipped";
     const plan = planAttachmentUpload(input);
@@ -1873,5 +1888,7 @@ async function createQBReceiptPurchaseUnderLock(
         }
     }
 
+    // A later duplicate-candidate scan retires this intent once it sees the ID.
+    // Do not add post-create QBO reads or assume DocNumber visibility is enough.
     return { ok: true, qbPurchaseId: created.id, docNumber, alreadyExists: false, attachment };
 }
