@@ -136,10 +136,19 @@ export function ReceiptsTab({
 
     return (
         <div className="space-y-6">
+            <p className="hui-card px-4 py-3 text-sm text-hui-textMuted">
+                Needs job, Needs review, Booking and Booked today cover only receipts in this intake queue.
+                Receipts handled through other email or photo paths may not appear in those totals.
+                Missing receipts is a separate list of open requests for bank charges. View recorded purchases in the{" "}
+                <a href="/automation?tab=register" className="font-medium text-hui-primary hover:underline">
+                    Register
+                </a>
+                .
+            </p>
             <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
-                <StatCard label="Waiting on a person" value={String(counts["needs-job"] + counts["needs-review"])} sub="Needs a job or a decision" />
-                <StatCard label="In flight" value={String(counts.booking)} sub="Booking into QuickBooks" />
-                <StatCard label="Missing receipts" value={String(counts["missing-receipts"])} sub="Bank charges with no receipt found" />
+                <StatCard label="Waiting on a person (intake queue)" value={String(counts["needs-job"] + counts["needs-review"])} sub="Queue receipts that need a job or a decision" />
+                <StatCard label="In flight (intake queue)" value={String(counts.booking)} sub="Queue receipts booking into QuickBooks" />
+                <StatCard label="Missing receipts" value={String(counts["missing-receipts"])} sub="Open receipt requests for bank charges" />
             </div>
 
             {/* Group filter chips, each carrying its own count badge. */}
@@ -240,7 +249,7 @@ export function ReceiptsTab({
             {groupIsVisible("needs-job", filters) && (
                 <GroupCard title={RECEIPT_GROUP_LABELS["needs-job"]} count={counts["needs-job"]}>
                     {queue.needsJob.length === 0 ? (
-                        <EmptyGroup message="Nothing here — every receipt has a job." />
+                        <EmptyGroup message="No receipts in this queue are waiting for a job." />
                     ) : (
                         queue.needsJob.map(row => (
                             <RowShell key={row.id}>
@@ -259,7 +268,7 @@ export function ReceiptsTab({
             {groupIsVisible("needs-review", filters) && (
                 <GroupCard title={RECEIPT_GROUP_LABELS["needs-review"]} count={counts["needs-review"]}>
                     {queue.needsReview.length === 0 ? (
-                        <EmptyGroup message="Nothing here — nothing is waiting on a decision." />
+                        <EmptyGroup message="No receipts in this queue are waiting on a decision." />
                     ) : (
                         queue.needsReview.map(row => (
                             <RowShell key={row.id}>
@@ -304,7 +313,7 @@ export function ReceiptsTab({
             {groupIsVisible("booking", filters) && (
                 <GroupCard title={RECEIPT_GROUP_LABELS.booking} count={counts.booking}>
                     {queue.booking.length === 0 ? (
-                        <EmptyGroup message="Nothing here — nothing is mid-booking." />
+                        <EmptyGroup message="No receipts in this queue are booking right now." />
                     ) : (
                         queue.booking.map(row => (
                             <RowShell key={row.id}>
@@ -330,7 +339,7 @@ export function ReceiptsTab({
             {groupIsVisible("booked-today", filters) && (
                 <GroupCard title={RECEIPT_GROUP_LABELS["booked-today"]} count={counts["booked-today"]}>
                     {queue.bookedToday.length === 0 ? (
-                        <EmptyGroup message="Nothing here yet today." />
+                        <EmptyGroup message="No receipts from this queue have been booked yet today." />
                     ) : (
                         queue.bookedToday.map(row => (
                             <RowShell key={row.id}>
@@ -374,7 +383,7 @@ export function ReceiptsTab({
                         </p>
                     )}
                     {missingByOwner.length === 0 ? (
-                        <EmptyGroup message="Nothing here — every bank charge has a receipt." />
+                        <EmptyGroup message="No open receipt requests in this view." />
                     ) : (
                         missingByOwner.map(bucket => (
                             <div key={bucket.owner}>
@@ -398,7 +407,7 @@ export function ReceiptsTab({
             {groupIsVisible("duplicates", filters) && (
                 <GroupCard title={RECEIPT_GROUP_LABELS.duplicates} count={counts.duplicates}>
                     {queue.duplicates.length === 0 ? (
-                        <EmptyGroup message="Nothing here — no duplicates parked." />
+                        <EmptyGroup message="No receipts in this queue are parked as duplicates." />
                     ) : (
                         queue.duplicates.map(row => (
                             <RowShell key={row.id}>
