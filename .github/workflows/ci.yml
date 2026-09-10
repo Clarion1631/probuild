@@ -529,8 +529,11 @@ jobs:
 
       - name: Apply receipt memo content schema and verify durable uniqueness
         run: |
-          node scripts/apply-receipt-memo-content.mjs --target ci --yes --expect-db probuild_migrations --expect-host localhost
-          node scripts/apply-receipt-memo-content.mjs --target ci --yes --expect-db probuild_migrations --expect-host localhost
+          MEMO_DB_HOST=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')
+          test -n "$MEMO_DB_HOST"
+          export DATABASE_URL="postgresql://probuild:probuild@${MEMO_DB_HOST}:5432/probuild_migrations?pgbouncer=true"
+          node scripts/apply-receipt-memo-content.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$MEMO_DB_HOST"
+          node scripts/apply-receipt-memo-content.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$MEMO_DB_HOST"
           npx tsx --test tests/receipt-memo-content-db.test.ts
         env:
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true

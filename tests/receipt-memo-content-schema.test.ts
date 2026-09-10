@@ -25,3 +25,17 @@ test('historical phase harnesses exclude later dependent memo migration for thei
   assert.ok(source.includes('process.on("exit",'));
  }
 });
+
+test('CI apply uses the container address for both dialled URL and strict server identity', async () => {
+ const { readFileSync }=await import('node:fs');
+ const { verifyTargetIdentity }=await import('../scripts/lib/apply-target.mjs');
+ const db={ $queryRawUnsafe:async()=>[{db:'probuild_migrations',host:'172.18.0.2'}] };
+ const base={target:'ci',from:'test',expectDb:'probuild_migrations'};
+ assert.equal((await verifyTargetIdentity(db,{...base,url:'postgresql://test:test@localhost/probuild_migrations',expectHost:'localhost'})).ok,false);
+ assert.equal((await verifyTargetIdentity(db,{...base,url:'postgresql://test:test@172.18.0.2/probuild_migrations',expectHost:'172.18.0.2'})).ok,true);
+ const ci=readFileSync(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
+ const step=ci.slice(ci.indexOf('- name: Apply receipt memo content schema'),ci.indexOf('  build:'));
+ assert.ok(step.includes('job.services.postgres.id'));
+ assert.ok(step.includes('--expect-host "$MEMO_DB_HOST"'));
+ assert.ok(step.includes('@${MEMO_DB_HOST}:5432/probuild_migrations?pgbouncer=true'));
+});
