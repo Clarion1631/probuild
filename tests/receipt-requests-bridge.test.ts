@@ -678,13 +678,13 @@ test("?continue=1 and moreToProcess consult BOTH cursors", () => {
     // Widened in round 45 (finding 2): an OWED FULL RUN is work in progress
     // too, even with no cursor parked — otherwise a 13:00 run that lost the
     // lease to a continuation would never be picked up.
-    assert.match(source, /const \[phase, lineCursor, openCursor, fullRunOwed, persistedCycle\] = await Promise\.all\(\[/);
-    assert.match(source, /readPhase\(\), readCursor\(\), readOpenCursor\(\), readFullRunRequested\(\), readCycle\(\),/);
+    assert.match(source, /const \[marker, lineCursor, openCursor, fullRunOwed, persistedCycle, bankEpoch, evidenceEpoch\] = await Promise\.all\(\[/);
+    assert.match(source, /readMarker\(\), readCursor\(\), readOpenCursor\(\), readFullRunRequested\(\), readCycle\(\),/);
     // ...and the PHASE, because each cursor is cleared the moment its pass
     // finishes, so a cycle can be unfinished with neither one parked.
     // An OWED FULL RUN keeps this pass alive even with no cursor parked
     // (round-45 gate, finding 2).
-    assert.match(source, /if \(!fullRunOwed && !cycleOpen && !shouldResumeSweep\(phase, lineCursor, openCursor\)\)/);
+    assert.match(source, /if \(!continuationNeedsWork\(/);
     assert.match(source, /moreToProcess: !exhausted \|\| !openExhausted/);
 });
 

@@ -668,12 +668,9 @@ async function writeCycle(cycle: SweepCycle | null): Promise<void> {
 const FULL_RUN_REQUESTED_KEY = "receiptRequestsFullRunRequested";
 
 async function readFullRunRequested(): Promise<boolean> {
-    try {
-        const row = await prisma.automationSetting.findUnique({ where: { key: FULL_RUN_REQUESTED_KEY } });
-        return !!row?.value;
-    } catch {
-        return false;
-    }
+    // An unreadable intent is not proof that no full run is owed.
+    const row = await prisma.automationSetting.findUnique({ where: { key: FULL_RUN_REQUESTED_KEY } });
+    return !!row?.value;
 }
 
 async function writeFullRunRequested(value: string | null): Promise<void> {
@@ -1854,6 +1851,25 @@ export async function transitionCompletedOpenPass(
     await clearOpenCheckpoint();
 }
 
+/** Completed cycles remain stored because card selection verifies their identity. */
+export function continuationNeedsWork(input: {
+    marker: SweepMarker; cycle: SweepCycle | null;
+    bankEpoch: string; evidenceEpoch: string;
+    fullRunOwed: boolean; lineCursor: string | null; openCursor: string | null; now: Date;
+}): boolean {
+    if (input.fullRunOwed) return true;
+    const completedAt = input.marker.chaserCompletedAt ? Date.parse(input.marker.chaserCompletedAt) : NaN;
+    const certified = input.cycle !== null
+        && input.marker.phase === "done"
+        && !input.marker.blockedReason
+        && input.marker.completedCycleId === input.cycle.id
+        && Number.isFinite(completedAt) && completedAt <= input.now.getTime()
+        && cycleStillValid(input.cycle, input.bankEpoch, input.evidenceEpoch);
+    if (certified) return false;
+    // A crash between durable cycle creation and phase/checkpoint writes still resumes.
+    return input.cycle !== null || shouldResumeSweep(input.marker.phase, input.lineCursor, input.openCursor);
+}
+
 export async function GET(request: Request) {
     const budget = createSweepBudget(Date.now(), Date.now, RUN_BUDGET_MS);
     if (!isCronAuthorized(request)) {
@@ -1882,23 +1898,26 @@ export async function GET(request: Request) {
         // Even both cursors are not enough: each is cleared the instant its pass
         // completes, so a run that finished the open-issue pass and then ran out
         // of budget parked NEITHER, and the line pass never resumed.
-        const [phase, lineCursor, openCursor, fullRunOwed, persistedCycle] = await Promise.all([
-            readPhase(), readCursor(), readOpenCursor(), readFullRunRequested(), readCycle(),
+        const [marker, lineCursor, openCursor, fullRunOwed, persistedCycle, bankEpoch, evidenceEpoch] = await Promise.all([
+            readMarker(), readCursor(), readOpenCursor(), readFullRunRequested(), readCycle(),
+            readBankLedgerEpoch(prisma), readReceiptEvidenceEpoch(prisma),
         ]);
+        const phase = marker.phase;
         /**
-         * A PERSISTED CYCLE IS WORK IN PROGRESS (round-46 gate, finding 3).
+         * AN UNCERTIFIED PERSISTED CYCLE IS WORK IN PROGRESS.
          *
          * The handoff between clearing the old cycle and `runSweep` writing the
          * new one is several writes long, and a crash inside it used to leave
          * phase `"done"`, no completion, no cursor and no request — which every
          * later continuation read as `nothing-in-progress`, losing the day. The
          * cycle record is written first now and is the durable evidence that a
-         * cycle is open, so this pass honours it whatever the cursors say.
+         * cycle is open. A matching, unchanged completion proves that it finished;
+         * otherwise this pass honours it whatever the cursors say.
          *
          * An owed full run counts for the same reason (round-45, finding 2).
          */
-        const cycleOpen = persistedCycle !== null;
-        if (!fullRunOwed && !cycleOpen && !shouldResumeSweep(phase, lineCursor, openCursor)) {
+        if (!continuationNeedsWork({ marker, cycle: persistedCycle, bankEpoch, evidenceEpoch,
+            fullRunOwed, lineCursor, openCursor, now: new Date() })) {
             return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
         }
         resumePhase = phase === "done" ? "open-issues" : phase;

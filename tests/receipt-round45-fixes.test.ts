@@ -86,7 +86,7 @@ test("the full run records its intent BEFORE reaching for the lease", () => {
     // And whoever runs next honours it.
     assert.match(sweep, /const fullRunOwed = continueOnly && await readFullRunRequested\(\);/);
     assert.match(sweep, /await writeFullRunRequested\(null\);/);
-    assert.match(sweep, /if \(!fullRunOwed && !cycleOpen && !shouldResumeSweep\(phase, lineCursor, openCursor\)\)/,
+    assert.match(sweep, /if \(!continuationNeedsWork\(/,
         "an owed full run is work in progress even with no cursor parked");
 });
 
