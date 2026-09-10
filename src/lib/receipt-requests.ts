@@ -504,12 +504,31 @@ export const GENERIC_PAYEE_TOKENS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Receipt comparison only: remove the observed leading WTB rail phrase and
+ * normalize the observed Costco/Lowe's store spellings. Ledger descriptors,
+ * reconciliation identity, ownership, date/cents rules and capacity are unchanged.
+ */
+function stripObservedRailPrefix(upper: string): string {
+    return upper
+        // Rail phrase is removed only when it LEADS; a descriptor that is
+        // nothing but the rail phrase becomes empty (no merchant, no match).
+        .replace(/^\s*MISCELLANEOUS\s+DEBIT(?:\s+|$)/, "")
+        // Observed bank store-form spellings, leading position only.
+        // COSTCO WHSE is Costco's own descriptor abbreviation of WHOLESALE;
+        // the repeated "#NNNN COSTCO WHSE NNNN" store echo collapses with it.
+        .replace(/^\s*COSTCO\s+WHSE(?:\s+#?(\d+)\s+COSTCO\s+WHSE\s+\1)?(?=\s|$)/, "COSTCO WHOLESALE")
+        // "LOWE S #NNNN LOWE S NNNN" (same store number echoed) is the bank's
+        // rendering of LOWE'S; a different second store number is NOT collapsed.
+        .replace(/^\s*LOWE\s+S\s+#?(\d+)(?:\s+LOWE\s+S\s+\1)?(?=\s|$)/, "LOWES")
+        .replace(/^\s*LOWE\s+S(?=\s|$)/, "LOWES");
+}
+
+/**
  * Comparable tokens, generics INCLUDED: 3+ characters, not a pure number, not a
  * stop word. Store numbers, ZIPs and terminal ids are noise.
  */
 export function payeeTokens(value: string): string[] {
-    return (value ?? "")
-        .toUpperCase()
+    return stripObservedRailPrefix((value ?? "").toUpperCase())
         // Possessives BIND, they do not separate: "LOWE'S" is one word, and
         // splitting on the apostrophe produced "LOWE" — which is not the
         // "LOWES" every bank descriptor carries, so the two never agreed.
