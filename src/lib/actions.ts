@@ -15,7 +15,7 @@ import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-help
 import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
-import { portalVisibleEstimateWhere } from "./estimate-portal-visibility";
+import { portalVisibleEstimateWhere, sentEstimateUpdateData } from "./estimate-portal-visibility";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
@@ -6196,9 +6196,16 @@ export async function sendEstimateToClient(
 
     const updatedStatus = ["Draft", "Sent", "Viewed"].includes(estimate.status) ? "Sent" : estimate.status;
     const isResend = !!estimate.sentAt;
+    // sentEstimateUpdateData also flips `privacy` to "Shared". Sending is the
+    // human review-and-share step the AI creator's `privacy: "Private"` default
+    // was waiting for, and portalVisibleEstimateWhere() treats "Private" as an
+    // absolute override — so without that flip the "View & Sign Estimate" link
+    // we just emailed 404s for the client (EST-00514, 2026-09-09). The three
+    // fields travel together, in estimate-portal-visibility.ts next to the gate
+    // they have to satisfy; do not inline them back apart.
     await prisma.estimate.update({
         where: { id: estimateId },
-        data: { sentAt: new Date(), status: updatedStatus },
+        data: sentEstimateUpdateData(updatedStatus),
     });
 
     // Append-only send trail — every send (incl. resends) gets its own event.
