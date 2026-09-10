@@ -30,7 +30,7 @@ test('CI apply uses the container address for both dialled URL and strict server
  const { readFileSync }=await import('node:fs');
  const { verifyTargetIdentity }=await import('../scripts/lib/apply-target.mjs');
  const db={ $queryRawUnsafe:async()=>[{db:'probuild_migrations',host:'172.18.0.2'}] };
- const base={target:'ci',from:'test',expectDb:'probuild_migrations'};
+ const base={target:'ci',from:'test',expectDb:'probuild_migrations',resolve:async()=>[]};
  assert.equal((await verifyTargetIdentity(db,{...base,url:'postgresql://test:test@localhost/probuild_migrations',expectHost:'localhost'})).ok,false);
  assert.equal((await verifyTargetIdentity(db,{...base,url:'postgresql://test:test@172.18.0.2/probuild_migrations',expectHost:'172.18.0.2'})).ok,true);
  const ci=readFileSync(new URL('../.github/workflows/ci.yml',import.meta.url),'utf8');
