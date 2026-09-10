@@ -74,7 +74,7 @@
     },
     {
       "path": "/api/cron/receipt-requests?continue=1",
-      "schedule": "5-59/15 * * * *"
+      "schedule": "1-28,31-58 * * * *"
     },
     {
       "path": "/api/cron/receipt-request-cards",
