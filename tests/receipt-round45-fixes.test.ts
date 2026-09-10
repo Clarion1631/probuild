@@ -25,8 +25,8 @@ test("the cycle's epochs live in a record of their own, not on the cursors", () 
     // The bug, stated from the source: cursors are cleared the moment their
     // pass completes, so a continuation could find nothing to validate and take
     // a fresh snapshot of a world that had already moved.
-    assert.match(sweep, /if \(openExhausted && openPass\.errors === 0\) await writeOpenCursor\(null\);/,
-        "the open cursor really is cleared on completion — that is what made cursor-only validation unsound");
+    assert.match(sweep, /transitionCompletedOpenPass\([\s\S]{0,180}writePhase\("lines", undefined, null, prisma, cycle\.id\)[\s\S]{0,80}writeOpenCursor\(null\)/,
+        "the open cursor clears after the durable phase handoff; the cycle must still validate epochs");
     assert.match(sweep, /clearCertifiedSweepCheckpoint\(decision.complete, \(\) => writeCursor\(null\)\)/);
 
     // The fix: a record written once per cycle and read on every continuation.

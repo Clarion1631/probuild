@@ -1846,6 +1846,14 @@ export async function clearCertifiedSweepCheckpoint(complete: boolean, clear: ()
     if (complete) await clear();
 }
 
+/** Keep the completed open checkpoint until its successor phase is durable. */
+export async function transitionCompletedOpenPass(
+    writeLinePhase: () => Promise<void>, clearOpenCheckpoint: () => Promise<void>,
+): Promise<void> {
+    await writeLinePhase();
+    await clearOpenCheckpoint();
+}
+
 export async function GET(request: Request) {
     const budget = createSweepBudget(Date.now(), Date.now, RUN_BUDGET_MS);
     if (!isCronAuthorized(request)) {
@@ -2216,8 +2224,14 @@ async function runSweep(
         if (unitResult.deferred) { deferred = true; break; }
         if (page.length < OPEN_ISSUE_BATCH_SIZE) { openExhausted = true; break; }
     }
-    // A finished pass starts over next run — that is what re-checks everything.
-    if (openExhausted && openPass.errors === 0) await writeOpenCursor(null);
+    // A crash before the phase write keeps the terminal open checkpoint; a
+    // crash after it resumes lines. Neither window replays the open backlog.
+    if (openExhausted && openPass.errors === 0 && openContended === 0 && !deferred) {
+        await transitionCompletedOpenPass(
+            () => writePhase("lines", undefined, null, prisma, cycle.id),
+            () => writeOpenCursor(null),
+        );
+    }
 
     let cursor = await readCursor();
     const totals: ReceiptRequestApplySummary = {

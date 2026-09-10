@@ -280,3 +280,23 @@ test("production wiring keeps one entry clock, full closure, and bounded orphan 
   assert.ok(source.includes("prisma.$transaction(tx => fn(tx as unknown as ReviewIssueLifecycleClient), options)"));
   assert.ok(source.includes("transaction(budget.transactionOptions())"));
 });
+
+test("open-pass handoff preserves its checkpoint until the line phase is durable", async () => {
+  const { transitionCompletedOpenPass } = await import("../src/app/api/cron/receipt-requests/route");
+  let phase = "open-issues";
+  let cursor: string | null = "last-open-issue";
+  const unavailable = new Error("phase write failed");
+  await assert.rejects(transitionCompletedOpenPass(async () => { throw unavailable; }, async () => { cursor = null; }), e => e === unavailable);
+  assert.equal(phase, "open-issues");
+  assert.equal(cursor, "last-open-issue");
+
+  const clearFailed = new Error("checkpoint clear failed");
+  await assert.rejects(transitionCompletedOpenPass(async () => { phase = "lines"; }, async () => { throw clearFailed; }), e => e === clearFailed);
+  assert.equal(phase, "lines", "a crash after the phase write resumes lines, not the open backlog");
+  assert.equal(cursor, "last-open-issue");
+
+  const order: string[] = [];
+  await transitionCompletedOpenPass(async () => { order.push("phase:lines"); }, async () => { order.push("clear:open"); cursor = null; });
+  assert.deepEqual(order, ["phase:lines", "clear:open"]);
+  assert.equal(cursor, null);
+});
