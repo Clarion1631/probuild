@@ -144,3 +144,159 @@ test("all three database reads use the same cap plus one overflow sentinel", () 
     assert.equal((src.match(/take: RECEIPT_OUTCOME_ROW_LIMIT \+ 1/g) ?? []).length, 3);
     assert.match(src, /RECEIPT_OUTCOME_ROW_LIMIT = 2_000/);
 });
+
+// ---- review corrections: snapshot clock after read, and "Records needing review" counting ----
+
+const rvIssue = (over: Record<string, unknown> = {}) => ({
+    id: "i1",
+    targetType: "bank-line",
+    targetKey: "tk1",
+    displayDetails: JSON.stringify({ resolution: "memo-signed", pdfId: "pdf1" }),
+    firstObservedAt: "2026-09-01T10:00:00.000Z",
+    clearedAt: "2026-09-02T10:00:00.000Z",
+    createdAt: "2026-09-01T10:00:00.000Z",
+    ...over,
+});
+const rvArtifact = (over: Record<string, unknown> = {}) => ({
+    id: "a1",
+    pdfId: "pdf1",
+    targetType: "bank-line",
+    targetKey: "tk1",
+    issueId: "i1",
+    createdAt: "2026-09-02T10:00:00.000Z",
+    ...over,
+});
+const rvCard = (over: Record<string, unknown> = {}) => ({
+    id: "c1",
+    itemsJson: JSON.stringify([{
+        n: 1, targetKey: "tk1", issueId: "i1", fingerprint: "pb-tk1",
+        date: "2026-09-01", vendor: "Example Vendor", cents: 1234,
+        amount: "12.34", cardTail: null,
+    }]),
+    status: "POSTED",
+    postedAt: "2026-09-01T11:00:00.000Z",
+    threadName: "spaces/S1/threads/t1",
+    messageName: "spaces/S1/messages/m1",
+    attempts: 1,
+    lastError: null,
+    resendQueuedAt: null,
+    createdAt: "2026-09-01T10:30:00.000Z",
+    ...over,
+});
+async function rvRun(raw: { issues: unknown[]; cards: unknown[]; artifacts: unknown[] }) {
+    return loadReceiptOutcomeAudit({ readSnapshot: async () => raw, now: NOW });
+}
+function rvReview(text: string): string {
+    const m = /Records needing review: (\S+)/.exec(text);
+    assert.ok(m, "Records needing review line present");
+    return m![1];
+}
+
+test("snapshot clock is observed after the read, so a card posted mid-read counts as posted", async () => {
+    let clock = new Date("2026-09-09T14:00:00.000Z");
+    const raw = {
+        issues: [rvIssue({ displayDetails: null, clearedAt: null })],
+        cards: [rvCard({ postedAt: new Date("2026-09-09T14:02:00.000Z") })],
+        artifacts: [],
+    };
+    const report = await loadReceiptOutcomeAudit({
+        readSnapshot: async () => {
+            clock = new Date("2026-09-09T14:05:00.000Z");
+            return raw;
+        },
+        now: () => clock,
+    });
+    assert.equal(report.collectionStatus, "available");
+    assert.equal(report.capturedAt, "2026-09-09T14:05:00.000Z");
+    assert.equal(report.counts.postedToChat, 1);
+    assert.equal((report.rows[0] as { postedToChat: unknown }).postedToChat, true);
+});
+
+test("failed read also stamps the clock observed after the attempt", async () => {
+    let clock = new Date("2026-09-09T14:00:00.000Z");
+    const report = await loadReceiptOutcomeAudit({
+        readSnapshot: async () => {
+            clock = new Date("2026-09-09T14:05:00.000Z");
+            throw new Error("boom");
+        },
+        now: () => clock,
+    });
+    assert.equal(report.collectionStatus, "unavailable");
+    assert.equal(report.capturedAt, "2026-09-09T14:05:00.000Z");
+});
+
+test("records needing review: clean filed target counts 0", async () => {
+    const report = await rvRun({ issues: [rvIssue()], cards: [rvCard()], artifacts: [rvArtifact()] });
+    assert.equal(report.counts.filedInProbuild, 1);
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), "0");
+});
+
+test("records needing review: memo-signed without a bound artifact counts 1", async () => {
+    const report = await rvRun({ issues: [rvIssue()], cards: [rvCard()], artifacts: [] });
+    assert.equal(report.evidenceErrors.length, 0);
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), "1");
+});
+
+test("records needing review: mismatched pdf counts 1", async () => {
+    const report = await rvRun({ issues: [rvIssue()], cards: [rvCard()], artifacts: [rvArtifact({ pdfId: "pdf-other" })] });
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), "1");
+});
+
+test("records needing review: several flags on one target count 1", async () => {
+    const report = await rvRun({
+        issues: [rvIssue({ clearedAt: null }), rvIssue({ id: "i2", clearedAt: null, createdAt: "2026-09-01T12:00:00.000Z" })],
+        cards: [rvCard()],
+        artifacts: [rvArtifact(), rvArtifact({ id: "a2", pdfId: "pdf2" })],
+    });
+    const flags = (report.rows[0] as { flags: string[] }).flags;
+    assert.ok(flags.includes("identity_conflict") && flags.includes("artifact_conflict"));
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), "1");
+});
+
+test("records needing review: duplicate identity error plus the same flagged target counts 1, not 2", async () => {
+    const report = await rvRun({
+        issues: [rvIssue(), rvIssue({ clearedAt: null })],
+        cards: [rvCard()],
+        artifacts: [rvArtifact()],
+    });
+    assert.deepEqual(report.evidenceErrors, ["issue_identity_conflict"]);
+    assert.ok((report.rows[0] as { flags: string[] }).flags.includes("identity_conflict"));
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), "1");
+});
+
+test("records needing review: orphan artifact with no target counts 1", async () => {
+    const report = await rvRun({ issues: [], cards: [], artifacts: [rvArtifact({ targetKey: "tk-orphan" })] });
+    assert.equal(report.rows.length, 0);
+    assert.deepEqual(report.evidenceErrors, ["artifact_without_target"]);
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), "1");
+});
+
+test("records needing review: benign pending flags count 0", async () => {
+    const report = await rvRun({
+        issues: [rvIssue({ displayDetails: null, clearedAt: null, firstObservedAt: "not-a-date" })],
+        cards: [],
+        artifacts: [],
+    });
+    const flags = (report.rows[0] as { flags: string[] }).flags;
+    assert.ok(flags.includes("no_request_card") && flags.includes("elapsed_unavailable"));
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), "0");
+});
+
+test("records needing review: unavailable read shows unknown", async () => {
+    const report = await loadReceiptOutcomeAudit({ readSnapshot: async () => { throw new Error("boom"); }, now: NOW });
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), "unknown");
+});
+
+
+test("review count deduplicates repeated targets and repeated unrepresented errors", async () => {
+    const report=await rvRun({issues:[rvIssue()],cards:[rvCard()],artifacts:[]});
+    report.rows=[report.rows[0],report.rows[0]];
+    report.evidenceErrors=['artifact_without_target','artifact_without_target'];
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), '2');
+});
+
+test("malformed review report sources stay unknown and do not throw", async () => {
+    const report=await rvRun({issues:[],cards:[],artifacts:[]});
+    report.rows=null as unknown as unknown[];
+    assert.equal(rvReview(formatReceiptOutcomeAudit(report)), 'unknown');
+});

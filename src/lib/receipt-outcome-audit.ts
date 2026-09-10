@@ -180,15 +180,21 @@ function nullCounts(): ReceiptOutcomeCounts {
 export async function loadReceiptOutcomeAudit(
     dependencies: ReceiptOutcomeAuditDependencies = {},
 ): Promise<ReceiptOutcomeAudit> {
-    const nowISO = (dependencies.now ?? (() => new Date()))().toISOString();
+    const clock = dependencies.now ?? (() => new Date());
+    // The snapshot clock is observed AFTER the read settles (success or failure):
+    // capturedAt is the end-of-collection observation, not the transaction start,
+    // so a card posted while the consistent read was running is never judged
+    // "future". The injected clock is therefore called only after the await.
+    const observeNow = (): string => clock().toISOString();
     const read = dependencies.readSnapshot ?? readProductionSnapshot;
 
     let raw: ReceiptOutcomeRawSnapshot;
     try {
         raw = await read();
     } catch {
-        return unavailableReceiptOutcomeAudit(nowISO);
+        return unavailableReceiptOutcomeAudit(observeNow());
     }
+    const nowISO = observeNow();
     if (!raw || !Array.isArray(raw.issues) || !Array.isArray(raw.cards) || !Array.isArray(raw.artifacts)) {
         return unavailableReceiptOutcomeAudit(nowISO);
     }
@@ -211,6 +217,87 @@ export async function loadReceiptOutcomeAudit(
     } catch {
         return unavailableReceiptOutcomeAudit(nowISO);
     }
+}
+
+/**
+ * Per-target flags that mean two records contradict each other, so a human
+ * must look. Deliberately excludes incompleteness-only states (no_request_card,
+ * missing_issue, card_evidence_incomplete, *_evidence_unknown) and the
+ * elapsed / timestamp-validity flags: those describe missing or odd timing
+ * evidence, not a contradiction, and source-level problems are already counted
+ * once through the global evidence errors below.
+ */
+const REVIEW_FLAGS: ReadonlySet<string> = new Set([
+    "identity_conflict",
+    "duplicate_open_issue",
+    "artifact_conflict",
+    "artifact_pdf_conflict",
+    "artifact_pdf_mismatch",
+    "resolution_without_artifact",
+    "artifact_without_resolution",
+    "artifact_without_issue",
+    "memo_conflict",
+    "issue_details_unknown",
+    "posted_status_unverified",
+    "card_status_unknown",
+]);
+
+/**
+ * Evidence errors the summariser also records as a per-target flag. When a
+ * counted target already carries the mapped flag, the error is the same
+ * finding and is not counted a second time.
+ */
+const ERROR_TO_FLAGS: Readonly<Record<string, readonly string[]>> = {
+    issue_identity_conflict: ["identity_conflict"],
+    card_identity_conflict: ["identity_conflict"],
+    artifact_identity_conflict: ["identity_conflict"],
+    artifact_pdf_identity_conflict: ["artifact_pdf_conflict"],
+    artifact_pdf_missing: ["artifact_conflict"],
+    artifact_duplicate: ["artifact_conflict"],
+    issue_details_malformed: ["issue_details_unknown"],
+};
+
+function isFlaggedRow(row: unknown): row is { targetKey: string; flags: string[] } {
+    if (row === null || typeof row !== "object") return false;
+    const r = row as { targetKey?: unknown; flags?: unknown };
+    return typeof r.targetKey === "string" && r.targetKey.trim().length > 0
+        && Array.isArray(r.flags)
+        && r.flags.every(f => typeof f === "string");
+}
+
+/**
+ * Distinct targets carrying at least one contradiction flag, plus each distinct
+ * global evidence error not already represented by a flagged target. A target
+ * with several flags, repeated rows for one target, or an error that is also a
+ * flag on a counted target all count once. Counts only: never echoes keys, ids
+ * or raw error text. Null (shown as "unknown") when the read failed.
+ */
+export function countRecordsNeedingReview(report: ReceiptOutcomeAudit): number | null {
+    if (!report || report.collectionStatus === "unavailable") return null;
+    if (!Array.isArray(report.rows) || !Array.isArray(report.evidenceErrors)) return null;
+    const rows: unknown[] = Array.isArray(report.rows) ? report.rows : [];
+    const errors: unknown[] = Array.isArray(report.evidenceErrors) ? report.evidenceErrors : [];
+
+    const flaggedTargets = new Set<string>();
+    const seenFlags = new Set<string>();
+    let malformedRows = 0;
+    for (const row of rows) {
+        if (!isFlaggedRow(row)) { malformedRows = 1; continue; }
+        const hits = row.flags.filter(f => REVIEW_FLAGS.has(f));
+        if (hits.length === 0) continue;
+        flaggedTargets.add(row.targetKey);
+        for (const f of hits) seenFlags.add(f);
+    }
+
+    const countedErrors = new Set<string>();
+    let unrecognized = 0;
+    for (const err of errors) {
+        if (typeof err !== "string") { unrecognized = 1; continue; }
+        const mapped = Object.prototype.hasOwnProperty.call(ERROR_TO_FLAGS, err) ? ERROR_TO_FLAGS[err] : undefined;
+        if (mapped && mapped.some(f => seenFlags.has(f))) continue;
+        countedErrors.add(err);
+    }
+    return flaggedTargets.size + countedErrors.size + unrecognized + malformedRows;
 }
 
 function show(value: number | null | undefined): string {
@@ -249,7 +336,7 @@ export function formatReceiptOutcomeAudit(report: ReceiptOutcomeAudit): string {
         line("Still open", c.unresolved),
         line("Waiting to resend", c.retry),
         line("Sending problems", c.error),
-        line("Records needing review", report.collectionStatus === "unavailable" ? null : report.evidenceErrors.length),
+        line("Records needing review", countRecordsNeedingReview(report)),
         evidenced("All requests needing a receipt", c.eligibleRequests),
         evidenced("Reached the purchaser", c.deliveredToPurchaser),
         evidenced("Return confirmation saved", c.bridgeAck),
