@@ -134,5 +134,7 @@ function normalizeBankPayee(payee: string): string {
 export function observedReceiptMerchantMatches(bankPayee: string, vendor: string | null | undefined): boolean {
     if (typeof bankPayee !== 'string' || typeof vendor !== 'string') return false;
     const mapped = OBSERVED_ALIASES.get(normalizeBankPayee(bankPayee));
-    return mapped !== undefined && mapped === collapse(vendor);
+    const normalizedVendor = collapse(vendor);
+    return mapped !== undefined && (mapped === normalizedVendor
+        || (mapped === 'CRC-WEST VAN' && normalizedVendor === 'CRC - WEST VAN'));
 }

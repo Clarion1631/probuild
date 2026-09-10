@@ -503,6 +503,11 @@ test('native CRC statement trace carries the exact four-day purchase date', () =
   assert.equal(bankAuthPurchaseDate(line('crc-wrong-source', '2026-08-31', -18125, raw, WRONG_SOURCE)), null);
 });
 
+test('CRC exact alias includes the current QBO spaced-hyphen vendor spelling', () => {
+  assert.equal(observedReceiptMerchantMatches('COLUMBIA RESOURCE COMP VANCOUVER WA', 'CRC - WEST VAN'), true);
+  assert.equal(observedReceiptMerchantMatches('COLUMBIA RESOURCE COMP VANCOUVER WA', 'CRC - EAST VAN'), false);
+});
+
 
 test('observed alias: COLUMBIA RESOURCE COMP VANCOUVER WA recognizes exact vendor CRC-WEST VAN', () => {
   assert.equal(observedReceiptMerchantMatches('COLUMBIA RESOURCE COMP VANCOUVER WA', 'CRC-WEST VAN'), true);
