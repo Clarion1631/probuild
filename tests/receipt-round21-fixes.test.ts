@@ -190,7 +190,7 @@ test("the non-aborting default survives, because the outer passes rely on it", a
 });
 
 test("the component transaction is the caller that asks to abort", () => {
-    assert.match(sweepSource, /\{ abortOnError: true \},\s*\);\s*summary\.opened \+= applied\.opened;/);
+    assert.match(sweepSource, /\{ abortOnError: true \},\s*\);\s*return applied;/);
 });
 
 // ── 4. undecided work may not stamp a completion ──────────────────────────

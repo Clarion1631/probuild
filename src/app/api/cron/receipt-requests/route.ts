@@ -37,6 +37,7 @@ import {
 } from "@/lib/receipt-requests";
 import { REGISTER_WINDOW_DAYS, registerWindowStartYmd } from "@/lib/bank-register-pull";
 import { lockBankLedgerEpoch, readBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
+import { createSweepBudget, runCheckpointedUnits, SweepDeferredError, isSweepDeferredError, type SweepBudget } from "@/lib/receipt-sweep-budget";
 import { withTxRetry } from "@/lib/tx-retry";
 import { lockReceiptEvidence, readReceiptEvidenceEpoch } from "@/lib/receipt-evidence-lock";
 import {
@@ -104,7 +105,7 @@ export const LOOKBACK_DAYS = REGISTER_WINDOW_DAYS;
  * so a run that dies mid-sweep loses at most this much progress, and the
  * cohort/evidence queries for a batch stay a size Postgres can answer fast.
  */
-const BATCH_SIZE = 200;
+const BATCH_SIZE = 1; // pageComponents keeps an oversized component whole.
 
 /**
  * Wall-clock budget for one invocation. `maxDuration` is 60s; stopping at 45
@@ -127,7 +128,7 @@ const CURSOR_KEY = "receiptRequestsCursor";
 /** The open-issue pass keeps its OWN resume point; sharing one would corrupt both. */
 const OPEN_CURSOR_KEY = "receiptRequestsOpenIssueCursor";
 /** Open issues per batch. Smaller than the line batch: each one costs a lookup. */
-const OPEN_ISSUE_BATCH_SIZE = 100;
+const OPEN_ISSUE_BATCH_SIZE = 1; // One seed, but its entire competing closure.
 
 /** Which half of the sweep is in progress. Persisted, so a resume knows. */
 const PHASE_KEY = SWEEP_MARKER_KEY;
@@ -667,12 +668,9 @@ async function writeCycle(cycle: SweepCycle | null): Promise<void> {
 const FULL_RUN_REQUESTED_KEY = "receiptRequestsFullRunRequested";
 
 async function readFullRunRequested(): Promise<boolean> {
-    try {
-        const row = await prisma.automationSetting.findUnique({ where: { key: FULL_RUN_REQUESTED_KEY } });
-        return !!row?.value;
-    } catch {
-        return false;
-    }
+    // An unreadable intent is not proof that no full run is owed.
+    const row = await prisma.automationSetting.findUnique({ where: { key: FULL_RUN_REQUESTED_KEY } });
+    return !!row?.value;
 }
 
 async function writeFullRunRequested(value: string | null): Promise<void> {
@@ -1127,7 +1125,7 @@ class ComponentMovedError extends Error {
  * Prisma's interactive default is 5s; a component is a handful of rows, but the
  * re-read is four queries and the writes are one per verdict.
  */
-const COMPONENT_TX_TIMEOUT_MS = 15_000;
+// Component admission uses the shared sweep budget: 15s transaction + 2s acquisition.
 
 /**
  * Namespace for the per-component advisory lock. Every writer of a component
@@ -1155,13 +1153,15 @@ async function processBatchWithReplan(
     detailsByKey: Map<string, Record<string, unknown>>,
     now: Date,
     cohortMode: "window" | "closure" = "window",
+    budget: SweepBudget = createSweepBudget(Date.now()),
 ): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; contended: number; replans: number }> {
     let replans = 0;
     let issues = openIssues;
     let resolved = resolvedIssueKeys;
     let details = detailsByKey;
     for (let attempt = 1; attempt <= MAX_COMPONENT_REPLANS; attempt++) {
-        const outcome = await processBatch(batch, issues, resolved, details, now, cohortMode);
+        budget.check();
+        const outcome = await processBatch(batch, issues, resolved, details, now, cohortMode, budget);
         // A batch that reached a verdict is never contended, whatever else it
         // left undecided — those are the STABLE non-verdicts (see
         // sweepPhaseAfter), and they must not hold the cycle open forever.
@@ -1179,7 +1179,9 @@ async function processBatchWithReplan(
          * attempt reaches the same wrong verdict as the first and opens a chase
          * for a charge somebody just answered.
          */
+        budget.check();
         const reloaded = await loadIssueSnapshot();
+        budget.check();
         issues = reloaded.openIssues;
         resolved = reloaded.resolvedIssueKeys;
         details = reloaded.detailsByKey;
@@ -1247,12 +1249,14 @@ async function processBatch(
      *   the line pass reaches for the same rows.
      */
     cohortMode: "window" | "closure" = "window",
+    budget: SweepBudget = createSweepBudget(Date.now()),
 ): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; replan: boolean }> {
     // THE LINES THIS BATCH IS ANSWERABLE FOR. The cohort query below drags in
     // neighbours so they can consume the evidence they are entitled to, but a
     // neighbour's OWN verdict belongs to the page that owns it — judging it here,
     // from a view that may be missing ITS competitors, is how a line got closed
     // on one page and reopened on the next, night after night.
+    budget.check();
     const judgeOnly = new Set(batch.map(row => row.id));
     // 1. THE COHORT.
     const cohortRows: BatchLine[] = [];
@@ -1262,10 +1266,11 @@ async function processBatch(
         // far the chain reaches.
         for (const row of batch) {
             try {
-                for (const found of await loadCompetingComponent(row)) {
+                for (const found of await loadCompetingComponent(row, budget.expired)) {
                     cohortRows.push({ ...found, postedDate: new Date(`${found.postedDate}T00:00:00Z`) });
                 }
             } catch (error) {
+                if (error instanceof ComponentDeadlineExceededError) throw new SweepDeferredError();
                 if (!(error instanceof ComponentTooLargeError)) throw error;
                 // Its competition set is unloadable, so it gets NO verdict —
                 // not a guess, and not a close. It stays open and reported.
@@ -1295,6 +1300,7 @@ async function processBatch(
     // pass (see runSweep). Loading every one of them into every batch made each
     // batch's evidence window span the whole backlog, which is exactly what
     // made batching pointless.
+    budget.check();
     const lines = [...new Map(
         [...batch, ...cohortRows].map(row => [row.id, row]),
     ).values()];
@@ -1312,9 +1318,11 @@ async function processBatch(
     // keys derived from `Expense.date` below must come from the SAME zone or
     // they disagree at the edges — the window would load an expense the
     // matcher then files on a different calendar day than the query claimed.
+    budget.check();
     const zone = await resolveCompanyTimeZone();
     const range = evidenceBoundsFor(fromYmd, toYmd, zone);
 
+    budget.check();
     const [expenseRows, intakeRows] = await Promise.all([
         prisma.expense.findMany({
             where: { date: range.timestamp },
@@ -1331,6 +1339,7 @@ async function processBatch(
             },
         }),
     ]);
+    budget.check();
     const lineIds = lines.map(row => row.id);
 
     // 2b. EXACT LINEAGE for every line in the cohort, by id — the retired zero
@@ -1338,9 +1347,10 @@ async function processBatch(
     // batch; each component's planned version takes its subset, and the locked
     // transaction re-reads the same helper for its own ids. An overflow throws
     // and the batch fails honestly.
-    const lineage = await loadRetiredReceiptLineage(prisma, lineIds, { candidatePurchaseIds: lineagePurchaseIds(expenseRows, intakeRows), candidateExpenseIds: lineageExpenseIds(intakeRows) });
+    const lineage = await loadRetiredReceiptLineage(prisma, lineIds, { candidatePurchaseIds: lineagePurchaseIds(expenseRows, intakeRows), candidateExpenseIds: lineageExpenseIds(intakeRows), checkBudget: budget.check });
 
     // 3. DECIDE.
+    budget.check();
     const fullPlan = planReceiptRequests({
         bankLines: lines.map(row => ({
             id: row.id,
@@ -1432,9 +1442,11 @@ async function processBatch(
         postedDate: row.postedDate.toISOString().slice(0, 10),
         amountCents: row.amountCents,
     })));
+    budget.check();
     const planIssueRows = await componentIssueRows(lineIds);
     const summary = emptySummary();
 
+    budget.check();
     for (const component of componentsInBatch) {
         const ids = new Set(component.lineIds);
         const componentOpen = plan.open.filter(item => ids.has(item.targetKey));
@@ -1537,7 +1549,7 @@ async function processBatch(
              * failure rolls the whole component back — nothing half-applied —
              * and re-running it against fresh state is always safe.
              */
-            await withTxRetry(() => prisma.$transaction(async tx => {
+            await runBudgetedComponent(budget, transactionOptions => prisma.$transaction(async tx => {
                 /**
                  * 0a. THE EVIDENCE LOCK, FIRST OF ALL (round-42 gate, finding 1).
                  *
@@ -1724,14 +1736,17 @@ async function processBatch(
                     // the cursor stops, so the next run redoes the component.
                     { abortOnError: true },
                 );
+                return applied;
+            }, transactionOptions), applied => {
                 summary.opened += applied.opened;
                 summary.closed += applied.closed;
                 summary.touched += applied.touched;
                 summary.skipped += applied.skipped;
                 summary.errors += applied.errors;
                 summary.failedTargets.push(...applied.failedTargets);
-            }, { timeout: COMPONENT_TX_TIMEOUT_MS }));
+            });
         } catch (error) {
+            if (isSweepDeferredError(error)) throw error;
             if (error instanceof ComponentMovedError) {
                 // NOTHING COMMITTED for this component. The caller replans the
                 // batch rather than half-applying a plan drawn from a world
@@ -1803,7 +1818,60 @@ async function evidenceRange(fromYmd: string, toYmd: string): Promise<EvidenceBo
     return evidenceBoundsFor(fromYmd, toYmd, await resolveCompanyTimeZone());
 }
 
+/** Admission repeats for every rolled-back retry; counters merge only after commit resolves. */
+export async function runBudgetedComponent<T>(
+    budget: SweepBudget,
+    transaction: (options: { timeout: number; maxWait: number }) => Promise<T>,
+    committed: (result: T) => void,
+): Promise<void> {
+    const result = await withTxRetry(() => transaction(budget.transactionOptions()));
+    committed(result);
+}
+
+/** Setup deferral preserves the durable phase, including an epoch-triggered restart. */
+export async function preserveDeferredSweepPhase(
+    read: () => Promise<SweepPhase>, write: (phase: SweepPhase) => Promise<void>,
+): Promise<SweepPhase> {
+    const current = await read();
+    const phase = current === "done" ? "open-issues" : current;
+    await write(phase);
+    return phase;
+}
+
+/** A terminal checkpoint is still needed when the completion fence was deferred. */
+export async function clearCertifiedSweepCheckpoint(complete: boolean, clear: () => Promise<void>): Promise<void> {
+    if (complete) await clear();
+}
+
+/** Keep the completed open checkpoint until its successor phase is durable. */
+export async function transitionCompletedOpenPass(
+    writeLinePhase: () => Promise<void>, clearOpenCheckpoint: () => Promise<void>,
+): Promise<void> {
+    await writeLinePhase();
+    await clearOpenCheckpoint();
+}
+
+/** Completed cycles remain stored because card selection verifies their identity. */
+export function continuationNeedsWork(input: {
+    marker: SweepMarker; cycle: SweepCycle | null;
+    bankEpoch: string; evidenceEpoch: string;
+    fullRunOwed: boolean; lineCursor: string | null; openCursor: string | null; now: Date;
+}): boolean {
+    if (input.fullRunOwed) return true;
+    const completedAt = input.marker.chaserCompletedAt ? Date.parse(input.marker.chaserCompletedAt) : NaN;
+    const certified = input.cycle !== null
+        && input.marker.phase === "done"
+        && !input.marker.blockedReason
+        && input.marker.completedCycleId === input.cycle.id
+        && Number.isFinite(completedAt) && completedAt <= input.now.getTime()
+        && cycleStillValid(input.cycle, input.bankEpoch, input.evidenceEpoch);
+    if (certified) return false;
+    // A crash between durable cycle creation and phase/checkpoint writes still resumes.
+    return input.cycle !== null || shouldResumeSweep(input.marker.phase, input.lineCursor, input.openCursor);
+}
+
 export async function GET(request: Request) {
+    const budget = createSweepBudget(Date.now(), Date.now, RUN_BUDGET_MS);
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
@@ -1830,23 +1898,26 @@ export async function GET(request: Request) {
         // Even both cursors are not enough: each is cleared the instant its pass
         // completes, so a run that finished the open-issue pass and then ran out
         // of budget parked NEITHER, and the line pass never resumed.
-        const [phase, lineCursor, openCursor, fullRunOwed, persistedCycle] = await Promise.all([
-            readPhase(), readCursor(), readOpenCursor(), readFullRunRequested(), readCycle(),
+        const [marker, lineCursor, openCursor, fullRunOwed, persistedCycle, bankEpoch, evidenceEpoch] = await Promise.all([
+            readMarker(), readCursor(), readOpenCursor(), readFullRunRequested(), readCycle(),
+            readBankLedgerEpoch(prisma), readReceiptEvidenceEpoch(prisma),
         ]);
+        const phase = marker.phase;
         /**
-         * A PERSISTED CYCLE IS WORK IN PROGRESS (round-46 gate, finding 3).
+         * AN UNCERTIFIED PERSISTED CYCLE IS WORK IN PROGRESS.
          *
          * The handoff between clearing the old cycle and `runSweep` writing the
          * new one is several writes long, and a crash inside it used to leave
          * phase `"done"`, no completion, no cursor and no request — which every
          * later continuation read as `nothing-in-progress`, losing the day. The
          * cycle record is written first now and is the durable evidence that a
-         * cycle is open, so this pass honours it whatever the cursors say.
+         * cycle is open. A matching, unchanged completion proves that it finished;
+         * otherwise this pass honours it whatever the cursors say.
          *
          * An owed full run counts for the same reason (round-45, finding 2).
          */
-        const cycleOpen = persistedCycle !== null;
-        if (!fullRunOwed && !cycleOpen && !shouldResumeSweep(phase, lineCursor, openCursor)) {
+        if (!continuationNeedsWork({ marker, cycle: persistedCycle, bankEpoch, evidenceEpoch,
+            fullRunOwed, lineCursor, openCursor, now: new Date() })) {
             return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
         }
         resumePhase = phase === "done" ? "open-issues" : phase;
@@ -1896,8 +1967,12 @@ export async function GET(request: Request) {
             // not a statement about the work in progress.
             await writePhase("open-issues", undefined, null, prisma, null);
         }
-        return await runSweep(now, startingFullRun ? "open-issues" : resumePhase, startingFullRun);
+        return await runSweep(now, startingFullRun ? "open-issues" : resumePhase, startingFullRun, budget);
     } catch (error) {
+        if (isSweepDeferredError(error)) {
+            const phase = await preserveDeferredSweepPhase(readPhase, phase => writePhase(phase));
+            return NextResponse.json({ ok: true, phase, deferred: true, moreToProcess: true });
+        }
         // A cursor that will not persist is an INVOCATION ERROR, not a quiet
         // note in the log. Whatever this run committed stays committed, but the
         // checkpoint did not move — so the platform must show the run as failed
@@ -1922,6 +1997,7 @@ async function runSweep(
      * request is discharged here, once the new cycle record is durable.
      */
     clearFullRunRequestOnStart = false,
+    budget: SweepBudget = createSweepBudget(Date.now()),
 ) {
     const windowStart = registerWindowStartYmd(now, LOOKBACK_DAYS);
     const windowEnd = now.toISOString().slice(0, 10);
@@ -1944,7 +2020,9 @@ async function runSweep(
      * Read here, before anything is judged, and carried on every checkpoint
      * this cycle writes.
      */
+    budget.check();
     const snapshotEpoch = await readBankLedgerEpoch(prisma);
+    budget.check();
     const snapshotEvidenceEpoch = await readReceiptEvidenceEpoch(prisma);
 
     /**
@@ -1957,6 +2035,7 @@ async function runSweep(
      * cannot reach.
      */
     let effectiveStartPhase = startPhase;
+    budget.check();
     let cycle = await readCycle();
     if (startPhase === "lines" || cycle !== null) {
         /**
@@ -2015,6 +2094,7 @@ async function runSweep(
     // before each write stays, and so does the RELOAD on every replan: it is
     // what stops a memo signed mid-run from being un-answered, and no amount of
     // bulking is worth losing that.
+    budget.check();
     const { openIssues, resolvedIssueKeys, detailsByKey } = await loadIssueSnapshot();
 
     // OLDEST-FIRST, FROM A DURABLE CURSOR, IN TIME-BUDGETED BATCHES.
@@ -2025,7 +2105,9 @@ async function runSweep(
     // each batch is small, the cursor is checkpointed after every one, and the
     // run exits cleanly when the budget is spent. The 15-minute schedule drains
     // whatever is left.
+    budget.check();
     const startedAt = Date.now();
+    let deferred = false;
 
     // PASS 1: EVERY OPEN ISSUE, every run, whatever the recent-line cursor says.
     //
@@ -2057,7 +2139,7 @@ async function runSweep(
     // plan was being made. Reported: a run full of them is a run racing a human.
     let replans = 0;
 
-    while (startPhase !== "lines" && Date.now() - startedAt < RUN_BUDGET_MS) {
+    while (startPhase !== "lines" && !budget.expired()) {
         const page = await prisma.reviewIssue.findMany({
             where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null },
             orderBy: [{ firstObservedAt: "asc" }, { id: "asc" }],
@@ -2068,84 +2150,107 @@ async function runSweep(
         if (page.length === 0) { openExhausted = true; break; }
         openBatches++;
 
-        const lines = await prisma.bankLine.findMany({
-            where: { id: { in: page.map(issue => issue.targetKey) } },
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
-        });
+        const unitResult = await runCheckpointedUnits([page], budget, async () => {
+            const lines = await prisma.bankLine.findMany({
+                where: { id: { in: page.map(issue => issue.targetKey) } },
+                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
+            });
 
-        // AN ISSUE WHOSE BANK LINE IS GONE can never be answered: the matcher
-        // has nothing to match, so it would be skipped forever and nag forever.
-        // A deleted or re-imported statement line is a real thing that happens.
-        // Close it with a reason a human can read rather than leaving a chase
-        // pointing at nothing.
-        const present = new Set(lines.map(line => line.id));
-        const orphaned = page.filter(issue => !present.has(issue.targetKey));
-        // ANY failure on THIS page stops the checkpoint. An orphan close that
-        // threw used to be counted and then stepped over, and a later
-        // `?continue=1` could finish the pass and clear the cursor — stranding
-        // that issue permanently, nagging with a target nothing can answer.
-        let pageErrors = 0;
-        let pageContended = 0;
-        for (const issue of orphaned) {
-            try {
-                const details = detailsByKey.get(issue.targetKey) ?? {};
-                await evaluateReviewIssue(
-                    RECEIPT_REQUEST_TARGET_TYPE,
-                    issue.targetKey,
-                    [],
-                    { ...details, resolution: "target-missing" },
-                    { episodeStatus: "SUPPRESSED" },
-                );
-                openPass.closed++;
-                targetMissing++;
-            } catch (error) {
-                openPass.errors++;
-                pageErrors++;
-                openPass.failedTargets.push(issue.targetKey);
-                console.error("[cron/receipt-requests] target-missing close failed", issue.targetKey,
-                    error instanceof Error ? error.message : "UnknownError");
+            // AN ISSUE WHOSE BANK LINE IS GONE can never be answered: the matcher
+            // has nothing to match, so it would be skipped forever and nag forever.
+            // A deleted or re-imported statement line is a real thing that happens.
+            // Close it with a reason a human can read rather than leaving a chase
+            // pointing at nothing.
+            const present = new Set(lines.map(line => line.id));
+            const orphaned = page.filter(issue => !present.has(issue.targetKey));
+            // ANY failure on THIS page stops the checkpoint. An orphan close that
+            // threw used to be counted and then stepped over, and a later
+            // `?continue=1` could finish the pass and clear the cursor — stranding
+            // that issue permanently, nagging with a target nothing can answer.
+            let pageErrors = 0;
+            let pageContended = 0;
+            for (const issue of orphaned) {
+                try {
+                    budget.transactionOptions();
+                    const details = detailsByKey.get(issue.targetKey) ?? {};
+                    await evaluateReviewIssue(
+                        RECEIPT_REQUEST_TARGET_TYPE,
+                        issue.targetKey,
+                        [],
+                        { ...details, resolution: "target-missing" },
+                        {
+                            episodeStatus: "SUPPRESSED",
+                            client: {
+                                reviewIssue: prisma.reviewIssue,
+                                reviewAlertEpisode: prisma.reviewAlertEpisode,
+                                $transaction: <T>(fn: (tx: ReviewIssueLifecycleClient) => Promise<T>) => {
+                                    const options = budget.transactionOptions();
+                                    return prisma.$transaction(tx => fn(tx as unknown as ReviewIssueLifecycleClient), options);
+                                },
+                            } as unknown as ReviewIssueLifecycleClient,
+                        },
+                    );
+                    openPass.closed++;
+                    targetMissing++;
+                } catch (error) {
+                    if (isSweepDeferredError(error)) throw error;
+                    openPass.errors++;
+                    pageErrors++;
+                    openPass.failedTargets.push(issue.targetKey);
+                    console.error("[cron/receipt-requests] target-missing close failed", issue.targetKey,
+                        error instanceof Error ? error.message : "UnknownError");
+                }
             }
-        }
 
-        if (lines.length > 0) {
-            const outcome = await processBatchWithReplan(
-                lines,
-                page.map(issue => ({ targetKey: issue.targetKey })),
-                resolvedIssueKeys,
-                detailsByKey,
-                now,
-                // An arbitrary page of old issues is not a component. Walk each
-                // one's chain to closure or judge a fragment.
-                "closure",
-            );
-            replans += outcome.replans;
-            openPass.opened += outcome.summary.opened;
-            openPass.closed += outcome.summary.closed;
-            openPass.touched += outcome.summary.touched;
-            openPass.skipped += outcome.summary.skipped;
-            openPass.errors += outcome.summary.errors;
-            openPass.failedTargets.push(...outcome.summary.failedTargets);
-            openUndecided += outcome.undecided;
-            openContended += outcome.contended;
-            pageErrors += outcome.summary.errors;
-            pageContended += outcome.contended;
-        }
+            if (lines.length > 0) {
+                const outcome = await processBatchWithReplan(
+                    lines,
+                    page.map(issue => ({ targetKey: issue.targetKey })),
+                    resolvedIssueKeys,
+                    detailsByKey,
+                    now,
+                    // An arbitrary page of old issues is not a component. Walk each
+                    // one's chain to closure or judge a fragment.
+                    "closure",
+                    budget,
+                );
+                replans += outcome.replans;
+                openPass.opened += outcome.summary.opened;
+                openPass.closed += outcome.summary.closed;
+                openPass.touched += outcome.summary.touched;
+                openPass.skipped += outcome.summary.skipped;
+                openPass.errors += outcome.summary.errors;
+                openPass.failedTargets.push(...outcome.summary.failedTargets);
+                openUndecided += outcome.undecided;
+                openContended += outcome.contended;
+                pageErrors += outcome.summary.errors;
+                pageContended += outcome.contended;
+            }
 
-        // Same rule as the line pass: never checkpoint past a failure — from
-        // EITHER half of this page. A contended component was never reconciled
-        // (see processBatchWithReplan) — advancing past it strands the page it
-        // sat on just as surely as an error would.
-        if (pageErrors > 0 || pageContended > 0) break;
+            // Same rule as the line pass: never checkpoint past a failure — from
+            // EITHER half of this page. A contended component was never reconciled
+            // (see processBatchWithReplan) — advancing past it strands the page it
+            // sat on just as surely as an error would.
+            if (pageErrors > 0 || pageContended > 0) throw new SweepDeferredError("Unit remains unreconciled");
 
-        openCursor = page[page.length - 1].id;
-        // The open-issue checkpoint carries the same pair as the line one — a
-        // resume into THIS pass has to prove the same thing (round-44 gate,
-        // finding 1).
-        await writeOpenCursor(formatSweepCursor({ key: openCursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
+        }, async () => {
+            openCursor = page[page.length - 1].id;
+            // The open-issue checkpoint carries the same pair as the line one — a
+            // resume into THIS pass has to prove the same thing (round-44 gate,
+            // finding 1).
+            await writeOpenCursor(formatSweepCursor({ key: openCursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
+        });
+        if (unitResult.deferred) { deferred = true; break; }
         if (page.length < OPEN_ISSUE_BATCH_SIZE) { openExhausted = true; break; }
     }
-    // A finished pass starts over next run — that is what re-checks everything.
-    if (openExhausted && openPass.errors === 0) await writeOpenCursor(null);
+    // A crash before the phase write keeps the terminal open checkpoint; a
+    // crash after it resumes lines. Neither window replays the open backlog.
+    if (openExhausted && openPass.errors === 0 && openContended === 0 && !deferred) {
+        await transitionCompletedOpenPass(
+            () => writePhase("lines", undefined, null, prisma, cycle.id),
+            () => writeOpenCursor(null),
+        );
+    }
 
     let cursor = await readCursor();
     const totals: ReceiptRequestApplySummary = {
@@ -2183,7 +2288,7 @@ async function runSweep(
     // and therefore who is asked — moves one of them too. Reading them here
     // made them blind to the open-issue pass that runs before this point, and
     // to everything that happened while a `"lines"` continuation skipped it.
-    const windowLines = await prisma.bankLine.findMany({
+    const windowLines = budget.expired() ? [] : await prisma.bankLine.findMany({
         where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
         orderBy: [{ postedDate: "asc" }, { id: "asc" }],
         select: { id: true, postedDate: true, amountCents: true },
@@ -2240,76 +2345,75 @@ async function runSweep(
         BATCH_SIZE,
     );
     let pageIndex = 0;
-    exhausted = pages.length === 0;
+    exhausted = !budget.expired() && pages.length === 0;
 
-    while (pageIndex < pages.length && Date.now() - startedAt < RUN_BUDGET_MS) {
+    while (pageIndex < pages.length && !budget.expired()) {
         const page = pages[pageIndex++];
-        const ids = page.flatMap(component => component.lineIds);
-        const batch = await prisma.bankLine.findMany({
-            where: { id: { in: ids } },
-            orderBy: [{ postedDate: "asc" }, { id: "asc" }],
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
-        });
-        // Every line in the page vanished between the two queries. Nothing to
-        // judge, but the checkpoint still has to move past it.
-        if (batch.length === 0) {
+        const unitResult = await runCheckpointedUnits([page], budget, async () => {
+            const ids = page.flatMap(component => component.lineIds);
+            const batch = await prisma.bankLine.findMany({
+                where: { id: { in: ids } },
+                orderBy: [{ postedDate: "asc" }, { id: "asc" }],
+                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
+            });
+            // Every line in the page vanished between the two queries. Nothing to
+            // judge, but the checkpoint still has to move past it.
+            if (batch.length === 0) return;
+
+            // Split the page by where its components sit. Distinct components share
+            // no candidate evidence by construction, so judging them in two calls
+            // cannot change any allocation — it only changes how each one's
+            // competitors were found.
+            const boundaryBatch = batch.filter(row => boundaryLineIds.has(row.id));
+            const interiorBatch = batch.filter(row => !boundaryLineIds.has(row.id));
+            let pageErrors = 0;
+            let pageContended = 0;
+            for (const [rows, mode] of [
+                [interiorBatch, "window"],
+                [boundaryBatch, "closure"],
+            ] as const) {
+                if (rows.length === 0) continue;
+                const outcome = await processBatchWithReplan(rows, openIssues, resolvedIssueKeys, detailsByKey, now, mode, budget);
+                replans += outcome.replans;
+                undecided += outcome.undecided;
+                lineContended += outcome.contended;
+                totals.opened += outcome.summary.opened;
+                totals.closed += outcome.summary.closed;
+                totals.touched += outcome.summary.touched;
+                totals.skipped += outcome.summary.skipped;
+                totals.errors += outcome.summary.errors;
+                totals.failedTargets.push(...outcome.summary.failedTargets);
+                pageErrors += outcome.summary.errors;
+                pageContended += outcome.contended;
+            }
+            batches++;
+            linesSeen += batch.length;
+
+            // THE CURSOR STOPS AT THE FIRST FAILURE — OR AT UNRESOLVED CONTENTION.
+            // Advancing past a target whose write threw is how a row that fails
+            // every night is never chased: the sweep would step over it forever and
+            // report a clean run. A contended component (processBatchWithReplan
+            // exhausted its replans) was never reconciled either — it has no
+            // verdict, so checkpointing past its page persists a cursor beyond a
+            // page nothing was decided for, same as an error would. A failed or
+            // contended batch keeps its cursor so the next invocation retries the
+            // same ground; the lifecycle writes are idempotent, so re-running is
+            // free.
+            if (pageErrors > 0 || pageContended > 0) throw new SweepDeferredError("Unit remains unreconciled");
+
+            // The checkpoint is the last COMPONENT this page finished, so a resume
+            // can never land in the middle of a competition set.
+        }, async () => {
             cursor = page[page.length - 1].key;
             await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
             if (pageIndex >= pages.length) exhausted = true;
-            continue;
-        }
-
-        // Split the page by where its components sit. Distinct components share
-        // no candidate evidence by construction, so judging them in two calls
-        // cannot change any allocation — it only changes how each one's
-        // competitors were found.
-        const boundaryBatch = batch.filter(row => boundaryLineIds.has(row.id));
-        const interiorBatch = batch.filter(row => !boundaryLineIds.has(row.id));
-        let pageErrors = 0;
-        let pageContended = 0;
-        for (const [rows, mode] of [
-            [interiorBatch, "window"],
-            [boundaryBatch, "closure"],
-        ] as const) {
-            if (rows.length === 0) continue;
-            const outcome = await processBatchWithReplan(rows, openIssues, resolvedIssueKeys, detailsByKey, now, mode);
-            replans += outcome.replans;
-            undecided += outcome.undecided;
-            lineContended += outcome.contended;
-            totals.opened += outcome.summary.opened;
-            totals.closed += outcome.summary.closed;
-            totals.touched += outcome.summary.touched;
-            totals.skipped += outcome.summary.skipped;
-            totals.errors += outcome.summary.errors;
-            totals.failedTargets.push(...outcome.summary.failedTargets);
-            pageErrors += outcome.summary.errors;
-            pageContended += outcome.contended;
-        }
-        batches++;
-        linesSeen += batch.length;
-
-        // THE CURSOR STOPS AT THE FIRST FAILURE — OR AT UNRESOLVED CONTENTION.
-        // Advancing past a target whose write threw is how a row that fails
-        // every night is never chased: the sweep would step over it forever and
-        // report a clean run. A contended component (processBatchWithReplan
-        // exhausted its replans) was never reconciled either — it has no
-        // verdict, so checkpointing past its page persists a cursor beyond a
-        // page nothing was decided for, same as an error would. A failed or
-        // contended batch keeps its cursor so the next invocation retries the
-        // same ground; the lifecycle writes are idempotent, so re-running is
-        // free.
-        if (pageErrors > 0 || pageContended > 0) break;
-
-        // The checkpoint is the last COMPONENT this page finished, so a resume
-        // can never land in the middle of a competition set.
-        cursor = page[page.length - 1].key;
-        await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
-        if (pageIndex >= pages.length) { exhausted = true; break; }
+        });
+        if (unitResult.deferred) { deferred = true; break; }
     }
 
     // A finished sweep starts over from the oldest line next time — that pass
     // is what re-checks everything for CLOSES.
-    if (exhausted && totals.errors === 0) await writeCursor(null);
+    // Retain the terminal checkpoint until certification; a deferred fence must not replay the whole pass.
 
     // THE PHASE, LAST, FROM WHAT ACTUALLY HAPPENED. It is what carries "the
     // open-issue half is done" across an invocation boundary — the cursor that
@@ -2379,6 +2483,7 @@ async function runSweep(
     let decision: { phase: SweepPhase; complete: boolean; blockedReason: string | null; ledgerMoved: boolean };
     if (certifiable) {
         try {
+            const fenceOptions = budget.transactionOptions();
             decision = await fenceAndWritePhase(
                 { snapshotEpoch, snapshotEvidenceEpoch, computedPhase, bankPullStale, now: new Date() },
                 fn => prisma.$transaction(async tx => fn({
@@ -2402,7 +2507,7 @@ async function runSweep(
                     // completed today" from "THIS cycle completed".
                     writePhase: (phase, completedAt, blockedReason) =>
                         writePhase(phase, completedAt, blockedReason, tx, cycle.id),
-                }), { timeout: FENCE_TX_TIMEOUT_MS }),
+                }), { ...fenceOptions, timeout: Math.min(fenceOptions.timeout, FENCE_TX_TIMEOUT_MS) }),
             );
         } catch (error) {
             /**
@@ -2413,8 +2518,9 @@ async function runSweep(
              * reason and the next continuation tries again, 15 minutes later,
              * with hours to spare before the cards.
              */
-            console.error("[cron/receipt-requests] ledger fence failed", error instanceof Error ? error.message : "UnknownError");
-            decision = { phase: "lines", complete: false, blockedReason: LEDGER_FENCE_FAILED_REASON, ledgerMoved: false };
+            if (isSweepDeferredError(error)) deferred = true;
+            else console.error("[cron/receipt-requests] ledger fence failed", error instanceof Error ? error.message : "UnknownError");
+            decision = { phase: "lines", complete: false, blockedReason: isSweepDeferredError(error) ? null : LEDGER_FENCE_FAILED_REASON, ledgerMoved: false };
             await writePhase(decision.phase, undefined, decision.blockedReason);
         }
     } else {
@@ -2423,11 +2529,14 @@ async function runSweep(
         decision = { ...sweepCompletionDecision({ computedPhase, bankPullStale }), ledgerMoved: false };
         await writePhase(decision.phase, undefined, decision.blockedReason);
     }
+    await clearCertifiedSweepCheckpoint(decision.complete, () => writeCursor(null));
     const ledgerMoved = decision.ledgerMoved;
     const fenceFailed = decision.blockedReason === LEDGER_FENCE_FAILED_REASON;
     const phase = decision.phase;
 
+    const deferredRun = deferred || (budget.expired() && phase !== "done");
     const result = {
+        deferred: deferredRun,
         ok: totals.errors === 0,
         phase,
         // Why this cycle is not stamping complete, when that is the reason.
@@ -2456,7 +2565,7 @@ async function runSweep(
         // exhausted its pages but left a component unreconciled, and including a
         // cycle held open because the register it read was not current.
         moreToProcess: !exhausted || !openExhausted || openContended > 0 || lineContended > 0
-            || bankPullStale || ledgerMoved || fenceFailed,
+            || bankPullStale || ledgerMoved || fenceFailed || deferredRun,
         cursor,
         elapsedMs: Date.now() - startedAt,
         ...totals,

@@ -171,8 +171,8 @@ test("the full-run request outlives the reset, and a persisted cycle is work in 
 
     // And a persisted cycle keeps a continuation alive even with no cursor
     // parked — which is the state a crash mid-handoff leaves behind.
-    assert.match(sweep, /const cycleOpen = persistedCycle !== null;/);
-    assert.match(sweep, /if \(!fullRunOwed && !cycleOpen && !shouldResumeSweep\(/);
+    assert.match(sweep, /return input.cycle !== null \|\| shouldResumeSweep\(/);
+    assert.match(sweep, /if \(!continuationNeedsWork\(/);
 });
 
 test("PRE-FIX CONTROL: clearing the request inside the reset loses the day", () => {

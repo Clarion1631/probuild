@@ -113,9 +113,10 @@ test("a fresh run clears BOTH cursors before it starts", () => {
     // (measured: that mutation survived until this assertion existed).
     const checkpoints = sweep.match(/await writeCursor\(/g) ?? [];
     const carried = sweep.match(/await writeCursor\(formatSweepCursor\(\{ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch \}\)\)/g) ?? [];
-    assert.equal(checkpoints.length - carried.length, 1,
-        "exactly one writeCursor call is not a checkpoint: the reset to null when a cycle finishes clean");
-    assert.equal(carried.length, 2, "and both real checkpoints carry BOTH epochs");
+    assert.equal(checkpoints.length - carried.length, 0,
+        "the completion reset is delegated to clearCertifiedSweepCheckpoint");
+    assert.equal(carried.length, 1, "the shared completed-unit checkpoint carries BOTH epochs, including vanished units");
+    assert.match(sweep, /clearCertifiedSweepCheckpoint\(decision.complete, \(\) => writeCursor\(null\)\)/);
 });
 
 // ═══ 3, 4. The cards cron, over a fake card table ═══════════════════════════

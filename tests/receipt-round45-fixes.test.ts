@@ -25,9 +25,9 @@ test("the cycle's epochs live in a record of their own, not on the cursors", () 
     // The bug, stated from the source: cursors are cleared the moment their
     // pass completes, so a continuation could find nothing to validate and take
     // a fresh snapshot of a world that had already moved.
-    assert.match(sweep, /if \(openExhausted && openPass\.errors === 0\) await writeOpenCursor\(null\);/,
-        "the open cursor really is cleared on completion — that is what made cursor-only validation unsound");
-    assert.match(sweep, /if \(exhausted && totals\.errors === 0\) await writeCursor\(null\);/);
+    assert.match(sweep, /transitionCompletedOpenPass\([\s\S]{0,180}writePhase\("lines", undefined, null, prisma, cycle\.id\)[\s\S]{0,80}writeOpenCursor\(null\)/,
+        "the open cursor clears after the durable phase handoff; the cycle must still validate epochs");
+    assert.match(sweep, /clearCertifiedSweepCheckpoint\(decision.complete, \(\) => writeCursor\(null\)\)/);
 
     // The fix: a record written once per cycle and read on every continuation.
     // The record lives in the shared marker module, not the sweep route: the
@@ -86,7 +86,7 @@ test("the full run records its intent BEFORE reaching for the lease", () => {
     // And whoever runs next honours it.
     assert.match(sweep, /const fullRunOwed = continueOnly && await readFullRunRequested\(\);/);
     assert.match(sweep, /await writeFullRunRequested\(null\);/);
-    assert.match(sweep, /if \(!fullRunOwed && !cycleOpen && !shouldResumeSweep\(phase, lineCursor, openCursor\)\)/,
+    assert.match(sweep, /if \(!continuationNeedsWork\(/,
         "an owed full run is work in progress even with no cursor parked");
 });
 

@@ -471,7 +471,7 @@ test("the component transaction is fenced by its own re-read, at the isolation t
 
     // The re-read comes after the locks and BEFORE the writes — a check that
     // runs earlier fences a smaller window than the one it claims to.
-    const txAt = sweep.indexOf("await withTxRetry(() => prisma.$transaction(async tx => {");
+    const txAt = sweep.indexOf("await runBudgetedComponent(budget, transactionOptions => prisma.$transaction(async tx => {");
     const lockAt = sweep.indexOf("pg_advisory_xact_lock", txAt);
     const refetchAt = sweep.indexOf("if (!componentVersionsMatch(planned, current))", txAt);
     const writeAt = sweep.indexOf("const applied = await applyReceiptRequestPlan(", txAt);
@@ -480,7 +480,7 @@ test("the component transaction is fenced by its own re-read, at the isolation t
 
     // The retry stays: a deadlock or a genuine serialization failure rolls the
     // whole component back, and re-running it is always safe.
-    assert.match(sweep, /await withTxRetry\(\(\) => prisma\.\$transaction\(async tx => \{/);
+    assert.match(sweep, /await runBudgetedComponent\(budget, transactionOptions => prisma\.\$transaction\(async tx => \{/);
     assert.match(sweep, /import \{ withTxRetry \} from "@\/lib\/tx-retry";/);
     const retry = readFileSync(join(repoRoot, "src/lib/tx-retry.ts"), "utf8");
     assert.match(retry, /pg === "40P01" \|\| pg === "40001"/, "both Postgres codes are retryable");

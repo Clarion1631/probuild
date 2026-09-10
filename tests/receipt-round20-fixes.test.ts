@@ -27,7 +27,7 @@ test("a replan reloads the issue snapshot instead of replaying the stale one", (
     assert.match(sweepSource, /resolved = reloaded\.resolvedIssueKeys;/);
     assert.match(sweepSource, /details = reloaded\.detailsByKey;/);
     // The retry passes the RELOADED values, not the parameters.
-    assert.match(sweepSource, /await processBatch\(batch, issues, resolved, details, now, cohortMode\)/);
+    assert.match(sweepSource, /await processBatch\(batch, issues, resolved, details, now, cohortMode, budget\)/);
     // ONE loader, shared with the run's opening snapshot — two would drift, and
     // a replan reading a subtly different set is the bug it exists to fix.
     assert.match(sweepSource, /const \{ openIssues, resolvedIssueKeys, detailsByKey \} = await loadIssueSnapshot\(\);/);
@@ -135,7 +135,7 @@ test("an orphan-close failure stops the open-issue checkpoint", () => {
     // It also covers CONTENDED components (round-22 finding): a component that
     // ran out of replans got no verdict, and advancing past its page would
     // strand it just as surely as an error would.
-    const breakAt = sweepSource.indexOf("if (pageErrors > 0 || pageContended > 0) break;");
+    const breakAt = sweepSource.indexOf("if (pageErrors > 0 || pageContended > 0) throw new SweepDeferredError");
     const advanceAt = sweepSource.indexOf("openCursor = page[page.length - 1].id;");
     assert.ok(breakAt > 0 && advanceAt > breakAt, "no checkpoint past a failure or contention");
     // And the old shape — breaking only on the batch's errors — is gone.
