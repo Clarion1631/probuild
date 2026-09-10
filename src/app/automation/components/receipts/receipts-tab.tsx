@@ -139,9 +139,9 @@ export function ReceiptsTab({
             <p className="hui-card px-4 py-3 text-sm text-hui-textMuted">
                 Needs job, Needs review, Booking and Booked today cover only receipts in this intake queue.
                 Receipts handled through other email or photo paths may not appear in those totals.
-                Missing receipts is a separate list of open requests for bank charges. View recorded purchases in the{" "}
+                Missing receipts is a separate list of open requests for bank charges.{" "}
                 <a href="/automation?tab=register" className="font-medium text-hui-primary hover:underline">
-                    Register
+                    View register
                 </a>
                 .
             </p>

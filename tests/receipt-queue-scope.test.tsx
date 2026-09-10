@@ -17,7 +17,7 @@ test("empty receipt queue explains its scope without asserting company-wide comp
         queue, filters: {group: null, projectId: null, owner: null}, jobs: [],
         filterHref: () => "/automation?tab=receipts",
     }));
-    assert.match(html, /href="\/automation\?tab=register"/);
+    assert.match(html, /href="\/automation\?tab=register"[^>]*>View register<\/a>/);
     assert.match(html, /Booked today[\s\S]*queue|queue[\s\S]*Booked today/);
     assert.match(html, /email[\s\S]*photo|photo[\s\S]*email/);
     assert.doesNotMatch(html, /every receipt has a job|nothing is waiting on a decision|every bank charge has a receipt/i);
@@ -29,7 +29,7 @@ test("scope and register navigation remain visible for a filtered empty group", 
         queue, filters: {group: "booked-today", projectId: "project-filter", owner: "Richard"}, jobs: [],
         filterHref: () => "/automation?tab=receipts",
     }));
-    assert.match(html, /href="\/automation\?tab=register"/);
+    assert.match(html, /href="\/automation\?tab=register"[^>]*>View register<\/a>/);
     assert.match(html, /queue/);
     assert.doesNotMatch(html, /every receipt|every bank charge/);
 });
