@@ -118,8 +118,22 @@ test("the continuation schedule never collides with a full run", () => {
         const contMinutes = minutesOf(at(cont));
         const overlap = fullMinutes.filter(m => contMinutes.includes(m));
         assert.deepEqual(overlap, [], `${cont} must never fire in the same minute as ${full}`);
-        assert.equal(contMinutes.length, 4, "still four continuation slots an hour");
+        assert.equal(contMinutes.length, cont === "/api/cron/receipt-requests?continue=1" ? 12 : 4,
+            "receipt work resumes every five minutes; bank pull cadence stays unchanged");
     }
+
+    assert.equal(vercel.crons.filter(cron => cron.path === "/api/cron/receipt-requests?continue=1").length, 1, "one existing continuation entry, not an additional scheduler");
+    const receiptMinutes = minutesOf(at("/api/cron/receipt-requests?continue=1"));
+    assert.deepEqual(receiptMinutes, [2, 7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57]);
+    assert.equal(at("/api/cron/receipt-requests"), "0 13 * * *");
+    assert.equal(at("/api/cron/receipt-request-cards"), "30 14 * * 1-5");
+    assert.equal(at("/api/cron/receipt-request-cards?retry=1"), "30 16 * * 1-5");
+    // Available starts, including the 13:00 full run; not a completion guarantee.
+    const startsBeforeCards = (hour: number) => 1 + (hour - 13) * receiptMinutes.length
+        + receiptMinutes.filter(minute => minute < 30).length;
+    assert.equal(startsBeforeCards(14), 19);
+    assert.equal(startsBeforeCards(16), 43);
+    assert.ok(!receiptMinutes.includes(30), "continuations avoid both card selection slots");
 
     // PRE-FIX CONTROL: the old field fired on the hour, which is exactly when
     // the full run goes.
