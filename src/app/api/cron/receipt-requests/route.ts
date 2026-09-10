@@ -1,3 +1,4 @@
+import { RECEIPT_AUTH_SETTLEMENT_MAX_DAYS, receiptRecognitionPolicy } from "@/lib/receipt-source-recognition";
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { prisma } from "@/lib/prisma";
@@ -61,6 +62,15 @@ import {
     type SweepPhase,
 } from "@/lib/receipt-sweep-marker";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
+
+// Default off until canonical statement source fields have been verified.
+// Enabling changes policy: start a fresh full sweep before any purchaser cards.
+const SOURCE_RECOGNITION_ENABLED = process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true";
+const RECOGNITION_POLICY = receiptRecognitionPolicy(SOURCE_RECOGNITION_ENABLED);
+const EVIDENCE_LOOKBACK_DAYS = SOURCE_RECOGNITION_ENABLED ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS : RECEIPT_MATCH_DATE_SLOP_DAYS;
+const SOURCE_ADJACENCY_DAYS = SOURCE_RECOGNITION_ENABLED
+    ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS + RECEIPT_MATCH_DATE_SLOP_DAYS
+    : COMPETING_LINE_ADJACENCY_DAYS;
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -873,9 +883,9 @@ async function loadCompetingComponent(seed: {
             // than silently truncated into a wrong answer.
             take: MAX_COMPONENT_LINES + 1,
             // `updatedAt` rides along for the component fingerprint — see BatchLine.
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
         }).then(rows => rows.map(row => ({ ...row, postedDate: row.postedDate.toISOString().slice(0, 10) }))),
-        { maxNodes: MAX_COMPONENT_LINES, deadlineExceeded },
+        { maxNodes: MAX_COMPONENT_LINES, deadlineExceeded, linkDays: SOURCE_ADJACENCY_DAYS },
     );
 }
 
@@ -908,7 +918,7 @@ export async function recomputeCodesFor(
             // Same shape as every other BankLine read here, `updatedAt`
             // included: one rule for all of them is what keeps a select that
             // feeds a fingerprint from quietly losing the column again.
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
         }),
         prisma.reviewIssue.findUnique({
             where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
@@ -950,13 +960,13 @@ export async function recomputeCodesFor(
     }
     // The component that actually contains this line — the loaded window may
     // hold same-amount lines that chain to nothing.
-    const component = groupCompetingLines(loadedLines).find(group => group.lineIds.includes(targetKey));
+    const component = groupCompetingLines(loadedLines, SOURCE_ADJACENCY_DAYS).find(group => group.lineIds.includes(targetKey));
     const componentIds = new Set(component?.lineIds ?? [targetKey]);
     const lines = loadedLines.filter(row => componentIds.has(row.id));
 
     // Evidence for the component's own span, widened by the match window.
     const componentDays = lines.map(row => Date.parse(`${row.postedDate}T00:00:00Z`));
-    const fromYmd = new Date(Math.min(...componentDays) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+    const fromYmd = new Date(Math.min(...componentDays) - EVIDENCE_LOOKBACK_DAYS * 86_400_000).toISOString().slice(0, 10);
     const toYmd = new Date(Math.max(...componentDays) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
     // CHECKED AGAIN BEFORE THE EVIDENCE LOAD. The walk above may have been
     // cheap and still have consumed the last of the budget; the two queries
@@ -1004,6 +1014,7 @@ export async function recomputeCodesFor(
     const lineage = await loadRetiredReceiptLineage(prisma, lines.map(l => l.id), { candidatePurchaseIds: lineagePurchaseIds(expenseRows, intakeRows), candidateExpenseIds: lineageExpenseIds(intakeRows) });
 
     const plan = planReceiptRequests({
+        sourceRecognitionEnabled: SOURCE_RECOGNITION_ENABLED,
         bankLines: lines,
         boundLineage: lineage.evidence,
         expenses: expenseRows.flatMap(row => {
@@ -1198,6 +1209,8 @@ async function processBatchWithReplan(
 }
 
 interface BatchLine {
+    account?: string;
+    sourceOfRecord?: string;
     id: string;
     postedDate: Date;
     amountCents: number;
@@ -1283,7 +1296,7 @@ async function processBatch(
         const cohortFilters = batch.map(row => competingLineFilter({
             amountCents: row.amountCents,
             postedDate: row.postedDate.toISOString().slice(0, 10),
-        }));
+        }, SOURCE_ADJACENCY_DAYS));
         const found = cohortFilters.length === 0 ? [] : await prisma.bankLine.findMany({
             where: {
                 OR: cohortFilters.map(f => ({
@@ -1291,7 +1304,7 @@ async function processBatch(
                     postedDate: { gte: new Date(`${f.from}T00:00:00Z`), lte: new Date(`${f.to}T00:00:00Z`) },
                 })),
             },
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
         });
         cohortRows.push(...found);
     }
@@ -1310,7 +1323,7 @@ async function processBatch(
 
     // 2. EVIDENCE FOR THE COHORT'S FULL SPAN, widened by the match window.
     const days = lines.map(row => row.postedDate.getTime());
-    const fromYmd = new Date(Math.min(...days) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+    const fromYmd = new Date(Math.min(...days) - EVIDENCE_LOOKBACK_DAYS * 86_400_000).toISOString().slice(0, 10);
     const toYmd = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
     // HALF-OPEN, company timezone. See evidenceRange.
     //
@@ -1352,12 +1365,15 @@ async function processBatch(
     // 3. DECIDE.
     budget.check();
     const fullPlan = planReceiptRequests({
+        sourceRecognitionEnabled: SOURCE_RECOGNITION_ENABLED,
         bankLines: lines.map(row => ({
             id: row.id,
             postedDate: row.postedDate.toISOString().slice(0, 10),
             amountCents: row.amountCents,
             rawDescriptor: row.rawDescriptor,
             checkNumber: row.checkNumber,
+            account: row.account,
+            sourceOfRecord: row.sourceOfRecord,
         })),
         // Decimal → cents from the STRING form. Number(d) * 100 is a float bug
         // on ordinary receipt totals (19.99 → 1998.9999999999998).
@@ -1441,7 +1457,7 @@ async function processBatch(
         id: row.id,
         postedDate: row.postedDate.toISOString().slice(0, 10),
         amountCents: row.amountCents,
-    })));
+    })), SOURCE_ADJACENCY_DAYS);
     budget.check();
     const planIssueRows = await componentIssueRows(lineIds);
     const summary = emptySummary();
@@ -1456,7 +1472,7 @@ async function processBatch(
         // The component's own span, and the evidence window around it.
         const componentLines = lines.filter(row => ids.has(row.id));
         const days = componentLines.map(row => row.postedDate.getTime());
-        const fromDay = new Date(Math.min(...days) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+        const fromDay = new Date(Math.min(...days) - EVIDENCE_LOOKBACK_DAYS * 86_400_000).toISOString().slice(0, 10);
         const toDay = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
         const componentRange = await evidenceRange(fromDay, toDay);
         // WIDER, for the BankLine re-read only. `groupCompetingLines` can join a
@@ -1467,8 +1483,8 @@ async function processBatch(
         // evidence-width range would never select it, so the re-read's line
         // count could never change to catch it. The join window, not the
         // evidence window, is what decides whether a bank line belongs here.
-        const joinFromDay = new Date(Math.min(...days) - COMPETING_LINE_ADJACENCY_DAYS * 86_400_000).toISOString().slice(0, 10);
-        const joinToDay = new Date(Math.max(...days) + COMPETING_LINE_ADJACENCY_DAYS * 86_400_000).toISOString().slice(0, 10);
+        const joinFromDay = new Date(Math.min(...days) - SOURCE_ADJACENCY_DAYS * 86_400_000).toISOString().slice(0, 10);
+        const joinToDay = new Date(Math.max(...days) + SOURCE_ADJACENCY_DAYS * 86_400_000).toISOString().slice(0, 10);
         const joinRange = await evidenceRange(joinFromDay, joinToDay);
         const amounts = [...new Set(componentLines.map(row => row.amountCents))];
         const intakeInWindow = (value: Date | null) =>
@@ -1490,6 +1506,8 @@ async function processBatch(
             lines: componentLines.map(row => ({
                 id: row.id,
                 rawDescriptor: row.rawDescriptor,
+                account: row.account,
+                sourceOfRecord: row.sourceOfRecord,
                 updatedAt: row.updatedAt,
             })),
             // EVERY FIELD THE PLANNER READS, not just identity: an amount, date
@@ -1637,7 +1655,7 @@ async function processBatch(
                         // `COMPETING_LINE_ADJACENCY_DAYS` past an edge could
                         // have joined this component since it was planned.
                         where: { amountCents: { in: amounts }, postedDate: joinRange.calendar },
-                        select: { id: true, updatedAt: true, rawDescriptor: true },
+                        select: { id: true, updatedAt: true, rawDescriptor: true, account: true, sourceOfRecord: true },
                     }),
                     expenses: currentExpenses.map(row => ({
                         id: row.id,
@@ -1855,6 +1873,7 @@ export async function transitionCompletedOpenPass(
 export function continuationNeedsWork(input: {
     marker: SweepMarker; cycle: SweepCycle | null;
     bankEpoch: string; evidenceEpoch: string;
+    recognitionPolicy?: string;
     fullRunOwed: boolean; lineCursor: string | null; openCursor: string | null; now: Date;
 }): boolean {
     if (input.fullRunOwed) return true;
@@ -1864,7 +1883,7 @@ export function continuationNeedsWork(input: {
         && !input.marker.blockedReason
         && input.marker.completedCycleId === input.cycle.id
         && Number.isFinite(completedAt) && completedAt <= input.now.getTime()
-        && cycleStillValid(input.cycle, input.bankEpoch, input.evidenceEpoch);
+        && cycleStillValid(input.cycle, input.bankEpoch, input.evidenceEpoch, input.recognitionPolicy);
     if (certified) return false;
     // A crash between durable cycle creation and phase/checkpoint writes still resumes.
     return input.cycle !== null || shouldResumeSweep(input.marker.phase, input.lineCursor, input.openCursor);
@@ -1910,13 +1929,13 @@ export async function GET(request: Request) {
          * new one is several writes long, and a crash inside it used to leave
          * phase `"done"`, no completion, no cursor and no request — which every
          * later continuation read as `nothing-in-progress`, losing the day. The
-         * cycle record is written first now and is the durable evidence that a
-         * cycle is open. A matching, unchanged completion proves that it finished;
+         * restart phase is written before the replacement cycle. Either record
+         * is durable evidence of unfinished work. A matching completion proves it finished;
          * otherwise this pass honours it whatever the cursors say.
          *
          * An owed full run counts for the same reason (round-45, finding 2).
          */
-        if (!continuationNeedsWork({ marker, cycle: persistedCycle, bankEpoch, evidenceEpoch,
+        if (!continuationNeedsWork({ marker, cycle: persistedCycle, bankEpoch, evidenceEpoch, recognitionPolicy: RECOGNITION_POLICY,
             fullRunOwed, lineCursor, openCursor, now: new Date() })) {
             return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
         }
@@ -2052,7 +2071,7 @@ async function runSweep(
          */
         const storedCursors = [parseSweepCursor(await readCursor()), parseSweepCursor(await readOpenCursor())]
             .filter(cursor => cursor.key !== null);
-        const stale = !cycleStillValid(cycle, snapshotEpoch, snapshotEvidenceEpoch)
+        const stale = !cycleStillValid(cycle, snapshotEpoch, snapshotEvidenceEpoch, RECOGNITION_POLICY)
             || storedCursors.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch));
         if (stale) {
             console.log("[cron/receipt-requests] ledger or evidence moved under the cycle; restarting it", {
@@ -2068,11 +2087,16 @@ async function runSweep(
     }
     startPhase = effectiveStartPhase;
 
+    // Persist the restart phase before the replacement cycle. Otherwise an
+    // interruption after writeCycle can leave a matching-policy cycle at the
+    // old "lines" phase and skip the open-issue pass on recovery.
+    if (startPhase !== "lines") await writePhase("open-issues", undefined, null, prisma, cycle === null ? null : undefined);
+
     // A cycle starting — fresh run, or a restart above — records what it is
     // being measured against, once, and nothing touches it again until the
     // next one starts.
     if (cycle === null) {
-        cycle = { id: randomUUID(), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch };
+        cycle = { id: randomUUID(), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY };
         await writeCycle(cycle);
     }
     /**
@@ -2082,9 +2106,6 @@ async function runSweep(
      * a window where a crash meant nothing at all was asking for the work.
      */
     if (clearFullRunRequestOnStart) await writeFullRunRequested(null);
-
-    // The cycle is unfinished from here until the line pass exhausts.
-    if (startPhase !== "lines") await writePhase("open-issues");
 
     // Every bank-line issue, open OR cleared. The open ones say what may need
     // closing; the cleared ones carry resolutions that must not be re-asked.
@@ -2153,7 +2174,7 @@ async function runSweep(
         const unitResult = await runCheckpointedUnits([page], budget, async () => {
             const lines = await prisma.bankLine.findMany({
                 where: { id: { in: page.map(issue => issue.targetKey) } },
-                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
+                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
             });
 
             // AN ISSUE WHOSE BANK LINE IS GONE can never be answered: the matcher
@@ -2298,7 +2319,7 @@ async function runSweep(
         id: row.id,
         postedDate: windowDates.get(row.id) as string,
         amountCents: row.amountCents,
-    })));
+    })), SOURCE_ADJACENCY_DAYS);
     /**
      * Components whose chain might continue OUTSIDE the loaded window.
      *
@@ -2315,6 +2336,7 @@ async function runSweep(
                 component.lineIds.map(id => windowDates.get(id) ?? ""),
                 windowStart,
                 windowEnd,
+                SOURCE_ADJACENCY_DAYS,
             ))
             .flatMap(component => component.lineIds),
     );
@@ -2354,7 +2376,7 @@ async function runSweep(
             const batch = await prisma.bankLine.findMany({
                 where: { id: { in: ids } },
                 orderBy: [{ postedDate: "asc" }, { id: "asc" }],
-                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
+                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
             });
             // Every line in the page vanished between the two queries. Nothing to
             // judge, but the checkpoint still has to move past it.

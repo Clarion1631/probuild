@@ -104,7 +104,7 @@ test("the recompute walks to closure, and an abort leaves the chase OPEN", () =>
     // we could not look, not because a receipt exists.
     assert.match(source, /if \(error instanceof ComponentTooLargeError\) \{[\s\S]{0,900}return \["MISSING_RECEIPT"\];/);
     // The loaded window is reduced to the component that holds the seed.
-    assert.match(source, /groupCompetingLines\(loadedLines\)\.find\(group => group\.lineIds\.includes\(targetKey\)\)/);
+    assert.match(source, /groupCompetingLines\(loadedLines, SOURCE_ADJACENCY_DAYS\)\.find\(group => group\.lineIds\.includes\(targetKey\)\)/);
 });
 
 // ── The open-issue pass walks too (round-15 item 2) ────────────────────────

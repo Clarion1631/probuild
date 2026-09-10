@@ -583,8 +583,8 @@ test("a scan that runs off the end WRAPS, and only a complete pass claims an exa
 // ── 3. The deadline bounds the SEND, not just the revalidation ──────────────
 
 /**
- * Drive the real cron. `?retry=1` with no sweep marker means selection is not
- * allowed, so nothing scans: the run's only job is the claimed row already on
+ * Drive the real cron. `?retry=1` with a completed matching-policy cycle means nothing scans:
+ * the run's only job is the claimed row already on
  * the books, which is exactly the send phase under test.
  */
 async function runCards(): Promise<Record<string, unknown>> {
@@ -609,10 +609,29 @@ function seedClaimedCard(): Record<string, unknown> {
     };
     cards = new Map([[`CJ|${date}`, row]]);
     queue = [scanRow("ri-1", "CJ")];
-    settings = new Map();
+    settings = new Map([["receiptRequestsCycle", JSON.stringify({ id: "retry-cycle", epoch: "1", evidenceEpoch: "1", recognitionPolicy: "receipt-source-v1:off" })]]);
+    settings.set("receiptRequestsPhase", JSON.stringify({ phase: "done", chaserCompletedAt: new Date().toISOString(), completedCycleId: "retry-cycle", blockedReason: null }));
     postCalls = [];
     return row;
 }
+
+test("retry cannot send a card under a different recognition policy", async () => {
+    const row = seedClaimedCard();
+    settings.set("receiptRequestsCycle", JSON.stringify({ id: "old-policy", epoch: "1", evidenceEpoch: "1", recognitionPolicy: "receipt-source-v1:on" }));
+    const summary = await runCards();
+    assert.equal(summary.skipped, "chaser-policy-changed");
+    assert.deepEqual(postCalls, []);
+    assert.equal(row.status, "PENDING");
+});
+
+test("matching new policy cannot retry until that cycle actually completes", async () => {
+    const row = seedClaimedCard();
+    settings.set("receiptRequestsPhase", JSON.stringify({ phase: "open-issues", chaserCompletedAt: null, completedCycleId: null }));
+    const summary = await runCards();
+    assert.equal(summary.skipped, "chaser-incomplete");
+    assert.deepEqual(postCalls, []);
+    assert.equal(row.status, "PENDING");
+});
 
 test("with less than the send headroom left, no row is flipped to POSTING and Chat is never called", async () => {
     /**

@@ -1,3 +1,4 @@
+import { bankAuthPurchaseDate, isCanonicalReceiptSource, observedReceiptMerchantMatches } from "./receipt-source-recognition";
 /**
  * Missing-receipt request matcher (Phase 2 §3).
  *
@@ -45,6 +46,8 @@ export const RECEIPT_MATCH_DATE_SLOP_DAYS = 2;
 export const DEAD_INTAKE_STATES: ReadonlySet<string> = new Set(["DUPLICATE", "VOID", "NON_RECEIPT"]);
 
 export interface ReceiptRequestBankLine {
+    account?: string;
+    sourceOfRecord?: string;
     id: string;
     /** YYYY-MM-DD. */
     postedDate: string;
@@ -130,6 +133,8 @@ export interface ReceiptRequestPlan {
 }
 
 export interface ReceiptRequestInput {
+    /** Explicit rollout gate; absent preserves the existing recognition policy. */
+    sourceRecognitionEnabled?: boolean;
     bankLines: readonly ReceiptRequestBankLine[];
     /**
      * The date range, inclusive, over which `expenses` and `intakes` are
@@ -207,11 +212,11 @@ export function isOfficeRail(rawDescriptor: string): boolean {
  * to equal. Being too wide costs a few extra rows in a recompute; being too
  * narrow reintroduces the bug.
  */
-export function competingLineFilter(line: { amountCents: number; postedDate: string }) {
+export function competingLineFilter(line: { amountCents: number; postedDate: string }, linkDays = COMPETING_LINE_ADJACENCY_DAYS) {
     const day = dayNumber(line.postedDate);
     // Wide enough to contain a whole chain: A and C never touch directly but
     // both touch B, so a ±2-day filter around A would miss C entirely.
-    const span = RECEIPT_MATCH_DATE_SLOP_DAYS * 4;
+    const span = linkDays * 2;
     return {
         amountCents: line.amountCents,
         from: day === null ? line.postedDate : ymdOf(day - span),
@@ -265,7 +270,7 @@ export interface LineComponent {
  * when A and C are six days apart and share no candidate directly, because
  * re-housing A can free the only receipt C can reach.
  */
-export function groupCompetingLines(lines: readonly CompetingLine[]): LineComponent[] {
+export function groupCompetingLines(lines: readonly CompetingLine[], linkDays = COMPETING_LINE_ADJACENCY_DAYS): LineComponent[] {
     const parent = new Map<string, string>();
     const find = (x: string): string => {
         let root = x;
@@ -301,7 +306,7 @@ export function groupCompetingLines(lines: readonly CompetingLine[]): LineCompon
             .filter((entry): entry is { line: CompetingLine; day: number } => entry.day !== null)
             .sort((a, b) => a.day - b.day || (a.line.id < b.line.id ? -1 : a.line.id > b.line.id ? 1 : 0));
         for (let i = 1; i < dated.length; i++) {
-            if (dated[i].day - dated[i - 1].day <= COMPETING_LINE_ADJACENCY_DAYS) {
+            if (dated[i].day - dated[i - 1].day <= linkDays) {
                 union(dated[i - 1].line.id, dated[i].line.id);
             }
         }
@@ -695,7 +700,7 @@ function dedupeEvidenceUnits(rows: EvidenceRow[]): EvidenceRow[] {
     return out;
 }
 
-function satisfies(line: ReceiptRequestBankLine, payee: string, evidence: EvidenceRow): boolean {
+function satisfies(line: ReceiptRequestBankLine, payee: string, evidence: EvidenceRow, sourceRecognitionEnabled = false): boolean {
     // 1. Amount, exact. The line is a signed posting; the evidence is a magnitude.
     if (evidence.amountCents !== -line.amountCents) return false;
     // 2. Date within ±2 calendar days. A null date can never agree with one.
@@ -703,9 +708,12 @@ function satisfies(line: ReceiptRequestBankLine, payee: string, evidence: Eviden
     const lineDay = dayNumber(line.postedDate);
     const evidenceDay = dayNumber(evidence.date);
     if (lineDay === null || evidenceDay === null) return false;
-    if (Math.abs(evidenceDay - lineDay) > RECEIPT_MATCH_DATE_SLOP_DAYS) return false;
-    // 3. Payee agreement. Amount + date alone is ZERO confidence.
-    return payeeMatches(payee, evidence.vendor);
+    const sourceEnabled = sourceRecognitionEnabled && isCanonicalReceiptSource(line);
+    const ordinaryDate = Math.abs(evidenceDay - lineDay) <= RECEIPT_MATCH_DATE_SLOP_DAYS;
+    if (!ordinaryDate && !(sourceEnabled && bankAuthPurchaseDate(line) === evidence.date)) return false;
+    // Merchant identity is still required for an exact bank-auth date.
+    return payeeMatches(payee, evidence.vendor)
+        || (sourceEnabled && observedReceiptMerchantMatches(payee, evidence.vendor));
 }
 
 /**
@@ -794,9 +802,13 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
      * True when this line's whole ±2-day evidence window sits inside what the
      * caller actually loaded. Absent bounds mean "everything was loaded".
      */
-    const evidenceIsComplete = (postedDay: number): boolean => {
+    const evidenceIsComplete = (line: ReceiptRequestBankLine): boolean => {
+        const postedDay = dayNumber(line.postedDate);
+        if (postedDay === null) return false;
         if (loadedFrom === null && loadedTo === null) return true;
-        if (loadedFrom !== null && postedDay - RECEIPT_MATCH_DATE_SLOP_DAYS < loadedFrom) return false;
+        const authDate = input.sourceRecognitionEnabled ? bankAuthPurchaseDate(line) : null;
+        const earliest = Math.min(postedDay - RECEIPT_MATCH_DATE_SLOP_DAYS, authDate ? dayNumber(authDate)! : postedDay);
+        if (loadedFrom !== null && earliest < loadedFrom) return false;
         if (loadedTo !== null && postedDay + RECEIPT_MATCH_DATE_SLOP_DAYS > loadedTo) return false;
         return true;
     };
@@ -820,15 +832,19 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
             const day = dayNumber(line.postedDate);
             if (day === null || todayDay === null) return false;
             if (todayDay - day < RECEIPT_REQUEST_GRACE_DAYS) return false;
-            return evidenceIsComplete(day);
+            return evidenceIsComplete(line);
         })
         .map(line => ({
             id: line.id,
             postedDate: line.postedDate,
             amountCents: line.amountCents,
             payee: normalizePayee(line.rawDescriptor),
+            rawDescriptor: line.rawDescriptor,
+            account: line.account,
+            sourceOfRecord: line.sourceOfRecord,
+            checkNumber: line.checkNumber,
         }));
-    const matched = matchEvidenceToLines(matchable, evidence);
+    const matched = matchEvidenceToLines(matchable, evidence, input.sourceRecognitionEnabled === true);
 
     for (const line of orderedLines) {
         const closeIfOpen = () => { if (openKeys.has(line.id)) close.push(line.id); };
@@ -876,7 +892,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
         // neither opened nor closed: the next run, with the right window
         // loaded, decides. Silence beats a confident wrong answer here — the
         // wrong answer is a chase for a receipt that already exists.
-        if (!evidenceIsComplete(lineDay)) {
+        if (!evidenceIsComplete(line)) {
             undecided.push(line.id);
             continue;
         }
@@ -932,8 +948,9 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
  * evidence id — so the same inputs always produce the same pairing.
  */
 export function matchEvidenceToLines(
-    lines: readonly { id: string; postedDate: string; payee: string; amountCents: number }[],
+    lines: readonly { id: string; postedDate: string; payee: string; amountCents: number; rawDescriptor?: string; account?: string; sourceOfRecord?: string; checkNumber?: string | null }[],
     evidence: readonly EvidenceRow[],
+    sourceRecognitionEnabled = false,
 ): Map<string, EvidenceRow> {
     // Candidate lists, deterministically ordered.
     const candidates = new Map<string, EvidenceRow[]>();
@@ -945,9 +962,10 @@ export function matchEvidenceToLines(
             .filter(row => row.targetBankLineId !== undefined
                 ? row.targetBankLineId === line.id && row.amountCents === -line.amountCents
                 : satisfies(
-                    { id: line.id, postedDate: line.postedDate, amountCents: line.amountCents, rawDescriptor: "" },
+                    { ...line, rawDescriptor: line.rawDescriptor ?? "" },
                     line.payee,
                     row,
+                    sourceRecognitionEnabled,
                 ))
             .map(row => {
                 const rowDay = row.date ? dayNumber(row.date) : null;
@@ -1422,7 +1440,7 @@ export function componentVersionOf(input: {
         expenseId?: string | null;
         qbPurchaseId?: string | null;
     }>;
-    lines?: ReadonlyArray<{ id: string; updatedAt?: Date | string | null; rawDescriptor?: string | null }>;
+    lines?: ReadonlyArray<{ id: string; updatedAt?: Date | string | null; rawDescriptor?: string | null; account?: string | null; sourceOfRecord?: string | null }>;
     expenses?: ReadonlyArray<{
         id: string;
         hasReceipt: boolean;
@@ -1450,7 +1468,7 @@ export function componentVersionOf(input: {
         lines: lines.length,
         // The DESCRIPTOR is hashed, not just the id: a refreshed descriptor
         // changes the payee, which changes what matches.
-        lineHash: fingerprint(lines.map(line => `${line.id}:${line.rawDescriptor ?? ""}`)),
+        lineHash: fingerprint(lines.map(line => JSON.stringify([line.id, line.rawDescriptor ?? "", line.account ?? "", line.sourceOfRecord ?? ""]))),
         expenses: expenses.length,
         // AMOUNT, DATE, VENDOR AND qbPurchaseId too — they decide which line an
         // expense can answer and which intake it unit-folds with (see

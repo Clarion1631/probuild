@@ -34,7 +34,7 @@ test("the cycle's epochs live in a record of their own, not on the cursors", () 
     // cards cron needs it too, and a route importing another route pulls the
     // whole sweep into its bundle.
     assert.match(read("src/lib/receipt-sweep-marker.ts"), /export const CYCLE_KEY = "receiptRequestsCycle";/);
-    assert.match(sweep, /cycle = \{ id: randomUUID\(\), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch \};/);
+    assert.match(sweep, /cycle = \{ id: randomUUID\(\), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY \};/);
     assert.match(sweep, /await writeCycle\(cycle\);/);
     // A fresh full run clears it with the cursors, so the next cycle cannot
     // inherit the last one's snapshot.
