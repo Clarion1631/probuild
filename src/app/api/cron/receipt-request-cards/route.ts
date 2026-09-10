@@ -1,3 +1,4 @@
+import { reviewedReceiptFactsFingerprint } from "@/server/receipt-reviewed-source-facts";
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
@@ -598,7 +599,7 @@ export async function GET(request: Request) {
         (await prisma.automationSetting.findUnique({ where: { key: CYCLE_KEY } }))?.value ?? null,
     );
     const currentCycleId = currentCycle?.id ?? null;
-    const recognitionPolicy = receiptRecognitionPolicy(process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true");
+    const recognitionPolicy = receiptRecognitionPolicy(process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true", reviewedReceiptFactsFingerprint);
     // A flag change invalidates selection AND retry certification until a fresh cycle finishes.
     if (!cycleRecognitionPolicyMatches(currentCycle, recognitionPolicy)) {
         return NextResponse.json({ ok: false, skipped: "chaser-policy-changed", date });

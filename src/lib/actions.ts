@@ -15,7 +15,7 @@ import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-help
 import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
-import { portalVisibleEstimateWhere } from "./estimate-portal-visibility";
+import { portalVisibleEstimateWhere, sentEstimateUpdateData } from "./estimate-portal-visibility";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
@@ -67,7 +67,7 @@ import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
-import { resolveCompanyTimeZone } from "./company-timezone";
+import { DEFAULT_COMPANY_TIME_ZONE, formatCompanyDateTime, resolveCompanyTimeZone } from "./company-timezone";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
@@ -2605,7 +2605,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         entityName: `Estimate ${estimate?.code || estimateId}`,
     });
 
-    const settings = await getCachedCompanySettings();
+    const [settings, companyTimeZone] = await Promise.all([getCachedCompanySettings(), resolveCompanyTimeZone().catch((e) => { console.warn("[approveEstimate] company time zone lookup failed, using default:", e); return DEFAULT_COMPANY_TIME_ZONE; })]); // one zone for both approval emails below; fail-soft because the approval is already committed above
     const companyName = settings.companyName || "Golden Touch Remodeling";
     const estimateCode = estimate?.code || estimateId;
     const projectName = estimate?.project?.name || estimate?.lead?.name || "your project";
@@ -2651,7 +2651,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                         <tr><td style="padding: 8px 0; color: #64748b; font-size: 13px;">Estimate</td><td style="padding: 8px 0; text-align: right; font-weight: 600; color: #0f172a; font-size: 13px;">${estimateCode}</td></tr>
                         <tr><td style="padding: 8px 0; color: #64748b; font-size: 13px;">Project</td><td style="padding: 8px 0; text-align: right; font-weight: 600; color: #0f172a; font-size: 13px;">${projectName}</td></tr>
                         <tr><td style="padding: 8px 0; color: #64748b; font-size: 13px;">Signed By</td><td style="padding: 8px 0; text-align: right; font-weight: 600; color: #0f172a; font-size: 13px;">${signatureName}</td></tr>
-                        <tr><td style="padding: 8px 0; color: #64748b; font-size: 13px;">Date</td><td style="padding: 8px 0; text-align: right; font-weight: 600; color: #0f172a; font-size: 13px;">${approvedAt.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}</td></tr>
+                        <tr><td style="padding: 8px 0; color: #64748b; font-size: 13px;">Date</td><td style="padding: 8px 0; text-align: right; font-weight: 600; color: #0f172a; font-size: 13px;">${approvedAt.toLocaleDateString("en-US", { timeZone: companyTimeZone, year: "numeric", month: "long", day: "numeric" })}</td></tr>
                     </table>
                     <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px;">
                         <p style="margin: 0; color: #166534; font-size: 13px;">✓ A signed copy of your estimate is attached to this email for your records.</p>
@@ -2686,7 +2686,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                     <p style="margin: 0 0 12px; color: #333;"><strong>${signatureName}</strong> has electronically signed estimate <strong>${estimateCode}</strong> for <strong>${projectName}</strong>.</p>
                     <table style="width: 100%; font-size: 13px; color: #555;">
                         <tr><td style="padding: 4px 0;">Client</td><td style="text-align: right; font-weight: 600;">${clientName}</td></tr>
-                        <tr><td style="padding: 4px 0;">Signed At</td><td style="text-align: right;">${approvedAt.toLocaleString()}</td></tr>
+                        <tr><td style="padding: 4px 0;">Signed At</td><td style="text-align: right;">${formatCompanyDateTime(approvedAt, companyTimeZone)}</td></tr>
                     </table>
                 </div>
                 ${clientEmail ? `<p style="margin: 12px 0 0; font-size: 12px; color: #888;">A copy was also sent to the client at ${clientEmail}.</p>` : ""}
@@ -6200,9 +6200,16 @@ export async function sendEstimateToClient(
 
     const updatedStatus = ["Draft", "Sent", "Viewed"].includes(estimate.status) ? "Sent" : estimate.status;
     const isResend = !!estimate.sentAt;
+    // sentEstimateUpdateData also flips `privacy` to "Shared". Sending is the
+    // human review-and-share step the AI creator's `privacy: "Private"` default
+    // was waiting for, and portalVisibleEstimateWhere() treats "Private" as an
+    // absolute override — so without that flip the "View & Sign Estimate" link
+    // we just emailed 404s for the client (EST-00514, 2026-09-09). The three
+    // fields travel together, in estimate-portal-visibility.ts next to the gate
+    // they have to satisfy; do not inline them back apart.
     await prisma.estimate.update({
         where: { id: estimateId },
-        data: { sentAt: new Date(), status: updatedStatus },
+        data: sentEstimateUpdateData(updatedStatus),
     });
 
     // Append-only send trail — every send (incl. resends) gets its own event.

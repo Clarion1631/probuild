@@ -1,4 +1,4 @@
-import { bankAuthPurchaseDate, isCanonicalReceiptSource, observedReceiptMerchantMatches } from "./receipt-source-recognition";
+import { bankAuthPurchaseDate, isCanonicalReceiptSource, observedReceiptMerchantMatches, reviewedReceiptMerchantMatches, type ReviewedReceiptMerchantEvidence } from "./receipt-source-recognition";
 /**
  * Missing-receipt request matcher (Phase 2 §3).
  *
@@ -59,6 +59,9 @@ export interface ReceiptRequestBankLine {
 
 /** An Expense, already reduced to integer cents by the caller. */
 export interface ReceiptEvidenceExpense {
+    /** Global one-to-one relation; absence from loaded intakes cannot grant a new edge. */
+    linkedIntakeId?: string | null;
+    reviewedSourceFact?: ReviewedReceiptMerchantEvidence | null;
     /** Stable row id. Evidence is assigned to at most ONE bank line, and the
      * tie-break has to be deterministic across runs — see assignEvidence. */
     id: string;
@@ -605,6 +608,7 @@ export function payeeMatches(a: string, b: string | null | undefined): boolean {
 // ── Satisfaction ─────────────────────────────────────────────────────────────
 
 export interface EvidenceRow {
+    reviewedSourceFact?: ReviewedReceiptMerchantEvidence | null;
     id: string;
     /** Rows sharing a unit key are ONE receipt and count once. */
     unit: string;
@@ -713,7 +717,9 @@ function satisfies(line: ReceiptRequestBankLine, payee: string, evidence: Eviden
     if (!ordinaryDate && !(sourceEnabled && bankAuthPurchaseDate(line) === evidence.date)) return false;
     // Merchant identity is still required for an exact bank-auth date.
     return payeeMatches(payee, evidence.vendor)
-        || (sourceEnabled && observedReceiptMerchantMatches(payee, evidence.vendor));
+        || (sourceEnabled && observedReceiptMerchantMatches(payee, evidence.vendor))
+        || (sourceEnabled && evidence.date === evidence.reviewedSourceFact?.purchaseDate
+            && reviewedReceiptMerchantMatches(line, evidence.reviewedSourceFact));
 }
 
 /**
@@ -764,6 +770,13 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
     // BEFORE dedupe, or the zero-amount retired Expense would win the fold and
     // hide the intake it shares a unit with.
     const lineage = resolveBoundLineage(input.boundLineage);
+    const reviewedFactFor = (expense: ReceiptEvidenceExpense) => {
+        if (!expense.reviewedSourceFact) return null;
+        const claims = input.intakes.filter(row => row.expenseId === expense.id);
+        if (expense.linkedIntakeId && !claims.some(row => row.id === expense.linkedIntakeId)) return null;
+        if (claims.some(row => DEAD_INTAKE_STATES.has(row.state) || !intakeArtifactIsVerified(row.stateReason) || !row.qbPurchaseId || row.qbPurchaseId !== expense.qbPurchaseId)) return null;
+        return expense.reviewedSourceFact;
+    };
     const evidence: EvidenceRow[] = [...lineage.bound, ...dedupeEvidenceUnits(([
         // An Expense with no receipt behind it is not evidence — it is the
         // thing being looked for. See ReceiptEvidenceExpense.hasReceipt.
@@ -774,6 +787,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
             amountCents: e.amountCents,
             date: e.date,
             vendor: e.vendor,
+            reviewedSourceFact: reviewedFactFor(e),
         })),
         ...input.intakes
             .filter(intake =>
@@ -1448,6 +1462,11 @@ export function componentVersionOf(input: {
         date?: Date | string | null;
         vendor?: string | null;
         qbPurchaseId?: string | null;
+        linkedIntakeId?: string | null;
+        receiptUrl?: string | null;
+        qbSyncToken?: string | null;
+        status?: string | null;
+        description?: string | null;
     }>;
     /** `lineageFingerprint(...)` of the component's lineage subset, when loaded. */
     lineageFingerprint?: string;
@@ -1480,6 +1499,11 @@ export function componentVersionOf(input: {
             iso(expense.date),
             expense.vendor ?? "",
             expense.qbPurchaseId ?? "",
+            expense.linkedIntakeId ?? "",
+            expense.receiptUrl ?? "",
+            expense.qbSyncToken ?? "",
+            expense.status ?? "",
+            expense.description ?? "",
         ].join(":"))),
         intakeHash: fingerprint(input.intakes.map(intake => [
             intake.id ?? "",

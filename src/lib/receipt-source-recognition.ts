@@ -15,8 +15,32 @@
 export const RECEIPT_AUTH_SETTLEMENT_MAX_DAYS = 7;
 
 /** Persisted with sweep certification so a flag change requires a new cycle. */
-export function receiptRecognitionPolicy(enabled: boolean): string {
-    return enabled ? 'receipt-source-v1:on' : 'receipt-source-v1:off';
+export function receiptRecognitionPolicy(enabled: boolean, reviewedFactsFingerprint = "absent"): string {
+    return enabled ? `receipt-source-v2:on:${reviewedFactsFingerprint}` : 'receipt-source-v1:off';
+}
+
+/** Server-reviewed document facts. No extra evidence unit or target binding. */
+export interface ReviewedReceiptMerchantEvidence {
+    bankPayee: string;
+    cardTail: string;
+    purchaseDate: string;
+    amountCents: number;
+    sourceFactDigest: string;
+}
+
+/** A reviewed fact supplies only an edge inside the normal complete matching component. */
+export function reviewedReceiptMerchantMatches(
+    line: ReceiptSourceLine,
+    fact: ReviewedReceiptMerchantEvidence | null | undefined,
+): boolean {
+    if (!fact || !/^[a-f0-9]{64}$/.test(fact.sourceFactDigest)) return false;
+    if (!isCanonicalReceiptSource(line) || !Number.isSafeInteger(fact.amountCents) || fact.amountCents <= 0) return false;
+    if (-line.amountCents !== fact.amountCents || bankAuthPurchaseDate(line) !== fact.purchaseDate) return false;
+    const card = /\bC#(\d{4})\b/.exec(line.rawDescriptor);
+    // Ordinary payee normalization removes standalone station numbers. Use
+    // the canonical raw merchant prefix so the reviewed store stays required.
+    const merchant = card ? line.rawDescriptor.slice(0, card.index) : '';
+    return card?.[1] === fact.cardTail && normalizeBankPayee(merchant) === fact.bankPayee;
 }
 
 export interface ReceiptSourceLine {
