@@ -306,7 +306,7 @@ test("the project's database host is derived from the URL, and only for a pooler
 });
 
 test("the live path uses the DNS-aware check and keeps the db name exact", () => {
-    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-phase2-receipt-queue.mjs"), "utf8");
+    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-phase2-receipt-queue.mjs"), "utf8").replace(/\r\n/g, "\n");
     assert.match(source, /await targetHostMatches\(actual\.host, expectHost, lookupAddresses, urlHostname, directHost\)/);
     assert.match(source, /const directHost = directDbHostForUrl\(url\);/);
     assert.match(source, /String\(actual\.db \?\? ""\) !== String\(expectDb \?\? ""\)/);
