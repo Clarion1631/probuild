@@ -283,3 +283,16 @@ test("the cron stamps all four inputs, at plan time and again under the lock", (
     // join this component, and the re-read has to be wide enough to see it.
     assert.match(source, /where: \{ amountCents: \{ in: amounts \}, postedDate: joinRange\.calendar \}/);
 });
+
+test("completion fence takes receipt evidence before the bank epoch", async () => {
+    const { fenceAndWritePhase } = await import("../src/app/api/cron/receipt-requests/route");
+    const calls: string[] = [];
+    const result = await fenceAndWritePhase({ snapshotEpoch: "1", snapshotEvidenceEpoch: "2", computedPhase: "done", bankPullStale: false, now: new Date("2026-09-10T00:00:00Z") }, async body => body({
+        lockEvidenceEpoch: async () => { calls.push("receipt-evidence"); return "2"; },
+        lockEpoch: async () => { calls.push("bank-epoch"); return "1"; },
+        countNewLines: async () => { calls.push("count"); return 0; },
+        writePhase: async () => { calls.push("write"); },
+    }));
+    assert.deepEqual(calls, ["receipt-evidence", "bank-epoch", "count", "write"]);
+    assert.equal(result.complete, true);
+});

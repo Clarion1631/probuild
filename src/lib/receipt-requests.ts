@@ -26,6 +26,7 @@
 import { classifyReceiptRequirement, resolveReceiptOwner, type ReceiptOwner } from "./receipt-policy";
 import { normalizePayee } from "./bank-ledger";
 import { intakeArtifactIsVerified } from "./receipt-intake/route-state";
+import type { BoundReceiptLineage } from "./retired-receipt-lineage";
 
 /** The one targetType these issues use. targetKey is the BankLine id. */
 export const RECEIPT_REQUEST_TARGET_TYPE = "bank-line";
@@ -153,6 +154,16 @@ export interface ReceiptRequestInput {
      * exactly the ones a re-open would resurrect.
      */
     resolvedIssueKeys?: readonly string[];
+    /**
+     * EXACT-LINEAGE evidence (see retired-receipt-lineage.ts): retired zero
+     * Expenses proven, by ids alone, to be the receipt for one specific line.
+     * A bound unit answers ONLY its target — no date or payee test, amount
+     * still checked — and every bound or reserved unit is removed from the
+     * ordinary evidence first, so a zero Expense can neither hide the intake it
+     * folds with nor add a second unit of capacity. Optional; absent means
+     * the matcher behaves exactly as before.
+     */
+    boundLineage?: BoundReceiptLineage | null;
     now: Date;
 }
 
@@ -569,13 +580,68 @@ export function payeeMatches(a: string, b: string | null | undefined): boolean {
 
 // ── Satisfaction ─────────────────────────────────────────────────────────────
 
-interface EvidenceRow {
+export interface EvidenceRow {
     id: string;
     /** Rows sharing a unit key are ONE receipt and count once. */
     unit: string;
     amountCents: number;
     date: string | null;
     vendor: string | null;
+    /**
+     * Set on an exact-lineage row: the ONE line this unit may answer. Such a
+     * row is never a candidate for any other line, and skips the date/payee
+     * tests for its target (the amount is still checked).
+     */
+    targetBankLineId?: string;
+}
+
+/**
+ * Turn the caller's bound lineage into evidence rows, and the set of units the
+ * ordinary evidence must give up.
+ *
+ * A unit bound to two different targets, or a target claiming two different
+ * units, is a CONFLICT: neither side gets a match, and the units stay excluded
+ * from ordinary evidence — a disputed receipt answers nobody. A unit that is
+ * bound but whose target is not judged at all (resolved, exempt, out of
+ * window) is still excluded, so an unrelated fuzzy line cannot borrow it.
+ */
+export function resolveBoundLineage(
+    lineage: BoundReceiptLineage | null | undefined,
+): { bound: EvidenceRow[]; excludedUnits: Set<string> } {
+    const excludedUnits = new Set<string>(lineage?.reservedUnits ?? []);
+    const bound: EvidenceRow[] = [];
+    if (!lineage) return { bound, excludedUnits };
+    const addTo = (map: Map<string, Set<string>>, key: string, value: string) => {
+        const set = map.get(key);
+        if (set) set.add(value);
+        else map.set(key, new Set([value]));
+    };
+    const targetsByUnit = new Map<string, Set<string>>();
+    const unitsByTarget = new Map<string, Set<string>>();
+    for (const item of lineage.bound) {
+        excludedUnits.add(item.unit);
+        excludedUnits.add(`expense:${item.expenseId}`);
+        addTo(targetsByUnit, item.unit, item.bankLineId);
+        addTo(unitsByTarget, item.bankLineId, item.unit);
+    }
+    const ordered = [...lineage.bound].sort((a, b) =>
+        (a.unit < b.unit ? -1 : a.unit > b.unit ? 1 : a.bankLineId < b.bankLineId ? -1 : a.bankLineId > b.bankLineId ? 1 : 0));
+    for (const item of ordered) {
+        if (lineage.reservedUnits.includes(item.unit)) continue;
+        if ((targetsByUnit.get(item.unit)?.size ?? 0) !== 1) continue;
+        if ((unitsByTarget.get(item.bankLineId)?.size ?? 0) !== 1) continue;
+        // The same binding listed twice is one receipt, once.
+        if (bound.some(row => row.unit === item.unit)) continue;
+        bound.push({
+            id: `lineage:${item.expenseId}`,
+            unit: item.unit,
+            amountCents: item.amountCents,
+            date: null,
+            vendor: null,
+            targetBankLineId: item.bankLineId,
+        });
+    }
+    return { bound, excludedUnits };
 }
 
 /**
@@ -666,10 +732,15 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
     // meant one receipt could satisfy two different charges, which is exactly
     // the one-to-one rule this was supposed to enforce. They are folded by
     // whichever identity they share (expenseId, then qbPurchaseId).
-    const evidence: EvidenceRow[] = dedupeEvidenceUnits([
+    // EXACT-LINEAGE UNITS COME OUT OF THE ORDINARY EVIDENCE FIRST, then each
+    // qualified bound unit appears exactly once, pinned to its target. Done
+    // BEFORE dedupe, or the zero-amount retired Expense would win the fold and
+    // hide the intake it shares a unit with.
+    const lineage = resolveBoundLineage(input.boundLineage);
+    const evidence: EvidenceRow[] = [...lineage.bound, ...dedupeEvidenceUnits(([
         // An Expense with no receipt behind it is not evidence — it is the
         // thing being looked for. See ReceiptEvidenceExpense.hasReceipt.
-        ...input.expenses.filter(e => e.hasReceipt).map(e => ({
+        ...input.expenses.filter(e => e.hasReceipt && !lineage.excludedUnits.has(`expense:${e.id}`)).map(e => ({
             id: `expense:${e.id}`,
             // An Expense's own id IS the expense link the intake points at.
             unit: evidenceUnitKey({ expenseId: e.id, qbPurchaseId: e.qbPurchaseId }) ?? `expense:${e.id}`,
@@ -680,6 +751,9 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
         ...input.intakes
             .filter(intake =>
                 !DEAD_INTAKE_STATES.has(intake.state)
+                // Reserve every known alias even if this intake carries a
+                // different Purchase id. One receipt must not answer twice.
+                && !(intake.expenseId && lineage.excludedUnits.has(`expense:${intake.expenseId}`))
                 && intake.totalCents !== null
                 // See ReceiptEvidenceIntake.stateReason.
                 && intakeArtifactIsVerified(intake.stateReason))
@@ -690,8 +764,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
                 date: intake.txnDate,
                 vendor: intake.vendor,
             })),
-    ]);
-
+    ] as EvidenceRow[]).filter(row => !lineage.excludedUnits.has(row.unit)))];
 
     // Oldest charge first, id breaking the tie: the assignment below depends on
     // the order lines are visited, so it must not depend on query order.
@@ -848,15 +921,19 @@ export function matchEvidenceToLines(
     for (const line of lines) {
         const lineDay = dayNumber(line.postedDate);
         const eligible = evidence
-            .filter(row => satisfies(
-                { id: line.id, postedDate: line.postedDate, amountCents: line.amountCents, rawDescriptor: "" },
-                line.payee,
-                row,
-            ))
-            .map(row => ({
-                row,
-                distance: lineDay === null ? 0 : Math.abs((dayNumber(row.date as string) as number) - lineDay),
-            }))
+            // An exact-bound row is an edge to ITS target only: no date or payee
+            // test, amount still exact. Everything else takes the fuzzy test.
+            .filter(row => row.targetBankLineId !== undefined
+                ? row.targetBankLineId === line.id && row.amountCents === -line.amountCents
+                : satisfies(
+                    { id: line.id, postedDate: line.postedDate, amountCents: line.amountCents, rawDescriptor: "" },
+                    line.payee,
+                    row,
+                ))
+            .map(row => {
+                const rowDay = row.date ? dayNumber(row.date) : null;
+                return { row, distance: lineDay === null || rowDay === null ? 0 : Math.abs(rowDay - lineDay) };
+            })
             .sort((a, b) => a.distance - b.distance || (a.row.unit < b.row.unit ? -1 : a.row.unit > b.row.unit ? 1 : 0))
             .map(entry => entry.row);
         candidates.set(line.id, eligible);
@@ -1276,6 +1353,15 @@ export interface ComponentVersion {
      * the evidence set is unchanged rather than merely unbumped.
      */
     intakeHash: string;
+    /**
+     * The exact-lineage snapshot for the component's lines (see
+     * retired-receipt-lineage.ts): every observation, claim, canonical field
+     * and retired-Expense field the rule read. A link written by reconcile, a
+     * receipt URL changed, a retirement undone — none of it touches a row the
+     * other hashes watch. Empty string when the caller supplied none, which
+     * keeps every older fixture equal to itself.
+     */
+    lineageHash: string;
 }
 
 /** A short, order-independent digest. Not cryptographic — a change detector. */
@@ -1326,6 +1412,8 @@ export function componentVersionOf(input: {
         vendor?: string | null;
         qbPurchaseId?: string | null;
     }>;
+    /** `lineageFingerprint(...)` of the component's lineage subset, when loaded. */
+    lineageFingerprint?: string;
 }): ComponentVersion {
     const iso = (value: Date | string | null | undefined): string =>
         value instanceof Date ? value.toISOString() : (value ?? "");
@@ -1366,6 +1454,7 @@ export function componentVersionOf(input: {
             intake.expenseId ?? "",
             intake.qbPurchaseId ?? "",
         ].join(":"))),
+        lineageHash: input.lineageFingerprint ?? "",
     };
 }
 
@@ -1377,5 +1466,6 @@ export function componentVersionsMatch(a: ComponentVersion, b: ComponentVersion)
         && a.lineHash === b.lineHash
         && a.expenses === b.expenses
         && a.expenseHash === b.expenseHash
-        && a.intakeHash === b.intakeHash;
+        && a.intakeHash === b.intakeHash
+        && a.lineageHash === b.lineageHash;
 }
