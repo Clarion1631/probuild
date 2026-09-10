@@ -19,6 +19,7 @@ export {
     startOfDateInTimeZone,
     endOfDateInTimeZone,
     dateInputInTimeZone,
+    formatCompanyDateTime,
 } from "./tz-date";
 
 /**

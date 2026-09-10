@@ -67,7 +67,7 @@ import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
-import { resolveCompanyTimeZone } from "./company-timezone";
+import { formatCompanyDateTime, resolveCompanyTimeZone } from "./company-timezone";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
@@ -2686,7 +2686,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                     <p style="margin: 0 0 12px; color: #333;"><strong>${signatureName}</strong> has electronically signed estimate <strong>${estimateCode}</strong> for <strong>${projectName}</strong>.</p>
                     <table style="width: 100%; font-size: 13px; color: #555;">
                         <tr><td style="padding: 4px 0;">Client</td><td style="text-align: right; font-weight: 600;">${clientName}</td></tr>
-                        <tr><td style="padding: 4px 0;">Signed At</td><td style="text-align: right;">${approvedAt.toLocaleString()}</td></tr>
+                        <tr><td style="padding: 4px 0;">Signed At</td><td style="text-align: right;">${formatCompanyDateTime(approvedAt, await resolveCompanyTimeZone())}</td></tr>
                     </table>
                 </div>
                 ${clientEmail ? `<p style="margin: 12px 0 0; font-size: 12px; color: #888;">A copy was also sent to the client at ${clientEmail}.</p>` : ""}
