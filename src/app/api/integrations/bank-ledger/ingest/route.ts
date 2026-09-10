@@ -863,6 +863,11 @@ const handlers = createBankLedgerIngestHandlers({
         // every row THIS call inserted, not just the conflicting one — so a
         // 409 built from it always means nothing from this request persisted.
         return prisma.$transaction(async tx => {
+            // Global Purchase claims are receipt-lineage evidence even before
+            // reconciliation links this observation to a canonical bank line.
+            // Fence both component decisions and sweep completion before insert.
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
+            await bumpBankLedgerEpoch(tx);
             const result = await tx.bankLineObservation.createMany({
                 data: rows.map(row => ({
                     source: "QBO_REGISTER",
