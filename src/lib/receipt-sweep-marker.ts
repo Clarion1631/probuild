@@ -173,6 +173,8 @@ export interface SweepCycle {
     id: string;
     epoch: string;
     evidenceEpoch: string;
+    /** Absent legacy cycles used the default-off recognition policy. */
+    recognitionPolicy?: string;
 }
 
 export function parseSweepCycle(value: string | null): SweepCycle | null {
@@ -182,7 +184,9 @@ export function parseSweepCycle(value: string | null): SweepCycle | null {
         if (typeof parsed?.id !== "string" || !parsed.id) return null;
         if (typeof parsed.epoch !== "string" || !parsed.epoch) return null;
         if (typeof parsed.evidenceEpoch !== "string" || !parsed.evidenceEpoch) return null;
-        return { id: parsed.id, epoch: parsed.epoch, evidenceEpoch: parsed.evidenceEpoch };
+        if (parsed.recognitionPolicy !== undefined && (typeof parsed.recognitionPolicy !== "string" || !parsed.recognitionPolicy)) return null;
+        return { id: parsed.id, epoch: parsed.epoch, evidenceEpoch: parsed.evidenceEpoch,
+            ...(parsed.recognitionPolicy === undefined ? {} : { recognitionPolicy: parsed.recognitionPolicy }) };
     } catch {
         return null;
     }
@@ -195,6 +199,11 @@ export function parseSweepCycle(value: string | null): SweepCycle | null {
  * measured against, and a continuation cannot certify on a guarantee nobody
  * wrote down.
  */
-export function cycleStillValid(cycle: SweepCycle | null, epoch: string, evidenceEpoch: string): boolean {
-    return cycle !== null && cycle.epoch === epoch && cycle.evidenceEpoch === evidenceEpoch;
+export function cycleRecognitionPolicyMatches(cycle: SweepCycle | null, policy: string): boolean {
+    return cycle !== null && (cycle.recognitionPolicy ?? "receipt-source-v1:off") === policy;
+}
+
+export function cycleStillValid(cycle: SweepCycle | null, epoch: string, evidenceEpoch: string, recognitionPolicy?: string): boolean {
+    return cycle !== null && cycle.epoch === epoch && cycle.evidenceEpoch === evidenceEpoch
+        && (recognitionPolicy === undefined || cycleRecognitionPolicyMatches(cycle, recognitionPolicy));
 }

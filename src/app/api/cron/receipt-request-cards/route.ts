@@ -22,7 +22,8 @@ import {
     type CardItemTruth,
     type OwnerCard,
 } from "@/lib/receipt-request-cards";
-import { CYCLE_KEY, SWEEP_MARKER_KEY, chaserCompletedFor, parseSweepCycle, parseSweepMarker } from "@/lib/receipt-sweep-marker";
+import { CYCLE_KEY, SWEEP_MARKER_KEY, chaserCompletedFor, parseSweepCycle, parseSweepMarker, cycleRecognitionPolicyMatches } from "@/lib/receipt-sweep-marker";
+import { receiptRecognitionPolicy } from "@/lib/receipt-source-recognition";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 import { itemsMissingCardRecord, recordCardOnIssues } from "@/lib/receipt-card-history";
 // Reused rather than re-implemented (Codex PR #443 gate, finding 1) — see its
@@ -592,10 +593,21 @@ export async function GET(request: Request) {
      * starts clears the stamp, so there is no window where the old answer
      * applies to the new cycle.
      */
-    const currentCycleId = parseSweepCycle(
+    const currentCycle = parseSweepCycle(
         (await prisma.automationSetting.findUnique({ where: { key: CYCLE_KEY } }))?.value ?? null,
-    )?.id ?? null;
+    );
+    const currentCycleId = currentCycle?.id ?? null;
+    const recognitionPolicy = receiptRecognitionPolicy(process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true");
+    // A flag change invalidates selection AND retry certification until a fresh cycle finishes.
+    if (!cycleRecognitionPolicyMatches(currentCycle, recognitionPolicy)) {
+        return NextResponse.json({ ok: false, skipped: "chaser-policy-changed", date });
+    }
     const selectionAllowed = chaserCompletedFor(marker, date, "America/Los_Angeles", currentCycleId);
+    // Creating a cycle under the new policy is not completion: retries must
+    // also wait for its certified finish, rather than replay an old pending card.
+    if (currentCycle?.recognitionPolicy !== undefined && !selectionAllowed) {
+        return NextResponse.json({ ok: false, skipped: "chaser-incomplete", date });
+    }
     if (!retryOnly) {
         if (!selectionAllowed) {
             const summary = {

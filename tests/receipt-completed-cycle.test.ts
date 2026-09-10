@@ -25,6 +25,14 @@ test("either changed epoch resumes instead of trusting an old completion", () =>
   assert.equal(continuationNeedsWork({ ...complete, evidenceEpoch: "10" }), true);
 });
 
+test("recognition policy changes resume even a completed cycle with no cursors", () => {
+  assert.equal(continuationNeedsWork({ ...complete, recognitionPolicy: "receipt-source-v1:off" }), false);
+  assert.equal(continuationNeedsWork({ ...complete, recognitionPolicy: "receipt-source-v1:on" }), true);
+  const enabled = { ...complete, cycle: { ...complete.cycle, recognitionPolicy: "receipt-source-v1:on" } };
+  assert.equal(continuationNeedsWork({ ...enabled, recognitionPolicy: "receipt-source-v1:on" }), false);
+  assert.equal(continuationNeedsWork({ ...enabled, recognitionPolicy: "receipt-source-v1:off" }), true);
+});
+
 test("unfinished or malformed persisted cycles never disappear without a cursor", () => {
   for (const marker of [
     { ...complete.marker, phase: "open-issues" as const },

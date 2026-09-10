@@ -238,9 +238,9 @@ test("a continuation whose stored epochs disagree restarts from the open-issue p
     // that re-checks an issue the 60-day line window cannot even see.
     // Widened in round 45 (finding 1): the CYCLE RECORD is checked as well as
     // the cursors, because a cursor is cleared the moment its pass completes.
-    assert.match(sweep, /const stale = !cycleStillValid\(cycle, snapshotEpoch, snapshotEvidenceEpoch\)/);
+    assert.match(sweep, /const stale = !cycleStillValid\(cycle, snapshotEpoch, snapshotEvidenceEpoch, RECOGNITION_POLICY\)/);
     assert.match(sweep, /\|\| storedCursors\.some\(cursor => !cursorUsableAt\(cursor, snapshotEpoch, snapshotEvidenceEpoch\)\)/);
-    const staleAt = sweep.indexOf("const stale = !cycleStillValid(cycle, snapshotEpoch, snapshotEvidenceEpoch)");
+    const staleAt = sweep.indexOf("const stale = !cycleStillValid(cycle, snapshotEpoch, snapshotEvidenceEpoch, RECOGNITION_POLICY)");
     const clearAt = sweep.indexOf("await Promise.all([writeCursor(null), writeOpenCursor(null)]);", staleAt);
     const restartAt = sweep.indexOf('effectiveStartPhase = "open-issues";', clearAt);
     assert.ok(staleAt > 0 && clearAt > staleAt && restartAt > clearAt,
