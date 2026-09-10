@@ -1,3 +1,4 @@
+import { reviewedReceiptFactForExpense, reviewedReceiptFactsFingerprint } from "@/server/receipt-reviewed-source-facts";
 import { RECEIPT_AUTH_SETTLEMENT_MAX_DAYS, receiptRecognitionPolicy } from "@/lib/receipt-source-recognition";
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
@@ -66,7 +67,7 @@ import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 // Default off until canonical statement source fields have been verified.
 // Enabling changes policy: start a fresh full sweep before any purchaser cards.
 const SOURCE_RECOGNITION_ENABLED = process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true";
-const RECOGNITION_POLICY = receiptRecognitionPolicy(SOURCE_RECOGNITION_ENABLED);
+const RECOGNITION_POLICY = receiptRecognitionPolicy(SOURCE_RECOGNITION_ENABLED, reviewedReceiptFactsFingerprint);
 const EVIDENCE_LOOKBACK_DAYS = SOURCE_RECOGNITION_ENABLED ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS : RECEIPT_MATCH_DATE_SLOP_DAYS;
 const SOURCE_ADJACENCY_DAYS = SOURCE_RECOGNITION_ENABLED
     ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS + RECEIPT_MATCH_DATE_SLOP_DAYS
@@ -983,7 +984,7 @@ export async function recomputeCodesFor(
             where: { date: range.timestamp },
             select: {
                 id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
-                receiptUrl: true, receiptIntake: { select: { id: true } },
+                receiptUrl: true, qbSyncToken: true, status: true, description: true, receiptIntake: { select: { id: true } },
             },
         }),
         prisma.receiptIntake.findMany({
@@ -1020,6 +1021,7 @@ export async function recomputeCodesFor(
         expenses: expenseRows.flatMap(row => {
             const cents = decimalStringToCents(row.amount.toString());
             if (cents === null) return [];
+            const reviewedDate = row.date ? dayKeyInTimeZone(row.date, zone) : null;
             return [{
                 id: row.id,
                 qbPurchaseId: row.qbPurchaseId,
@@ -1028,6 +1030,8 @@ export async function recomputeCodesFor(
                 // COMPANY-LOCAL DAY, not the UTC one — see processBatch.
                 date: row.date ? dayKeyInTimeZone(row.date, zone) : null,
                 vendor: row.vendor,
+                linkedIntakeId: row.receiptIntake?.id ?? null,
+                reviewedSourceFact: reviewedReceiptFactForExpense({ ...row, amountCents: cents, date: reviewedDate }),
             }];
         }),
         intakes: intakeRows.map(row => ({
@@ -1341,7 +1345,7 @@ async function processBatch(
             where: { date: range.timestamp },
             select: {
                 id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
-                receiptUrl: true, receiptIntake: { select: { id: true } },
+                receiptUrl: true, qbSyncToken: true, status: true, description: true, receiptIntake: { select: { id: true } },
             },
         }),
         prisma.receiptIntake.findMany({
@@ -1380,6 +1384,7 @@ async function processBatch(
         expenses: expenseRows.flatMap(row => {
             const cents = decimalStringToCents(row.amount.toString());
             if (cents === null) return [];
+            const reviewedDate = row.date ? dayKeyInTimeZone(row.date, zone) : null;
             return [{
                 id: row.id,
                 qbPurchaseId: row.qbPurchaseId,
@@ -1399,6 +1404,8 @@ async function processBatch(
                  */
                 date: row.date ? dayKeyInTimeZone(row.date, zone) : null,
                 vendor: row.vendor,
+                linkedIntakeId: row.receiptIntake?.id ?? null,
+                reviewedSourceFact: reviewedReceiptFactForExpense({ ...row, amountCents: cents, date: reviewedDate }),
             }];
         }),
         intakes: intakeRows.map(row => ({
@@ -1522,6 +1529,7 @@ async function processBatch(
                     date: row.date,
                     vendor: row.vendor,
                     qbPurchaseId: row.qbPurchaseId,
+                    linkedIntakeId: row.receiptIntake?.id ?? null, receiptUrl: row.receiptUrl, qbSyncToken: row.qbSyncToken, status: row.status, description: row.description,
                 })),
             // This component's share of the batch-wide lineage load. Per-line
             // entries carry their own global collision evidence, so the subset
@@ -1640,7 +1648,7 @@ async function processBatch(
                         where: { date: componentRange.timestamp },
                         select: {
                             id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
-                            receiptUrl: true, receiptIntake: { select: { id: true } },
+                            receiptUrl: true, qbSyncToken: true, status: true, description: true, receiptIntake: { select: { id: true } },
                         },
                     });
                 const current = componentVersionOf({
@@ -1664,6 +1672,7 @@ async function processBatch(
                         date: row.date,
                         vendor: row.vendor,
                         qbPurchaseId: row.qbPurchaseId,
+                        linkedIntakeId: row.receiptIntake?.id ?? null, receiptUrl: row.receiptUrl, qbSyncToken: row.qbSyncToken, status: row.status, description: row.description,
                     })),
                     // The SAME helper, inside the transaction, under both
                     // locks, for this component's ids.
