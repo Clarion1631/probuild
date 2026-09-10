@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
     HISTORY_MISSING_WARNING,
+    RETIRED_EXPENSE_DESCRIPTION,
+    RETIRED_EXPENSE_WARNING,
+    RETIREMENT_RACE_REASON,
     SOURCE_REFRESH_AUDIT_ACTION,
     SOURCE_REFRESH_BASIS,
     SourceRefreshRollback,
@@ -12,6 +15,7 @@ import {
     parseDecimalCents,
     type BankSourceRefreshDependencies,
     type ExpenseEvidence,
+    type ExpenseRetirementEvidence,
     type ObservationSnapshot,
     type RefreshEvidence,
     type RefreshItemResult,
@@ -458,13 +462,14 @@ test("source refresh: real Prisma applier takes locks in order, CAS on full old 
     const evidenceLock = idx(c => c.kind === "exec" && (c.args as unknown[]).includes(RECEIPT_EVIDENCE_LOCK));
     const expenseLock = idx(c => c.kind === "unsafe");
     const identityLock = idx(c => c.kind === "exec" && (c.args as unknown[]).includes(BANK_LINE_IDENTITY_LOCK));
-    const expenseIdRead = idx(c => c.kind === "expense.findMany");
+    const parentPeek = idx(c => c.kind === "expense.findMany");
+    const expenseIdRead = calls.findIndex((c, i) => c.kind === "expense.findMany" && i > identityLock);
     const expenseLocks = calls.map((c, i) => ({ c, i })).filter(({ c }) => (c.kind === "exec" || c.kind === "query" || c.kind === "unsafe") && JSON.stringify(c.args).includes("exp-")).map(({ i }) => i);
     const firstRead = idx(c => c.kind === "obs.findMany");
     const epoch = idx(c => c.kind === "query" && (c.args as unknown[]).includes(BANK_LEDGER_EPOCH_KEY));
     const cas = idx(c => c.kind === "obs.updateMany");
     const audit = idx(c => c.kind === "audit.create");
-    assert.ok(evidenceLock === 0 && evidenceLock < expenseLock && expenseLock < identityLock && identityLock < expenseIdRead, `lock order ${JSON.stringify(calls.map(c => c.kind))}`);
+    assert.ok(evidenceLock === 0 && evidenceLock < expenseLock && expenseLock < parentPeek && parentPeek < identityLock && identityLock < expenseIdRead, `lock order ${JSON.stringify(calls.map(c => c.kind))}`);
     assert.equal(expenseLocks.length, 2, "one advisory lock per existing Expense");
     assert.ok(expenseIdRead < expenseLocks[0] && expenseLocks[1] < firstRead, "Expense locks taken after the identity lock and before evidence is read");
     assert.ok(JSON.stringify(calls[expenseLocks[0]].args).includes("exp-1") && JSON.stringify(calls[expenseLocks[1]].args).includes("exp-2"), "Expense locks taken in sorted id order");
@@ -557,4 +562,305 @@ test("source refresh digest includes the exact GL row, excluding only fetch timi
         assert.notEqual(before.plan.digest, changed.plan.digest);
         assert.equal(before.plan.digest, laterFetch.plan.digest);
     }
+});
+
+// ---------------------------------------------------------------------------
+// Retired-Expense exception: literal-zero retired Expense on a Closed Complete job
+// ---------------------------------------------------------------------------
+
+const RETIRED_ID = "6597";
+
+function retirement(overrides: Partial<ExpenseRetirementEvidence> = {}): ExpenseRetirementEvidence {
+    return {
+        description: RETIRED_EXPENSE_DESCRIPTION, status: "Reviewed",
+        taxAmount: null, taxSource: null, installedAtCustomer: null, taxDeductibleBase: null, taxDeductibleBaseSource: null, taxAtSource: false, needsTaxReview: false,
+        projectId: "proj-1", estimateId: "est-1", itemId: "item-1",
+        project: { id: "proj-1", status: "Closed Complete" },
+        estimate: { id: "est-1", projectId: "proj-1" },
+        item: { id: "item-1", estimateId: "est-1" },
+        ...overrides,
+    };
+}
+
+/** Observed QXO identity/date/amount with synthetic valid retirement tax/item metadata; live metadata is not asserted by this fixture. */
+function retiredExpense(overrides: Partial<ExpenseEvidence> = {}): ExpenseEvidence {
+    return { id: "exp-r", qbPurchaseId: RETIRED_ID, date: "2026-08-13", amount: "0.00", qbSyncToken: "1", vendor: "QXO", retirement: retirement(), ...overrides };
+}
+
+function retiredObservation(overrides: Partial<ObservationSnapshot> = {}): ObservationSnapshot {
+    return oldObservation({ id: "obs-r", postedDate: "2026-08-13", rawDescriptor: "QXO Expense", amountCents: -8548, createdAt: "2026-08-14T04:00:00.000Z", ...overrides });
+}
+
+function retiredRegister(overrides: Partial<BankRegisterRow> = {}): BankRegisterResult {
+    return register([registerRow({ qbTxnId: RETIRED_ID, date: "2026-08-13", name: "QXO", memo: "Howard/Salzer exterior - QXO ($85.48) � Invoice VD76026 [gtr-file:1QrLK_EXfr5rgKsyVQzGWbYY98hKqyw3X]", amountCents: -8548, ...overrides })]);
+}
+
+function retiredPurchase(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return purchase({ Id: RETIRED_ID, TxnDate: "2026-08-13", TotalAmt: 85.48, SyncToken: "1", EntityRef: { name: "QXO", value: "77" }, PrivateNote: "Howard/Salzer exterior - QXO ($85.48) � Invoice VD76026 [gtr-file:1QrLK_EXfr5rgKsyVQzGWbYY98hKqyw3X]", MetaData: { CreateTime: "2026-08-13T10:00:00-07:00", LastUpdatedTime: "2026-09-05T08:00:00-07:00" }, ...overrides });
+}
+
+function retiredEvidence(expenseOverrides: Partial<ExpenseEvidence> = {}, observationOverrides: Partial<ObservationSnapshot> = {}): RefreshEvidence {
+    return evidence({ observations: [retiredObservation(observationOverrides)], expenses: [retiredExpense(expenseOverrides)] });
+}
+
+function retiredPlan(overrides: { qbTxnId?: string; evidence?: RefreshEvidence; register?: BankRegisterResult; purchaseRaw?: unknown } = {}) {
+    return planSourceRefresh({
+        qbTxnId: overrides.qbTxnId ?? RETIRED_ID,
+        evidence: overrides.evidence ?? retiredEvidence(),
+        register: overrides.register ?? retiredRegister(),
+        purchaseRaw: "purchaseRaw" in overrides ? overrides.purchaseRaw : retiredPurchase(),
+    });
+}
+
+test("retired Expense: 6597 and 6547 zero retired QXO Expenses allow a descriptor-only refresh to the current memo", () => {
+    const first = retiredPlan();
+    assert.equal(first.status, "eligible");
+    if (first.status === "eligible") {
+        assert.equal(first.plan.basis, SOURCE_REFRESH_BASIS);
+        assert.deepEqual(first.plan.warnings, [HISTORY_MISSING_WARNING, RETIRED_EXPENSE_WARNING]);
+        assert.deepEqual(first.plan.next, { postedDate: "2026-08-13", rawDescriptor: "Howard/Salzer exterior - QXO ($85.48) � Invoice VD76026 [gtr-file:1QrLK_EXfr5rgKsyVQzGWbYY98hKqyw3X]" });
+        assert.equal(first.plan.old.postedDate, "2026-08-13", "descriptor-only: the date does not move");
+        assert.deepEqual(first.plan.localEvidence.expenses, [retiredExpense()], "retirement, project, estimate and item facts are in the reviewed evidence");
+        assert.deepEqual(first.evidence.expenses[0].retirement, retirement());
+        assert.equal(first.plan.purchase.SyncToken, "1");
+    }
+
+    const second = retiredPlan({
+        qbTxnId: "6547",
+        evidence: evidence({
+            observations: [retiredObservation({ id: "obs-s", postedDate: "2026-08-12", amountCents: -133029, createdAt: "2026-08-13T04:00:00.000Z" })],
+            expenses: [retiredExpense({ id: "exp-s", qbPurchaseId: "6547", date: "2026-08-12" })],
+        }),
+        register: register([registerRow({ qbTxnId: "6547", date: "2026-08-12", name: "QXO", memo: "Howard/Salzer exterior - QXO ($1330.29) � Invoice 2411269 [gtr-file:1tTzgTonAOapWdYVPoDQIXkbBrAk1GA0y]", amountCents: -133029 })]),
+        purchaseRaw: retiredPurchase({ Id: "6547", TxnDate: "2026-08-12", TotalAmt: 1330.29, PrivateNote: "Howard/Salzer exterior - QXO ($1330.29) � Invoice 2411269 [gtr-file:1tTzgTonAOapWdYVPoDQIXkbBrAk1GA0y]", MetaData: { CreateTime: "2026-08-12T10:00:00-07:00", LastUpdatedTime: "2026-09-05T08:00:00-07:00" } }),
+    });
+    assert.equal(second.status, "eligible");
+    if (second.status === "eligible") {
+        assert.deepEqual(second.plan.next, { postedDate: "2026-08-12", rawDescriptor: "Howard/Salzer exterior - QXO ($1330.29) � Invoice 2411269 [gtr-file:1tTzgTonAOapWdYVPoDQIXkbBrAk1GA0y]" });
+        assert.deepEqual(second.plan.warnings, [HISTORY_MISSING_WARNING, RETIRED_EXPENSE_WARNING]);
+        assert.equal(second.plan.localEvidence.expenses[0].amount, "0.00");
+    }
+
+    const literalZero = retiredPlan({ evidence: retiredEvidence({ amount: "0" }) });
+    assert.equal(literalZero.status, "eligible", "\"0\" is the literal zero too");
+
+    const projectOnly = retiredPlan({ evidence: retiredEvidence({ retirement: retirement({ estimateId: null, itemId: null, estimate: null, item: null }) }) });
+    assert.equal(projectOnly.status, "eligible", "no estimate/item named is fine when the project is Closed Complete");
+
+    const positiveWithMetadata = retiredPlan({ evidence: retiredEvidence({ amount: "85.48" }) });
+    assert.equal(positiveWithMetadata.status, "eligible");
+    assert.deepEqual(positiveWithMetadata.status === "eligible" && positiveWithMetadata.plan.warnings, [HISTORY_MISSING_WARNING], "a positive Expense is never flagged retired");
+
+    const positiveWithoutMetadata = retiredPlan({ evidence: retiredEvidence({ amount: "85.48", retirement: undefined }) });
+    assert.equal(positiveWithoutMetadata.status, "eligible", "old fixtures without retirement metadata still work for positive Expenses");
+
+    const unchanged = retiredPlan({ evidence: retiredEvidence({}, { rawDescriptor: "Howard/Salzer exterior - QXO ($85.48) � Invoice VD76026 [gtr-file:1QrLK_EXfr5rgKsyVQzGWbYY98hKqyw3X]" }) });
+    assert.equal(unchanged.status, "noop");
+});
+
+test("retired Expense: every retirement, attribution, token and date rule is required", async t => {
+    const withRetirement = (overrides: Partial<ExpenseRetirementEvidence>): RefreshEvidence => retiredEvidence({ retirement: retirement(overrides) });
+    const cases: [string, Parameters<typeof retiredPlan>[0], string][] = [
+        ["metadata missing", { evidence: retiredEvidence({ retirement: undefined }) }, "expense-retirement-metadata-missing"],
+        ["marker reason differs", { evidence: withRetirement({ description: "[QuickBooks import] Removed in QBO (deleted)" }) }, "expense-retirement-marker-mismatch"],
+        ["marker case differs", { evidence: withRetirement({ description: "[quickbooks import] removed in qbo (no-active-project)" }) }, "expense-retirement-marker-mismatch"],
+        ["marker null", { evidence: withRetirement({ description: null }) }, "expense-retirement-marker-mismatch"],
+        ["status not Reviewed", { evidence: withRetirement({ status: "Pending" }) }, "expense-retirement-status-mismatch"],
+        ["tax amount retained", { evidence: withRetirement({ taxAmount: "5.00" }) }, "expense-retirement-tax-not-retired"],
+        ["tax source retained", { evidence: withRetirement({ taxSource: "manual" }) }, "expense-retirement-tax-not-retired"],
+        ["installedAtCustomer retained", { evidence: withRetirement({ installedAtCustomer: false }) }, "expense-retirement-tax-not-retired"],
+        ["deductible base retained", { evidence: withRetirement({ taxDeductibleBase: "0.00" }) }, "expense-retirement-tax-not-retired"],
+        ["deductible base source retained", { evidence: withRetirement({ taxDeductibleBaseSource: "manual" }) }, "expense-retirement-tax-not-retired"],
+        ["taxAtSource true", { evidence: withRetirement({ taxAtSource: true }) }, "expense-retirement-tax-not-retired"],
+        ["needsTaxReview true", { evidence: withRetirement({ needsTaxReview: true }) }, "expense-retirement-tax-not-retired"],
+        ["project In Progress", { evidence: withRetirement({ project: { id: "proj-1", status: "In Progress" } }) }, "expense-retirement-project-active"],
+        ["project merely Closed", { evidence: withRetirement({ project: { id: "proj-1", status: "Closed" } }) }, "expense-retirement-project-active"],
+        ["project status case differs", { evidence: withRetirement({ project: { id: "proj-1", status: "closed complete" } }) }, "expense-retirement-project-active"],
+        ["project status null", { evidence: withRetirement({ project: { id: "proj-1", status: null } }) }, "expense-retirement-project-active"],
+        ["no explicit projectId", { evidence: withRetirement({ projectId: null }) }, "expense-retirement-project-missing"],
+        ["project row missing", { evidence: withRetirement({ project: null }) }, "expense-retirement-project-missing"],
+        ["project row is another job", { evidence: withRetirement({ project: { id: "proj-2", status: "Closed Complete" } }) }, "expense-retirement-project-missing"],
+        ["estimate row missing", { evidence: withRetirement({ estimate: null }) }, "expense-retirement-estimate-missing"],
+        ["estimate row is another estimate", { evidence: withRetirement({ estimate: { id: "est-2", projectId: "proj-1" } }) }, "expense-retirement-estimate-missing"],
+        ["estimate on another project", { evidence: withRetirement({ estimate: { id: "est-1", projectId: "proj-2" } }) }, "expense-retirement-estimate-project-mismatch"],
+        ["estimate present without estimateId", { evidence: withRetirement({ estimateId: null, itemId: null, item: null }) }, "expense-retirement-estimate-inconsistent"],
+        ["item row missing", { evidence: withRetirement({ item: null }) }, "expense-retirement-item-missing"],
+        ["item row is another item", { evidence: withRetirement({ item: { id: "item-2", estimateId: "est-1" } }) }, "expense-retirement-item-missing"],
+        ["item on another estimate", { evidence: withRetirement({ item: { id: "item-1", estimateId: "est-2" } }) }, "expense-retirement-item-estimate-mismatch"],
+        ["item present without itemId", { evidence: withRetirement({ itemId: null }) }, "expense-retirement-item-inconsistent"],
+        ["stale sync token", { evidence: retiredEvidence({ qbSyncToken: "0" }) }, "expense-sync-token-stale"],
+        ["missing sync token", { evidence: retiredEvidence({ qbSyncToken: null }) }, "expense-sync-token-missing"],
+        ["expense vendor differs", { evidence: retiredEvidence({ vendor: "Lowes" }) }, "expense-vendor-mismatch"],
+        ["expense date differs from Purchase", { evidence: retiredEvidence({ date: "2026-08-12" }) }, "expense-date-mismatch"],
+        ["stored date differs from Purchase TxnDate (descriptor-only exception)", { evidence: retiredEvidence({}, { postedDate: "2026-08-12" }) }, "retired-expense-date-change"],
+        ["sub-cent zero is not literal zero", { evidence: retiredEvidence({ amount: "0.000" }) }, "expense-amount-malformed"],
+        ["double zero is not literal zero", { evidence: retiredEvidence({ amount: "00" }) }, "expense-amount-malformed"],
+        ["small positive is a mismatch, not retired", { evidence: retiredEvidence({ amount: "0.50" }) }, "expense-amount-mismatch"],
+        ["stored cents changed", { evidence: retiredEvidence({}, { amountCents: -8549 }) }, "amount-changed"],
+        ["canonical line still blocks", { evidence: evidence({ observations: [retiredObservation()], expenses: [retiredExpense()], bankLines: [{ id: "bl-9", account: "WTB-0723", postedDate: "2026-08-13", amountCents: -8548, state: "CANONICAL", sourceOfRecord: "QBO", probuildExpenseId: null }] }) }, "canonical-line-exists"],
+        ["receipt intake still blocks", { evidence: evidence({ observations: [retiredObservation()], expenses: [retiredExpense()], intakes: [{ id: "ri-1", state: "BOOKED", expenseId: null }] }) }, "receipt-intake-linked"],
+    ];
+    for (const [name, input, reason] of cases) {
+        await t.test(name, () => {
+            const outcome = retiredPlan(input);
+            assert.equal(outcome.status, "blocked", name);
+            assert.equal(outcome.status === "blocked" && outcome.reason, reason);
+            if (outcome.status === "blocked" && input?.evidence) {
+                const { sourcePurchase: _purchase, sourceRegister: _register, ...local } = outcome.evidence;
+                assert.deepEqual(local, JSON.parse(JSON.stringify(input.evidence)), "retirement evidence is retained verbatim (absent optional fields omitted)");
+            }
+        });
+    }
+});
+
+test("retired Expense: digest covers retirement, project, estimate and item evidence", () => {
+    const base = retiredPlan();
+    const otherItem = retiredPlan({ evidence: retiredEvidence({ retirement: retirement({ itemId: "item-2", item: { id: "item-2", estimateId: "est-1" } }) }) });
+    const otherEstimate = retiredPlan({ evidence: retiredEvidence({ retirement: retirement({ estimateId: "est-2", estimate: { id: "est-2", projectId: "proj-1" }, item: { id: "item-1", estimateId: "est-2" } }) }) });
+    const otherProject = retiredPlan({ evidence: retiredEvidence({ retirement: retirement({ projectId: "proj-2", project: { id: "proj-2", status: "Closed Complete" }, estimate: { id: "est-1", projectId: "proj-2" } }) }) });
+    const digests = [base, otherItem, otherEstimate, otherProject].map(outcome => {
+        assert.equal(outcome.status, "eligible");
+        return outcome.status === "eligible" ? outcome.plan.digest : "";
+    });
+    assert.equal(new Set(digests).size, 4, "each attribution change yields a different digest");
+    const positive = retiredPlan({ evidence: retiredEvidence({ amount: "85.48" }) });
+    assert.equal(positive.status, "eligible");
+    assert.notEqual(positive.status === "eligible" && positive.plan.digest, digests[0]);
+});
+
+test("retired Expense: apply rereads retirement metadata under the locks and refuses a reopened project or moved attribution", async () => {
+    const world = { obs: retiredObservation(), expense: retiredExpense(), audit: [] as Record<string, unknown>[], order: [] as string[] };
+    const current = (): RefreshEvidence => evidence({ observations: [{ ...world.obs }], expenses: [JSON.parse(JSON.stringify(world.expense)) as ExpenseEvidence] });
+    const handlers = createBankSourceRefreshHandlers({
+        authorize: () => true,
+        readRegister: async () => retiredRegister(),
+        readPurchase: async () => retiredPurchase(),
+        readEvidence: async () => current(),
+        apply: async (_id, body) => body({
+            readEvidence: async () => current(),
+            bumpEpoch: async () => { world.order.push("epoch"); },
+            updateObservation: async (_old, next) => { world.order.push("cas"); world.obs = { ...world.obs, ...next }; return 1; },
+            appendAudit: async (_entityId, snapshot) => { world.order.push("audit"); world.audit.push(snapshot); },
+        }),
+    });
+    const [dry] = await results(await handlers.POST(request({ items: [{ qbTxnId: RETIRED_ID }] })));
+    assert.equal(dry.status, "eligible");
+    if (dry.status !== "eligible") return;
+    assert.deepEqual(dry.plan.warnings, [HISTORY_MISSING_WARNING, RETIRED_EXPENSE_WARNING]);
+    const digest = dry.plan.digest;
+
+    // The job was reopened between the dry-run and the apply: rejected on the reread, nothing written.
+    world.expense = retiredExpense({ retirement: retirement({ project: { id: "proj-1", status: "In Progress" } }) });
+    const [reopened] = await results(await handlers.POST(request({ mode: "apply", items: [{ qbTxnId: RETIRED_ID, expectedDigest: digest }] })));
+    assert.equal(reopened.status, "blocked");
+    assert.equal(reopened.status === "blocked" && reopened.reason, "expense-retirement-project-active");
+    assert.deepEqual(world.order, []);
+    assert.equal(world.audit.length, 0);
+
+    // Attribution moved consistently to another estimate: still a different digest, so the reviewed version no longer applies.
+    world.expense = retiredExpense({ retirement: retirement({ estimateId: "est-2", estimate: { id: "est-2", projectId: "proj-1" }, item: { id: "item-1", estimateId: "est-2" } }) });
+    const [moved] = await results(await handlers.POST(request({ mode: "apply", items: [{ qbTxnId: RETIRED_ID, expectedDigest: digest }] })));
+    assert.equal(moved.status, "blocked");
+    assert.equal(moved.status === "blocked" && moved.reason, "digest-mismatch");
+    assert.deepEqual(world.order, []);
+
+    // Retirement metadata missing at apply time (a narrower reader) always rejects the zero Expense.
+    world.expense = retiredExpense({ retirement: undefined });
+    const [missing] = await results(await handlers.POST(request({ mode: "apply", items: [{ qbTxnId: RETIRED_ID, expectedDigest: digest }] })));
+    assert.equal(missing.status === "blocked" && missing.reason, "expense-retirement-metadata-missing");
+
+    world.expense = retiredExpense();
+    const [applied] = await results(await handlers.POST(request({ mode: "apply", items: [{ qbTxnId: RETIRED_ID, expectedDigest: digest }] })));
+    assert.equal(applied.status, "applied");
+    assert.deepEqual(world.order, ["epoch", "cas", "audit"]);
+    assert.equal(world.obs.postedDate, "2026-08-13", "date untouched");
+    assert.equal(world.obs.rawDescriptor, "Howard/Salzer exterior - QXO ($85.48) � Invoice VD76026 [gtr-file:1QrLK_EXfr5rgKsyVQzGWbYY98hKqyw3X]");
+    assert.equal(world.obs.amountCents, -8548);
+    assert.deepEqual(world.expense, retiredExpense(), "Expense never mutated");
+    const snapshot = world.audit[0] as Record<string, unknown>;
+    assert.deepEqual(snapshot.warnings, [HISTORY_MISSING_WARNING, RETIRED_EXPENSE_WARNING]);
+    assert.deepEqual((snapshot.localEvidence as RefreshEvidence).expenses[0].retirement, retirement(), "audit carries every retirement and attribution fact");
+    assert.equal(snapshot.digest, digest);
+
+    const [retry] = await results(await handlers.POST(request({ mode: "apply", items: [{ qbTxnId: RETIRED_ID, expectedDigest: digest }] })));
+    assert.equal(retry.status, "noop");
+    assert.equal(world.audit.length, 1);
+});
+
+test("retired Expense: Prisma applier share-locks Project, Estimate and EstimateItem after the Purchase lock and before the identity lock, and refuses a parent race", async () => {
+    type Call = { kind: string; sql?: string; args?: unknown };
+    async function run(raceOnReread: boolean) {
+        const calls: Call[] = [];
+        let expenseReads = 0;
+        let bodyCalls = 0;
+        const old = retiredObservation();
+        const tx = {
+            $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => { calls.push({ kind: "exec", sql: strings.join("?"), args: values }); },
+            $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => { calls.push({ kind: "query", sql: strings.join("?"), args: values }); return [{ value: "1" }]; },
+            $queryRawUnsafe: async (sql: string, ...values: unknown[]) => { calls.push({ kind: "unsafe", sql, args: values }); return []; },
+            bankLineObservation: {
+                findMany: async () => { calls.push({ kind: "obs.findMany" }); return [{ ...old, postedDate: new Date("2026-08-13T00:00:00Z"), createdAt: new Date(old.createdAt) }]; },
+                updateMany: async (args: unknown) => { calls.push({ kind: "obs.updateMany", args }); return { count: 1 }; },
+            },
+            bankLine: { findMany: async () => [] },
+            expense: {
+                findMany: async (args: { select?: Record<string, unknown> }) => {
+                    calls.push({ kind: "expense.findMany", args });
+                    expenseReads++;
+                    // Reads: 1 = parent peek, 2 = Expense id read, 3 = post-lock identity reread, 4 = evidence.
+                    const projectId = raceOnReread && expenseReads === 3 ? "proj-2" : "proj-1";
+                    return [{
+                        id: "exp-r", qbPurchaseId: RETIRED_ID, date: new Date("2026-08-13T00:00:00Z"), amount: "0.00", qbSyncToken: "1", vendor: "QXO",
+                        description: RETIRED_EXPENSE_DESCRIPTION, status: "Reviewed",
+                        taxAmount: null, taxSource: null, installedAtCustomer: null, taxDeductibleBase: null, taxDeductibleBaseSource: null, taxAtSource: false, needsTaxReview: false,
+                        projectId, estimateId: "est-1", itemId: "item-1",
+                        project: { id: projectId, status: "Closed Complete" }, estimate: { id: "est-1", projectId: "proj-9" }, item: { id: "item-1", estimateId: "est-1" },
+                    }];
+                },
+            },
+            receiptIntake: { findMany: async () => [] },
+            auditLog: { create: async (args: unknown) => { calls.push({ kind: "audit.create", args }); } },
+        };
+        const applier = createRefreshApplier({ $transaction: async (fn: (t: unknown) => Promise<unknown>) => fn(tx) } as never);
+        const result = await applier(RETIRED_ID, async ctx => {
+            bodyCalls++;
+            const ev = await ctx.readEvidence();
+            assert.equal(ev.expenses[0].amount, "0.00");
+            assert.equal(ev.expenses[0].retirement?.description, RETIRED_EXPENSE_DESCRIPTION);
+            assert.equal(ev.expenses[0].retirement?.taxAtSource, false);
+            assert.deepEqual(ev.expenses[0].retirement?.project, { id: "proj-1", status: "Closed Complete" });
+            assert.deepEqual(ev.expenses[0].retirement?.estimate, { id: "est-1", projectId: "proj-9" });
+            assert.deepEqual(ev.expenses[0].retirement?.item, { id: "item-1", estimateId: "est-1" });
+            return { qbTxnId: RETIRED_ID, status: "noop", reason: "test" };
+        });
+        return { calls, result, bodyCalls };
+    }
+
+    const ok = await run(false);
+    assert.equal(ok.result.status, "noop");
+    assert.equal(ok.bodyCalls, 1);
+    const idx = (pred: (c: Call) => boolean) => ok.calls.findIndex(pred);
+    const purchaseLock = idx(c => c.kind === "unsafe");
+    const projectLock = idx(c => c.kind === "unsafe" && (c.sql ?? "").includes('FROM "Project"'));
+    const estimateLock = idx(c => c.kind === "unsafe" && (c.sql ?? "").includes('FROM "Estimate"'));
+    const itemLock = idx(c => c.kind === "unsafe" && (c.sql ?? "").includes('"EstimateItem"'));
+    const identityLock = idx(c => c.kind === "exec" && (c.args as unknown[]).includes(BANK_LINE_IDENTITY_LOCK));
+    const expenseLocks = ok.calls.map((c, i) => ({ c, i })).filter(({ c }) => (c.kind === "exec" || c.kind === "query" || c.kind === "unsafe") && JSON.stringify(c.args).includes("exp-")).map(({ i }) => i);
+    const reads = ok.calls.map((c, i) => ({ c, i })).filter(({ c }) => c.kind === "expense.findMany").map(({ i }) => i);
+    const firstRead = idx(c => c.kind === "obs.findMany");
+    const kinds = JSON.stringify(ok.calls.map(c => c.kind));
+    assert.ok(purchaseLock >= 0 && purchaseLock < reads[0] && reads[0] < projectLock && projectLock < estimateLock && estimateLock < itemLock && itemLock < identityLock, `lock order ${kinds}`);
+    assert.deepEqual(ok.calls[projectLock].args, [["proj-1", "proj-9"]], "explicit and estimate project ids, sorted, in one statement");
+    assert.deepEqual(ok.calls[estimateLock].args, [["proj-1", "proj-9"], ["est-1"]]);
+    assert.deepEqual(ok.calls[itemLock].args, [["proj-1", "proj-9"], ["item-1"]]);
+    assert.equal(expenseLocks.length, 1, "one advisory lock for the single Expense");
+    assert.equal(reads.length, 4, `peek, id read, reread, evidence: ${kinds}`);
+    assert.ok(identityLock < reads[1] && reads[1] < expenseLocks[0] && expenseLocks[0] < reads[2] && reads[2] < firstRead, `identity tuple reread after the Expense lock and before evidence: ${kinds}`);
+
+    const raced = await run(true);
+    assert.equal(raced.result.status, "blocked");
+    assert.equal(raced.result.status === "blocked" && raced.result.reason, RETIREMENT_RACE_REASON);
+    assert.equal(raced.bodyCalls, 0, "the body never runs against an unlocked new parent");
+    assert.equal(raced.calls.filter(c => c.kind === "obs.findMany" || c.kind === "obs.updateMany" || c.kind === "audit.create").length, 0, "no evidence read and no writes");
+    assert.ok(raced.calls.some(c => c.kind === "unsafe" && (c.sql ?? "").includes('FROM "Project"') && JSON.stringify(c.args) === JSON.stringify([["proj-1", "proj-9"]])), "locks were taken from the peek, not the raced reread");
 });
