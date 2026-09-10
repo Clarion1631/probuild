@@ -161,3 +161,6 @@ qa-screenshots/
 # and break `next build`.
 /gtr-probuild/
 /_context/
+
+# quiet-check full logs
+/.quiet-check/
