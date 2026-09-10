@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { getPipelineHealth } from "@/lib/pipeline-health";
 import { hasCronSecret } from "@/lib/cron-auth";
+import { loadReceiptOutcomeAudit } from "@/lib/receipt-outcome-audit";
 
 export const dynamic = "force-dynamic";
 // Auth runs before the health sweep; its bounded QBO probe may use 30s.
@@ -33,8 +34,18 @@ export async function GET(request: Request) {
         }
     }
 
+    const noStore = { "Cache-Control": "no-store, max-age=0" };
+
+    // ?outcomes=only: just the receipt-outcome audit, skipping the health
+    // sweep and its bounded QBO probe. Read-only, narrow, DB only.
+    if (new URL(request.url).searchParams.get("outcomes") === "only") {
+        const receiptOutcomes = await loadReceiptOutcomeAudit();
+        return NextResponse.json({ receiptOutcomes }, { headers: noStore });
+    }
+
     const health = await getPipelineHealth();
-    return NextResponse.json(health, {
-        headers: { "Cache-Control": "no-store, max-age=0" },
-    });
+    // Appended, not merged: health.ok keeps its operational meaning and an
+    // unavailable audit reads as unavailable, never as a quiet zero.
+    const receiptOutcomes = await loadReceiptOutcomeAudit();
+    return NextResponse.json({ ...health, receiptOutcomes }, { headers: noStore });
 }

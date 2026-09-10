@@ -3,6 +3,12 @@ import { getPipelineHealth, formatPipelineDigest, type PipelineHealth } from "@/
 import { sendNotification } from "@/lib/email";
 import { postTextToWebhook } from "@/lib/chat-webhook";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import {
+    loadReceiptOutcomeAudit,
+    formatReceiptOutcomeAudit,
+    unavailableReceiptOutcomeAudit,
+    type ReceiptOutcomeAudit,
+} from "@/lib/receipt-outcome-audit";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -71,6 +77,12 @@ export interface PipelineDigestDependencies {
     isEmailConfigured?: () => boolean;
     /** Overridable so tests need not wait out the real 10s deadline. */
     deliveryTimeoutMs?: number;
+    /**
+     * Optional receipt-outcome audit (same loader as /api/health/pipeline).
+     * Omitted by tests that inject deps, so they never touch the DB and the
+     * digest text they assert on is unchanged. Production wires the real one.
+     */
+    getReceiptOutcomes?: () => Promise<ReceiptOutcomeAudit>;
 }
 
 export function createPipelineDigestHandlers(dependencies: PipelineDigestDependencies) {
@@ -82,7 +94,22 @@ export function createPipelineDigestHandlers(dependencies: PipelineDigestDepende
             }
 
             const health = await dependencies.getHealth();
-            const { subject, text } = formatPipelineDigest(health);
+            const { subject, text: healthText } = formatPipelineDigest(health);
+
+            // Appended, never folded into health.ok: a stalled receipt chase is
+            // not a pipeline outage, and an unreadable audit must say so rather
+            // than read as zero.
+            let receiptOutcomes: ReceiptOutcomeAudit | undefined;
+            if (dependencies.getReceiptOutcomes) {
+                try {
+                    receiptOutcomes = await dependencies.getReceiptOutcomes();
+                } catch {
+                    receiptOutcomes = unavailableReceiptOutcomeAudit(new Date().toISOString());
+                }
+            }
+            const text = receiptOutcomes
+                ? `${healthText}\n\n${formatReceiptOutcomeAudit(receiptOutcomes)}`
+                : healthText;
 
             const to = dependencies.getRecipient();
             // <pre> keeps the line-per-item layout intact for HTML clients,
@@ -128,12 +155,18 @@ export function createPipelineDigestHandlers(dependencies: PipelineDigestDepende
                 // instead of being swallowed by a 200 nobody reads.
                 console.error("[cron/pipeline-digest] digest email was not accepted");
                 return NextResponse.json(
-                    { ok: false, reason: "email-not-accepted", chatPosted, health },
+                    { ok: false, reason: "email-not-accepted", chatPosted, health, ...(receiptOutcomes ? { receiptOutcomes } : {}) },
                     { status: 500 },
                 );
             }
 
-            return NextResponse.json({ ok: health.ok, emailed, chatPosted, health });
+            return NextResponse.json({
+                ok: health.ok,
+                emailed,
+                chatPosted,
+                health,
+                ...(receiptOutcomes ? { receiptOutcomes } : {}),
+            });
         },
     };
 }
@@ -145,6 +178,7 @@ const handlers = createPipelineDigestHandlers({
     postChat: postTextToWebhook,
     getChatWebhook: () => process.env.BOT_HEALTH_CHAT_WEBHOOK,
     getRecipient: () => process.env.PIPELINE_DIGEST_TO || DEFAULT_TO,
+    getReceiptOutcomes: () => loadReceiptOutcomeAudit(),
 });
 
 export async function GET(request: Request) {
