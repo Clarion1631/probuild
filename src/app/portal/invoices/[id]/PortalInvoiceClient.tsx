@@ -234,6 +234,11 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Project</p>
                                 <p className="text-sm font-semibold text-slate-800">{initialInvoice.projectName || "Project"}</p>
+                                {/* Job site, not the client's address — a property manager's
+                                    office says nothing about which building this bills. */}
+                                {initialInvoice.projectLocation && (
+                                    <p className="text-sm text-slate-500 mt-1">Job site: {initialInvoice.projectLocation}</p>
+                                )}
                             </div>
                         </div>
                     </div>

@@ -1080,7 +1080,24 @@ export async function generateInvoicePdf(
     ry -= 16;
     drawRL('Project', invoice.project?.name || '', ry);
 
-    y -= 20;
+    // Job site address, under BILL TO on the left — property managers bill for
+    // several buildings and need the site to tell the invoices apart. Deliberately
+    // NOT falling back to the client's address (a manager's office is not the job
+    // site); blank location renders nothing at all. It lives here rather than in the
+    // right column because a full street address doesn't fit that 160px block.
+    const jobSite = (invoice.project?.location || '').trim();
+    if (jobSite) {
+        y -= 18;
+        page.drawText('JOB SITE', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
+        for (const line of wrapPlainText(jobSite, helvetica, 10, 260)) {
+            y -= 14;
+            page.drawText(line, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
+        }
+    }
+
+    // Divider clears whichever column ran longer (the job-site block can push the
+    // left column past the right one, and a client-less invoice does the reverse).
+    y = Math.min(y, ry) - 20;
     page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 20;
 

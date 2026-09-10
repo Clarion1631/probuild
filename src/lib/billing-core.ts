@@ -715,6 +715,10 @@ export function buildMilestoneRequestEmail(input: {
     companyName: string;
     clientName: string | null | undefined;
     projectName: string | null | undefined;
+    // Job site address (Project.location). Never the client's address — a property
+    // manager's office doesn't identify which building is being billed. Blank
+    // renders no line at all.
+    projectLocation?: string | null | undefined;
     invoiceCode: string;
     milestones: Array<{ name: string; amount: number }>;
     portalUrl: string;
@@ -723,6 +727,7 @@ export function buildMilestoneRequestEmail(input: {
     const total = input.milestones.reduce((sum, m) => sum + m.amount, 0);
     const single = input.milestones.length === 1;
     const projectName = input.projectName || "project";
+    const jobSite = (input.projectLocation || "").trim();
     const milestoneRows = input.milestones.map(m => `
                     <tr>
                         <td style="padding: 10px 0; color: #333; border-bottom: 1px solid #f0f0f0;">${escapeHtml(m.name)}</td>
@@ -745,6 +750,7 @@ export function buildMilestoneRequestEmail(input: {
                 <p style="color: #666; line-height: 1.6;">
                     ${company} is requesting ${single ? "a progress payment" : "payment"} for your ${escapeHtml(projectName)}:
                 </p>
+                ${jobSite ? `<p style="color: #666; font-size: 13px; margin: 0;">Job site: ${escapeHtml(jobSite)}</p>` : ""}
                 <table style="width: 100%; border-collapse: collapse; margin: 8px 0 0;">
                     ${milestoneRows}
                 </table>
@@ -779,7 +785,7 @@ async function sendMilestoneRequestEmail(
         code: string;
         clientId: string | null;
         client: { name: string | null; email: string | null; additionalEmail: string | null } | null;
-        project: { name: string; clientId: string | null; client: { additionalEmail: string | null } | null } | null;
+        project: { name: string; location: string | null; clientId: string | null; client: { additionalEmail: string | null } | null } | null;
     },
     milestones: Array<{ id: string; name: string; amount: number }>,
     recipient: string,
@@ -802,6 +808,7 @@ async function sendMilestoneRequestEmail(
         companyName,
         clientName: invoice.client?.name,
         projectName: invoice.project?.name,
+        projectLocation: invoice.project?.location,
         invoiceCode: invoice.code,
         milestones,
         portalUrl,
