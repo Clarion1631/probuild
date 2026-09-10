@@ -601,7 +601,7 @@ test("/start's signer-failure cleanup is a CAS over the lease it wrote, not a de
     // which would leak a STAGING row (and its sourceRef) on every signer fault.
     assert.match(start, /const leaseExpiresAt = uploadLeaseExpiry\(\);/);
     assert.match(start, /const leaseNonce = newLeaseNonce\(\);/);
-    assert.match(start, /uploadUrlExpiresAt: leaseExpiresAt,\n\s+uploadLeaseVersion: 1,\n\s+uploadLeaseNonce: leaseNonce,/);
+    assert.match(start, /uploadUrlExpiresAt: leaseExpiresAt,\r?\n\s+uploadLeaseVersion: 1,\r?\n\s+uploadLeaseNonce: leaseNonce,/);
     // AND THE GENERATION IS IN THE CAS. Pinning the expiry alone was the hole
     // in the previous round's own fix: an adoption computes "now + 2h" exactly
     // as this request did, so the two can land on the same millisecond and the
