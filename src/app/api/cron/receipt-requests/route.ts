@@ -1929,8 +1929,8 @@ export async function GET(request: Request) {
          * new one is several writes long, and a crash inside it used to leave
          * phase `"done"`, no completion, no cursor and no request — which every
          * later continuation read as `nothing-in-progress`, losing the day. The
-         * cycle record is written first now and is the durable evidence that a
-         * cycle is open. A matching, unchanged completion proves that it finished;
+         * restart phase is written before the replacement cycle. Either record
+         * is durable evidence of unfinished work. A matching completion proves it finished;
          * otherwise this pass honours it whatever the cursors say.
          *
          * An owed full run counts for the same reason (round-45, finding 2).
@@ -2087,6 +2087,11 @@ async function runSweep(
     }
     startPhase = effectiveStartPhase;
 
+    // Persist the restart phase before the replacement cycle. Otherwise an
+    // interruption after writeCycle can leave a matching-policy cycle at the
+    // old "lines" phase and skip the open-issue pass on recovery.
+    if (startPhase !== "lines") await writePhase("open-issues", undefined, null, prisma, cycle === null ? null : undefined);
+
     // A cycle starting — fresh run, or a restart above — records what it is
     // being measured against, once, and nothing touches it again until the
     // next one starts.
@@ -2101,9 +2106,6 @@ async function runSweep(
      * a window where a crash meant nothing at all was asking for the work.
      */
     if (clearFullRunRequestOnStart) await writeFullRunRequested(null);
-
-    // The cycle is unfinished from here until the line pass exhausts.
-    if (startPhase !== "lines") await writePhase("open-issues");
 
     // Every bank-line issue, open OR cleared. The open ones say what may need
     // closing; the cleared ones carry resolutions that must not be re-asked.

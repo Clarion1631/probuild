@@ -566,8 +566,9 @@ export async function GET(request: Request) {
      * gets. So this refuses to select, says so, and consumes NOTHING — the
      * later `?retry=1` pass (or tomorrow) will find the slot free.
      *
-     * The retry pass is exempt: it never selects, it only re-posts a snapshot
-     * an earlier run already claimed while the chase WAS complete.
+     * The retry pass never selects. Legacy cycles retain the earlier replay
+     * exemption; cycles recording a recognition policy must finish before
+     * replay too, so a pending snapshot cannot bypass current certification.
      */
     const marker = parseSweepMarker(
         (await prisma.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } }))?.value,

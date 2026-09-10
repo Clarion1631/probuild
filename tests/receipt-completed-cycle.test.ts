@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { continuationNeedsWork } from "../src/app/api/cron/receipt-requests/route";
-import { chaserCompletedFor, type SweepMarker } from "../src/lib/receipt-sweep-marker";
+import { readFileSync } from "node:fs";
+import { continuationNeedsWork, parseSweepCursor, cursorUsableAt } from "../src/app/api/cron/receipt-requests/route";
+import { chaserCompletedFor, cycleStillValid, type SweepMarker } from "../src/lib/receipt-sweep-marker";
 
 const now = new Date("2026-09-10T14:20:00Z");
 const complete = {
@@ -59,4 +60,37 @@ test("empty initial state is idle but phase, cursor, or full intent remains resu
   assert.equal(continuationNeedsWork({ ...empty, openCursor: "unfinished" }), true);
   assert.equal(continuationNeedsWork({ ...empty, lineCursor: "unfinished" }), true);
   assert.equal(continuationNeedsWork({ ...empty, fullRunOwed: true }), true);
+});
+
+test("interruption after replacing the policy cycle cannot skip the open-issue restart", async () => {
+  const source = readFileSync(new URL('../src/app/api/cron/receipt-requests/route.ts', import.meta.url), 'utf8');
+  const begin = source.indexOf('    let effectiveStartPhase = startPhase;');
+  const end = source.indexOf('    // Every bank-line issue, open OR cleared.', begin);
+  assert.ok(begin > 0 && end > begin);
+  const initSource = source.slice(begin, end);
+  // Execute the real initialization sequence with only its persistence dependencies replaced.
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const initialize = new AsyncFunction('state', 'deps', `
+    const { budget, readCycle, readCursor, readOpenCursor, parseSweepCursor, cycleStillValid,
+      cursorUsableAt, writeCursor, writeOpenCursor, writeCycle, writePhase, writeFullRunRequested } = deps;
+    const snapshotEpoch = '7', snapshotEvidenceEpoch = '9', RECOGNITION_POLICY = 'receipt-source-v1:on';
+    const randomUUID = () => 'new-policy-cycle';
+    const clearFullRunRequestOnStart = false, prisma = {}, console = {log(){}};
+    let startPhase = state.phase;
+    ${initSource}
+    return startPhase;
+  `);
+  const state: any = { phase: 'lines', cycle: { id: 'old', epoch: '7', evidenceEpoch: '9', recognitionPolicy: 'receipt-source-v1:off' } };
+  let interrupt = true;
+  const deps = {
+    budget: { check() {} }, readCycle: async () => ({ ...state.cycle }),
+    readCursor: async () => null, readOpenCursor: async () => null,
+    parseSweepCursor, cycleStillValid, cursorUsableAt,
+    writeCursor: async () => {}, writeOpenCursor: async () => {}, writeFullRunRequested: async () => {},
+    writeCycle: async (cycle: unknown) => { state.cycle = cycle; if (interrupt) throw new Error('interruption after persisted cycle'); },
+    writePhase: async (phase: string) => { state.phase = phase; },
+  };
+  await assert.rejects(initialize(state, deps), /interruption/);
+  interrupt = false;
+  assert.equal(await initialize(state, deps), 'open-issues', 'restart survives a crash after the new cycle is durable');
 });

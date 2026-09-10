@@ -10,9 +10,13 @@ Recognition still requires existing receipt evidence and exact cents. Shared Exp
 
 The saved sweep cycle records its recognition policy. A changed policy restarts continuation from a fresh cycle; card selection and retries reject mismatched policy certification. Legacy cycle records without a policy represent the prior default-off behavior.
 
+Every cycle recording a policy must complete before retries, including a same-policy cycle restarted by changed evidence. Pending cards remain pending during that delay. This conservative replay gate prevents an old claimed snapshot from bypassing a fresh review.
+
 ## Rollout and acceptance
 
 Deploy with the flag off. Read the protected `receipt-evidence-diagnostic` endpoint using explicit canonical bank UUIDs and candidate QBO IDs (at most ten each). Verify current raw descriptors, source of record, account, statement associations and receipt-bearing Expense evidence. Native CSV fixtures and matching filenames alone do not establish live associations.
+
+The diagnostic deliberately supports the known UUID bank-line identifiers only, not a general legacy-ID inventory. Canonical statement ingestion mints lowercase UUIDs; UUID inputs are normalized to that form. Unsupported legacy CUID identifiers are rejected rather than enumerated or guessed.
 
 Keep purchaser cards disabled while enabling the flag, wait for the new deployment, and request a fresh full sweep. Verify the first twenty review outcomes individually before releasing cards. Duplicate financial records, uncertain source identity, generic merchant candidates, and parked multi-document inputs remain internal review cases. No historical receipt replay is part of this change.
 
