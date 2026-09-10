@@ -11,6 +11,7 @@ import {
     type ReconcileAmbiguousGroup,
     type ReconcilePairedGroup,
 } from "@/lib/bank-ledger";
+import { guardAndLinkObservation, lockBankLineIdentity, toExpectedSnapshot, type GuardedReconcileLink } from "@/lib/bank-reconcile-guard";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -137,10 +138,10 @@ export interface PersistedReconciliation {
  * `remaining` rather than attempted. Defaults to unbounded so any other
  * caller/test that doesn't pass it keeps running every chunk in one call.
  */
-export async function persistLinksInChunks(
-    links: ReconcileLink[],
+export async function persistLinksInChunks<L extends ReconcileLink>(
+    links: L[],
     chunkSize: number,
-    runChunk: (chunk: ReconcileLink[], chunkIndex: number) => Promise<{ linked: string[]; exceptions: ReconcileExceptionResult[] }>,
+    runChunk: (chunk: L[], chunkIndex: number) => Promise<{ linked: string[]; exceptions: ReconcileExceptionResult[] }>,
     maxChunks: number = Infinity,
     /**
      * `deadlineAt` is an ABSOLUTE epoch-ms instant this loop must not start a
@@ -214,7 +215,8 @@ export interface BankLedgerReconcileHandlerDependencies {
     findCandidateBankLines(account: string | null, since: string): Promise<ReconcileBankLine[]>;
 
     /** Writes links in bounded chunks, up to RECONCILE_MAX_CHUNKS_PER_INVOCATION per call (see the module comment); a per-link unique-index conflict is caught and reported as an exception, a whole-chunk failure is reported as a chunk error, and any links past the per-invocation cap are reported in `remaining` — none of these fail the whole run. */
-    persistLinks(links: ReconcileLink[], deadlineAt?: number): Promise<PersistedReconciliation>;
+    /** Links arrive enriched with the exact match-key snapshots the planner saw (src/lib/bank-reconcile-guard.ts); the real adapter re-verifies both rows under lock and refuses a stale plan without linking. */
+    persistLinks(links: GuardedReconcileLink[], deadlineAt?: number): Promise<PersistedReconciliation>;
 }
 
 function ambiguousForResponse(ambiguous: ReconcileAmbiguousGroup[]) {
@@ -292,7 +294,18 @@ export function createBankLedgerReconcileHandlers(dependencies: BankLedgerReconc
             };
         }
 
-        const result = await dependencies.persistLinks(proposed, deadlineAt);
+        // Enrich each proposed link with the EXACT rows the planner read, so
+        // persistence can refuse a link whose inputs moved in between (a source
+        // refresh, a restatement, a descriptor rewrite). The pure planner and
+        // its outputs are untouched; this is an additional optional shape.
+        const observationById = new Map(observations.map(o => [o.id, o]));
+        const bankLineById = new Map(bankLines.map(l => [l.id, l]));
+        const enriched: GuardedReconcileLink[] = proposed.map(link => ({
+            ...link,
+            expectedObservation: toExpectedSnapshot(observationById.get(link.observationId)),
+            expectedBankLine: toExpectedSnapshot(bankLineById.get(link.bankLineId)),
+        }));
+        const result = await dependencies.persistLinks(enriched, deadlineAt);
         return {
             proposed: proposed.length,
             linked: result.linked.length,
@@ -439,22 +452,27 @@ const handlers = createBankLedgerReconcileHandlers({
             const chunkExceptions: ReconcileExceptionResult[] = [];
 
             await prisma.$transaction(async tx => {
+                // Once per chunk, never per link: serializes this chunk against
+                // every other bank-line identity writer (ingest, descriptor
+                // refresh, source refresh) so a row cannot move between the
+                // guard's re-read and the CAS below.
+                await lockBankLineIdentity(tx);
                 for (let i = 0; i < chunk.length; i++) {
                     const link = chunk[i];
                     const savepoint = `bank_ledger_reconcile_${chunkIndex}_${i}`;
                     await tx.$executeRawUnsafe(`SAVEPOINT "${savepoint}"`);
                     try {
-                        // Guarded on bankLineId: null so a concurrent reconcile
-                        // run can't double-claim the same observation between
-                        // planning and this write.
-                        const result = await tx.bankLineObservation.updateMany({
-                            where: { id: link.observationId, bankLineId: null },
-                            data: { bankLineId: link.bankLineId },
-                        });
-                        if (result.count === 0) {
+                        // Locks BOTH rows FOR UPDATE, re-verifies them against
+                        // the planner's snapshots and the match rule, confirms
+                        // the observation is still unlinked and the candidate
+                        // still has no QBO observation, then CASes the link.
+                        // A plan whose inputs moved is reported as
+                        // "stale-reconcile-plan" and is NOT counted as linked.
+                        const guard = await guardAndLinkObservation(tx, link);
+                        if (!guard.ok) {
                             await tx.$executeRawUnsafe(`ROLLBACK TO SAVEPOINT "${savepoint}"`);
                             await tx.$executeRawUnsafe(`RELEASE SAVEPOINT "${savepoint}"`);
-                            chunkExceptions.push({ observationId: link.observationId, bankLineId: link.bankLineId, reason: "observation-already-linked" });
+                            chunkExceptions.push({ observationId: link.observationId, bankLineId: link.bankLineId, reason: guard.reason });
                             continue;
                         }
                         await tx.$executeRawUnsafe(`RELEASE SAVEPOINT "${savepoint}"`);

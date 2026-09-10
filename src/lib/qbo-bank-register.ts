@@ -242,6 +242,7 @@ export async function fetchBankRegister(
     getTokens: () => Promise<QBTokens>,
     startDate: string,
     endDate: string,
+    options: { fresh?: boolean } = {},
 ): Promise<BankRegisterResult> {
     // Regex + calendar round-trip: "2026-02-30" normalizes under Date.parse
     // and must not slip through as a valid date (Codex r2).
@@ -259,7 +260,8 @@ export async function fetchBankRegister(
 
     const accountId = bankAccountId();
     const cacheKey = `${accountId}:${startDate}:${endDate}`;
-    const cached = registerCache.get(cacheKey);
+    // Reviewed source refresh must not inherit an older UI/pull snapshot.
+    const cached = options.fresh ? undefined : registerCache.get(cacheKey);
     if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.result;
     if (Date.now() - lastFailureAt < FAILURE_COOLDOWN_MS) {
         // Outage cooldown applies with OR without a cached copy — a cold
@@ -268,7 +270,7 @@ export async function fetchBankRegister(
         throw new Error("QBO recently failed — cooling down");
     }
 
-    const running = inFlight.get(cacheKey);
+    const running = options.fresh ? undefined : inFlight.get(cacheKey);
     if (running) return running;
 
     const request = (async (): Promise<BankRegisterResult> => {
@@ -319,7 +321,7 @@ export async function fetchBankRegister(
                 startDate,
                 endDate,
             };
-            registerCache.set(cacheKey, { result, at: Date.now() });
+            if (!options.fresh) registerCache.set(cacheKey, { result, at: Date.now() });
             return result;
         } catch (error) {
             lastFailureAt = Date.now();
@@ -327,10 +329,10 @@ export async function fetchBankRegister(
             if (cached) return { ...cached.result, stale: true };
             throw error;
         } finally {
-            inFlight.delete(cacheKey);
+            if (!options.fresh) inFlight.delete(cacheKey);
         }
     })();
-    inFlight.set(cacheKey, request);
+    if (!options.fresh) inFlight.set(cacheKey, request);
     return request;
 }
 
