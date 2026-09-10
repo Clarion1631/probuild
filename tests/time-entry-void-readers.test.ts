@@ -9,10 +9,10 @@ const root = path.resolve(__dirname, "../src");
 // must never be reused as operational totals. Unique-ID reads likewise retain
 // source for ownership, immutable-history replay and guarded mutation checks.
 const retained: Record<string, string> = {
-    "lib/actions.ts:3267": "estimate-item deletion retains historical source evidence",
-    "lib/actions.ts:5483": "estimate deletion retains historical source evidence",
+    "lib/actions.ts:3271": "estimate-item deletion retains historical source evidence",
+    "lib/actions.ts:5487": "estimate deletion retains historical source evidence",
     "lib/payroll-parent-delete.ts:96": "parent deletion refuses any retained source row",
-    "lib/actions.ts:3661": "structural deletion must see retained historical evidence",
+    "lib/actions.ts:3665": "structural deletion must see retained historical evidence",
     "lib/time-expense-actions.ts:254": "bulk deletion authorization reads original ownership",
     "lib/time-expense-actions.ts:281": "bulk deletion rechecks ownership under row locks",
     "lib/time-expense-core.ts:420": "reassignment authorization reads original ownership",
