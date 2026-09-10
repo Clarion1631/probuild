@@ -24,7 +24,9 @@ function harness(pending = false) {
     });
     vm.runInContext(readFileSync("docs/apps-script/runReceiptAutomation.gs", "utf8"), context);
     vm.runInContext(readFileSync("docs/apps-script/sendToQBOviaAPI.gs", "utf8"), context);
-    Object.assign(context, { getState: () => structuredClone(persisted),
+    // receiptWriterMode_ lives in receiptV2Dispatch.gs (deployed alongside, not in this repo).
+    // The scanner never falls back to legacy when it is missing, so the harness must supply it.
+    Object.assign(context, { receiptWriterMode_: () => "legacy", getState: () => structuredClone(persisted),
         setState: (_file: unknown, state: unknown) => { persisted = structuredClone(state); },
         sendToQBO: () => { effects.emails++; }, cleanMoney: () => 0,
         reportStageBeacon_: (_file: unknown, stage: string, status: string, reason: string) => {

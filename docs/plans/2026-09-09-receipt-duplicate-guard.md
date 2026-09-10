@@ -185,3 +185,23 @@ for the next park. Alerts distinguish unresolved outcomes from query visibility.
 - Targeted `codex-peer-review` completed two blind-debate rounds; both accepted
   findings were fixed and independently verified, with no new or contested issues.
 - No live QBO/DB operations, merge, or deployment were performed for this follow-up.
+
+## Installed writer-mode compatibility
+
+Fresh read-only pulls of both GTR Apps Script projects on September 9 matched
+the complete September 7 snapshots. The installed receipt scanner already has
+legacy/v2/paused dispatch controls. The companion now preserves its legacy-only
+mail-quota check and routes v2 or paused files before any legacy parse or write.
+A forwarding failure cannot fall back to the legacy writer; a missing dispatch
+helper fails closed.
+
+- 49 focused hermetic tests passed, including all four duplicate fixtures and
+  five routing regressions. The routing test is included in `test:unit`.
+- Independent Astra and Codex CLI blind reviews found no actionable defect in
+  the four-file compatibility delta. Astra independently passed 13 tests; the
+  CLI test launch hit `spawn EPERM`, so its contribution was source review.
+- Apply the four companion deltas to a fresh complete installed-source snapshot.
+  Preserve `receiptV2Dispatch`, `receiptV2`, `receiptV2AppsScript`, other files,
+  Script Properties and triggers. Never push this partial docs directory as an
+  entire Apps Script project.
+- No merge, deployment, live business job or QBO transaction change was performed.

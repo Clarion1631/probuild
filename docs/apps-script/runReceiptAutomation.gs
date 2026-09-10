@@ -200,7 +200,7 @@ function runReceiptAutomation() {
     // it would push perfectly readable receipts into terminal give-up (manual entry for
     // Marge) over an outage that heals itself at midnight. Skipping the scan costs nothing:
     // the files keep, and the next run after the reset picks them up untouched.
-    if (MailApp.getRemainingDailyQuota() <= 0) {
+    if (receiptWriterMode_() === 'legacy' && MailApp.getRemainingDailyQuota() <= 0) {
       Logger.log(" > [SKIP] Daily mail quota is exhausted — pausing the scan until it resets.");
       return;
     }
@@ -266,6 +266,16 @@ function processFilesInIterator(fileIterator, ctx, archive, needsReview) {
  * CORE LOGIC
  */
 function processSingleFile(file, ctx, archive, needsReview) {
+  // Gate before any legacy parse, rename, API send, email fallback or archive.
+  // Each rejected v2 file stays for review; the scan continues with no v1 fallback.
+  const writerMode = receiptWriterMode_();
+  if (writerMode !== 'legacy') {
+    if (writerMode === 'v2') {
+      try { forwardReceiptFromScanV2_(file, ctx); }
+      catch (error) { Logger.log('[V2 REVIEW] forwarding failed: '+String(error.message || error)); }
+    }
+    return;
+  }
   const originalName = file.getName();
   Logger.log("Processing: " + originalName + " [" + ctx.projectName + (ctx.category ? " / " + ctx.category : "") + "]");
 
