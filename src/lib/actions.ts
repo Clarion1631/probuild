@@ -2930,6 +2930,9 @@ export async function getInvoiceForPortal(id: string) {
             return {
                 ...invoice,
                 projectName: invoice.project?.name || null,
+                // Job site address — never the client's own address, which for a
+                // property manager is an office, not the property being billed.
+                projectLocation: invoice.project?.location?.trim() || null,
                 clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
                 clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
             };
@@ -2952,6 +2955,7 @@ export async function getInvoiceForPortal(id: string) {
         return {
             ...invoice,
             projectName: invoice.project?.name || null,
+            projectLocation: invoice.project?.location?.trim() || null,
             clientName: invoice.client?.name || invoice.project?.client?.name || "Client",
             clientEmail: invoice.client?.email || invoice.project?.client?.email || null,
         };

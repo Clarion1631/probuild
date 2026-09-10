@@ -546,6 +546,10 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
+    // Job site line: project.location only, trimmed — a blank location renders no line
+    // at all (never a bare "Job site:"). Same rule as buildMilestoneRequestEmail.
+    const jobSite = (invoice.project?.location || "").trim();
+
     const invoiceAdditionalEmail = invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null;
     const invoiceCc = buildCc(recipientEmail, invoiceAdditionalEmail);
     const emailResult = await sendNotification(
@@ -564,6 +568,7 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
                     ${companyName} has sent you an invoice for <strong>${formatCurrency(invoice.totalAmount)}</strong>.
                     Please click the button below to view the details and make a payment.
                 </p>
+                ${jobSite ? `<p style="color: #666; font-size: 13px; margin: 8px 0 0;">Job site: ${escapeHtml(jobSite)}</p>` : ""}
                 <div style="text-align: center; margin: 32px 0;">
                     <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
                         View & Pay Invoice
@@ -715,6 +720,10 @@ export function buildMilestoneRequestEmail(input: {
     companyName: string;
     clientName: string | null | undefined;
     projectName: string | null | undefined;
+    // Job site address (Project.location). Never the client's address — a property
+    // manager's office doesn't identify which building is being billed. Blank
+    // renders no line at all.
+    projectLocation?: string | null | undefined;
     invoiceCode: string;
     milestones: Array<{ name: string; amount: number }>;
     portalUrl: string;
@@ -723,6 +732,7 @@ export function buildMilestoneRequestEmail(input: {
     const total = input.milestones.reduce((sum, m) => sum + m.amount, 0);
     const single = input.milestones.length === 1;
     const projectName = input.projectName || "project";
+    const jobSite = (input.projectLocation || "").trim();
     const milestoneRows = input.milestones.map(m => `
                     <tr>
                         <td style="padding: 10px 0; color: #333; border-bottom: 1px solid #f0f0f0;">${escapeHtml(m.name)}</td>
@@ -745,6 +755,7 @@ export function buildMilestoneRequestEmail(input: {
                 <p style="color: #666; line-height: 1.6;">
                     ${company} is requesting ${single ? "a progress payment" : "payment"} for your ${escapeHtml(projectName)}:
                 </p>
+                ${jobSite ? `<p style="color: #666; font-size: 13px; margin: 0;">Job site: ${escapeHtml(jobSite)}</p>` : ""}
                 <table style="width: 100%; border-collapse: collapse; margin: 8px 0 0;">
                     ${milestoneRows}
                 </table>
@@ -779,7 +790,7 @@ async function sendMilestoneRequestEmail(
         code: string;
         clientId: string | null;
         client: { name: string | null; email: string | null; additionalEmail: string | null } | null;
-        project: { name: string; clientId: string | null; client: { additionalEmail: string | null } | null } | null;
+        project: { name: string; location: string | null; clientId: string | null; client: { additionalEmail: string | null } | null } | null;
     },
     milestones: Array<{ id: string; name: string; amount: number }>,
     recipient: string,
@@ -802,6 +813,7 @@ async function sendMilestoneRequestEmail(
         companyName,
         clientName: invoice.client?.name,
         projectName: invoice.project?.name,
+        projectLocation: invoice.project?.location,
         invoiceCode: invoice.code,
         milestones,
         portalUrl,

@@ -89,6 +89,46 @@ test.describe("Milestone payment request email (composition)", () => {
         // Header injection requires CRLF — the subject must contain neither.
         expect(subject).not.toMatch(/[\r\n]/);
     });
+
+    test("shows the job site address, and no empty label when there isn't one", () => {
+        const withSite = buildMilestoneRequestEmail({
+            companyName: "GTR",
+            clientName: "Dixie Berg",
+            projectName: "Berg ADU",
+            projectLocation: "415 NE 4th Ave, Camas, WA 98607, USA",
+            invoiceCode: "INV-00177",
+            milestones: [{ name: "Drywall Complete", amount: 10000 }],
+            portalUrl: "https://app.example.com/portal/invoices/inv1?milestone=ms1",
+        }).html;
+        expect(withSite).toContain("Job site: 415 NE 4th Ave, Camas, WA 98607, USA");
+
+        // Blank/whitespace/absent location renders nothing — never a bare "Job site:".
+        for (const projectLocation of [undefined, null, "", "   "]) {
+            const html = buildMilestoneRequestEmail({
+                companyName: "GTR",
+                clientName: "Dixie Berg",
+                projectName: "Berg ADU",
+                projectLocation,
+                invoiceCode: "INV-00177",
+                milestones: [{ name: "Drywall Complete", amount: 10000 }],
+                portalUrl: "https://app.example.com/portal/invoices/inv1?milestone=ms1",
+            }).html;
+            expect(html).not.toContain("Job site");
+        }
+
+        // The address is customer-controlled text like every other field here.
+        const evil = buildMilestoneRequestEmail({
+            companyName: "GTR",
+            clientName: "Dixie Berg",
+            projectName: "Berg ADU",
+            projectLocation: '<img src=x onerror=alert(1)>',
+            invoiceCode: "INV-00177",
+            milestones: [{ name: "Drywall Complete", amount: 10000 }],
+            portalUrl: "https://app.example.com/portal/invoices/inv1?milestone=ms1",
+        }).html;
+        expect(evil).not.toContain("<img src=x");
+        expect(evil).toContain("&lt;img src=x");
+    });
 });
 
 const FIX = {
