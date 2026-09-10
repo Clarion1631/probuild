@@ -1,3 +1,4 @@
+import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import {
     canonicalizeReasonCodes,
@@ -30,9 +31,18 @@ import {
  * (optimistic concurrency) — a version conflict retries the WHOLE evaluation
  * (re-read + re-decide), never just the write, so a decision is never applied
  * against a row it didn't actually see.
+ *
+ * Timestamps: `ReviewIssue.updatedAt` is a required DateTime with NO schema
+ * default and NO `@updatedAt` (deliberate — the schema is authoritative and
+ * the column is a manual responsibility). Every write in this module stamps
+ * it from the injected clock: creation MUST supply it (the production cron
+ * failed with "Argument updatedAt is missing" when it didn't), and every
+ * update MUST advance it because component fingerprints are derived from it
+ * and have to change whenever the issue changes. The write-data types below
+ * make both obligations compile-time errors rather than runtime surprises.
  */
 
-// ── Pure decision tree ───────────────────────────────────────────────────────
+// ── Pure decision tree ────────────────────────────────────────────────────────
 
 export interface ReviewIssueState {
     id: string;
@@ -142,17 +152,25 @@ export interface ReviewIssueRow {
     firstObservedAt: Date;
     clearedAt: Date | null;
     currentGeneration: number;
+    /** Manually maintained (schema has no `@updatedAt`) — see module header. */
+    updatedAt: Date;
 }
+
+/** Use the generated schema contract so mandatory columns cannot drift. */
+export type ReviewIssueCreateData = Prisma.ReviewIssueUncheckedCreateInput;
+
+/** The database does not automatically maintain this fingerprint timestamp. */
+export type ReviewIssueUpdateData = Prisma.ReviewIssueUpdateManyMutationInput & { updatedAt: Date };
 
 export interface ReviewIssueLifecycleClient {
     reviewIssue: {
         findUnique(args: {
             where: { targetType_targetKey: { targetType: string; targetKey: string } } | { id: string };
         }): Promise<ReviewIssueRow | null>;
-        create(args: { data: Record<string, unknown> }): Promise<ReviewIssueRow>;
+        create(args: { data: ReviewIssueCreateData }): Promise<ReviewIssueRow>;
         updateMany(args: {
             where: { id: string; version: number } & Record<string, unknown>;
-            data: Record<string, unknown>;
+            data: ReviewIssueUpdateData;
         }): Promise<{ count: number }>;
     };
     reviewAlertEpisode: {
@@ -253,6 +271,9 @@ export async function evaluateReviewIssue(
         });
         const existing = existingRow ? toState(existingRow) : null;
         const decision = decideLifecycle(existing, codesForAttempt);
+        // One stamp per attempt so every column written in this transaction
+        // (firstObservedAt / clearedAt / updatedAt) carries the same instant.
+        const stamp = now();
 
         let displayOnlyWrite = false;
         try {
@@ -276,7 +297,7 @@ export async function evaluateReviewIssue(
                         if (existing!.displayDetails === displayDetailsJson) return; // genuinely nothing changed — no write at all
                         const updated = await tx.reviewIssue.updateMany({
                             where: { id: existing!.id, version: existing!.version },
-                            data: { displayDetails: displayDetailsJson, version: { increment: 1 } },
+                            data: { displayDetails: displayDetailsJson, updatedAt: stamp, version: { increment: 1 } },
                         });
                         if (updated.count === 0) throw new VersionConflict();
                         displayOnlyWrite = true;
@@ -287,9 +308,10 @@ export async function evaluateReviewIssue(
                         const updated = await tx.reviewIssue.updateMany({
                             where: { id: existing!.id, version: existing!.version },
                             data: {
-                                clearedAt: now(),
+                                clearedAt: stamp,
                                 acknowledgedCodes: "[]",
                                 acknowledgedAt: null,
+                                updatedAt: stamp,
                                 version: { increment: 1 },
                             },
                         });
@@ -312,10 +334,14 @@ export async function evaluateReviewIssue(
                                     reasonHash: decision.reasonHash,
                                     displayDetails: displayDetailsJson,
                                     acknowledgedCodes: "[]",
-                                    firstObservedAt: now(),
+                                    firstObservedAt: stamp,
                                     currentGeneration: decision.openGeneration!,
                                     version: 1,
-                                },
+                                    // Required by the schema (no default, no
+                                    // @updatedAt) — omitting it is what broke
+                                    // the receipt-requests cron in production.
+                                    updatedAt: stamp,
+                                } satisfies ReviewIssueCreateData,
                             });
                         } catch (error) {
                             // Finding 6: two concurrent evaluators can both
@@ -351,8 +377,9 @@ export async function evaluateReviewIssue(
                                 reasonCodes: encodeReasonCodes(decision.canonicalCodes),
                                 reasonHash: decision.reasonHash,
                                 displayDetails: displayDetailsJson,
-                                firstObservedAt: now(),
+                                firstObservedAt: stamp,
                                 currentGeneration: decision.openGeneration!,
+                                updatedAt: stamp,
                                 version: { increment: 1 },
                             },
                         });
@@ -377,6 +404,7 @@ export async function evaluateReviewIssue(
                                 reasonCodes: encodeReasonCodes(decision.canonicalCodes),
                                 reasonHash: decision.reasonHash,
                                 displayDetails: displayDetailsJson,
+                                updatedAt: stamp,
                                 version: { increment: 1 },
                             },
                         });
@@ -392,6 +420,7 @@ export async function evaluateReviewIssue(
                                 reasonHash: decision.reasonHash,
                                 displayDetails: displayDetailsJson,
                                 currentGeneration: decision.openGeneration!,
+                                updatedAt: stamp,
                                 version: { increment: 1 },
                             },
                         });
@@ -441,7 +470,7 @@ export async function evaluateReviewIssue(
     );
 }
 
-// ── Mark reviewed ─────────────────────────────────────────────────────────────
+// ── Mark reviewed ────────────────────────────────────────────────────────────
 
 export class StaleMarkReviewedError extends Error {
     constructor() {
@@ -488,13 +517,15 @@ export async function markReviewed(
     const currentCodes = decodeReasonCodes(row.reasonCodes);
     const existingAck = decodeReasonCodes(row.acknowledgedCodes);
     const nextAck = canonicalizeReasonCodes([...existingAck, ...currentCodes]);
+    const stamp = now();
 
     const updated = await client.$transaction(async tx => {
         const result = await tx.reviewIssue.updateMany({
             where: { id: input.id, version: input.version, reasonHash: input.reasonHash, clearedAt: null },
             data: {
                 acknowledgedCodes: encodeReasonCodes(nextAck),
-                acknowledgedAt: now(),
+                acknowledgedAt: stamp,
+                updatedAt: stamp,
                 version: { increment: 1 },
             },
         });

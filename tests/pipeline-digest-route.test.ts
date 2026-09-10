@@ -15,6 +15,7 @@ import {
     type PipelineDigestDependencies,
 } from "../src/app/api/cron/pipeline-digest/route";
 import type { PipelineHealth } from "../src/lib/pipeline-health";
+import { loadReceiptOutcomeAudit } from "../src/lib/receipt-outcome-audit";
 
 const HEALTH: PipelineHealth = {
     ok: true,
@@ -42,6 +43,7 @@ const HEALTH: PipelineHealth = {
 function handlers(overrides: Partial<PipelineDigestDependencies> = {}) {
     return createPipelineDigestHandlers({
         getHealth: overrides.getHealth ?? (async () => HEALTH),
+        getReceiptOutcomes: overrides.getReceiptOutcomes,
         sendEmail: overrides.sendEmail ?? (async () => ({ success: true })),
         postChat: overrides.postChat ?? (async () => ({ sent: true })),
         getChatWebhook: overrides.getChatWebhook ?? (() => undefined),
@@ -74,6 +76,60 @@ test("a delivered digest returns 200 with the health payload", async () => {
         const body = await response.json();
         assert.equal(body.emailed, true);
         assert.equal(body.ok, true);
+    });
+});
+
+test("digest carries outcome evidence without turning operational success into business completion", async () => {
+    await withCronSecret(async () => {
+        let deliveredText = "";
+        const { GET } = handlers({
+            getReceiptOutcomes: () => loadReceiptOutcomeAudit({
+                readSnapshot: async () => ({ issues: [], cards: [], artifacts: [] }),
+                now: () => new Date("2026-09-09T14:00:00Z"),
+            }),
+            sendEmail: async (_to, _subject, _html, text) => {
+                deliveredText = text;
+                return { success: true };
+            },
+        });
+        const response = await GET(cronRequest());
+        const body = await response.json();
+        assert.equal(body.ok, true);
+        assert.equal(body.receiptOutcomes.counts.eligibleRequests, null);
+        assert.equal(body.receiptOutcomes.counts.filedInProbuild, 0);
+        assert.match(deliveredText, /Receipt follow-up/);
+        assert.match(deliveredText, /Return confirmation saved: unknown/);
+    });
+});
+
+test("outcome reader failure still delivers an explicit unavailable report", async () => {
+    await withCronSecret(async () => {
+        let deliveredText = "";
+        const { GET } = handlers({
+            getReceiptOutcomes: async () => { throw new Error("private database details"); },
+            sendEmail: async (_to, _subject, _html, text) => {
+                deliveredText = text;
+                return { success: true };
+            },
+        });
+        const response = await GET(cronRequest());
+        const body = await response.json();
+        assert.equal(body.receiptOutcomes.collectionStatus, "unavailable");
+        assert.equal(body.receiptOutcomes.counts.filedInProbuild, null);
+        assert.match(deliveredText, /UNAVAILABLE/);
+        assert.ok(!deliveredText.includes("private database"));
+    });
+});
+
+test("unauthorized digest does not collect outcome evidence", async () => {
+    await withCronSecret(async () => {
+        let reads = 0;
+        const { GET } = handlers({
+            getReceiptOutcomes: async () => { reads++; throw new Error("must not run"); },
+        });
+        const response = await GET(new Request("https://example.test/api/cron/pipeline-digest"));
+        assert.equal(response.status, 401);
+        assert.equal(reads, 0);
     });
 });
 

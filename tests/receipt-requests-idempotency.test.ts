@@ -62,6 +62,7 @@ function inMemoryLifecycle() {
                     acknowledgedCodes: String(data.acknowledgedCodes ?? "[]"),
                     acknowledgedAt: null,
                     firstObservedAt: data.firstObservedAt as Date,
+                    updatedAt: data.updatedAt as Date,
                     clearedAt: null,
                     currentGeneration: Number(data.currentGeneration),
                 };

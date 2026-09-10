@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -27,7 +28,7 @@ function state(overrides: Partial<ReviewIssueState> = {}): ReviewIssueState {
     };
 }
 
-// ── Step 1: reason set empty ──────────────────────────────────────────────────
+// ── Step 1: reason set empty ─────────────────────────────────────────────────
 
 test("step 1: empty set + no existing issue → noop (nothing to create or clear)", () => {
     const decision = decideLifecycle(null, []);
@@ -54,7 +55,7 @@ test("step 1 takes priority over every other step regardless of ack/hash state",
     assert.equal(decision.step, 1);
 });
 
-// ── Step 2: no issue exists ────────────────────────────────────────────────────
+// ── Step 2: no issue exists ──────────────────────────────────────────────────
 
 test("step 2: non-empty set + no existing issue → create at generation 1", () => {
     const decision = decideLifecycle(null, ["NO_RECEIPT"]);
@@ -63,7 +64,7 @@ test("step 2: non-empty set + no existing issue → create at generation 1", () 
     assert.equal(decision.openGeneration, 1);
 });
 
-// ── Step 3: cleared issue, set non-empty → reopen ─────────────────────────────
+// ── Step 3: cleared issue, set non-empty → reopen ────────────────────────────
 
 test("step 3: cleared issue regresses → reopen at currentGeneration + 1", () => {
     const existing = state({ clearedAt: new Date("2026-01-01"), currentGeneration: 3 });
@@ -86,7 +87,7 @@ test("step 3 takes priority over step 4 even if the new codes happen to be a sub
     assert.equal(decision.action, "reopen");
 });
 
-// ── Step 4: acknowledged superset → suppress ──────────────────────────────────
+// ── Step 4: acknowledged superset → suppress ─────────────────────────────────
 
 test("step 4: acknowledged codes are an exact match → suppress", () => {
     const existing = state({ acknowledgedCodes: ["NO_RECEIPT"], reasonHash: "stale-hash" });
@@ -116,7 +117,7 @@ test("step 4 takes priority over step 5/6 even when the hash also changed", () =
     assert.equal(decision.step, 4);
 });
 
-// ── Step 5: same hash → touch only ────────────────────────────────────────────
+// ── Step 5: same hash → touch only ───────────────────────────────────────────
 
 test("step 5: identical reason set as currently stored → touch, no new episode", () => {
     const codes: ReasonCode[] = ["NO_RECEIPT", "NO_JOB_COST"];
@@ -132,7 +133,7 @@ test("step 5 is order-independent — codes supplied in a different order still 
     assert.equal(decision.action, "touch");
 });
 
-// ── Step 6: changed hash → supersede ──────────────────────────────────────────
+// ── Step 6: changed hash → supersede ─────────────────────────────────────────
 
 test("step 6: hash changed, not fully acknowledged → supersede, generation + 1", () => {
     const existing = state({ reasonHash: "old-hash", currentGeneration: 2, acknowledgedCodes: [] });
@@ -191,6 +192,15 @@ interface FakeEpisode extends Record<string, unknown> {
     status: string;
 }
 
+/** Columns the real schema requires with NO default — the fake rejects a
+ * create that omits any of them, the same way Prisma does at runtime
+ * ("Argument `updatedAt` is missing"). This is the production failure the
+ * receipt-requests cron hit; the fake must not paper over it. */
+const REQUIRED_CREATE_COLUMNS = Prisma.dmmf.datamodel.models
+    .find(model => model.name === "ReviewIssue")!.fields
+    .filter(field => field.kind !== "object" && field.isRequired && !field.hasDefaultValue && !field.isUpdatedAt)
+    .map(field => field.name);
+
 function createFakeClient() {
     const issues = new Map<string, ReviewIssueRow & Record<string, unknown>>();
     const episodes: FakeEpisode[] = [];
@@ -216,6 +226,12 @@ function createFakeClient() {
                 return null;
             },
             async create(args) {
+                const data = args.data as Record<string, unknown>;
+                for (const column of REQUIRED_CREATE_COLUMNS) {
+                    if (data[column] === undefined) {
+                        throw new Error(`Argument \`${column}\` is missing.`);
+                    }
+                }
                 const id = `issue-${++issueSeq}`;
                 // Real Prisma defaults an omitted nullable column to SQL NULL
                 // (surfaced as `null`, not `undefined`) — match that here so
@@ -296,6 +312,12 @@ function createFakeClient() {
     };
 }
 
+/** Deterministic clock: every call returns a strictly later instant. */
+function tickingClock(startMs = Date.UTC(2026, 8, 9, 12, 0, 0)) {
+    let t = startMs;
+    return () => new Date((t += 1000));
+}
+
 test("evaluateReviewIssue: create writes a PENDING generation-1 episode", async () => {
     const { client, issues, episodes } = createFakeClient();
     await evaluateReviewIssue("qbo-purchase", "p-1", ["NO_RECEIPT"], { amountCents: -100 }, { client });
@@ -307,6 +329,68 @@ test("evaluateReviewIssue: create writes a PENDING generation-1 episode", async 
     assert.equal(episodes.length, 1);
     assert.equal(episodes[0].generation, 1);
     assert.equal(episodes[0].status, "PENDING");
+});
+
+// ── updatedAt is a manual responsibility (no @updatedAt in the schema) ───────
+
+test("evaluateReviewIssue: create stamps the schema-required updatedAt from the injected clock (production cron regression)", async () => {
+    const { client, issues } = createFakeClient();
+    const fixed = new Date("2026-09-09T12:00:00.000Z");
+
+    // The fake, like Prisma, throws "Argument `updatedAt` is missing" when the
+    // column is omitted — so simply completing the create is the regression.
+    await evaluateReviewIssue("qbo-purchase", "p-1", ["NO_RECEIPT"], null, { client, now: () => fixed });
+
+    const issue = [...issues.values()][0];
+    assert.ok(issue.updatedAt instanceof Date, "updatedAt must be written explicitly on create");
+    assert.equal(issue.updatedAt.getTime(), fixed.getTime(), "updatedAt comes from the injected clock, not Date.now()");
+    assert.equal(issue.firstObservedAt.getTime(), fixed.getTime(), "same instant as firstObservedAt in one transaction");
+});
+
+test("evaluateReviewIssue: every lifecycle write advances updatedAt (component fingerprints derive from it)", async () => {
+    const { client, issues } = createFakeClient();
+    const now = tickingClock();
+    const issueRow = () => [...issues.values()][0];
+    let last: number;
+    const expectAdvanced = (label: string) => {
+        const next = issueRow().updatedAt.getTime();
+        assert.ok(next > last, `${label}: updatedAt must advance (was ${last}, now ${next})`);
+        last = next;
+    };
+
+    await evaluateReviewIssue("qbo-purchase", "p-1", ["NO_RECEIPT"], { amountCents: -100 }, { client, now });
+    last = issueRow().updatedAt.getTime();
+
+    // touch (step 5) with unchanged codes AND unchanged display: no write at
+    // all, so updatedAt must NOT move — a fingerprint change here would be a lie.
+    await evaluateReviewIssue("qbo-purchase", "p-1", ["NO_RECEIPT"], { amountCents: -100 }, { client, now });
+    assert.equal(issueRow().updatedAt.getTime(), last, "a genuine no-op leaves updatedAt alone");
+
+    // touch (step 5) with a display-only change
+    await evaluateReviewIssue("qbo-purchase", "p-1", ["NO_RECEIPT"], { amountCents: -150 }, { client, now });
+    expectAdvanced("touch/display-only");
+
+    // supersede (step 6)
+    await evaluateReviewIssue("qbo-purchase", "p-1", ["AMOUNT_MISMATCH"], null, { client, now });
+    expectAdvanced("supersede");
+
+    // markReviewed (ack)
+    const row = issueRow();
+    const ack = await markReviewed({ id: row.id, version: row.version, reasonHash: row.reasonHash }, client, now);
+    assert.deepEqual(ack, { ok: true });
+    expectAdvanced("markReviewed");
+
+    // suppress (step 4) — acknowledged set still covers the current codes
+    await evaluateReviewIssue("qbo-purchase", "p-1", ["AMOUNT_MISMATCH"], { note: "x" }, { client, now });
+    expectAdvanced("suppress");
+
+    // clear (step 1)
+    await evaluateReviewIssue("qbo-purchase", "p-1", [], null, { client, now });
+    expectAdvanced("clear");
+
+    // reopen (step 3)
+    await evaluateReviewIssue("qbo-purchase", "p-1", ["NO_JOB_COST"], null, { client, now });
+    expectAdvanced("reopen");
 });
 
 test("evaluateReviewIssue: rollout baseline mode opens a SUPPRESSED episode instead of PENDING", async () => {
@@ -436,7 +520,7 @@ test("markReviewed returns not-found for an unknown id", async () => {
     assert.deepEqual(result, { ok: false, reason: "not-found" });
 });
 
-// ── Finding 6: optimistic concurrency incomplete ────────────────────────────
+// ── Finding 6: optimistic concurrency incomplete ─────────────────────────────
 
 test("evaluateReviewIssue: a concurrent 'no issue' create (P2002) is retried, not thrown", async () => {
     const { client, issues, episodes, forceNextIssueCreateConflict } = createFakeClient();
