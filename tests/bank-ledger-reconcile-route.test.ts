@@ -169,7 +169,11 @@ test("bank-ledger reconcile: happy path", async t => {
         assert.equal(res.status, 200);
         assert.deepEqual(await res.json(), { ok: true, proposed: 1, linked: 1, exceptions: [], ambiguous: [], pairedByOrder: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 1);
-        assert.deepEqual(persistLinksCalls[0], [{ observationId: "obs1", bankLineId: "bl1" }]);
+        assert.deepEqual(persistLinksCalls[0].map(({ observationId, bankLineId }) => ({ observationId, bankLineId })), [{ observationId: "obs1", bankLineId: "bl1" }]);
+        const guarded = persistLinksCalls[0][0] as import("../src/lib/bank-reconcile-guard").GuardedReconcileLink;
+        assert.ok(guarded.expectedObservation);
+        assert.deepEqual(guarded.expectedObservation, guarded.expectedBankLine);
+        assert.deepEqual(Object.keys(guarded.expectedObservation).sort(), ["account", "amountCents", "checkNumber", "normalizedPayee", "postedDate"]);
     });
 
     await t.test("does not propose a link across different payees sharing account+date+amount", async () => {
@@ -249,7 +253,11 @@ test("bank-ledger reconcile: ambiguous groups (Codex round-3 defect 1)", async t
         assert.equal(body.linked, 1);
         assert.equal(body.ambiguous.length, 1);
         assert.equal(persistLinksCalls.length, 1);
-        assert.deepEqual(persistLinksCalls[0], [{ observationId: "obs1", bankLineId: "bl1" }]);
+        assert.deepEqual(persistLinksCalls[0].map(({ observationId, bankLineId }) => ({ observationId, bankLineId })), [{ observationId: "obs1", bankLineId: "bl1" }]);
+        const guarded = persistLinksCalls[0][0] as import("../src/lib/bank-reconcile-guard").GuardedReconcileLink;
+        assert.ok(guarded.expectedObservation);
+        assert.deepEqual(guarded.expectedObservation, guarded.expectedBankLine);
+        assert.deepEqual(Object.keys(guarded.expectedObservation).sort(), ["account", "amountCents", "checkNumber", "normalizedPayee", "postedDate"]);
     });
 });
 

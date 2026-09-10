@@ -297,6 +297,6 @@ test("review count deduplicates repeated targets and repeated unrepresented erro
 
 test("malformed review report sources stay unknown and do not throw", async () => {
     const report=await rvRun({issues:[],cards:[],artifacts:[]});
-    report.rows=null as unknown as unknown[];
+    (report as { rows: unknown }).rows = null;
     assert.equal(rvReview(formatReceiptOutcomeAudit(report)), 'unknown');
 });

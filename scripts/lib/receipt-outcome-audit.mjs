@@ -21,10 +21,27 @@ export const LIMITATIONS = Object.freeze([
   'retry counts resendQueuedAt only; error counts non-empty lastError only. Flags may overlap; counts are per target, not per card. No success rate is computed because no denominator is observed.',
   'A missing source array or malformed JSON makes dependent metrics null (unknown), never zero.',
   'Scheduler and pipeline health (GET /api/health/pipeline) is a separate, independent signal and is not consulted or inferred.',
+  'associations list only provider-verified request cards (card id, request id, thread, message, post time, item number, fingerprint) and the single accepted artifact (pdf id, created time). Card and artifact evidence carry separate absent / conflict / unavailable / verified statuses; malformed association data fails closed to conflict or unavailable and never changes a count.',
 ]);
 
 const isNonEmpty = (v) => typeof v === 'string' && v.trim().length > 0;
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+// The server derives this via the shared bridge helper; validate offline snapshots too.
+export function isReceiptRequestId(v) {
+  if (typeof v !== 'string') return false;
+  const m = /^receipt-req-([A-Za-z][A-Za-z0-9_-]*)-(\d{4}-\d{2}-\d{2})$/.exec(v);
+  if (!m) return false;
+  const t = Date.parse(m[2] + 'T00:00:00Z');
+  return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === m[2];
+}
+const ARTIFACT_CONFLICT_FLAGS = ['identity_conflict', 'duplicate_open_issue', 'artifact_conflict', 'artifact_pdf_conflict', 'artifact_pdf_mismatch', 'artifact_without_resolution', 'artifact_without_issue'];
+
+function isProviderPost(c, nowMs) {
+  const postTime = parseIso(c.postedAt);
+  const messageSpace = typeof c.messageName === 'string' ? /^spaces\/([^/]+)\/messages\/[^/]+$/.exec(c.messageName)?.[1] : null;
+  const threadSpace = typeof c.threadName === 'string' ? /^spaces\/([^/]+)\/threads\/[^/]+$/.exec(c.threadName)?.[1] : null;
+  return postTime !== null && postTime <= nowMs && !!messageSpace && messageSpace === threadSpace;
+}
 
 export function parseIso(v) {
   if (!isNonEmpty(v) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(v)) return null;
@@ -56,10 +73,7 @@ function evaluateTarget(targetKey, t, { nowMs, issuesUnknown, cardsUnknown, arti
 
   let hasPosted = false, hasInflight = false, hasPending = false;
   for (const c of t.cards) {
-    const postTime = parseIso(c.postedAt);
-    const messageSpace = typeof c.messageName === 'string' ? /^spaces\/([^/]+)\/messages\/[^/]+$/.exec(c.messageName)?.[1] : null;
-    const threadSpace = typeof c.threadName === 'string' ? /^spaces\/([^/]+)\/threads\/[^/]+$/.exec(c.threadName)?.[1] : null;
-    const posted = postTime !== null && postTime <= nowMs && messageSpace && messageSpace === threadSpace;
+    const posted = isProviderPost(c, nowMs);
     if (posted) hasPosted = true;
     else if (c.status === 'PENDING') hasPending = true;
     else {
@@ -121,6 +135,34 @@ function evaluateTarget(targetKey, t, { nowMs, issuesUnknown, cardsUnknown, arti
     if (issue && fo !== null && fo <= nowMs) elapsedMs = nowMs - fo; else flags.add('elapsed_unavailable');
   }
 
+  // Associations: evidence only, never a substitute for the counts above.
+  /** @type {'absent' | 'conflict' | 'unavailable' | 'verified'} */
+  let cardEvidence;
+  let assocCards = null;
+  if (cardsUnknown) cardEvidence = 'unavailable';
+  else {
+    const valid = [];
+    let conflict = false, unavailable = false;
+    for (const { card: c, item, bad, req } of t.cardItems) {
+      if (bad || req === 'bad') conflict = true;
+      else if (req === 'missing') unavailable = true;
+      else if (!isProviderPost(c, nowMs) && c.status !== 'PENDING') unavailable = true;
+      else if (isProviderPost(c, nowMs)) valid.push({ cardId: c.id, requestId: c.requestId, threadName: c.threadName, messageName: c.messageName, postedAt: c.postedAt, itemNumber: item.n, fingerprint: item.fingerprint });
+    }
+    if (conflict) { cardEvidence = 'conflict'; }
+    else if (unavailable) { cardEvidence = 'unavailable'; }
+    else { assocCards = valid.sort((a, b) => (a.cardId < b.cardId ? -1 : a.cardId > b.cardId ? 1 : 0)); cardEvidence = valid.length ? 'verified' : 'absent'; }
+  }
+  /** @type {'absent' | 'conflict' | 'unavailable' | 'verified'} */
+  let artifactEvidence;
+  let filedArtifactOut = null;
+  if (issuesUnknown || artifactsUnknown || (issue && issue.detailsBad)) artifactEvidence = 'unavailable';
+  else if (ARTIFACT_CONFLICT_FLAGS.some((f) => flags.has(f))) artifactEvidence = 'conflict';
+  else if (filed === true) { artifactEvidence = 'verified'; filedArtifactOut = { pdfId: filedArtifact.pdfId, createdAt: parseIso(filedArtifact.createdAt) === null || parseIso(filedArtifact.createdAt) > nowMs ? null : filedArtifact.createdAt }; }
+  else if (arts.length === 0) artifactEvidence = 'absent';
+  else artifactEvidence = 'conflict';
+  const associations = { cards: assocCards, cardEvidence, filedArtifact: filedArtifactOut, artifactEvidence };
+
   return {
     targetKey,
     issueId: issue ? issue.id : null,
@@ -133,6 +175,7 @@ function evaluateTarget(targetKey, t, { nowMs, issuesUnknown, cardsUnknown, arti
     bridgeAck: null,
     elapsedMs,
     flags: [...flags].sort(),
+    associations,
   };
 }
 
@@ -156,7 +199,7 @@ export function auditReceiptOutcomes(snapshot, now) {
   const targets = new Map();
   const tgt = (key) => {
     let t = targets.get(key);
-    if (!t) { t = { issues: [], cards: [], artifacts: [], flags: new Set(), inCohort: false }; targets.set(key, t); }
+    if (!t) { t = { issues: [], cards: [], artifacts: [], cardItems: [], flags: new Set(), inCohort: false }; targets.set(key, t); }
     return t;
   };
 
@@ -193,13 +236,19 @@ export function auditReceiptOutcomes(snapshot, now) {
     cardIds.add(c.id);
     const p = parseJson(c.itemsJson);
     if (!p.ok || !Array.isArray(p.value)) { addErr('card_items_malformed'); cardsUnknown = true; continue; }
-    const seen = new Set();
+    const seen = new Set(), seenN = new Set(), entries = [];
+    let assocBad = false;
     for (const item of p.value) {
       if (!isObj(item) || !isNonEmpty(item.targetKey)) { addErr('card_item_malformed'); cardsUnknown = true; continue; }
-      if (seen.has(item.targetKey)) continue;
+      if (!Number.isSafeInteger(item.n) || item.n < 1 || seenN.has(item.n) || item.fingerprint !== `pb-${item.targetKey}`) assocBad = true;
+      seenN.add(item.n);
+      if (seen.has(item.targetKey)) { assocBad = true; continue; }
       seen.add(item.targetKey);
       const t = tgt(item.targetKey); t.inCohort = true; t.cards.push(c);
+      entries.push({ t, item });
     }
+    const req = c.requestId == null ? 'missing' : isReceiptRequestId(c.requestId) ? 'ok' : 'bad';
+    for (const { t, item } of entries) t.cardItems.push({ card: c, item, bad: assocBad, req });
   }
 
   const artifactIds = new Map(), pdfOwner = new Map();
