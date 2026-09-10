@@ -15,16 +15,25 @@
  * internal notification's Signed At cell actually uses it, and that the client
  * email's Date cell reports the company's calendar day — still date-only, because
  * that email deliberately shows no clock time.
+ *
+ * A fourth thing, added after review: resolving that zone must never be able to
+ * fail the approval. The estimate's status is committed to "Approved" ~80 lines
+ * above the lookup, and getCachedCompanySettings() is an unstable_cache that often
+ * runs zero queries — so pairing it with a resolver that ALWAYS hits the database
+ * would turn a transient DB blip into an approval that is saved but never emails
+ * the client, never emails the team, and never files the signed PDF (that filing
+ * comes after both emails). The resolve is fail-soft; the last three tests pin it.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
-import path from "node:path";
 import { formatCompanyDateTime, DEFAULT_COMPANY_TIME_ZONE } from "../src/lib/tz-date";
 
 const PT = "America/Los_Angeles";
-const ACTIONS_PATH = path.join(process.cwd(), "src/lib/actions.ts");
+// Resolved from this file rather than process.cwd(), so the suite reads the same
+// actions.ts whichever directory the runner happens to be launched from.
+const ACTIONS_PATH = new URL("../src/lib/actions.ts", import.meta.url);
 
 // The exact instant from the EST-00514 report: 10:52:08 AM PDT on 2026-09-10.
 const EST_00514_SIGNED_AT = new Date("2026-09-10T17:52:08.000Z");
@@ -74,6 +83,65 @@ function renderClientDateCell(timeZone: string, instant: Date): string {
     assert.ok(expression, `client Date cell must render approvedAt inline: ${row.trim()}`);
     const render = new Function("approvedAt", "companyTimeZone", `return ${expression[1]};`);
     return withUtcProcessZone(() => render(instant, timeZone)) as string;
+}
+
+/**
+ * The one line in approveEstimate that resolves the zone shared by both emails.
+ */
+function zoneResolveRow(): string {
+    const rows = actionsSource()
+        .split("\n")
+        .filter((line) => /const \[settings, companyTimeZone\] = await Promise\.all\(/.test(line));
+    assert.equal(rows.length, 1, "expected exactly one companyTimeZone resolve in approveEstimate");
+    return rows[0];
+}
+
+/**
+ * Lift the SECOND element of that Promise.all — the resolve call plus whatever is
+ * chained onto it — straight out of the source, so the behavioural tests below run
+ * the SHIPPED expression instead of a copy of it. Quote-aware, so a bracket inside
+ * the warn message cannot truncate the scan.
+ */
+function resolveZoneExpression(): string {
+    const row = zoneResolveRow();
+    const start = row.indexOf("resolveCompanyTimeZone(");
+    assert.ok(start >= 0, `expected resolveCompanyTimeZone() in: ${row.trim()}`);
+    let depth = 0;
+    let quote: string | null = null;
+    for (let i = start; i < row.length; i++) {
+        const ch = row[i];
+        if (quote !== null) {
+            if (ch === "\\") i++;
+            else if (ch === quote) quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+        else if (ch === "(" || ch === "[" || ch === "{") depth++;
+        else if (ch === ")" || ch === "}") depth--;
+        else if (ch === "]") {
+            if (depth === 0) return row.slice(start, i);
+            depth--;
+        }
+    }
+    return assert.fail(`could not delimit the companyTimeZone expression in: ${row.trim()}`);
+}
+
+/**
+ * Evaluate that expression against a stubbed resolver and a stubbed default, so
+ * the fallback is proved by running it rather than by reading it.
+ */
+async function runResolveExpression(resolver: () => Promise<string>, fallback: string): Promise<unknown> {
+    const logged: unknown[][] = [];
+    const sink = (...args: unknown[]) => {
+        logged.push(args);
+    };
+    const factory = new Function(
+        "resolveCompanyTimeZone",
+        "DEFAULT_COMPANY_TIME_ZONE",
+        "console",
+        `return ${resolveZoneExpression()};`
+    );
+    return await factory(resolver, fallback, { warn: sink, error: sink, log: sink });
 }
 
 test("the EST-00514 instant renders as 10:52 AM Pacific, not the 5:52 PM UTC clock", () => {
@@ -190,10 +258,51 @@ test("the client Date cell passes a timeZone, and that zone is resolved from Com
     );
     // Resolved ONCE, above both emails, so the client's Date cell and the internal
     // Signed At cell can never disagree about which clock they are printing.
+    // Deliberately open-ended after the resolve call: it carries a fail-soft
+    // .catch(), pinned by the next test. What this pins is that there is exactly
+    // one resolve, taken alongside the settings read, feeding both emails.
     assert.ok(
-        /const \[settings, companyTimeZone\] = await Promise\.all\(\[getCachedCompanySettings\(\), resolveCompanyTimeZone\(\)\]\)/.test(
+        /const \[settings, companyTimeZone\] = await Promise\.all\(\[getCachedCompanySettings\(\), resolveCompanyTimeZone\(\)/.test(
             actionsSource()
         ),
         "approveEstimate must resolve companyTimeZone once via resolveCompanyTimeZone()"
+    );
+});
+
+test("the zone resolve is fail-soft, so a DB blip cannot strand an already-approved estimate", async () => {
+    const row = zoneResolveRow();
+    assert.ok(
+        /resolveCompanyTimeZone\(\)\s*\.catch\(/.test(row),
+        `resolveCompanyTimeZone() must carry a fail-soft .catch(): ${row.trim()}`
+    );
+    // getCachedCompanySettings() is an unstable_cache and can serve this with zero
+    // queries; the resolve always touches the database. A rejecting resolver must
+    // yield a usable zone rather than throw past the two emails and the PDF filing.
+    const resolved = await runResolveExpression(async () => {
+        throw new Error("db down");
+    }, DEFAULT_COMPANY_TIME_ZONE);
+    assert.equal(resolved, DEFAULT_COMPANY_TIME_ZONE);
+});
+
+test("the fallback is the shared default-zone constant, not a literal copy of it", async () => {
+    // A sentinel the source cannot have hard-coded: if the catch returned a zone
+    // string literal instead of the imported constant, this is what fails.
+    const sentinel = "Test/Sentinel_Zone";
+    assert.equal(
+        await runResolveExpression(async () => {
+            throw new Error("db down");
+        }, sentinel),
+        sentinel
+    );
+    assert.ok(
+        /import \{[^}]*DEFAULT_COMPANY_TIME_ZONE[^}]*\} from "\.\/company-timezone";/.test(actionsSource()),
+        "actions.ts must import DEFAULT_COMPANY_TIME_ZONE"
+    );
+});
+
+test("a successful resolve still wins — the fallback does not swallow the configured zone", async () => {
+    assert.equal(
+        await runResolveExpression(async () => "America/New_York", DEFAULT_COMPANY_TIME_ZONE),
+        "America/New_York"
     );
 });

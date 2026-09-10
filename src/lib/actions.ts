@@ -67,7 +67,7 @@ import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
-import { formatCompanyDateTime, resolveCompanyTimeZone } from "./company-timezone";
+import { DEFAULT_COMPANY_TIME_ZONE, formatCompanyDateTime, resolveCompanyTimeZone } from "./company-timezone";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
@@ -2605,7 +2605,7 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         entityName: `Estimate ${estimate?.code || estimateId}`,
     });
 
-    const [settings, companyTimeZone] = await Promise.all([getCachedCompanySettings(), resolveCompanyTimeZone()]); // one zone for both approval emails below
+    const [settings, companyTimeZone] = await Promise.all([getCachedCompanySettings(), resolveCompanyTimeZone().catch((e) => { console.warn("[approveEstimate] company time zone lookup failed, using default:", e); return DEFAULT_COMPANY_TIME_ZONE; })]); // one zone for both approval emails below; fail-soft because the approval is already committed above
     const companyName = settings.companyName || "Golden Touch Remodeling";
     const estimateCode = estimate?.code || estimateId;
     const projectName = estimate?.project?.name || estimate?.lead?.name || "your project";
