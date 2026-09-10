@@ -546,6 +546,10 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
+    // Job site line: project.location only, trimmed — a blank location renders no line
+    // at all (never a bare "Job site:"). Same rule as buildMilestoneRequestEmail.
+    const jobSite = (invoice.project?.location || "").trim();
+
     const invoiceAdditionalEmail = invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null;
     const invoiceCc = buildCc(recipientEmail, invoiceAdditionalEmail);
     const emailResult = await sendNotification(
@@ -564,6 +568,7 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
                     ${companyName} has sent you an invoice for <strong>${formatCurrency(invoice.totalAmount)}</strong>.
                     Please click the button below to view the details and make a payment.
                 </p>
+                ${jobSite ? `<p style="color: #666; font-size: 13px; margin: 8px 0 0;">Job site: ${escapeHtml(jobSite)}</p>` : ""}
                 <div style="text-align: center; margin: 32px 0;">
                     <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
                         View & Pay Invoice

@@ -57,6 +57,10 @@ function reminderEmailHtml(opts: {
     clientName: string;
     milestoneName: string;
     invoiceCode: string;
+    // Project.location only (the job site address). Blank/whitespace/absent
+    // renders no line at all — never a bare "Job site:". Same rule as
+    // buildMilestoneRequestEmail in billing-core.ts.
+    projectLocation?: string | null;
     amount: number | string | { toString(): string };
     daysUntil: number;
     payUrl: string | null;
@@ -64,7 +68,8 @@ function reminderEmailHtml(opts: {
     phone?: string | null;
     email?: string | null;
 }) {
-    const { clientName, milestoneName, invoiceCode, amount, daysUntil, payUrl, companyName, phone, email } = opts;
+    const { clientName, milestoneName, invoiceCode, projectLocation, amount, daysUntil, payUrl, companyName, phone, email } = opts;
+    const jobSite = (projectLocation || "").trim();
     const isOverdue = daysUntil < 0;
     const dueLabel = dueDateLabel(daysUntil);
     // Only emit the pay link when it's https — qbInvoiceLink comes from QuickBooks and the
@@ -78,6 +83,7 @@ function reminderEmailHtml(opts: {
         <h2 style="color:${isOverdue ? "#b91c1c" : "#1e293b"};margin-bottom:8px;">Payment Reminder</h2>
         <p>Hi ${escapeHtml(clientName || "there")},</p>
         <p>This is a reminder that <strong>${escapeHtml(milestoneName)}</strong> on Invoice #${escapeHtml(invoiceCode)} is <strong>${dueLabel}</strong>.</p>
+        ${jobSite ? `<p style="color:#666;font-size:13px;margin:0;">Job site: ${escapeHtml(jobSite)}</p>` : ""}
         <p>Amount due: <strong>${formatCurrency(amount)}</strong></p>
         ${payButton}
         <p style="color:#9ca3af;font-size:12px;margin-top:32px;">
@@ -181,7 +187,7 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                     select: {
                         id: true,
                         code: true,
-                        project: { select: { id: true, name: true } },
+                        project: { select: { id: true, name: true, location: true } },
                         client: { select: { id: true, name: true, email: true } },
                     },
                 },
@@ -313,6 +319,7 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                         clientName: invoice.client?.name || "",
                         milestoneName: schedule.name,
                         invoiceCode: invoice.code,
+                        projectLocation: invoice.project?.location,
                         amount: schedule.amount,
                         daysUntil,
                         payUrl,
