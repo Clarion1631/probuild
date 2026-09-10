@@ -33,7 +33,7 @@ Memo binding uses targetType/targetKey, so a recreated issue can retain an older
 
 `elapsedMs` is now minus firstObservedAt for open targets, or artifact createdAt minus firstObservedAt for a backed filing. Missing, invalid, future, or out-of-order timestamps yield null and static flags. The pure function takes an explicit clock. This elapsed time is backend observation-to-filing, not original purchaser request-to-signature latency.
 
-Rows expose target/issue/card identifiers for protected review, but exclude owner, vendor, amount, raw error, PDF ID, and artifact ID. The digest exposes only counts and limitations.
+Rows expose target/issue/card identifiers and protected association evidence: validated request/thread/item identities and the accepted PDF ID with nullable artifact time. They omit separate owner/contact fields, vendor, amount, raw error and artifact row ID. The digest exposes only counts and limitations. See [association contract](RECEIPT-OUTCOME-ASSOCIATIONS.md).
 
 ## Offline verification
 

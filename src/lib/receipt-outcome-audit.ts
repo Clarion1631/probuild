@@ -11,6 +11,7 @@
  * collectionStatus "unavailable" with a static message (no raw diagnostics).
  */
 import { Prisma } from "@prisma/client";
+import { requestIdFor } from "./receipt-request-cards";
 import { auditReceiptOutcomes } from "../../scripts/lib/receipt-outcome-audit.mjs";
 
 export const RECEIPT_OUTCOME_SCOPE = "persisted-request-cohort";
@@ -47,9 +48,46 @@ export interface ReceiptOutcomeSnapshot {
     artifacts: unknown[] | null;
 }
 
+export type ReceiptOutcomeEvidence = "absent" | "conflict" | "unavailable" | "verified";
+
+/** A provider-verified request card that named this target. Nothing else about the card is exposed. */
+export interface ReceiptOutcomeCardAssociation {
+    cardId: string;
+    requestId: string;
+    threadName: string;
+    messageName: string;
+    postedAt: string;
+    itemNumber: number;
+    fingerprint: string;
+}
+
+export interface ReceiptOutcomeAssociations {
+    /** null when association evidence is unavailable or conflicting (never a partial list). */
+    cards: ReceiptOutcomeCardAssociation[] | null;
+    cardEvidence: ReceiptOutcomeEvidence;
+    /** Present only when the summariser accepted exactly one artifact for this target. createdAt is null if unparseable or future. */
+    filedArtifact: { pdfId: string; createdAt: string | null } | null;
+    artifactEvidence: ReceiptOutcomeEvidence;
+}
+
+export interface ReceiptOutcomeRow {
+    targetKey: string;
+    issueId: string | null;
+    requestCardIds: string[];
+    stage: string;
+    postedToChat: boolean | null;
+    deliveredToPurchaser: null;
+    signedArtifactRecorded: boolean | null;
+    filedInProbuild: boolean | null;
+    bridgeAck: null;
+    elapsedMs: number | null;
+    flags: string[];
+    associations: ReceiptOutcomeAssociations;
+}
+
 export interface ReceiptOutcomeReport {
     counts: ReceiptOutcomeCounts;
-    rows: unknown[];
+    rows: ReceiptOutcomeRow[];
     evidenceErrors: unknown[];
     [extra: string]: unknown;
 }
@@ -106,6 +144,9 @@ async function readProductionSnapshot(): Promise<ReceiptOutcomeRawSnapshot> {
                     orderBy: { id: "asc" },
                     select: {
                         id: true,
+                        // owner + pacificDate are read ONLY to derive requestId in normalizeCard; neither reaches the summariser.
+                        owner: true,
+                        pacificDate: true,
                         itemsJson: true,
                         status: true,
                         postedAt: true,
@@ -139,6 +180,31 @@ async function readProductionSnapshot(): Promise<ReceiptOutcomeRawSnapshot> {
             isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
         },
     );
+}
+
+const OWNER_SHAPE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+const DATE_SHAPE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Validate inputs, then use the same request id helper as the bridge.
+ * Returns null (never a guess) when owner or date is not a valid input for that contract.
+ */
+export function receiptRequestId(owner: unknown, pacificDate: unknown): string | null {
+    if (typeof owner !== "string" || !OWNER_SHAPE.test(owner)) return null;
+    if (typeof pacificDate !== "string") return null;
+    const m = DATE_SHAPE.exec(pacificDate);
+    if (!m) return null;
+    const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+    const t = new Date(Date.UTC(y, mo - 1, d));
+    if (t.getUTCFullYear() !== y || t.getUTCMonth() !== mo - 1 || t.getUTCDate() !== d) return null;
+    return requestIdFor(owner, pacificDate);
+}
+
+/** Server normalisation: replace owner/pacificDate with the derived requestId (or null). Any raw requestId is ignored. */
+function normalizeCard(card: unknown): unknown {
+    if (card === null || typeof card !== "object" || Array.isArray(card)) return card;
+    const { owner, pacificDate, ...rest } = card as Record<string, unknown>;
+    return { ...rest, requestId: receiptRequestId(owner, pacificDate) };
 }
 
 /** The honest failure shape: every count null, never zero. */
@@ -209,7 +275,7 @@ export async function loadReceiptOutcomeAudit(
             capturedAt: nowISO,
             scope: RECEIPT_OUTCOME_SCOPE,
             issues: raw.issues,
-            cards: raw.cards,
+            cards: raw.cards.map(normalizeCard),
             artifacts: raw.artifacts,
         }));
         const report = summarize(snapshot, nowISO);

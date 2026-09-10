@@ -242,7 +242,9 @@ test('duplicate or conflicting identities fail closed', () => {
 test('output carries no vendor, owner, pdf id, artifact id, money text, or raw error', () => {
   const a = run(snap({ issues: [issue({ displayDetails: memo() })], cards: [posted({ lastError: 'boom secret' })], artifacts: [artifact()] }));
   const out = JSON.stringify(a);
-  for (const s of ['Vendor Zed', 'owner-secret', 'pdf-secret', 'art-secret', 'boom secret', '$12.34', '1111']) assert.ok(!out.includes(s), s);
+  for (const s of ['Vendor Zed', 'owner-secret', 'art-secret', 'boom secret', '$12.34', '1111']) assert.ok(!out.includes(s), s);
+  const stripped = JSON.stringify(a, (k, v) => (k === 'filedArtifact' ? undefined : v));
+  assert.ok(!stripped.includes('pdf-secret'), 'pdf id appears only inside the accepted filedArtifact');
 });
 
 test('CLI runs offline from a snapshot file, fails closed on bad input', () => {
