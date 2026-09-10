@@ -8,6 +8,7 @@ import { lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 import { lockQboExpense } from "@/lib/qbo-expense-sync";
 import { lockExpense } from "@/lib/expense-lock";
 import { lockBankLineIdentity } from "@/lib/bank-reconcile-guard";
+import { lockAttributionParents } from "@/lib/phase-invariant";
 import { projectPurchase, type PurchaseProjection } from "@/app/api/integrations/bank-ledger/conflict-diagnostic/route";
 import type { BankRegisterResult, BankRegisterRow } from "@/lib/qbo-bank-register";
 
@@ -27,6 +28,15 @@ import type { BankRegisterResult, BankRegisterRow } from "@/lib/qbo-bank-registe
  *     at most ONE Expense may carry the qbPurchaseId, and only when it provably
  *     matches the authenticated Purchase (exact id, gross cents, date, SyncToken,
  *     vendor name) — it is read under its advisory lock and NEVER mutated;
+ *     the ONE exception to the gross-cents match is a RETIRED Expense: literal
+ *     zero amount, the importer's exact "Removed in QBO (no-active-project)"
+ *     marker, Reviewed, full tax classification retired, on a job whose status
+ *     is literally "Closed Complete" with its estimate/item attribution intact
+ *     (project/estimate/item rows read and matched by id). That case is
+ *     descriptor-only (the stored date must already equal the Purchase
+ *     TxnDate), is flagged with `retired-expense-zero-preserved`, and the
+ *     applier share-locks Project -> Estimate -> EstimateItem before the bank
+ *     and Expense locks, refusing if the parent tuple moved meanwhile;
  *   - the live register row must be a single Expense whose Purchase entity
  *     (read directly, id + bank AccountRef verified) agrees with it on date,
  *     amount and vendor name.
@@ -47,12 +57,20 @@ import type { BankRegisterResult, BankRegisterRow } from "@/lib/qbo-bank-registe
  * even when a stale token is supplied.
  */
 
-export const SOURCE_REFRESH_POLICY_VERSION = "qbo-source-refresh/1";
+export const SOURCE_REFRESH_POLICY_VERSION = "qbo-source-refresh/2";
 export const SOURCE_REFRESH_ACCOUNT = BANK_REGISTER_ACCOUNT;
 export const SOURCE_REFRESH_SOURCE = "QBO_REGISTER";
 export const SOURCE_REFRESH_BASIS = "reviewed-current-source";
 export const SOURCE_REFRESH_AUDIT_ACTION = "QBO_SOURCE_REFRESH";
 export const HISTORY_MISSING_WARNING = "historical-field-history-missing";
+/** Warning carried by a plan whose single Expense is a retired zero row, preserved as-is. */
+export const RETIRED_EXPENSE_WARNING = "retired-expense-zero-preserved";
+/** The importer's exact retirement marker (deactivateQboExpense, reason `no-active-project`). */
+export const RETIRED_EXPENSE_DESCRIPTION = "[QuickBooks import] Removed in QBO (no-active-project)";
+export const RETIRED_EXPENSE_STATUS = "Reviewed";
+/** Literal project status required; `isActive` or "not In Progress" are NOT accepted. */
+export const RETIRED_PROJECT_STATUS = "Closed Complete";
+export const RETIREMENT_RACE_REASON = "retirement-attribution-race";
 export const MAX_REFRESH_ITEMS = 3;
 export const MAX_REFRESH_BODY_BYTES = 8 * 1024;
 /** Overall wall clock for one request; register (<=30s) plus three Purchase reads (10s each) fits under maxDuration 120. */
@@ -65,6 +83,8 @@ const DIGEST = /^[0-9a-f]{64}$/;
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 const ISO_TS = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const DECIMAL_AMOUNT = /^(\d{1,15})(?:\.(\d{1,2}))?$/;
+/** Literal zero only: "0", "0.0" or "0.00". Anything else is not a retired amount. */
+const ZERO_AMOUNT = /^0(?:\.00?)?$/;
 
 /** A real calendar day: Date.parse accepts Feb 30, so round-trip through UTC and compare. */
 export function isCalendarDay(day: string): boolean {
@@ -98,7 +118,71 @@ export interface ObservationSnapshot {
     bankLineId: string | null;
 }
 export interface CanonicalLineEvidence { id: string; account: string; postedDate: string; amountCents: number; state: string; sourceOfRecord: string; probuildExpenseId: string | null }
-export interface ExpenseEvidence { id: string; qbPurchaseId: string | null; date: string | null; amount: string; qbSyncToken: string | null; vendor: string | null }
+/**
+ * Retirement and attribution facts of an Expense, read with the evidence. Every
+ * field is a literal DB value (Decimals as strings) so the digest and audit
+ * carry exactly what was proven. Absent on old fixtures: a positive Expense
+ * never needs it, a ZERO Expense without it is always rejected.
+ */
+export interface ExpenseRetirementEvidence {
+    description: string | null;
+    status: string | null;
+    taxAmount: string | null;
+    taxSource: string | null;
+    installedAtCustomer: boolean | null;
+    taxDeductibleBase: string | null;
+    taxDeductibleBaseSource: string | null;
+    taxAtSource: boolean;
+    needsTaxReview: boolean;
+    projectId: string | null;
+    estimateId: string | null;
+    itemId: string | null;
+    project: { id: string; status: string | null } | null;
+    estimate: { id: string; projectId: string | null } | null;
+    item: { id: string; estimateId: string | null } | null;
+}
+export interface ExpenseEvidence { id: string; qbPurchaseId: string | null; date: string | null; amount: string; qbSyncToken: string | null; vendor: string | null; retirement?: ExpenseRetirementEvidence }
+
+/** Only a LITERAL zero ("0", "0.0", "0.00") is a candidate for the retired-Expense exception. */
+export function isRetiredZeroAmount(amount: string): boolean {
+    return ZERO_AMOUNT.test(amount);
+}
+
+/**
+ * PURE. Why a zero Expense is NOT a provably retired one, or null when it is.
+ * Requires the importer's exact marker, Reviewed, the full retired tax tuple,
+ * an explicit project that exists with the literal "Closed Complete" status,
+ * and any named estimate/item to exist and chain back to that same project.
+ */
+export function retiredExpenseRejection(expense: ExpenseEvidence): string | null {
+    const r = expense.retirement;
+    if (r === undefined || r === null) return "expense-retirement-metadata-missing";
+    if (r.description !== RETIRED_EXPENSE_DESCRIPTION) return "expense-retirement-marker-mismatch";
+    if (r.status !== RETIRED_EXPENSE_STATUS) return "expense-retirement-status-mismatch";
+    const taxRetired = r.taxAmount === null && r.taxSource === null && r.installedAtCustomer === null
+        && r.taxDeductibleBase === null && r.taxDeductibleBaseSource === null && r.taxAtSource === false && r.needsTaxReview === false;
+    if (!taxRetired) return "expense-retirement-tax-not-retired";
+    if (r.projectId === null || r.projectId === "") return "expense-retirement-project-missing";
+    if (r.project === null || r.project.id !== r.projectId) return "expense-retirement-project-missing";
+    if (r.project.status !== RETIRED_PROJECT_STATUS) return "expense-retirement-project-active";
+    if (r.estimateId !== null) {
+        if (r.estimate === null || r.estimate.id !== r.estimateId) return "expense-retirement-estimate-missing";
+        if (r.estimate.projectId !== r.projectId) return "expense-retirement-estimate-project-mismatch";
+    } else if (r.estimate !== null) {
+        return "expense-retirement-estimate-inconsistent";
+    }
+    if (r.itemId !== null) {
+        if (r.item === null || r.item.id !== r.itemId) return "expense-retirement-item-missing";
+        if (r.item.estimateId !== r.estimateId) return "expense-retirement-item-estimate-mismatch";
+    } else if (r.item !== null) {
+        return "expense-retirement-item-inconsistent";
+    }
+    return null;
+}
+
+function cloneRetirement(r: ExpenseRetirementEvidence): ExpenseRetirementEvidence {
+    return { ...r, project: r.project ? { ...r.project } : null, estimate: r.estimate ? { ...r.estimate } : null, item: r.item ? { ...r.item } : null };
+}
 export interface IntakeEvidence { id: string; state: string; expenseId: string | null }
 export interface RefreshEvidence {
     observations: ObservationSnapshot[];
@@ -163,7 +247,7 @@ export function summarizeEvidence(evidence: RefreshEvidence): EvidenceSummary {
     return {
         observations: evidence.observations.map(o => ({ id: o.id, postedDate: o.postedDate, rawDescriptor: o.rawDescriptor, amountCents: o.amountCents, checkNumber: o.checkNumber, createdAt: o.createdAt, clearedStatus: o.clearedStatus, bankLineId: o.bankLineId })),
         bankLines: evidence.bankLines.map(l => ({ id: l.id, account: l.account, postedDate: l.postedDate, amountCents: l.amountCents, state: l.state, sourceOfRecord: l.sourceOfRecord, probuildExpenseId: l.probuildExpenseId })),
-        expenses: evidence.expenses.map(e => ({ id: e.id, qbPurchaseId: e.qbPurchaseId, date: e.date, amount: e.amount, qbSyncToken: e.qbSyncToken, vendor: e.vendor })),
+        expenses: evidence.expenses.map(e => ({ id: e.id, qbPurchaseId: e.qbPurchaseId, date: e.date, amount: e.amount, qbSyncToken: e.qbSyncToken, vendor: e.vendor, ...(e.retirement === undefined ? {} : { retirement: cloneRetirement(e.retirement) }) })),
         intakes: evidence.intakes.map(i => ({ id: i.id, state: i.state, expenseId: i.expenseId })),
     };
 }
@@ -264,18 +348,27 @@ export function planSourceRefresh(input: PlanInput): PlanOutcome {
     if ((row.name ?? "").trim() !== vendor) return blocked("gl-entity-mismatch");
 
     // Exactly one Expense is permitted, and only when it provably IS the current authenticated Purchase. Never mutated.
+    // A literal-zero RETIRED Expense is the one exception to the cents match; every other check still applies.
+    let retiredExpenseZero = false;
     const expense = evidence.expenses[0] ?? null;
     if (expense !== null) {
         if (expense.qbPurchaseId !== qbTxnId) return blocked("expense-purchase-id-mismatch");
         if (expense.date === null) return blocked("expense-date-missing");
         if (expense.date !== purchase.TxnDate) return blocked("expense-date-mismatch");
-        const expenseCents = parseDecimalCents(expense.amount);
-        if (expenseCents === null) return blocked("expense-amount-malformed");
-        if (expenseCents !== cents) return blocked("expense-amount-mismatch");
+        retiredExpenseZero = isRetiredZeroAmount(expense.amount);
+        if (!retiredExpenseZero) {
+            const expenseCents = parseDecimalCents(expense.amount);
+            if (expenseCents === null) return blocked("expense-amount-malformed");
+            if (expenseCents !== cents) return blocked("expense-amount-mismatch");
+        }
         if (expense.qbSyncToken === null) return blocked("expense-sync-token-missing");
         if (expense.qbSyncToken !== purchase.SyncToken) return blocked("expense-sync-token-stale");
         if (expense.vendor === null || expense.vendor.trim() === "") return blocked("expense-vendor-missing");
         if (expense.vendor.trim() !== vendor) return blocked("expense-vendor-mismatch");
+        if (retiredExpenseZero) {
+            const rejection = retiredExpenseRejection(expense);
+            if (rejection !== null) return blocked(rejection);
+        }
     }
 
     const oldPayee = normalizePayee(old.rawDescriptor);
@@ -286,12 +379,15 @@ export function planSourceRefresh(input: PlanInput): PlanOutcome {
     if (!samePayee && !legacyExact && !legacyNormalized) return blocked("descriptor-unsupported");
     const warnings: string[] = [];
     if (!samePayee) warnings.push(HISTORY_MISSING_WARNING);
+    if (retiredExpenseZero) warnings.push(RETIRED_EXPENSE_WARNING);
 
     const next: RefreshTarget = { postedDate: line.postedDate, rawDescriptor: line.rawDescriptor };
     if (next.postedDate === old.postedDate && next.rawDescriptor === old.rawDescriptor) {
         return { status: "noop", reason: "unchanged", evidence: summary };
     }
     if (next.postedDate !== old.postedDate) {
+        // The retired exception is descriptor-only: the stored date must already be the Purchase TxnDate.
+        if (retiredExpenseZero) return blocked("retired-expense-date-change");
         const lastUpdated = Date.parse(purchase.MetaData.LastUpdatedTime);
         const createdAt = Date.parse(old.createdAt);
         if (Number.isNaN(createdAt)) return blocked("timestamp-invalid");
@@ -536,6 +632,12 @@ function iso(value: Date | string): string {
 function asDate(day: string): Date {
     return new Date(`${day}T00:00:00Z`);
 }
+function text(value: unknown): string | null {
+    return value === null || value === undefined ? null : String(value);
+}
+function flag(value: unknown): boolean | null {
+    return value === null || value === undefined ? null : Boolean(value);
+}
 
 /** Bounded, independent evidence reads; the scoping lives here so no caller can widen it. */
 export async function readRefreshEvidence(db: RefreshDbClient, qbTxnId: string): Promise<RefreshEvidence> {
@@ -555,7 +657,15 @@ export async function readRefreshEvidence(db: RefreshDbClient, qbTxnId: string):
         where: { qbPurchaseId: qbTxnId },
         orderBy: { id: "asc" },
         take: EVIDENCE_TAKE,
-        select: { id: true, qbPurchaseId: true, date: true, amount: true, qbSyncToken: true, vendor: true },
+        select: {
+            id: true, qbPurchaseId: true, date: true, amount: true, qbSyncToken: true, vendor: true,
+            description: true, status: true,
+            taxAmount: true, taxSource: true, installedAtCustomer: true, taxDeductibleBase: true, taxDeductibleBaseSource: true, taxAtSource: true, needsTaxReview: true,
+            projectId: true, estimateId: true, itemId: true,
+            project: { select: { id: true, status: true } },
+            estimate: { select: { id: true, projectId: true } },
+            item: { select: { id: true, estimateId: true } },
+        },
     });
     const intakes = await db.receiptIntake.findMany({
         where: { OR: [{ qbPurchaseId: qbTxnId }, { postVoidQbPurchaseId: qbTxnId }] },
@@ -574,7 +684,19 @@ export async function readRefreshEvidence(db: RefreshDbClient, qbTxnId: string):
             bankLineId: o.bankLineId ?? null,
         })),
         bankLines: bankLines.map(l => ({ id: l.id, account: l.account, postedDate: ymd(l.postedDate) ?? "", amountCents: l.amountCents, state: String(l.state), sourceOfRecord: String(l.sourceOfRecord), probuildExpenseId: l.probuildExpenseId ?? null })),
-        expenses: expenses.map(e => ({ id: e.id, qbPurchaseId: e.qbPurchaseId ?? null, date: ymd(e.date), amount: String(e.amount), qbSyncToken: e.qbSyncToken ?? null, vendor: e.vendor ?? null })),
+        expenses: expenses.map(e => ({
+            id: e.id, qbPurchaseId: e.qbPurchaseId ?? null, date: ymd(e.date), amount: String(e.amount), qbSyncToken: e.qbSyncToken ?? null, vendor: e.vendor ?? null,
+            retirement: {
+                description: text(e.description), status: text(e.status),
+                taxAmount: text(e.taxAmount), taxSource: text(e.taxSource), installedAtCustomer: flag(e.installedAtCustomer),
+                taxDeductibleBase: text(e.taxDeductibleBase), taxDeductibleBaseSource: text(e.taxDeductibleBaseSource),
+                taxAtSource: e.taxAtSource === true, needsTaxReview: e.needsTaxReview === true,
+                projectId: e.projectId ?? null, estimateId: e.estimateId ?? null, itemId: e.itemId ?? null,
+                project: e.project ? { id: e.project.id, status: text(e.project.status) } : null,
+                estimate: e.estimate ? { id: e.estimate.id, projectId: e.estimate.projectId ?? null } : null,
+                item: e.item ? { id: e.item.id, estimateId: e.item.estimateId ?? null } : null,
+            },
+        })),
         intakes: intakes.map(i => ({ id: i.id, state: String(i.state), expenseId: i.expenseId ?? null })),
     };
 }
@@ -617,12 +739,33 @@ export function createApplyContext(tx: RefreshDbClient, qbTxnId: string): Refres
     };
 }
 
+/** Bounded peek at the attribution parents every Expense carrying the id references, plus the identity tuple to re-check under the locks. */
+async function peekAttributionParents(tx: RefreshDbClient, qbTxnId: string): Promise<{ projectIds: string[]; estimateIds: string[]; itemIds: string[]; identity: string }> {
+    const rows = await tx.expense.findMany({
+        where: { qbPurchaseId: qbTxnId },
+        orderBy: { id: "asc" },
+        take: EVIDENCE_TAKE,
+        select: { id: true, projectId: true, estimateId: true, itemId: true, estimate: { select: { projectId: true } } },
+    });
+    const identity = rows.map(r => ({ id: r.id, projectId: r.projectId ?? null, estimateId: r.estimateId ?? null, itemId: r.itemId ?? null, estimateProjectId: r.estimate?.projectId ?? null }));
+    const ids = (values: (string | null)[]): string[] => [...new Set(values.filter((v): v is string => v !== null && v !== ""))].sort();
+    return {
+        projectIds: ids(identity.flatMap(t => [t.projectId, t.estimateProjectId])),
+        estimateIds: ids(identity.map(t => t.estimateId)),
+        itemIds: ids(identity.map(t => t.itemId)),
+        identity: JSON.stringify(identity),
+    };
+}
+
 /**
  * One transaction per item. Lock order: receipt-evidence (outermost) →
- * per-Purchase QBO lock → bank-line identity lock → advisory lock on each
- * existing Expense (sorted ids, at most EVIDENCE_TAKE) → evidence read → row CAS. A
- * SourceRefreshRollback thrown by the body rolls everything back (epoch bump
- * included) and becomes the item's result.
+ * per-Purchase QBO lock → attribution parents (Project → Estimate → EstimateItem,
+ * sorted ids from a bounded peek, via the canonical lockAttributionParents) →
+ * bank-line identity lock → advisory lock on each existing Expense (sorted ids,
+ * at most EVIDENCE_TAKE) → parent identity reread (blocked
+ * `retirement-attribution-race` if it moved, no writes) → evidence read → row
+ * CAS. A SourceRefreshRollback thrown by the body rolls everything back (epoch
+ * bump included) and becomes the item's result.
  */
 export function createRefreshApplier(client: Pick<PrismaClient, "$transaction">): BankSourceRefreshDependencies["apply"] {
     return async (qbTxnId, body, budgetMs = REFRESH_TX_TIMEOUT_MS) => {
@@ -630,10 +773,16 @@ export function createRefreshApplier(client: Pick<PrismaClient, "$transaction">)
             return await client.$transaction(async tx => {
                 await lockReceiptEvidence(tx);
                 await lockQboExpense(tx, qbTxnId);
+                // Project -> Estimate -> EstimateItem is the global attribution order; it goes BEFORE the bank and Expense locks.
+                const peek = await peekAttributionParents(tx, qbTxnId);
+                await lockAttributionParents(tx, { projectIds: peek.projectIds, estimateIds: peek.estimateIds, itemIds: peek.itemIds });
                 await lockBankLineIdentity(tx);
                 const expenseIds = (await tx.expense.findMany({ where: { qbPurchaseId: qbTxnId }, orderBy: { id: "asc" }, take: EVIDENCE_TAKE, select: { id: true } }))
                     .map(e => e.id).sort();
                 for (const id of expenseIds) await lockExpense(tx, id);
+                // A parent named now but not at the peek is unlocked; refuse rather than reach for it out of order.
+                const reread = await peekAttributionParents(tx, qbTxnId);
+                if (reread.identity !== peek.identity) return { qbTxnId, status: "blocked", reason: RETIREMENT_RACE_REASON } as RefreshItemResult;
                 return body(createApplyContext(tx, qbTxnId));
             }, { timeout: Math.max(1, Math.floor(Math.min(REFRESH_TX_TIMEOUT_MS, budgetMs))), maxWait: Math.max(1, Math.floor(Math.min(2000, budgetMs))) });
         } catch (error) {
