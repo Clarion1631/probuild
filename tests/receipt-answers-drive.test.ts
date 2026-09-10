@@ -80,6 +80,8 @@ interface FakeIssueRow {
 
 /** A `ReceiptMemoArtifact` row — the DURABLE memo binding (round-34 finding 1). */
 interface FakeArtifactRow {
+    pdfSha256?: string | null;
+    provenanceJson?: string | null;
     pdfId: string;
     targetType: string;
     targetKey: string;
@@ -106,11 +108,14 @@ interface FakePrisma {
         updateMany: (args: { where: { id: string; version: number }; data: Record<string, unknown> }) => Promise<{ count: number }>;
     };
     receiptMemoArtifact: {
+        findMany: (args: any) => Promise<any[]>;
+        count: (args: any) => Promise<number>;
         findUnique: (args: {
             where: { pdfId?: string; targetType_targetKey?: { targetType: string; targetKey: string } };
         }) => Promise<FakeArtifactRow | null>;
         create: (args: { data: FakeArtifactRow }) => Promise<FakeArtifactRow>;
     };
+    $queryRaw: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown[]>;
     $executeRaw: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<undefined>;
     $transaction: <T>(fn: (tx: FakePrisma) => Promise<T>) => Promise<T>;
 }
@@ -148,6 +153,13 @@ const fakePrisma: FakePrisma = {
     // The DURABLE memo binding (round-34 finding 1). Both unique indexes are
     // real here: `pdfId`, and (targetType, targetKey).
     receiptMemoArtifact: {
+        findMany: async args => {
+            const all = [...artifacts.values()].map(row => ({...row,pdfSha256:row.pdfSha256 ?? null}));
+            const w=args.where;
+            const rows=w?.pdfSha256===null ? all.filter(r=>r.pdfSha256===null) : all.filter(r=>(w?.OR ?? []).some((q:any)=>q.pdfId===r.pdfId || q.AND?.every((v:any)=>Object.entries(v).every(([k,value])=>(r as any)[k]===value)) || q.pdfSha256?.equals===r.pdfSha256));
+            return rows.sort((a,b)=>a.pdfId.localeCompare(b.pdfId)).slice(0,args.take ?? rows.length);
+        },
+        count: async () => [...artifacts.values()].filter(r=>r.pdfSha256==null).length,
         findUnique: async ({ where }) => {
             if (where.pdfId !== undefined) return artifacts.get(where.pdfId) ?? null;
             const key = where.targetType_targetKey;
@@ -162,6 +174,7 @@ const fakePrisma: FakePrisma = {
                 row => row.targetType === data.targetType && row.targetKey === data.targetKey,
             );
             if (boundAlready) throw uniqueViolation("ReceiptMemoArtifact_targetType_targetKey_key");
+            if (data.pdfSha256 && [...artifacts.values()].some(row=>row.pdfSha256===data.pdfSha256)) throw uniqueViolation("ReceiptMemoArtifact_pdfSha256_key");
             artifacts.set(data.pdfId, { ...data });
             return { ...data };
         },
@@ -179,6 +192,7 @@ const fakePrisma: FakePrisma = {
      * life of the transaction, exactly as `_xact_` means, and released in the
      * `finally` below.
      */
+    $queryRaw: async () => { evidenceEpoch++; return []; },
     $executeRaw: async (strings, ...values) => {
         lockCalls.push(String(values[0]));
         callOrder.push(`lock:${String(values[0])}`);
@@ -202,7 +216,7 @@ const fakePrisma: FakePrisma = {
         // A BOX, not a bare `let`: the assignment happens inside the `$executeRaw`
         // closure below, so TypeScript narrows a plain binding to `null` by the
         // time the `finally` reads it and the release becomes uncallable.
-        const lock: { release: (() => void) | null } = { release: null };
+        const releases: Array<()=>void> = [];
         const tx: FakePrisma = {
             ...fakePrisma,
             reviewIssue: {
@@ -225,6 +239,7 @@ const fakePrisma: FakePrisma = {
                     return created;
                 },
             },
+            $queryRaw: async () => { evidenceEpoch++; undo.push(()=>{evidenceEpoch--;}); return []; },
             $executeRaw: async (strings, ...values) => {
                 const key = String(values[0]);
                 await fakePrisma.$executeRaw(strings, ...values);
@@ -236,7 +251,7 @@ const fakePrisma: FakePrisma = {
                 const held = new Promise<void>(resolve => { signal = resolve; });
                 lockHolders.set(key, previous.then(() => held));
                 await previous;
-                lock.release = signal;
+                releases.push(signal);
                 return undefined;
             },
         };
@@ -246,13 +261,16 @@ const fakePrisma: FakePrisma = {
             for (const step of undo.reverse()) step();
             throw error;
         } finally {
-            lock.release?.();
+            for(const release of releases.reverse()) release();
         }
     },
 };
 
 /** Per-key lock queues, so the advisory lock above is mutual exclusion, not a log line. */
 const lockHolders = new Map<string, Promise<void>>();
+
+let evidenceEpoch = 0;
+let contentHash = 'a'.repeat(64);
 
 let POST: (request: Request) => Promise<Response>;
 
@@ -268,6 +286,7 @@ before(async () => {
             return {
                 isDriveFileId: (value: unknown) =>
                     typeof value === "string" && /^[A-Za-z0-9_-]{10,200}$/.test(value.trim()),
+                probeDrivePdfContent: async (fileId: string) => ({kind:'verified',id:fileId,sha256:contentHash,version:'1',byteLength:100}),
                 probeDriveFile: async (fileId: string) => {
                     probedIds.push(fileId);
                     return probeResult;
@@ -297,6 +316,8 @@ before(async () => {
 });
 
 function reset() {
+    delete process.env.RECEIPT_MEMO_CONTENT_GUARD_ENABLED;
+    evidenceEpoch=0; contentHash="a".repeat(64);
     probedIds = [];
     writes = [];
     cleared = [];
@@ -1028,4 +1049,22 @@ test("CONCURRENT PDF-A → issue 1 and PDF-A → issue 2: exactly one wins", asy
     assert.ok(reasons.includes("artifact-reused"));
     assert.deepEqual([...artifacts.keys()], [FILE_ID], "one memo, one binding");
     assert.equal(cleared.length, 1, "and one chase closed, not two");
+});
+
+function contentMode(){reset();process.env.RECEIPT_MEMO_CONTENT_GUARD_ENABLED='true';foundMemo(FILE_ID);}
+test('content guard stores immutable hash under evidence/hash/PDF locks and bumps epoch once',async()=>{
+ contentMode();assert.equal((await post({fingerprint:'pb-bl-1',signed:true,pdf_id:FILE_ID})).status,200);assert.equal(artifacts.get(FILE_ID)?.pdfSha256,contentHash);assert.equal(evidenceEpoch,1);assert.deepEqual(lockCalls.slice(0,3),['receipt-evidence',`memo-sha256:${contentHash}`,`memo-pdf:${FILE_ID}`]);
+ const priorWrites=writes.length;artifacts.set('other_pdf_id_12345',{pdfId:'other_pdf_id_12345',targetType:'bank-line',targetKey:'unrelated',issueId:'other',pdfSha256:null});assert.equal((await post({fingerprint:'pb-bl-1',signed:true,pdf_id:FILE_ID})).status,200);assert.equal(evidenceEpoch,1);assert.equal(writes.length,priorWrites);
+});
+test('content guard blocks new binding on global historical unknown content',async()=>{
+ contentMode();artifacts.set('other_pdf_id_12345',{pdfId:'other_pdf_id_12345',targetType:'bank-line',targetKey:'unrelated',issueId:'other'});const response=await post({fingerprint:'pb-bl-1',signed:true,pdf_id:FILE_ID});assert.equal(response.status,503);assert.equal((await response.json()).reason,'hashless-bindings');assert.equal(evidenceEpoch,0);assert.equal(writes.length,0);
+});
+test('content guard preserves exact card association refusal',async()=>{contentMode();const response=await post({fingerprint:'pb-bl-1',signed:true,pdf_id:FILE_ID,request_id:'not-this-card'});assert.equal(response.status,422);assert.equal(evidenceEpoch,0);assert.equal(artifacts.size,0);});
+test('content guard concurrent same bytes in different PDF IDs has one winner',async()=>{
+ contentMode();addTwinCharge();const other='other_pdf_id_12345';const responses=await Promise.all([post({fingerprint:'pb-bl-1',signed:true,pdf_id:FILE_ID}),post({fingerprint:'pb-bl-2',signed:true,pdf_id:other,thread:SECOND_THREAD})]);assert.deepEqual(responses.map(r=>r.status).sort(),[200,409]);assert.equal(artifacts.size,1);assert.equal(evidenceEpoch,1);
+});
+test('content guard losing both CAS attempts rolls back evidence epochs',async()=>{contentMode();updateManyCounts=[0,0];const response=await post({fingerprint:'pb-bl-1',signed:true,pdf_id:FILE_ID});assert.equal(response.status,409);assert.equal(evidenceEpoch,0);assert.equal(artifacts.size,0);});
+test('content guard rejects changed bytes for an already-bound PDF',async()=>{contentMode();await post({fingerprint:'pb-bl-1',signed:true,pdf_id:FILE_ID});contentHash='b'.repeat(64);assert.equal((await post({fingerprint:'pb-bl-1',signed:true,pdf_id:FILE_ID})).status,409);assert.equal(evidenceEpoch,1);});
+test('content guard old same-ID binding retry stays functional without backfilling hash',async()=>{
+ contentMode();issues.get('bl-1')!.displayDetails=JSON.stringify({...JSON.parse(CARDED_DETAILS),resolution:'memo-signed',pdfId:FILE_ID});artifacts.set(FILE_ID,{pdfId:FILE_ID,targetType:'bank-line',targetKey:'bl-1',issueId:'ri-1'});artifacts.set('other_pdf_id_12345',{pdfId:'other_pdf_id_12345',targetType:'bank-line',targetKey:'unrelated',issueId:'other'});assert.equal((await post({fingerprint:'pb-bl-1',signed:true,pdf_id:FILE_ID})).status,200);assert.equal(artifacts.get(FILE_ID)?.pdfSha256,undefined);assert.equal(evidenceEpoch,0);
 });

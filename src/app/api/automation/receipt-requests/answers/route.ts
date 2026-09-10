@@ -15,9 +15,12 @@ import {
     matchCardAssociation,
     missingAssociationFields,
 } from "@/lib/receipt-card-history";
-import { isDriveFileId, probeDriveFile } from "@/lib/google-drive";
+import { isDriveFileId, probeDriveFile, probeDrivePdfContent } from "@/lib/google-drive";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 import { affidavitNameVerdict } from "@/lib/receipt-affidavit-name";
+
+import { lockReceiptEvidence, bumpReceiptEvidenceEpoch } from '@/lib/receipt-evidence-lock';
+import { inspectMemoContentBinding, type MemoContentTx } from '@/lib/receipt-memo-content-guard';
 
 export const dynamic = "force-dynamic";
 
@@ -38,8 +41,8 @@ export const dynamic = "force-dynamic";
  * `{ok:true, ignored:true}` — not an error. The forwarder ships one file for
  * both systems and must not retry forever on rows that were never ours.
  *
- * NEVER emails anything, and never downloads the PDF: it reads the file's
- * METADATA to prove it exists, then records the id and a link. A `signed:true`
+ * NEVER emails anything. The default path reads file metadata; the enabled
+ * content guard also verifies bounded PDF bytes before recording a new binding. A `signed:true`
  * with no `pdf_id`, or one naming a file Drive says is not there, writes
  * nothing (422); a Drive we cannot reach is a 503 with `retry`, never a
  * recorded resolution.
@@ -180,6 +183,7 @@ function isUniqueConstraintError(error: unknown): boolean {
 
 /** What one locked read-check-write attempt concluded. */
 type AttemptOutcome =
+    | { kind: "content-incomplete"; unknownCount: number; unknownPdfIds: string[]; truncated: boolean }
     | { kind: "missing" }
     | { kind: "reused" }
     | { kind: "already-bound"; detail: string }
@@ -210,11 +214,13 @@ type AttemptOutcome =
  * error inside a Postgres transaction leaves that transaction aborted, so there
  * is no continuing from it.
  */
+class MemoEvidenceRace extends Error {}
+
 async function withBindingBackstop(run: () => Promise<AttemptOutcome>): Promise<AttemptOutcome> {
     try {
         return await run();
     } catch (error) {
-        if (isUniqueConstraintError(error)) return { kind: "lost-race" };
+        if (isUniqueConstraintError(error) || error instanceof MemoEvidenceRace) return { kind: "lost-race" };
         throw error;
     }
 }
@@ -381,6 +387,14 @@ export async function POST(request: Request) {
         : null;
     const artifactUrl = callerUrl ?? probe.webViewLink ?? null;
 
+    // Enabled only after the read-only global legacy inventory and schema rollout.
+    // This same gate is required for administrative recovery writes.
+    const contentGuardEnabled = process.env.RECEIPT_MEMO_CONTENT_GUARD_ENABLED === 'true';
+    const content = contentGuardEnabled ? await probeDrivePdfContent(pdfId) : null;
+    if (content && content.kind !== 'verified') {
+        return NextResponse.json({ ok: false, reason: 'artifact-content-unverifiable', retry: true, targetKey: bankLineId }, { status: 503 });
+    }
+
     // RECORD FIRST, CLEAR ONLY IF IT COMMITTED.
     //
     // This used to clear the issue even when its details CAS lost — leaving a
@@ -408,8 +422,9 @@ export async function POST(request: Request) {
     let reused = false;
     /** The pdfId this issue is already bound to, when a DIFFERENT one arrived. */
     let alreadyBound: string | null = null;
+    let contentIncomplete: { unknownCount: number; unknownPdfIds: string[]; truncated: boolean } | null = null;
 
-    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !incompleteAssociation && !wrongThread && !mismatch && !reused && !alreadyBound; attempt++) {
+    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !incompleteAssociation && !wrongThread && !mismatch && !reused && !alreadyBound && !contentIncomplete; attempt++) {
         const outcome: AttemptOutcome = await withBindingBackstop(() => prisma.$transaction(async tx => {
             /**
              * THE PDF-ID LOCK — taken BEFORE the reuse check, and held through
@@ -427,6 +442,10 @@ export async function POST(request: Request) {
              * file blocks on this line until the first commits, and then sees
              * its resolution.
              */
+            if (content?.kind === 'verified') {
+                await lockReceiptEvidence(tx);
+                await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`memo-sha256:${content.sha256}`}))`;
+            }
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`memo-pdf:${pdfId}`}))`;
 
             const issue = await tx.reviewIssue.findUnique({
@@ -539,6 +558,21 @@ export async function POST(request: Request) {
             const nameVerdict = affidavitNameVerdict(probe.name, amountCents);
             if (nameVerdict === "mismatch") return { kind: "mismatch" };
 
+            if (content?.kind === 'verified') {
+                const binding = await inspectMemoContentBinding(tx as unknown as MemoContentTx, {
+                    pdfId, pdfSha256: content.sha256, targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: bankLineId, issueId: issue.id,
+                });
+                if (binding.kind === 'conflict') return { kind: 'reused' };
+                if (binding.kind === 'incomplete') return { kind: 'content-incomplete', unknownCount: binding.unknownCount, unknownPdfIds: binding.unknownPdfIds, truncated: binding.truncated };
+                // An exact historical binding remains acknowledgeable. Do not backfill
+                // its hash or replace its original signing metadata during a retry.
+                if (binding.kind === 'same' && bound === pdfId) return {
+                    kind: 'recorded', alreadyCleared: issue.clearedAt !== null,
+                    alreadyResolved: alreadyAnswered, unparseableName: nameVerdict === 'unparseable' ? probe.name ?? '' : null,
+                };
+                await bumpReceiptEvidenceEpoch(tx);
+            }
+
             details.resolution = "memo-signed";
             // The ID is the durable identity; the URL is how a human opens it.
             details.pdfId = pdfId;
@@ -569,6 +603,7 @@ export async function POST(request: Request) {
                     await tx.receiptMemoArtifact.create({
                         data: {
                             pdfId,
+                            ...(content?.kind === 'verified' ? { pdfSha256: content.sha256, provenanceJson: JSON.stringify({ version: 1, kind: 'ordinary-card-answer', thread: association.thread, item: association.n, requestId: association.requestId, signedAt: typeof body.at === 'string' ? body.at : null }) } : {}),
                             targetType: RECEIPT_REQUEST_TARGET_TYPE,
                             targetKey: bankLineId,
                             issueId: issue.id,
@@ -582,10 +617,12 @@ export async function POST(request: Request) {
                     unparseableName: nameVerdict === "unparseable" ? probe.name ?? "" : null,
                 };
             }
+            if (content?.kind === "verified") throw new MemoEvidenceRace("memo evidence CAS changed");
             return { kind: "lost-race" };
         }));
 
         switch (outcome.kind) {
+            case "content-incomplete": contentIncomplete = outcome; break;
             case "missing": missing = true; break;
             case "reused": reused = true; break;
             case "already-bound": alreadyBound = outcome.detail; break;
@@ -605,6 +642,7 @@ export async function POST(request: Request) {
         }
     }
 
+    if (contentIncomplete) return NextResponse.json({ ok: false, reason: 'hashless-bindings', retry: true, targetKey: bankLineId, ...contentIncomplete }, { status: 503 });
     if (missing) {
         return NextResponse.json({ ok: true, ignored: true, reason: "unknown-target" });
     }

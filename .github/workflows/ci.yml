@@ -527,6 +527,15 @@ jobs:
           APPLY_E2E_SERVER_URL: postgresql://probuild:probuild@localhost:5432/postgres
           APPLY_E2E_DB: probuild_apply_phase2
 
+      - name: Apply receipt memo content schema and verify durable uniqueness
+        run: |
+          node scripts/apply-receipt-memo-content.mjs --target ci --yes --expect-db probuild_migrations --expect-host localhost
+          node scripts/apply-receipt-memo-content.mjs --target ci --yes --expect-db probuild_migrations --expect-host localhost
+          npx tsx --test tests/receipt-memo-content-db.test.ts
+        env:
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+          RECEIPT_MEMO_TEST_DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest
