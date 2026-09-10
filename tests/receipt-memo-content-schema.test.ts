@@ -12,3 +12,16 @@ test('hash CHECK constraint is recorded in the migration blind-spot inventory', 
  assert.equal(entries[0].table,'"ReceiptMemoArtifact"');
  assert.equal(entries[0].def, `CHECK ((("pdfSha256" IS NULL) OR ("pdfSha256" ~ '^[0-9a-f]{64}$'::text)))`);
 });
+
+test('historical phase harnesses exclude later dependent memo migration for their whole run', async () => {
+ const { readFileSync } = await import('node:fs');
+ for (const [file, list] of [['ci-apply-receipt-intake-e2e.mjs','PHASE1_DEPENDENT_MIGRATIONS'], ['ci-apply-phase2-receipt-queue-e2e.mjs','PHASE2_DEPENDENT_MIGRATIONS']]) {
+  const source=readFileSync(new URL('../scripts/'+file, import.meta.url),'utf8');
+  const start=source.indexOf('const '+list+' = [');
+  assert.ok(start>=0,file+' must declare dependent migrations');
+  const array=source.slice(start,source.indexOf('];',start));
+  assert.ok(array.includes('20260910233000_receipt_memo_content'),file+' must park the ALTER while its parent table is absent');
+  assert.ok(source.includes('for (const name of '+list+') parkForTheRun(name);'));
+  assert.ok(source.includes('process.on("exit",'));
+ }
+});
