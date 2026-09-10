@@ -97,8 +97,8 @@ test("digest carries outcome evidence without turning operational success into b
         assert.equal(body.ok, true);
         assert.equal(body.receiptOutcomes.counts.eligibleRequests, null);
         assert.equal(body.receiptOutcomes.counts.filedInProbuild, 0);
-        assert.match(deliveredText, /Receipt outcomes/);
-        assert.match(deliveredText, /Bridge ack: unknown/);
+        assert.match(deliveredText, /Receipt follow-up/);
+        assert.match(deliveredText, /Return confirmation saved: unknown/);
     });
 });
 

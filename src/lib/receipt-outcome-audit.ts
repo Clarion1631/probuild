@@ -14,7 +14,12 @@ import { Prisma } from "@prisma/client";
 import { auditReceiptOutcomes } from "../../scripts/lib/receipt-outcome-audit.mjs";
 
 export const RECEIPT_OUTCOME_SCOPE = "persisted-request-cohort";
-export const RECEIPT_OUTCOME_HEADING = "Receipt outcomes (persisted request cohort)";
+export const RECEIPT_OUTCOME_HEADING = "Receipt follow-up: what is finished?";
+/** Operational limit, not a date/eligibility filter. Read one extra row to detect overflow.
+ * At most 6,003 narrowly selected records can enter one scheduled audit.
+ * Never summarize a truncated history: reaching this limit requires a scoped audit design.
+ */
+export const RECEIPT_OUTCOME_ROW_LIMIT = 2_000;
 /** Static, PII-free. Raw reader errors are deliberately not surfaced. */
 export const RECEIPT_OUTCOME_UNAVAILABLE = "receipt outcome evidence could not be read";
 
@@ -83,6 +88,8 @@ async function readProductionSnapshot(): Promise<ReceiptOutcomeRawSnapshot> {
             await tx.$executeRaw`SET TRANSACTION READ ONLY`;
             const [issues, cards, artifacts] = await Promise.all([
                 tx.reviewIssue.findMany({
+                    take: RECEIPT_OUTCOME_ROW_LIMIT + 1,
+                    orderBy: { id: "asc" },
                     where: { targetType: "bank-line" },
                     select: {
                         id: true,
@@ -95,6 +102,8 @@ async function readProductionSnapshot(): Promise<ReceiptOutcomeRawSnapshot> {
                     },
                 }),
                 tx.receiptRequestCard.findMany({
+                    take: RECEIPT_OUTCOME_ROW_LIMIT + 1,
+                    orderBy: { id: "asc" },
                     select: {
                         id: true,
                         itemsJson: true,
@@ -109,6 +118,8 @@ async function readProductionSnapshot(): Promise<ReceiptOutcomeRawSnapshot> {
                     },
                 }),
                 tx.receiptMemoArtifact.findMany({
+                    take: RECEIPT_OUTCOME_ROW_LIMIT + 1,
+                    orderBy: { id: "asc" },
                     where: { targetType: "bank-line" },
                     select: {
                         id: true,
@@ -181,6 +192,9 @@ export async function loadReceiptOutcomeAudit(
     if (!raw || !Array.isArray(raw.issues) || !Array.isArray(raw.cards) || !Array.isArray(raw.artifacts)) {
         return unavailableReceiptOutcomeAudit(nowISO);
     }
+    if ([raw.issues, raw.cards, raw.artifacts].some(rows => rows.length > RECEIPT_OUTCOME_ROW_LIMIT)) {
+        return { ...unavailableReceiptOutcomeAudit(nowISO), collectionError: "receipt-outcome-row-limit" };
+    }
 
     // Date objects become ISO strings here, so the pure summariser only ever
     // sees the same JSON shape the CLI collector hands it.
@@ -209,7 +223,7 @@ function line(label: string, value: number | null | undefined, note?: string): s
 
 function evidenced(label: string, value: number | null | undefined): string {
     return value === null || value === undefined
-        ? line(label, value, "not evidenced by the persisted cohort")
+        ? line(label, value, "not shown by these records")
         : line(label, value);
 }
 
@@ -222,22 +236,25 @@ export function formatReceiptOutcomeAudit(report: ReceiptOutcomeAudit): string {
     const c: Partial<ReceiptOutcomeCounts> = report?.counts ?? {};
     const lines: string[] = [RECEIPT_OUTCOME_HEADING];
     if (report?.collectionStatus === "unavailable") {
-        lines.push(`  Source: UNAVAILABLE (${RECEIPT_OUTCOME_UNAVAILABLE}); counts below are unknown, not zero`);
+        lines.push(report.collectionError === "receipt-outcome-row-limit"
+            ? "  UNAVAILABLE: too many records for this scheduled check. No partial totals are shown."
+            : "  UNAVAILABLE: these records could not be checked. Counts below are unknown, not zero.");
     }
     lines.push(
-        line("Observed targets", c.observedTargets),
-        line("Posted to Chat", c.postedToChat),
-        line("Awaiting purchaser", c.awaitingPurchaser),
-        line("Recorded signed memo", c.signedArtifactsRecorded),
-        line("Filed in ProBuild", c.filedInProbuild, "receipt chase only, not QBO posting or job costing"),
-        line("Unresolved", c.unresolved),
-        line("Retry", c.retry),
-        line("Error", c.error),
-        line("Evidence problems", report.collectionStatus === "unavailable" ? null : report.evidenceErrors.length),
-        evidenced("Eligible requests", c.eligibleRequests),
-        evidenced("Delivered to purchaser", c.deliveredToPurchaser),
-        evidenced("Bridge ack", c.bridgeAck),
-        "  Note: a successful scheduler run is not an outcome; only the counts above are.",
+        "  Covers charges already recorded in ProBuild; other requests may be missing.",
+        line("Charges checked", c.observedTargets),
+        line("Requests sent to Chat", c.postedToChat),
+        line("Waiting for purchaser", c.awaitingPurchaser),
+        line("Signed statements on file", c.filedInProbuild),
+        line("Still open", c.unresolved),
+        line("Waiting to resend", c.retry),
+        line("Sending problems", c.error),
+        line("Records needing review", report.collectionStatus === "unavailable" ? null : report.evidenceErrors.length),
+        evidenced("All requests needing a receipt", c.eligibleRequests),
+        evidenced("Reached the purchaser", c.deliveredToPurchaser),
+        evidenced("Return confirmation saved", c.bridgeAck),
+        "  A signed statement on file does not confirm QuickBooks entry or finished job costing.",
+        "  An automatic check running successfully does not mean the receipt work is finished.",
     );
     return lines.join("\n");
 }

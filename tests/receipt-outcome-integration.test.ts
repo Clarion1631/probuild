@@ -61,12 +61,12 @@ test("formatter shows unknown for null counts and says unavailable when the sour
     const text = formatReceiptOutcomeAudit(unavailableReceiptOutcomeAudit(NOW().toISOString()));
     assert.ok(text.startsWith(RECEIPT_OUTCOME_HEADING));
     assert.match(text, /UNAVAILABLE/);
-    assert.match(text, /Observed targets: unknown/);
-    assert.match(text, /Eligible requests: unknown/);
-    assert.match(text, /Delivered to purchaser: unknown/);
-    assert.match(text, /Bridge ack: unknown/);
-    assert.match(text, /scheduler run is not an outcome/);
-    assert.match(text, /not QBO posting or job costing/);
+    assert.match(text, /Charges checked: unknown/);
+    assert.match(text, /All requests needing a receipt: unknown/);
+    assert.match(text, /Reached the purchaser: unknown/);
+    assert.match(text, /Return confirmation saved: unknown/);
+    assert.match(text, /check running successfully does not mean the receipt work is finished/);
+    assert.match(text, /does not confirm QuickBooks entry or finished job costing/);
     assert.ok(!/%/.test(text), "no percentages");
 });
 
@@ -114,4 +114,33 @@ test("daily digest route wires the real loader and formatter as an optional depe
     assert.match(src, /formatReceiptOutcomeAudit\(receiptOutcomes\)/);
     assert.ok(src.indexOf("await dependencies.getHealth()") < src.indexOf("dependencies.getReceiptOutcomes"));
     assert.match(src, /ok: health\.ok/, "health.ok keeps its operational meaning");
+});
+
+test("any overflowing evidence source makes the entire report unavailable", async () => {
+    for (const key of ["issues", "cards", "artifacts"] as const) {
+        const raw = { issues: [], cards: [], artifacts: [] } as { issues: unknown[]; cards: unknown[]; artifacts: unknown[] };
+        raw[key] = Array.from({ length: 2001 }, (_, i) => ({ id: `row-${i}` }));
+        const audit = await loadReceiptOutcomeAudit({ readSnapshot: async () => raw, now: NOW });
+        assert.equal(audit.collectionStatus, "unavailable", key);
+        assert.equal(audit.collectionError, "receipt-outcome-row-limit", key);
+        assert.equal(audit.rows.length, 0, key);
+        assert.ok(Object.values(audit.counts).every(value => value === null), key);
+        assert.match(formatReceiptOutcomeAudit(audit), /too many records/i);
+    }
+});
+
+test("the exact row cap remains readable, with no silent lower cutoff", async () => {
+    const issues = Array.from({ length: 2000 }, (_, i) => ({
+        id: `issue-${i}`, targetType: "bank-line", targetKey: `charge-${i}`,
+        displayDetails: null, firstObservedAt: "2026-09-01T00:00:00Z", createdAt: "2026-09-01T00:00:00Z", clearedAt: null,
+    }));
+    const audit = await loadReceiptOutcomeAudit({ readSnapshot: async () => ({ issues, cards: [], artifacts: [] }), now: NOW });
+    assert.equal(audit.collectionStatus, "available");
+    assert.equal(audit.counts.observedTargets, 2000);
+});
+
+test("all three database reads use the same cap plus one overflow sentinel", () => {
+    const src = source("../src/lib/receipt-outcome-audit.ts");
+    assert.equal((src.match(/take: RECEIPT_OUTCOME_ROW_LIMIT \+ 1/g) ?? []).length, 3);
+    assert.match(src, /RECEIPT_OUTCOME_ROW_LIMIT = 2_000/);
 });

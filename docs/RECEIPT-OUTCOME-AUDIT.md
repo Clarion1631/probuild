@@ -8,7 +8,7 @@ Operational `health.ok` retains its existing meaning. It is not affidavit comple
 
 The cohort is the union of current bank-line ReviewIssue targets and immutable ReceiptRequestCard item targets. Targets are counted once even if several cards refer to them. It is the complete persisted backend snapshot, not the full population of explicit Drive requests or potentially eligible purchases. No success percentage is calculated.
 
-The server reader fetches narrow projections of ReviewIssue, ReceiptRequestCard, and ReceiptMemoArtifact in one RepeatableRead, READ ONLY Prisma transaction (2-second queue wait, 8-second transaction timeout). It does not fetch QBO, Drive, Chat, or secret values. Failed collection returns null counts and a static diagnostic, never empty success. Imports do not query the database.
+The server reader fetches at most 2,001 rows per table (2,000 plus an overflow sentinel), ordered by ID. If any table exceeds 2,000 rows, the entire audit is unavailable with all counts null: it never reports partial history as complete. This operational limit bounds each scheduled read to 6,003 records; it is not an eligibility or date filter. A larger population needs a separately designed scoped audit before reporting can resume. The server reader fetches narrow projections of ReviewIssue, ReceiptRequestCard, and ReceiptMemoArtifact in one RepeatableRead, READ ONLY Prisma transaction (2-second queue wait, 8-second transaction timeout). It does not fetch QBO, Drive, Chat, or secret values. Failed collection returns null counts and a static diagnostic, never empty success. Imports do not query the database.
 
 | Metric | Evidence |
 |---|---|
