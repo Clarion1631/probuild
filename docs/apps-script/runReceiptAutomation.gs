@@ -200,7 +200,7 @@ function runReceiptAutomation() {
     // it would push perfectly readable receipts into terminal give-up (manual entry for
     // Marge) over an outage that heals itself at midnight. Skipping the scan costs nothing:
     // the files keep, and the next run after the reset picks them up untouched.
-    if (MailApp.getRemainingDailyQuota() <= 0) {
+    if (receiptWriterMode_() === 'legacy' && MailApp.getRemainingDailyQuota() <= 0) {
       Logger.log(" > [SKIP] Daily mail quota is exhausted — pausing the scan until it resets.");
       return;
     }
@@ -266,6 +266,16 @@ function processFilesInIterator(fileIterator, ctx, archive, needsReview) {
  * CORE LOGIC
  */
 function processSingleFile(file, ctx, archive, needsReview) {
+  // Gate before any legacy parse, rename, API send, email fallback or archive.
+  // Each rejected v2 file stays for review; the scan continues with no v1 fallback.
+  const writerMode = receiptWriterMode_();
+  if (writerMode !== 'legacy') {
+    if (writerMode === 'v2') {
+      try { forwardReceiptFromScanV2_(file, ctx); }
+      catch (error) { Logger.log('[V2 REVIEW] forwarding failed: '+String(error.message || error)); }
+    }
+    return;
+  }
   const originalName = file.getName();
   Logger.log("Processing: " + originalName + " [" + ctx.projectName + (ctx.category ? " / " + ctx.category : "") + "]");
 
@@ -696,7 +706,12 @@ function processSingleFile(file, ctx, archive, needsReview) {
           // attachment, bank-match ready). Falls back to the legacy email send
           // internally on any terminal decline; throws on transient failures so
           // this pass retries — see sendToQBOviaAPI.js.
-          sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment, fresh);
+          const pushOutcome = sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment, fresh);
+          if (pushOutcome && pushOutcome.parked) {
+            const reviewMsg = parkAlertMessage_("qboDuplicate", file, fresh, ctx, originalName, aiData);
+            parkWithAlert_(file, fresh, "qboDuplicate", reviewMsg.subject, reviewMsg.body, needsReview);
+            return; // The hold must not become emailed=true or enter the archive.
+          }
 
           fresh.emailed = true;
           setState(file, fresh);
@@ -798,7 +813,14 @@ function parkWithAlert_(file, state, reasonKey, subject, body, needsReview) {
   // Beacon LAST: the park (state + alert + move) must complete even if the
   // Command Center endpoint is stalled — a blocked fetch here could otherwise
   // burn the execution budget before the file was actually parked.
-  if (firstParkForReason) reportStageBeacon_(file, "read", "parked", reasonKey);
+  // The API helper persists parkReason before returning a duplicate hold.
+  // Track the attempt separately so safe early persistence cannot hide it.
+  // The existing helper is best effort and does not acknowledge delivery.
+  if (state.parkBeaconAttemptedReason !== reasonKey) {
+    reportStageBeacon_(file, "read", "parked", reasonKey);
+    state.parkBeaconAttemptedReason = reasonKey;
+    setState(file, state);
+  }
 }
 
 /**
@@ -812,6 +834,22 @@ function parkWithAlert_(file, state, reasonKey, subject, body, needsReview) {
  */
 function parkAlertMessage_(reasonKey, file, state, ctx, fileName, aiData) {
   const d = aiData || state.data || {};
+
+  if (reasonKey === "qboDuplicate") {
+    const review = state.qboDuplicateReview || {};
+    const candidates = (review.candidates || []).map(function(c) {
+      return "Purchase " + c.id + " | " + c.date + " | $" + Number(c.amount).toFixed(2);
+    }).join("\n");
+    return {
+      subject: "Receipt bot: possible QuickBooks duplicate — " + fileName,
+      body: '"' + fileName + '" (' + ctx.projectName + ') was held for review. No new Purchase was created.\n' +
+        "QuickBooks candidates (same amount and nearby date, or same month/day in another year):\n" + candidates + "\n" +
+        ((review.pendingFileIds || []).length ? "An earlier create needs reconciliation (outcome unresolved or Purchase not yet visible to duplicate scans); source file(s): " + review.pendingFileIds.join(", ") + "\n" : "") +
+        "Receipt attachment: " + (review.attachment || "not confirmed") + "\n" +
+        "Do not forward or enter this receipt again until these purchases have been reviewed.\n" +
+        'The file was moved to "' + NEEDS_REVIEW_NAME + '".'
+    };
+  }
 
   if (reasonKey === PARK_ZERO_TOTAL) {
     const zeroAiDate = normalizeDateStr(d.date);

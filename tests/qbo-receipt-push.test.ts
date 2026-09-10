@@ -44,6 +44,7 @@ const PROJECT: QboReceiptProjectCandidate = { id: "project-1", name: "Mueller Re
  * tests run without a database; contention itself is covered by the concurrency
  * test at the end of this file.
  */
+import { memoryCreateIntents } from "./fixtures/receipt-create-intents";
 const INLINE_LOCK: ReceiptFileLock = (_fileId, run) => run();
 
 function baseInput(overrides: Partial<CreateQBReceiptPurchaseInput> = {}): CreateQBReceiptPurchaseInput {
@@ -167,6 +168,7 @@ function createDeps(overrides: DepsOverrides = {}) {
         customerCalls: [] as string[],
     };
     const deps: Partial<QboReceiptPushDependencies> = {
+        createIntents: memoryCreateIntents(),
         // Runs the push inline unless a test supplies the serializing lock.
         withFileLock: overrides.withFileLock ?? ((_fileId, run) => run()),
         qbQueryFn: async (_tokens: unknown, query: string) => {
@@ -1406,7 +1408,7 @@ test("the whole push, end to end, stops before the route ceiling", async () => {
                 return slow("vendor-1");
             },
             ensureCustomerFn: async () => slow("cust-1"),
-            listProjects: async () => [PROJECT],
+            createIntents: memoryCreateIntents(), listProjects: async () => [PROJECT],
             withFileLock: INLINE_LOCK,
             qbCreateFn: async () => {
                 createCalls++;
@@ -2055,7 +2057,11 @@ test("the real vendor/customer ensures are bounded by the route budget", async (
 
     const slowFetch = (async (url: string) => {
         calls.push(String(url));
-        await new Promise(resolve => setTimeout(resolve, CALL_MS));
+        // Fast, empty duplicate preflight; retain slow REAL customer/vendor
+        // ensures so this test still proves their shared route deadline.
+        if (!decodeURIComponent(String(url)).includes("TxnDate >=")) {
+            await new Promise(resolve => setTimeout(resolve, CALL_MS));
+        }
         // Every lookup comes back empty, so the helpers walk their full path.
         return new Response(JSON.stringify({ QueryResponse: {} }), {
             status: 200,
@@ -2072,7 +2078,7 @@ test("the real vendor/customer ensures are bounded by the route budget", async (
             TOKENS,
             baseInput({ ...FILE_INPUT }),
             // Only the database read is stubbed; every QBO call is real.
-            { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK },
+            { createIntents: memoryCreateIntents(), listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK },
             deadline,
         ),
     ).then(() => null, (e: unknown) => e as Error);
@@ -2121,7 +2127,7 @@ test("an already-spent budget stops the real ensures before any QBO call", async
         createQBReceiptPurchase(
             TOKENS,
             baseInput({ ...FILE_INPUT }),
-            { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK },
+            { createIntents: memoryCreateIntents(), listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK },
             spent,
         ),
     ).then(() => null, (e: unknown) => e as Error);
@@ -2156,7 +2162,7 @@ test("two concurrent pushes each honour THEIR OWN remaining budget", async () =>
         qbQueryFn: (async (_t: unknown, query: string) => await slowAccounts(query)) as never,
         ensureVendorFn: (async () => "vendor-1") as never,
         ensureCustomerFn: (async () => "cust-1") as never,
-        listProjects: async () => [PROJECT],
+        createIntents: memoryCreateIntents(), listProjects: async () => [PROJECT],
         withFileLock: INLINE_LOCK,
         qbCreateFn: (async () => ({ id: "purchase-1" })) as never,
         uploadAttachment: (async () => "attached" as ReceiptAttachmentStatus) as never,
@@ -2381,7 +2387,7 @@ test("a SHORT-budget push starting the verification does not poison it for other
         qbQueryFn: (async (_t: unknown, query: string) => await slowAccounts(query)) as never,
         ensureVendorFn: (async () => "vendor-1") as never,
         ensureCustomerFn: (async () => "cust-1") as never,
-        listProjects: async () => [PROJECT],
+        createIntents: memoryCreateIntents(), listProjects: async () => [PROJECT],
         withFileLock: INLINE_LOCK,
         qbCreateFn: (async () => ({ id: "purchase-1" })) as never,
         uploadAttachment: (async () => "attached" as ReceiptAttachmentStatus) as never,
@@ -2442,7 +2448,7 @@ test("a 503 on the REAL vendor/customer/purchase create reaches the route as a 5
                 const mod = await import("../src/lib/qbo-receipt-push");
                 // Real ensures, real queries, real create — nothing stubbed but
                 // the project list, which is a database read.
-                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK }, deadline);
+                return mod.createQBReceiptPurchase(tokens, input, { createIntents: memoryCreateIntents(), listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK }, deadline);
             }),
         logEvent: event => { events.push(event); },
     });
@@ -2510,7 +2516,7 @@ test("a 400 on the REAL customer create is a terminal qbo-fault at the route", a
         createPurchase: (tokens, input, deadline) =>
             withFetch(badRequest, async () => {
                 const mod = await import("../src/lib/qbo-receipt-push");
-                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK }, deadline);
+                return mod.createQBReceiptPurchase(tokens, input, { createIntents: memoryCreateIntents(), listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK }, deadline);
             }),
         logEvent: event => { events.push(event); },
     });
@@ -2842,7 +2848,8 @@ test("two simultaneous pushes of one file upload the attachment ONCE and agree o
         createQBReceiptPurchase(TOKENS, input, b.deps),
     ]);
 
-    assert.equal(order.length, 2, "both deliveries went through the per-file lock");
+    assert.equal(order.filter(key => key === input.fileId).length, 2, "both deliveries went through the per-file lock");
+    assert.equal(order.filter(key => key.startsWith("duplicate-amount:")).length, 2, "both deliveries also serialize by amount");
     assert.equal(uploads.length, 1, "the receipt image is uploaded exactly once");
     // The uploaded name is this branch's STABLE one (fileId-derived), not the
     // caller's raw "receipt.jpg"  see the collision test above.
@@ -2966,9 +2973,9 @@ test("round 35 gate: two simultaneous pushes take the REAL lease — one upload,
             fileId,
             () => {
                 entered.push(fileId);
-                concurrent++;
+                if (fileId === input.fileId) concurrent++;
                 maxConcurrent = Math.max(maxConcurrent, concurrent);
-                return run().finally(() => { concurrent--; });
+                return run().finally(() => { if (fileId === input.fileId) concurrent--; });
             },
             undefined,
             // A real (short) timer, so the winner's work actually gets to run
@@ -2981,7 +2988,7 @@ test("round 35 gate: two simultaneous pushes take the REAL lease — one upload,
         createQBReceiptPurchase(TOKENS, input, createDeps({ ...shared, withFileLock: lock }).deps),
     ]);
 
-    assert.equal(entered.length, 2, "both deliveries ran");
+    assert.equal(entered.filter(key => key === input.fileId).length, 2, "both deliveries ran");
     assert.equal(maxConcurrent, 1, "but never at the same time");
     assert.equal(uploads.length, 1, "the receipt image is uploaded exactly once");
     assert.equal(first.ok && first.qbPurchaseId, "77");

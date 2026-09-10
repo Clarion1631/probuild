@@ -104,6 +104,7 @@ export const maxDuration = 60;
 interface ReceiptPushLine { sku?: unknown; desc?: unknown; price?: unknown }
 interface ReceiptPushGroup { category?: unknown; amount?: unknown; lines?: unknown; tax?: unknown }
 interface ReceiptPushBody {
+    dryRun?: unknown;
     fileId?: unknown;
     projectName?: unknown;
     docType?: unknown;
@@ -140,6 +141,7 @@ function normalizeGroups(raw: unknown): CreateQBReceiptPurchaseInput["groups"] {
 
 function buildInput(body: ReceiptPushBody, groups: CreateQBReceiptPurchaseInput["groups"]): CreateQBReceiptPurchaseInput {
     return {
+        ...(body.dryRun === true ? { dryRun: true } : {}),
         projectName: body.projectName as string,
         fileId: body.fileId as string,
         groups,
@@ -204,7 +206,7 @@ export function attachmentSucceeded(attachment: string | undefined): boolean {
 
 function pushEventFromOutcome(
     input: CreateQBReceiptPurchaseInput,
-    outcome: { status: "created" | "already-exists" | "fallback" | "error" | "attachment-failed"; reason?: string },
+    outcome: { status: "created" | "already-exists" | "fallback" | "error" | "attachment-failed" | "needs-review"; reason?: string },
     detail?: Record<string, unknown>,
 ): AutomationEventInput {
     const taxCents = input.groups
@@ -257,6 +259,9 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 return NextResponse.json({ ok: false, reason: "invalid-json" });
             }
 
+            if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") {
+                return NextResponse.json({ ok: false, reason: "invalid-dry-run" }, { status: 400 });
+            }
             const groups = normalizeGroups(body.groups);
             if (
                 typeof body.fileId !== "string" || !body.fileId ||
@@ -273,6 +278,7 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
             // divert the money path into an error branch.
             const rawLog = dependencies.logEvent ?? logAutomationEvent;
             const logEvent = async (event: AutomationEventInput) => {
+                if (body.dryRun === true) return;
                 try { await rawLog(event); } catch (error) {
                     console.error("push audit log failed", error instanceof Error ? error.name : "UnknownError");
                 }
@@ -327,6 +333,22 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 // Apps Script treats ok:false as terminal, same convention as
                 // sendToProBuild.txt.
                 const result = await dependencies.createPurchase(tokens, input, deadline);
+                if (input.dryRun === true) {
+                    // Non-200 also protects older Apps Script versions, whose
+                    // 200/ok:false handling sends the receipt into QBO by email.
+                    return NextResponse.json(result, { status: 409 });
+                }
+                if (!result.ok && result.reason === "duplicate-create-pending") {
+                    await logEvent(pushEventFromOutcome(input,{status:"needs-review",reason:result.reason},
+                        {pendingFileIds:result.pendingFileIds,candidates:result.candidates}));
+                    return NextResponse.json({...result,reviewRequired:true,retry:false},{status:409});
+                }
+                if (!result.ok && result.reason === "duplicate-purchase-review") {
+                    await logEvent(pushEventFromOutcome(input,
+                        { status: "needs-review", reason: result.reason },
+                        { candidates: result.candidates, attachment: result.attachment }));
+                    return NextResponse.json({ ...result, reviewRequired: true, retry: false }, { status: 409 });
+                }
                 // A booking whose receipt never made it is reported as
                 // attachment-failed, not as a clean create — see
                 // ATTACHMENT_FAILED_STATUS.

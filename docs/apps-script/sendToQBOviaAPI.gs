@@ -21,8 +21,9 @@
  *  - GAS flag off / no key / file > 3MB / ambiguous prior legacy email
  *    (possibleDuplicate) / uncategorized Shop doc -> email path (sticky)
  *  - HTTP 401            -> ONE alert per file (quota-guarded), then throw (retry)
+ *  - HTTP 409 duplicate  -> durable review hold; NEVER email or archive as sent
  *  - other non-200       -> throw (transient; retries next pass)
- *  - 200 { ok:false }    -> sticky email route, then the legacy sendToQBO(...)
+ *  - 200 { ok:false }    -> first-attempt refusal may email; prior API attempt parks
  *  - 200 { ok:true }     -> state.qboApi = the QBO purchase id
  * Shop/overhead docs ride the API path when they carry a category folder
  * (the folder name mirrors the QBO expense account — ProBuild resolves it via
@@ -42,6 +43,7 @@ const PROBUILD_QBO_PUSH_URL = "https://probuild.goldentouchremodeling.com/api/in
 const MAX_QBO_PUSH_ATTACHMENT_BYTES = 3 * 1024 * 1024;
 
 function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment, state) {
+  if (state.parkReason === "qboDuplicate") return { parked: true };
   if (state.qboApi) return; // already handled on a previous pass
 
   // Books the document via the legacy email send and stamps the sticky
@@ -210,6 +212,20 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
     throw new Error("ProBuild QBO push HTTP 401 (unauthorized) — check RECEIPT_INGEST_SECRET.");
   }
 
+  if (code === 409) {
+    const review = JSON.parse(res.getContentText());
+    if ((review.reason === "duplicate-purchase-review" || review.reason === "duplicate-create-pending") && review.reviewRequired === true) {
+      // Persist BEFORE returning. A crash before alert/move re-enters the
+      // terminal park branch on the next pass, never the email fallback.
+      state.parkReason = "qboDuplicate";
+      state.qboDuplicateReview = { candidates: review.candidates || [], attachment: review.attachment,
+        pendingFileIds: review.pendingFileIds || [] };
+      setState(file, state);
+      Logger.log("   >> QBO duplicate review: " + state.qboDuplicateReview.candidates.map(function(c) { return c.id; }).join(", "));
+      return { parked: true };
+    }
+  }
+
   if (code !== 200) {
     // ProBuild unreachable / transient server error -> retry next pass. The
     // sticky "api" route + server-side idempotency make retries safe.
@@ -228,7 +244,18 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
     return;
   }
 
-  // Terminal decline (push-disabled, project-not-matched, missing-vendor,
+  if (apiCommitted) {
+    // A decline on this retry (even push-disabled or invalid input) says
+    // nothing about a prior POST whose response was lost. Never email it.
+    state.parkReason = "qboDuplicate";
+    state.qboDuplicateReview = { candidates: [], pendingFileIds: [file.getId()],
+      reason: "prior-api-attempt:" + (body.reason || "unknown") };
+    setState(file, state);
+    Logger.log("   >> Earlier API attempt unresolved — held for QBO review, no email fallback.");
+    return { parked: true };
+  }
+
+  // First-attempt terminal decline (push-disabled, project-not-matched, missing-vendor,
   // amount-mismatch, qbo-fault, ...): this document becomes an email
   // document — route persisted first, then booked via the legacy path.
   Logger.log("   >> QuickBooks API push declined (" + body.reason + ") — falling back to email path.");

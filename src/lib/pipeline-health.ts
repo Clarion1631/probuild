@@ -3,6 +3,15 @@ import { prisma } from "@/lib/prisma";
 import { CARD_RESEND_QUEUED_REASON, CARD_RESEND_STALE_HOURS } from "@/lib/receipt-request-cards";
 import { STAGING_SWEEP_MINUTES } from "./receipt-intake/worker";
 import {
+    createRouteDeadline,
+    isQBBudgetExhaustedError,
+    isQBTimeoutError,
+    qbQuery,
+    type QBTokens,
+    type RouteDeadline,
+} from "./quickbooks";
+import type { DuplicatePurchasePair } from "./qbo-purchase-duplicates";
+import {
     PAID_DELETION_UNRESOLVABLE,
     PAYLINK_MISSING_MARKER,
     PAYLINK_PENDING_MARKER,
@@ -72,6 +81,13 @@ export interface CountProbe {
     count: number;
 }
 
+export interface DuplicatePurchasesProbe {
+    status: ProbeStatus;
+    reason?: ProbeFailure;
+    /** Possible matches only; this read never resolves or changes a purchase. */
+    pairs: DuplicatePurchasePair[];
+}
+
 export interface PipelineHealth {
     ok: boolean;
     /** Empty exactly when `ok` is true. Machine-readable, one per failed check. */
@@ -107,6 +123,8 @@ export interface PipelineHealth {
          * purpose: they must not be able to disguise a dead cron.
          */
         lastPaymentsSync: TimestampProbe;
+        /** Always populated by getPipelineHealth; optional for older cached snapshots. */
+        duplicatePurchases?: DuplicatePurchasesProbe;
     };
     /** receipt-push events in the last 24h, by status ("created", "fallback", ...). */
     receipts24h: CountsProbe;
@@ -466,6 +484,18 @@ export function purchaseSyncStaleHours(): number {
  *    long it has actually been and a human decides whether the silence is
  *    expected.
  */
+type ReceiptStatusGroup = { status: string; source: string | null; _count: { _all: number } };
+
+/** Linked guard evidence is audit detail, not another receipt outcome. */
+export function summarizeReceiptStatusCounts(rows: ReceiptStatusGroup[]): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const row of rows) {
+        if (row.source === "purchase-guard") continue;
+        counts[row.status] = (counts[row.status] ?? 0) + row._count._all;
+    }
+    return counts;
+}
+
 export function evaluatePipelineHealth(input: {
     intuit: IntuitProbe;
     lastPurchaseSync: TimestampProbe;
@@ -477,6 +507,7 @@ export function evaluatePipelineHealth(input: {
     purchaseSyncRun: TimestampProbe;
     lastReceiptPush: TimestampProbe;
     lastPaymentsSync: TimestampProbe;
+    duplicatePurchases?: DuplicatePurchasesProbe;
     receipts24h: CountsProbe;
     bank: TimestampProbe;
     stuck: CountProbe;
@@ -608,6 +639,12 @@ export function evaluatePipelineHealth(input: {
         // Nothing will book until a human reconnects QuickBooks, so say that
         // rather than folding it into a generic error count.
         reasons.push("quickbooks-reconnect-needed");
+    }
+
+    if (input.duplicatePurchases?.status === "error") {
+        reasons.push("probe-failed:duplicatePurchases");
+    } else if (input.duplicatePurchases && input.duplicatePurchases.pairs.length > 0) {
+        reasons.push(`possible-duplicate-purchases:${input.duplicatePurchases.pairs.length}`);
     }
 
     if (input.payLinksPending.status === "ok" && input.payLinksPending.count > 0) {
@@ -1459,7 +1496,67 @@ export async function runProbe<T>(
     }
 }
 
-export async function getPipelineHealth(): Promise<PipelineHealth> {
+/** Runs alongside the DB probes; leaves room for the digest's 10s delivery deadline. */
+export const QBO_DUPLICATE_PROBE_TIMEOUT_MS = 30_000;
+
+export interface DuplicatePurchaseProbeDependencies {
+    getTokens?: (deadline: RouteDeadline) => Promise<QBTokens>;
+    query?: typeof qbQuery;
+    timeoutMs?: number;
+}
+
+/**
+ * External reads must not hold a Prisma transaction while QBO is responding.
+ * Auth and every page use ONE deadline; the wall timer also bounds a stuck
+ * settings read. No partial result is published when any part fails.
+ */
+export async function probeDuplicatePurchases(
+    now: Date,
+    deps: DuplicatePurchaseProbeDependencies = {},
+): Promise<DuplicatePurchasesProbe> {
+    const timeoutMs = deps.timeoutMs ?? QBO_DUPLICATE_PROBE_TIMEOUT_MS;
+    const deadline = createRouteDeadline(timeoutMs);
+    const query: typeof qbQuery = deps.query ?? ((t, sql, d) => qbQuery(t, sql, d, { expectedEntity: "Purchase" }));
+    const timedOut = Symbol("duplicate-purchases-timeout");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let expired = false;
+    const work = async () => {
+        const getTokens = deps.getTokens ?? (await import("./quickbooks-payments")).getFreshQBTokens;
+        const tokens = await getTokens(deadline);
+        // An auth/settings read may finish after the wall timer. Do not start
+        // new QBO work after the caller has already reported it unavailable.
+        if (expired) throw new Error("duplicate-purchases-probe-expired");
+        const { findRecentQboPurchaseDuplicates } = await import("./qbo-purchase-duplicates");
+        return findRecentQboPurchaseDuplicates(tokens, <T,>(t: QBTokens, sql: string) => {
+            if (expired) return Promise.reject(new Error("duplicate-purchases-probe-expired"));
+            return query<T>(t, sql, deadline);
+        }, now);
+    };
+    try {
+        const result = await Promise.race([
+            work(),
+            new Promise<typeof timedOut>(resolve => {
+                timer = setTimeout(() => { expired = true; resolve(timedOut); }, timeoutMs);
+            }),
+        ]);
+        if (result === timedOut) return { status: "error", reason: "timeout", pairs: [] };
+        return { status: "ok", pairs: result };
+    } catch (error) {
+        // Log only the class; QBO failures may contain receipt details or a URL.
+        console.error("[pipeline-health] duplicate purchase probe failed", error instanceof Error ? error.name : "UnknownError");
+        return {
+            status: "error",
+            reason: isQBTimeoutError(error) || isQBBudgetExhaustedError(error) ? "timeout" : "error",
+            pairs: [],
+        };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+export async function getPipelineHealth(deps: {
+    duplicatePurchaseProbe?: DuplicatePurchaseProbeDependencies;
+} = {}): Promise<PipelineHealth> {
     const now = Date.now();
     const since24h = new Date(now - DAY_MS);
 
@@ -1473,7 +1570,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         qboAuth, payLinksPending, payLinksMissing, parkedCreates,
         parkedDocumentSyncs, pendingDeletions, unreconciledMoney, maintenanceRun,
         uncertainCards, queuedCards, rejectedQueuedCards, bankPull,
-        chaser, driveCredentials,
+        chaser, driveCredentials, duplicatePurchases,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -1561,11 +1658,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             },
             { createdAt: null, latestStatus: null },
         ),
-        probe<Array<{ status: string; _count: { _all: number } }>>(
+        probe<ReceiptStatusGroup[]>(
             "receipts24h",
             async (db) => {
                 const rows = await db.automationEvent.groupBy({
-                    by: ["status"],
+                    by: ["status", "source"],
                     where: { kind: "receipt-push", createdAt: { gte: since24h } },
                     _count: { _all: true },
                 });
@@ -1878,13 +1975,14 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             },
             { ok: false, source: "none" },
         ),
+        probeDuplicatePurchases(new Date(now), deps.duplicatePurchaseProbe),
     ]);
 
-    const counts: Record<string, number> = {};
-    for (const row of receiptRows.value) counts[row.status] = row._count._all;
+    const counts = summarizeReceiptStatusCounts(receiptRows.value);
 
     const snapshot = {
         intuit,
+        duplicatePurchases,
         lastPurchaseSync: {
             status: lastPurchase.status,
             reason: lastPurchase.reason,
@@ -1990,6 +2088,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             purchaseSyncRun: snapshot.purchaseSyncRun,
             lastReceiptPush: snapshot.lastReceiptPush,
             lastPaymentsSync: snapshot.lastPaymentsSync,
+            duplicatePurchases: snapshot.duplicatePurchases,
         },
         receipts24h: snapshot.receipts24h,
         bank: snapshot.bank,
@@ -2102,6 +2201,24 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
             health.intake?.quarantined?.status === "error" ? "unavailable (probe failed)" : health.intake?.quarantined?.count ?? "unavailable"
         }`,
     ];
+    const duplicates = health.qbo.duplicatePurchases;
+    lines.push(`Possible duplicate QBO purchases: ${
+        !duplicates ? "unavailable (not checked)"
+            : duplicates.status === "error" ? `unavailable (probe failed: ${duplicates.reason ?? "error"})`
+                : duplicates.pairs.length
+    }`);
+    if (duplicates?.status === "ok" && duplicates.pairs.length > 0) {
+        lines.push("Bookkeeper review required; no QBO transactions changed.");
+        // Keep external vendor labels on one line in both Chat and email.
+        const vendorLabel = (vendor: string | null) => typeof vendor === "string" && vendor.trim()
+            ? vendor.replace(/[\r\n\t]/g, " ") : "vendor unavailable";
+        for (const pair of duplicates.pairs) {
+            const reason = pair.match === "within-7-days"
+                ? "same amount within 7 days"
+                : "same amount and same month/day in different years";
+            lines.push(`- Possible duplicate: QBO ${pair.ids[0]} (${pair.dates[0]}, ${vendorLabel(pair.vendors[0])}) / QBO ${pair.ids[1]} (${pair.dates[1]}, ${vendorLabel(pair.vendors[1])}); $${pair.amount.toFixed(2)}; ${reason}.`);
+        }
+    }
     if (health.payLinksMissing?.status === "ok" && health.payLinksMissing.count > 0) {
         lines.push(`${health.payLinksMissing.count} QuickBooks invoice(s) have NO payable link after repeated retries — open them in QuickBooks and enable payments by hand.`);
     }

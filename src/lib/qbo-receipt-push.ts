@@ -20,8 +20,11 @@
  * the Vendor entity. createQBReceiptPurchase's dependency-injection shape
  * mirrors syncQboExpenses in ./qbo-expense-sync.ts.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { prisma } from "./prisma";
+import { automationEventData } from "./automation-events";
+import { findPurchaseDuplicateCandidates, matchDates, type DuplicatePurchaseCandidate } from "./qbo-purchase-duplicates";
+import { receiptCreateIntentStore, type ReceiptCreateIntentStore } from "./receipt-create-intents";
 import {
     qbFetch,
     qbQuery,
@@ -202,6 +205,8 @@ export interface QboReceiptGroup {
 }
 
 export interface CreateQBReceiptPurchaseInput {
+    /** Read QBO and report the decision; never create, attach, lease, or log. */
+    dryRun?: boolean;
     projectName: string;
     docType?: string;
     vendor?: string;
@@ -306,6 +311,9 @@ export interface ExistingPurchaseCheck {
 }
 
 export type CreateQBReceiptPurchaseResult =
+    | { ok: false; reason: "duplicate-create-pending"; pendingFileIds: string[]; candidates: DuplicatePurchaseCandidate[] }
+    | { ok: false; reason: "duplicate-purchase-review"; candidates: DuplicatePurchaseCandidate[]; attachment: ReceiptAttachmentStatus }
+    | { ok: false; reason: "dry-run"; action: "would-create" | "already-exists" | "needs-review"; candidates: DuplicatePurchaseCandidate[]; pendingFileIds?: string[] }
     | {
         ok: true;
         qbPurchaseId: string;
@@ -335,7 +343,56 @@ export interface QboReceiptProjectCandidate {
     name: string;
 }
 
+interface ReceiptDuplicateReview {
+    fileId: string;
+    realmId: string;
+    candidates: DuplicatePurchaseCandidate[];
+    pendingFileIds?: string[];
+}
+
+/** Keep identifiers below the audit serializer's 4,000-character clipping limit. */
+function duplicateReviewDetails(record: ReceiptDuplicateReview) {
+    const pendingFileIds = record.pendingFileIds ?? [];
+    const base = {
+        fileId: record.fileId, realmId: record.realmId, reviewId: randomUUID(),
+        candidateCount: record.candidates.length, pendingCount: pendingFileIds.length,
+    };
+    const emptyChunk = () => ({
+        ...base, chunkIndex: Number.MAX_SAFE_INTEGER, chunkCount: Number.MAX_SAFE_INTEGER,
+        candidateIds: [] as string[], pendingFileIds: [] as string[],
+    });
+    const chunks: ReturnType<typeof emptyChunk>[] = [];
+    let chunk = emptyChunk();
+    // Reserve room for linkage/counts while calculating boundaries. Replacing
+    // the placeholder numbers with actual indices only makes each chunk smaller.
+    for (const [field, ids] of [
+        ["candidateIds", record.candidates.map(c => c.id)],
+        ["pendingFileIds", pendingFileIds],
+    ] as const) {
+        for (const id of ids) {
+            chunk[field].push(id);
+            if (JSON.stringify(chunk).length <= 3500) continue;
+            chunk[field].pop();
+            if (!chunk.candidateIds.length && !chunk.pendingFileIds.length) {
+                throw new QboRetryableError("Receipt review identifiers exceed audit storage budget");
+            }
+            chunks.push(chunk);
+            chunk = emptyChunk();
+            chunk[field].push(id);
+            if (JSON.stringify(chunk).length > 3500) {
+                throw new QboRetryableError("Receipt review identifiers exceed audit storage budget");
+            }
+        }
+    }
+    chunks.push(chunk);
+    return chunks.map((part, index) => ({...part, chunkIndex:index+1, chunkCount:chunks.length}));
+}
+
 export interface QboReceiptPushDependencies {
+    createIntents?: ReceiptCreateIntentStore;
+    now?: () => Date;
+    /** Durable evidence must land BEFORE attempting an attachment on a possible duplicate. */
+    recordDuplicateReview?: (record: ReceiptDuplicateReview) => Promise<void>;
     qbQueryFn: <T = any>(tokens: QBTokens, query: string) => Promise<T[]>;
     qbCreateFn: (tokens: QBTokens, payload: Record<string, unknown>, requestId: string) => Promise<{ id: string }>;
     /**
@@ -918,6 +975,8 @@ async function ensureAttachmentOnExistingPurchase(
     deadline?: RouteDeadline,
     /** Injectable for tests; defaults to the real token refresh. */
     refreshTokens?: () => Promise<QBTokens>,
+    /** For an uncertain duplicate, preserve ANY existing attachment, not just this file's. */
+    preserveAnyAttachment = false,
 ): Promise<ReceiptAttachmentStatus> {
     const plan = planAttachmentUpload(input);
     if (!plan) return "skipped";
@@ -961,15 +1020,24 @@ async function ensureAttachmentOnExistingPurchase(
         }
         // Entity ids are only unique per entity type, so a value-only query can
         // surface attachments from other transaction types — keep Purchase links.
+        if (preserveAnyAttachment && rows.some(row => !row || !Array.isArray(row.AttachableRef) ||
+            row.AttachableRef.length === 0 || row.AttachableRef.some(ref => !ref?.EntityRef ||
+                typeof ref.EntityRef.value !== "string" || !ref.EntityRef.value.trim() ||
+                typeof ref.EntityRef.type !== "string" || !ref.EntityRef.type.trim()))) {
+            throw new QboRetryableError("Attachment references are unreadable; absence is unconfirmed");
+        }
         const alreadyAttached = (rows ?? []).some(
             row =>
                 row?.AttachableRef?.some(
                     ref =>
                         ref.EntityRef?.value === purchaseId &&
                         /^purchase$/i.test(ref.EntityRef?.type ?? ""),
-                ) && (row.FileName ?? "") === plan.fileName,
+                ) && (preserveAnyAttachment || (row.FileName ?? "") === plan.fileName),
         );
         if (alreadyAttached) return "already-attached";
+        // This legacy lookup has a default page size of 100. A full page that
+        // only names other entity types cannot prove this Purchase has no image.
+        if (preserveAnyAttachment && rows.length >= 100) return "failed:attachment-lookup-incomplete";
         return await uploadAttachment(activeTokens, purchaseId, plan);
     } catch (error) {
         // Retryable: our deadline, a 429/5xx, a transport failure. These say
@@ -1438,9 +1506,16 @@ export async function createQBReceiptPurchase(
     deps: Partial<QboReceiptPushDependencies> = {},
     deadline?: RouteDeadline,
 ): Promise<CreateQBReceiptPurchaseResult> {
+    if (input.dryRun === true) return createQBReceiptPurchaseUnderLock(tokens, input, deps, deadline);
     const withFileLock: ReceiptFileLock =
         deps.withFileLock ?? ((fileId, run) => withReceiptFileLease(fileId, run, deadline));
-    return withFileLock(input.fileId, () => createQBReceiptPurchaseUnderLock(tokens, input, deps, deadline));
+    const run = () => withFileLock(input.fileId, () => createQBReceiptPurchaseUnderLock(tokens, input, deps, deadline));
+    // Different captures have different Drive IDs. Serialize equal-amount checks
+    // through CREATE across both legacy and v2 callers; a per-file lock alone
+    // allows both to see an empty result and create concurrently.
+    const amount = Math.round(input.totalAmount * 100);
+    if (!Number.isSafeInteger(amount) || amount <= 0) return run();
+    return withFileLock(`duplicate-amount:${tokens.realmId}:${amount}`, run);
 }
 
 async function createQBReceiptPurchaseUnderLock(
@@ -1455,8 +1530,10 @@ async function createQBReceiptPurchaseUnderLock(
      */
     deadline?: RouteDeadline,
 ): Promise<CreateQBReceiptPurchaseResult> {
-    const qbQueryFn = deps.qbQueryFn ?? ((t, q) => qbQuery(t, q, deadline));
+    const qbQueryFn = deps.qbQueryFn ?? ((t, q) => qbQuery(t, q, deadline,
+        { expectedEntity: /FROM Purchase\b/i.test(q) ? "Purchase" : /FROM attachable\b/i.test(q) ? "Attachable" : undefined }));
     const qbCreateFn = deps.qbCreateFn ?? ((t, p, r) => defaultQbCreatePurchase(t, p, r, deadline));
+    const intents = deps.createIntents ?? receiptCreateIntentStore;
     // Every default QBO call carries the route budget: the ensures are two more
     // serial round trips, and they were the gap that let a push still overrun.
     const ensureVendorFn = deps.ensureVendorFn ?? ((t, n) => ensureQBVendor(t, n, deadline));
@@ -1493,18 +1570,33 @@ async function createQBReceiptPurchaseUnderLock(
     // number, a date or a job the books do not have. QBO cannot return a
     // nested Line/EntityRef/TxnTaxDetail from a field list, so the whole entity
     // is fetched — it is one row, and only on the replay path.
-    const existing = await qbQueryFn<Record<string, unknown>>(
-        tokens,
-        `SELECT * FROM Purchase WHERE DocNumber = '${escapeQBString(docNumber)}'`,
-    );
+    let existing: Record<string, unknown>[];
+    try {
+        existing = await qbQueryFn<Record<string, unknown>>(
+            tokens,
+            `SELECT * FROM Purchase WHERE DocNumber = '${escapeQBString(docNumber)}'`,
+        );
+    } catch (error) {
+        const status = qboHttpStatus(error);
+        if (status !== null && status !== 401 && status !== 403) {
+            throw new QboRetryableError("Receipt identity check unavailable", status);
+        }
+        throw error;
+    }
     if (existing.length > 0) {
         if (existing.length > 1 || !(String(existing[0].PrivateNote ?? "")).includes(marker)) {
             return { ok: false, reason: "docnumber-conflict", docNumber };
         }
-        // THE PURCHASE EXISTS. Say so before doing anything else with it: the
-        // attachment re-check below is a QBO round trip that can fail, and the
-        // caller still has to know a Purchase is there.
+        if (input.dryRun === true) return { ok: false, reason: "dry-run", action: "already-exists", candidates: [] };
+        // Fence ownership and record that a Purchase is known BEFORE any other
+        // fallible work, including durable intent reads or acknowledgments.
         await deps.onExistingPurchase?.();
+        // DocNumber proves identity, but need not share the date query's index.
+        // Remember its acknowledged ID without clearing the guard's protection.
+        const priorIntent = (await intents.list(tokens.realmId)).find(p => p.fileId === input.fileId);
+        if (priorIntent && !priorIntent.qbPurchaseId) {
+            await intents.acknowledge(tokens.realmId, priorIntent, String(existing[0].Id ?? ""));
+        }
         const booked = compareExistingPurchase(readBookedPurchase(existing[0], taxAccountId), input);
         // The Purchase exists, but that does NOT mean the receipt file made it
         // across. The common way to reach this branch is a first attempt whose
@@ -1568,6 +1660,82 @@ async function createQBReceiptPurchaseUnderLock(
     }
     if (Math.abs(groupsSumCents - totalCents) > 2) {
         return { ok: false, reason: "amount-mismatch", groupsSum: groupsSumCents / 100, totalAmount: input.totalAmount };
+    }
+
+    let candidates: DuplicatePurchaseCandidate[];
+    try {
+        candidates = await findPurchaseDuplicateCandidates(
+            tokens, { totalAmount: input.totalAmount, date: input.date }, qbQueryFn, deps.now?.() ?? new Date(),
+        );
+    } catch (error) {
+        const status = qboHttpStatus(error);
+        // A refused READ is not permission to book via the legacy email fallback.
+        // Preserve auth failures for reconnect handling; other query refusals retry.
+        if (status !== null && status !== 401 && status !== 403) {
+            throw new QboRetryableError("Receipt duplicate check unavailable", status);
+        }
+        throw error;
+    }
+    const receiptDate = input.date;
+    // A visible Purchase does not resolve an unknown create for another capture.
+    // Read both evidence sources before choosing any attachment destination.
+    const storedIntents = await intents.list(tokens.realmId);
+    // Only an acknowledged ID observed by this strict query resolves an intent.
+    // An unrelated visible candidate never settles an unknown create outcome.
+    const visibleIds = new Set(candidates.map(candidate => candidate.id));
+    const observedIntents = storedIntents.filter(p => p.qbPurchaseId && visibleIds.has(p.qbPurchaseId));
+    if (input.dryRun !== true) {
+        for (const observed of observedIntents) await intents.remove(tokens.realmId, observed.fileId);
+    }
+    const observedSources = new Set(observedIntents.map(p => p.fileId));
+    const unresolved = storedIntents.filter(p => !observedSources.has(p.fileId));
+    const ownIntent = unresolved.find(p => p.fileId === input.fileId);
+    const pendingFileIds = unresolved
+        .filter(p => p.fileId === input.fileId
+            ? !!p.qbPurchaseId || candidates.length > 0 || p.amountCents !== totalCents || p.date !== receiptDate
+              // Changed OCR or another visible candidate makes a same-source replay ambiguous.
+            : p.amountCents === totalCents && matchDates(receiptDate,p.date,deps.now?.() ?? new Date()))
+        .map(p => p.fileId);
+    if (input.dryRun === true) {
+        return { ok: false, reason: "dry-run", action: candidates.length || pendingFileIds.length ? "needs-review" : "would-create",
+            candidates, ...(pendingFileIds.length ? {pendingFileIds} : {}) };
+    }
+    if (candidates.length || pendingFileIds.length) {
+        const reason = pendingFileIds.length ? "duplicate-create-pending" : "duplicate-purchase-review";
+        const record = { fileId: input.fileId, realmId: tokens.realmId, candidates, pendingFileIds };
+        if (deps.recordDuplicateReview) await deps.recordDuplicateReview(record);
+        else {
+            // Every linked chunk must persist before the hold or an attachment.
+            // Rich candidate metadata can exceed the generic audit serializer's
+            // budget; these compact ID lists remain complete and machine-readable.
+            for (const detail of duplicateReviewDetails(record)) {
+                await prisma.automationEvent.create({ data: automationEventData({
+                    kind: "receipt-push", status: "needs-review", reason,
+                    source: "purchase-guard", vendor: input.vendor, projectName: input.projectName,
+                    amountCents: totalCents, docNumber, fileName: input.fileName, detail,
+                }) });
+            }
+        }
+        console.warn("[receipt-duplicate-guard] held for review", {
+            fileId: input.fileId, candidateIds: candidates.map(c => c.id), pendingFileIds,
+        });
+        if (pendingFileIds.length) return {ok:false,reason:"duplicate-create-pending",pendingFileIds,candidates};
+        let attachment: ReceiptAttachmentStatus = "skipped";
+        // Same amount/date identifies CANDIDATES, not identity. Never select one
+        // from multiple hits or create a second Purchase. No Purchase fields change.
+        if (candidates.length === 1) {
+            try {
+                attachment = await ensureAttachmentOnExistingPurchase(
+                    tokens, candidates[0].id, input, qbQueryFn, uploadAttachment, deadline, refreshTokensFn, true,
+                );
+            } catch (error) {
+                // The duplicate hold is already durable. An attachment failure
+                // must not prevent either caller from parking this receipt.
+                attachment = "failed:attachment-unconfirmed";
+                console.error("[receipt-duplicate-guard] attachment unconfirmed", error instanceof Error ? error.name : "UnknownError");
+            }
+        }
+        return { ok: false, reason: "duplicate-purchase-review", candidates, attachment };
     }
 
     // Overhead docs post to the category's own expense account. The tax split
@@ -1668,8 +1836,36 @@ async function createQBReceiptPurchaseUnderLock(
     if (isBudgetExhausted(deadline)) {
         throw new QBBudgetExhaustedError("Route budget exhausted before the QBO Purchase create");
     }
-    await deps.onBeforeCreate?.();
-    const created = await qbCreateFn(tokens, payload, requestId);
+    // Persist BEFORE issuing the create. A timeout, process death, or unknown
+    // response leaves this intent intact after the short amount lease expires.
+    const newIntent = !ownIntent;
+    const createIntent = ownIntent ?? {fileId:input.fileId,date:input.date,amountCents:totalCents};
+    if (newIntent && !await intents.put(tokens.realmId, createIntent)) {
+        throw new QboRetryableError("Receipt create intent changed; retry the original source");
+    }
+    try { await deps.onBeforeCreate?.(); }
+    catch (error) {
+        if (newIntent) await intents.remove(tokens.realmId,input.fileId); // No call in THIS first attempt.
+        throw error;
+    }
+    let created: {id:string};
+    try { created = await qbCreateFn(tokens, payload, requestId); }
+    catch (error) {
+        const status = qboHttpStatus(error);
+        if (newIntent && (error instanceof QboPurchaseFaultError ||
+            (status !== null && status >= 400 && status < 500 && status !== 408 && status !== 429))) {
+            await intents.remove(tokens.realmId,input.fileId); // Definite refusal only.
+        }
+        if (!newIntent) {
+            // This retry's refusal cannot settle the original unknown outcome,
+            // and must not enable the legacy caller's terminal email fallback.
+            throw new QboRetryableError("Earlier receipt create remains unresolved", status ?? undefined);
+        }
+        throw error;
+    }
+    // The create acknowledgment is not proof that QBO queries can see it yet.
+    // Keep the source protected while that visibility catches up.
+    await intents.acknowledge(tokens.realmId, createIntent, created.id);
 
     let attachment: ReceiptAttachmentStatus = "skipped";
     const plan = planAttachmentUpload(input);
@@ -1692,5 +1888,7 @@ async function createQBReceiptPurchaseUnderLock(
         }
     }
 
+    // A later duplicate-candidate scan retires this intent once it sees the ID.
+    // Do not add post-create QBO reads or assume DocNumber visibility is enough.
     return { ok: true, qbPurchaseId: created.id, docNumber, alreadyExists: false, attachment };
 }

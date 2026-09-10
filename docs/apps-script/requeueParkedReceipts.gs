@@ -38,7 +38,7 @@ const REQUEUE_FOLDER_NAME = "_Needs Review";
 
 /** Counters and flags that gate a retry. Everything else is preserved. */
 const REQUEUE_CLEARED_KEYS = [
-  "attempts", "runs", "busyPasses", "parkReason", "parkAlerted",
+  "attempts", "runs", "busyPasses", "parkReason", "parkAlerted", "parkBeaconAttemptedReason",
   "lastError", "lastErrorAt",
 ];
 
