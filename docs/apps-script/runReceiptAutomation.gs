@@ -1310,7 +1310,10 @@ function tryAutoSplitMultiDoc(file, ctx, archive, originalName) {
     }
 
     const PDFLib = loadPdfLib_();
-    const bytes = file.getBlob().getBytes();
+    // Apps Script Blob.getBytes() returns a plain JS array of SIGNED bytes (-128..127). pdf-lib
+    // only accepts string | Uint8Array | ArrayBuffer, so wrap it in a Uint8Array created in the
+    // same realm pdf-lib was evaluated in; the typed-array constructor wraps negatives to 0..255.
+    const bytes = new Uint8Array(file.getBlob().getBytes());
     const parent = file.getParents().next();
     const base = originalName.replace(/\.pdf$/i, "");
     const groups = map.transactions;
@@ -1351,7 +1354,7 @@ function tryAutoSplitMultiDoc(file, ctx, archive, originalName) {
       children.forEach(function (c) {
         const existing = parent.getFilesByName(c.name);
         const child = existing.hasNext() ? existing.next()
-          : parent.createFile(Utilities.newBlob(c.bytes, "application/pdf", c.name));
+          : parent.createFile(Utilities.newBlob(pdfBytesToAppsScriptBytes_(c.bytes), "application/pdf", c.name));
         try { child.setDescription(JSON.stringify({ splitFrom: file.getId() })); } catch (e) {}
         made.push(c.name);
       });
@@ -1404,6 +1407,15 @@ function tryAutoSplitMultiDoc(file, ctx, archive, originalName) {
     Logger.log(" > [AUTO-SPLIT ERROR] " + originalName + ": " + e.toString());
     return false;
   }
+}
+
+// pdf-lib's save() yields a Uint8Array (0..255). Apps Script's Utilities.newBlob expects a plain
+// JS array of SIGNED bytes (-128..127), the same shape Blob.getBytes() returns. Convert explicitly
+// so the blob never receives a typed array; values above 127 wrap to their negative two's-complement.
+function pdfBytesToAppsScriptBytes_(u8) {
+  const out = new Array(u8.length);
+  for (let i = 0; i < u8.length; i++) out[i] = u8[i] > 127 ? u8[i] - 256 : u8[i];
+  return out;
 }
 
 // Gemini pass for multi-docs: group pages by transaction. Returns
