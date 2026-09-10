@@ -132,7 +132,7 @@ test("the open-issue pass asks for closure; the line pass keeps the window", () 
     // The open pass passes "closure" explicitly.
     assert.match(source, /page\.map\(issue => \(\{ targetKey: issue\.targetKey \}\)\),[\s\S]{0,400}"closure",/);
     // In closure mode the expansion is per line, through the same walk.
-    assert.match(source, /if \(cohortMode === "closure"\) \{[\s\S]{0,300}await loadCompetingComponent\(row\)/);
+    assert.match(source, /if \(cohortMode === "closure"\) \{[\s\S]{0,300}await loadCompetingComponent\(row, budget.expired\)/);
     // An unloadable component costs that line its verdict — never a close.
     assert.match(source, /judgeOnly\.delete\(row\.id\);/);
     assert.match(source, /undecided: plan\.undecided\.length \+ unresolved\.length/);
@@ -188,5 +188,5 @@ test("the line pass sends only its edge components through the walk", () => {
     assert.match(source, /\[interiorBatch, "window"\],\s*\n\s*\[boundaryBatch, "closure"\],/);
     // And a failure in EITHER still stops the cursor — so does contention.
     assert.match(source, /pageErrors \+= outcome\.summary\.errors;/);
-    assert.match(source, /if \(pageErrors > 0 \|\| pageContended > 0\) break;/);
+    assert.match(source, /if \(pageErrors > 0 \|\| pageContended > 0\) throw new SweepDeferredError/);
 });

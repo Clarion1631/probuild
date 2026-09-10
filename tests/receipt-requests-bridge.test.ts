@@ -367,9 +367,9 @@ test("the retry pass is scheduled two hours after the morning card", () => {
 
 test("the sweep is time-budgeted, checkpoints per batch, and stops at a failure", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    assert.match(source, /const BATCH_SIZE = 200;/);
+    assert.match(source, /const BATCH_SIZE = 1;/);
     assert.match(source, /const RUN_BUDGET_MS = 45_000;/);
-    assert.match(source, /while \([^)]*Date\.now\(\) - startedAt < RUN_BUDGET_MS\)/);
+    assert.match(source, /while \([^)]*!budget\.expired\(\)\)/);
     // Checkpoint after every page, so a killed run loses one page, not all.
     // The checkpoint carries the epoch it was taken against (round-42 gate,
     // finding 2): a cursor measured against a ledger that has since moved is
@@ -378,8 +378,8 @@ test("the sweep is time-budgeted, checkpoints per batch, and stops at a failure"
     // The cursor must NOT advance past a target whose write threw — from
     // either half of the page (round-20 finding 3) — or past an unresolved
     // contended component (round-22 finding: no replan ever reached a verdict).
-    assert.match(source, /if \(pageErrors > 0 \|\| pageContended > 0\) break;/);
-    const breakAt = source.lastIndexOf("if (pageErrors > 0 || pageContended > 0) break;");
+    assert.match(source, /if \(pageErrors > 0 \|\| pageContended > 0\) throw new SweepDeferredError/);
+    const breakAt = source.lastIndexOf("if (pageErrors > 0 || pageContended > 0) throw new SweepDeferredError");
     const advanceAt = source.lastIndexOf("cursor = page[page.length - 1].key;");
     assert.ok(breakAt > 0 && advanceAt > breakAt, "the break must come BEFORE the cursor advances");
     // And errors make the run a 500.
@@ -587,7 +587,7 @@ test("only a REJECTED send returns to PENDING; UNKNOWN is never auto-retried", (
 
 test("open issues are paged with their OWN cursor and budget", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    assert.match(source, /const OPEN_ISSUE_BATCH_SIZE = 100;/);
+    assert.match(source, /const OPEN_ISSUE_BATCH_SIZE = 1;/);
     assert.match(source, /const OPEN_CURSOR_KEY = "receiptRequestsOpenIssueCursor";/);
     assert.notEqual(
         source.indexOf('const OPEN_CURSOR_KEY'),
@@ -596,8 +596,8 @@ test("open issues are paged with their OWN cursor and budget", () => {
     );
     // Same wall clock as the line pass, and it never checkpoints past a failure
     // or an unresolved contended component.
-    assert.match(source, /while \([^)]*Date\.now\(\) - startedAt < RUN_BUDGET_MS\)[\s\S]{0,400}reviewIssue\.findMany/);
-    assert.match(source, /if \(pageErrors > 0 \|\| pageContended > 0\) break;[\s\S]{0,200}openCursor = page\[page\.length - 1\]\.id;/);
+    assert.match(source, /while \([^)]*!budget\.expired\(\)\)[\s\S]{0,400}reviewIssue\.findMany/);
+    assert.match(source, /if \(pageErrors > 0 \|\| pageContended > 0\) throw new SweepDeferredError[\s\S]{0,200}openCursor = page\[page\.length - 1\]\.id;/);
 });
 
 test("an issue whose BankLine is gone is CLOSED as target-missing", () => {

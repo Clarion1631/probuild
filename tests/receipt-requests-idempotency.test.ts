@@ -386,7 +386,7 @@ test("a resume already past the open pass does not redo it", () => {
     );
     // The pass is skipped, not merely fast: re-running it would eat the budget
     // the line pass has been waiting for.
-    assert.match(source, /while \(startPhase !== "lines" && Date\.now\(\) - startedAt < RUN_BUDGET_MS\)/);
+    assert.match(source, /while \(startPhase !== "lines" && !budget\.expired\(\)\)/);
     assert.match(source, /let openExhausted = startPhase === "lines";/);
     // The phase is persisted from what actually happened, in one place.
     assert.match(source, /const computedPhase = sweepPhaseAfter\(\{/);
@@ -400,5 +400,5 @@ test("a resume already past the open pass does not redo it", () => {
     // Widened in round 45 (finding 2): a continuation that finds an owed full
     // run performs it, rather than resuming into a cycle the full run was
     // about to restart.
-    assert.match(source, /runSweep\(now, startingFullRun \? "open-issues" : resumePhase, startingFullRun\)/);
+    assert.match(source, /runSweep\(now, startingFullRun \? "open-issues" : resumePhase, startingFullRun, budget\)/);
 });

@@ -120,7 +120,7 @@ test("the sweep takes the two locks in the SAME order the wrapper does", () => {
     // The other half of an AB-BA: it is only an inversion relative to
     // something. This pins the something.
     const sweep = read("src/app/api/cron/receipt-requests/route.ts");
-    const txAt = sweep.indexOf("await withTxRetry(() => prisma.$transaction(async tx => {");
+    const txAt = sweep.indexOf("await runBudgetedComponent(budget, transactionOptions => prisma.$transaction(async tx => {");
     const evidenceAt = sweep.indexOf("await lockReceiptEvidence(tx);", txAt);
     const rowLockAt = sweep.indexOf("FOR UPDATE", evidenceAt);
     assert.ok(txAt > 0 && evidenceAt > txAt && rowLockAt > evidenceAt,
@@ -218,7 +218,7 @@ test("the epochs are captured BEFORE the open-issue pass, not after it", () => {
     const runSweepAt = sweep.indexOf("async function runSweep(");
     const ledgerAt = sweep.indexOf("const snapshotEpoch = await readBankLedgerEpoch(prisma);", runSweepAt);
     const evidenceAt = sweep.indexOf("const snapshotEvidenceEpoch = await readReceiptEvidenceEpoch(prisma);", runSweepAt);
-    const openPassAt = sweep.indexOf('while (startPhase !== "lines" && Date.now() - startedAt < RUN_BUDGET_MS)', runSweepAt);
+    const openPassAt = sweep.indexOf('while (startPhase !== "lines" && !budget.expired())', runSweepAt);
 
     assert.ok(runSweepAt > 0 && ledgerAt > runSweepAt && evidenceAt > runSweepAt);
     assert.ok(openPassAt > ledgerAt && openPassAt > evidenceAt,

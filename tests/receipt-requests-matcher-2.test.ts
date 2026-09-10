@@ -1013,7 +1013,7 @@ test("the whole component aborts together — never half its verdicts", () => {
     // underneath it.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     // One transaction per component, holding its verdicts.
-    assert.match(source, /await withTxRetry\(\(\) => prisma\.\$transaction\(async tx => \{[\s\S]{0,4200}FOR UPDATE/);
+    assert.match(source, /await runBudgetedComponent\(budget, transactionOptions => prisma\.\$transaction\(async tx => \{[\s\S]{0,4200}FOR UPDATE/);
     // And it opens with the component's advisory lock, so two sweeps working
     // the same set serialize instead of both passing their checks.
     assert.match(source, /pg_advisory_xact_lock\(hashtext\(\$\{`\$\{COMPONENT_LOCK_PREFIX\}/);

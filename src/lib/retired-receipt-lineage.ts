@@ -405,7 +405,7 @@ function readExpense(row: unknown): LineageExpenseRow {
 export async function loadRetiredReceiptLineage(
     db: LineageDb,
     lineIds: readonly string[],
-    options: { cap?: number; candidatePurchaseIds?: readonly string[]; candidateExpenseIds?: readonly string[] } = {},
+    options: { cap?: number; candidatePurchaseIds?: readonly string[]; candidateExpenseIds?: readonly string[]; checkBudget?: () => void } = {},
 ): Promise<RetiredReceiptLineage> {
     const cap = options.cap ?? LINEAGE_QUERY_CAP;
     const ids = [...new Set(lineIds)].sort();
@@ -414,7 +414,9 @@ export async function loadRetiredReceiptLineage(
     if (ids.length === 0) return buildRetiredReceiptLineage({ lineIds: [], lines: [], observations: [], claims: [], expenses: [] });
     if (ids.length > cap) throw new LineageQueryOverflowError("bankLine ids", cap);
     const bounded = async (query: string, fetch: () => Promise<unknown[]>): Promise<unknown[]> => {
+        options.checkBudget?.();
         const rows = await fetch();
+        options.checkBudget?.();
         if (rows.length > cap) throw new LineageQueryOverflowError(query, cap);
         return rows;
     };

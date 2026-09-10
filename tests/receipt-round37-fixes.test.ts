@@ -493,7 +493,7 @@ test("a fence that cannot be taken refuses to certify, under its own reason", as
     const route = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     assert.match(
         route,
-        /catch \(error\) \{[\s\S]{0,900}blockedReason: LEDGER_FENCE_FAILED_REASON[\s\S]{0,200}await writePhase\(decision\.phase, undefined, decision\.blockedReason\)/,
+        /catch \(error\) \{[\s\S]{0,900}blockedReason: isSweepDeferredError\(error\) \? null : LEDGER_FENCE_FAILED_REASON[\s\S]{0,200}await writePhase\(decision\.phase, undefined, decision\.blockedReason\)/,
         "and the caller writes the held phase without a completion stamp",
     );
     assert.equal(LEDGER_FENCE_FAILED_REASON, "ledger-fence-failed");

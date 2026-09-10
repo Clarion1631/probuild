@@ -116,7 +116,7 @@ test("the writers this fence is built for are all in the covered set", () => {
 
 test("the sweep holds the same lock across its reads AND its verdicts", () => {
     const sweep = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    const txAt = sweep.indexOf("await withTxRetry(() => prisma.$transaction(async tx => {");
+    const txAt = sweep.indexOf("await runBudgetedComponent(budget, transactionOptions => prisma.$transaction(async tx => {");
     const lockAt = sweep.indexOf("await lockReceiptEvidence(tx);", txAt);
     const componentLockAt = sweep.indexOf("pg_advisory_xact_lock", txAt);
     const readAt = sweep.indexOf("tx.receiptIntake.findMany(", txAt);
