@@ -97,15 +97,14 @@ test("the continuation schedule never collides with a full run", () => {
     /** The minutes a cron field actually fires on. */
     const minutesOf = (schedule: string) => {
         const field = schedule.split(" ")[0];
-        const stepped = /^(\*|\d+)(?:-59)?\/(\d+)$/.exec(field);
-        if (stepped) {
-            const start = stepped[1] === "*" ? 0 : Number(stepped[1]);
-            const step = Number(stepped[2]);
-            const out: number[] = [];
-            for (let m = start; m <= 59; m += step) out.push(m);
-            return out;
-        }
-        return [Number(field)];
+        return field.split(",").flatMap(part => {
+            const match = /^(\*|\d+)(?:-(\d+))?(?:\/(\d+))?$/.exec(part);
+            assert.ok(match, `unsupported minute field: ${part}`);
+            const start = match[1] === "*" ? 0 : Number(match[1]);
+            const end = match[2] ? Number(match[2]) : match[1] === "*" || match[3] ? 59 : start;
+            const step = Number(match[3] ?? 1);
+            return Array.from({ length: Math.floor((end - start) / step) + 1 }, (_, i) => start + i * step);
+        });
     };
 
     const pairs = [
@@ -118,21 +117,29 @@ test("the continuation schedule never collides with a full run", () => {
         const contMinutes = minutesOf(at(cont));
         const overlap = fullMinutes.filter(m => contMinutes.includes(m));
         assert.deepEqual(overlap, [], `${cont} must never fire in the same minute as ${full}`);
-        assert.equal(contMinutes.length, cont === "/api/cron/receipt-requests?continue=1" ? 12 : 4,
-            "receipt work resumes every five minutes; bank pull cadence stays unchanged");
+        assert.equal(contMinutes.length, cont === "/api/cron/receipt-requests?continue=1" ? 56 : 4,
+            "receipt work resumes each minute with full/card gaps; bank pull cadence stays unchanged");
     }
 
     assert.equal(vercel.crons.filter(cron => cron.path === "/api/cron/receipt-requests?continue=1").length, 1, "one existing continuation entry, not an additional scheduler");
     const receiptMinutes = minutesOf(at("/api/cron/receipt-requests?continue=1"));
-    assert.deepEqual(receiptMinutes, [2, 7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57]);
+    assert.deepEqual(receiptMinutes, Array.from({ length: 60 }, (_, i) => i)
+        .filter(minute => ![0, 29, 30, 59].includes(minute)));
+    assert.equal(new Set(receiptMinutes).size, 56, "no duplicate minute slots");
+    for (const protectedMinute of [0, 30]) {
+        assert.ok(receiptMinutes.every(minute => (protectedMinute - minute + 60) % 60 >= 2),
+            "last continuation starts at least two minutes before full/card selection");
+        assert.ok(receiptMinutes.every(minute => (minute - protectedMinute + 60) % 60 >= 1),
+            "first continuation starts at least one minute after full/card selection");
+    }
     assert.equal(at("/api/cron/receipt-requests"), "0 13 * * *");
     assert.equal(at("/api/cron/receipt-request-cards"), "30 14 * * 1-5");
     assert.equal(at("/api/cron/receipt-request-cards?retry=1"), "30 16 * * 1-5");
     // Available starts, including the 13:00 full run; not a completion guarantee.
     const startsBeforeCards = (hour: number) => 1 + (hour - 13) * receiptMinutes.length
         + receiptMinutes.filter(minute => minute < 30).length;
-    assert.equal(startsBeforeCards(14), 19);
-    assert.equal(startsBeforeCards(16), 43);
+    assert.equal(startsBeforeCards(14), 85);
+    assert.equal(startsBeforeCards(16), 197);
     assert.ok(!receiptMinutes.includes(30), "continuations avoid both card selection slots");
 
     // PRE-FIX CONTROL: the old field fired on the hour, which is exactly when

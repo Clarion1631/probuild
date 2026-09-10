@@ -333,9 +333,9 @@ test("the freshness window is the one the cron schedule implies", () => {
     // cycle held open for a stale pull could never finish before delivery.
     const resume = at("/api/cron/receipt-requests?continue=1");
     assert.ok(resume, "the ?continue=1 resume pass must be scheduled");
-    // Every five minutes, but OFFSET off the hour so it never collides with the
+    // Each minute with full/card gaps, so it never collides with the
     // 13:00 full run (round-45 gate, finding 2).
-    assert.match(resume as string, /^2-59\/5 /, "every five minutes, offset, so it runs many times before 14:30");
+    assert.equal(resume, "1-28,31-58 * * * *", "minute continuations with full/card gaps before 14:30");
 });
 
 test("bankPullFresh: a healthy pull is fresh at chaser time, last night's is not", () => {

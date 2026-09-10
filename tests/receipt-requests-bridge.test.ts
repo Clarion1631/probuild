@@ -503,15 +503,15 @@ test("?continue=1 only resumes; with no cursor it exits immediately", () => {
         crons: Array<{ path: string; schedule: string }>;
     };
     assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests")?.schedule, "0 13 * * *");
-    // Five-minute continuations stay OFFSET off the hour (round-45 gate):
+    // Minute continuations leave gaps around full/card times (round-45 gate):
     // the old unoffset schedule collided with the 13:00 full run — and the continuation
     // could win the lease, so the full run returned `already-running` having
     // cleared nothing and the day's cycle never restarted.
-    assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests?continue=1")?.schedule, "2-59/5 * * * *");
+    assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests?continue=1")?.schedule, "1-28,31-58 * * * *");
     const fullRun = vercel.crons.find((c: { path: string }) => c.path === "/api/cron/receipt-requests")?.schedule as string;
     const fullRunMinute = Number(fullRun.split(" ")[0]);
     assert.equal(fullRunMinute, 0);
-    assert.equal([2, 7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57].includes(fullRunMinute), false,
+    assert.equal(Array.from({ length: 60 }, (_, minute) => minute).filter(minute => ![0, 29, 30, 59].includes(minute)).includes(fullRunMinute), false,
         "the continuation never fires in the same minute as the full run");
 });
 
