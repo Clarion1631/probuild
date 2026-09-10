@@ -291,3 +291,42 @@ export function addCalendarDaysInTimeZone(instant: Date, days: number, timeZone:
     const wc = wallClockPartsAt(instant.getTime(), timeZone);
     return resolveWallClockInstant(wc.year, wc.month, wc.day + days, wc.hour, wc.minute, wc.second, instant.getUTCMilliseconds(), timeZone);
 }
+
+/**
+ * Render an instant as a human-readable company-local date and time, with the
+ * zone label attached — e.g. "Sep 10, 2026, 10:52 AM PDT".
+ *
+ * The zone label is not decoration. Production runs in UTC, so a bare
+ * `date.toLocaleString()` in a notification email prints a UTC wall clock that
+ * staff read as their own: the internal "Estimate Approved: EST-00514" email on
+ * 2026-09-10 showed "9/10/2026, 5:52:08 PM" for a signature made at 10:52 AM
+ * Pacific. Naming the zone lets a reader tell which clock they are looking at.
+ *
+ * Falls back to DEFAULT_COMPANY_TIME_ZONE when the configured zone is missing
+ * or is not a valid IANA name, and never throws — a bad CompanySettings.timeZone
+ * must not be able to fail an estimate approval.
+ */
+export function formatCompanyDateTime(date: Date, timeZone?: string | null): string {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "";
+    const zone = validTimeZone(timeZone) ? timeZone : DEFAULT_COMPANY_TIME_ZONE;
+    try {
+        const formatted = new Intl.DateTimeFormat("en-US", {
+            timeZone: zone,
+            month: "short",
+            day: "numeric",
+            year: "numeric",
+            hour: "numeric",
+            minute: "2-digit",
+            timeZoneName: "short",
+        }).format(date);
+        // ICU 72 switched the separator before AM/PM to U+202F (narrow no-break
+        // space) and runtimes disagree about it, so normalize the exotic spaces
+        // to a plain one and keep the output identical across Node versions.
+        return formatted.replace(/[\u202f\u00a0]/g, " ");
+    } catch {
+        // validTimeZone() already probed Intl with this zone, so reaching here
+        // means a runtime quirk rather than bad configuration. Degrade to the
+        // UTC instant, explicitly labelled, rather than returning nothing.
+        return date.toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+    }
+}
