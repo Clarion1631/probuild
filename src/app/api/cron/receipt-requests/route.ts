@@ -39,6 +39,14 @@ import { REGISTER_WINDOW_DAYS, registerWindowStartYmd } from "@/lib/bank-registe
 import { lockBankLedgerEpoch, readBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 import { withTxRetry } from "@/lib/tx-retry";
 import { lockReceiptEvidence, readReceiptEvidenceEpoch } from "@/lib/receipt-evidence-lock";
+import {
+    lineageFingerprint,
+    lineagePurchaseIds,
+    lineageExpenseIds,
+    loadRetiredReceiptLineage,
+    lockBankLineIdentity,
+    subsetLineage,
+} from "@/lib/retired-receipt-lineage";
 import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_CHASER_WINDOW_HOURS } from "@/lib/pipeline-health";
 import {
     CYCLE_KEY,
@@ -235,6 +243,8 @@ export async function fenceAndWritePhase(
     transaction: <T>(fn: (ops: LedgerFenceOps) => Promise<T>) => Promise<T>,
 ): Promise<{ phase: SweepPhase; complete: boolean; blockedReason: string | null; ledgerMoved: boolean }> {
     return transaction(async ops => {
+        // Receipt evidence is the outermost lock, including at completion.
+        const evidenceEpoch = await ops.lockEvidenceEpoch();
         const epoch = await ops.lockEpoch();
         const epochMoved = epoch !== input.snapshotEpoch;
         /**
@@ -251,7 +261,6 @@ export async function fenceAndWritePhase(
          * treated exactly like a ledger move: hold the cycle open, let the
          * 15-minute continuation re-judge over the truth.
          */
-        const evidenceEpoch = await ops.lockEvidenceEpoch();
         const evidenceMoved = evidenceEpoch !== input.snapshotEvidenceEpoch;
         const appeared = epochMoved || evidenceMoved ? 0 : await ops.countNewLines();
         const ledgerMoved = epochMoved || evidenceMoved || appeared > 0;
@@ -990,9 +999,15 @@ export async function recomputeCodesFor(
         }),
     ]);
     const siblingBoundPdfIds = new Map(siblingBindings.map(row => [row.targetKey, row.pdfId]));
+    // EXACT LINEAGE for the component's lines — the same helper every other
+    // path consumes. Loaded by line id, not by date, so a retired zero Expense
+    // outside the evidence window still reaches its bound line. An overflow
+    // throws: this recompute reports an honest error rather than a verdict.
+    const lineage = await loadRetiredReceiptLineage(prisma, lines.map(l => l.id), { candidatePurchaseIds: lineagePurchaseIds(expenseRows, intakeRows), candidateExpenseIds: lineageExpenseIds(intakeRows) });
 
     const plan = planReceiptRequests({
         bankLines: lines,
+        boundLineage: lineage.evidence,
         expenses: expenseRows.flatMap(row => {
             const cents = decimalStringToCents(row.amount.toString());
             if (cents === null) return [];
@@ -1318,6 +1333,13 @@ async function processBatch(
     ]);
     const lineIds = lines.map(row => row.id);
 
+    // 2b. EXACT LINEAGE for every line in the cohort, by id — the retired zero
+    // Expenses this proves may sit outside the date window above. One load per
+    // batch; each component's planned version takes its subset, and the locked
+    // transaction re-reads the same helper for its own ids. An overflow throws
+    // and the batch fails honestly.
+    const lineage = await loadRetiredReceiptLineage(prisma, lineIds, { candidatePurchaseIds: lineagePurchaseIds(expenseRows, intakeRows), candidateExpenseIds: lineageExpenseIds(intakeRows) });
+
     // 3. DECIDE.
     const fullPlan = planReceiptRequests({
         bankLines: lines.map(row => ({
@@ -1367,6 +1389,7 @@ async function processBatch(
             // A row parked because its bytes are gone is not evidence.
             stateReason: row.stateReason,
         })),
+        boundLineage: lineage.evidence,
         openIssueKeys: openIssues.map(row => row.targetKey),
         resolvedIssueKeys,
         evidenceLoadedFrom: fromYmd,
@@ -1470,6 +1493,11 @@ async function processBatch(
                     vendor: row.vendor,
                     qbPurchaseId: row.qbPurchaseId,
                 })),
+            // This component's share of the batch-wide lineage load. Per-line
+            // entries carry their own global collision evidence, so the subset
+            // equals a fresh load of exactly these ids — which is what the
+            // locked re-read below computes.
+            lineageFingerprint: lineageFingerprint(subsetLineage(lineage.snapshot, component.lineIds, lineagePurchaseIds(expenseRows.filter(row => expenseInWindow(row.date)), intakeRows.filter(row => intakeInWindow(row.txnDate))), lineageExpenseIds(intakeRows.filter(row => intakeInWindow(row.txnDate))))),
         });
 
         try {
@@ -1524,6 +1552,16 @@ async function processBatch(
                 await lockReceiptEvidence(tx);
 
                 /**
+                 * 0a'. THE BANK-LINE IDENTITY LOCK, next. The exact-lineage
+                 * re-read below follows observation links that the reconcile
+                 * writer creates; holding the identity lock here means a link
+                 * cannot land between that re-read and the verdict. Inside the
+                 * evidence lock, before the component and row locks — the same
+                 * order everywhere, so it cannot deadlock.
+                 */
+                await lockBankLineIdentity(tx);
+
+                /**
                  * 0b. THE COMPONENT LOCK.
                  *
                  * Row locks cover the rows that EXIST; they cannot exclude a
@@ -1560,19 +1598,27 @@ async function processBatch(
                 }
 
                 // 2. THE FINGERPRINT, FROM THE LOCKED ROWS.
-                const current = componentVersionOf({
-                    issues: await tx.reviewIssue.findMany({
-                        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: component.lineIds } },
-                        select: { targetKey: true, updatedAt: true },
-                    }),
-                    intakes: await tx.receiptIntake.findMany({
+                const currentIntakes = await tx.receiptIntake.findMany({
                         where: { txnDate: componentRange.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
                         select: {
                             id: true, updatedAt: true, state: true, stateReason: true,
                             totalCents: true, txnDate: true, vendor: true,
                             expenseId: true, qbPurchaseId: true,
                         },
+                    });
+                const currentExpenses = await tx.expense.findMany({
+                        where: { date: componentRange.timestamp },
+                        select: {
+                            id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
+                            receiptUrl: true, receiptIntake: { select: { id: true } },
+                        },
+                    });
+                const current = componentVersionOf({
+                    issues: await tx.reviewIssue.findMany({
+                        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: component.lineIds } },
+                        select: { targetKey: true, updatedAt: true },
                     }),
+                    intakes: currentIntakes,
                     lines: await tx.bankLine.findMany({
                         // The JOIN window, not the evidence window — see
                         // `joinRange` above. A same-amount line up to
@@ -1581,13 +1627,7 @@ async function processBatch(
                         where: { amountCents: { in: amounts }, postedDate: joinRange.calendar },
                         select: { id: true, updatedAt: true, rawDescriptor: true },
                     }),
-                    expenses: (await tx.expense.findMany({
-                        where: { date: componentRange.timestamp },
-                        select: {
-                            id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
-                            receiptUrl: true, receiptIntake: { select: { id: true } },
-                        },
-                    })).map(row => ({
+                    expenses: currentExpenses.map(row => ({
                         id: row.id,
                         hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
                         amountCents: decimalStringToCents(row.amount.toString()),
@@ -1595,6 +1635,9 @@ async function processBatch(
                         vendor: row.vendor,
                         qbPurchaseId: row.qbPurchaseId,
                     })),
+                    // The SAME helper, inside the transaction, under both
+                    // locks, for this component's ids.
+                    lineageFingerprint: lineageFingerprint((await loadRetiredReceiptLineage(tx, component.lineIds, { candidatePurchaseIds: lineagePurchaseIds(currentExpenses, currentIntakes), candidateExpenseIds: lineageExpenseIds(currentIntakes) })).snapshot),
                 });
                 if (!componentVersionsMatch(planned, current)) throw new ComponentMovedError();
 

@@ -12,6 +12,7 @@ import {
     type ReconcilePairedGroup,
 } from "@/lib/bank-ledger";
 import { guardAndLinkObservation, lockBankLineIdentity, toExpectedSnapshot, type GuardedReconcileLink } from "@/lib/bank-reconcile-guard";
+import { bumpBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -404,6 +405,88 @@ function isUniqueConstraintError(error: unknown): boolean {
     return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
 }
 
+/** The raw-SQL capability one chunk transaction needs (savepoints). */
+export interface ReconcileChunkTx {
+    $executeRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
+}
+
+/** The I/O one chunk performs, injectable so lock ORDER is testable without a database. */
+export interface ReconcileChunkIo<Tx extends ReconcileChunkTx> {
+    lockBankLineIdentity(tx: Tx): Promise<unknown>;
+    bumpBankLedgerEpoch(tx: Tx): Promise<void>;
+    guardAndLinkObservation(tx: Tx, link: GuardedReconcileLink): Promise<{ ok: true } | { ok: false; reason: string }>;
+    isUniqueConstraintError(error: unknown): boolean;
+}
+
+/**
+ * The body of ONE chunk transaction. Order is the contract:
+ *
+ *   1. the bank-line identity lock (once per chunk),
+ *   2. `bumpBankLedgerEpoch` — BEFORE any row lock or link mutation, in this
+ *      same transaction (bank-ledger-epoch.ts: the bump must precede the
+ *      `BankLine` writes it fences, so a chaser fencing now blocks on this
+ *      transaction and then sees the new value). One bump per chunk, taken
+ *      even if every link in the chunk ends up refused — conservative
+ *      invalidation, accepted on purpose over extra savepoint machinery.
+ *   3. per-link SAVEPOINT / guard-and-link / RELEASE or ROLLBACK TO.
+ *
+ * A non-unique-index error propagates and rolls the whole chunk back —
+ * bump included, since they share the transaction.
+ */
+export async function runReconcileChunk<Tx extends ReconcileChunkTx>(
+    tx: Tx,
+    chunk: GuardedReconcileLink[],
+    chunkIndex: number,
+    io: ReconcileChunkIo<Tx>,
+): Promise<{ linked: string[]; exceptions: ReconcileExceptionResult[] }> {
+    const chunkLinked: string[] = [];
+    const chunkExceptions: ReconcileExceptionResult[] = [];
+
+    // Once per chunk, never per link: serializes this chunk against
+    // every other bank-line identity writer (ingest, descriptor
+    // refresh, source refresh) so a row cannot move between the
+    // guard's re-read and the CAS below.
+    await io.lockBankLineIdentity(tx);
+    await io.bumpBankLedgerEpoch(tx);
+    for (let i = 0; i < chunk.length; i++) {
+        const link = chunk[i];
+        const savepoint = `bank_ledger_reconcile_${chunkIndex}_${i}`;
+        await tx.$executeRawUnsafe(`SAVEPOINT "${savepoint}"`);
+        try {
+            // Locks BOTH rows FOR UPDATE, re-verifies them against
+            // the planner's snapshots and the match rule, confirms
+            // the observation is still unlinked and the candidate
+            // still has no QBO observation, then CASes the link.
+            // A plan whose inputs moved is reported as
+            // "stale-reconcile-plan" and is NOT counted as linked.
+            const guard = await io.guardAndLinkObservation(tx, link);
+            if (!guard.ok) {
+                await tx.$executeRawUnsafe(`ROLLBACK TO SAVEPOINT "${savepoint}"`);
+                await tx.$executeRawUnsafe(`RELEASE SAVEPOINT "${savepoint}"`);
+                chunkExceptions.push({ observationId: link.observationId, bankLineId: link.bankLineId, reason: guard.reason });
+                continue;
+            }
+            await tx.$executeRawUnsafe(`RELEASE SAVEPOINT "${savepoint}"`);
+            chunkLinked.push(link.observationId);
+        } catch (error) {
+            if (io.isUniqueConstraintError(error)) {
+                // The partial unique index on (source, bankLineId) —
+                // this canonical BankLine already has a QBO
+                // observation linked (a concurrent run won the
+                // race). Roll back just this link and keep
+                // processing the rest of the chunk.
+                await tx.$executeRawUnsafe(`ROLLBACK TO SAVEPOINT "${savepoint}"`);
+                await tx.$executeRawUnsafe(`RELEASE SAVEPOINT "${savepoint}"`);
+                chunkExceptions.push({ observationId: link.observationId, bankLineId: link.bankLineId, reason: "bank-line-already-claimed" });
+                continue;
+            }
+            throw error;
+        }
+    }
+
+    return { linked: chunkLinked, exceptions: chunkExceptions };
+}
+
 const handlers = createBankLedgerReconcileHandlers({
     getIngestSecret: () => process.env.BANK_LEDGER_INGEST_SECRET,
 
@@ -448,53 +531,15 @@ const handlers = createBankLedgerReconcileHandlers({
 
     persistLinks: async (links, deadlineAt) => {
         return persistLinksInChunks(links, RECONCILE_CHUNK_SIZE, async (chunk, chunkIndex) => {
-            const chunkLinked: string[] = [];
-            const chunkExceptions: ReconcileExceptionResult[] = [];
-
-            await prisma.$transaction(async tx => {
-                // Once per chunk, never per link: serializes this chunk against
-                // every other bank-line identity writer (ingest, descriptor
-                // refresh, source refresh) so a row cannot move between the
-                // guard's re-read and the CAS below.
-                await lockBankLineIdentity(tx);
-                for (let i = 0; i < chunk.length; i++) {
-                    const link = chunk[i];
-                    const savepoint = `bank_ledger_reconcile_${chunkIndex}_${i}`;
-                    await tx.$executeRawUnsafe(`SAVEPOINT "${savepoint}"`);
-                    try {
-                        // Locks BOTH rows FOR UPDATE, re-verifies them against
-                        // the planner's snapshots and the match rule, confirms
-                        // the observation is still unlinked and the candidate
-                        // still has no QBO observation, then CASes the link.
-                        // A plan whose inputs moved is reported as
-                        // "stale-reconcile-plan" and is NOT counted as linked.
-                        const guard = await guardAndLinkObservation(tx, link);
-                        if (!guard.ok) {
-                            await tx.$executeRawUnsafe(`ROLLBACK TO SAVEPOINT "${savepoint}"`);
-                            await tx.$executeRawUnsafe(`RELEASE SAVEPOINT "${savepoint}"`);
-                            chunkExceptions.push({ observationId: link.observationId, bankLineId: link.bankLineId, reason: guard.reason });
-                            continue;
-                        }
-                        await tx.$executeRawUnsafe(`RELEASE SAVEPOINT "${savepoint}"`);
-                        chunkLinked.push(link.observationId);
-                    } catch (error) {
-                        if (isUniqueConstraintError(error)) {
-                            // The partial unique index on (source, bankLineId) —
-                            // this canonical BankLine already has a QBO
-                            // observation linked (a concurrent run won the
-                            // race). Roll back just this link and keep
-                            // processing the rest of the chunk.
-                            await tx.$executeRawUnsafe(`ROLLBACK TO SAVEPOINT "${savepoint}"`);
-                            await tx.$executeRawUnsafe(`RELEASE SAVEPOINT "${savepoint}"`);
-                            chunkExceptions.push({ observationId: link.observationId, bankLineId: link.bankLineId, reason: "bank-line-already-claimed" });
-                            continue;
-                        }
-                        throw error;
-                    }
-                }
-            }, { timeout: RECONCILE_TX_TIMEOUT_MS });
-
-            return { linked: chunkLinked, exceptions: chunkExceptions };
+            return prisma.$transaction(
+                tx => runReconcileChunk<Prisma.TransactionClient>(tx, chunk, chunkIndex, {
+                    lockBankLineIdentity,
+                    bumpBankLedgerEpoch,
+                    guardAndLinkObservation,
+                    isUniqueConstraintError,
+                }),
+                { timeout: RECONCILE_TX_TIMEOUT_MS },
+            );
         }, RECONCILE_MAX_CHUNKS_PER_INVOCATION, { deadlineAt });
     },
 });
