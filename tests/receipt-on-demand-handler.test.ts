@@ -453,3 +453,31 @@ test("the suite performs no network I/O", () => {
     // a real one, so any un-stubbed fetch in the handler would have thrown.
     assert.equal(globalThis.fetch, REAL_FETCH === globalThis.fetch ? REAL_FETCH : globalThis.fetch);
 });
+
+
+test("exact on-demand route reaches strict bearer auth through the production proxy", async () => {
+    const oldNode = process.env.NODE_ENV;
+    const oldVercel = process.env.VERCEL_ENV;
+    Object.assign(process.env, { NODE_ENV: "production", VERCEL_ENV: "production", CRON_SECRET: "fictional-on-demand-cron" });
+    try {
+        const { default: proxy, isPublicProxyBypass } = await import("../src/proxy");
+        const { NextRequest } = await import("next/server");
+        for (const path of ["/api/automation/receipt-requests/on-demand", "/api/automation/receipt-requests/on-demand/"]) {
+            assert.equal(isPublicProxyBypass(path), true);
+            const response = await proxy(new NextRequest("https://example.test" + path, { method: "POST", headers: { authorization: "Bearer fictional-on-demand-cron" } }), { waitUntil() {} } as any);
+            assert.equal(response?.headers.get("x-middleware-next"), "1");
+        }
+        for (const path of ["/api/automation/receipt-requests/on-demand/extra", "/api/automation/receipt-requests/on-demand-extra", "/api/automation/receipt-requests/on-demands", "/api/automation/receipt-requests/other"]) {
+            assert.equal(isPublicProxyBypass(path), false, path);
+        }
+        const actionResponse = await proxy(new NextRequest("https://example.test/api/automation/receipt-requests/on-demand", { method: "POST", headers: { "next-action": "fictional-action" } }), { waitUntil() {} } as any);
+        assert.equal(actionResponse?.status, 403);
+        const { POST } = await import("../src/app/api/automation/receipt-requests/on-demand/route");
+        assert.equal((await POST(new Request("https://example.test/api/automation/receipt-requests/on-demand", { method: "POST" }))).status, 401);
+    } finally {
+        if (oldNode === undefined) delete (process.env as Record<string, string | undefined>).NODE_ENV;
+        else Object.assign(process.env, { NODE_ENV: oldNode });
+        if (oldVercel === undefined) delete process.env.VERCEL_ENV;
+        else process.env.VERCEL_ENV = oldVercel;
+    }
+});
