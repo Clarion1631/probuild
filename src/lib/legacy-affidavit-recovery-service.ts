@@ -1,3 +1,4 @@
+import { sanitizeProbeDiagnostic, type PdfProbeDiagnostic } from './drive-pdf-probe';
 import {
   validateLegacyRecoveryProof,
   stableRecoveryDigest,
@@ -26,6 +27,7 @@ export interface RecoveryResult {
   reason?: string;
   capturedAt?: string;
   diagnostics?: RecoveryDiagnostics;
+  pdfDiagnostic?: PdfProbeDiagnostic;
 }
 
 export interface SnapshotArtifact {
@@ -48,7 +50,7 @@ export interface RecoverySnapshot {
 
 export type DriveResult =
   | { kind: 'verified'; id: string; sha256: string; version: string; byteLength: number }
-  | { kind: 'unavailable'; reason: string };
+  | { kind: 'unavailable'; reason: string; diagnostic?: unknown };
 
 export interface VerifiedPdf {
   id: string;
@@ -223,7 +225,9 @@ export function createLegacyRecoveryService(deps: RecoveryDeps): { handle(req: R
     if (stableRecoveryDigest(packet) !== packetDigest) return { ok: false, status: 'rejected', reason: 'packetDigest does not match packet' };
     if (packet.target?.bankLineId !== bankLineId) return { ok: false, status: 'conflict', reason: 'packet target does not match requested bank line' };
     const driveResult = await deps.drive(packet.pdf.id);
-    if (driveResult.kind === 'unavailable') return { ok: false, status: 'incomplete', reason: 'pdf unavailable' };
+    if (driveResult.kind === 'unavailable') return { ok: false, status: 'incomplete', reason: 'pdf unavailable',
+      ...(req.mode === 'prepare' ? { pdfDiagnostic: sanitizeProbeDiagnostic(driveResult.diagnostic) } : {}),
+    };
     const driveOut = verifyDrive(driveResult, packet);
     if (typeof driveOut === 'string') return { ok: false, status: 'conflict', reason: driveOut };
     const pdf = driveOut;
