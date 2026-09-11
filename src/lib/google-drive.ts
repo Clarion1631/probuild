@@ -371,15 +371,14 @@ export async function probeDriveFile(fileId: string, timeoutMs = 5_000): Promise
 }
 
 /** Fresh bounded PDF bytes for immutable content binding. No writes or mock fallback. */
-export async function probeDrivePdfContent(fileId: string): Promise<import('./drive-pdf-bytes').PdfByteResult> {
-    const { verifyBoundedPdf } = await import('./drive-pdf-bytes');
-    if (!isDriveFileId(fileId)) return { kind: 'unavailable', reason: 'invalid_file_id' };
+export async function probeDrivePdfContent(fileId: string): Promise<import('./drive-pdf-probe').PdfProbeResult> {
+    const { probePdfWithDiagnostics } = await import('./drive-pdf-probe');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20_000);
     try {
-        if (!(await ensureDriveAuth()).ok) return { kind: 'unavailable', reason: 'provider_error' };
         const drive = google.drive({ version: 'v3', auth: oauth2Client });
-        return await verifyBoundedPdf(fileId, {
+        return await probePdfWithDiagnostics(fileId, {
+            ensureAuth: ensureDriveAuth,
             metadata: async () => (await drive.files.get(
                 { fileId, fields: 'id,mimeType,trashed,version,size', supportsAllDrives: true },
                 { timeout: 5_000, signal: controller.signal },
@@ -394,6 +393,5 @@ export async function probeDrivePdfContent(fileId: string): Promise<import('./dr
                 finally { stream.destroy(); }
             },
         });
-    } catch { return { kind: 'unavailable', reason: 'provider_error' }; }
-    finally { clearTimeout(timer); controller.abort(); }
+    } finally { clearTimeout(timer); controller.abort(); }
 }

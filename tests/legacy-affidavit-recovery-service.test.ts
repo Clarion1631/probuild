@@ -24,7 +24,7 @@ type Snapshot = {
 
 type DriveResult =
   | { kind: 'verified'; id: string; sha256: string; version: string; byteLength: number }
-  | { kind: 'unavailable'; reason: string };
+  | { kind: 'unavailable'; reason: string; diagnostic?: unknown };
 
 const NOW = new Date('2026-09-10T12:00:00.000Z');
 const BANK_LINE = '9c1e4d2a-7b3f-4e8c-a1d5-2f6b8c9d0e1a';
@@ -391,4 +391,17 @@ test('prepare rejects details the real writer cannot preserve as an object', asy
     const h = makeHarness({ snapshot: { issue: { id: ISSUE_ID, version: 3, displayDetails } } });
     assert.equal((await h.service.handle({ mode: 'prepare', bankLineId: BANK_LINE })).status, 'ready');
   }
+});
+
+
+test('prepare alone returns sanitized PDF diagnostics without opening a transaction', async () => {
+  const diagnostic = { reason: 'provider_error', authSource: 'company-settings', phase: 'metadata-before', providerHttp: 403, token: 'must-never-leak' };
+  const h = makeHarness({ drive: { [PDF_ID]: { kind: 'unavailable', reason: 'must-never-leak', diagnostic } } });
+  const prepared = await h.service.handle({ mode: 'prepare', bankLineId: BANK_LINE });
+  assert.deepEqual((prepared as any).pdfDiagnostic, { reason: 'provider_error', authSource: 'company-settings', phase: 'metadata-before', providerHttp: 403 });
+  assert.equal(JSON.stringify(prepared).includes('must-never-leak'), false);
+  const applied = await h.service.handle({ mode: 'apply', bankLineId: BANK_LINE, planDigest: 'a'.repeat(64) });
+  assert.equal('pdfDiagnostic' in applied, false);
+  assert.equal(h.transactions, 0);
+  assert.equal(h.committed.length, 0);
 });
