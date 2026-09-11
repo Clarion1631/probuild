@@ -907,6 +907,7 @@ export async function recomputeCodesFor(
     targetKey: string,
     cache?: Map<string, ReasonCode[]>,
     deadlineExceeded?: () => boolean,
+    strictCompleteness = false,
 ): Promise<ReasonCode[]> {
     if (cache?.has(targetKey)) return cache.get(targetKey)!;
     // The cache miss is the expensive path; the hit above costs nothing and is
@@ -948,6 +949,8 @@ export async function recomputeCodesFor(
         loadedLines = await loadCompetingComponent(line, deadlineExceeded);
     } catch (error) {
         if (error instanceof ComponentTooLargeError) {
+            // An explicit new request needs a verdict; keeping an old issue open is not one.
+            if (strictCompleteness) throw error;
             // NO VERDICT. Returning [] would CLEAR the issue, which is the one
             // wrong answer available here: it closes a chase because we could
             // not look, not because a receipt exists. Keeping the code leaves
