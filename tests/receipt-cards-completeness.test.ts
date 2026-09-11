@@ -1,6 +1,7 @@
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import { ComponentTooLargeError } from "../src/lib/receipt-requests";
 import type { ReasonCode } from "../src/lib/review-alert-reasons";
 import type { CardItem, CardItemTruth } from "../src/lib/receipt-request-cards";
 
@@ -191,7 +192,6 @@ type LoadCardItemTruth = (
 let loadCardItemTruth: LoadCardItemTruth;
 let recomputeCodesFor: Recompute;
 let rebuildCardItems: typeof import("../src/lib/receipt-request-cards").rebuildCardItems;
-let ComponentTooLargeError: typeof import("../src/lib/receipt-requests").ComponentTooLargeError;
 
 before(async () => {
     const originalRequire = Module.prototype.require;
@@ -212,11 +212,9 @@ before(async () => {
         const cards: { loadCardItemTruth?: unknown } = await import("../src/app/api/cron/receipt-request-cards/route");
         const requests: { recomputeCodesFor?: unknown } = await import("../src/app/api/cron/receipt-requests/route");
         const lib = await import("../src/lib/receipt-request-cards");
-        const errors = await import("../src/lib/receipt-requests");
         loadCardItemTruth = cards.loadCardItemTruth as LoadCardItemTruth;
         recomputeCodesFor = requests.recomputeCodesFor as Recompute;
         rebuildCardItems = lib.rebuildCardItems;
-        ComponentTooLargeError = errors.ComponentTooLargeError;
     } finally {
         Module.prototype.require = originalRequire;
     }
@@ -267,7 +265,12 @@ test("REAL adapter, ACTUAL overflow: revalidation rejects with ComponentTooLarge
 
     await assert.rejects(
         loadCardItemTruth(["ri-overflow"], { deadlineExceeded: () => false }),
-        ComponentTooLargeError,
+        (error: unknown) => {
+            assert.ok(error instanceof ComponentTooLargeError);
+            assert.equal(error.count, 201);
+            assert.equal(error.cap, 200);
+            return true;
+        },
         "overflow is incomplete evidence: it must surface as an error, never as a MISSING_RECEIPT verdict the card would send",
     );
     assert.equal(fetchCalls, 0, "nothing was posted");
