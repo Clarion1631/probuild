@@ -207,3 +207,57 @@ export function cycleStillValid(cycle: SweepCycle | null, epoch: string, evidenc
     return cycle !== null && cycle.epoch === epoch && cycle.evidenceEpoch === evidenceEpoch
         && (recognitionPolicy === undefined || cycleRecognitionPolicyMatches(cycle, recognitionPolicy));
 }
+
+// ── The continuation predicate (moved verbatim from the sweep route) ─────────
+//
+// These lived in `api/cron/receipt-requests/route.ts`. They are pure, and the
+// read-only health diagnostic has to ask the SAME question the sweep's
+// continuation pass asks, without importing the sweep. One definition, imported
+// by both; the route re-exports them so its existing importers are unchanged.
+
+/**
+ * A resume pass has work whenever the cycle is unfinished — by the phase, or by
+ * either cursor. The cursors stay in the test for rows written before the phase
+ * marker existed.
+ */
+export function shouldResumeSweep(
+    phase: SweepPhase,
+    lineCursor: string | null,
+    openCursor: string | null,
+): boolean {
+    return phase !== "done" || !!lineCursor || !!openCursor;
+}
+
+export interface CycleCertificationInput {
+    marker: SweepMarker; cycle: SweepCycle | null;
+    bankEpoch: string; evidenceEpoch: string;
+    recognitionPolicy?: string;
+    now: Date;
+}
+
+/**
+ * The completion a continuation trusts: THIS cycle, phase done, nothing
+ * blocking, stamped at a real instant that is not in the future, and the world
+ * (both epochs, and the recognition policy when given) unchanged since the
+ * cycle started. This is the `certified` sub-expression of
+ * `continuationNeedsWork`, named so a diagnostic can report it on its own.
+ */
+export function cycleCertified(input: CycleCertificationInput): boolean {
+    const completedAt = input.marker.chaserCompletedAt ? Date.parse(input.marker.chaserCompletedAt) : NaN;
+    return input.cycle !== null
+        && input.marker.phase === "done"
+        && !input.marker.blockedReason
+        && input.marker.completedCycleId === input.cycle.id
+        && Number.isFinite(completedAt) && completedAt <= input.now.getTime()
+        && cycleStillValid(input.cycle, input.bankEpoch, input.evidenceEpoch, input.recognitionPolicy);
+}
+
+/** Completed cycles remain stored because card selection verifies their identity. */
+export function continuationNeedsWork(input: CycleCertificationInput & {
+    fullRunOwed: boolean; lineCursor: string | null; openCursor: string | null;
+}): boolean {
+    if (input.fullRunOwed) return true;
+    if (cycleCertified(input)) return false;
+    // A crash between durable cycle creation and phase/checkpoint writes still resumes.
+    return input.cycle !== null || shouldResumeSweep(input.marker.phase, input.lineCursor, input.openCursor);
+}

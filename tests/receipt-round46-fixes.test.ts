@@ -170,8 +170,11 @@ test("the full-run request outlives the reset, and a persisted cycle is work in 
         "the cycle record is durable BEFORE the request that asked for it is cleared");
 
     // And a persisted cycle keeps a continuation alive even with no cursor
-    // parked — which is the state a crash mid-handoff leaves behind.
-    assert.match(sweep, /return input.cycle !== null \|\| shouldResumeSweep\(/);
+    // parked — which is the state a crash mid-handoff leaves behind. The
+    // predicate now lives in the shared marker module (the health diagnostic
+    // imports it there); the sweep still asks it at the top of every resume.
+    const predicate = read("src/lib/receipt-sweep-marker.ts");
+    assert.match(predicate, /return input.cycle !== null \|\| shouldResumeSweep\(/);
     assert.match(sweep, /if \(!continuationNeedsWork\(/);
 });
 

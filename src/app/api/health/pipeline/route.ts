@@ -3,6 +3,7 @@ import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions"
 import { getPipelineHealth } from "@/lib/pipeline-health";
 import { hasCronSecret } from "@/lib/cron-auth";
 import { loadReceiptOutcomeAudit } from "@/lib/receipt-outcome-audit";
+import { loadChaserCompletionDiagnostic } from "@/lib/receipt-chaser-completion";
 
 export const dynamic = "force-dynamic";
 // Auth runs before the health sweep; its bounded QBO probe may use 30s.
@@ -36,16 +37,26 @@ export async function GET(request: Request) {
 
     const noStore = { "Cache-Control": "no-store, max-age=0" };
 
+    const params = new URL(request.url).searchParams;
     // ?outcomes=only: just the receipt-outcome audit, skipping the health
     // sweep and its bounded QBO probe. Read-only, narrow, DB only.
-    if (new URL(request.url).searchParams.get("outcomes") === "only") {
+    if (params.get("outcomes") === "only") {
         const receiptOutcomes = await loadReceiptOutcomeAudit();
         return NextResponse.json({ receiptOutcomes }, { headers: noStore });
+    }
+
+    // ?chaser=only: the missing-receipt chaser's CURRENT-CYCLE completion proof
+    // alone — eight fixed AutomationSetting rows read twice, no QBO probe, no
+    // outcome audit. Read-only and bounded; same gate as everything above.
+    if (params.get("chaser") === "only") {
+        const chaserCompletion = await loadChaserCompletionDiagnostic();
+        return NextResponse.json({ chaserCompletion }, { headers: noStore });
     }
 
     const health = await getPipelineHealth();
     // Appended, not merged: health.ok keeps its operational meaning and an
     // unavailable audit reads as unavailable, never as a quiet zero.
     const receiptOutcomes = await loadReceiptOutcomeAudit();
-    return NextResponse.json({ ...health, receiptOutcomes }, { headers: noStore });
+    const chaserCompletion = await loadChaserCompletionDiagnostic();
+    return NextResponse.json({ ...health, receiptOutcomes, chaserCompletion }, { headers: noStore });
 }
