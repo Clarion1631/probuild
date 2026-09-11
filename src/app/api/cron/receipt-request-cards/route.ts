@@ -5,7 +5,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { decodeReasonCodes, type ReasonCode } from "@/lib/review-alert-reasons";
-import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasBackedResolution, isComponentDeadlineExceeded } from "@/lib/receipt-requests";
+import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasBackedResolution, isComponentDeadlineExceeded, ComponentTooLargeError } from "@/lib/receipt-requests";
 import {
     CARD_OWNERS_ASKED,
     CARD_POST_TIMEOUT_MS,
@@ -27,9 +27,8 @@ import { CYCLE_KEY, SWEEP_MARKER_KEY, chaserCompletedFor, parseSweepCycle, parse
 import { receiptRecognitionPolicy } from "@/lib/receipt-source-recognition";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 import { itemsMissingCardRecord, recordCardOnIssues } from "@/lib/receipt-card-history";
-// Reused rather than re-implemented (Codex PR #443 gate, finding 1) — see its
-// doc comment for why the safe-direction bias that governs an OCC retry is
-// exactly the bias this re-verification wants too.
+// Reuse the canonical matcher in strict mode: an unresolved reconciliation
+// hold is not a completed evidence verdict authorizing a notification.
 import { recomputeCodesFor } from "@/app/api/cron/receipt-requests/route";
 
 export const dynamic = "force-dynamic";
@@ -404,6 +403,7 @@ export async function loadCardItemTruth(
             targetKey: string,
             cache?: Map<string, ReasonCode[]>,
             deadlineExceeded?: () => boolean,
+            strict?: boolean,
         ) => Promise<ReasonCode[]>;
         deadlineExceeded?: () => boolean;
     } = {},
@@ -489,7 +489,7 @@ export async function loadCardItemTruth(
                  * produces: not verified, therefore not sent this run.
                  */
                 try {
-                    evidenceSatisfied = (await recompute(row.targetKey, cache, deadlineExceeded)).length === 0;
+                    evidenceSatisfied = (await recompute(row.targetKey, cache, deadlineExceeded, true)).length === 0;
                 } catch (error) {
                     if (!isComponentDeadlineExceeded(error)) throw error;
                     revalidationSkipped = true;
@@ -952,6 +952,7 @@ export async function GET(request: Request) {
      * marker.
      */
     const budgetDeferred: string[] = [];
+    const incompleteDeferred: string[] = [];
     /**
      * Owners whose day was claimed by a concurrent invocation between this
      * run's check and its reservation (round-43 gate, finding 1). Not a
@@ -1013,10 +1014,24 @@ export async function GET(request: Request) {
         // signed memo arriving, or Marge reassigning it all happen in that
         // window, and the card went out regardless. Asking somebody for a
         // receipt they already sent is how the list becomes noise.
-        const truth = await loadCardItemTruth(claimedCard.items.map(item => item.issueId), {
-            cache: revalidationCache,
-            deadlineExceeded: () => remainingRevalidationBudgetMs(runStartedAt) <= 0,
-        });
+        let truth: Map<string, CardItemTruth>;
+        try {
+            truth = await loadCardItemTruth(claimedCard.items.map(item => item.issueId), {
+                cache: revalidationCache,
+                deadlineExceeded: () => remainingRevalidationBudgetMs(runStartedAt) <= 0,
+            });
+        } catch (error) {
+            if (!(error instanceof ComponentTooLargeError)) throw error;
+            // No verdict: preserve the entire snapshot and queued resend. Only
+            // release this claim; another owner's complete check can proceed.
+            await prisma.receiptRequestCard.updateMany({
+                where: { id: rowId, claimToken: token, postedAt: null },
+                data: { claimedAt: null, claimToken: null },
+            });
+            sendDeferred.push(claimedCard.owner);
+            incompleteDeferred.push(claimedCard.owner);
+            continue;
+        }
         const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner);
 
         /**
@@ -1399,6 +1414,7 @@ export async function GET(request: Request) {
         // because "we ran out of clock before the send" and "we ran out of
         // clock inside the check" are different failures to chase.
         ...(budgetDeferred.length > 0 ? { budgetDeferredOwners: budgetDeferred } : {}),
+        ...(incompleteDeferred.length > 0 ? { incompleteDeferredOwners: incompleteDeferred } : {}),
         // Lost the (owner, day) reservation to a concurrent run; sent nothing.
         ...(dayTaken.length > 0 ? { dayAlreadyClaimedOwners: dayTaken } : {}),
         ...(budgetDeferred.length > 0
