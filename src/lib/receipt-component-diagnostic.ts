@@ -26,20 +26,23 @@ export const CLAIM_CAP = 500;
 export const EPOCH_KEYS = ['bankLedgerEpoch', 'receiptEvidenceEpoch', 'bankRegisterPullLastSuccess'] as const;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CUID_RE = /^c[0-9a-z]{24}$/;
 const QB_TXN_RE = /^\d{1,20}$/;
 const DEAD_STATES = [...DEAD_INTAKE_STATES];
 
 export interface ReceiptComponentDiagnosticQuery { bankLineId: string; qbTxnId: string }
 
-/** Exactly one `bankLineId` (UUID) and exactly one `qbTxnId` (1..20 digits). Nothing else, nothing repeated. */
+/** Exactly one `bankLineId` (UUID, or Prisma CUIDv1: lower-case `c` + 24 lower-case ASCII alphanumerics) and exactly one `qbTxnId` (1..20 digits). Nothing else, nothing repeated. */
 export function parseReceiptComponentDiagnosticQuery(params: URLSearchParams): ReceiptComponentDiagnosticQuery | null {
     const keys = [...params.keys()];
     if (keys.length !== 2 || !keys.includes('bankLineId') || !keys.includes('qbTxnId')) return null;
     const bank = params.getAll('bankLineId');
     const qb = params.getAll('qbTxnId');
     if (bank.length !== 1 || qb.length !== 1) return null;
-    if (!UUID_RE.test(bank[0]) || !QB_TXN_RE.test(qb[0])) return null;
-    return { bankLineId: bank[0].toLowerCase(), qbTxnId: qb[0] };
+    if (!QB_TXN_RE.test(qb[0])) return null;
+    if (UUID_RE.test(bank[0])) return { bankLineId: bank[0].toLowerCase(), qbTxnId: qb[0] };
+    if (CUID_RE.test(bank[0])) return { bankLineId: bank[0], qbTxnId: qb[0] };
+    return null;
 }
 
 type FindManyOnly<M extends { findMany: unknown }> = Pick<M, 'findMany'>;
@@ -335,7 +338,7 @@ export function createReceiptComponentDiagnosticHandler(deps: {
         const startedAt = deps.now?.() ?? new Date();
         if (!deps.authorized(request)) return respond({ error: 'Unauthorized' }, 401);
         const query = parseReceiptComponentDiagnosticQuery(new URL(request.url).searchParams);
-        if (!query) return respond({ error: 'Provide exactly one bankLineId (UUID) and exactly one qbTxnId (1-20 digits); no other parameters.' }, 400);
+        if (!query) return respond({ error: 'Provide exactly one bankLineId (UUID or CUID) and exactly one qbTxnId (1-20 digits); no other parameters.' }, 400);
         try {
             return respond({ ok: true, ...(await deps.load(query, startedAt)) });
         } catch {

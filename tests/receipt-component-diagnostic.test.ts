@@ -321,3 +321,61 @@ test('existing lineage census includes global source claims and exact aliases',a
     assert.ok(r.lineage.units?.some(unit=>unit.unit===`purchase:${QB_ID}`));
     assert.ok(calls.some(c=>c.model==='bankLineObservation' && typeof (c.args.where as Record<string,unknown>).sourceLineId==='object'));
 });
+
+// Synthetic CUIDv1: lower-case c followed by exactly 24 lower-case ASCII alphanumerics.
+const CUID_ID = 'c' + 'abcdefghij0123456789klmn';
+
+test('parse accepts a Prisma CUIDv1 bankLineId unchanged and still canonicalizes UUIDs', () => {
+    assert.equal(CUID_ID.length, 25);
+    const alphaUuid = 'ABCDEFAB-ABCD-4ABC-8ABC-ABCDEFABCDEF';
+    assert.deepEqual(parseReceiptComponentDiagnosticQuery(new URLSearchParams({ bankLineId: alphaUuid, qbTxnId: QB_ID })), { bankLineId: alphaUuid.toLowerCase(), qbTxnId: QB_ID });
+    assert.deepEqual(parseReceiptComponentDiagnosticQuery(new URLSearchParams({ bankLineId: CUID_ID, qbTxnId: QB_ID })), { bankLineId: CUID_ID, qbTxnId: QB_ID });
+    assert.deepEqual(parseReceiptComponentDiagnosticQuery(new URLSearchParams({ bankLineId: LINE_ID, qbTxnId: QB_ID })), { bankLineId: LINE_ID, qbTxnId: QB_ID });
+    assert.deepEqual(parseReceiptComponentDiagnosticQuery(new URLSearchParams({ bankLineId: LINE_ID.toUpperCase(), qbTxnId: QB_ID })), { bankLineId: LINE_ID, qbTxnId: QB_ID });
+});
+
+test('parse rejects CUID boundary and shape violations', () => {
+    const bad: Record<string, string> = {
+        short: 'c' + 'a'.repeat(23),
+        long: 'c' + 'a'.repeat(25),
+        upperPrefix: 'C' + 'a'.repeat(24),
+        upperBody: 'c' + 'A' + 'a'.repeat(23),
+        cuid2NoPrefix: 'tz4a98xxat96iws9zmbrgj3a',
+        underscore: 'c' + 'a'.repeat(23) + '_',
+        hyphen: 'c' + 'a'.repeat(23) + '-',
+        leadingSpace: ' ' + CUID_ID,
+        trailingSpace: CUID_ID + ' ',
+        innerSpace: 'c' + 'a'.repeat(12) + ' ' + 'a'.repeat(11),
+        newline: CUID_ID + '\n',
+        slash: 'c' + 'a'.repeat(23) + '/',
+        dotdot: 'c' + 'a'.repeat(22) + '..',
+        backslash: 'c' + 'a'.repeat(23) + '\\',
+        nonAscii: 'c' + 'a'.repeat(23) + '\u00e9',
+        list: `${CUID_ID},${CUID_ID}`,
+        empty: '',
+        justC: 'c',
+    };
+    for (const [label, id] of Object.entries(bad)) {
+        assert.equal(parseReceiptComponentDiagnosticQuery(new URLSearchParams({ bankLineId: id, qbTxnId: QB_ID })), null, label);
+    }
+    assert.equal(parseReceiptComponentDiagnosticQuery(new URLSearchParams(`bankLineId=${CUID_ID}&bankLineId=${CUID_ID}&qbTxnId=${QB_ID}`)), null, 'repeated cuid');
+    assert.equal(parseReceiptComponentDiagnosticQuery(new URLSearchParams(`bankLineId=${CUID_ID}&qbTxnId=${QB_ID}&x=1`)), null, 'extra key');
+    assert.equal(parseReceiptComponentDiagnosticQuery(new URLSearchParams(`bankLineId=${CUID_ID}&qbTxnId=1,2`)), null, 'qb list');
+});
+
+test('handler: authorized load receives the exact CUID once, no enumeration', async () => {
+    const seen: unknown[][] = [];
+    const h = createReceiptComponentDiagnosticHandler({ authorized: () => true, load: async (...args: unknown[]) => { seen.push(args); return {}; } });
+    const res = await h(new Request(`https://example.invalid/d?bankLineId=${CUID_ID}&qbTxnId=${QB_ID}`));
+    assert.notEqual(res.status, 400);
+    assert.notEqual(res.status, 401);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.equal(seen.length, 1);
+    const serialized = JSON.stringify(seen[0]);
+    assert.ok(serialized.includes(`"${CUID_ID}"`), serialized);
+    assert.equal(serialized.split(CUID_ID).length - 1, 1, 'CUID passed exactly once');
+    assert.ok(serialized.includes(`"${QB_ID}"`), serialized);
+    const badRes = await h(new Request(`https://example.invalid/d?bankLineId=${'C' + 'a'.repeat(24)}&qbTxnId=${QB_ID}`));
+    assert.equal(badRes.status, 400);
+    assert.equal(seen.length, 1);
+});
