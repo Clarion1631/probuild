@@ -398,10 +398,31 @@ test('prepare alone returns sanitized PDF diagnostics without opening a transact
   const diagnostic = { reason: 'provider_error', authSource: 'company-settings', phase: 'metadata-before', providerHttp: 403, token: 'must-never-leak' };
   const h = makeHarness({ drive: { [PDF_ID]: { kind: 'unavailable', reason: 'must-never-leak', diagnostic } } });
   const prepared = await h.service.handle({ mode: 'prepare', bankLineId: BANK_LINE });
-  assert.deepEqual((prepared as any).pdfDiagnostic, { reason: 'provider_error', authSource: 'company-settings', phase: 'metadata-before', providerHttp: 403 });
+  assert.deepEqual((prepared as any).pdfDiagnostic, { reason: 'provider_error', authSource: 'company-settings', phase: 'metadata-before', providerHttp: 403, providerCategory: 'unknown' });
   assert.equal(JSON.stringify(prepared).includes('must-never-leak'), false);
   const applied = await h.service.handle({ mode: 'apply', bankLineId: BANK_LINE, planDigest: 'a'.repeat(64) });
   assert.equal('pdfDiagnostic' in applied, false);
   assert.equal(h.transactions, 0);
   assert.equal(h.committed.length, 0);
+});
+
+test('prepare passes a known providerCategory through and strips raw categories to unknown', async () => {
+  const known = { reason: 'provider_error', authSource: 'token-file-or-env', phase: 'auth', providerHttp: 400, providerCategory: 'invalid_grant' };
+  const k = makeHarness({ drive: { [PDF_ID]: { kind: 'unavailable', reason: 'provider_error', diagnostic: known } } });
+  const preparedKnown = await k.service.handle({ mode: 'prepare', bankLineId: BANK_LINE });
+  assert.equal(preparedKnown.status, 'incomplete');
+  assert.deepEqual((preparedKnown as any).pdfDiagnostic, known);
+
+  const raw = { reason: 'provider_error', authSource: 'token-file-or-env', phase: 'media', providerHttp: 403, providerCategory: 'raw-reason-must-never-leak' };
+  const r = makeHarness({ drive: { [PDF_ID]: { kind: 'unavailable', reason: 'provider_error', diagnostic: raw } } });
+  const preparedRaw = await r.service.handle({ mode: 'prepare', bankLineId: BANK_LINE });
+  assert.deepEqual((preparedRaw as any).pdfDiagnostic, { reason: 'provider_error', authSource: 'token-file-or-env', phase: 'media', providerHttp: 403, providerCategory: 'unknown' });
+  assert.equal(JSON.stringify(preparedRaw).includes('raw-reason-must-never-leak'), false);
+
+  const applied = await r.service.handle({ mode: 'apply', bankLineId: BANK_LINE, planDigest: 'a'.repeat(64) });
+  assert.equal('pdfDiagnostic' in applied, false);
+  assert.equal(k.transactions, 0);
+  assert.equal(r.transactions, 0);
+  assert.equal(k.committed.length, 0);
+  assert.equal(r.committed.length, 0);
 });
