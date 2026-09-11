@@ -1,4 +1,6 @@
 import { reviewedReceiptFactForExpense, reviewedReceiptFactsFingerprint } from "@/server/receipt-reviewed-source-facts";
+import { reviewedReceiptPairForExpense, reviewedReceiptPairsFingerprint } from "@/server/receipt-reviewed-pair-facts";
+import { loadReviewedPairCensus, pairCensusFingerprint, reviewedPairCensusKeys, subsetPairCensus } from "@/lib/reviewed-pair-census";
 import { RECEIPT_AUTH_SETTLEMENT_MAX_DAYS, receiptRecognitionPolicy } from "@/lib/receipt-source-recognition";
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
@@ -67,7 +69,7 @@ import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 // Default off until canonical statement source fields have been verified.
 // Enabling changes policy: start a fresh full sweep before any purchaser cards.
 const SOURCE_RECOGNITION_ENABLED = process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true";
-const RECOGNITION_POLICY = receiptRecognitionPolicy(SOURCE_RECOGNITION_ENABLED, reviewedReceiptFactsFingerprint);
+const RECOGNITION_POLICY = receiptRecognitionPolicy(SOURCE_RECOGNITION_ENABLED, reviewedReceiptFactsFingerprint, reviewedReceiptPairsFingerprint);
 const EVIDENCE_LOOKBACK_DAYS = SOURCE_RECOGNITION_ENABLED ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS : RECEIPT_MATCH_DATE_SLOP_DAYS;
 const SOURCE_ADJACENCY_DAYS = SOURCE_RECOGNITION_ENABLED
     ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS + RECEIPT_MATCH_DATE_SLOP_DAYS
@@ -884,7 +886,9 @@ async function loadCompetingComponent(seed: {
             // than silently truncated into a wrong answer.
             take: MAX_COMPONENT_LINES + 1,
             // `updatedAt` rides along for the component fingerprint — see BatchLine.
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
+            // The link columns ride along for the reviewed exact-pair edge, which
+            // refuses to decide a line whose link state was not loaded.
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true, qbTxnId: true, probuildExpenseId: true },
         }).then(rows => rows.map(row => ({ ...row, postedDate: row.postedDate.toISOString().slice(0, 10) }))),
         { maxNodes: MAX_COMPONENT_LINES, deadlineExceeded, linkDays: SOURCE_ADJACENCY_DAYS },
     );
@@ -920,7 +924,7 @@ export async function recomputeCodesFor(
             // Same shape as every other BankLine read here, `updatedAt`
             // included: one rule for all of them is what keeps a select that
             // feeds a fingerprint from quietly losing the column again.
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true, qbTxnId: true, probuildExpenseId: true },
         }),
         prisma.reviewIssue.findUnique({
             where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
@@ -944,7 +948,10 @@ export async function recomputeCodesFor(
     // differently depending on which is considered first, so recomputing one
     // row in isolation saw "a receipt exists" and closed a charge whose receipt
     // had already been given to its twin.
-    let loadedLines: Array<{ id: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber: string | null }>;
+    let loadedLines: Array<{
+        id: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber: string | null;
+        account: string; sourceOfRecord: string; qbTxnId: string | null; probuildExpenseId: string | null;
+    }>;
     try {
         loadedLines = await loadCompetingComponent(line, deadlineExceeded);
     } catch (error) {
@@ -987,7 +994,7 @@ export async function recomputeCodesFor(
             where: { date: range.timestamp },
             select: {
                 id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
-                receiptUrl: true, qbSyncToken: true, status: true, description: true, receiptIntake: { select: { id: true } },
+                receiptUrl: true, qbSyncToken: true, status: true, description: true, sourceFileId: true, sourceGroupIndex: true, receiptIntake: { select: { id: true } },
             },
         }),
         prisma.receiptIntake.findMany({
@@ -1016,27 +1023,35 @@ export async function recomputeCodesFor(
     // outside the evidence window still reaches its bound line. An overflow
     // throws: this recompute reports an honest error rather than a verdict.
     const lineage = await loadRetiredReceiptLineage(prisma, lines.map(l => l.id), { candidatePurchaseIds: lineagePurchaseIds(expenseRows, intakeRows), candidateExpenseIds: lineageExpenseIds(intakeRows) });
+    const expenses = expenseRows.flatMap(row => {
+        const cents = decimalStringToCents(row.amount.toString());
+        if (cents === null) return [];
+        const reviewedDate = row.date ? dayKeyInTimeZone(row.date, zone) : null;
+        return [{
+            id: row.id,
+            qbPurchaseId: row.qbPurchaseId,
+            hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
+            amountCents: cents,
+            // COMPANY-LOCAL DAY, not the UTC one — see processBatch.
+            date: row.date ? dayKeyInTimeZone(row.date, zone) : null,
+            vendor: row.vendor,
+            linkedIntakeId: row.receiptIntake?.id ?? null,
+            reviewedSourceFact: reviewedReceiptFactForExpense({ ...row, amountCents: cents, date: reviewedDate }),
+            reviewedPairFact: reviewedReceiptPairForExpense({ ...row, amountCents: cents, date: reviewedDate }),
+        }];
+    });
+    // GLOBAL IDENTITY CENSUS for every pinned pair in this window — the same
+    // helper the batch and its locked re-read consume. Queried by exact alias
+    // across all accounts, states and dates; an overflow throws, which is an
+    // honest error rather than a verdict.
+    const pairCensus = await loadReviewedPairCensus(prisma, reviewedPairCensusKeys(expenses));
 
     const plan = planReceiptRequests({
         sourceRecognitionEnabled: SOURCE_RECOGNITION_ENABLED,
         bankLines: lines,
         boundLineage: lineage.evidence,
-        expenses: expenseRows.flatMap(row => {
-            const cents = decimalStringToCents(row.amount.toString());
-            if (cents === null) return [];
-            const reviewedDate = row.date ? dayKeyInTimeZone(row.date, zone) : null;
-            return [{
-                id: row.id,
-                qbPurchaseId: row.qbPurchaseId,
-                hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
-                amountCents: cents,
-                // COMPANY-LOCAL DAY, not the UTC one — see processBatch.
-                date: row.date ? dayKeyInTimeZone(row.date, zone) : null,
-                vendor: row.vendor,
-                linkedIntakeId: row.receiptIntake?.id ?? null,
-                reviewedSourceFact: reviewedReceiptFactForExpense({ ...row, amountCents: cents, date: reviewedDate }),
-            }];
-        }),
+        pairCensus: pairCensus.evidence,
+        expenses,
         intakes: intakeRows.map(row => ({
             id: row.id,
             expenseId: row.expenseId,
@@ -1224,6 +1239,13 @@ interface BatchLine {
     rawDescriptor: string;
     checkNumber: string | null;
     /**
+     * The line's reconciliation link state. Read by the reviewed exact-pair
+     * edge (which refuses an unloaded value) and stamped into the component
+     * fingerprint, so a link landing between plan and commit forces a replan.
+     */
+    qbTxnId: string | null;
+    probuildExpenseId: string | null;
+    /**
      * CARRIED FOR THE FINGERPRINT, not for the matcher.
      *
      * The in-transaction fingerprint re-reads the component's bank lines WITH
@@ -1311,7 +1333,7 @@ async function processBatch(
                     postedDate: { gte: new Date(`${f.from}T00:00:00Z`), lte: new Date(`${f.to}T00:00:00Z`) },
                 })),
             },
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true, qbTxnId: true, probuildExpenseId: true },
         });
         cohortRows.push(...found);
     }
@@ -1348,7 +1370,7 @@ async function processBatch(
             where: { date: range.timestamp },
             select: {
                 id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
-                receiptUrl: true, qbSyncToken: true, status: true, description: true, receiptIntake: { select: { id: true } },
+                receiptUrl: true, qbSyncToken: true, status: true, description: true, sourceFileId: true, sourceGroupIndex: true, receiptIntake: { select: { id: true } },
             },
         }),
         prisma.receiptIntake.findMany({
@@ -1369,6 +1391,43 @@ async function processBatch(
     // and the batch fails honestly.
     const lineage = await loadRetiredReceiptLineage(prisma, lineIds, { candidatePurchaseIds: lineagePurchaseIds(expenseRows, intakeRows), candidateExpenseIds: lineageExpenseIds(intakeRows), checkBudget: budget.check });
 
+    // Decimal → cents from the STRING form. Number(d) * 100 is a float bug
+    // on ordinary receipt totals (19.99 → 1998.9999999999998).
+    const expenses = expenseRows.flatMap(row => {
+        const cents = decimalStringToCents(row.amount.toString());
+        if (cents === null) return [];
+        const reviewedDate = row.date ? dayKeyInTimeZone(row.date, zone) : null;
+        return [{
+            id: row.id,
+            qbPurchaseId: row.qbPurchaseId,
+            hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
+            amountCents: cents,
+            /**
+             * THE COMPANY'S CALENDAR DAY, not UTC's.
+             *
+             * `Expense.date` is a TIMESTAMP — an instant — and the query
+             * that loaded it used company-local midnights. Deriving its day
+             * key with `.toISOString()` moves every expense stamped after
+             * 5pm Pacific to the NEXT day, so a receipt filed at 7pm on the
+             * 16th was matched against the 17th: at the ±2-day edge it
+             * dropped out of range entirely and its charge got chased with
+             * the receipt sitting right there. DST-correct, which a fixed
+             * offset would not be.
+             */
+            date: row.date ? dayKeyInTimeZone(row.date, zone) : null,
+            vendor: row.vendor,
+            linkedIntakeId: row.receiptIntake?.id ?? null,
+            reviewedSourceFact: reviewedReceiptFactForExpense({ ...row, amountCents: cents, date: reviewedDate }),
+            reviewedPairFact: reviewedReceiptPairForExpense({ ...row, amountCents: cents, date: reviewedDate }),
+        }];
+    });
+    // 2c. GLOBAL IDENTITY CENSUS for every reviewed exact pair in the cohort's
+    // window, by exact alias across all accounts, states and dates. One load per
+    // batch; each component's planned version takes its subset, and the locked
+    // transaction re-reads the same helper for its own rows. An overflow throws
+    // and the batch fails honestly.
+    const pairCensus = await loadReviewedPairCensus(prisma, reviewedPairCensusKeys(expenses), { checkBudget: budget.check });
+
     // 3. DECIDE.
     budget.check();
     const fullPlan = planReceiptRequests({
@@ -1381,36 +1440,11 @@ async function processBatch(
             checkNumber: row.checkNumber,
             account: row.account,
             sourceOfRecord: row.sourceOfRecord,
+            qbTxnId: row.qbTxnId,
+            probuildExpenseId: row.probuildExpenseId,
         })),
-        // Decimal → cents from the STRING form. Number(d) * 100 is a float bug
-        // on ordinary receipt totals (19.99 → 1998.9999999999998).
-        expenses: expenseRows.flatMap(row => {
-            const cents = decimalStringToCents(row.amount.toString());
-            if (cents === null) return [];
-            const reviewedDate = row.date ? dayKeyInTimeZone(row.date, zone) : null;
-            return [{
-                id: row.id,
-                qbPurchaseId: row.qbPurchaseId,
-                hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
-                amountCents: cents,
-                /**
-                 * THE COMPANY'S CALENDAR DAY, not UTC's.
-                 *
-                 * `Expense.date` is a TIMESTAMP — an instant — and the query
-                 * that loaded it used company-local midnights. Deriving its day
-                 * key with `.toISOString()` moves every expense stamped after
-                 * 5pm Pacific to the NEXT day, so a receipt filed at 7pm on the
-                 * 16th was matched against the 17th: at the ±2-day edge it
-                 * dropped out of range entirely and its charge got chased with
-                 * the receipt sitting right there. DST-correct, which a fixed
-                 * offset would not be.
-                 */
-                date: row.date ? dayKeyInTimeZone(row.date, zone) : null,
-                vendor: row.vendor,
-                linkedIntakeId: row.receiptIntake?.id ?? null,
-                reviewedSourceFact: reviewedReceiptFactForExpense({ ...row, amountCents: cents, date: reviewedDate }),
-            }];
-        }),
+        expenses,
+        pairCensus: pairCensus.evidence,
         intakes: intakeRows.map(row => ({
             id: row.id,
             expenseId: row.expenseId,
@@ -1515,10 +1549,18 @@ async function processBatch(
             // fields.
             lines: componentLines.map(row => ({
                 id: row.id,
+                updatedAt: row.updatedAt,
                 rawDescriptor: row.rawDescriptor,
                 account: row.account,
                 sourceOfRecord: row.sourceOfRecord,
-                updatedAt: row.updatedAt,
+                // The fields a reviewed exact pair pins on its named line. A
+                // corrected date, amount or check number, or a link landing,
+                // changes whether that edge exists (reviewedReceiptPairMatches).
+                postedDate: row.postedDate,
+                amountCents: row.amountCents,
+                checkNumber: row.checkNumber,
+                qbTxnId: row.qbTxnId,
+                probuildExpenseId: row.probuildExpenseId,
             })),
             // EVERY FIELD THE PLANNER READS, not just identity: an amount, date
             // or vendor correction changes which line an expense can answer,
@@ -1539,6 +1581,13 @@ async function processBatch(
             // equals a fresh load of exactly these ids — which is what the
             // locked re-read below computes.
             lineageFingerprint: lineageFingerprint(subsetLineage(lineage.snapshot, component.lineIds, lineagePurchaseIds(expenseRows.filter(row => expenseInWindow(row.date)), intakeRows.filter(row => intakeInWindow(row.txnDate))), lineageExpenseIds(intakeRows.filter(row => intakeInWindow(row.txnDate))))),
+            // This component's share of the batch-wide pair census: the pinned
+            // Expenses inside its evidence window. Each entry is decided from its
+            // own rows, so the subset equals a fresh load of those keys — which is
+            // what the locked re-read below computes from its own Expense rows.
+            pairCensusFingerprint: pairCensusFingerprint(subsetPairCensus(pairCensus.snapshot, expenses
+                .filter(e => e.reviewedPairFact && expenseInWindow(expenseRows.find(row => row.id === e.id)?.date ?? null))
+                .map(e => e.id))),
         });
 
         try {
@@ -1651,9 +1700,20 @@ async function processBatch(
                         where: { date: componentRange.timestamp },
                         select: {
                             id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
-                            receiptUrl: true, qbSyncToken: true, status: true, description: true, receiptIntake: { select: { id: true } },
+                            receiptUrl: true, qbSyncToken: true, status: true, description: true, sourceFileId: true, sourceGroupIndex: true, receiptIntake: { select: { id: true } },
                         },
                     });
+                // The SAME pair census, inside the transaction, under both locks,
+                // keyed from the LOCKED Expense rows through the same resolver the
+                // planner used — so a pair that appeared, drifted, or gained a
+                // competing claim since the plan moves the fingerprint.
+                const currentPairCensus = await loadReviewedPairCensus(tx, reviewedPairCensusKeys(currentExpenses.flatMap(row => {
+                    const cents = decimalStringToCents(row.amount.toString());
+                    if (cents === null) return [];
+                    // The same company-local day key the planner resolved the pair with.
+                    const reviewedDate = row.date ? dayKeyInTimeZone(row.date, zone) : null;
+                    return [{ id: row.id, reviewedPairFact: reviewedReceiptPairForExpense({ ...row, amountCents: cents, date: reviewedDate }) }];
+                })));
                 const current = componentVersionOf({
                     issues: await tx.reviewIssue.findMany({
                         where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: component.lineIds } },
@@ -1666,7 +1726,8 @@ async function processBatch(
                         // `COMPETING_LINE_ADJACENCY_DAYS` past an edge could
                         // have joined this component since it was planned.
                         where: { amountCents: { in: amounts }, postedDate: joinRange.calendar },
-                        select: { id: true, updatedAt: true, rawDescriptor: true, account: true, sourceOfRecord: true },
+                        // Every field the planned stamp hashed, re-read under the locks.
+                        select: { id: true, updatedAt: true, rawDescriptor: true, account: true, sourceOfRecord: true, postedDate: true, amountCents: true, checkNumber: true, qbTxnId: true, probuildExpenseId: true },
                     }),
                     expenses: currentExpenses.map(row => ({
                         id: row.id,
@@ -1680,6 +1741,7 @@ async function processBatch(
                     // The SAME helper, inside the transaction, under both
                     // locks, for this component's ids.
                     lineageFingerprint: lineageFingerprint((await loadRetiredReceiptLineage(tx, component.lineIds, { candidatePurchaseIds: lineagePurchaseIds(currentExpenses, currentIntakes), candidateExpenseIds: lineageExpenseIds(currentIntakes) })).snapshot),
+                    pairCensusFingerprint: pairCensusFingerprint(currentPairCensus.snapshot),
                 });
                 if (!componentVersionsMatch(planned, current)) throw new ComponentMovedError();
 
@@ -2186,7 +2248,7 @@ async function runSweep(
         const unitResult = await runCheckpointedUnits([page], budget, async () => {
             const lines = await prisma.bankLine.findMany({
                 where: { id: { in: page.map(issue => issue.targetKey) } },
-                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
+                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true, qbTxnId: true, probuildExpenseId: true },
             });
 
             // AN ISSUE WHOSE BANK LINE IS GONE can never be answered: the matcher
@@ -2388,7 +2450,7 @@ async function runSweep(
             const batch = await prisma.bankLine.findMany({
                 where: { id: { in: ids } },
                 orderBy: [{ postedDate: "asc" }, { id: "asc" }],
-                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true },
+                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true, account: true, sourceOfRecord: true, qbTxnId: true, probuildExpenseId: true },
             });
             // Every line in the page vanished between the two queries. Nothing to
             // judge, but the checkpoint still has to move past it.

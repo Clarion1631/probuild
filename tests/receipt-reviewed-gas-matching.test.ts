@@ -274,8 +274,8 @@ test('all production evidence reads and both OCC projections carry reviewed fact
  assert.match(route,/@\/server\/receipt-reviewed-source-facts/);
 });
 test('new facts invalidate previous enabled cycle while disabled semantics stay stable',()=>{
- assert.equal(receiptRecognitionPolicy(true),'receipt-source-v2:on:absent');
- assert.equal(receiptRecognitionPolicy(false),'receipt-source-v1:off');
+ assert.equal(receiptRecognitionPolicy(true,'absent','absent'),'receipt-source-v3:on:absent:pair:absent');
+ assert.equal(receiptRecognitionPolicy(false,'absent','absent'),'receipt-source-v1:off');
 });
 
 test('global linked intake outside the loaded window or dead-excluded cannot grant a reviewed edge',()=>{
@@ -305,12 +305,12 @@ test('linked intake insertion deletion and replacement invalidate OCC even when 
  assert.equal(componentVersionsMatch(v('created'),v('replaced')),false);
 });
 test('config change removal and invalid pin invalidate sweep and card certification policy',()=>{
- const p=receiptRecognitionPolicy(true,config.fingerprint);
- assert.notEqual(p,receiptRecognitionPolicy(true,'absent'));
- assert.notEqual(p,receiptRecognitionPolicy(true,'invalid'));
- assert.notEqual(p,receiptRecognitionPolicy(true,'b'.repeat(64)));
+ const p=receiptRecognitionPolicy(true,config.fingerprint,'absent');
+ assert.notEqual(p,receiptRecognitionPolicy(true,'absent','absent'));
+ assert.notEqual(p,receiptRecognitionPolicy(true,'invalid','absent'));
+ assert.notEqual(p,receiptRecognitionPolicy(true,'b'.repeat(64),'absent'));
  const sweep=readFileSync(new URL('../src/app/api/cron/receipt-requests/route.ts',import.meta.url),'utf8');
  const cards=readFileSync(new URL('../src/app/api/cron/receipt-request-cards/route.ts',import.meta.url),'utf8');
- assert.match(sweep,/receiptRecognitionPolicy\(SOURCE_RECOGNITION_ENABLED, reviewedReceiptFactsFingerprint\)/);
- assert.match(cards,/receiptRecognitionPolicy\(process\.env\.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true", reviewedReceiptFactsFingerprint\)/);
+ assert.match(sweep,/receiptRecognitionPolicy\(SOURCE_RECOGNITION_ENABLED, reviewedReceiptFactsFingerprint, reviewedReceiptPairsFingerprint\)/);
+ assert.match(cards,/receiptRecognitionPolicy\(process\.env\.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true", reviewedReceiptFactsFingerprint, reviewedReceiptPairsFingerprint\)/);
 });

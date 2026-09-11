@@ -6,6 +6,7 @@ import { lockBankLedgerEpoch } from './bank-ledger-epoch';
 import { CYCLE_KEY, SWEEP_MARKER_KEY, parseSweepCycle, parseSweepMarker, chaserCompletedFor, cycleStillValid } from './receipt-sweep-marker';
 import { receiptRecognitionPolicy } from './receipt-source-recognition';
 import { reviewedReceiptFactsFingerprint } from '@/server/receipt-reviewed-source-facts';
+import { reviewedReceiptPairsFingerprint } from '@/server/receipt-reviewed-pair-facts';
 import { effectiveOwner, RECEIPT_REQUEST_TARGET_TYPE } from './receipt-requests';
 import { decodeReasonCodes } from './review-alert-reasons';
 import { parseMissingReceiptDetails } from '@/app/automation/receipts-data';
@@ -50,7 +51,7 @@ export function createOnDemandDeps(install: OnDemandStoreInstall = {}): OnDemand
     async function settings(client: Db) {
         const rows = await client.automationSetting.findMany({ where: { key: { in: SETTING_KEYS } }, select: { key: true, value: true } });
         const values = Object.fromEntries(SETTING_KEYS.map(key => [key, rows.find(r => r.key === key)?.value ?? null]));
-        const policy = receiptRecognitionPolicy(env.RECEIPT_SOURCE_RECOGNITION_ENABLED === 'true', reviewedReceiptFactsFingerprint);
+        const policy = receiptRecognitionPolicy(env.RECEIPT_SOURCE_RECOGNITION_ENABLED === 'true', reviewedReceiptFactsFingerprint, reviewedReceiptPairsFingerprint);
         return { values, policy, ledger: values.bankLedgerEpoch ?? '0', evidence: values.receiptEvidenceEpoch ?? '0' };
     }
 

@@ -14,9 +14,17 @@
 /** Bounded settlement allowance (calendar days), not a fuzzy date window. */
 export const RECEIPT_AUTH_SETTLEMENT_MAX_DAYS = 7;
 
-/** Persisted with sweep certification so a flag change requires a new cycle. */
-export function receiptRecognitionPolicy(enabled: boolean, reviewedFactsFingerprint = "absent"): string {
-    return enabled ? `receipt-source-v2:on:${reviewedFactsFingerprint}` : 'receipt-source-v1:off';
+/**
+ * Persisted with sweep certification so a flag change requires a new cycle.
+ *
+ * BOTH private packet fingerprints ride in the string, and both are required
+ * arguments so a call site cannot quietly certify against half the config: a
+ * reviewed packet added, revised, revoked or corrupted changes the policy, the
+ * saved cycle no longer matches, and no card can be sent until a fresh complete
+ * sweep certifies under the new one. `v3` retires every `v2` certificate.
+ */
+export function receiptRecognitionPolicy(enabled: boolean, reviewedFactsFingerprint: string, reviewedPairsFingerprint: string): string {
+    return enabled ? `receipt-source-v3:on:${reviewedFactsFingerprint}:pair:${reviewedPairsFingerprint}` : 'receipt-source-v1:off';
 }
 
 /** Server-reviewed document facts. No extra evidence unit or target binding. */
@@ -26,6 +34,109 @@ export interface ReviewedReceiptMerchantEvidence {
     purchaseDate: string;
     amountCents: number;
     sourceFactDigest: string;
+}
+
+// ── Reviewed exact pair (one pinned line, one pinned positive Expense) ────
+
+/** The decision-relevant reviewed fields of the canonical line. `checkNumber` is pinned null: a check is never a card pair. */
+export interface ReviewedReceiptPairTarget {
+    account: string;
+    sourceOfRecord: string;
+    /** Settlement (posting) date, YYYY-MM-DD. */
+    postedDate: string;
+    /** Signed canonical cents (negative). */
+    amountCents: number;
+    rawDescriptor: string;
+    checkNumber: null;
+    /** The authorization date the descriptor trace carries, YYYY-MM-DD. Re-derived at match time. */
+    bankAuthDate: string;
+}
+
+/**
+ * A server-reviewed association between ONE canonical bank line and ONE existing
+ * positive receipted Expense, admitted only for that named pair.
+ *
+ * WHY IT EXISTS. A reviewed source can place an existing Expense's accounting
+ * date one day before the bank's own authorization trace and three days before
+ * settlement — an authenticated confirmation that states payment on that day, or
+ * a merchant order receipt whose order was placed then (which states no capture
+ * time at all). Neither the ordinary ±2-day rule nor the exact authorization-date
+ * rule can see that receipt, and widening either would be a fuzzy window for
+ * every receipt. So the reviewer pins the DECISION-RELEVANT fields of both sides
+ * — the line's account, source, posting date, cents, descriptor (which carries
+ * the card and trace), and the Expense's id, purchase id, sync token, status,
+ * description, receipt URL, cents, date, vendor and source-document identity —
+ * and the match holds only while every pinned field still holds. That is not a
+ * pin of every database column: races on the rows themselves (`updatedAt`, a
+ * link landing, a competitor arriving) are fenced at runtime by the component
+ * fingerprint, the locked re-read and the global pair census, separately.
+ *
+ * The bank trace in the descriptor and any processor transaction id or merchant
+ * order id in the review provenance are DIFFERENT identifiers. Nothing here
+ * treats them as the same, and the runtime projection carries no provenance.
+ *
+ * It supplies one edge inside the ordinary complete matching: the Expense keeps
+ * its usual unit key, so it still folds with its intake, is still excluded when
+ * lineage binds or reserves it, and can still be taken by an ordinary competitor.
+ */
+export interface ReviewedReceiptPairEvidence {
+    targetBankLineId: string;
+    target: ReviewedReceiptPairTarget;
+    /** Complete normalized merchant prefix of the descriptor (before `C#`). */
+    bankPayee: string;
+    cardTail: string;
+    /**
+     * The reviewed Expense accounting date (company-local day); may precede
+     * `target.bankAuthDate`. A stated payment date exists only in the email
+     * provenance kind and is review-time only; it is never carried here.
+     */
+    purchaseDate: string;
+    /** POSITIVE magnitude, equal to `-target.amountCents`. */
+    amountCents: number;
+    expenseId: string;
+    qbPurchaseId: string;
+    /** The pinned Expense's current receipt and source-document identity — census keys, not review provenance. */
+    receiptUrl: string;
+    sourceFileId: string | null;
+    sourceGroupIndex: number | null;
+    sourceFactDigest: string;
+}
+
+/** A planner line with the link state the pair predicate requires to be LOADED. */
+export interface ReviewedReceiptPairLine extends ReceiptSourceLine {
+    id: string;
+    qbTxnId?: string | null;
+    probuildExpenseId?: string | null;
+}
+
+/**
+ * True only for the pair's named line, with every pinned line field exact, the
+ * descriptor still parsing to the pinned authorization date, card and payee, the
+ * line's link state loaded and either empty or the pair's OWN identities, and the
+ * evidence being the pinned magnitude on the pinned reviewed Expense accounting date.
+ *
+ * Unloaded link state (`undefined`) fails closed: an adapter that did not select
+ * `qbTxnId`/`probuildExpenseId` cannot vouch that no competing link exists.
+ */
+export function reviewedReceiptPairMatches(
+    line: ReviewedReceiptPairLine,
+    evidence: { amountCents: number; date: string | null },
+    fact: ReviewedReceiptPairEvidence | null | undefined,
+): boolean {
+    if (!fact || !/^[a-f0-9]{64}$/.test(fact.sourceFactDigest)) return false;
+    if (!line || typeof line.id !== 'string' || line.id !== fact.targetBankLineId) return false;
+    if (!isCanonicalReceiptSource(line)) return false;
+    const t = fact.target;
+    if (line.account !== t.account || line.sourceOfRecord !== t.sourceOfRecord || line.postedDate !== t.postedDate
+        || line.amountCents !== t.amountCents || line.rawDescriptor !== t.rawDescriptor || (line.checkNumber ?? null) !== null) return false;
+    if (line.qbTxnId === undefined || line.probuildExpenseId === undefined) return false;
+    if (line.qbTxnId !== null && line.qbTxnId !== fact.qbPurchaseId) return false;
+    if (line.probuildExpenseId !== null && line.probuildExpenseId !== fact.expenseId) return false;
+    if (bankAuthPurchaseDate(line) !== t.bankAuthDate) return false;
+    const card = /\bC#(\d{4})\b/.exec(line.rawDescriptor);
+    if (!card || card[1] !== fact.cardTail || normalizeBankPayee(line.rawDescriptor.slice(0, card.index)) !== fact.bankPayee) return false;
+    if (!Number.isSafeInteger(fact.amountCents) || fact.amountCents <= 0 || -line.amountCents !== fact.amountCents) return false;
+    return evidence.amountCents === fact.amountCents && evidence.date === fact.purchaseDate;
 }
 
 /** A reviewed fact supplies only an edge inside the normal complete matching component. */
@@ -146,7 +257,8 @@ function collapse(s: string): string {
     return s.toUpperCase().replace(/\s+/g, ' ').trim();
 }
 
-function normalizeBankPayee(payee: string): string {
+/** Complete bank merchant label: whitespace collapsed, upper-cased, leading rail phrase removed. No other normalization. */
+export function normalizeBankPayee(payee: string): string {
     return collapse(collapse(payee).replace(/^MISCELLANEOUS DEBIT /, ''));
 }
 
