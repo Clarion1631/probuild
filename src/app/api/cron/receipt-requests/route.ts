@@ -1043,14 +1043,16 @@ export async function recomputeCodesFor(
     // GLOBAL IDENTITY CENSUS for every pinned pair in this window — the same
     // helper the batch and its locked re-read consume. Queried by exact alias
     // across all accounts, states and dates; an overflow throws, which is an
-    // honest error rather than a verdict.
-    const pairCensus = await loadReviewedPairCensus(prisma, reviewedPairCensusKeys(expenses));
+    // honest error rather than a verdict. ONLY UNDER RECOGNITION: with the flag
+    // off nothing is queried and the planner receives no census, so a private
+    // packet cannot touch a disabled verdict.
+    const pairCensus = SOURCE_RECOGNITION_ENABLED ? await loadReviewedPairCensus(prisma, reviewedPairCensusKeys(expenses)) : null;
 
     const plan = planReceiptRequests({
         sourceRecognitionEnabled: SOURCE_RECOGNITION_ENABLED,
         bankLines: lines,
         boundLineage: lineage.evidence,
-        pairCensus: pairCensus.evidence,
+        pairCensus: pairCensus?.evidence ?? null,
         expenses,
         intakes: intakeRows.map(row => ({
             id: row.id,
@@ -1425,8 +1427,8 @@ async function processBatch(
     // window, by exact alias across all accounts, states and dates. One load per
     // batch; each component's planned version takes its subset, and the locked
     // transaction re-reads the same helper for its own rows. An overflow throws
-    // and the batch fails honestly.
-    const pairCensus = await loadReviewedPairCensus(prisma, reviewedPairCensusKeys(expenses), { checkBudget: budget.check });
+    // and the batch fails honestly. ONLY UNDER RECOGNITION (see recomputeCodesFor).
+    const pairCensus = SOURCE_RECOGNITION_ENABLED ? await loadReviewedPairCensus(prisma, reviewedPairCensusKeys(expenses), { checkBudget: budget.check }) : null;
 
     // 3. DECIDE.
     budget.check();
@@ -1444,7 +1446,7 @@ async function processBatch(
             probuildExpenseId: row.probuildExpenseId,
         })),
         expenses,
-        pairCensus: pairCensus.evidence,
+        pairCensus: pairCensus?.evidence ?? null,
         intakes: intakeRows.map(row => ({
             id: row.id,
             expenseId: row.expenseId,
@@ -1585,9 +1587,9 @@ async function processBatch(
             // Expenses inside its evidence window. Each entry is decided from its
             // own rows, so the subset equals a fresh load of those keys — which is
             // what the locked re-read below computes from its own Expense rows.
-            pairCensusFingerprint: pairCensusFingerprint(subsetPairCensus(pairCensus.snapshot, expenses
+            pairCensusFingerprint: pairCensus ? pairCensusFingerprint(subsetPairCensus(pairCensus.snapshot, expenses
                 .filter(e => e.reviewedPairFact && expenseInWindow(expenseRows.find(row => row.id === e.id)?.date ?? null))
-                .map(e => e.id))),
+                .map(e => e.id))) : "",
         });
 
         try {
@@ -1706,8 +1708,9 @@ async function processBatch(
                 // The SAME pair census, inside the transaction, under both locks,
                 // keyed from the LOCKED Expense rows through the same resolver the
                 // planner used — so a pair that appeared, drifted, or gained a
-                // competing claim since the plan moves the fingerprint.
-                const currentPairCensus = await loadReviewedPairCensus(tx, reviewedPairCensusKeys(currentExpenses.flatMap(row => {
+                // competing claim since the plan moves the fingerprint. Under the
+                // same recognition gate as the planned stamp, so both stamp "" off.
+                const currentPairCensus = !SOURCE_RECOGNITION_ENABLED ? null : await loadReviewedPairCensus(tx, reviewedPairCensusKeys(currentExpenses.flatMap(row => {
                     const cents = decimalStringToCents(row.amount.toString());
                     if (cents === null) return [];
                     // The same company-local day key the planner resolved the pair with.
@@ -1741,7 +1744,7 @@ async function processBatch(
                     // The SAME helper, inside the transaction, under both
                     // locks, for this component's ids.
                     lineageFingerprint: lineageFingerprint((await loadRetiredReceiptLineage(tx, component.lineIds, { candidatePurchaseIds: lineagePurchaseIds(currentExpenses, currentIntakes), candidateExpenseIds: lineageExpenseIds(currentIntakes) })).snapshot),
-                    pairCensusFingerprint: pairCensusFingerprint(currentPairCensus.snapshot),
+                    pairCensusFingerprint: currentPairCensus ? pairCensusFingerprint(currentPairCensus.snapshot) : "",
                 });
                 if (!componentVersionsMatch(planned, current)) throw new ComponentMovedError();
 

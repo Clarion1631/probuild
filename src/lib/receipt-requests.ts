@@ -191,7 +191,9 @@ export interface ReceiptRequestInput {
      * dates, and nothing but its own rows found. Its `reservedUnits` (disputed
      * pairs) are removed from ordinary evidence exactly like lineage
      * reservations. Absent means the census was not loaded, which is unknown,
-     * and unknown withholds every pair edge.
+     * and unknown withholds every pair edge. IGNORED ENTIRELY unless
+     * `sourceRecognitionEnabled` is true: disabled verdicts are independent of
+     * any private packet, and the production sweep does not load it then.
      */
     pairCensus?: ReviewedPairCensusEvidence | null;
     now: Date;
@@ -799,10 +801,16 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
     // BEFORE dedupe, or the zero-amount retired Expense would win the fold and
     // hide the intake it shares a unit with.
     const lineage = resolveBoundLineage(input.boundLineage);
+    // THE CENSUS EXISTS ONLY UNDER RECOGNITION. With the flag off, a private
+    // pair packet must not be able to change any verdict — a disputed pair's
+    // reservation would turn a satisfied ordinary match into a chase while the
+    // `receipt-source-v1:off` certificate stayed valid. So the census is ignored
+    // entirely unless recognition is on, whatever the caller passed.
+    const pairCensus = input.sourceRecognitionEnabled === true ? input.pairCensus ?? null : null;
     // A pair the global census found disputed answers nobody: both of its unit
     // aliases leave the ordinary evidence, the same way a disputed retired unit does.
-    for (const unit of input.pairCensus?.reservedUnits ?? []) lineage.excludedUnits.add(unit);
-    const pairEligible = new Set(input.pairCensus?.eligible ?? []);
+    for (const unit of pairCensus?.reservedUnits ?? []) lineage.excludedUnits.add(unit);
+    const pairEligible = new Set(pairCensus?.eligible ?? []);
     // Reviewed facts (gas merchant facts and exact pairs alike) ride on an
     // Expense only while its intake aliases agree: a linked intake this
     // component never loaded, a dead or unverified claimant, or one carrying a

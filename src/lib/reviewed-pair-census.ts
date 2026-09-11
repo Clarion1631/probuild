@@ -30,6 +30,25 @@
  * backfill) says nothing about which page the row came from, so the same file
  * with an unknown group is treated as the same physical receipt.
  *
+ * SPLIT PURCHASE IDENTITIES ARE CLAIMS, NEVER EVIDENCE. The register pull gives a
+ * Purchase with several account-affecting splits the durable identities
+ * `<qbTxnId>#<ordinal>` (`splitIdentity` in bank-register-pull.ts), and ingest
+ * persists those as `BankLineObservation.sourceLineId` and, when it mints a
+ * canonical line from one, as `BankLine.qbTxnId`. The census therefore queries
+ * and filters the WHOLE claim family — the exact id and every `<id>#<digits>`
+ * member — for observations, canonical links, Expense and intake aliases. Any
+ * split member is a conservative conflict wherever it sits (linked elsewhere,
+ * linked to the target, or unlinked): a Purchase the register represents as
+ * several postings is not one whole debit, and a split is never normalized into
+ * the exact id or admitted as positive evidence. Prefix neighbours (`20001`,
+ * `20000#1`) are not family; a malformed suffix (`2000#`, `2000#x`) is not a
+ * contract identity and is excluded rather than guessed at.
+ *
+ * ONLY WITH RECOGNITION ENABLED. When `RECEIPT_SOURCE_RECOGNITION_ENABLED` is
+ * off the sweep neither loads this census nor lets the planner apply one, so the
+ * disabled verdicts and the `receipt-source-v1:off` certificate stay independent
+ * of any private packet.
+ *
  * THE CENSUS IS NOT THE ONLY DEFENSE on the target's own link state: the
  * planner predicate (`reviewedReceiptPairMatches`) independently refuses a
  * target whose `qbTxnId`/`probuildExpenseId` name anything but the pair's own
@@ -119,6 +138,7 @@ export type PairCensusConflict =
     | "canonical-link-elsewhere"
     | "observation-linked-elsewhere"
     | "duplicate-observation-claim"
+    | "purchase-split-claim"
     | "expense-missing"
     | "expense-ambiguous"
     | "expense-drift"
@@ -187,6 +207,21 @@ function normalizeIntake(r: PairCensusIntakeRow): PairCensusIntakeRow {
     };
 }
 
+/** The persisted split identity contract: `<qbTxnId>#<ordinal>` (bank-register-pull.ts `splitIdentity`). */
+const SPLIT_SUFFIX = /^#[0-9]+$/;
+
+/** True for the exact Purchase id or any contract-shaped split of it. Neighbours and malformed suffixes are not family. */
+export function isPurchaseClaimIdentity(value: string | null | undefined, qbPurchaseId: string): boolean {
+    if (typeof value !== "string") return false;
+    if (value === qbPurchaseId) return true;
+    return value.startsWith(qbPurchaseId) && SPLIT_SUFFIX.test(value.slice(qbPurchaseId.length));
+}
+
+/** True only for a split member (`<id>#<ordinal>`), never the exact id. */
+export function isPurchaseSplitIdentity(value: string | null | undefined, qbPurchaseId: string): boolean {
+    return isPurchaseClaimIdentity(value, qbPurchaseId) && value !== qbPurchaseId;
+}
+
 /** Dedupe by Expense id, sorted, so planned and locked builds see one key order. */
 function uniqueKeys(keys: readonly PairCensusKey[]): PairCensusKey[] {
     const byExpense = new Map<string, PairCensusKey>();
@@ -212,27 +247,37 @@ export function buildReviewedPairCensus(rows: PairCensusRows): ReviewedPairCensu
     const intakes = rows.intakes.map(normalizeIntake);
 
     const pairs: PairCensusEntry[] = keys.map(key => {
+        const claims = (value: string | null) => isPurchaseClaimIdentity(value, key.qbPurchaseId);
+        const isSplit = (value: string | null) => isPurchaseSplitIdentity(value, key.qbPurchaseId);
         const own = {
-            lines: lines.filter(l => l.id === key.targetBankLineId || l.qbTxnId === key.qbPurchaseId || l.probuildExpenseId === key.expenseId).sort(byId),
-            observations: observations.filter(o => o.source === QBO_REGISTER_SOURCE && o.sourceLineId === key.qbPurchaseId).sort(byId),
+            lines: lines.filter(l => l.id === key.targetBankLineId || claims(l.qbTxnId) || l.probuildExpenseId === key.expenseId).sort(byId),
+            observations: observations.filter(o => o.source === QBO_REGISTER_SOURCE && claims(o.sourceLineId)).sort(byId),
             expenses: expenses.filter(e => e.id === key.expenseId
-                || e.qbPurchaseId === key.qbPurchaseId
+                || claims(e.qbPurchaseId)
                 || (key.receiptUrl !== null && e.receiptUrl === key.receiptUrl)
                 || (key.sourceFileId !== null && e.sourceFileId === key.sourceFileId)).sort(byId),
-            intakes: intakes.filter(i => i.qbPurchaseId === key.qbPurchaseId || i.postVoidQbPurchaseId === key.qbPurchaseId || i.expenseId === key.expenseId).sort(byId),
+            intakes: intakes.filter(i => claims(i.qbPurchaseId) || claims(i.postVoidQbPurchaseId) || i.expenseId === key.expenseId).sort(byId),
         };
         const conflicts = new Set<PairCensusConflict>();
 
+        // A split member anywhere — canonical link, observation, Expense or intake
+        // alias, linked or not, on the target or not — means the register does
+        // not represent this Purchase as one whole debit. Conservative conflict;
+        // never confirmation.
+        if (own.lines.some(l => isSplit(l.qbTxnId)) || own.observations.some(o => isSplit(o.sourceLineId))
+            || own.expenses.some(e => isSplit(e.qbPurchaseId)) || own.intakes.some(i => isSplit(i.qbPurchaseId) || isSplit(i.postVoidQbPurchaseId))) {
+            conflicts.add("purchase-split-claim");
+        }
         // Canonical bank links, any account, any state: only the named target
-        // may carry the pair's identities, and then only its own. The target's
-        // absence is not decided here (the planner has no line to judge then);
-        // its presence with foreign links is.
+        // may carry the pair's identities, and then only its own EXACT ids. The
+        // target's absence is not decided here (the planner has no line to judge
+        // then); its presence with foreign links is.
         for (const l of own.lines) {
             if (l.id !== key.targetBankLineId) conflicts.add("canonical-link-elsewhere");
             else if ((l.qbTxnId !== null && l.qbTxnId !== key.qbPurchaseId) || (l.probuildExpenseId !== null && l.probuildExpenseId !== key.expenseId)) conflicts.add("target-link-mismatch");
         }
-        // QBO register observations of the Purchase: at most one anywhere, and
-        // linked to nothing or to the named target.
+        // QBO register observations of the Purchase family: at most one anywhere,
+        // and linked to nothing or to the named target.
         if (own.observations.some(o => o.bankLineId !== null && o.bankLineId !== key.targetBankLineId)) conflicts.add("observation-linked-elsewhere");
         if (own.observations.length > 1) conflicts.add("duplicate-observation-claim");
         // The pinned Expense must exist, once, still carrying the pinned identities;
@@ -244,7 +289,7 @@ export function buildReviewedPairCensus(rows: PairCensusRows): ReviewedPairCensu
             || self[0].sourceFileId !== key.sourceFileId || self[0].sourceGroupIndex !== key.sourceGroupIndex)) conflicts.add("expense-drift");
         for (const e of own.expenses) {
             if (e.id === key.expenseId) continue;
-            if (e.qbPurchaseId === key.qbPurchaseId) conflicts.add("purchase-alias-reuse");
+            if (claims(e.qbPurchaseId)) conflicts.add("purchase-alias-reuse");
             if (key.receiptUrl !== null && e.receiptUrl === key.receiptUrl) conflicts.add("receipt-url-reuse");
             // The same source file is the same physical receipt unless BOTH group
             // indices are known and differ: an unknown group on either side cannot
@@ -257,10 +302,10 @@ export function buildReviewedPairCensus(rows: PairCensusRows): ReviewedPairCensu
         // Expense's own booked intake (both aliases agreeing). Dead-state rows are
         // recorded (they move the fingerprint) but are not capacity.
         for (const i of own.intakes) {
-            if (i.postVoidQbPurchaseId === key.qbPurchaseId) conflicts.add("purchase-post-void");
+            if (claims(i.postVoidQbPurchaseId)) conflicts.add("purchase-post-void");
             if (DEAD_INTAKE_STATES.has(i.state)) continue;
             const claimsExpense = i.expenseId === key.expenseId;
-            const claimsPurchase = i.qbPurchaseId === key.qbPurchaseId;
+            const claimsPurchase = claims(i.qbPurchaseId);
             if ((claimsExpense && !claimsPurchase) || (claimsPurchase && !claimsExpense)) conflicts.add("intake-alias-reuse");
         }
         const sorted = [...conflicts].sort();
@@ -375,20 +420,27 @@ export async function loadReviewedPairCensus(
     const expenseIds = [...new Set(unique.map(k => k.expenseId))].sort();
     const receiptUrls = [...new Set(unique.flatMap(k => (k.receiptUrl ? [k.receiptUrl] : [])))].sort();
     const sourceFileIds = [...new Set(unique.flatMap(k => (k.sourceFileId ? [k.sourceFileId] : [])))].sort();
+    // The whole persisted claim family per Purchase: the exact id plus every
+    // `<id>#…` split identity. The prefix carries the `#`, so `20001` is not a
+    // neighbour of `2000`; the pure rule then admits only `#<digits>` suffixes.
+    const purchaseFamily = <F extends string>(field: F) => [
+        { [field]: { in: purchaseIds } },
+        ...purchaseIds.map(id => ({ [field]: { startsWith: `${id}#` } })),
+    ] as Array<Record<F, { in: string[] } | { startsWith: string }>>;
 
     const lines = (await bounded("bankLine.links", () => db.bankLine.findMany({
-        where: { OR: [{ id: { in: targetIds } }, { qbTxnId: { in: purchaseIds } }, { probuildExpenseId: { in: expenseIds } }] },
+        where: { OR: [{ id: { in: targetIds } }, ...purchaseFamily("qbTxnId"), { probuildExpenseId: { in: expenseIds } }] },
         select: LINE_SELECT, take: cap + 1,
     }))).map(readLine);
     const observations = (await bounded("bankLineObservation.claims", () => db.bankLineObservation.findMany({
-        where: { source: QBO_REGISTER_SOURCE, sourceLineId: { in: purchaseIds } },
+        where: { source: QBO_REGISTER_SOURCE, OR: purchaseFamily("sourceLineId") },
         select: OBSERVATION_SELECT, take: cap + 1,
     }))).map(readObservation);
     const expenses = (await bounded("expense.aliases", () => db.expense.findMany({
         where: {
             OR: [
                 { id: { in: expenseIds } },
-                { qbPurchaseId: { in: purchaseIds } },
+                ...purchaseFamily("qbPurchaseId"),
                 ...(receiptUrls.length ? [{ receiptUrl: { in: receiptUrls } }] : []),
                 ...(sourceFileIds.length ? [{ sourceFileId: { in: sourceFileIds } }] : []),
             ],
@@ -396,7 +448,7 @@ export async function loadReviewedPairCensus(
         select: EXPENSE_SELECT, take: cap + 1,
     }))).map(readExpense);
     const intakes = (await bounded("receiptIntake.aliases", () => db.receiptIntake.findMany({
-        where: { OR: [{ qbPurchaseId: { in: purchaseIds } }, { postVoidQbPurchaseId: { in: purchaseIds } }, { expenseId: { in: expenseIds } }] },
+        where: { OR: [...purchaseFamily("qbPurchaseId"), ...purchaseFamily("postVoidQbPurchaseId"), { expenseId: { in: expenseIds } }] },
         select: INTAKE_SELECT, take: cap + 1,
     }))).map(readIntake);
 

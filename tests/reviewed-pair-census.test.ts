@@ -7,6 +7,8 @@ import {
     REVIEWED_PAIR_CENSUS_CAP,
     ReviewedPairCensusOverflowError,
     buildReviewedPairCensus,
+    isPurchaseClaimIdentity,
+    isPurchaseSplitIdentity,
     loadReviewedPairCensus,
     pairCensusFingerprint,
     reviewedPairCensusKeys,
@@ -180,10 +182,11 @@ test("loader: queries every alias by exact identity across all accounts, states 
     assert.deepEqual(census.evidence, { eligible: ["synthetic-pair-expense-0"], reservedUnits: [] });
     assert.deepEqual(calls.map(c => c.model), ["bankLine", "bankLineObservation", "expense", "receiptIntake"]);
     const [lines, observations, expenses, intakes] = calls.map(c => c.args);
-    assert.deepEqual(lines.where, { OR: [{ id: { in: ["synthetic-pair-line-0"] } }, { qbTxnId: { in: ["2000"] } }, { probuildExpenseId: { in: ["synthetic-pair-expense-0"] } }] }, "the target itself plus every link alias; no account, state or date filter");
-    assert.deepEqual(observations.where, { source: "QBO_REGISTER", sourceLineId: { in: ["2000"] } }, "no bankLineId or account filter");
-    assert.deepEqual(expenses.where, { OR: [{ id: { in: ["synthetic-pair-expense-0"] } }, { qbPurchaseId: { in: ["2000"] } }, { receiptUrl: { in: [RECEIPT_URL] } }] }, "exact receipt URL, never a substring; no date window");
-    assert.deepEqual(intakes.where, { OR: [{ qbPurchaseId: { in: ["2000"] } }, { postVoidQbPurchaseId: { in: ["2000"] } }, { expenseId: { in: ["synthetic-pair-expense-0"] } }] }, "every alias, any state");
+    // The whole persisted Purchase claim family: the exact id AND every `<id>#…` split identity.
+    assert.deepEqual(lines.where, { OR: [{ id: { in: ["synthetic-pair-line-0"] } }, { qbTxnId: { in: ["2000"] } }, { qbTxnId: { startsWith: "2000#" } }, { probuildExpenseId: { in: ["synthetic-pair-expense-0"] } }] }, "the target itself plus every link alias; no account, state or date filter");
+    assert.deepEqual(observations.where, { source: "QBO_REGISTER", OR: [{ sourceLineId: { in: ["2000"] } }, { sourceLineId: { startsWith: "2000#" } }] }, "no bankLineId or account filter");
+    assert.deepEqual(expenses.where, { OR: [{ id: { in: ["synthetic-pair-expense-0"] } }, { qbPurchaseId: { in: ["2000"] } }, { qbPurchaseId: { startsWith: "2000#" } }, { receiptUrl: { in: [RECEIPT_URL] } }] }, "exact receipt URL, never a substring; no date window");
+    assert.deepEqual(intakes.where, { OR: [{ qbPurchaseId: { in: ["2000"] } }, { qbPurchaseId: { startsWith: "2000#" } }, { postVoidQbPurchaseId: { in: ["2000"] } }, { postVoidQbPurchaseId: { startsWith: "2000#" } }, { expenseId: { in: ["synthetic-pair-expense-0"] } }] }, "every alias, any state");
     for (const args of [lines, observations, expenses, intakes]) assert.equal(args.take, REVIEWED_PAIR_CENSUS_CAP + 1);
     assert.equal(census.snapshot.pairs[0].expenses[0].amount, "555.55", "Decimal read through its string form");
 });
@@ -193,7 +196,7 @@ test("loader: a pinned source file id widens the Expense query to the file's who
     const { db, calls } = fakeDb({ expenses: [selfExpense({ sourceFileId: FILE, sourceGroupIndex: 0 })] });
     await loadReviewedPairCensus(db, [key({ sourceFileId: FILE, sourceGroupIndex: 0 })]);
     const expenses = calls.find(c => c.model === "expense")!.args;
-    assert.deepEqual((expenses.where as { OR: unknown[] }).OR[3], { sourceFileId: { in: [FILE] } });
+    assert.deepEqual((expenses.where as { OR: unknown[] }).OR[4], { sourceFileId: { in: [FILE] } });
     // Through the real loader, both null/known directions and the known-unequal split.
     const alias = (group: number | null) => selfExpense({ id: "synthetic-alias", qbPurchaseId: "2999", receiptUrl: null, sourceFileId: FILE, sourceGroupIndex: group });
     const loaded = async (own: number | null, other: number | null) =>
@@ -223,6 +226,123 @@ test("loader: no pairs means no queries and an empty census; overflow throws rat
     let budgetChecks = 0;
     await loadReviewedPairCensus(fakeDb({ expenses: [selfExpense()] }).db, [key()], { checkBudget: () => { budgetChecks++; } });
     assert.ok(budgetChecks >= 8, "budget checked before and after every read");
+});
+
+// ── Split Purchase identities: discovered by the query, conflicts only ─────
+
+/**
+ * A fake that EVALUATES the where clause the loader sends (`in`, `startsWith`,
+ * equality, `OR`), so discovery is proven by the query rather than by rows
+ * handed straight back. Mirrors the persisted contract: the register pull mints
+ * `<qbTxnId>#<ordinal>` for multi-split transactions, ingest stores it as
+ * `BankLineObservation.sourceLineId` and, for a line it mints, `BankLine.qbTxnId`.
+ */
+function filteringDb(data: { lines?: PairCensusLineRow[]; observations?: PairCensusObservationRow[]; expenses?: PairCensusExpenseRow[]; intakes?: PairCensusIntakeRow[] }): { db: PairCensusDb; calls: Call[] } {
+    const calls: Call[] = [];
+    const matches = (row: Record<string, unknown>, where: Record<string, unknown>): boolean => Object.entries(where).every(([field, cond]) => {
+        if (field === "OR") return (cond as Record<string, unknown>[]).some(alt => matches(row, alt));
+        const value = row[field];
+        if (cond && typeof cond === "object") {
+            const c = cond as { in?: unknown[]; startsWith?: string };
+            if (c.in) return c.in.includes(value);
+            if (c.startsWith !== undefined) return typeof value === "string" && value.startsWith(c.startsWith);
+            throw new Error(`unsupported condition ${JSON.stringify(cond)}`);
+        }
+        return value === cond;
+    });
+    const model = (name: string, rows: readonly unknown[]): { findMany: (args: any) => Promise<unknown[]> } => ({
+        findMany: async args => { calls.push({ model: name, args }); return rows.filter(row => matches(row as Record<string, unknown>, args.where)); },
+    });
+    return {
+        calls,
+        db: {
+            bankLine: model("bankLine", data.lines ?? []),
+            bankLineObservation: model("bankLineObservation", data.observations ?? []),
+            expense: model("expense", (data.expenses ?? []).map(e => ({ ...e, amount: { toString: () => e.amount } }))),
+            receiptIntake: model("receiptIntake", data.intakes ?? []),
+        },
+    };
+}
+
+test("split identity contract: exact id or `<id>#<digits>` are family; neighbours and malformed suffixes are not", () => {
+    for (const v of ["2000", "2000#0", "2000#1", "2000#12"]) assert.equal(isPurchaseClaimIdentity(v, "2000"), true, v);
+    for (const v of ["20001", "20000#1", "12000", "2000#", "2000#x", "2000#1#2", "2000 #1", "#2000", "", null, undefined]) assert.equal(isPurchaseClaimIdentity(v, "2000"), false, String(v));
+    assert.equal(isPurchaseSplitIdentity("2000", "2000"), false);
+    assert.equal(isPurchaseSplitIdentity("2000#0", "2000"), true);
+    assert.equal(isPurchaseSplitIdentity("2000#x", "2000"), false);
+});
+
+test("loader: a split of the Purchase linked to ANOTHER line is discovered by the query and conflicts", async () => {
+    const { db, calls } = filteringDb({
+        observations: [obs(), obs({ id: "obs-split-1", sourceLineId: "2000#1", bankLineId: "synthetic-far-line", account: "WTB-9999" })],
+        expenses: [selfExpense()],
+    });
+    const census = await loadReviewedPairCensus(db, [key()]);
+    assert.deepEqual(census.snapshot.pairs[0].observations.map(o => o.id), ["obs-0", "obs-split-1"], "the split row came back through the startsWith clause");
+    assert.deepEqual(census.snapshot.pairs[0].conflicts, ["duplicate-observation-claim", "observation-linked-elsewhere", "purchase-split-claim"]);
+    assert.deepEqual(census.evidence, { eligible: [], reservedUnits: ["expense:synthetic-pair-expense-0", "purchase:2000"] });
+    assert.equal(calls.length, 4);
+});
+
+test("loader: a split on the TARGET, an unlinked split family, or a split canonical/Expense/intake alias is a conflict, never confirmation", async () => {
+    const run = async (data: Parameters<typeof filteringDb>[0]) => (await loadReviewedPairCensus(filteringDb({ expenses: [selfExpense()], observations: [obs()], ...data }).db, [key()])).snapshot.pairs[0];
+    // Split observation linked to the target itself: the register shows this Purchase as several postings.
+    const onTarget = await run({ observations: [obs({ id: "obs-split-0", sourceLineId: "2000#0", bankLineId: "synthetic-pair-line-0" })] });
+    assert.ok(onTarget.conflicts.includes("purchase-split-claim"), onTarget.conflicts.join(","));
+    assert.equal(onTarget.eligible, false);
+    // Two unlinked splits and no exact observation: still not one whole debit.
+    const family = await run({ observations: [obs({ id: "obs-split-0", sourceLineId: "2000#0" }), obs({ id: "obs-split-1", sourceLineId: "2000#1" })] });
+    assert.deepEqual(family.conflicts, ["duplicate-observation-claim", "purchase-split-claim"]);
+    // A canonical line elsewhere minted from a split carries the split id in qbTxnId.
+    const canonical = await run({ lines: [lineRow({ id: "synthetic-far-line", qbTxnId: "2000#0" })] });
+    assert.deepEqual(canonical.conflicts, ["canonical-link-elsewhere", "purchase-split-claim"]);
+    // The target itself linked to a split id is a mismatch, not its own exact link.
+    const target = await run({ lines: [lineRow({ id: "synthetic-pair-line-0", account: "WTB-0723", state: "POSTED", qbTxnId: "2000#0" })] });
+    assert.deepEqual(target.conflicts, ["purchase-split-claim", "target-link-mismatch"]);
+    // Expense and intake aliases carrying a split id.
+    const expenseAlias = await run({ expenses: [selfExpense(), selfExpense({ id: "synthetic-far-expense", qbPurchaseId: "2000#1", receiptUrl: null })] });
+    assert.deepEqual(expenseAlias.conflicts, ["purchase-alias-reuse", "purchase-split-claim"]);
+    const intakeAlias = await run({ intakes: [intakeRow({ id: "synthetic-far-intake", qbPurchaseId: "2000#1" })] });
+    assert.deepEqual(intakeAlias.conflicts, ["intake-alias-reuse", "purchase-split-claim"]);
+    const postVoidSplit = await run({ intakes: [intakeRow({ id: "synthetic-far-intake", state: "VOID", qbPurchaseId: null, postVoidQbPurchaseId: "2000#0" })] });
+    assert.deepEqual(postVoidSplit.conflicts, ["purchase-post-void", "purchase-split-claim"]);
+});
+
+test("loader: prefix neighbours and malformed suffixes are neither claims nor snapshot rows", async () => {
+    const { db } = filteringDb({
+        observations: [
+            obs(),
+            obs({ id: "obs-neighbour-a", sourceLineId: "20001", bankLineId: "synthetic-far-line" }),
+            obs({ id: "obs-neighbour-b", sourceLineId: "20000#1", bankLineId: "synthetic-far-line" }),
+            obs({ id: "obs-malformed-a", sourceLineId: "2000#", bankLineId: "synthetic-far-line" }),
+            obs({ id: "obs-malformed-b", sourceLineId: "2000#x", bankLineId: "synthetic-far-line" }),
+            obs({ id: "obs-malformed-c", sourceLineId: "2000#1#2", bankLineId: "synthetic-far-line" }),
+        ],
+        lines: [lineRow({ id: "synthetic-far-line", qbTxnId: "20001" }), lineRow({ id: "synthetic-far-line-2", qbTxnId: "2000#x" })],
+        expenses: [selfExpense(), selfExpense({ id: "synthetic-far-expense", qbPurchaseId: "20001", receiptUrl: null })],
+        intakes: [intakeRow({ id: "synthetic-far-intake", qbPurchaseId: "2000#" })],
+    });
+    const census = await loadReviewedPairCensus(db, [key()]);
+    const entry = census.snapshot.pairs[0];
+    assert.deepEqual(entry.observations.map(o => o.id), ["obs-0"]);
+    assert.deepEqual(entry.lines, []);
+    assert.deepEqual(entry.expenses.map(e => e.id), ["synthetic-pair-expense-0"]);
+    assert.deepEqual(entry.intakes, []);
+    assert.deepEqual(entry.conflicts, []);
+    assert.deepEqual(census.evidence.eligible, ["synthetic-pair-expense-0"]);
+});
+
+test("loader: a split claim landing between the planned census and the locked re-read moves the fingerprint", async () => {
+    const keys = [key()];
+    const planned = await loadReviewedPairCensus(filteringDb({ observations: [obs()], expenses: [selfExpense()] }).db, keys);
+    const locked = await loadReviewedPairCensus(filteringDb({ observations: [obs(), obs({ id: "obs-split-1", sourceLineId: "2000#1", bankLineId: "synthetic-far-line" })], expenses: [selfExpense()] }).db, keys);
+    const stamp = (c: typeof planned) => componentVersionOf({ issues: [], intakes: [], lines: [], expenses: [], pairCensusFingerprint: pairCensusFingerprint(c.snapshot) });
+    assert.equal(planned.evidence.eligible.length, 1);
+    assert.equal(locked.evidence.eligible.length, 0);
+    assert.equal(componentVersionsMatch(stamp(planned), stamp(locked)), false);
+    // Same rows, same fingerprint, whatever order they arrive in.
+    const reordered = await loadReviewedPairCensus(filteringDb({ observations: [obs({ id: "obs-split-1", sourceLineId: "2000#1", bankLineId: "synthetic-far-line" }), obs()], expenses: [selfExpense()] }).db, keys);
+    assert.equal(pairCensusFingerprint(reordered.snapshot), pairCensusFingerprint(locked.snapshot));
 });
 
 // ── Planner integration through the real loader ───────────────────────────
@@ -311,9 +431,14 @@ test("route: both adapters, the planned stamp and the locked re-read load the sa
     assert.match(src, /@\/lib\/reviewed-pair-census/);
     assert.equal((src.match(/await loadReviewedPairCensus\(prisma, /g) ?? []).length, 2, "recompute and batch planning");
     assert.equal((src.match(/await loadReviewedPairCensus\(tx, /g) ?? []).length, 1, "locked re-read inside the component transaction");
-    assert.equal((src.match(/pairCensus: pairCensus\.evidence,/g) ?? []).length, 2, "both planner calls consume the census verdicts");
-    assert.equal((src.match(/pairCensusFingerprint: pairCensusFingerprint\(/g) ?? []).length, 2, "planned stamp and locked stamp");
+    assert.equal((src.match(/pairCensus: pairCensus\?\.evidence \?\? null,/g) ?? []).length, 2, "both planner calls consume the census verdicts");
+    assert.equal((src.match(/pairCensusFingerprint: pairCensus \? pairCensusFingerprint\(/g) ?? []).length, 1, "planned stamp");
+    assert.equal((src.match(/pairCensusFingerprint: currentPairCensus \? pairCensusFingerprint\(/g) ?? []).length, 1, "locked stamp");
     assert.match(src, /pairCensusFingerprint\(subsetPairCensus\(pairCensus\.snapshot, /, "the planned stamp takes this component's share");
+    // EVERY load is gated on the recognition flag: with it off, no census query runs anywhere.
+    assert.equal((src.match(/SOURCE_RECOGNITION_ENABLED \? await loadReviewedPairCensus\(prisma, /g) ?? []).length, 2, "both planning adapters gate the load");
+    assert.equal((src.match(/!SOURCE_RECOGNITION_ENABLED \? null : await loadReviewedPairCensus\(tx, /g) ?? []).length, 1, "the locked re-read gates the load");
+    assert.equal((src.match(/loadReviewedPairCensus\(/g) ?? []).length, 3, "no ungated load exists");
     // The locked census keys come from the locked Expense rows, resolved through the same adapter.
     assert.match(src, /reviewedPairCensusKeys\(currentExpenses\.flatMap\(/);
     // The three Expense selects carry the pinned source identity the census and resolver compare.

@@ -103,6 +103,37 @@ test('without the pair fact no existing rule reaches a payment one day before au
   assert.deepEqual(run({}, { sourceRecognitionEnabled: undefined }).close, []);
 });
 
+test('with recognition OFF the packet and census are inert: ordinary verdicts are identical with or without them', () => {
+  // A receipt that an ORDINARY line satisfies (exact cents, +2 days, lone brand token),
+  // while the same Expense is also pinned by a pair packet for a different named line.
+  const ordinary = { ...line(), id: 'synthetic-ordinary', postedDate: '2025-06-15', rawDescriptor: 'SYNTHMART ONLINE C#1111 DBT CRD 0900 06/14/25 22222222' };
+  const disputed = { eligible: [] as string[], reservedUnits: [`expense:${EXPENSE_ID}`, `purchase:${PURCHASE}`] };
+  const eligible = { eligible: [EXPENSE_ID], reservedUnits: [] as string[] };
+  const plan = (flag: boolean, e: ReturnType<typeof expense> | Record<string, unknown>, census: unknown) => planReceiptRequests({
+    sourceRecognitionEnabled: flag, bankLines: [ordinary], expenses: [e], intakes: [], openIssueKeys: [ordinary.id], pairCensus: census, now: NOW,
+  } as any);
+  // Baseline: no packet at all (no pair fact, no census), flag off → the ordinary match closes.
+  const noPacket = plan(false, expense({ reviewedPairFact: null }), undefined);
+  assert.deepEqual(noPacket.close, [ordinary.id]);
+  // Flag off with a packet installed, revised (eligible) or revoked (null/undefined census),
+  // and even a DISPUTED census: every verdict equals the no-packet verdict.
+  for (const census of [disputed, eligible, null, undefined]) {
+    for (const e of [expense(), expense({ reviewedPairFact: null })]) {
+      const plan0 = plan(false, e, census);
+      assert.deepEqual(plan0.close, noPacket.close, JSON.stringify({ census, fact: !!e.reviewedPairFact }));
+      assert.deepEqual(plan0.open, noPacket.open);
+      assert.deepEqual(plan0.undecided, noPacket.undecided);
+    }
+  }
+  // Flag off never yields the pair edge for the named line either, disputed or clean.
+  assert.deepEqual(run({}, { sourceRecognitionEnabled: false, pairCensus: eligible }).close, []);
+  assert.deepEqual(run({}, { sourceRecognitionEnabled: false, pairCensus: disputed }).close, []);
+  // Flag ON keeps the protections: a disputed pair reserves the unit from the ordinary line too.
+  assert.deepEqual(plan(true, expense(), disputed).close, []);
+  assert.equal(plan(true, expense(), disputed).open.length, 1);
+  assert.deepEqual(plan(true, expense(), eligible).close, [ordinary.id]);
+});
+
 test('the pair predicate is exact on every pinned line field', () => {
   const fact = pairFor(pair().expected)!;
   const evidence = { amountCents: 55555, date: '2025-06-13' };
