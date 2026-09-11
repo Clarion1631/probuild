@@ -56,6 +56,7 @@ import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_CHASER_WINDOW_HOURS } from "@/lib
 import {
     CYCLE_KEY,
     SWEEP_MARKER_KEY,
+    continuationNeedsWork,
     cycleStillValid,
     formatSweepMarker,
     parseSweepCycle,
@@ -452,17 +453,12 @@ export function sweepPhaseAfter(run: {
 }
 
 /**
- * A resume pass has work whenever the cycle is unfinished — by the phase, or by
- * either cursor. The cursors stay in the test for rows written before the phase
- * marker existed.
+ * `shouldResumeSweep` and `continuationNeedsWork` now live in
+ * `@/lib/receipt-sweep-marker` (unchanged), so the read-only health diagnostic
+ * can ask the continuation's exact question without importing this route.
+ * Re-exported here so existing importers keep working.
  */
-export function shouldResumeSweep(
-    phase: SweepPhase,
-    lineCursor: string | null,
-    openCursor: string | null,
-): boolean {
-    return phase !== "done" || !!lineCursor || !!openCursor;
-}
+export { shouldResumeSweep, continuationNeedsWork } from "@/lib/receipt-sweep-marker";
 
 /**
  * The client the marker is read and written through: the pool by default, or an
@@ -1944,26 +1940,6 @@ export async function transitionCompletedOpenPass(
 ): Promise<void> {
     await writeLinePhase();
     await clearOpenCheckpoint();
-}
-
-/** Completed cycles remain stored because card selection verifies their identity. */
-export function continuationNeedsWork(input: {
-    marker: SweepMarker; cycle: SweepCycle | null;
-    bankEpoch: string; evidenceEpoch: string;
-    recognitionPolicy?: string;
-    fullRunOwed: boolean; lineCursor: string | null; openCursor: string | null; now: Date;
-}): boolean {
-    if (input.fullRunOwed) return true;
-    const completedAt = input.marker.chaserCompletedAt ? Date.parse(input.marker.chaserCompletedAt) : NaN;
-    const certified = input.cycle !== null
-        && input.marker.phase === "done"
-        && !input.marker.blockedReason
-        && input.marker.completedCycleId === input.cycle.id
-        && Number.isFinite(completedAt) && completedAt <= input.now.getTime()
-        && cycleStillValid(input.cycle, input.bankEpoch, input.evidenceEpoch, input.recognitionPolicy);
-    if (certified) return false;
-    // A crash between durable cycle creation and phase/checkpoint writes still resumes.
-    return input.cycle !== null || shouldResumeSweep(input.marker.phase, input.lineCursor, input.openCursor);
 }
 
 export async function GET(request: Request) {
