@@ -1,4 +1,4 @@
-import { bankAuthPurchaseDate, isCanonicalReceiptSource, observedReceiptMerchantMatches, reviewedReceiptMerchantMatches, type ReviewedReceiptMerchantEvidence } from "./receipt-source-recognition";
+import { bankAuthPurchaseDate, isCanonicalReceiptSource, observedReceiptMerchantMatches, reviewedReceiptMerchantMatches, reviewedReceiptPairMatches, type ReviewedReceiptMerchantEvidence, type ReviewedReceiptPairEvidence } from "./receipt-source-recognition";
 /**
  * Missing-receipt request matcher (Phase 2 §3).
  *
@@ -28,6 +28,7 @@ import { classifyReceiptRequirement, resolveReceiptOwner, type ReceiptOwner } fr
 import { normalizePayee } from "./bank-ledger";
 import { intakeArtifactIsVerified } from "./receipt-intake/route-state";
 import type { BoundReceiptLineage } from "./retired-receipt-lineage";
+import type { ReviewedPairCensusEvidence } from "./reviewed-pair-census";
 
 /** The one targetType these issues use. targetKey is the BankLine id. */
 export const RECEIPT_REQUEST_TARGET_TYPE = "bank-line";
@@ -55,6 +56,15 @@ export interface ReceiptRequestBankLine {
     amountCents: number;
     rawDescriptor: string;
     checkNumber?: string | null;
+    /**
+     * The line's reconciliation link state, when the caller LOADED it. Only the
+     * reviewed exact-pair edge reads these: it requires them to be present and
+     * either empty or the pair's own identities, so a line already linked to a
+     * different purchase or Expense can never be closed through the pair.
+     * Absent means "not loaded", which that edge treats as unknown, not as empty.
+     */
+    qbTxnId?: string | null;
+    probuildExpenseId?: string | null;
 }
 
 /** An Expense, already reduced to integer cents by the caller. */
@@ -62,6 +72,8 @@ export interface ReceiptEvidenceExpense {
     /** Global one-to-one relation; absence from loaded intakes cannot grant a new edge. */
     linkedIntakeId?: string | null;
     reviewedSourceFact?: ReviewedReceiptMerchantEvidence | null;
+    /** Server-reviewed exact pair naming ONE bank line this Expense answers (see receipt-source-recognition). */
+    reviewedPairFact?: ReviewedReceiptPairEvidence | null;
     /** Stable row id. Evidence is assigned to at most ONE bank line, and the
      * tie-break has to be deterministic across runs — see assignEvidence. */
     id: string;
@@ -172,6 +184,18 @@ export interface ReceiptRequestInput {
      * the matcher behaves exactly as before.
      */
     boundLineage?: BoundReceiptLineage | null;
+    /**
+     * GLOBAL IDENTITY CENSUS for reviewed exact pairs (see reviewed-pair-census.ts).
+     * A pinned Expense carries its pair edge only when the census lists it as
+     * eligible — every alias of it queried, across all accounts, states and
+     * dates, and nothing but its own rows found. Its `reservedUnits` (disputed
+     * pairs) are removed from ordinary evidence exactly like lineage
+     * reservations. Absent means the census was not loaded, which is unknown,
+     * and unknown withholds every pair edge. IGNORED ENTIRELY unless
+     * `sourceRecognitionEnabled` is true: disabled verdicts are independent of
+     * any private packet, and the production sweep does not load it then.
+     */
+    pairCensus?: ReviewedPairCensusEvidence | null;
     now: Date;
 }
 
@@ -609,6 +633,7 @@ export function payeeMatches(a: string, b: string | null | undefined): boolean {
 
 export interface EvidenceRow {
     reviewedSourceFact?: ReviewedReceiptMerchantEvidence | null;
+    reviewedPairFact?: ReviewedReceiptPairEvidence | null;
     id: string;
     /** Rows sharing a unit key are ONE receipt and count once. */
     unit: string;
@@ -713,6 +738,12 @@ function satisfies(line: ReceiptRequestBankLine, payee: string, evidence: Eviden
     const evidenceDay = dayNumber(evidence.date);
     if (lineDay === null || evidenceDay === null) return false;
     const sourceEnabled = sourceRecognitionEnabled && isCanonicalReceiptSource(line);
+    // 2a. A reviewed EXACT PAIR is an edge to its one named line only: every
+    //     pinned line and Expense field must still hold, and the reviewed
+    //     Expense accounting date stands in for the date test for that pair alone. It is
+    //     still this row's ordinary unit in the same matching — no capacity is
+    //     added, and any competitor for the unit is resolved below as usual.
+    if (sourceEnabled && evidence.reviewedPairFact && reviewedReceiptPairMatches(line, evidence, evidence.reviewedPairFact)) return true;
     const ordinaryDate = Math.abs(evidenceDay - lineDay) <= RECEIPT_MATCH_DATE_SLOP_DAYS;
     if (!ordinaryDate && !(sourceEnabled && bankAuthPurchaseDate(line) === evidence.date)) return false;
     // Merchant identity is still required for an exact bank-auth date.
@@ -770,12 +801,29 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
     // BEFORE dedupe, or the zero-amount retired Expense would win the fold and
     // hide the intake it shares a unit with.
     const lineage = resolveBoundLineage(input.boundLineage);
-    const reviewedFactFor = (expense: ReceiptEvidenceExpense) => {
-        if (!expense.reviewedSourceFact) return null;
+    // THE CENSUS EXISTS ONLY UNDER RECOGNITION. With the flag off, a private
+    // pair packet must not be able to change any verdict — a disputed pair's
+    // reservation would turn a satisfied ordinary match into a chase while the
+    // `receipt-source-v1:off` certificate stayed valid. So the census is ignored
+    // entirely unless recognition is on, whatever the caller passed.
+    const pairCensus = input.sourceRecognitionEnabled === true ? input.pairCensus ?? null : null;
+    // A pair the global census found disputed answers nobody: both of its unit
+    // aliases leave the ordinary evidence, the same way a disputed retired unit does.
+    for (const unit of pairCensus?.reservedUnits ?? []) lineage.excludedUnits.add(unit);
+    const pairEligible = new Set(pairCensus?.eligible ?? []);
+    // Reviewed facts (gas merchant facts and exact pairs alike) ride on an
+    // Expense only while its intake aliases agree: a linked intake this
+    // component never loaded, a dead or unverified claimant, or one carrying a
+    // different Purchase id means the source identity is in dispute, and a
+    // disputed source grants no reviewed edge. A pair edge additionally needs
+    // the global census to have cleared this exact Expense.
+    const reviewedEvidenceFor = (expense: ReceiptEvidenceExpense): Pick<EvidenceRow, "reviewedSourceFact" | "reviewedPairFact"> => {
+        const none = { reviewedSourceFact: null, reviewedPairFact: null };
+        if (!expense.reviewedSourceFact && !expense.reviewedPairFact) return none;
         const claims = input.intakes.filter(row => row.expenseId === expense.id);
-        if (expense.linkedIntakeId && !claims.some(row => row.id === expense.linkedIntakeId)) return null;
-        if (claims.some(row => DEAD_INTAKE_STATES.has(row.state) || !intakeArtifactIsVerified(row.stateReason) || !row.qbPurchaseId || row.qbPurchaseId !== expense.qbPurchaseId)) return null;
-        return expense.reviewedSourceFact;
+        if (expense.linkedIntakeId && !claims.some(row => row.id === expense.linkedIntakeId)) return none;
+        if (claims.some(row => DEAD_INTAKE_STATES.has(row.state) || !intakeArtifactIsVerified(row.stateReason) || !row.qbPurchaseId || row.qbPurchaseId !== expense.qbPurchaseId)) return none;
+        return { reviewedSourceFact: expense.reviewedSourceFact ?? null, reviewedPairFact: pairEligible.has(expense.id) ? expense.reviewedPairFact ?? null : null };
     };
     const evidence: EvidenceRow[] = [...lineage.bound, ...dedupeEvidenceUnits(([
         // An Expense with no receipt behind it is not evidence — it is the
@@ -787,7 +835,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
             amountCents: e.amountCents,
             date: e.date,
             vendor: e.vendor,
-            reviewedSourceFact: reviewedFactFor(e),
+            ...reviewedEvidenceFor(e),
         })),
         ...input.intakes
             .filter(intake =>
@@ -812,6 +860,21 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
     const loadedFrom = input.evidenceLoadedFrom ? dayNumber(input.evidenceLoadedFrom) : null;
     const loadedTo = input.evidenceLoadedTo ? dayNumber(input.evidenceLoadedTo) : null;
 
+    // The reviewed Expense accounting day each named line's exact pair reaches back to.
+    // Its window must be loaded too, or "no receipt found" would only mean
+    // "we did not look" for exactly the pair this line was reviewed for.
+    const pairPurchaseDayByLine = new Map<string, number>();
+    if (input.sourceRecognitionEnabled) {
+        for (const expense of input.expenses) {
+            const fact = expense.reviewedPairFact;
+            if (!fact || !expense.hasReceipt || !pairEligible.has(expense.id)) continue;
+            const day = dayNumber(fact.purchaseDate);
+            if (day === null) continue;
+            const prior = pairPurchaseDayByLine.get(fact.targetBankLineId);
+            if (prior === undefined || day < prior) pairPurchaseDayByLine.set(fact.targetBankLineId, day);
+        }
+    }
+
     /**
      * True when this line's whole ±2-day evidence window sits inside what the
      * caller actually loaded. Absent bounds mean "everything was loaded".
@@ -821,7 +884,11 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
         if (postedDay === null) return false;
         if (loadedFrom === null && loadedTo === null) return true;
         const authDate = input.sourceRecognitionEnabled ? bankAuthPurchaseDate(line) : null;
-        const earliest = Math.min(postedDay - RECEIPT_MATCH_DATE_SLOP_DAYS, authDate ? dayNumber(authDate)! : postedDay);
+        const earliest = Math.min(
+            postedDay - RECEIPT_MATCH_DATE_SLOP_DAYS,
+            authDate ? dayNumber(authDate)! : postedDay,
+            pairPurchaseDayByLine.get(line.id) ?? postedDay,
+        );
         if (loadedFrom !== null && earliest < loadedFrom) return false;
         if (loadedTo !== null && postedDay + RECEIPT_MATCH_DATE_SLOP_DAYS > loadedTo) return false;
         return true;
@@ -857,6 +924,8 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
             account: line.account,
             sourceOfRecord: line.sourceOfRecord,
             checkNumber: line.checkNumber,
+            qbTxnId: line.qbTxnId,
+            probuildExpenseId: line.probuildExpenseId,
         }));
     const matched = matchEvidenceToLines(matchable, evidence, input.sourceRecognitionEnabled === true);
 
@@ -962,7 +1031,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
  * evidence id — so the same inputs always produce the same pairing.
  */
 export function matchEvidenceToLines(
-    lines: readonly { id: string; postedDate: string; payee: string; amountCents: number; rawDescriptor?: string; account?: string; sourceOfRecord?: string; checkNumber?: string | null }[],
+    lines: readonly { id: string; postedDate: string; payee: string; amountCents: number; rawDescriptor?: string; account?: string; sourceOfRecord?: string; checkNumber?: string | null; qbTxnId?: string | null; probuildExpenseId?: string | null }[],
     evidence: readonly EvidenceRow[],
     sourceRecognitionEnabled = false,
 ): Map<string, EvidenceRow> {
@@ -1413,6 +1482,16 @@ export interface ComponentVersion {
      * keeps every older fixture equal to itself.
      */
     lineageHash: string;
+    /**
+     * The reviewed-pair global census for the pinned Expenses in this
+     * component's window (see reviewed-pair-census.ts): every canonical link,
+     * observation claim, Expense alias and intake alias the rule read. A link
+     * landing in another account, a receipt document reused by a far-dated
+     * Expense — none of it touches a row the other hashes watch. Empty string
+     * when the caller supplied none, which keeps every older fixture equal to
+     * itself.
+     */
+    pairCensusHash: string;
 }
 
 /** A short, order-independent digest. Not cryptographic — a change detector. */
@@ -1454,7 +1533,25 @@ export function componentVersionOf(input: {
         expenseId?: string | null;
         qbPurchaseId?: string | null;
     }>;
-    lines?: ReadonlyArray<{ id: string; updatedAt?: Date | string | null; rawDescriptor?: string | null; account?: string | null; sourceOfRecord?: string | null }>;
+    /**
+     * `postedDate`, `amountCents`, `checkNumber` and the two link columns are
+     * the line fields a reviewed exact pair pins; a correction to any of them,
+     * or a reconciliation link landing, changes whether that edge exists while
+     * leaving the descriptor and identity untouched. Optional, so older
+     * fixtures that never supplied them still agree with themselves.
+     */
+    lines?: ReadonlyArray<{
+        id: string;
+        updatedAt?: Date | string | null;
+        rawDescriptor?: string | null;
+        account?: string | null;
+        sourceOfRecord?: string | null;
+        postedDate?: Date | string | null;
+        amountCents?: number | null;
+        checkNumber?: string | null;
+        qbTxnId?: string | null;
+        probuildExpenseId?: string | null;
+    }>;
     expenses?: ReadonlyArray<{
         id: string;
         hasReceipt: boolean;
@@ -1470,6 +1567,8 @@ export function componentVersionOf(input: {
     }>;
     /** `lineageFingerprint(...)` of the component's lineage subset, when loaded. */
     lineageFingerprint?: string;
+    /** `pairCensusFingerprint(...)` of the component's reviewed-pair census subset, when loaded. */
+    pairCensusFingerprint?: string;
 }): ComponentVersion {
     const iso = (value: Date | string | null | undefined): string =>
         value instanceof Date ? value.toISOString() : (value ?? "");
@@ -1487,7 +1586,10 @@ export function componentVersionOf(input: {
         lines: lines.length,
         // The DESCRIPTOR is hashed, not just the id: a refreshed descriptor
         // changes the payee, which changes what matches.
-        lineHash: fingerprint(lines.map(line => JSON.stringify([line.id, line.rawDescriptor ?? "", line.account ?? "", line.sourceOfRecord ?? ""]))),
+        lineHash: fingerprint(lines.map(line => JSON.stringify([
+            line.id, line.rawDescriptor ?? "", line.account ?? "", line.sourceOfRecord ?? "",
+            iso(line.postedDate), line.amountCents ?? "", line.checkNumber ?? "", line.qbTxnId ?? "", line.probuildExpenseId ?? "",
+        ]))),
         expenses: expenses.length,
         // AMOUNT, DATE, VENDOR AND qbPurchaseId too — they decide which line an
         // expense can answer and which intake it unit-folds with (see
@@ -1516,6 +1618,7 @@ export function componentVersionOf(input: {
             intake.qbPurchaseId ?? "",
         ].join(":"))),
         lineageHash: input.lineageFingerprint ?? "",
+        pairCensusHash: input.pairCensusFingerprint ?? "",
     };
 }
 
@@ -1528,5 +1631,6 @@ export function componentVersionsMatch(a: ComponentVersion, b: ComponentVersion)
         && a.expenses === b.expenses
         && a.expenseHash === b.expenseHash
         && a.intakeHash === b.intakeHash
-        && a.lineageHash === b.lineageHash;
+        && a.lineageHash === b.lineageHash
+        && a.pairCensusHash === b.pairCensusHash;
 }
