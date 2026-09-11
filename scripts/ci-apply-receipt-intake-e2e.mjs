@@ -55,6 +55,7 @@ const PHASE1_DEPENDENT_MIGRATIONS = [
     // to prevent.
     "20260901120000_expense_attribution",
     "20260901120000_phase2_receipt_queue",
+    "20260910233000_receipt_memo_content",
 ];
 
 /** Move a migration directory aside, and put it back however this process ends. */

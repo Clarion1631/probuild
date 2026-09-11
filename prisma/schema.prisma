@@ -3203,6 +3203,10 @@ model ReceiptMemoArtifact {
   id String @id @default(cuid())
   /// The affidavit app's Drive file id — the memo's durable identity.
   pdfId String @unique
+  /// Content identity; null means historical bytes have not been verified.
+  pdfSha256 String? @unique
+  /// Immutable original provenance and separate administrative recovery metadata.
+  provenanceJson String?
   /// The ReviewIssue this memo answers, by its natural key (always "bank-line"
   /// today). Stored as the key rather than only the row id so the binding
   /// survives an issue being deleted and recreated for the same bank line.

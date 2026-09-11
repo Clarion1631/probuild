@@ -41,6 +41,23 @@ admin.pathname = "/postgres";
 const run = (cmd, args, env) =>
     execFileSync(cmd, args, { stdio: "inherit", env: { ...process.env, ...env }, shell: process.platform === "win32" });
 
+// Later additions to Phase 2 tables must be excluded from BOTH historical
+// shapes: the pre-feature apply and its committed-migration reference.
+const PHASE2_DEPENDENT_MIGRATIONS = [
+    "20260910233000_receipt_memo_content",
+];
+function parkForTheRun(name) {
+    const dir = path.join("prisma", "migrations", name);
+    const parked = path.join(mkdtempSync(path.join(tmpdir(), "p2dep-")), name);
+    renameSync(dir, parked);
+    process.on("exit", () => {
+        try { renameSync(parked, dir); } catch {
+            // Best effort restoration in this disposable CI checkout.
+        }
+    });
+}
+for (const name of PHASE2_DEPENDENT_MIGRATIONS) parkForTheRun(name);
+
 const adminClient = new PrismaClient({ datasources: { db: { url: admin.toString() } } });
 try {
     await adminClient.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${DB}"`);
