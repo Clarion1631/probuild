@@ -202,7 +202,7 @@ test("the sweep recomputes source truth on an OCC retry instead of reapplying a 
     // receipt-request-cards, then round 34) — this call site still passes only
     // `targetKey`, so the sweep's per-call behaviour is unchanged and it keeps
     // its own outer budget rather than inheriting the card cron's.
-    assert.match(source, /async function recomputeCodesFor\(\s*targetKey: string,\s*cache\?: Map<string, ReasonCode\[\]>,\s*deadlineExceeded\?: \(\) => boolean,\s*\): Promise<ReasonCode\[\]> \{/);
+    assert.match(source, /async function recomputeCodesFor\(\s*targetKey: string,\s*cache\?: Map<string, ReasonCode\[\]>,\s*deadlineExceeded\?: \(\) => boolean,\s*strictCompleteness = false,\s*\): Promise<ReasonCode\[\]> \{/);
     // ARTIFACT-BACKED since round 36, finding 3: a `memo-signed` blob with no
     // ReceiptMemoArtifact of its own is a memo that answered a DIFFERENT charge,
     // and reading it as an answer kept this one closed for ever.
