@@ -477,6 +477,12 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // one of these checks (e.g. the estimate was deleted between attempts).
     // parkedBeforeSend folds that in, so the strong key is handed back only
     // when no attempt, past or present, may have created a Purchase.
+    // Manual queue transitions and retries must not bypass source triage.
+    // A plausible amount on a bank/error screenshot or reconstructed memo
+    // is not permission to create a merchant Purchase.
+    if (!["receipt", "check"].includes(String(row.docType ?? "").trim().toLowerCase())) {
+        return parkedBeforeSend(row, "source-document-review");
+    }
     if (!row.projectId) return parkedBeforeSend(row, "no-estimate");
     if (row.totalCents === null || row.totalCents <= 0) return parkedBeforeSend(row, "refund-or-zero");
     if (!row.txnDate) return parkedBeforeSend(row, "invalid-date");

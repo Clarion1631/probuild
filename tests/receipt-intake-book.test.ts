@@ -360,6 +360,16 @@ function recorder(
     };
 }
 
+test("booking rechecks source type after a retry or manual queue transition", async () => {
+    for (const docType of ["reconstructed", "non_receipt", "error", "bank_record", "unknown", "", null]) {
+        const r = recorder();
+        const result = await bookReceipt(row({ docType }), r.deps);
+        assert.ok(result.outcome === "needs-review");
+        assert.equal(result.reason, "source-document-review");
+        assert.equal(r.purchaseCalls.length + r.sendMarks.length + r.expenses.length, 0);
+    }
+});
+
 test("a taxed receipt splits into a pre-tax line and a sales-tax line that reconstruct the total", () => {
     const groups = buildGroups("receipt", 36498, 2920, "82766");
     assert.deepEqual(groups, [

@@ -114,6 +114,7 @@ export function createOnDemandDeps(install: OnDemandStoreInstall = {}): OnDemand
         if (validateSnapshot(snapshot, id, targets(), now()).length) return snapshot;
         const result = (await truth([snapshot.item.issueId], { deadlineExceeded: deadline })).get(snapshot.item.issueId);
         if (!result || result.revalidationSkipped || deadline()) throw Error('evidence-incomplete');
+        if (result.outreachHold) throw Error(`receipt-outreach-held:${result.outreachHold}`);
         if (hash(before) !== hash(await settings(db))) throw Error('source-moved');
         snapshot.flags.sourceFound = result.evidenceSatisfied;
         snapshot.flags.acknowledged ||= result.acknowledged;

@@ -415,6 +415,17 @@ test("readSnapshot throws when loadTruth returns nothing for the issue", async (
     await assert.rejects(async () => { await deps.readSnapshot(BANKLINE); }, /evidence-incomplete/);
 });
 
+test("readSnapshot blocks source review and office invoice holds before on-demand claim", async () => {
+    for (const outreachHold of ["existing-evidence-review", "office-invoice"]) {
+        const rows = seed(emptyRows());
+        const { deps } = depsFor(rows, { loadTruth: async (ids: string[]) => new Map(ids.map(id => [id, {
+            clearedAt: null, acknowledged: false, resolved: false, evidenceSatisfied: false, owner: "Justin", outreachHold,
+        }])) });
+        await assert.rejects(deps.readSnapshot(BANKLINE), /receipt-outreach-held/);
+        assert.equal(rows.cards.length, 0);
+    }
+});
+
 test("readSnapshot throws when the evidence epoch drifts during truth load", async () => {
     const rows = seed(emptyRows());
     const { deps } = depsFor(rows, {

@@ -6,7 +6,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { decodeReasonCodes, type ReasonCode } from "@/lib/review-alert-reasons";
-import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasBackedResolution, isComponentDeadlineExceeded, ComponentTooLargeError } from "@/lib/receipt-requests";
+import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasBackedResolution, isComponentDeadlineExceeded, ComponentTooLargeError, ReceiptOutreachHeldError, type ReceiptOutreachHold } from "@/lib/receipt-requests";
 import {
     CARD_OWNERS_ASKED,
     CARD_POST_TIMEOUT_MS,
@@ -244,6 +244,7 @@ function toCandidate(issue: {
         payee: str(details.payee) ?? "",
         fingerprint: str(details.fingerprint) ?? `pb-${issue.targetKey}`,
         everCarded: cards.length > 0 || (details.card !== undefined && details.card !== null),
+        outreachHold: details.outreachHold === "existing-evidence-review" || details.outreachHold === "office-invoice" ? details.outreachHold : null,
     };
 }
 
@@ -467,6 +468,7 @@ export async function loadCardItemTruth(
         const needsRecompute = clearedAt === null && !resolved && !acknowledged;
         let evidenceSatisfied = false;
         let revalidationSkipped = false;
+        let outreachHold: ReceiptOutreachHold | null = null;
         if (needsRecompute) {
             if (deadlineExceeded()) {
                 // ERR TOWARD NOT SENDING. The budget for real re-verification
@@ -492,8 +494,11 @@ export async function loadCardItemTruth(
                 try {
                     evidenceSatisfied = (await recompute(row.targetKey, cache, deadlineExceeded, true)).length === 0;
                 } catch (error) {
-                    if (!isComponentDeadlineExceeded(error)) throw error;
-                    revalidationSkipped = true;
+                    if (error instanceof ReceiptOutreachHeldError) outreachHold = error.reason;
+                    else {
+                        if (!isComponentDeadlineExceeded(error)) throw error;
+                        revalidationSkipped = true;
+                    }
                 }
             }
         }
@@ -503,6 +508,7 @@ export async function loadCardItemTruth(
             resolved,
             evidenceSatisfied,
             owner: effectiveOwner(details),
+            outreachHold,
             ...(revalidationSkipped ? { revalidationSkipped: true } : {}),
         });
     }

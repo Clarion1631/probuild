@@ -19,6 +19,8 @@ import {
     COMPETING_LINE_ADJACENCY_DAYS,
     DEAD_INTAKE_STATES,
     RECEIPT_MATCH_DATE_SLOP_DAYS,
+    RECEIPT_REVIEW_WINDOW_DAYS,
+    ReceiptOutreachHeldError,
     RECEIPT_REQUEST_TARGET_TYPE,
     decimalStringToCents,
     ComponentDeadlineExceededError,
@@ -71,7 +73,7 @@ import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 // Enabling changes policy: start a fresh full sweep before any purchaser cards.
 const SOURCE_RECOGNITION_ENABLED = process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true";
 const RECOGNITION_POLICY = receiptRecognitionPolicy(SOURCE_RECOGNITION_ENABLED, reviewedReceiptFactsFingerprint, reviewedReceiptPairsFingerprint);
-const EVIDENCE_LOOKBACK_DAYS = SOURCE_RECOGNITION_ENABLED ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS : RECEIPT_MATCH_DATE_SLOP_DAYS;
+const EVIDENCE_LOOKBACK_DAYS = Math.max(RECEIPT_REVIEW_WINDOW_DAYS, SOURCE_RECOGNITION_ENABLED ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS : RECEIPT_MATCH_DATE_SLOP_DAYS);
 const SOURCE_ADJACENCY_DAYS = SOURCE_RECOGNITION_ENABLED
     ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS + RECEIPT_MATCH_DATE_SLOP_DAYS
     : COMPETING_LINE_ADJACENCY_DAYS;
@@ -974,7 +976,7 @@ export async function recomputeCodesFor(
     // Evidence for the component's own span, widened by the match window.
     const componentDays = lines.map(row => Date.parse(`${row.postedDate}T00:00:00Z`));
     const fromYmd = new Date(Math.min(...componentDays) - EVIDENCE_LOOKBACK_DAYS * 86_400_000).toISOString().slice(0, 10);
-    const toYmd = new Date(Math.max(...componentDays) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+    const toYmd = new Date(Math.max(...componentDays) + RECEIPT_REVIEW_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
     // CHECKED AGAIN BEFORE THE EVIDENCE LOAD. The walk above may have been
     // cheap and still have consumed the last of the budget; the two queries
     // below scan a 60-day-wide window of Expense and ReceiptIntake and are the
@@ -1080,8 +1082,12 @@ export async function recomputeCodesFor(
     // EVERY member of the component gets its verdict cached here, not just the
     // one that was asked for — a later call for a sibling's targetKey is then
     // a map read instead of a second full traversal of this same component.
+    const held = plan.open.find(item => item.targetKey === targetKey)?.displayDetails.outreachHold;
+    if (strictCompleteness && held) throw new ReceiptOutreachHeldError(held);
     if (cache) {
         for (const memberId of componentIds) {
+            // Do not turn a sibling's review hold into a cached send approval.
+            if (strictCompleteness && plan.open.find(item => item.targetKey === memberId)?.displayDetails.outreachHold) continue;
             cache.set(memberId, plan.open.some(o => o.targetKey === memberId) ? ["MISSING_RECEIPT"] : []);
         }
         return cache.get(targetKey)!;
@@ -1351,7 +1357,7 @@ async function processBatch(
     // 2. EVIDENCE FOR THE COHORT'S FULL SPAN, widened by the match window.
     const days = lines.map(row => row.postedDate.getTime());
     const fromYmd = new Date(Math.min(...days) - EVIDENCE_LOOKBACK_DAYS * 86_400_000).toISOString().slice(0, 10);
-    const toYmd = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+    const toYmd = new Date(Math.max(...days) + RECEIPT_REVIEW_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
     // HALF-OPEN, company timezone. See evidenceRange.
     //
     // ONE resolved zone for the whole batch: the window boundaries and the day
@@ -1515,7 +1521,7 @@ async function processBatch(
         const componentLines = lines.filter(row => ids.has(row.id));
         const days = componentLines.map(row => row.postedDate.getTime());
         const fromDay = new Date(Math.min(...days) - EVIDENCE_LOOKBACK_DAYS * 86_400_000).toISOString().slice(0, 10);
-        const toDay = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+        const toDay = new Date(Math.max(...days) + RECEIPT_REVIEW_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
         const componentRange = await evidenceRange(fromDay, toDay);
         // WIDER, for the BankLine re-read only. `groupCompetingLines` can join a
         // same-amount line up to `COMPETING_LINE_ADJACENCY_DAYS` (4 days) from

@@ -24,7 +24,7 @@ import { bankAuthPurchaseDate, isCanonicalReceiptSource, observedReceiptMerchant
  * EMPTY normalized payee is not an identity (bank-ledger.ts) — it matches
  * nothing, ever.
  */
-import { classifyReceiptRequirement, resolveReceiptOwner, type ReceiptOwner } from "./receipt-policy";
+import { classifyReceiptRequirement, isCrewReceiptRequest, resolveReceiptOwner, type ReceiptOwner } from "./receipt-policy";
 import { normalizePayee } from "./bank-ledger";
 import { intakeArtifactIsVerified } from "./receipt-intake/route-state";
 import type { BoundReceiptLineage } from "./retired-receipt-lineage";
@@ -42,6 +42,17 @@ export const RECEIPT_REQUEST_GRACE_DAYS = 3;
 
 /** Date agreement window, in calendar days either side of the posted date. */
 export const RECEIPT_MATCH_DATE_SLOP_DAYS = 2;
+
+/** A review window, never an automatic matching window. Includes late-entered receipts. */
+export const RECEIPT_REVIEW_WINDOW_DAYS = 30;
+export type ReceiptOutreachHold = "existing-evidence-review" | "office-invoice";
+
+export class ReceiptOutreachHeldError extends Error {
+    constructor(public readonly reason: ReceiptOutreachHold) {
+        super(`Receipt outreach held: ${reason}`);
+        this.name = "ReceiptOutreachHeldError";
+    }
+}
 
 /** ReceiptIntake states that can never satisfy a bank line. */
 export const DEAD_INTAKE_STATES: ReadonlySet<string> = new Set(["DUPLICATE", "VOID", "NON_RECEIPT"]);
@@ -125,6 +136,7 @@ export interface ReceiptEvidenceIntake {
 }
 
 export interface MissingReceiptDisplayDetails {
+    outreachHold?: ReceiptOutreachHold | null;
     owner: ReceiptOwner;
     cardTail: string | null;
     postedDate: string;
@@ -565,6 +577,7 @@ export function payeeTokens(value: string): string[] {
         // splitting on the apostrophe produced "LOWE" — which is not the
         // "LOWES" every bank descriptor carries, so the two never agreed.
         .replace(/['’]/g, "")
+        .replace(/\bSHERWIN[ -]+WILLIAMS\d+\b/g, "SHERWIN WILLIAMS")
         .replace(/[^A-Z0-9 ]/g, " ")
         .split(/\s+/)
         .filter(token =>
@@ -994,6 +1007,18 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
         const owner = ownerVerdict.cardTail === null && !isOfficeRail(line.rawDescriptor)
             ? "unattributed"
             : ownerVerdict.owner;
+        // A possible document is an internal reconciliation task, not proof
+        // that the purchaser failed to provide one. Do not close or bind it.
+        const nearDate = (date: string | null) => {
+            const day = date ? dayNumber(date) : null;
+            return day !== null && Math.abs(day - lineDay) <= RECEIPT_REVIEW_WINDOW_DAYS;
+        };
+        const existingEvidence = input.expenses.some(row => row.hasReceipt
+            && row.amountCents === Math.abs(line.amountCents) && nearDate(row.date))
+            || input.intakes.some(row => !DEAD_INTAKE_STATES.has(row.state)
+                && row.totalCents === Math.abs(line.amountCents) && nearDate(row.txnDate));
+        const outreachHold: ReceiptOutreachHold | null = !isCrewReceiptRequest(line)
+            ? "office-invoice" : existingEvidence ? "existing-evidence-review" : null;
         open.push({
             targetKey: line.id,
             displayDetails: {
@@ -1004,6 +1029,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
                 payee,
                 rawDescriptor: line.rawDescriptor,
                 fingerprint: receiptRequestFingerprint(line.id),
+                outreachHold,
             },
         });
     }

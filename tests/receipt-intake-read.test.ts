@@ -31,6 +31,14 @@ function geminiJson(payload: unknown): Response {
 
 const noSleep = async () => {};
 
+test("source screening distinguishes merchant evidence from reconstructions and error images", () => {
+    const prompt = buildReadPrompt([]);
+    for (const source of ["Check Query Error", "bank transaction history", "reconstructed", "Missing Receipt Affidavit"]) {
+        assert.ok(prompt.includes(source), `${source} must be screened before extracting money`);
+    }
+    assert.ok(prompt.includes("verbatim merchant email"), "original email conversion remains valid evidence");
+});
+
 test("the prompt carries the v3.6 rules that decide money", () => {
     const prompt = buildReadPrompt(PHASES);
 

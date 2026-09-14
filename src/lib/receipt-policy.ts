@@ -111,7 +111,7 @@ const NO_RECEIPT_RULES: Array<{ key: string; test: RegExp; reason: string }> = [
  */
 const SUBSCRIPTION_RULE = {
     key: "software-subscription",
-    test: /\bANTHROPIC\b|\bGOOGLE\s*\*?\s*CLOUD\b|\bPLAID\b|\bOPENAI\b|\bMICROSOFT\b|\bADOBE\b|\bINTUIT\b(?!.*\bTRAN FEE\b)|\bGITHUB\b|\bVERCEL\b/i,
+    test: /\bANTHROPIC\b|\bGOOGLE\s*\*?\s*CLOUD\b|\bPLAID\b|\bOPENAI\b|\bOPENROUTER\b|\bMICROSOFT\b|\bADOBE\b|\bINTUIT\b(?!.*\bTRAN FEE\b)|\bGITHUB\b|\bVERCEL\b/i,
     reason: "Software subscription — emailed invoice, overhead not job cost",
 };
 
@@ -156,6 +156,12 @@ export function classifyReceiptRequirement(line: ReceiptPolicyLine): ReceiptPoli
         reason: "Merchant purchase",
         ruleKey: "merchant",
     };
+}
+
+/** Collection stays active for office invoices; crew outreach does not. */
+export function isCrewReceiptRequest(line: ReceiptPolicyLine): boolean {
+    const verdict = classifyReceiptRequirement(line);
+    return verdict.requirement === "receipt_expected" && verdict.ruleKey !== "software-subscription";
 }
 
 // ── Card rails ───────────────────────────────────────────────────────────

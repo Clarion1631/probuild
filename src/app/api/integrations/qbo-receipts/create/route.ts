@@ -4,6 +4,7 @@ import { logAutomationEvent, type AutomationEventInput } from "@/lib/automation-
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import {
     createQBReceiptPurchase,
+    receiptSourceNeedsReview,
     QboAccountConfigError,
     QboPurchaseFaultError,
     isQboAttachmentAuthError,
@@ -248,28 +249,23 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
             if (!secret || request.headers.get("x-ingest-key") !== secret) {
                 return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
             }
-            if (!dependencies.isPushEnabled()) {
-                return NextResponse.json({ ok: false, reason: "push-disabled" });
-            }
+            const pushEnabled = dependencies.isPushEnabled();
 
             let body: ReceiptPushBody;
             try {
                 body = await request.json();
             } catch {
-                return NextResponse.json({ ok: false, reason: "invalid-json" });
+                return NextResponse.json({ ok: false, reason: pushEnabled ? "invalid-json" : "push-disabled" });
             }
+            const sourceNeedsReview = receiptSourceNeedsReview(body.docType);
+            if (!pushEnabled && !sourceNeedsReview) return NextResponse.json({ ok: false, reason: "push-disabled" });
 
             if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") {
                 return NextResponse.json({ ok: false, reason: "invalid-dry-run" }, { status: 400 });
             }
             const groups = normalizeGroups(body.groups);
-            if (
-                typeof body.fileId !== "string" || !body.fileId ||
-                typeof body.projectName !== "string" || !body.projectName ||
-                groups.length === 0
-            ) {
-                return NextResponse.json({ ok: false, reason: "missing-fields" });
-            }
+            const hasRequiredFields = typeof body.fileId === "string" && !!body.fileId &&
+                typeof body.projectName === "string" && !!body.projectName && groups.length > 0;
 
             // Input + logger BEFORE token fetch so token failures are audited
             // too — "one event per authenticated push attempt" must include
@@ -284,6 +280,14 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 }
             };
             const input = buildInput(body, groups);
+            // A disabled/paused API falls back to the QBO email inbox. Reject
+            // unsupported source types first so that route cannot book them.
+            // Check the raw value before buildInput discards invalid types.
+            if (sourceNeedsReview) {
+                if (hasRequiredFields) await logEvent(pushEventFromOutcome(input, { status: "needs-review", reason: "source-document-review" }));
+                return NextResponse.json({ ok: false, reason: "source-document-review", reviewRequired: true, retry: false }, { status: 409 });
+            }
+            if (!hasRequiredFields) return NextResponse.json({ ok: false, reason: "missing-fields" });
 
             // Command Center pause: terminal ok:false so the bot books via the
             // email path while paused — receipts keep flowing, just not
@@ -342,6 +346,10 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                     await logEvent(pushEventFromOutcome(input,{status:"needs-review",reason:result.reason},
                         {pendingFileIds:result.pendingFileIds,candidates:result.candidates}));
                     return NextResponse.json({...result,reviewRequired:true,retry:false},{status:409});
+                }
+                if (!result.ok && result.reason === "source-document-review") {
+                    await logEvent(pushEventFromOutcome(input, { status: "needs-review", reason: result.reason }));
+                    return NextResponse.json({ ...result, reviewRequired: true, retry: false }, { status: 409 });
                 }
                 if (!result.ok && result.reason === "duplicate-purchase-review") {
                     await logEvent(pushEventFromOutcome(input,

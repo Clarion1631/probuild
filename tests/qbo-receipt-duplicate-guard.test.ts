@@ -134,14 +134,59 @@ test("known-Purchase hook and ownership fence precede fallible intent reconcilia
    assert.equal(effects.creates+effects.uploads,0);
  }
 });
-test("different file/vendor/year is held before create, recorded, and missing image attached",async()=>{
+test("a sole amount/date candidate is held without attaching an unproven document",async()=>{
  const {deps,effects}=setup([candidate()]);
  const r=await createQBReceiptPurchase(tokens,input(),deps);
  assert.equal(r.ok,false); if(r.ok) return;
  assert.equal(r.reason,"duplicate-purchase-review");
  assert.deepEqual((r as any).candidates.map((c:any)=>c.id),["6761"]);
- assert.equal(effects.creates,0); assert.equal(effects.ensures,0); assert.equal(effects.uploads,1);
+ assert.equal(effects.creates,0); assert.equal(effects.ensures,0); assert.equal(effects.uploads,0);
+ assert.equal((r as any).attachment,"skipped");
+ assert.equal(effects.queries.some(q=>/FROM attachable/i.test(q)),false);
  assert.equal(effects.reviews.length,1);
+});
+
+test("classified reconstructed and non-receipt sources cannot create or attach a Purchase",async()=>{
+ for (const docType of ["reconstructed", "non_receipt", "error", "bank_record", "unknown", ""]) {
+  const {deps,effects}=setup();
+  const result=await createQBReceiptPurchase(tokens,input({docType}),deps);
+  assert.deepEqual(result,{ok:false,reason:"source-document-review"});
+  assert.equal(effects.creates+effects.uploads+effects.ensures+effects.queries.length+effects.locks.length,0);
+ }
+});
+
+test("source-document refusal is HTTP409 review, never a legacy email fallback",async()=>{
+ const events:any[]=[];
+ const {deps,effects}=setup();
+ const h=createQboReceiptCreateHandlers({getIngestSecret:()=>"secret",isPushEnabled:()=>true,isPushPaused:async()=>false,
+  getFreshTokens:async()=>tokens,logEvent:async e=>{events.push(e)},createPurchase:async(t,i,d)=>createQBReceiptPurchase(t,i,deps,d)});
+ const res=await h.POST(new Request("http://test",{method:"POST",headers:{"x-ingest-key":"secret"},body:JSON.stringify(input({docType:"non_receipt"}))}));
+ assert.equal(res.status,409);
+ assert.deepEqual(await res.json(),{ok:false,reason:"source-document-review",reviewRequired:true,retry:false});
+ assert.equal(effects.creates+effects.uploads,0);
+ assert.equal(events[0].status,"needs-review");
+});
+
+test("source screening precedes disabled and paused API fallback, including invalid type values",async()=>{
+ for (const enabled of [false,true]) for (const docType of ["reconstructed",null,42]) {
+  let calls=0;
+  const h=createQboReceiptCreateHandlers({getIngestSecret:()=>"secret",isPushEnabled:()=>enabled,isPushPaused:async()=>true,
+   getFreshTokens:async()=>{calls++;return tokens},logEvent:async()=>{},createPurchase:async()=>{calls++;throw new Error("must not book")}});
+  const res=await h.POST(new Request("http://test",{method:"POST",headers:{"x-ingest-key":"secret"},body:JSON.stringify({...input(),docType})}));
+  assert.equal(res.status,409);
+  assert.equal((await res.json()).reason,"source-document-review");
+  assert.equal(calls,0);
+ }
+});
+
+test("malformed booking fields cannot make a rejected source fall back to email",async()=>{
+ const h=createQboReceiptCreateHandlers({getIngestSecret:()=>"secret",isPushEnabled:()=>true,isPushPaused:async()=>false,
+  getFreshTokens:async()=>{throw new Error("no token call")},logEvent:async()=>{},createPurchase:async()=>{throw new Error("no booking")}});
+ for (const over of [{groups:[]},{projectName:""},{fileId:""}]) {
+  const res=await h.POST(new Request("http://test",{method:"POST",headers:{"x-ingest-key":"secret"},body:JSON.stringify({...input({docType:"non_receipt"}),...over})}));
+  assert.equal(res.status,409);
+  assert.equal((await res.json()).reason,"source-document-review");
+ }
 });
 test("any existing attachment is retained; candidate filename need not match",async()=>{
  const {deps,effects}=setup([candidate()], [{FileName:"original.jpg",AttachableRef:[{EntityRef:{type:"Purchase",value:"6761"}}]}]);
@@ -186,6 +231,8 @@ test("legacy endpoint sends 409 for duplicate review so old bot cannot fall back
 
 test("dry-run fixtures: all four incidents are held without any business writes", async () => {
  const fixtures = [
+   {name:"OpenRouter reconstructed capture",date:"2026-08-21",amount:28.41,rows:[{Id:"6833",TxnDate:"2026-08-24",TotalAmt:28.41,EntityRef:{name:"OpenAI"}}],ids:["6833"]},
+   {name:"US Market bank capture",date:"2026-08-20",amount:74,rows:[{Id:"6636",TxnDate:"2026-08-20",TotalAmt:74,EntityRef:{name:"VeriFone Gold Disk"}}],ids:["6636"]},
    {name:"Bigfoot vendor drift",date:"2026-09-03",amount:575,rows:[candidate("6728","2026-09-03")],ids:["6728"]},
    {name:"Bigfoot wrong year",date:"2026-09-08",amount:575,rows:[candidate()],ids:["6761"]},
    {name:"Les Schwab manual bridge",date:"2026-08-19",amount:1974.76,rows:[
@@ -369,7 +416,7 @@ test("changed OCR on the original source cannot overwrite an unresolved amount/d
  assert.equal(effects.creates+effects.uploads+effects.ensures,0);
 });
 
-test("unreadable attachment response parks with an unconfirmed image, without uploading", async () => {
+test("candidate review does not inspect or modify its attachments", async () => {
  const {deps,effects}=setup();delete deps.qbQueryFn;
  const previous=globalThis.fetch;
  globalThis.fetch=async url=>{
@@ -382,16 +429,17 @@ test("unreadable attachment response parks with an unconfirmed image, without up
  try {
    const result=await createQBReceiptPurchase(tokens,input(),deps);
    assert.ok(!result.ok&&result.reason==="duplicate-purchase-review");
-   assert.equal(result.attachment,"failed:attachment-unconfirmed");
+   assert.equal(result.attachment,"skipped");
  } finally {globalThis.fetch=previous}
  assert.equal(effects.uploads,0);assert.equal(effects.reviews.length,1);
 });
 
-test("a full attachment page without a Purchase link is incomplete, not proof of no image", async () => {
+test("candidate review does not depend on an incomplete attachment page", async () => {
  const {deps,effects}=setup([candidate()],Array.from({length:100},()=>({AttachableRef:[{EntityRef:{type:"Bill",value:"6761"}}]})));
  const result=await createQBReceiptPurchase(tokens,input(),deps);
  assert.ok(!result.ok&&result.reason==="duplicate-purchase-review");
- assert.equal(result.attachment,"failed:attachment-lookup-incomplete");assert.equal(effects.uploads,0);
+ assert.equal(result.attachment,"skipped");assert.equal(effects.uploads,0);
+ assert.equal(effects.queries.some(q=>/FROM attachable/i.test(q)),false);
 });
 
 test("a same-source retry refusal returns a non-email response while its original create is unknown", async () => {
@@ -405,13 +453,13 @@ test("a same-source retry refusal returns a non-email response while its origina
  assert.equal((await deps.createIntents!.list(tokens.realmId)).length,1);
 });
 
-test("unreadable attachment rows cannot prove a candidate has no image", async () => {
+test("unreadable candidate attachment rows never cause an upload", async () => {
  for (const row of [null, {}, {AttachableRef:[]}, {AttachableRef:[null]},
    {AttachableRef:[{EntityRef:{value:"6761"}}]}, {AttachableRef:[{EntityRef:{type:"Purchase"}}]}]) {
    const {deps,effects}=setup([candidate()],[row] as any);
    const result=await createQBReceiptPurchase(tokens,input(),deps);
    assert.ok(!result.ok&&result.reason==="duplicate-purchase-review");
-   assert.equal(result.attachment,"failed:attachment-unconfirmed");
+   assert.equal(result.attachment,"skipped");
    assert.equal(effects.uploads,0);
  }
 });
@@ -470,13 +518,13 @@ test("an unreadable intent store cannot be skipped merely because a candidate is
  assert.equal(effects.creates+effects.uploads+effects.ensures+effects.reviews.length,0);
 });
 
-test("an unrelated pending create does not prevent attaching to a sole visible candidate", async () => {
+test("a sole candidate stays unattached even when pending creates are unrelated", async () => {
  const {deps,effects}=setup([candidate()]);
  const pending={fileId:"unrelated-source",date:"2026-06-01",amountCents:57500};
  await deps.createIntents!.put(tokens.realmId,pending);
  const result=await createQBReceiptPurchase(tokens,input(),deps);
  assert.ok(!result.ok&&result.reason==="duplicate-purchase-review");
- assert.equal(result.attachment,"attached");assert.equal(effects.uploads,1);assert.equal(effects.creates,0);
+ assert.equal(result.attachment,"skipped");assert.equal(effects.uploads,0);assert.equal(effects.creates,0);
  assert.deepEqual(await deps.createIntents!.list(tokens.realmId),[pending]);
 });
 
