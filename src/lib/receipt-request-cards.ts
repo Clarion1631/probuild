@@ -34,7 +34,8 @@
  * page-only by policy (receipt-policy.ts) — Justin's spend is overwhelmingly
  * overhead, and nobody sends the owner an affidavit request.
  */
-import type { ReceiptOwner } from "./receipt-policy";
+import { isCrewReceiptRequest, type ReceiptOwner } from "./receipt-policy";
+import type { ReceiptOutreachHold } from "./receipt-requests";
 
 /** The owners a card is ever addressed to. */
 export const CARD_OWNERS_ASKED: ReceiptOwner[] = ["CJ", "Richard"];
@@ -51,6 +52,7 @@ export const CARD_RATE_CEILING = 10;
 export const MAX_ITEMS_PER_CARD = 10;
 
 export interface CardCandidateIssue {
+    outreachHold?: ReceiptOutreachHold | null;
     /** ReviewIssue id. */
     id: string;
     /** BankLine id. */
@@ -212,7 +214,8 @@ export function selectOwnerItems(
     owner: string,
 ): { items: CardItem[]; overflow: number } {
     const mine = candidates
-        .filter(issue => issue.owner === owner && !issue.acknowledged)
+        .filter(issue => issue.owner === owner && !issue.acknowledged && !issue.outreachHold
+            && isCrewReceiptRequest({ amountCents: issue.amountCents, rawDescriptor: issue.payee }))
         .sort((a, b) => {
             if (a.everCarded !== b.everCarded) return a.everCarded ? 1 : -1;
             if (a.postedDate !== b.postedDate) return a.postedDate < b.postedDate ? -1 : 1;
@@ -507,6 +510,7 @@ export async function postOwnerCard(
 
 /** One item's CURRENT truth, read fresh from its ReviewIssue. */
 export interface CardItemTruth {
+    outreachHold?: ReceiptOutreachHold | null;
     /** Non-null once the issue was answered or the charge got its receipt. */
     clearedAt: Date | null;
     /** Every current reason code has been acknowledged by a human. */
@@ -536,6 +540,7 @@ export interface CardItemTruth {
 }
 
 export type CardItemDropReason =
+    | ReceiptOutreachHold
     | "missing"
     | "cleared"
     | "acknowledged"
@@ -593,7 +598,7 @@ export function rebuildCardItems(
                                 ? "acknowledged"
                                 : current.owner !== owner
                                     ? "owner-changed"
-                                    : null;
+                                    : current.outreachHold ?? (!isCrewReceiptRequest({ amountCents: -item.cents, rawDescriptor: item.vendor }) ? "office-invoice" : null);
         if (reason) {
             dropped.push({ issueId: item.issueId, reason });
             continue;

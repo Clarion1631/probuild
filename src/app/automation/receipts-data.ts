@@ -53,6 +53,7 @@ export type IntakeRow = {
 };
 
 export interface MissingReceiptRow {
+    outreachHold?: string | null;
     /** ReviewIssue id — the mark-reviewed contract's `id`. */
     id: string;
     version: number;
@@ -255,6 +256,7 @@ export function toMissingReceiptRow(issue: {
         amountCents: typeof details.amountCents === "number" ? details.amountCents : 0,
         payee: str(details.payee) ?? "",
         rawDescriptor: str(details.rawDescriptor) ?? "",
+        outreachHold: str(details.outreachHold),
         fingerprint: str(details.fingerprint) ?? `pb-${issue.targetKey}`,
         threadName: str(card.threadName),
         resolution: str(details.resolution),

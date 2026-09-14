@@ -442,6 +442,13 @@ function MissingReceiptRowView({ row }: { row: MissingReceiptRow }) {
                     {row.postedDate || "date unknown"}
                     {row.cardTail ? ` · card …${row.cardTail}` : " · no card (office rail)"}
                 </p>
+                {row.outreachHold && (
+                    <p className="text-xs text-amber-700 mt-1">
+                        {row.outreachHold === "office-invoice"
+                            ? "Office invoice — collect from billing email. Crew request held."
+                            : "Existing document needs reconciliation. Crew request held."}
+                    </p>
+                )}
                 {row.resolution === "memo-signed" && (
                     <p className="text-xs text-teal-700 mt-1">
                         Memo signed

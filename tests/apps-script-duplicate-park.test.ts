@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
-function harness(pending = false) {
+function harness(pending = false, sourceReview = false) {
     const effects = { emails: 0, fetches: 0, moves: [] as string[], notices: [] as string[], beacons: [] as string[] };
     let persisted: any = { qboRoute: "api" };
     const blob = { getBytes: () => [1], getName: () => "receipt.png", getContentType: () => "image/png" };
     const file = { getId: () => "new-capture", getName: () => "receipt.png", getBlob: () => blob,
+        getUrl: () => "https://drive.google.com/file/d/new-capture/view",
         getDescription: () => JSON.stringify(persisted),
         setDescription: (value: string) => {persisted=JSON.parse(value)},
         moveTo: (where: string) => effects.moves.push(where) };
@@ -16,7 +17,9 @@ function harness(pending = false) {
         Logger: { log() {} }, PropertiesService: { getScriptProperties: () => ({getProperty: (key: string) => key === "QBO_API_PUSH_ENABLED" ? "true" : "test"}) },
         Utilities: { base64Encode: () => "AQ==" },
         UrlFetchApp: { fetch: () => { effects.fetches++; return { getResponseCode: () => 409,
-            getContentText: () => JSON.stringify(pending
+            getContentText: () => JSON.stringify(sourceReview
+                ? {ok:false,reason:"source-document-review",reviewRequired:true,retry:false}
+                : pending
                 ? {ok:false,reason:"duplicate-create-pending",reviewRequired:true,pendingFileIds:["unresolved-source"]}
                 : { ok: false, reason: "duplicate-purchase-review", reviewRequired: true,
                     candidates: [{ id: "6761", date: "2024-09-08", amount: 575 }], attachment: "already-attached" }) }; } },
@@ -56,6 +59,36 @@ test("legacy bot persists duplicate review, never emails it, and only retries al
     assert.equal(h.state().emailed, undefined);
     assert.equal(h.effects.emails, 0);
     assert.equal(h.effects.fetches, 1);
+});
+
+test("legacy source triage does not turn reconstructed or unknown documents into receipts", () => {
+    const h = harness();
+    for (const value of [undefined, null, "", "reconstructed", "bank_record", "error", "non_receipt"]) {
+        assert.equal(h.context.receiptDocumentType_(value), "non_receipt");
+    }
+    for (const value of ["receipt", "check", "multi"]) assert.equal(h.context.receiptDocumentType_(value), value);
+    const source = readFileSync("docs/apps-script/runReceiptAutomation.gs", "utf8");
+    assert.match(source, /Check Query Error/);
+    assert.match(source, /verbatim merchant email/);
+});
+
+test("a source-document API hold parks durably without email or purchase retries", () => {
+    const h = harness(false, true);
+    assert.equal(h.send().parked, true);
+    assert.equal(h.state().parkReason, "sourceDocument");
+    h.send();
+    h.context.processSingleFile(h.file, {projectName:"Test"}, "archive", "review");
+    assert.equal(h.effects.fetches, 1);
+    assert.equal(h.effects.emails, 0);
+    assert.deepEqual(h.effects.moves, ["review"]);
+    assert.match(h.effects.notices[0], /merchant-issued/);
+});
+
+test("non-receipt notices ask for source review without inventing a payroll classification", () => {
+    const h = harness();
+    h.context.sendNonReceiptAlertIfNeeded(h.file, {}, {projectName:"Test"}, "error-image.jpg");
+    assert.match(h.effects.notices[0], /original merchant/);
+    assert.doesNotMatch(h.effects.notices[0], /Gusto|route it to payroll/);
 });
 
 test("a pre-persisted duplicate hold emits its park beacon once after recovery", () => {

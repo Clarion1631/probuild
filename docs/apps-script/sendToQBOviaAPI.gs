@@ -43,6 +43,7 @@ const PROBUILD_QBO_PUSH_URL = "https://probuild.goldentouchremodeling.com/api/in
 const MAX_QBO_PUSH_ATTACHMENT_BYTES = 3 * 1024 * 1024;
 
 function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment, state) {
+  if (state.parkReason === "sourceDocument") return { parked: true, parkReason: "sourceDocument" };
   if (state.parkReason === "qboDuplicate") return { parked: true };
   if (state.qboApi) return; // already handled on a previous pass
 
@@ -214,6 +215,11 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
 
   if (code === 409) {
     const review = JSON.parse(res.getContentText());
+    if (review.reason === "source-document-review" && review.reviewRequired === true) {
+      state.parkReason = "sourceDocument";
+      setState(file, state);
+      return { parked: true, parkReason: "sourceDocument" };
+    }
     if ((review.reason === "duplicate-purchase-review" || review.reason === "duplicate-create-pending") && review.reviewRequired === true) {
       // Persist BEFORE returning. A crash before alert/move re-enters the
       // terminal park branch on the next pass, never the email fallback.

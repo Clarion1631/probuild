@@ -227,6 +227,35 @@ after(() => {
     assert.equal(fetchCalls, 0, "no card, no webhook, nothing on the network at any point");
 });
 
+test("late-entered document holds the real queued-card adapter and cannot become cached send approval", async () => {
+    componentLines = singletonComponent;
+    issues = [issueRow("ri-review", line.id, JSON.stringify({ owner: "Richard" }))];
+    const previous = tables.expense;
+    const ranges: Array<{ gte: Date; lt: Date }> = [];
+    tables.expense = model({ findMany: async ({ where }: any) => {
+        if (!where.date) return [];
+        ranges.push(where.date);
+        const date = new Date("2026-01-27T12:00:00Z");
+        return date >= where.date.gte && date < where.date.lt ? [{
+            id: "fictional-late-receipt", amount: "123.45", date, vendor: "Different merchant label",
+            receiptUrl: "https://drive.google.com/file/d/fictional-receipt/view", receiptIntake: null,
+            qbPurchaseId: "fictional-qbo", qbSyncToken: "0", status: "Approved",
+        }] : [];
+    } });
+    try {
+        const cache = new Map<string, ReasonCode[]>();
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const truth = await loadCardItemTruth(["ri-review"], { cache });
+            assert.equal(truth.get("ri-review")?.evidenceSatisfied, false);
+            assert.equal(truth.get("ri-review")?.outreachHold, "existing-evidence-review");
+            assert.deepEqual(rebuildCardItems([cardItem("ri-review", line.id)], truth, "Richard").dropped,
+                [{ issueId: "ri-review", reason: "existing-evidence-review" }]);
+            assert.equal(cache.has(line.id), false);
+        }
+        assert.ok(ranges.length >= 2);
+    } finally { tables.expense = previous; }
+});
+
 // -- The seam: the scheduled default asks strictly ---------------------------
 
 test("the scheduled default asks the STRICT question: recompute is called with strict=true, sharing this card's cache and deadline", async () => {

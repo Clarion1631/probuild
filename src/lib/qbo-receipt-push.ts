@@ -311,6 +311,7 @@ export interface ExistingPurchaseCheck {
 }
 
 export type CreateQBReceiptPurchaseResult =
+    | { ok: false; reason: "source-document-review" }
     | { ok: false; reason: "duplicate-create-pending"; pendingFileIds: string[]; candidates: DuplicatePurchaseCandidate[] }
     | { ok: false; reason: "duplicate-purchase-review"; candidates: DuplicatePurchaseCandidate[]; attachment: ReceiptAttachmentStatus }
     | { ok: false; reason: "dry-run"; action: "would-create" | "already-exists" | "needs-review"; candidates: DuplicatePurchaseCandidate[]; pendingFileIds?: string[] }
@@ -1500,12 +1501,23 @@ export async function withReceiptFileLease<T>(
  * be bypassed by calling the push directly — the implementation below is not
  * exported.
  */
+export function receiptSourceNeedsReview(docType: unknown): boolean {
+    return docType !== undefined &&
+        (typeof docType !== "string" || !["receipt", "check"].includes(docType.trim().toLowerCase()));
+}
+
 export async function createQBReceiptPurchase(
     tokens: QBTokens,
     input: CreateQBReceiptPurchaseInput,
     deps: Partial<QboReceiptPushDependencies> = {},
     deadline?: RouteDeadline,
 ): Promise<CreateQBReceiptPurchaseResult> {
+    // Legacy callers may omit the classification. An explicit non-receipt,
+    // reconstruction, or unreadable classification may never be coerced to
+    // a merchant receipt, including on an idempotent attachment retry.
+    if (receiptSourceNeedsReview(input.docType)) {
+        return { ok: false, reason: "source-document-review" };
+    }
     if (input.dryRun === true) return createQBReceiptPurchaseUnderLock(tokens, input, deps, deadline);
     const withFileLock: ReceiptFileLock =
         deps.withFileLock ?? ((fileId, run) => withReceiptFileLease(fileId, run, deadline));
@@ -1720,22 +1732,10 @@ async function createQBReceiptPurchaseUnderLock(
             fileId: input.fileId, candidateIds: candidates.map(c => c.id), pendingFileIds,
         });
         if (pendingFileIds.length) return {ok:false,reason:"duplicate-create-pending",pendingFileIds,candidates};
-        let attachment: ReceiptAttachmentStatus = "skipped";
-        // Same amount/date identifies CANDIDATES, not identity. Never select one
-        // from multiple hits or create a second Purchase. No Purchase fields change.
-        if (candidates.length === 1) {
-            try {
-                attachment = await ensureAttachmentOnExistingPurchase(
-                    tokens, candidates[0].id, input, qbQueryFn, uploadAttachment, deadline, refreshTokensFn, true,
-                );
-            } catch (error) {
-                // The duplicate hold is already durable. An attachment failure
-                // must not prevent either caller from parking this receipt.
-                attachment = "failed:attachment-unconfirmed";
-                console.error("[receipt-duplicate-guard] attachment unconfirmed", error instanceof Error ? error.name : "UnknownError");
-            }
-        }
-        return { ok: false, reason: "duplicate-purchase-review", candidates, attachment };
+        // One candidate is still only an amount/date coincidence. Attaching
+        // here would turn an unverified association into apparent evidence.
+        // Only the source-identity replay above may repair its own attachment.
+        return { ok: false, reason: "duplicate-purchase-review", candidates, attachment: "skipped" };
     }
 
     // Overhead docs post to the category's own expense account. The tax split
