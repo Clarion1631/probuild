@@ -2057,6 +2057,12 @@ export async function getPipelineHealth(deps: {
             enabled: bankPull.value.enabled,
             lastSuccessAt: bankPull.value.lastSuccessAt,
             ambiguousCount: bankPull.value.ambiguousCount,
+            // READ BY THE PROBE, AND IT HAS TO REACH THE VERDICT. It was
+            // missing here, so `evaluatePipelineHealth` always saw `undefined`
+            // and `bank-quarantine:<n>` / `bank-quarantine-unreadable` — the
+            // reasons round 46 and round 48 added to stop a short register
+            // certifying itself — have never once fired in production.
+            quarantinedCount: bankPull.value.quarantinedCount,
             unclearedCount: bankPull.value.unclearedCount,
             staleAmbiguous: bankPull.value.staleAmbiguous,
             blockedReason: bankPull.value.blockedReason,
