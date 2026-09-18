@@ -103,7 +103,7 @@
 <div class="wrap">
   <h1>GTR Expense Pipeline</h1>
   <p class="sub">From a swipe of the Washington Trust debit card to job-cost visibility in ProBuild — who touches what, where the money data lives, and what runs by itself. Goal: answer "are we profitable, is cash flow good" daily.</p>
-  <p class="stamp">Updated August 10, 2026 · Every stage below is <b>live and verified end-to-end</b> (test receipt → QuickBooks purchase → ProBuild job cost, receipt attached the whole way).</p>
+  <p class="stamp">Updated September 18, 2026 · Every stage below is <b>live and verified end-to-end</b> (test receipt → QuickBooks purchase → ProBuild job cost, receipt attached the whole way).</p>
 
   <div class="glance" aria-label="The pipeline at a glance">
     <svg class="logo" viewBox="0 0 49.4 37.25" aria-label="Gmail"><path fill="#4285f4" d="M3.37 37.25h7.87V18.14L0 9.71v24.17c0 1.86 1.51 3.37 3.37 3.37z"/><path fill="#34a853" d="M38.16 37.25h7.87c1.86 0 3.37-1.51 3.37-3.37V9.71L38.16 18.14z"/><path fill="#fbbc04" d="M38.16 3.37v14.77L49.4 9.71V5.06c0-4.17-4.76-6.55-8.1-4.05z"/><path fill="#ea4335" d="M11.24 18.14V3.37L24.7 13.47 38.16 3.37v14.77L24.7 28.24z"/><path fill="#c5221f" d="M0 5.06v4.65l11.24 8.43V3.37L8.1 1.01C4.76-1.49 0 .89 0 5.06z"/></svg>
@@ -204,6 +204,9 @@
     <tr><td>Folder reconciler</td><td>Daily</td><td>Creates intake folders for new In-Progress projects; emails Justin when a folder matches no project</td></tr>
     <tr><td>QBO → ProBuild sync</td><td>Every 4 hours <span class="pill on">on</span></td><td>Imports finalized purchases into job costs, copies receipts over, applies voids/edits/moves</td></tr>
     <tr><td>Robot bookkeeper (stuck-receipt resolver)</td><td>Daily, 7:23&nbsp;AM</td><td>An AI bookkeeper (Claude Opus, on Justin's PC) works the <i>_Needs Review</i> pile: checks QuickBooks, splits multi-receipt scans, refiles duplicates, and writes a daily digest</td></tr>
+    <tr><td>Bank register pull</td><td>Nightly, 2:00&nbsp;AM&nbsp;UTC</td><td>Reads the QuickBooks register for the Washington Trust account and records the last 7 days as bank charges, so the missing-receipt check has fresh truth to work from instead of waiting for the monthly statement. When the statement does arrive it attaches to those same charges rather than creating duplicates. Read-only — it never writes to QuickBooks</td></tr>
+    <tr><td>Missing-receipt check</td><td>Daily, 6:00&nbsp;AM&nbsp;Pacific</td><td>Compares every bank charge older than 3 days against the receipts and expenses we hold. Anything with no match opens on the <b>Receipts</b> tab; anything that gets matched closes itself</td></tr>
+    <tr><td>Receipt chase card</td><td>Weekday mornings <span class="pill">off until switched on</span></td><td>Posts ONE Chat message per person (CJ, Richard) listing their missing receipts. Reply in the thread with a photo, a job name, or "sign N" for a memo. Never emails anything</td></tr>
   </table>
   </div>
 
@@ -223,6 +226,7 @@
   <div class="tablewrap">
   <table>
     <tr><th>Question</th><th>Where to look</th></tr>
+    <tr><td>What is waiting on a person right now?</td><td>The <b>Receipts</b> tab on this page: <i>Needs job</i>, <i>Needs review</i>, <i>Booking</i>, <i>Booked today</i>, <i>Missing receipts</i> (grouped by whose card it was), <i>Duplicates</i>, <i>Exceptions</i> (QuickBooks may hold a purchase for a receipt somebody voided mid-send — go void it there), <i>Uncertain deliveries</i> (a morning Chat card we asked for and never got a confirmed answer about: look in the Receipts Need Review space and mark it delivered, or resend it). Setting a job there hands the receipt straight back to the pipeline</td></tr>
     <tr><td>Is money flowing?</td><td>This Automation page — receipts booked this month, hands-free rate, "Booked" chips on recent receipts</td></tr>
     <tr><td>What's actually stuck?</td><td>Drive: <code>Expenses → New Receipts &amp; Checks → _Needs Review</code>. <b>The folder is the truth</b> — the count on this page can run low, because files dropped straight into _Needs Review never reported themselves to ProBuild</td></tr>
     <tr><td>What did the robot bookkeeper do?</td><td>Drive: <code>Claude → Bookeeping → resolver-digests</code> — one dated note per day: what it fixed, what needs a human, what it left alone and why</td></tr>
@@ -250,6 +254,108 @@
       <li><b>Emergency stop:</b> Settings on this page can pause receipt-push and the QBO sync; the daily bookkeeper is a Windows scheduled task (<code>receipt-resolver-daily</code>) on Justin's PC.</li>
     </ul>
   </div>
+
+  <div class="callout">
+    <h3>Missing receipts — how the chase works</h3>
+    <p>A bank charge more than 3 days old with no receipt or expense behind it opens a <b>missing receipt</b> item on the Receipts tab. Loan payments, insurance, bank fees, tax payments and owner transfers are exempt by rule — there is no merchant receipt to find, and the reason is shown rather than hidden. Items are grouped by whose card was used (…8516 CJ, …6098 Richard, …4297 Justin); charges with no card are the office's to chase and the crew never sees them.</p>
+    <ul>
+      <li><b>It closes itself.</b> When matching evidence turns up — same amount to the cent, within 2 days, same merchant — the item disappears on the next nightly run. If that evidence is later deleted, the item comes back.</li>
+      <li><b>Three ways to answer</b> in the Chat thread: send a photo, reply with the job name, or reply "sign N" to sign a memo instead. A signed memo closes the item and its PDF link is kept on it.</li>
+      <li><b>No emailed PDFs, ever.</b> The whole loop happens in the thread and on this page.</li>
+      <li><b>One message per person per day.</b> The card is posted into the <b>Receipts Need Review</b> Chat space through an incoming webhook (the <code>RECEIPTS_CHAT_WEBHOOK</code> setting). If that setting is missing, the chase simply doesn't post — the Receipts tab still lists every item, so nothing goes unseen.</li>
+      <li><b>A retry can't double-ask.</b> A webhook gives no way to tell Chat &quot;this is the same message you already have&quot;, so ProBuild remembers instead: every listed item records the day it was asked about, and an owner whose items were all listed earlier today gets no second card.</li>
+      <li><b>It is a chase, not a correction.</b> Nothing here edits a bank line, an expense, or QuickBooks — it only decides whether to ask a human.</li>
+    </ul>
+  </div>
+
+  <h2 id="marge-checklist">Marge's daily checklist</h2>
+
+  <div class="stage g">
+    <span class="tag">Your job in one minute</span>
+    <div class="h3row"><h3>The pipeline does the chasing. You check that it's working.</h3></div>
+    <p>Receipts get pulled in, read, and booked in QuickBooks on their own. Missing ones get chased in Chat on their own. Your part is a short daily look to confirm that is actually happening, not chasing receipts by hand.</p>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage b">
+    <span class="tag">Every morning</span>
+    <div class="h3row"><h3>A two minute look at the Automation page</h3></div>
+    <ol style="padding-left: 1.2rem; font-size: .88rem;">
+      <li style="margin-bottom: .3rem;">Open <b>Automation</b> from the top menu, then the <b>Receipts</b> tab.</li>
+      <li style="margin-bottom: .3rem;">Good looks like this: <i>Needs job</i> and <i>Needs review</i> are low, and nothing new is sitting in <i>Exceptions</i> or <i>Duplicates</i>.</li>
+      <li>Forward to Justin: anything in <i>Exceptions</i>, a QuickBooks connection that looks disconnected, or a missing-receipt chase that does not seem to be going out. You do not need to fix these yourself, just flag them.</li>
+    </ol>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage a">
+    <span class="tag">When a charge has no receipt</span>
+    <div class="h3row"><h3>Three cases, three different answers</h3></div>
+    <div class="split">
+      <div class="cell"><b>Card purchase</b><p>If it was CJ's or Richard's card, they answer it themselves, in their own Chat thread: a photo, or <code>sign N</code> (N is the item number on their card). You cannot sign for them, and nothing typed in your own thread counts as their sign off. A charge on Justin's card has no chase card at all, so flag it to him directly.</p></div>
+      <div class="cell"><b>Check or sub payment</b><p>Example: a $3,500 check to an electrician. That needs the sub's invoice, not a receipt. Ask Richard for the invoice. A missing-receipt memo is the wrong document for a check like this.</p></div>
+    </div>
+    <p style="margin-top: .6rem;"><b>Already have the file?</b> Photo it into the <b>Receipts Need Review</b> Chat space (swept roughly every 10 minutes), or drop it straight into the <b>New Receipts &amp; Checks</b> Drive folder under the right job and category. If a Drive drop has not moved within an hour, tell Justin. Do not re-upload it or send it somewhere else, the Drive watcher's own health is not something ProBuild can see.</p>
+  </div>
+
+  <div class="callout">
+    <h3>What Beverly understands, today</h3>
+    <div class="tablewrap">
+    <table>
+      <tr><th>You send</th><th>What happens</th></tr>
+      <tr><td>A photo, in your own thread</td><td>Read and matched</td></tr>
+      <tr><td><code>@Beverly sign N</code>, in the card owner's own thread</td><td>Opens a missing-receipt memo to sign</td></tr>
+      <tr><td><code>@Beverly affidavit: vendor date $amount job</code></td><td>Saved for Justin to check by hand today. <i>Coming: an automatic checker is planned but not live yet.</i></td></tr>
+      <tr><td>Plain text with no photo (example: "Red Point 8/31 $3,500")</td><td>Beverly cannot act on this on its own. It needs to be a photo, a <code>sign N</code>, or an <code>affidavit:</code> message.</td></tr>
+    </table>
+    </div>
+    <p style="margin-top: .6rem; font-size: .82rem;">Two bots share the Beverly name in Receipts Need Review: <b>Beverly Receipt Requests</b> posts the "receipts needed" list cards, and plain <b>Beverly</b> answers @mentions. Easy to mix up, so check which one a message is actually from.</p>
+  </div>
+
+  <div class="callout">
+    <h3>Who to go to</h3>
+    <div class="tablewrap">
+    <table>
+      <tr><th>Person</th><th>Their part in this</th></tr>
+      <tr><td>Marge</td><td>Get receipts in, review auto-created purchases, run the morning check above, flag what looks stuck</td></tr>
+      <tr><td>Richard / CJ</td><td>Sign off on their own card charges, send sub invoices for checks</td></tr>
+      <tr><td>Justin</td><td>Stale bank pulls, a blocked chase, anything you flag from the morning check, affidavit requests waiting on a human</td></tr>
+      <tr><td>Vanessa</td><td>Matches the bank feed, cleans up duplicate entries, sales tax report at filing time</td></tr>
+    </table>
+    </div>
+  </div>
+
+  <div class="callout">
+    <h3>Two things never to do</h3>
+    <ul>
+      <li><b>Never click "Mark reviewed" just to clear a charge off the list.</b> It only quiets the alert for what is currently flagged. It does not book a receipt and does not close the real gap.</li>
+      <li><b>Never re-enter an expense in QuickBooks that the pipeline already booked.</b> That creates a duplicate for Vanessa to clean up later. If a charge looks unbooked, flag it instead of typing it in yourself.</li>
+    </ul>
+  </div>
+
+  <div class="callout">
+    <h3>Technical terms, if Justin ever uses them with you</h3>
+    <p style="font-size: .82rem; margin-bottom: .4rem;">These come from the pipeline's own health check, not from anything you would normally see on the Automation page. Useful mainly if Justin forwards you a note that uses one.</p>
+    <div class="tablewrap">
+    <table>
+      <tr><th>Term</th><th>Plain English</th><th>Who handles it</th></tr>
+      <tr><td><code>bank-pull-stale</code></td><td>The nightly read of the bank register has not succeeded in a while, so the missing-receipt check cannot trust its numbers yet</td><td>Justin</td></tr>
+      <tr><td><code>chaser-blocked:reason</code></td><td>The missing-receipt chase is holding back its cards on purpose, because the register is not fresh enough to ask about the right things</td><td>Justin</td></tr>
+      <tr><td><code>possible-duplicate-purchases:N</code></td><td>N purchases in QuickBooks look like they might be the same charge booked twice</td><td>Vanessa or Justin, never delete one yourself</td></tr>
+      <tr><td><code>no-receipts-72h</code></td><td>Nothing has booked automatically in the last 3 days, which can mean the pipeline stalled</td><td>Justin</td></tr>
+    </table>
+    </div>
+  </div>
+
+  <div class="callout">
+    <h3>What changed recently</h3>
+    <ul>
+      <li>The automatic "receipts needed" list cards are switched off in production while old receipts get sorted out, so nobody is being auto-asked right now. They ship off by default and only start again when Justin turns the setting back on.</li>
+      <li>The old affidavit processor was retired September 4, 2026. A new one is planned but not live, so <code>affidavit:</code> requests wait for Justin to check by hand.</li>
+      <li>Two bots share the Beverly name in Receipts Need Review, see the table above.</li>
+    </ul>
+  </div>
+  <div class="arrow">▼</div>
 
   <h2>What's next on the roadmap</h2>
   <div class="tablewrap">
