@@ -1692,7 +1692,7 @@ test("the bank-pull read runs inside the Promise.all, as a probe", () => {
         join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
         "utf8",
     );
-    assert.match(source, /probe<\{[\s\S]{0,400}\}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
+    assert.match(source, /probe<\{[\s\S]{0,600}\}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
     assert.doesNotMatch(source, /bankPull: await readBankPullState\(\)/, "the unprobed await is gone");
     // The read no longer swallows its own failure — the probe reports it.
     const fn = source.slice(source.indexOf("async function readBankPullState("));

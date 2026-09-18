@@ -443,7 +443,7 @@ test("the bank pull fails on a stale fetch and on chunk errors; truncation is no
     // budget-truncated run read part of one window, which is not proof the
     // register is current. Behaviour lives in tests/bank-pull-window.test.ts.
     const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s\S]{0,140}?quarantineHeld\.length === 0 && !quarantineBlocked[\s]*&& !summary\.uncertified;/);
+    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s\S]{0,140}?quarantineHeld\.length === 0 && !quarantineBlocked[\s\S]{0,1200}?&& conflictOutcome\.ok[\s]*&& !summary\.uncertified;/);
     // The write itself, and the release of an owed stamp, are ONE transaction
     // (round-37 gate, finding 2) — the ONLY place stampPending is ever cleared.
     assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,300}await commitFreshnessStamp\(/);
@@ -882,7 +882,7 @@ test("mintFromQbo reports truncation, and a truncated run stamps nothing", () =>
     assert.match(route, /const MINT_MAX_BATCHES = 10;/);
     assert.match(route, /remainingCursor = result\.nextId;/);
     // The freshness clock needs a run that was BOTH clean and whole.
-    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s\S]{0,140}?quarantineHeld\.length === 0 && !quarantineBlocked[\s]*&& !summary\.uncertified;/);
+    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s\S]{0,140}?quarantineHeld\.length === 0 && !quarantineBlocked[\s\S]{0,1200}?&& conflictOutcome\.ok[\s]*&& !summary\.uncertified;/);
     // The write itself, and the release of an owed stamp, are ONE transaction
     // (round-37 gate, finding 2) — the ONLY place stampPending is ever cleared.
     assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,300}await commitFreshnessStamp\(/);

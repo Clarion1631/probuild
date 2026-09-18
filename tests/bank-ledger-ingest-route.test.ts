@@ -505,6 +505,36 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
         assert.equal(createQboObservationsCalls.length, 2);
     });
 
+    await t.test("a body with no onConflict aborts, exactly as before", async () => {
+        // AC1. The standalone runners (post-qbo-register.mjs,
+        // parse-wtb-daily-csv.mjs) send no mode and must be untouched.
+        const { handlers, createQboObservationsCalls } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null }],
+            ]),
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7401, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 409);
+        const body = await res.json();
+        assert.deepEqual(body, { ok: false, reason: "qbo-txn-conflict", qbTxnId: "qb-1" });
+        assert.equal("conflicts" in body, false, "abort mode's response shape does not change");
+        assert.equal(createQboObservationsCalls.length, 0);
+    });
+
+    await t.test("400 invalid-conflict-mode when onConflict is present but unrecognised", async () => {
+        // The same "a typo must never read as a mode" rule as clearedStatus:
+        // `onConflict: "quarantne"` silently aborting would be the worst of both.
+        const { handlers } = makeHandlers();
+        const res = await handlers.POST(makeRequest({
+            ...qboBody([{ postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" }]),
+            onConflict: "quarantne",
+        }));
+        assert.equal(res.status, 400);
+        assert.deepEqual(await res.json(), { ok: false, reason: "invalid-conflict-mode" });
+    });
+
     await t.test("Codex round-3 defect 7b: a representation-only difference (whitespace, empty-string checkNumber) does NOT 409", async () => {
         const { handlers, createQboObservationsCalls } = makeHandlers({
             findExistingQboObservations: async () => new Map([
@@ -519,5 +549,161 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
         assert.equal(body.inserted, 0);
         assert.equal(body.existing, 1);
         assert.equal(createQboObservationsCalls.length, 0);
+    });
+});
+
+test("bank-ledger ingest: QBO_REGISTER restatement quarantine", async t => {
+    /**
+     * One transaction a human edited in QuickBooks used to roll back the whole
+     * nightly batch: the pull's freshness stamp never advanced, `bank-pull-stale`
+     * fired after 36h, and the receipt chaser blocked indefinitely. Quarantine
+     * mode excludes that line and commits the rest.
+     *
+     * It is NOT partial success. The check runs BEFORE any row is touched, from
+     * data already in hand — so the response describes a complete operation over
+     * a smaller set. The post-insert race path is a different thing entirely and
+     * still aborts (see below).
+     */
+    function qboBody(lines: unknown[], account = "WTB-0723") {
+        return { source: "QBO_REGISTER", account, lines, onConflict: "quarantine" };
+    }
+    const stored = (over: Record<string, unknown> = {}) => ({
+        postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null, ...over,
+    });
+
+    await t.test("AC2: the rest of the batch commits, and the conflict is reported", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers({
+            findExistingQboObservations: async () => new Map([["qb-2", stored()]]),
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-15", amountCents: -100, rawDescriptor: "ARCO", qbTxnId: "qb-1" },
+            { postedDate: "2026-07-16", amountCents: -7401, rawDescriptor: "US MARKET", qbTxnId: "qb-2" },
+            { postedDate: "2026-07-17", amountCents: -200, rawDescriptor: "NAPA", qbTxnId: "qb-3" },
+        ])));
+        assert.equal(res.status, 200, "one edited transaction must not stop the register");
+        const body = await res.json();
+        assert.deepEqual(
+            (createQboObservationsCalls as Array<{ qbTxnId: string }>).map(row => row.qbTxnId),
+            ["qb-1", "qb-3"],
+            "the two clean ids land; the restated one is not written",
+        );
+        assert.equal(body.conflicted, 1);
+        assert.equal(body.conflicts[0].qbTxnId, "qb-2");
+        assert.deepEqual(body.conflicts[0].fields, ["amountCents"]);
+        assert.deepEqual(body.conflicts[0].stored, { postedDate: "2026-07-16", amountCents: -7400, checkNumber: null });
+        assert.deepEqual(body.conflicts[0].fresh, { postedDate: "2026-07-16", amountCents: -7401, checkNumber: null });
+        // NO LINE TEXT LEAVES THIS ROUTE — a payee move is a flag, never words.
+        assert.equal(JSON.stringify(body).includes("US MARKET"), false);
+    });
+
+    await t.test("AC3: a conflicted line is neither inserted nor `existing`", async () => {
+        const { handlers } = makeHandlers({
+            findExistingQboObservations: async () => new Map([["qb-2", stored()]]),
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-15", amountCents: -100, rawDescriptor: "ARCO", qbTxnId: "qb-1" },
+            { postedDate: "2026-07-16", amountCents: -7401, rawDescriptor: "US MARKET", qbTxnId: "qb-2" },
+            { postedDate: "2026-07-17", amountCents: -200, rawDescriptor: "NAPA", qbTxnId: "qb-3" },
+        ])));
+        const body = await res.json();
+        assert.equal(body.inserted, 2);
+        assert.equal(body.existing, 0, "counting it as existing is the partial-success lie in a different costume");
+        assert.equal(body.inserted + body.existing + body.conflicted, 3);
+    });
+
+    await t.test("AC4: not one column on a quarantined row is touched", async () => {
+        const descriptors: unknown[] = [];
+        const cleared: unknown[] = [];
+        const { handlers, createQboObservationsCalls } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", stored({ clearedStatus: "Uncleared" })],
+            ]),
+            refreshQboDescriptors: async (_account, rows) => { descriptors.push(...rows); return rows.length; },
+            refreshQboClearedStatus: async (_account, rows) => { cleared.push(...rows); return rows.length; },
+        });
+        // A new amount AND a new descriptor AND a new clearance, all at once.
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -9999, rawDescriptor: "US MARKET STORE 12", qbTxnId: "qb-1", clearedStatus: "Reconciled" },
+        ])));
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.equal(body.conflicted, 1);
+        assert.deepEqual(descriptors, [], "the stored descriptor stays as it is");
+        assert.deepEqual(cleared, [], "and so does the stored clearance — we have declared this row stale");
+        assert.equal(body.descriptorsRefreshed, 0);
+        assert.equal(body.clearedRefreshed, 0);
+        assert.equal(createQboObservationsCalls.length, 0);
+    });
+
+    await t.test("AC5: a descriptor-only change still refreshes, and is not a conflict", async () => {
+        // The round-3 defect-7b fixture, in quarantine mode.
+        const descriptors: unknown[] = [];
+        const { handlers } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", stored({ rawDescriptor: "US  MARKET", checkNumber: "" })],
+            ]),
+            refreshQboDescriptors: async (_account, rows) => { descriptors.push(...rows); return rows.length; },
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET POS DEB C#8516", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.equal(body.conflicted, 0);
+        assert.deepEqual(body.conflicts, []);
+        assert.equal(descriptors.length, 1, "same identity, newer words: take the newer words");
+    });
+
+    await t.test("AC6: the post-insert race still aborts, in quarantine mode too", async () => {
+        /**
+         * That conflict is discovered INSIDE createQboObservations' own
+         * transaction, after the createMany — the only honest answer there is to
+         * roll everything back and 409 with no counts. The next run's
+         * deterministic pre-check quarantines it; no special case needed.
+         */
+        const { handlers } = makeHandlers({
+            findExistingQboObservations: async () => new Map(),
+            createQboObservations: async () => { throw new QboIngestConflictError("qb-1"); },
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 409);
+        const body = await res.json();
+        assert.deepEqual(body, { ok: false, reason: "qbo-txn-conflict", qbTxnId: "qb-1" });
+        assert.equal("inserted" in body, false, "a conflict response must never carry a partial-success inserted count");
+    });
+
+    await t.test("AC7: `linked` says whether the stale row is already in the canonical ledger", async () => {
+        const { handlers } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", stored({ bankLineId: "line-1" })],
+                ["qb-2", stored({ bankLineId: null })],
+            ]),
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7401, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+            { postedDate: "2026-07-18", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-2" },
+        ])));
+        const body = await res.json();
+        assert.equal(body.conflicts.length, 2);
+        const byId = Object.fromEntries(body.conflicts.map((c: { qbTxnId: string }) => [c.qbTxnId, c]));
+        assert.equal(byId["qb-1"].linked, true, "its amountCents is immutable by trigger — only a human can fix that one");
+        assert.equal(byId["qb-2"].linked, false);
+        assert.deepEqual(byId["qb-2"].fields, ["postedDate"]);
+    });
+
+    await t.test("a payee change is reported as a flag, and a check-number change by name", async () => {
+        const { handlers } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", stored({ rawDescriptor: "US MARKET", checkNumber: "1027" })],
+            ]),
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "PACIFIC PLUMBING", checkNumber: "1028", qbTxnId: "qb-1" },
+        ])));
+        const body = await res.json();
+        assert.deepEqual(body.conflicts[0].fields, ["checkNumber", "payee"]);
+        assert.equal(JSON.stringify(body).includes("PACIFIC"), false, "no descriptor text leaves this route");
     });
 });

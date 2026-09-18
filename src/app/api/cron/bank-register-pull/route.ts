@@ -9,9 +9,12 @@ import {
     BANK_PULL_AMBIGUOUS_KEY,
     BANK_PULL_QUARANTINE_ACCEPTED_KEY,
     BANK_PULL_QUARANTINE_KEY,
+    BANK_PULL_CONFLICT_KEY,
     BANK_PULL_SPLIT_MANIFEST_KEY,
+    type BankPullConflictEntry,
     outstandingQuarantine,
     parseAcceptedQuarantine,
+    parseBankPullConflicts,
     parseQuarantine,
     BANK_PULL_AMBIGUOUS_STALE_KEY,
     BANK_PULL_BLOCKED_REASON_KEY,
@@ -31,6 +34,7 @@ import {
     runBankRegisterPull,
     type BankRegisterIngestLine,
     type BankRegisterIngestResult,
+    type QboRestatementConflict,
     type QuarantinedTxn,
 } from "@/lib/bank-register-pull";
 import { BANK_LINE_IDENTITY_LOCK, bankLineIdentityPayee, planQboMint } from "@/lib/bank-line-mint";
@@ -52,6 +56,19 @@ export const MANIFEST_UNREADABLE_REASON = "bank-manifest-unreadable";
 export const QUARANTINE_UNREADABLE_REASON = "bank-quarantine-unreadable";
 /** Quarantine state this run could not persist. */
 export const QUARANTINE_UNWRITABLE_REASON = "bank-quarantine-unwritable";
+
+/**
+ * The restatement record this run could not read, or could not persist.
+ *
+ * Either one means "we do not know which stored observations QuickBooks has
+ * since changed" — and that is exactly the state in which the mint exclusion
+ * cannot be enforced. So unlike an outstanding restatement (which is reported
+ * and lets the pipeline move), a broken STORE blocks the freshness stamp. It is
+ * infrastructure failing, not a QuickBooks edit, so this does not recreate the
+ * freeze it replaces.
+ */
+export const CONFLICT_UNREADABLE_REASON = "bank-conflict-unreadable";
+export const CONFLICT_UNWRITABLE_REASON = "bank-conflict-unwritable";
 
 class SplitManifestUnreadableError extends Error {
     constructor(message: string) {
@@ -363,6 +380,102 @@ async function persistQuarantine(found: readonly QuarantinedTxn[]): Promise<Quar
     return { ok: true, reason: null, outstanding: outstandingQuarantine(merged, accepted) };
 }
 
+/**
+ * What the durable restatement record says, read BEFORE the pull.
+ *
+ * Before, because the mint's exclusion set is built from it: an unreadable
+ * record means the mint dependency is not supplied at all (see runPull), which
+ * is the same "the dependency is simply absent" idiom the feature flag already
+ * uses — there is no "enabled" branch inside the pull to get wrong.
+ */
+interface ConflictOutcome {
+    ok: boolean;
+    reason: string | null;
+    entries: BankPullConflictEntry[];
+}
+
+async function readConflictStore(): Promise<ConflictOutcome> {
+    let row;
+    try {
+        row = await prisma.automationSetting.findUnique({ where: { key: BANK_PULL_CONFLICT_KEY } });
+    } catch (error) {
+        console.error("[cron/bank-register-pull] conflict read failed", error instanceof Error ? error.message : "UnknownError");
+        return { ok: false, reason: CONFLICT_UNREADABLE_REASON, entries: [] };
+    }
+    // A row that EXISTS but does not parse is not "nothing restated" — it is a
+    // store this run cannot reason about, and the one thing it decides is which
+    // observations may never be minted.
+    const parsed = parseBankPullConflicts(row?.value);
+    if (parsed === null) {
+        console.error("[cron/bank-register-pull] restatement record is malformed; refusing to read it as none");
+        return { ok: false, reason: CONFLICT_UNREADABLE_REASON, entries: [] };
+    }
+    return { ok: true, reason: null, entries: parsed };
+}
+
+/**
+ * Merge this run's restatements into the durable record.
+ *
+ * MERGED, not replaced, and with one deletion rule: an entry is dropped only
+ * when this run actually RE-OFFERED its id to the ingest and the ingest did not
+ * report it as a conflict — i.e. QuickBooks and the stored row agree again.
+ * That is how a human reverting an edit in QuickBooks clears the record with no
+ * code and no SQL. Entries outside `offered` are carried forward untouched: a
+ * narrow window must not forget what a wider one found.
+ */
+export function mergeConflictRecord(
+    found: readonly QboRestatementConflict[],
+    offered: readonly string[],
+    prior: readonly BankPullConflictEntry[],
+    now: string,
+): BankPullConflictEntry[] {
+    const byId = new Map(prior.map(entry => [entry.qbTxnId, entry]));
+    const foundIds = new Set(found.map(conflict => conflict.qbTxnId));
+
+    // RE-OFFERED AND NOT REPORTED BACK = QuickBooks agrees with us again. That
+    // is the whole resolution path: a human changes the transaction back, the
+    // next run re-reads it, and the record clears itself.
+    for (const id of offered) {
+        if (foundIds.has(id)) continue;
+        byId.delete(id);
+    }
+    for (const conflict of found) {
+        const existing = byId.get(conflict.qbTxnId);
+        byId.set(conflict.qbTxnId, {
+            qbTxnId: conflict.qbTxnId,
+            fields: [...conflict.fields],
+            linked: conflict.linked,
+            // The AGE survives; only the reading of the condition is replaced.
+            firstSeenAt: existing?.firstSeenAt || now,
+            lastSeenAt: now,
+        });
+    }
+    return [...byId.values()];
+}
+
+async function persistConflicts(
+    found: readonly QboRestatementConflict[],
+    offered: readonly string[],
+    prior: readonly BankPullConflictEntry[],
+): Promise<ConflictOutcome> {
+    const merged = mergeConflictRecord(found, offered, prior, new Date().toISOString());
+    try {
+        const value = JSON.stringify(merged);
+        await prisma.automationSetting.upsert({
+            where: { key: BANK_PULL_CONFLICT_KEY },
+            update: { value },
+            create: { key: BANK_PULL_CONFLICT_KEY, value },
+        });
+    } catch (error) {
+        console.error("[cron/bank-register-pull] conflict write failed", error instanceof Error ? error.message : "UnknownError");
+        // The KNOWN entries, not just this run's: the store may now disagree
+        // with what we believe, and the safe belief is the larger one.
+        return { ok: false, reason: CONFLICT_UNWRITABLE_REASON, entries: merged };
+    }
+
+    return { ok: true, reason: null, entries: merged };
+}
+
 async function commitFreshnessStamp(at: string): Promise<void> {
     await prisma.$transaction(async tx => {
         await tx.automationSetting.upsert({
@@ -530,6 +643,7 @@ const MINT_MAX_BATCHES = 10;
 async function mintFromQbo(
     account: string,
     deadlineAt?: number,
+    exclude?: ReadonlySet<string>,
 ): Promise<{ minted: number; skipped: Record<string, number>; complete: boolean; remainingCursor: string | null }> {
     // The START of the oldest allowed day, not an instant 60 days ago:
     // `postedDate` is a `@db.Date` at UTC midnight, so an instant boundary
@@ -569,7 +683,18 @@ async function mintFromQbo(
 
             const [observations, existingLines] = await Promise.all([
                 tx.bankLineObservation.findMany({
-                    where: { source: "QBO_REGISTER", account, postedDate: { gte: since } },
+                    where: {
+                        source: "QBO_REGISTER",
+                        account,
+                        postedDate: { gte: since },
+                        // NEVER MINT A CONFLICTED OBSERVATION. It holds content
+                        // QuickBooks has since changed; minting copies that
+                        // content into a canonical line whose `amountCents` is
+                        // immutable by trigger, so a stale mint is permanent and
+                        // only a human with SQL can unpick it. `sourceLineId` is
+                        // the qbTxnId for a QBO_REGISTER row.
+                        ...(exclude && exclude.size > 0 ? { sourceLineId: { notIn: [...exclude] } } : {}),
+                    },
                     select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, clearedStatus: true, bankLineId: true },
                 }),
                 tx.bankLine.findMany({
@@ -676,6 +801,8 @@ async function recordBlockedReason(reason: string): Promise<void> {
 async function runPull() {
     const startedAt = Date.now();
     const windowState = await readWindowState();
+    // READ BEFORE THE PULL, because the mint's exclusion set is built from it.
+    const conflictStore = await readConflictStore();
     const summary = await runBankRegisterPull({
         account: BANK_REGISTER_ACCOUNT,
         days: BANK_REGISTER_PULL_DAYS,
@@ -752,8 +879,20 @@ async function runPull() {
             return { rows: register.rows, stale: register.stale, clearedProbeOk: register.clearedProbeOk };
         },
 
-        ingest: async (account: string, lines: BankRegisterIngestLine[]) => {
-            const response = await bankLedgerIngestHandlers.handleQboRegister(account, lines);
+        /**
+         * ONE EDITED TRANSACTION MUST NOT STOP THE REGISTER.
+         *
+         * In `abort` mode the ingest 409s and rolls the whole batch back, so
+         * `BANK_PULL_LAST_SUCCESS_KEY` never advances, `bank-pull-stale` fires
+         * after 36h and the receipt chaser blocks — which is exactly what
+         * QuickBooks txn 6696 did for eleven days. Quarantine excludes the
+         * restated line and commits the rest; the stored row is still never
+         * rewritten, and the excluded id never mints (see mintFromQbo below).
+         */
+        conflictMode: "quarantine",
+
+        ingest: async (account: string, lines: BankRegisterIngestLine[], options?: { onConflict?: "abort" | "quarantine" }) => {
+            const response = await bankLedgerIngestHandlers.handleQboRegister(account, lines, options);
             let body: BankRegisterIngestResult["body"] = null;
             try { body = (await response.json()) as BankRegisterIngestResult["body"]; } catch { /* non-JSON error body */ }
             return { status: response.status, body };
@@ -788,7 +927,22 @@ async function runPull() {
         // this pull has no way to read (round-37 gate, finding 1). OFF by
         // default — the dependency is simply absent unless the flag is on, so
         // there is no "enabled" branch inside the pull to get wrong.
-        ...(process.env.BANK_LINE_MINT_FROM_QBO === "true" ? { mintFromQbo } : {}),
+        //
+        // AND ABSENT AGAIN WHEN THE CONFLICT STORE COULD NOT BE READ. Minting
+        // is the one irreversible thing this cron does, and the prior-conflict
+        // set is what keeps it off a stale observation; without it the
+        // exclusion cannot be enforced, so there is nothing to mint safely.
+        // The exclusion is the union of what is DURABLY known (including
+        // conflicts from outside this run's window) and what this run found.
+        ...(process.env.BANK_LINE_MINT_FROM_QBO === "true" && conflictStore.ok
+            ? {
+                mintFromQbo: (account: string, deadlineAt?: number, runConflicts: readonly string[] = []) =>
+                    mintFromQbo(account, deadlineAt, new Set([
+                        ...conflictStore.entries.map(entry => entry.qbTxnId),
+                        ...runConflicts,
+                    ])),
+            }
+            : {}),
     });
 
     // HOW MANY OBSERVATIONS QUICKBOOKS HAS NOT CLEARED.
@@ -969,8 +1123,33 @@ async function runPull() {
     }
     const quarantineHeld = quarantine.ok ? quarantine.outstanding : quarantine.outstanding;
     const quarantineBlocked = !quarantine.ok;
+    /**
+     * MERGE THIS RUN'S RESTATEMENTS INTO THE DURABLE RECORD.
+     *
+     * Skipped entirely when the store was unreadable: overwriting it would
+     * destroy the record of which observations may never be minted, which is
+     * the same mistake the quarantine path refuses to make.
+     */
+    const conflictOutcome = conflictStore.ok
+        ? await persistConflicts(summary.restatementConflicts ?? [], summary.offeredQbTxnIds ?? [], conflictStore.entries)
+        : conflictStore;
+    if (!conflictOutcome.ok && conflictOutcome.reason) {
+        await recordBlockedReason(conflictOutcome.reason);
+    }
     const stampWarranted = summary.ok && summary.complete && summary.clearedProbeOk && ambiguousCount === 0
         && quarantineHeld.length === 0 && !quarantineBlocked
+        /**
+         * THE STORE, NEVER THE CONFLICTS THEMSELVES — and the asymmetry with
+         * the quarantine above is deliberate, so do not "tidy" it.
+         *
+         * An outstanding restatement does NOT appear here. The stored row is
+         * equally stale whether this stamp lands or not, so withholding it buys
+         * no correctness and costs every other line's receipts — which is the
+         * eleven-day freeze this whole change exists to end. What does block is
+         * a store this run could not read or write, because that is precisely
+         * the state in which the mint exclusion above cannot be enforced.
+         */
+        && conflictOutcome.ok
         && !summary.uncertified;
     /**
      * A FAILED STAMP IS A FAILED RUN (round-36 gate, finding 4).

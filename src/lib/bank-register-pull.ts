@@ -33,7 +33,9 @@
  * overlapping window inserts nothing. A qbTxnId that comes back with DIFFERENT
  * content (QBO edited an amount/date after we recorded it) is a 409 from the
  * ingest path — a real restatement a human must look at, never silently
- * overwritten.
+ * overwritten. The cron runs that ingest in `quarantine` mode, where the
+ * restated line alone is excluded and the rest of its batch commits; the
+ * stored row is still never rewritten, and the excluded id never mints.
  *
  * THE INTRA-WINDOW CURSOR (`continueAfter`) IS ONE-DIRECTIONAL, and the run
  * that finishes draining it has to account for that. It exists so a
@@ -156,9 +158,14 @@ export interface ConvertedRegisterRows {
      */
     split: number;
     /**
-     * Splits QuickBooks RESTATED since the last run: same identity, different
-     * content. The ingest updates the row it already has — it never mints a
-     * second one (round-46 gate, finding 1).
+     * Splits whose content moved since the last run: same identity, different
+     * hash (round-46 gate, finding 1).
+     *
+     * A SIGNAL, NOT A VERDICT, and never the conflict oracle. It is derived
+     * from the MANIFEST, so it is wrong in both directions: a descriptor-only
+     * change appears here and must NOT be excluded from anything, and a reset
+     * or absent manifest hides a real restatement entirely. Only the ingest
+     * decides, against what is actually stored.
      */
     restated: string[];
     /**
@@ -256,9 +263,12 @@ export function splitIdentity(qbTxnId: string, ordinal: number, splitCount: numb
  *
  *   * SAME cardinality, SAME hashes — nothing changed. Ordinary re-ingest,
  *     idempotent on identity.
- *   * SAME cardinality, a hash MOVED — QuickBooks restated that split. The
- *     identity is unchanged, so the ingest UPDATES the row it already has
- *     rather than minting a second one. Reported in `restated`.
+ *   * SAME cardinality, a hash MOVED — QuickBooks changed that split since the
+ *     last run. The identity is unchanged, so nothing mints a second row;
+ *     what happens next is the INGEST'S decision, made against the content it
+ *     actually holds, not against this manifest. A descriptor-only change is
+ *     refreshed in place; a genuine identity change is quarantined (or, in
+ *     abort mode, 409s). Reported in `restated` as a signal only.
  *   * DIFFERENT cardinality — a 1↔N transition, or N↔M. Every ordinal's meaning
  *     may have shifted, so no id can be trusted to still name the same posting.
  *     Quarantined as unsupported rather than guessed at.
@@ -823,10 +833,45 @@ export function advanceScanBoundary(
 
 // ── Orchestration ───────────────────────────────────────────────────────────
 
+/**
+ * One transaction QuickBooks restated after we stored it.
+ *
+ * DECLARED STRUCTURALLY, not imported from the ingest route: this module is
+ * pure and the route is a Next.js handler. The two shapes are checked against
+ * each other where they meet — the cron's `ingest` adapter.
+ */
+export interface QboRestatementConflict {
+    qbTxnId: string;
+    fields: Array<"postedDate" | "amountCents" | "checkNumber" | "payee">;
+    stored: { postedDate: string; amountCents: number; checkNumber: string | null };
+    fresh: { postedDate: string; amountCents: number; checkNumber: string | null };
+    /** True when the stale observation is already attached to a canonical BankLine. */
+    linked: boolean;
+}
+
 export interface BankRegisterIngestResult {
     status: number;
-    body: { ok?: boolean; inserted?: number; existing?: number; reason?: string; qbTxnId?: string } | null;
+    body: {
+        ok?: boolean;
+        inserted?: number;
+        existing?: number;
+        reason?: string;
+        qbTxnId?: string;
+        /** Quarantine mode only: lines excluded from an otherwise committed batch. */
+        conflicted?: number;
+        conflicts?: QboRestatementConflict[];
+    } | null;
 }
+
+/**
+ * MORE RESTATEMENTS IN ONE RUN THAN A HUMAN COULD HAVE MADE.
+ *
+ * Fifty conflicts is not somebody correcting a transaction in QuickBooks, it is
+ * something systemic — a changed hash function, a changed descriptor format —
+ * and quietly continuing over it would use this mechanism to hide a real bug.
+ * Past the cap the run falls back to the old fatal behaviour.
+ */
+export const MAX_CONFLICTS_PER_RUN = 50;
 
 export interface BankRegisterPullDependencies {
     /**
@@ -841,7 +886,15 @@ export interface BankRegisterPullDependencies {
      */
     fetchRows(startDate: string, endDate: string): Promise<{ rows: BankRegisterRowLike[]; stale: boolean; clearedProbeOk?: boolean }>;
     /** Posts one batch through the bank-ledger ingest path (source QBO_REGISTER). */
-    ingest(account: string, lines: BankRegisterIngestLine[]): Promise<BankRegisterIngestResult>;
+    ingest(account: string, lines: BankRegisterIngestLine[], options?: { onConflict?: "abort" | "quarantine" }): Promise<BankRegisterIngestResult>;
+    /**
+     * What a restatement does to the batch carrying it.
+     *
+     * `"abort"` by default, so the pure tests keep the semantics they were
+     * written against; the cron opts into `"quarantine"`, where one transaction
+     * a human edited in QuickBooks no longer stops the whole nightly pull.
+     */
+    conflictMode?: "abort" | "quarantine";
     /**
      * Runs the reconcile step for the account. Errors here never fail the pull.
      *
@@ -889,8 +942,14 @@ export interface BankRegisterPullDependencies {
      * supplies it when `BANK_LINE_MINT_FROM_QBO === "true"`. Runs after
      * reconcile, so anything the statement already covers is linked and no
      * longer a mint candidate.
+     *
+     * `excludeQbTxnIds` is THIS RUN'S restatement conflicts, and it is not
+     * optional in spirit: a conflicted observation holds content QuickBooks has
+     * since changed, and minting copies that content into a canonical line
+     * whose `amountCents` is immutable by trigger. The caller unions it with
+     * whatever prior conflicts it holds durably.
      */
-    mintFromQbo?(account: string, deadlineAt?: number): Promise<{
+    mintFromQbo?(account: string, deadlineAt?: number, excludeQbTxnIds?: readonly string[]): Promise<{
         minted: number;
         skipped: Record<string, number>;
         /** False when the mint stopped on its batch cap or the deadline. */
@@ -991,6 +1050,20 @@ export interface BankRegisterPullSummary {
      * identities, and they post.
      */
     conflictQbTxnIds?: string[];
+    /**
+     * Restatements EXCLUDED from this run's batches, the rest of each batch
+     * committed. NOT a failure, and deliberately distinct from
+     * `conflictQbTxnIds` above, which still means "this run FAILED on these".
+     */
+    restatementConflicts?: QboRestatementConflict[];
+    /**
+     * Every qbTxnId this run actually OFFERED to the ingest.
+     *
+     * The durable conflict record deletes only ids in here: an id this run
+     * never re-read is not evidence that QuickBooks agrees with us again, and a
+     * narrow window must not forget a wider one's finding.
+     */
+    offeredQbTxnIds?: string[];
     /** Rows posted under a `<qbTxnId>#<ordinal>` split identity this run. */
     splitObservations?: number;
     /** Splits QuickBooks restated: same identity, updated in place. */
@@ -1189,7 +1262,7 @@ export async function runBankRegisterPull(
     summary.splitObservations = split;
     if (restated.length > 0) {
         summary.restatedSplits = [...restated];
-        console.log("[bank-register-pull] QuickBooks restated known splits; updating in place", restated);
+        console.log("[bank-register-pull] known splits changed since the last manifest; the ingest decides", restated);
     }
     if (quarantined.length > 0) {
         summary.quarantinedQbTxnIds = quarantined.map(entry => entry.qbTxnId);
@@ -1230,6 +1303,28 @@ export async function runBankRegisterPull(
     // RESUME INSIDE THE WINDOW. Ordered, and past whatever the last run
     // finished, so a budget-limited run makes real progress every time instead
     // of re-posting its own first batches.
+    const conflictMode = dependencies.conflictMode ?? "abort";
+    // KEYED BY qbTxnId so the same restatement seen in two batches — the
+    // pending loop and the prefix rescan both re-offer it — is one record.
+    const conflictsById = new Map<string, QboRestatementConflict>();
+    const offeredQbTxnIds: string[] = [];
+    let conflictFlood = false;
+    /**
+     * Fold one 200 response's conflicts in, and say whether the run may carry
+     * on. Past MAX_CONFLICTS_PER_RUN it may not: a flood is a systemic change,
+     * not a human edit, and continuing over it would use this mechanism to hide
+     * a real bug.
+     */
+    const absorbConflicts = (found: readonly QboRestatementConflict[] | undefined): boolean => {
+        for (const conflict of found ?? []) conflictsById.set(conflict.qbTxnId, conflict);
+        if (conflictsById.size <= MAX_CONFLICTS_PER_RUN) return true;
+        conflictFlood = true;
+        summary.ok = false;
+        summary.complete = false;
+        summary.error = summary.error ?? "conflict-flood";
+        return false;
+    };
+
     const cursor = dependencies.windowState?.continueAfter;
     const { prefix, pending } = splitAtCursor(lines, cursor);
     summary.resumedAfter = cursor ?? null;
@@ -1254,11 +1349,15 @@ export async function runBankRegisterPull(
             break;
         }
         batchIndex++;
-        const { status, body } = await dependencies.ingest(account, batch);
+        for (const line of batch) offeredQbTxnIds.push(line.qbTxnId);
+        const { status, body } = await dependencies.ingest(account, batch, { onConflict: conflictMode });
         if (status === 200 && body?.ok) {
             summary.inserted += body.inserted ?? 0;
             summary.existing += body.existing ?? 0;
             lastPosted = batch[batch.length - 1] ?? lastPosted;
+            // A FLOOD STOPS THE RUN WHERE A 409 USED TO — later batches are not
+            // attempted, exactly today's behaviour for an unresolved conflict.
+            if (!absorbConflicts(body.conflicts)) break;
             continue;
         }
         summary.ok = false;
@@ -1302,10 +1401,12 @@ export async function runBankRegisterPull(
                 summary.complete = false;
                 break;
             }
-            const { status, body } = await dependencies.ingest(account, batch);
+            for (const line of batch) offeredQbTxnIds.push(line.qbTxnId);
+            const { status, body } = await dependencies.ingest(account, batch, { onConflict: conflictMode });
             if (status === 200 && body?.ok) {
                 summary.inserted += body.inserted ?? 0;
                 summary.existing += body.existing ?? 0;
+                if (!absorbConflicts(body.conflicts)) break;
                 continue;
             }
             summary.ok = false;
@@ -1315,6 +1416,22 @@ export async function runBankRegisterPull(
                 summary.conflictQbTxnIds = [...new Set([...(summary.conflictQbTxnIds ?? []), body.qbTxnId])];
             }
             break;
+        }
+    }
+
+    // WHAT THIS RUN OFFERED, AND WHAT CAME BACK RESTATED. Both are reported
+    // even when the run failed: the offered list is what lets the durable
+    // record self-clear (an id re-read and agreed on is deleted), and a
+    // truncated run must not cause a conflict record to be forgotten.
+    summary.offeredQbTxnIds = [...new Set(offeredQbTxnIds)];
+    if (conflictsById.size > 0) {
+        summary.restatementConflicts = [...conflictsById.values()]
+            .sort((a, b) => a.qbTxnId.localeCompare(b.qbTxnId));
+        if (conflictFlood) {
+            console.error("[bank-register-pull] restatement flood; refusing to continue", conflictsById.size);
+        } else {
+            console.warn("[bank-register-pull] QuickBooks restated stored transactions; excluded from this run",
+                summary.restatementConflicts.map(conflict => conflict.qbTxnId));
         }
     }
 
@@ -1394,7 +1511,21 @@ export async function runBankRegisterPull(
     }
     if (dependencies.mintFromQbo && mintIsSafe) {
         try {
-            summary.minted = await dependencies.mintFromQbo(account, workDeadline());
+            /**
+             * AND IT NEVER SEES A CONFLICTED ID.
+             *
+             * A restatement does not make `mintIsSafe` false — the rest of the
+             * register is fine and blocking it is the freeze this change
+             * exists to end — so the exclusion has to travel with the call.
+             * Minting copies observation content into a canonical line whose
+             * `amountCents` is immutable by trigger: a stale mint is permanent
+             * and only a human with SQL can unpick it.
+             */
+            summary.minted = await dependencies.mintFromQbo(
+                account,
+                workDeadline(),
+                (summary.restatementConflicts ?? []).map(conflict => conflict.qbTxnId),
+            );
             // A TRUNCATED MINT IS NOT A COMPLETE RUN. It is not a failure
             // either — the batch cap and the deadline are the system working —
             // but a backlog of unminted observations is exactly the state the

@@ -7,6 +7,9 @@ import {
     ymdDaysAgo,
     type BankRegisterIngestLine,
     type BankRegisterRowLike,
+    type QboRestatementConflict,
+    BANK_REGISTER_CHUNK_SIZE,
+    MAX_CONFLICTS_PER_RUN,
     MAX_SPLITS_PER_TXN,
 } from "../src/lib/bank-register-pull";
 
@@ -477,4 +480,137 @@ test("a mint failure FAILS the pull too, though the observations are already sto
     assert.equal(summary.error, "mint-failed");
     assert.equal(summary.inserted, 4, "whatever committed stays committed");
     assert.equal(summary.minted, null);
+});
+
+// ── restatement quarantine: the run continues, the mint does not ─────────────
+
+/**
+ * QuickBooks transaction 6696 was edited after ProBuild stored it. In abort
+ * mode that 409'd, rolled the batch back, and the nightly cron failed 89 times
+ * over eleven days while the freshness stamp — and every owner's chase cards —
+ * waited on it. These are the tests that would have caught that.
+ */
+const conflictOf = (qbTxnId: string, linked = false): QboRestatementConflict => ({
+    qbTxnId,
+    fields: ["amountCents"],
+    stored: { postedDate: "2026-08-12", amountCents: -12_345, checkNumber: null },
+    fresh: { postedDate: "2026-08-12", amountCents: -99_999, checkNumber: null },
+    linked,
+});
+
+/** Enough rows to fill `count` batches of BANK_REGISTER_CHUNK_SIZE. */
+function manyRows(count: number): BankRegisterRowLike[] {
+    const rows: BankRegisterRowLike[] = [];
+    for (let i = 0; i < count * BANK_REGISTER_CHUNK_SIZE; i++) {
+        rows.push({ date: "2026-08-12", qbType: "Expense", qbTxnId: `t${i}`, docNum: null, name: `V${i}`, memo: null, amountCents: -(i + 1) });
+    }
+    return rows;
+}
+
+test("AC8: the pull continues past a conflicted batch, and reports it without failing", async () => {
+    const batchSizes: number[] = [];
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        fetchRows: async () => ({ rows: manyRows(3), stale: false }),
+        ingest: async (_account, lines, options) => {
+            batchSizes.push(lines.length);
+            assert.equal(options?.onConflict, "quarantine", "the mode travels with every batch");
+            // Batch 1 carries the restatement; batches 2 and 3 are clean.
+            const conflicts = batchSizes.length === 1 ? [conflictOf("6696")] : [];
+            return {
+                status: 200,
+                body: { ok: true, inserted: lines.length - conflicts.length, existing: 0, conflicted: conflicts.length, conflicts },
+            };
+        },
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+    });
+
+    assert.equal(batchSizes.length, 3, "every batch is attempted — this is the assertion the 89 failed runs lacked");
+    assert.equal(summary.ok, true, "a QuickBooks edit is not a failed run");
+    assert.equal(summary.complete, true, "and it does not withhold the freshness stamp");
+    assert.equal(summary.error, undefined);
+    assert.deepEqual(summary.restatementConflicts?.map(c => c.qbTxnId), ["6696"]);
+    assert.equal(summary.conflictQbTxnIds, undefined, "`conflictQbTxnIds` still means THIS RUN FAILED on these");
+});
+
+test("AC8b: the same conflict seen in two batches is one record, and every offered id is reported", async () => {
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        fetchRows: async () => ({ rows: manyRows(2), stale: false }),
+        ingest: async (_account, lines) => ({
+            status: 200,
+            body: { ok: true, inserted: lines.length, existing: 0, conflicted: 1, conflicts: [conflictOf("6696")] },
+        }),
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+    });
+    assert.equal(summary.restatementConflicts?.length, 1, "deduped across batches by qbTxnId");
+    assert.equal(summary.offeredQbTxnIds?.length, 2 * BANK_REGISTER_CHUNK_SIZE);
+    assert.equal(new Set(summary.offeredQbTxnIds).size, summary.offeredQbTxnIds?.length);
+});
+
+test("AC9: the mint never sees a conflicted id", async () => {
+    let excluded: readonly string[] | undefined;
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        fetchRows: async () => ({ rows: FIVE_ROW_FIXTURE, stale: false, clearedProbeOk: true }),
+        ingest: async (_account, lines) => ({
+            status: 200,
+            body: { ok: true, inserted: lines.length - 1, existing: 0, conflicted: 1, conflicts: [conflictOf("6696", true)] },
+        }),
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+        mintFromQbo: async (_account, _deadlineAt, excludeQbTxnIds) => {
+            excluded = excludeQbTxnIds;
+            return { minted: 0, skipped: {}, complete: true, remainingCursor: null };
+        },
+    });
+    /**
+     * A restatement deliberately does NOT make `mintIsSafe` false — blocking the
+     * whole register over one edited transaction is the freeze being fixed — so
+     * the exclusion travelling with the call is the ONLY thing standing between
+     * a stale observation and a permanent canonical line whose `amountCents` is
+     * immutable by trigger.
+     */
+    assert.equal(summary.minted?.complete, true, "the mint still runs for every other observation");
+    assert.ok(excluded?.includes("6696"), "the conflicted id must be excluded from the mint");
+});
+
+test("AC10: a flood is not a human edit — it stops the run", async () => {
+    const attempted: number[] = [];
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        fetchRows: async () => ({ rows: manyRows(3), stale: false }),
+        ingest: async (_account, lines) => {
+            attempted.push(lines.length);
+            // One batch, more conflicts than any human could have made.
+            const conflicts = attempted.length === 1
+                ? Array.from({ length: MAX_CONFLICTS_PER_RUN + 1 }, (_, i) => conflictOf(`t${i}`))
+                : [];
+            return { status: 200, body: { ok: true, inserted: 0, existing: 0, conflicted: conflicts.length, conflicts } };
+        },
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+        mintFromQbo: async () => { throw new Error("the mint must not run"); },
+    });
+    assert.equal(attempted.length, 1, "later batches are not attempted — exactly today's behaviour");
+    assert.equal(summary.ok, false, "fifty restatements means something systemic changed");
+    assert.equal(summary.complete, false, "so no freshness stamp");
+    assert.equal(summary.error, "conflict-flood");
+    assert.equal(summary.minted, null, "and nothing mints against a picture we know is wrong");
+    assert.equal(summary.mintSkipped, "ingest-failed");
+    assert.equal(summary.restatementConflicts?.length, MAX_CONFLICTS_PER_RUN + 1, "the finding is still recorded");
+});
+
+test("the default is `abort`, so the pure tests keep the semantics they were written against", async () => {
+    const modes: Array<string | undefined> = [];
+    const store = fakeIngestStore();
+    await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        fetchRows: async () => ({ rows: FIVE_ROW_FIXTURE, stale: false }),
+        ingest: async (account, lines, options) => { modes.push(options?.onConflict); return store.ingest(account, lines); },
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+    });
+    assert.deepEqual(modes, ["abort"]);
 });

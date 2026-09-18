@@ -94,6 +94,8 @@ interface IngestBody {
     source?: unknown;
     account?: unknown;
     lines?: unknown;
+    /** QBO_REGISTER only — see QboConflictMode. Absent is "abort". */
+    onConflict?: unknown;
     // STATEMENT only:
     periodStart?: unknown;
     periodEnd?: unknown;
@@ -189,6 +191,55 @@ export class QboIngestConflictError extends Error {
     }
 }
 
+/**
+ * What a restatement conflict does to the rest of the request.
+ *
+ * `"abort"` is the original contract and the default: the first mismatch 409s
+ * and nothing is written. `"quarantine"` excludes every mismatching line and
+ * commits the rest — a complete, fully-reported operation over a smaller set,
+ * not a partial success (the pre-insert check runs before a single row is
+ * touched).
+ */
+export type QboConflictMode = "abort" | "quarantine";
+
+export interface QboRestatementConflict {
+    qbTxnId: string;
+    /** Which identity components moved. "payee" is reported as a flag only — no descriptor text leaves this route. */
+    fields: Array<"postedDate" | "amountCents" | "checkNumber" | "payee">;
+    stored: { postedDate: string; amountCents: number; checkNumber: string | null };
+    fresh: { postedDate: string; amountCents: number; checkNumber: string | null };
+    /** True when the stale observation is already attached to a canonical BankLine. */
+    linked: boolean;
+}
+
+/**
+ * WHICH IDENTITY COMPONENTS MOVED, and nothing more.
+ *
+ * `rawDescriptor` never leaves this route — the existing rule is that it only
+ * ever echoes an index and a field name, never line text — so a payee change is
+ * reported as the flag `"payee"`, compared through the same
+ * `bankLineIdentityPayee` the content hash canonicalizes with. The check number
+ * is compared the way the hash normalizes it, so "" and null are never a
+ * difference.
+ */
+function describeRestatement(qbTxnId: string, fresh: ValidatedLineBase, stored: ExistingQboObservation): QboRestatementConflict {
+    const check = (value: string | null) => (value === null || value.trim() === "" ? null : value);
+    const fields: QboRestatementConflict["fields"] = [];
+    if (stored.postedDate !== fresh.postedDate) fields.push("postedDate");
+    if (stored.amountCents !== fresh.amountCents) fields.push("amountCents");
+    if (check(stored.checkNumber) !== check(fresh.checkNumber)) fields.push("checkNumber");
+    if (bankLineIdentityPayee({ memo: stored.rawDescriptor }) !== bankLineIdentityPayee({ memo: fresh.rawDescriptor })) {
+        fields.push("payee");
+    }
+    return {
+        qbTxnId,
+        fields,
+        stored: { postedDate: stored.postedDate, amountCents: stored.amountCents, checkNumber: check(stored.checkNumber) },
+        fresh: { postedDate: fresh.postedDate, amountCents: fresh.amountCents, checkNumber: check(fresh.checkNumber) },
+        linked: (stored.bankLineId ?? null) !== null,
+    };
+}
+
 export interface ExistingQboObservation {
     postedDate: string;
     amountCents: number;
@@ -200,6 +251,13 @@ export interface ExistingQboObservation {
      * of `computeQboLineContentHash` and must never make a row a restatement.
      */
     clearedStatus?: string | null;
+    /**
+     * The canonical line this observation was minted into, when it was. Read
+     * only so a conflict record can say whether the STALE content is already in
+     * the ledger — `BankLine.amountCents` is immutable by trigger, so that is
+     * the subset only a human can repair.
+     */
+    bankLineId?: string | null;
 }
 
 export interface StatementImportLineInput {
@@ -361,7 +419,8 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
         }
     }
 
-    async function handleQboRegister(account: string, rawLines: IngestLineInput[]) {
+    async function handleQboRegister(account: string, rawLines: IngestLineInput[], options?: { onConflict?: QboConflictMode }) {
+        const onConflict: QboConflictMode = options?.onConflict ?? "abort";
         const validated: ValidatedQboLine[] = [];
         for (let i = 0; i < rawLines.length; i++) {
             const result = validateQboLine(rawLines[i] ?? {}, i);
@@ -391,13 +450,33 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
         // the pull stopped appending the transaction type carry the old text;
         // refusing them would stall the nightly pull forever on transactions
         // that never changed. Same identity, newer words: take the newer words.
+        //
+        // IN QUARANTINE MODE A RESTATEMENT EXCLUDES ITS OWN LINE AND NOTHING
+        // ELSE. One transaction a human edited in QuickBooks used to stop the
+        // whole nightly pull — the batch rolled back, the freshness stamp never
+        // advanced, and the receipt chaser blocked on a stale register
+        // indefinitely. The stored row is still never rewritten here; the rest
+        // of the batch simply gets to land.
+        const conflicts: QboRestatementConflict[] = [];
+        const conflictedIds = new Set<string>();
         const refreshDescriptors: Array<{ qbTxnId: string; rawDescriptor: string }> = [];
         for (const line of validated) {
             const priorContent = existing.get(line.qbTxnId);
             if (!priorContent) continue;
             if (computeQboLineContentHash(priorContent) !== computeQboLineContentHash(line)) {
-                return NextResponse.json({ ok: false, reason: "qbo-txn-conflict", qbTxnId: line.qbTxnId }, { status: 409 });
+                if (onConflict === "abort") {
+                    return NextResponse.json({ ok: false, reason: "qbo-txn-conflict", qbTxnId: line.qbTxnId }, { status: 409 });
+                }
+                if (!conflictedIds.has(line.qbTxnId)) {
+                    conflictedIds.add(line.qbTxnId);
+                    conflicts.push(describeRestatement(line.qbTxnId, line, priorContent));
+                }
+                continue;
             }
+            // Unreachable for a conflicted id — `isDescriptorOnlyChange` is
+            // false by definition once the hashes differ — but said explicitly
+            // so a reader does not have to re-derive that.
+            if (conflictedIds.has(line.qbTxnId)) continue;
             if (isDescriptorOnlyChange(priorContent, line)) {
                 refreshDescriptors.push({ qbTxnId: line.qbTxnId, rawDescriptor: line.rawDescriptor });
             }
@@ -422,6 +501,12 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
         for (const line of validated) {
             const prior = existing.get(line.qbTxnId);
             if (!prior) continue;
+            // NOT ONE COLUMN ON A ROW WE HAVE DECLARED STALE. Clearance is
+            // mutable state and safe to move in general, but it is QuickBooks'
+            // answer about a transaction whose content we no longer agree with,
+            // so a quarantined row is left exactly as it is until the
+            // restatement is resolved.
+            if (conflictedIds.has(line.qbTxnId)) continue;
             if (line.clearedStatus === "Unknown") continue;
             if (prior.clearedStatus === line.clearedStatus) continue;
             if (clearedSeen.has(line.qbTxnId)) continue;
@@ -440,6 +525,11 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
         const rows: Array<{ account: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber: string | null; qbTxnId: string; clearedStatus: ClearedStatus }> = [];
         for (const line of validated) {
             if (existing.has(line.qbTxnId)) continue;
+            // Already covered by the line above — a conflicted id is by
+            // definition one we have stored content for — and asserted anyway,
+            // because "a quarantined line is treated as if it were not in the
+            // request" is the rule, not a consequence.
+            if (conflictedIds.has(line.qbTxnId)) continue;
             if (insertedQbTxnIds.has(line.qbTxnId)) continue;
             insertedQbTxnIds.add(line.qbTxnId);
             rows.push({
@@ -468,8 +558,22 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
                 throw error;
             }
         }
-        const existingCount = validated.length - inserted;
+        // A CONFLICTED LINE IS NEITHER INSERTED NOR `existing`. Counting it as
+        // existing would claim the stored row matches what was offered, which
+        // is the partial-success lie in a different costume.
+        const existingCount = validated.length - conflicts.length - inserted;
 
+        if (onConflict === "quarantine") {
+            return NextResponse.json({
+                ok: true,
+                inserted,
+                existing: existingCount,
+                descriptorsRefreshed,
+                clearedRefreshed,
+                conflicted: conflicts.length,
+                conflicts,
+            });
+        }
         return NextResponse.json({ ok: true, inserted, existing: existingCount, descriptorsRefreshed, clearedRefreshed });
     }
 
@@ -520,7 +624,15 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
             const rawLines = body.lines as IngestLineInput[];
 
             if (body.source === "STATEMENT") return handleStatement(body, account, rawLines);
-            return handleQboRegister(account, rawLines);
+
+            // ABSENT MEANS "abort" — the original contract, so the standalone
+            // runners (post-qbo-register.mjs, parse-wtb-daily-csv.mjs) are
+            // untouched. A PRESENT but unrecognised value is refused, the same
+            // "a typo must never read as a mode" rule as clearedStatus.
+            if (body.onConflict !== undefined && body.onConflict !== "abort" && body.onConflict !== "quarantine") {
+                return NextResponse.json({ ok: false, reason: "invalid-conflict-mode" }, { status: 400 });
+            }
+            return handleQboRegister(account, rawLines, { onConflict: body.onConflict as QboConflictMode | undefined });
         },
     };
 }
@@ -709,7 +821,7 @@ const handlers = createBankLedgerIngestHandlers({
     findExistingQboObservations: async (account, qbTxnIds) => {
         const rows = await prisma.bankLineObservation.findMany({
             where: { source: "QBO_REGISTER", account, sourceDocumentId: "QBO_REGISTER", sourceLineId: { in: qbTxnIds } },
-            select: { sourceLineId: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, clearedStatus: true },
+            select: { sourceLineId: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, clearedStatus: true, bankLineId: true },
         });
         const result = new Map<string, ExistingQboObservation>();
         for (const row of rows) {
@@ -719,6 +831,7 @@ const handlers = createBankLedgerIngestHandlers({
                 rawDescriptor: row.rawDescriptor,
                 checkNumber: row.checkNumber,
                 clearedStatus: row.clearedStatus,
+                bankLineId: row.bankLineId,
             });
         }
         return result;
