@@ -1294,16 +1294,37 @@ async function runPull() {
      * back on its own. An UNWRITABLE store is the opposite case — a transient KV
      * write failure — and keeps the continuation.
      *
-     * "Only" is read off the two places a failure can still come from once the
-     * store has been judged: anything that failed BEFORE it owns `summary.error`
-     * (first writer wins), and reconcile is the only step after it that runs at
-     * all when `ok` is already false — the mint and the checkpoint are both
-     * gated on it.
+     * "Only" is NOT read off `summary.error` alone. First writer wins, so the
+     * unreadable store owning that field proves only that nothing failed BEFORE
+     * it — it says nothing about work this run left unfinished without failing,
+     * which does not set `error` at all. Each such case is checked by name:
+     *
+     *  - `reconciled.chunkErrors` — a rolled-back chunk IS a failure, and
+     *    reconcile is the only step that still runs once `ok` is false (the
+     *    mint and the checkpoint are both gated on it), so it can be the
+     *    second failure that `error` never mentions.
+     *  - `reconciled.remaining` — links this run did not attempt. Not a
+     *    failure (`error` stays "conflict-store-unreadable"), but a backlog a
+     *    later pass genuinely drains, because the links it writes are durable
+     *    whatever the conflict store does.
+     *  - `summary.continues` — the pull hit its budget mid-window and set no
+     *    `error` either. Unfinished work by definition.
+     *
+     * LIMITATION, stated rather than designed around: `summary.ok` is false
+     * here, so the pull skips its window-state save and neither `continueAfter`
+     * nor `reconcileRemaining` is persisted. The continuation slot therefore
+     * re-plans the same window from the same mark. That still advances the
+     * reconcile backlog (linking writes rows), but a budget-truncated run
+     * re-ingests from the window's start and can stop at the same place. It is
+     * re-armed anyway, because "unfinished work gets a slot" is the rule, and
+     * withholding one leaves the work waiting for the nightly run.
      */
     const unreadableStoreIsTheOnlyFailure = summary.conflictStore === "unreadable"
         && summary.error === "conflict-store-unreadable"
         && !!summary.reconciled
-        && (summary.reconciled.chunkErrors ?? 0) === 0;
+        && (summary.reconciled.chunkErrors ?? 0) === 0
+        && (summary.reconciled.remaining ?? 0) === 0
+        && !summary.continues;
     if (!summary.ok && !unreadableStoreIsTheOnlyFailure) {
         statePatch.continuationPending = true;
         statePatch.continuationReason = "failed";

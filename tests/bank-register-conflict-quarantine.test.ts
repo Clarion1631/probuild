@@ -311,6 +311,8 @@ let registerStale: boolean;
 let failWrites: Set<string>;
 /** Forces a batch response, so a FAILED ingest can be modelled (500/400/bare 409). */
 let ingestOverride: ((lines: Array<{ qbTxnId: string }>) => Response | null) | null;
+/** Links the fake reconcile reports it did not attempt — this run's backlog. */
+let reconcileRemaining: number;
 
 /** The window state the cron persisted, parsed — `null` when it never wrote one. */
 const WINDOW_STATE_KEY = "bankRegisterPullWindow";
@@ -424,7 +426,7 @@ before(async () => {
                 bankLedgerReconcileHandlers: {
                     runReconcile: async () => ({
                         linked: 0, proposed: 0, exceptions: [],
-                        ambiguous: [], ambiguousStale: [], pairedByOrder: [], chunkErrors: [], remaining: 0,
+                        ambiguous: [], ambiguousStale: [], pairedByOrder: [], chunkErrors: [], remaining: reconcileRemaining,
                     }),
                 },
             };
@@ -454,6 +456,7 @@ function reset() {
     registerStale = false;
     failWrites = new Set();
     ingestOverride = null;
+    reconcileRemaining = 0;
     process.env.BANK_LINE_MINT_FROM_QBO = "true";
 }
 
@@ -640,6 +643,69 @@ test("G1: an unreadable conflict store must not let the window checkpoint advanc
         await pull();
         assert.equal(savedWindowState()?.continuationPending, undefined);
         assert.equal(savedWindowState()?.continuationReason, undefined);
+    });
+
+    /**
+     * BUT "ONLY A HUMAN CAN REPAIR IT" IS A CLAIM ABOUT THE STORE, NOT ABOUT
+     * THE RUN.
+     *
+     * The suppression above was derived from `summary.error`, and first writer
+     * wins — so an unreadable store took ownership of that field and hid every
+     * other piece of unfinished work the same run left behind. Neither of the
+     * two below sets `error` at all, and because `ok` is false the pull skips
+     * its own state save, so nothing else records them either: the work sat
+     * until the next nightly pull, roughly a day later.
+     */
+    await t.test("but a reconcile backlog is work a retry CAN drain, so the slot comes back", async () => {
+        reset();
+        settings.set(BANK_PULL_CONFLICT_KEY, "{not json");
+        reconcileRemaining = 7;
+
+        const response = await pull();
+        assert.equal(response.status, 500, "still a failed run, still paged");
+        const summary = await response.json() as { error?: string; reconciled?: { remaining?: number } };
+        assert.equal(summary.error, "conflict-store-unreadable",
+            "the store still owns `error` — which is exactly why it cannot be the whole test");
+        assert.equal(summary.reconciled?.remaining, 7);
+        // The links a later pass writes are durable whatever the conflict store
+        // does, so this backlog really does drain.
+        assert.equal(savedWindowState()?.continuationPending, true);
+        assert.equal(savedWindowState()?.continuationReason, "failed");
+    });
+
+    await t.test("and a budget-truncated window keeps its continuation too", async () => {
+        reset();
+        settings.set(BANK_PULL_CONFLICT_KEY, "{not json");
+        // Two batches, with the clock jumping past the 50s pull budget between
+        // them: the second never runs, so `continues` is set and `error` is
+        // not — truncation is not a failure.
+        registerRowCount = 501;
+        const realNow = Date.now;
+        let skew = 0;
+        ingestOverride = () => {
+            skew += 60_000;
+            return null;
+        };
+        Date.now = () => realNow() + skew;
+        let summary: { continues?: boolean; error?: string };
+        try {
+            const response = await pull();
+            assert.equal(response.status, 500);
+            summary = await response.json() as typeof summary;
+        } finally {
+            Date.now = realNow;
+        }
+        assert.equal(summary.continues, true, "the run really was cut short mid-window");
+        assert.equal(summary.error, "conflict-store-unreadable");
+        assert.equal(ingestModes.length, 1, "only the first batch was posted");
+        /**
+         * Re-armed even though the skipped state save means no `continueAfter`
+         * is persisted and the resume pass re-plans the same window. That
+         * limitation is recorded in the route; what is NOT acceptable is
+         * unfinished work with no slot at all.
+         */
+        assert.equal(savedWindowState()?.continuationPending, true);
+        assert.equal(savedWindowState()?.continuationReason, "failed");
     });
 });
 
