@@ -143,7 +143,17 @@ test("AC12: an unreadable record is NEVER read as none", () => {
     assert.equal(parseBankPullConflicts('{"a":1}'), null, "an object is not a list");
     assert.equal(parseBankPullConflicts('[{"qbTxnId":"6696"}]'), null, "a row missing fields/linked is malformed");
     assert.equal(parseBankPullConflicts('[{"qbTxnId":"6696","fields":["amountCents"],"linked":"yes"}]'), null);
+    /**
+     * F4: ONLY ABSENCE IS EMPTY. A row that exists and holds an empty or
+     * whitespace-only string is a store somebody truncated — `!value` read it as
+     * `[]`, i.e. "nothing restated", which is precisely the state in which the
+     * mint exclusion cannot be enforced. The two sibling parsers keep the looser
+     * rule on purpose; this is the one the mint reads.
+     */
+    assert.equal(parseBankPullConflicts(""), null, "an empty row is not an empty list");
+    assert.equal(parseBankPullConflicts("   \n\t"), null, "and neither is a whitespace-only one");
     assert.deepEqual(parseBankPullConflicts(null), [], "absent is empty");
+    assert.deepEqual(parseBankPullConflicts(undefined), [], "and so is a row that is not there at all");
     assert.deepEqual(parseBankPullConflicts("[]"), []);
     assert.deepEqual(
         parseBankPullConflicts('[{"qbTxnId":"6696","fields":["amountCents"],"linked":true,"firstSeenAt":"a","lastSeenAt":"b"}]'),
@@ -183,14 +193,14 @@ const conflict = (qbTxnId: string, linked = false): QboRestatementConflict => ({
 const entry = (qbTxnId: string, firstSeenAt: string): BankPullConflictEntry =>
     ({ qbTxnId, fields: ["amountCents"], linked: false, firstSeenAt, lastSeenAt: firstSeenAt });
 
-test("AC13: a re-offered id that agrees again is deleted; the age of one still conflicting survives", () => {
+test("AC13: a re-VERIFIED id that agrees again is deleted; the age of one still conflicting survives", () => {
     const merged = mergeConflictRecord(
         [conflict("A", true)],
         ["A", "B"],
         [entry("A", "T0"), entry("B", "T0")],
         "T1",
     );
-    assert.deepEqual(merged.map(e => e.qbTxnId), ["A"], "B was re-read and agreed — the record clears itself");
+    assert.deepEqual(merged.map(e => e.qbTxnId), ["A"], "B was committed and not reported back — the record clears itself");
     assert.equal(merged[0].firstSeenAt, "T0", "the age survives; a human needs to know how long this has been true");
     assert.equal(merged[0].lastSeenAt, "T1");
     assert.equal(merged[0].linked, true, "and the reading of the condition is replaced");
@@ -283,8 +293,15 @@ test("AC15: a failed probe says so rather than claiming none", () => {
 let settings: Map<string, string>;
 /** Every `where` the mint's observation read was given this run. */
 let mintObservationWheres: Array<Record<string, unknown>>;
-/** The conflicts the fake ingest reports back, per run. */
-let ingestConflicts: QboRestatementConflict[];
+/** The qbTxnIds the fake ingest reports back as restated, per run. */
+let conflictingIds: string[];
+/** The `onConflict` mode the cron handed each batch. */
+let ingestModes: Array<string | undefined>;
+/** How many register rows the fake QuickBooks fetch returns. */
+let registerRowCount: number;
+
+/** `6696` first — the transaction this whole mechanism was built for. */
+const registerTxnId = (index: number) => (index === 0 ? "6696" : `t${index}`);
 
 const pullPrisma = {
     automationSetting: {
@@ -325,11 +342,11 @@ before(async () => {
         if (id === "@/lib/qbo-bank-register") {
             return {
                 fetchBankRegister: async (_get: unknown, startDate: string, endDate: string) => ({
-                    rows: [{
-                        date: endDate, qbType: "Expense", qbTxnId: "6696", docNum: null,
-                        name: "LOWES", amountCents: -12_345, memo: "LOWES #02516 POS DEB C#8516",
+                    rows: Array.from({ length: registerRowCount }, (_unused, index) => ({
+                        date: endDate, qbType: "Expense", qbTxnId: registerTxnId(index), docNum: null,
+                        name: "LOWES", amountCents: -(12_345 + index), memo: `LOWES #0251${index} POS DEB C#8516`,
                         clearedStatus: "Cleared",
-                    }],
+                    })),
                     stale: false, clearedProbeOk: true, fetchedAt: new Date().toISOString(),
                     accountId: "1", startDate, endDate,
                 }),
@@ -338,16 +355,41 @@ before(async () => {
         if (id === "@/app/api/integrations/bank-ledger/ingest/route") {
             return {
                 bankLedgerIngestHandlers: {
-                    handleQboRegister: async (_account: string, lines: unknown[]) => new Response(
-                        JSON.stringify({
-                            ok: true,
-                            inserted: lines.length - ingestConflicts.length,
-                            existing: 0,
-                            conflicted: ingestConflicts.length,
-                            conflicts: ingestConflicts,
-                        }),
-                        { status: 200 },
-                    ),
+                    /**
+                     * HONOURS THE MODE IT IS HANDED. A fake that quarantines
+                     * whatever the caller asked for proves nothing about the
+                     * caller: mode-forwarding could break and every test would
+                     * still pass. In `abort` — the DEFAULT, and what the cron
+                     * would silently fall back to — a restatement 409s the whole
+                     * batch, which is the eleven-day freeze.
+                     */
+                    handleQboRegister: async (
+                        _account: string,
+                        lines: Array<{ qbTxnId: string }>,
+                        options?: { onConflict?: string },
+                    ) => {
+                        ingestModes.push(options?.onConflict);
+                        const conflicts = lines
+                            .filter(line => conflictingIds.includes(line.qbTxnId))
+                            .map(line => conflict(line.qbTxnId, line.qbTxnId === "6696"));
+                        if (conflicts.length > 0 && (options?.onConflict ?? "abort") === "abort") {
+                            return new Response(
+                                JSON.stringify({ ok: false, reason: "qbo-txn-conflict", qbTxnId: conflicts[0].qbTxnId }),
+                                { status: 409 },
+                            );
+                        }
+                        return new Response(
+                            JSON.stringify({
+                                ok: true,
+                                inserted: lines.length - conflicts.length,
+                                existing: 0,
+                                conflicted: conflicts.length,
+                                conflictedLines: conflicts.length,
+                                conflicts,
+                            }),
+                            { status: 200 },
+                        );
+                    },
                 },
             };
         }
@@ -381,7 +423,9 @@ before(async () => {
 function reset() {
     settings = new Map();
     mintObservationWheres = [];
-    ingestConflicts = [];
+    conflictingIds = [];
+    ingestModes = [];
+    registerRowCount = 1;
     process.env.BANK_LINE_MINT_FROM_QBO = "true";
 }
 
@@ -400,10 +444,17 @@ test("AC9: a DURABLE prior conflict, from outside this run's window, is still ex
     settings.set(BANK_PULL_CONFLICT_KEY, JSON.stringify([
         { qbTxnId: "6600", fields: ["postedDate"], linked: false, firstSeenAt: "T0", lastSeenAt: "T0" },
     ]));
-    ingestConflicts = [conflict("6696", true)];
+    conflictingIds = ["6696"];
 
     const response = await pull();
     assert.equal(response.status, 200, "one edited transaction is not a failed run any more");
+    /**
+     * THE MODE ACTUALLY TRAVELS. `handleQboRegister` defaults to `abort`, which
+     * is the 409 that froze the pipeline for eleven days, so a cron that stopped
+     * passing `quarantine` would silently restore the freeze. The fake honours
+     * whatever it is handed, so this assertion has teeth.
+     */
+    assert.deepEqual(ingestModes, ["quarantine"]);
 
     const excluded = mintExclusion();
     assert.ok(excluded, "the mint ran, and it ran narrowed");
@@ -411,12 +462,21 @@ test("AC9: a DURABLE prior conflict, from outside this run's window, is still ex
     assert.ok(excluded.includes("6600"), "AND the durable one this window never re-read");
 });
 
-test("AC9/AC12: an unreadable conflict store supplies NO mint dependency, blocks the stamp, and says why", async () => {
+test("AC9/AC12/F3: an unreadable conflict store supplies NO mint dependency, blocks the stamp, and does NOT answer 200", async () => {
     reset();
     settings.set(BANK_PULL_CONFLICT_KEY, "{not json");
 
     const response = await pull();
-    assert.equal(response.status, 200, "the run itself still succeeds; it simply does not certify");
+    /**
+     * WITHHOLDING THE STAMP IS NOT ENOUGH ON ITS OWN. A 200 is what the platform
+     * surfaces; nobody reads the body. "We cannot tell which observations may
+     * never be minted" would have sat silent until `bank-pull-stale` fired a day
+     * and a half later — the same shape of lie this whole file exists to stop.
+     */
+    assert.equal(response.status, 500);
+    const summary = await response.json() as { ok: boolean; conflictStore?: string };
+    assert.equal(summary.ok, false);
+    assert.equal(summary.conflictStore, "unreadable");
 
     assert.equal(mintExclusion(), null, "the mint must not run at all — the exclusion cannot be enforced");
     assert.equal(mintObservationWheres.length, 0);
@@ -427,46 +487,98 @@ test("AC9/AC12: an unreadable conflict store supplies NO mint dependency, blocks
         "and the record is never overwritten — that would destroy what we could not read");
 });
 
-test("AC8/AC12: a restatement this run FOUND is recorded, and the stamp still lands", async () => {
+test("F4: a TRUNCATED record is unreadable too, not an empty one", async () => {
     reset();
-    ingestConflicts = [conflict("6696", true)];
+    // A row that exists and holds nothing. `!value` used to read this as "no
+    // conflicts", which is the exact state in which a stale observation mints.
+    settings.set(BANK_PULL_CONFLICT_KEY, "   ");
+
+    const response = await pull();
+    assert.equal(response.status, 500);
+    assert.equal(mintObservationWheres.length, 0, "no mint dependency is supplied at all");
+    assert.equal(settings.has(BANK_PULL_LAST_SUCCESS_KEY), false, "the stamp is withheld");
+    assert.equal(settings.get(BANK_PULL_CONFLICT_KEY), "   ", "and nothing overwrites it");
+});
+
+test("AC8/AC12/F9: a restatement this run FOUND is recorded, and the stamp STILL lands", async () => {
+    reset();
+    conflictingIds = ["6696"];
 
     const response = await pull();
     assert.equal(response.status, 200);
     /**
-     * THE LINE THAT ENDS THE ELEVEN-DAY FREEZE. The clock advances, so
-     * `bank-pull-stale` clears within one run, `chaser-blocked:bank-pull-stale`
-     * clears, and cards flow — while the conflict stays visible in health and
-     * the digest until QuickBooks agrees again.
+     * THE LINE THAT ENDS THE ELEVEN-DAY FREEZE, asserted as the positive claim
+     * rather than the absence of a blocker: with an outstanding conflict
+     * (count > 0), a readable and writable store, and no flood, the cron
+     * COMMITS the freshness stamp. `bank-pull-stale` clears within one run,
+     * `chaser-blocked:bank-pull-stale` clears, and cards flow — while the
+     * conflict stays visible in health and the digest until QuickBooks agrees.
      */
-    assert.ok(settings.has(BANK_PULL_LAST_SUCCESS_KEY), "an outstanding restatement does not withhold the stamp");
     const recorded = parseBankPullConflicts(settings.get(BANK_PULL_CONFLICT_KEY));
-    assert.equal(recorded?.length, 1);
+    assert.equal(recorded?.length, 1, "there IS an outstanding conflict");
     assert.equal(recorded?.[0].qbTxnId, "6696");
     assert.equal(recorded?.[0].linked, true);
+    assert.ok(settings.has(BANK_PULL_LAST_SUCCESS_KEY), "and the stamp landed anyway — that is the non-blocking claim");
 });
 
-test("a prior conflict the run re-offers and no longer sees is deleted, with no code and no SQL", async () => {
+test("a prior conflict the run re-reads and no longer sees is deleted, with no code and no SQL", async () => {
     reset();
     settings.set(BANK_PULL_CONFLICT_KEY, JSON.stringify([
         { qbTxnId: "6696", fields: ["amountCents"], linked: false, firstSeenAt: "T0", lastSeenAt: "T0" },
     ]));
-    // The fetch returns 6696 and the ingest reports no conflict: a human put
-    // the transaction back the way it was.
-    ingestConflicts = [];
+    // The fetch returns 6696 and the ingest commits it without reporting a
+    // conflict: a human put the transaction back the way it was.
+    conflictingIds = [];
 
     await pull();
     assert.deepEqual(parseBankPullConflicts(settings.get(BANK_PULL_CONFLICT_KEY)), []);
     assert.ok(settings.has(BANK_PULL_LAST_SUCCESS_KEY));
 });
 
+test("AC10b: a flood withholds the stamp and the mint, and names itself", async () => {
+    reset();
+    registerRowCount = 60;
+    conflictingIds = Array.from({ length: 51 }, (_unused, index) => registerTxnId(index));
+
+    const response = await pull();
+    /**
+     * NOT A FAILURE. `ok: false` here parked a continuation that re-fetched the
+     * same window and flooded again, forever. The run finishes, the clean rows
+     * land, the record is durable — and the two things that would ACT on a
+     * picture we believe is wrong are held.
+     */
+    assert.equal(response.status, 200);
+    assert.equal(settings.has(BANK_PULL_LAST_SUCCESS_KEY), false, "the freshness stamp is withheld");
+    assert.equal(settings.get(BANK_PULL_BLOCKED_REASON_KEY), "conflict-flood",
+        "and a human can see WHY immediately, not 36 hours later");
+    assert.equal(mintObservationWheres.length, 0, "nothing mints over fifty transactions we already believe are stale");
+    assert.equal(parseBankPullConflicts(settings.get(BANK_PULL_CONFLICT_KEY))?.length, 51,
+        "the conflicts are still persisted — the point is to SEE all of them at once");
+});
+
 // ═══ The invariants, stated where they are easiest to "tidy" away ══════════
 
 test("the cron's stamp gate names the asymmetry, and the mint gate names the trigger", () => {
     const route = read("src/app/api/cron/bank-register-pull/route.ts");
-    // The stamp is decided by the STORE, never by the conflicts themselves.
+    // The stamp is decided by the STORE, never by the conflicts themselves —
+    // except a flood, which is a systemic change rather than a human edit.
     assert.match(route, /&& conflictOutcome\.ok/);
+    assert.match(route, /&& !summary\.conflictFlood/);
     assert.match(route, /THE STORE, NEVER THE CONFLICTS THEMSELVES/);
+    /**
+     * THE RECORD IS DURABLE BEFORE THE MINT. Persisting it out here, after
+     * `runBankRegisterPull` had already minted and checkpointed, left a window
+     * in which the exclusion was lost and the permanent line it was meant to
+     * prevent already existed. It is a dependency now, so the ordering is the
+     * pull's to enforce and the cron cannot reintroduce the gap by moving a
+     * statement.
+     */
+    assert.match(route, /persistConflicts: \(found: readonly QboRestatementConflict\[\], verified: readonly string\[\]\) =>/);
+    const pull = read("src/lib/bank-register-pull.ts");
+    assert.ok(
+        pull.indexOf("dependencies.persistConflicts(") < pull.indexOf("dependencies.mintFromQbo("),
+        "the conflict record must be written before anything irreversible reads it",
+    );
     // And the mint dependency is absent — not disabled — when the store is bad.
     assert.match(route, /BANK_LINE_MINT_FROM_QBO === "true" && conflictStore\.ok/);
     assert.match(route, /sourceLineId: \{ notIn: \[\.\.\.exclude\] \}/);

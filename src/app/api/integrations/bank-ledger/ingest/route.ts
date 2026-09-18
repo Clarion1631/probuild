@@ -561,7 +561,16 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
         // A CONFLICTED LINE IS NEITHER INSERTED NOR `existing`. Counting it as
         // existing would claim the stored row matches what was offered, which
         // is the partial-success lie in a different costume.
-        const existingCount = validated.length - conflicts.length - inserted;
+        //
+        // COUNTED AS OCCURRENCES, NOT AS RECORDS. `conflicts` is deduped by
+        // qbTxnId — a batch carrying the same restated transaction twice
+        // produces one record — so subtracting `conflicts.length` credited the
+        // second occurrence to `existing`, which is the same lie one line over.
+        // `validated.length` counts occurrences, so the subtrahend must too.
+        const excludedOccurrences = conflictedIds.size === 0
+            ? 0
+            : validated.reduce((count, line) => count + (conflictedIds.has(line.qbTxnId) ? 1 : 0), 0);
+        const existingCount = validated.length - excludedOccurrences - inserted;
 
         if (onConflict === "quarantine") {
             return NextResponse.json({
@@ -571,6 +580,8 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
                 descriptorsRefreshed,
                 clearedRefreshed,
                 conflicted: conflicts.length,
+                /** Occurrences, so `inserted + existing + conflictedLines === validated.length`. */
+                conflictedLines: excludedOccurrences,
                 conflicts,
             });
         }

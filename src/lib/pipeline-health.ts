@@ -1064,7 +1064,16 @@ export interface BankPullConflictEntry {
  * state in which a stale observation could be minted into a canonical line.
  */
 export function parseBankPullConflicts(value: string | null | undefined): BankPullConflictEntry[] | null {
-    if (!value) return [];
+    /**
+     * ONLY ABSENCE IS "NOTHING RESTATED". A row that exists and holds an empty
+     * or whitespace-only string is a store somebody or something truncated —
+     * `!value` used to read it as `[]`, which is exactly the "we do not know
+     * what is held" state being read as silence, and it is the state in which
+     * the mint exclusion cannot be enforced. The two sibling parsers keep their
+     * looser rule on purpose: this is the one the mint reads.
+     */
+    if (value === null || value === undefined) return [];
+    if (value.trim() === "") return null;
     let parsed: unknown;
     try {
         parsed = JSON.parse(value);

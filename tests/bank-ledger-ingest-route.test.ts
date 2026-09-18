@@ -609,6 +609,33 @@ test("bank-ledger ingest: QBO_REGISTER restatement quarantine", async t => {
         assert.equal(body.inserted, 2);
         assert.equal(body.existing, 0, "counting it as existing is the partial-success lie in a different costume");
         assert.equal(body.inserted + body.existing + body.conflicted, 3);
+        assert.equal(body.conflictedLines, 1, "one transaction, one occurrence");
+    });
+
+    await t.test("AC3b: the SECOND occurrence of a conflicted id is not counted as `existing` either", async () => {
+        /**
+         * `conflicts` is deduped by qbTxnId — one restated transaction is one
+         * record however many lines carry it — while `validated.length` counts
+         * OCCURRENCES. Subtracting the record count credited every repeat to
+         * `existing`, which claims the stored row matched what was offered: the
+         * partial-success lie one line over from where it was fixed.
+         */
+        const { handlers } = makeHandlers({
+            findExistingQboObservations: async () => new Map([["qb-2", stored()]]),
+        });
+        const repeated = { postedDate: "2026-07-16", amountCents: -7401, rawDescriptor: "US MARKET", qbTxnId: "qb-2" };
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-15", amountCents: -100, rawDescriptor: "ARCO", qbTxnId: "qb-1" },
+            repeated,
+            { ...repeated },
+        ])));
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.equal(body.conflicted, 1, "one RECORD");
+        assert.equal(body.conflictedLines, 2, "two OCCURRENCES");
+        assert.equal(body.inserted, 1);
+        assert.equal(body.existing, 0);
+        assert.equal(body.inserted + body.existing + body.conflictedLines, 3, "and the three counts tie out against the batch");
     });
 
     await t.test("AC4: not one column on a quarantined row is touched", async () => {

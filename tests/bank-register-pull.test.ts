@@ -507,8 +507,34 @@ function manyRows(count: number): BankRegisterRowLike[] {
     return rows;
 }
 
+/**
+ * A committed batch's answer, arithmetically possible: the conflicts it reports
+ * are lines that were actually IN the batch, and the counts tie out
+ * (`inserted + existing + conflictedLines === lines.length`). A fake that
+ * reports a conflict on an id the batch never carried, or counts every line
+ * inserted while also reporting one excluded, cannot happen in production and
+ * tests nothing.
+ */
+function committed(lines: readonly BankRegisterIngestLine[], conflictIndexes: readonly number[], linked = false) {
+    const conflicts = conflictIndexes
+        .filter(i => i < lines.length)
+        .map(i => conflictOf(lines[i].qbTxnId, linked));
+    return {
+        status: 200,
+        body: {
+            ok: true,
+            inserted: lines.length - conflicts.length,
+            existing: 0,
+            conflicted: conflicts.length,
+            conflictedLines: conflicts.length,
+            conflicts,
+        },
+    };
+}
+
 test("AC8: the pull continues past a conflicted batch, and reports it without failing", async () => {
     const batchSizes: number[] = [];
+    let restated: string | undefined;
     const summary = await runBankRegisterPull({
         now: () => Date.parse("2026-08-12T02:00:00Z"),
         conflictMode: "quarantine",
@@ -517,11 +543,9 @@ test("AC8: the pull continues past a conflicted batch, and reports it without fa
             batchSizes.push(lines.length);
             assert.equal(options?.onConflict, "quarantine", "the mode travels with every batch");
             // Batch 1 carries the restatement; batches 2 and 3 are clean.
-            const conflicts = batchSizes.length === 1 ? [conflictOf("6696")] : [];
-            return {
-                status: 200,
-                body: { ok: true, inserted: lines.length - conflicts.length, existing: 0, conflicted: conflicts.length, conflicts },
-            };
+            if (batchSizes.length !== 1) return committed(lines, []);
+            restated = lines[0].qbTxnId;
+            return committed(lines, [0]);
         },
         reconcile: async () => ({ linked: 0, proposed: 0 }),
     });
@@ -530,36 +554,85 @@ test("AC8: the pull continues past a conflicted batch, and reports it without fa
     assert.equal(summary.ok, true, "a QuickBooks edit is not a failed run");
     assert.equal(summary.complete, true, "and it does not withhold the freshness stamp");
     assert.equal(summary.error, undefined);
-    assert.deepEqual(summary.restatementConflicts?.map(c => c.qbTxnId), ["6696"]);
+    assert.deepEqual(summary.restatementConflicts?.map(c => c.qbTxnId), [restated]);
     assert.equal(summary.conflictQbTxnIds, undefined, "`conflictQbTxnIds` still means THIS RUN FAILED on these");
 });
 
-test("AC8b: the same conflict seen in two batches is one record, and every offered id is reported", async () => {
+test("AC8b: a committed batch verifies exactly the ids it did NOT report back", async () => {
+    let restated: string | undefined;
     const summary = await runBankRegisterPull({
         now: () => Date.parse("2026-08-12T02:00:00Z"),
         conflictMode: "quarantine",
         fetchRows: async () => ({ rows: manyRows(2), stale: false }),
-        ingest: async (_account, lines) => ({
-            status: 200,
-            body: { ok: true, inserted: lines.length, existing: 0, conflicted: 1, conflicts: [conflictOf("6696")] },
-        }),
+        ingest: async (_account, lines) => {
+            if (restated !== undefined) return committed(lines, []);
+            restated = lines[0].qbTxnId;
+            return committed(lines, [0]);
+        },
         reconcile: async () => ({ linked: 0, proposed: 0 }),
     });
-    assert.equal(summary.restatementConflicts?.length, 1, "deduped across batches by qbTxnId");
-    assert.equal(summary.offeredQbTxnIds?.length, 2 * BANK_REGISTER_CHUNK_SIZE);
-    assert.equal(new Set(summary.offeredQbTxnIds).size, summary.offeredQbTxnIds?.length);
+    assert.equal(summary.restatementConflicts?.length, 1);
+    /**
+     * The conflicting id is NOT verified — verification is the evidence that
+     * lets the durable record delete an entry, and "we re-read it and it still
+     * disagrees" is the opposite of that.
+     */
+    assert.equal(summary.verifiedQbTxnIds?.length, 2 * BANK_REGISTER_CHUNK_SIZE - 1);
+    assert.equal(summary.verifiedQbTxnIds?.includes(restated!), false);
+    assert.equal(new Set(summary.verifiedQbTxnIds).size, summary.verifiedQbTxnIds?.length);
+});
+
+test("F1: a FAILED batch verifies nothing — its ids are not evidence QuickBooks agrees", async () => {
+    let attempt = 0;
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        fetchRows: async () => ({ rows: manyRows(2), stale: false }),
+        ingest: async (_account, lines) => {
+            attempt++;
+            if (attempt === 1) return committed(lines, []);
+            // The bare post-insert-race 409: the whole batch rolled back, so
+            // nothing in it was re-read against stored content.
+            return { status: 409, body: { ok: false, reason: "qbo-txn-conflict", qbTxnId: lines[0].qbTxnId } };
+        },
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+    });
+    assert.equal(summary.ok, false, "a 409 is still a failed run");
+    assert.equal(summary.verifiedQbTxnIds?.length, BANK_REGISTER_CHUNK_SIZE,
+        "exactly the FIRST batch's ids — the rolled-back batch contributes none");
+});
+
+test("F1: a run truncated by its own budget verifies only what it actually posted", async () => {
+    let elapsed = 0;
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        budgetMs: 1_000,
+        elapsedMs: () => elapsed,
+        fetchRows: async () => ({ rows: manyRows(3), stale: false }),
+        ingest: async (_account, lines) => {
+            // One batch lands, then the budget is gone.
+            elapsed = 2_000;
+            return committed(lines, []);
+        },
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+    });
+    assert.equal(summary.continues, true);
+    assert.equal(summary.verifiedQbTxnIds?.length, BANK_REGISTER_CHUNK_SIZE,
+        "a narrow run must not claim to have re-read the window it never reached");
 });
 
 test("AC9: the mint never sees a conflicted id", async () => {
     let excluded: readonly string[] | undefined;
+    let restated: string | undefined;
     const summary = await runBankRegisterPull({
         now: () => Date.parse("2026-08-12T02:00:00Z"),
         conflictMode: "quarantine",
         fetchRows: async () => ({ rows: FIVE_ROW_FIXTURE, stale: false, clearedProbeOk: true }),
-        ingest: async (_account, lines) => ({
-            status: 200,
-            body: { ok: true, inserted: lines.length - 1, existing: 0, conflicted: 1, conflicts: [conflictOf("6696", true)] },
-        }),
+        ingest: async (_account, lines) => {
+            restated = lines[0].qbTxnId;
+            return committed(lines, [0], true);
+        },
         reconcile: async () => ({ linked: 0, proposed: 0 }),
         mintFromQbo: async (_account, _deadlineAt, excludeQbTxnIds) => {
             excluded = excludeQbTxnIds;
@@ -574,33 +647,121 @@ test("AC9: the mint never sees a conflicted id", async () => {
      * immutable by trigger.
      */
     assert.equal(summary.minted?.complete, true, "the mint still runs for every other observation");
-    assert.ok(excluded?.includes("6696"), "the conflicted id must be excluded from the mint");
+    assert.ok(excluded?.includes(restated!), "the conflicted id must be excluded from the mint");
 });
 
-test("AC10: a flood is not a human edit — it stops the run", async () => {
+test("F2: the DURABLE set is what the mint excludes, and it is written before the mint runs", async () => {
+    const order: string[] = [];
+    let excluded: readonly string[] | undefined;
+    let restated: string | undefined;
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        windowState: { highWater: null, lastFullSweep: null, continueAfter: null },
+        saveWindowState: async () => { order.push("saveState"); },
+        fetchRows: async () => ({ rows: FIVE_ROW_FIXTURE, stale: false, clearedProbeOk: true }),
+        ingest: async (_account, lines) => {
+            order.push("ingest");
+            restated = lines[0].qbTxnId;
+            return committed(lines, [0]);
+        },
+        persistConflicts: async (found, verified) => {
+            order.push("persistConflicts");
+            assert.deepEqual(found.map(c => c.qbTxnId), [restated]);
+            assert.equal(verified.includes(restated!), false);
+            // The merged record: this run's find, plus one from a wider window
+            // this run never re-read.
+            return { ok: true, entries: [{ qbTxnId: restated! }, { qbTxnId: "6600" }] };
+        },
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+        mintFromQbo: async (_account, _deadlineAt, excludeQbTxnIds) => {
+            order.push("mint");
+            excluded = excludeQbTxnIds;
+            return { minted: 0, skipped: {}, complete: true, remainingCursor: null };
+        },
+    });
+    assert.deepEqual(order, ["ingest", "persistConflicts", "mint", "saveState"],
+        "the record has to survive a crash between the ingest and the permanent write it gates");
+    assert.deepEqual([...(excluded ?? [])].sort(), [restated, "6600"].sort());
+    assert.equal(summary.ok, true);
+});
+
+test("F2: a record this run could NOT write stops the mint and the checkpoint", async () => {
+    const order: string[] = [];
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        windowState: { highWater: null, lastFullSweep: null, continueAfter: null },
+        saveWindowState: async () => { order.push("saveState"); },
+        fetchRows: async () => ({ rows: FIVE_ROW_FIXTURE, stale: false, clearedProbeOk: true }),
+        ingest: async (_account, lines) => { order.push("ingest"); return committed(lines, [0]); },
+        persistConflicts: async () => {
+            order.push("persistConflicts");
+            return { ok: false, reason: "bank-conflict-unwritable", entries: [] };
+        },
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+        mintFromQbo: async () => { order.push("mint"); return { minted: 1, skipped: {} }; },
+    });
+    assert.deepEqual(order, ["ingest", "persistConflicts"], "no mint, and no checkpoint to step the window past this one");
+    assert.equal(summary.ok, false);
+    assert.equal(summary.error, "conflict-store-unwritable");
+    assert.equal(summary.conflictStore, "unwritable");
+    assert.equal(summary.minted, null);
+    assert.equal(summary.mintSkipped, "conflict-store-unwritable");
+    assert.equal(summary.highWater, undefined, "the window is retried, not advanced over");
+});
+
+test("AC10a: a flood holds the mint and the stamp — and does NOT stop the run", async () => {
     const attempted: number[] = [];
+    let flooded: string[] = [];
     const summary = await runBankRegisterPull({
         now: () => Date.parse("2026-08-12T02:00:00Z"),
         conflictMode: "quarantine",
         fetchRows: async () => ({ rows: manyRows(3), stale: false }),
         ingest: async (_account, lines) => {
             attempted.push(lines.length);
-            // One batch, more conflicts than any human could have made.
-            const conflicts = attempted.length === 1
-                ? Array.from({ length: MAX_CONFLICTS_PER_RUN + 1 }, (_, i) => conflictOf(`t${i}`))
-                : [];
-            return { status: 200, body: { ok: true, inserted: 0, existing: 0, conflicted: conflicts.length, conflicts } };
+            // One batch, more restatements than any human could have made.
+            if (attempted.length !== 1) return committed(lines, []);
+            const indexes = Array.from({ length: MAX_CONFLICTS_PER_RUN + 1 }, (_, i) => i);
+            flooded = indexes.map(i => lines[i].qbTxnId);
+            return committed(lines, indexes);
         },
         reconcile: async () => ({ linked: 0, proposed: 0 }),
         mintFromQbo: async () => { throw new Error("the mint must not run"); },
     });
-    assert.equal(attempted.length, 1, "later batches are not attempted — exactly today's behaviour");
-    assert.equal(summary.ok, false, "fifty restatements means something systemic changed");
-    assert.equal(summary.complete, false, "so no freshness stamp");
-    assert.equal(summary.error, "conflict-flood");
-    assert.equal(summary.minted, null, "and nothing mints against a picture we know is wrong");
-    assert.equal(summary.mintSkipped, "ingest-failed");
+    /**
+     * BREAKING HERE WEDGED THE PIPELINE. `ok: false` parked a continuation, the
+     * continuation re-fetched the same window, flooded again, and the register
+     * never moved. Everything clean still has to land; what a flood stops is
+     * acting on the picture.
+     */
+    assert.equal(attempted.length, 3, "every remaining batch is still ingested and quarantined");
+    assert.equal(summary.ok, true);
+    assert.equal(summary.complete, true);
+    assert.equal(summary.error, undefined);
+    assert.equal(summary.conflictFlood, true);
     assert.equal(summary.restatementConflicts?.length, MAX_CONFLICTS_PER_RUN + 1, "the finding is still recorded");
+    assert.equal(summary.minted, null, "and nothing mints against a picture we know is wrong");
+    assert.equal(summary.mintSkipped, "conflict-flood");
+    // Every non-conflicting line in the flooded batch still posted.
+    assert.equal(summary.inserted, 3 * BANK_REGISTER_CHUNK_SIZE - flooded.length);
+});
+
+test("AC10c: a flood leaves NO continuation pending — the 15-minute pass must not re-run it", async () => {
+    type SavedState = { continuationPending?: boolean; continueAfter?: unknown };
+    const saved: SavedState[] = [];
+    await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        windowState: { highWater: null, lastFullSweep: null, continueAfter: null },
+        saveWindowState: async next => { saved.push(next as SavedState); },
+        fetchRows: async () => ({ rows: manyRows(1), stale: false, clearedProbeOk: true }),
+        ingest: async (_account, lines) => committed(lines, Array.from({ length: MAX_CONFLICTS_PER_RUN + 1 }, (_, i) => i)),
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+    });
+    assert.equal(saved.length, 1, "a flood is not a failure, so the checkpoint is still written");
+    assert.equal(saved[0].continuationPending, false, "nothing-in-progress — re-running the flood is the wedge");
+    assert.equal(saved[0].continueAfter, null);
 });
 
 test("the default is `abort`, so the pure tests keep the semantics they were written against", async () => {

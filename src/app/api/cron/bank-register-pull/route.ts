@@ -69,6 +69,15 @@ export const QUARANTINE_UNWRITABLE_REASON = "bank-quarantine-unwritable";
  */
 export const CONFLICT_UNREADABLE_REASON = "bank-conflict-unreadable";
 export const CONFLICT_UNWRITABLE_REASON = "bank-conflict-unwritable";
+/**
+ * More restatements in one run than a human could have made.
+ *
+ * Deliberately NOT fatal to the run any more — the batches all ran and every
+ * clean line landed — but it holds the mint and the freshness stamp, so it is a
+ * blocked reason a person can see immediately rather than `bank-pull-stale`
+ * thirty-six hours later.
+ */
+export const CONFLICT_FLOOD_REASON = "conflict-flood";
 
 class SplitManifestUnreadableError extends Error {
     constructor(message: string) {
@@ -416,26 +425,35 @@ async function readConflictStore(): Promise<ConflictOutcome> {
 /**
  * Merge this run's restatements into the durable record.
  *
- * MERGED, not replaced, and with one deletion rule: an entry is dropped only
- * when this run actually RE-OFFERED its id to the ingest and the ingest did not
- * report it as a conflict — i.e. QuickBooks and the stored row agree again.
- * That is how a human reverting an edit in QuickBooks clears the record with no
- * code and no SQL. Entries outside `offered` are carried forward untouched: a
- * narrow window must not forget what a wider one found.
+ * MERGED, not replaced, and with one deletion rule: an entry is dropped only on
+ * POSITIVE VERIFICATION — its id was in a batch the ingest COMMITTED (`200 &&
+ * ok`) and that response did not report it as a conflict, i.e. QuickBooks and
+ * the stored row agree again. That is how a human reverting an edit in
+ * QuickBooks clears the record with no code and no SQL.
+ *
+ * It used to be enough to have OFFERED the id. That is a much weaker claim: a
+ * batch that answered 500, 400, or the bare post-insert-race 409 re-read
+ * nothing, and every id in it was nonetheless recorded as agreed and its prior
+ * conflict deleted. A deleted conflict is one the mint stops excluding, and
+ * minting a stale observation is permanent — `BankLine.amountCents` is
+ * immutable by trigger. A record is never forgotten without evidence.
+ *
+ * Entries outside `verified` are carried forward untouched: a narrow window
+ * must not forget what a wider one found.
  */
 export function mergeConflictRecord(
     found: readonly QboRestatementConflict[],
-    offered: readonly string[],
+    verified: readonly string[],
     prior: readonly BankPullConflictEntry[],
     now: string,
 ): BankPullConflictEntry[] {
     const byId = new Map(prior.map(entry => [entry.qbTxnId, entry]));
     const foundIds = new Set(found.map(conflict => conflict.qbTxnId));
 
-    // RE-OFFERED AND NOT REPORTED BACK = QuickBooks agrees with us again. That
-    // is the whole resolution path: a human changes the transaction back, the
-    // next run re-reads it, and the record clears itself.
-    for (const id of offered) {
+    // RE-READ AND NOT REPORTED BACK = QuickBooks agrees with us again. That is
+    // the whole resolution path: a human changes the transaction back, the next
+    // run re-reads it, and the record clears itself.
+    for (const id of verified) {
         if (foundIds.has(id)) continue;
         byId.delete(id);
     }
@@ -455,10 +473,10 @@ export function mergeConflictRecord(
 
 async function persistConflicts(
     found: readonly QboRestatementConflict[],
-    offered: readonly string[],
+    verified: readonly string[],
     prior: readonly BankPullConflictEntry[],
 ): Promise<ConflictOutcome> {
-    const merged = mergeConflictRecord(found, offered, prior, new Date().toISOString());
+    const merged = mergeConflictRecord(found, verified, prior, new Date().toISOString());
     try {
         const value = JSON.stringify(merged);
         await prisma.automationSetting.upsert({
@@ -891,6 +909,30 @@ async function runPull() {
          */
         conflictMode: "quarantine",
 
+        /**
+         * THE RECORD IS WRITTEN BEFORE THE MINT, not after the run.
+         *
+         * It used to be persisted out here, once `runBankRegisterPull` had
+         * already minted and saved the window checkpoint — so a crash or a
+         * failed KV write in between lost the exclusion while the canonical
+         * line it was meant to prevent had already been created, permanently
+         * (`BankLine.amountCents` is immutable by trigger). Handed in as a
+         * dependency, it runs after the last ingest batch and before the mint
+         * gate, and an unwritable store stops the mint and the checkpoint
+         * instead of being discovered too late to matter.
+         *
+         * ABSENT when the store could not be READ, which is the same "the
+         * dependency is simply absent" idiom the mint below uses: overwriting a
+         * record we could not parse would destroy the list of observations that
+         * may never be minted.
+         */
+        ...(conflictStore.ok
+            ? {
+                persistConflicts: (found: readonly QboRestatementConflict[], verified: readonly string[]) =>
+                    persistConflicts(found, verified, conflictStore.entries),
+            }
+            : {}),
+
         ingest: async (account: string, lines: BankRegisterIngestLine[], options?: { onConflict?: "abort" | "quarantine" }) => {
             const response = await bankLedgerIngestHandlers.handleQboRegister(account, lines, options);
             let body: BankRegisterIngestResult["body"] = null;
@@ -1124,17 +1166,46 @@ async function runPull() {
     const quarantineHeld = quarantine.ok ? quarantine.outstanding : quarantine.outstanding;
     const quarantineBlocked = !quarantine.ok;
     /**
-     * MERGE THIS RUN'S RESTATEMENTS INTO THE DURABLE RECORD.
+     * WHAT THE DURABLE RECORD DID, read as one answer from two places.
      *
-     * Skipped entirely when the store was unreadable: overwriting it would
-     * destroy the record of which observations may never be minted, which is
-     * the same mistake the quarantine path refuses to make.
+     * The MERGE itself now happens inside `runBankRegisterPull`, through the
+     * `persistConflicts` dependency above — before the mint and before the
+     * window checkpoint, because those are the irreversible steps it exists to
+     * gate. What is left here is reading the outcome: the store was either
+     * unreadable before the run (the dependency was never supplied, so nothing
+     * was overwritten) or unwritable during it (the pull already refused to
+     * mint or advance).
      */
-    const conflictOutcome = conflictStore.ok
-        ? await persistConflicts(summary.restatementConflicts ?? [], summary.offeredQbTxnIds ?? [], conflictStore.entries)
-        : conflictStore;
-    if (!conflictOutcome.ok && conflictOutcome.reason) {
+    const conflictOutcome: { ok: boolean; reason: string | null } = !conflictStore.ok
+        ? { ok: false, reason: CONFLICT_UNREADABLE_REASON }
+        : summary.conflictStore === "unwritable"
+            ? { ok: false, reason: CONFLICT_UNWRITABLE_REASON }
+            : { ok: true, reason: null };
+    /**
+     * AND A RUN THAT COULD NOT READ IT DOES NOT ANSWER 200.
+     *
+     * Withholding the stamp is not enough on its own: the platform surfaces a
+     * status, nobody reads a 200 body, and "the mint exclusion cannot be
+     * enforced" would have sat silent until `bank-pull-stale` fired a day and a
+     * half later. Same convention as every other failure on this route — `ok:
+     * false` is a 500.
+     */
+    if (!conflictStore.ok) {
+        summary.conflictStore = "unreadable";
+        summary.ok = false;
+        summary.error = summary.error ?? CONFLICT_UNREADABLE_REASON;
+    }
+    if (conflictOutcome.reason) {
         await recordBlockedReason(conflictOutcome.reason);
+    }
+    /**
+     * A FLOOD IS SAID OUT LOUD TOO. It leaves `ok` and `complete` true on
+     * purpose — breaking the run parked a continuation that re-ran the same
+     * flood forever — so this reason is the only immediate signal that fifty
+     * transactions changed at once and nothing is minting over them.
+     */
+    if (summary.conflictFlood) {
+        await recordBlockedReason(CONFLICT_FLOOD_REASON);
     }
     const stampWarranted = summary.ok && summary.complete && summary.clearedProbeOk && ambiguousCount === 0
         && quarantineHeld.length === 0 && !quarantineBlocked
@@ -1150,6 +1221,15 @@ async function runPull() {
          * the state in which the mint exclusion above cannot be enforced.
          */
         && conflictOutcome.ok
+        /**
+         * AND NOT A FLOOD. Fifty restatements in one run is something systemic —
+         * a changed hash function, a changed descriptor format — not a person
+         * editing a transaction, and certifying the register as current over it
+         * would use the quarantine mechanism to hide a real bug. It does not
+         * fail the run (that wedged the continuation); it withholds the two
+         * things that would act on the picture: this stamp, and the mint.
+         */
+        && !summary.conflictFlood
         && !summary.uncertified;
     /**
      * A FAILED STAMP IS A FAILED RUN (round-36 gate, finding 4).
