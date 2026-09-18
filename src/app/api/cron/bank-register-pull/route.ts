@@ -932,6 +932,20 @@ async function runPull() {
                     persistConflicts(found, verified, conflictStore.entries),
             }
             : {}),
+        /**
+         * AND THE UNREADABLE CASE TRAVELS IN, rather than being applied after
+         * the run (round-49 gate).
+         *
+         * Omitting `persistConflicts` and `mintFromQbo` was not enough: the pull
+         * still finished with `ok: true`, and the window-state save is gated on
+         * exactly that, so the high-water mark advanced. The restatements the
+         * run had just found were persisted nowhere, and `PULL_OVERLAP_DAYS` is
+         * 3 while the mint looks back 60 — so once they aged out of the overlap
+         * the register would never re-offer them and nothing excluded them from
+         * the mint. The flag makes the pull refuse the mint AND the checkpoint
+         * at the same point it already refuses them for an unwritable store.
+         */
+        conflictStoreUnreadable: !conflictStore.ok,
 
         ingest: async (account: string, lines: BankRegisterIngestLine[], options?: { onConflict?: "abort" | "quarantine" }) => {
             const response = await bankLedgerIngestHandlers.handleQboRegister(account, lines, options);
@@ -1189,12 +1203,12 @@ async function runPull() {
      * enforced" would have sat silent until `bank-pull-stale` fired a day and a
      * half later. Same convention as every other failure on this route — `ok:
      * false` is a 500.
+     *
+     * `summary.ok` is set false by the pull itself now, off
+     * `conflictStoreUnreadable` above — it used to be set HERE, after the run,
+     * which was too late to stop the window checkpoint the 500 was supposed to
+     * prevent. The 500 below still follows from it.
      */
-    if (!conflictStore.ok) {
-        summary.conflictStore = "unreadable";
-        summary.ok = false;
-        summary.error = summary.error ?? CONFLICT_UNREADABLE_REASON;
-    }
     if (conflictOutcome.reason) {
         await recordBlockedReason(conflictOutcome.reason);
     }
@@ -1270,7 +1284,27 @@ async function runPull() {
      */
     const statePatch: Record<string, unknown> = {};
     if (stampFailed) statePatch.stampPending = true;
-    if (!summary.ok) {
+    /**
+     * EXCEPT THE ONE FAILURE RE-RUNNING CANNOT REPAIR.
+     *
+     * A corrupt conflict-store row does not heal itself: every one of the day's
+     * 44 continuation slots would re-read the same unparseable value, turn into
+     * a full pull, and fail again. Only a person can fix it, and the 500 plus
+     * `bank-conflict-unreadable` is what tells them. The nightly run still comes
+     * back on its own. An UNWRITABLE store is the opposite case — a transient KV
+     * write failure — and keeps the continuation.
+     *
+     * "Only" is read off the two places a failure can still come from once the
+     * store has been judged: anything that failed BEFORE it owns `summary.error`
+     * (first writer wins), and reconcile is the only step after it that runs at
+     * all when `ok` is already false — the mint and the checkpoint are both
+     * gated on it.
+     */
+    const unreadableStoreIsTheOnlyFailure = summary.conflictStore === "unreadable"
+        && summary.error === "conflict-store-unreadable"
+        && !!summary.reconciled
+        && (summary.reconciled.chunkErrors ?? 0) === 0;
+    if (!summary.ok && !unreadableStoreIsTheOnlyFailure) {
         statePatch.continuationPending = true;
         statePatch.continuationReason = "failed";
     }

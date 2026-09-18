@@ -299,6 +299,25 @@ let conflictingIds: string[];
 let ingestModes: Array<string | undefined>;
 /** How many register rows the fake QuickBooks fetch returns. */
 let registerRowCount: number;
+/** True when QuickBooks did not answer and the fetch served its cache. */
+let registerStale: boolean;
+/**
+ * KV keys whose WRITE fails this run.
+ *
+ * Without this the fake could only ever model an unreadable store, so the
+ * unwritable half of the same invariant — the pull's own `persistConflicts`
+ * failure path — had no cron-level cover at all.
+ */
+let failWrites: Set<string>;
+/** Forces a batch response, so a FAILED ingest can be modelled (500/400/bare 409). */
+let ingestOverride: ((lines: Array<{ qbTxnId: string }>) => Response | null) | null;
+
+/** The window state the cron persisted, parsed — `null` when it never wrote one. */
+const WINDOW_STATE_KEY = "bankRegisterPullWindow";
+function savedWindowState(): Record<string, unknown> | null {
+    const value = settings.get(WINDOW_STATE_KEY);
+    return value ? JSON.parse(value) as Record<string, unknown> : null;
+}
 
 /** `6696` first — the transaction this whole mechanism was built for. */
 const registerTxnId = (index: number) => (index === 0 ? "6696" : `t${index}`);
@@ -308,10 +327,12 @@ const pullPrisma = {
         findUnique: async ({ where }: { where: { key: string } }) =>
             (settings.has(where.key) ? { key: where.key, value: settings.get(where.key)! } : null),
         upsert: async ({ where, update, create }: { where: { key: string }; update: { value: string }; create: { key: string; value: string } }) => {
+            if (failWrites.has(where.key)) throw new Error(`kv write failed: ${where.key}`);
             settings.set(where.key, settings.has(where.key) ? update.value : create.value);
             return { key: where.key };
         },
         update: async ({ where, data }: { where: { key: string }; data: { value: string } }) => {
+            if (failWrites.has(where.key)) throw new Error(`kv write failed: ${where.key}`);
             settings.set(where.key, data.value);
             return { key: where.key };
         },
@@ -347,7 +368,7 @@ before(async () => {
                         name: "LOWES", amountCents: -(12_345 + index), memo: `LOWES #0251${index} POS DEB C#8516`,
                         clearedStatus: "Cleared",
                     })),
-                    stale: false, clearedProbeOk: true, fetchedAt: new Date().toISOString(),
+                    stale: registerStale, clearedProbeOk: true, fetchedAt: new Date().toISOString(),
                     accountId: "1", startDate, endDate,
                 }),
             };
@@ -369,6 +390,10 @@ before(async () => {
                         options?: { onConflict?: string },
                     ) => {
                         ingestModes.push(options?.onConflict);
+                        // A batch the route FAILED on: it re-read nothing, so
+                        // nothing in it is evidence QuickBooks agrees.
+                        const forced = ingestOverride?.(lines);
+                        if (forced) return forced;
                         const conflicts = lines
                             .filter(line => conflictingIds.includes(line.qbTxnId))
                             .map(line => conflict(line.qbTxnId, line.qbTxnId === "6696"));
@@ -426,6 +451,9 @@ function reset() {
     conflictingIds = [];
     ingestModes = [];
     registerRowCount = 1;
+    registerStale = false;
+    failWrites = new Set();
+    ingestOverride = null;
     process.env.BANK_LINE_MINT_FROM_QBO = "true";
 }
 
@@ -556,6 +584,135 @@ test("AC10b: a flood withholds the stamp and the mint, and names itself", async 
         "the conflicts are still persisted — the point is to SEE all of them at once");
 });
 
+/** One durable entry, as the KV row holds it. */
+const priorConflictRow = (qbTxnId: string, firstSeenAt: string) =>
+    JSON.stringify([{ qbTxnId, fields: ["amountCents"], linked: false, firstSeenAt, lastSeenAt: firstSeenAt }]);
+
+test("G1: an unreadable conflict store must not let the window checkpoint advance", async t => {
+    /**
+     * THE BLOCKER ROUND 2 FOUND, AT THE LEVEL IT ACTUALLY BIT.
+     *
+     * Omitting the two dependencies was not enough. The pull still returned
+     * `ok: true`, and its window-state save is gated on exactly that — so the
+     * high-water mark advanced, and the route only set `ok: false` afterwards.
+     * The restatements found that night were persisted nowhere (the store was
+     * unreadable, so nothing was written to it on purpose), and the pull's
+     * 3-day re-fetch overlap is far shorter than the mint's 60-day lookback:
+     * once they aged out of the overlap, nothing re-offered them and nothing
+     * excluded them.
+     */
+    await t.test("the control — a healthy run is what moves the window forward", async () => {
+        reset();
+        const response = await pull();
+        assert.equal(response.status, 200);
+        assert.ok(savedWindowState()?.highWater, "so the absence of a mark below is a real difference");
+    });
+
+    await t.test("and an unreadable store leaves no checkpoint behind at all", async () => {
+        reset();
+        settings.set(BANK_PULL_CONFLICT_KEY, "{not json");
+        conflictingIds = ["6696"];
+
+        const response = await pull();
+        assert.equal(response.status, 500);
+        assert.equal(mintObservationWheres.length, 0, "no mint — the exclusion cannot be enforced");
+        assert.equal(settings.has(BANK_PULL_LAST_SUCCESS_KEY), false, "and no freshness stamp");
+        assert.equal(settings.get(BANK_PULL_BLOCKED_REASON_KEY), "bank-conflict-unreadable");
+        /**
+         * The clean lines still landed — that is quarantine mode working, and it
+         * is safe precisely BECAUSE the window did not move: the next run
+         * re-offers this span and re-detects the restatement.
+         */
+        assert.deepEqual(ingestModes, ["quarantine"]);
+        assert.equal(savedWindowState(), null,
+            "no high-water mark, so the next run reads this same window again");
+    });
+
+    await t.test("and it does not re-arm the continuation — only a human can repair the row", async () => {
+        /**
+         * Re-running cannot parse a value that does not parse. Arming the
+         * continuation turned all 44 of the day's slots into full pulls that
+         * failed identically. The nightly run still comes back on its own, and
+         * the 500 plus `bank-conflict-unreadable` is what pages a person.
+         */
+        reset();
+        settings.set(BANK_PULL_CONFLICT_KEY, "{not json");
+        await pull();
+        assert.equal(savedWindowState()?.continuationPending, undefined);
+        assert.equal(savedWindowState()?.continuationReason, undefined);
+    });
+});
+
+test("G2/F6: an UNWRITABLE store fails the same way — but keeps the continuation, because a retry CAN fix it", async () => {
+    reset();
+    conflictingIds = ["6696"];
+    failWrites.add(BANK_PULL_CONFLICT_KEY);
+
+    const response = await pull();
+    assert.equal(response.status, 500);
+    const summary = await response.json() as { ok: boolean; conflictStore?: string; highWater?: string | null };
+    assert.equal(summary.ok, false);
+    assert.equal(summary.conflictStore, "unwritable");
+    assert.equal(mintObservationWheres.length, 0, "nothing mints against an exclusion that was never recorded");
+    assert.equal(settings.has(BANK_PULL_LAST_SUCCESS_KEY), false, "the freshness stamp is withheld");
+    assert.equal(settings.get(BANK_PULL_BLOCKED_REASON_KEY), "bank-conflict-unwritable");
+
+    const state = savedWindowState();
+    assert.equal(state?.highWater, undefined, "the window is retried, not advanced over");
+    // THE ASYMMETRY WITH UNREADABLE. A KV write that failed is transient;
+    // coming back in fifteen minutes is exactly the right response to it.
+    assert.equal(state?.continuationPending, true);
+    assert.equal(state?.continuationReason, "failed");
+});
+
+test("G4a: a batch that FAILED never forgets a prior conflict — 500, 400 and a bare 409 alike", async t => {
+    /**
+     * The round-1 bug, as behaviour rather than as a unit call. Every id merely
+     * OFFERED used to count as re-verified, so a batch that answered 500, 400 or
+     * the bare post-insert-race 409 — all of which re-read nothing — deleted the
+     * prior conflicts it happened to carry. A deleted conflict is one the mint
+     * stops excluding, and a stale mint is permanent: `BankLine.amountCents` is
+     * immutable by trigger.
+     */
+    for (const failure of [
+        { label: "a 500", status: 500, body: { ok: false, reason: "server-error" } },
+        { label: "a 400", status: 400, body: { ok: false, reason: "duplicate-qbtxnid" } },
+        { label: "a bare 409", status: 409, body: { ok: false, reason: "qbo-txn-conflict", qbTxnId: "6696" } },
+    ]) {
+        await t.test(`${failure.label} proves nothing, so 6696 stays on the record`, async () => {
+            reset();
+            settings.set(BANK_PULL_CONFLICT_KEY, priorConflictRow("6696", "T0"));
+            ingestOverride = () => new Response(JSON.stringify(failure.body), { status: failure.status });
+
+            const response = await pull();
+            assert.equal(response.status, 500, "a failed batch is still a failed run");
+            const recorded = parseBankPullConflicts(settings.get(BANK_PULL_CONFLICT_KEY));
+            assert.equal(recorded?.length, 1, "the prior conflict survives a run that re-read nothing");
+            assert.equal(recorded?.[0].qbTxnId, "6696");
+            assert.equal(recorded?.[0].firstSeenAt, "T0", "and its age survives — a human needs to know how long");
+            assert.equal(mintObservationWheres.length, 0);
+        });
+    }
+});
+
+test("G3: a STALE fetch cannot self-clear a durable conflict", async () => {
+    reset();
+    settings.set(BANK_PULL_CONFLICT_KEY, priorConflictRow("6696", "T0"));
+    // QuickBooks did not answer; the cached copy re-posts cleanly and reports
+    // no conflict. That is our own cache agreeing with our own store — not
+    // evidence QuickBooks agrees, which is the only thing that may delete an
+    // entry.
+    registerStale = true;
+    conflictingIds = [];
+
+    const response = await pull();
+    assert.equal(response.status, 500, "a stale fetch is not a successful pull");
+    const recorded = parseBankPullConflicts(settings.get(BANK_PULL_CONFLICT_KEY));
+    assert.equal(recorded?.length, 1);
+    assert.equal(recorded?.[0].qbTxnId, "6696");
+    assert.equal(recorded?.[0].firstSeenAt, "T0");
+});
+
 // ═══ The invariants, stated where they are easiest to "tidy" away ══════════
 
 test("the cron's stamp gate names the asymmetry, and the mint gate names the trigger", () => {
@@ -575,8 +732,19 @@ test("the cron's stamp gate names the asymmetry, and the mint gate names the tri
      */
     assert.match(route, /persistConflicts: \(found: readonly QboRestatementConflict\[\], verified: readonly string\[\]\) =>/);
     const pull = read("src/lib/bank-register-pull.ts");
+    /**
+     * BOTH CALLS MUST EXIST FIRST. `-1 < -1` is false but `-1 < n` is true, so a
+     * pin that only compares the two offsets passes VACUOUSLY the moment either
+     * call is deleted or renamed — which is the exact change it is here to
+     * catch. The behavioural ordering test lives in bank-register-pull.test.ts;
+     * this is the source-text belt.
+     */
+    const persistAt = pull.indexOf("dependencies.persistConflicts(");
+    const mintAt = pull.indexOf("dependencies.mintFromQbo(");
+    assert.ok(persistAt >= 0, "the pull must still CALL persistConflicts");
+    assert.ok(mintAt >= 0, "the pull must still CALL mintFromQbo");
     assert.ok(
-        pull.indexOf("dependencies.persistConflicts(") < pull.indexOf("dependencies.mintFromQbo("),
+        persistAt < mintAt,
         "the conflict record must be written before anything irreversible reads it",
     );
     // And the mint dependency is absent — not disabled — when the store is bad.

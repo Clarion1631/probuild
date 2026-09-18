@@ -704,11 +704,146 @@ test("F2: a record this run could NOT write stops the mint and the checkpoint", 
     });
     assert.deepEqual(order, ["ingest", "persistConflicts"], "no mint, and no checkpoint to step the window past this one");
     assert.equal(summary.ok, false);
+    assert.equal(summary.complete, false, "and nothing may certify a run whose exclusion set was never recorded");
     assert.equal(summary.error, "conflict-store-unwritable");
     assert.equal(summary.conflictStore, "unwritable");
     assert.equal(summary.minted, null);
     assert.equal(summary.mintSkipped, "conflict-store-unwritable");
     assert.equal(summary.highWater, undefined, "the window is retried, not advanced over");
+});
+
+test("F5: a record this run could not READ stops them at the same point — the checkpoint never moves", async () => {
+    /**
+     * THE BLOCKER ROUND 2 FOUND. The caller reads the durable record before the
+     * pull (the mint's exclusion set comes from it), so an unreadable one used
+     * to be acted on AFTER this function returned — by which time the window
+     * state had already been saved with an advanced high-water mark, because
+     * that save is gated on `summary.ok` and nothing had made it false yet. The
+     * restatements found that night were persisted nowhere, and the pull's
+     * 3-day re-fetch overlap is far shorter than the 60-day mint lookback, so
+     * once they aged out the register would never offer them again while the
+     * mint still would have taken them.
+     */
+    const order: string[] = [];
+    const saved: unknown[] = [];
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        conflictStoreUnreadable: true,
+        windowState: { highWater: null, lastFullSweep: null, continueAfter: null },
+        saveWindowState: async next => { order.push("saveState"); saved.push(next); },
+        fetchRows: async () => ({ rows: FIVE_ROW_FIXTURE, stale: false, clearedProbeOk: true }),
+        ingest: async (_account, lines) => { order.push("ingest"); return committed(lines, [0]); },
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+        mintFromQbo: async () => { order.push("mint"); return { minted: 1, skipped: {} }; },
+    });
+    /**
+     * THE CLEAN LINES STILL LAND. That is the quarantine mode working as
+     * intended and it is safe — the ingest is idempotent, and because the window
+     * is not advanced the next run re-offers this same span and re-detects the
+     * restatement.
+     */
+    assert.deepEqual(order, ["ingest"], "the ingest runs; nothing irreversible follows it");
+    assert.equal(saved.length, 0);
+    assert.equal(summary.inserted, 3, "and whatever was not restated is stored");
+    assert.equal(summary.highWater, undefined, "the high-water mark is untouched");
+    assert.equal(summary.ok, false);
+    assert.equal(summary.complete, false);
+    assert.equal(summary.error, "conflict-store-unreadable");
+    assert.equal(summary.conflictStore, "unreadable");
+    assert.equal(summary.minted, null);
+    assert.equal(summary.mintSkipped, "conflict-store-unreadable");
+    assert.equal(summary.restatementConflicts?.length, 1,
+        "the conflict is still FOUND and reported — it is the checkpoint that must not move past it");
+});
+
+test("F2: with SEVERAL batches, every ingest still precedes the record, the mint and the checkpoint", async () => {
+    /**
+     * The one-batch case cannot tell "after the last ingest" from "after the
+     * first". A record written between batches would exclude only what had been
+     * seen so far, and the mint that follows would run over the rest.
+     */
+    const order: string[] = [];
+    await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        windowState: { highWater: null, lastFullSweep: null, continueAfter: null },
+        saveWindowState: async () => { order.push("saveState"); },
+        fetchRows: async () => ({ rows: manyRows(3), stale: false, clearedProbeOk: true }),
+        ingest: async (_account, lines) => { order.push("ingest"); return committed(lines, [0]); },
+        persistConflicts: async () => { order.push("persistConflicts"); return { ok: true, entries: [] }; },
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+        mintFromQbo: async () => {
+            order.push("mint");
+            return { minted: 0, skipped: {}, complete: true, remainingCursor: null };
+        },
+    });
+    assert.deepEqual(order, ["ingest", "ingest", "ingest", "persistConflicts", "mint", "saveState"]);
+    assert.ok(
+        order.lastIndexOf("ingest") < order.indexOf("persistConflicts"),
+        "the LAST batch, not merely the first, is covered by the record the mint reads",
+    );
+});
+
+test("AC10d: the flood boundary is exactly MAX_CONFLICTS_PER_RUN, and it is counted across batches", async t => {
+    const runWith = async (perBatch: readonly number[]) => {
+        let batch = 0;
+        let minted = false;
+        const summary = await runBankRegisterPull({
+            now: () => Date.parse("2026-08-12T02:00:00Z"),
+            conflictMode: "quarantine",
+            fetchRows: async () => ({ rows: manyRows(perBatch.length), stale: false, clearedProbeOk: true }),
+            ingest: async (_account, lines) =>
+                committed(lines, Array.from({ length: perBatch[batch++] ?? 0 }, (_unused, i) => i)),
+            reconcile: async () => ({ linked: 0, proposed: 0 }),
+            mintFromQbo: async () => {
+                minted = true;
+                return { minted: 0, skipped: {}, complete: true, remainingCursor: null };
+            },
+        });
+        return { summary, minted };
+    };
+
+    await t.test("exactly the limit is a busy human, not a flood — and the mint still runs", async () => {
+        const { summary, minted } = await runWith([MAX_CONFLICTS_PER_RUN]);
+        assert.equal(summary.conflictFlood, undefined);
+        assert.equal(summary.restatementConflicts?.length, MAX_CONFLICTS_PER_RUN);
+        assert.equal(minted, true, "narrowed by the fifty, but it runs — blocking it is the freeze being fixed");
+    });
+
+    await t.test("one more is a flood", async () => {
+        const { summary, minted } = await runWith([MAX_CONFLICTS_PER_RUN + 1]);
+        assert.equal(summary.conflictFlood, true);
+        assert.equal(minted, false);
+        assert.equal(summary.mintSkipped, "conflict-flood");
+    });
+
+    await t.test("and the threshold may be crossed BETWEEN batches — the count is the run's, not the batch's", async () => {
+        const { summary, minted } = await runWith([30, 25]);
+        assert.equal(summary.conflictFlood, true);
+        assert.equal(summary.restatementConflicts?.length, 55);
+        assert.equal(minted, false);
+    });
+});
+
+test("G3: a STALE fetch verifies NOTHING — a cache agreeing with our own store is not QuickBooks agreeing", async () => {
+    /**
+     * Verification is the one claim that DELETES a durable conflict, and a
+     * deleted conflict is one the mint stops excluding — permanent, because
+     * `BankLine.amountCents` is immutable by trigger. A stale fetch asked
+     * QuickBooks nothing, so it can never be that evidence. What it FINDS is
+     * still recorded: forgetting needs evidence, remembering does not.
+     */
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        conflictMode: "quarantine",
+        fetchRows: async () => ({ rows: FIVE_ROW_FIXTURE, stale: true, clearedProbeOk: true }),
+        ingest: async (_account, lines) => committed(lines, [0]),
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+    });
+    assert.equal(summary.stale, true);
+    assert.deepEqual(summary.verifiedQbTxnIds, []);
+    assert.equal(summary.restatementConflicts?.length, 1, "but a conflict it saw is still reported");
 });
 
 test("AC10a: a flood holds the mint and the stamp — and does NOT stop the run", async () => {

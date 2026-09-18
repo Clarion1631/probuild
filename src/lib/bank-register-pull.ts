@@ -935,6 +935,24 @@ export interface BankRegisterPullDependencies {
         verifiedQbTxnIds: readonly string[],
     ): Promise<{ ok: boolean; reason?: string | null; entries: ReadonlyArray<{ qbTxnId: string }> }>;
     /**
+     * The caller could not READ the durable restatement record, and says so
+     * BEFORE the run rather than after it.
+     *
+     * The record is read outside this function, because the mint's exclusion set
+     * is built from it. An unreadable one used to be applied outside too — after
+     * this function had already saved the advanced window state, since that save
+     * is gated on `summary.ok` and nothing had yet made it false. The
+     * restatements the run found that night were persisted nowhere, and once
+     * they aged past the pull's 3-day re-fetch overlap the window never offered
+     * them again, while the 60-day mint lookback still would have minted them.
+     *
+     * Handed in, it lands at exactly the same point as an unwritable store: the
+     * clean lines still ingest (that is the quarantine mode working), and the
+     * mint and the checkpoint are both held, so the next run re-offers this same
+     * window and re-detects what it found.
+     */
+    conflictStoreUnreadable?: boolean;
+    /**
      * Runs the reconcile step for the account. Errors here never fail the pull.
      *
      * `deadlineAt` is an ABSOLUTE epoch-ms deadline, already reduced by
@@ -1116,9 +1134,11 @@ export interface BankRegisterPullSummary {
      */
     conflictFlood?: boolean;
     /**
-     * The durable restatement store could not be WRITTEN this run. Set by the
-     * pull; the cron sets `"unreadable"` for the read it does before the run.
-     * Either way the mint exclusion cannot be enforced.
+     * The durable restatement store could not be READ before this run, or
+     * WRITTEN during it. Both are set by the pull — the read happens in the
+     * caller but travels in as `conflictStoreUnreadable`, so both land at the
+     * same point, before the mint and before the checkpoint. Either way the
+     * mint exclusion cannot be enforced.
      */
     conflictStore?: "unreadable" | "unwritable";
     /** Rows posted under a `<qbTxnId>#<ordinal>` split identity this run. */
@@ -1162,7 +1182,7 @@ export interface BankRegisterPullSummary {
     highWater?: string | null;
     /** Why minting was held back this run, when it was. */
     mintSkipped?: "stale-fetch" | "quarantined" | "ingest-failed" | "incomplete-window" | "cleared-probe-failed"
-        | "conflict-flood" | "conflict-store-unwritable";
+        | "conflict-flood" | "conflict-store-unwritable" | "conflict-store-unreadable";
     /**
      * The window this run parked for a continuation to re-run, or null when it
      * parked none (and cleared any it inherited). Reported so a failed probe is
@@ -1486,7 +1506,20 @@ export async function runBankRegisterPull(
     // even when the run failed: the verified list is what lets the durable
     // record self-clear (an id re-read and agreed on is deleted), and a
     // truncated or failed run must not cause a conflict record to be forgotten.
-    summary.verifiedQbTxnIds = [...new Set(verifiedQbTxnIds)];
+    /**
+     * A STALE FETCH IS NOT POSITIVE EVIDENCE (Codex round-49 gate).
+     *
+     * Verification is the one claim that DELETES a durable conflict record, and
+     * it means "we asked QuickBooks again and it agrees with what we hold". A
+     * stale fetch asked nobody: the rows are a cached copy from an earlier run,
+     * so re-posting them says only that our own cache agrees with our own
+     * store. Letting them verify would let a run QuickBooks never answered
+     * self-clear a conflict and re-open the observation to the mint —
+     * permanent, because `amountCents` is immutable by trigger. Conflicts such
+     * a run FINDS are still recorded: forgetting needs evidence, remembering
+     * does not.
+     */
+    summary.verifiedQbTxnIds = fetched.stale ? [] : [...new Set(verifiedQbTxnIds)];
     if (conflictsById.size > 0) {
         summary.restatementConflicts = [...conflictsById.values()]
             .sort((a, b) => a.qbTxnId.localeCompare(b.qbTxnId));
@@ -1515,10 +1548,24 @@ export async function runBankRegisterPull(
      * When it cannot be written this run does not mint, does not advance or
      * save the window (the `summary.ok` gate below already skips that save), and
      * says so — so the same window is retried rather than silently stepped over.
+     *
+     * And when it could not be READ — decided by the caller before the run, and
+     * handed in — exactly the same thing happens, at exactly this point. That
+     * decision used to be applied after this function returned, by which time
+     * the window state had already been saved with an advanced high-water mark:
+     * the night's restatements were recorded nowhere and the window that would
+     * have re-offered them had moved on.
      */
     let conflictStoreUnwritable = false;
+    const conflictStoreUnreadable = dependencies.conflictStoreUnreadable === true;
     let durableConflictIds: string[] | null = null;
-    if (dependencies.persistConflicts) {
+    if (conflictStoreUnreadable) {
+        summary.conflictStore = "unreadable";
+        summary.ok = false;
+        summary.complete = false;
+        summary.error = summary.error ?? "conflict-store-unreadable";
+        console.error("[bank-register-pull] restatement record unreadable; not minting and not advancing the window");
+    } else if (dependencies.persistConflicts) {
         const outcome = await dependencies.persistConflicts(
             summary.restatementConflicts ?? [],
             summary.verifiedQbTxnIds ?? [],
@@ -1611,17 +1658,19 @@ export async function runBankRegisterPull(
         summary.minted = null;
         summary.mintSkipped = fetched.stale
             ? "stale-fetch"
-            : conflictStoreUnwritable
-                ? "conflict-store-unwritable"
-                : conflictFlood
-                    ? "conflict-flood"
-                    : quarantined.length > 0
-                        ? "quarantined"
-                        : !clearedProbeOk
-                            ? "cleared-probe-failed"
-                            : summary.ok
-                                ? "incomplete-window"
-                                : "ingest-failed";
+            : conflictStoreUnreadable
+                ? "conflict-store-unreadable"
+                : conflictStoreUnwritable
+                    ? "conflict-store-unwritable"
+                    : conflictFlood
+                        ? "conflict-flood"
+                        : quarantined.length > 0
+                            ? "quarantined"
+                            : !clearedProbeOk
+                                ? "cleared-probe-failed"
+                                : summary.ok
+                                    ? "incomplete-window"
+                                    : "ingest-failed";
     }
     if (dependencies.mintFromQbo && mintIsSafe) {
         try {
