@@ -971,6 +971,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // decays silently while the work runs.
             deadline: invocationDeadline,
             isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
+            // Opt-IN, and SEPARATE from the push switch on purpose: with the
+            // QuickBooks push off and this on, booking writes the ProBuild
+            // Expense natively and never calls QuickBooks. Read fresh here for
+            // the same reason the two above are.
+            isNativeBookingEnabled: () => process.env.RECEIPT_BOOK_NATIVE === "true",
             isPushPaused: () => isPaused(PAUSE_KEYS.receiptPush),
             // Same env read as the worker's own isDryRunEnabled — read fresh
             // here too, since book() is the last stop before a real QBO write.

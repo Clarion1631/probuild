@@ -192,6 +192,12 @@ function recorder(
         estimates?: { id: string }[];
         intakeStillBooking?: boolean;
         existingExpense?: Record<string, unknown> | null;
+        /**
+         * `ReceiptIntake.expenseId` — the NATIVE booking's identity key. Set by
+         * a test that models a row this pipeline already booked without a
+         * QuickBooks Purchase.
+         */
+        intakeExpenseId?: string | null;
     } = {},
 ): Recorder {
     const intakeStillBooking = opts.intakeStillBooking !== false;
@@ -209,9 +215,12 @@ function recorder(
         projectStatus: string;
         costCodeActive: boolean;
         estimateProjectId: string | null;
+        intakeExpenseId: string | null;
     } = {
         // Set by a test to model a Purchase that is ALREADY booked.
         existingExpense: opts.existingExpense ?? null,
+        // The native identity: what this intake row is already linked to.
+        intakeExpenseId: opts.intakeExpenseId ?? null,
         // What the locked estimate says its job is. A test that models a
         // reassignment moves this.
         estimateProjectId: "proj-1",
@@ -275,6 +284,9 @@ function recorder(
             },
         },
         receiptIntake: {
+            // The NATIVE identity read. `expenseId` is `@unique` on this model,
+            // so a row that already carries one cannot be booked twice.
+            findUnique: async () => ({ expenseId: state.intakeExpenseId }),
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
             // TWO fenced writes, in one transaction: the state fence
             // (`state: 'BOOKING'`) refuses when a human voided the row, and the
@@ -337,6 +349,9 @@ function recorder(
     const deps: BookDependencies = {
         db: tx as any,
         isPushEnabled: () => true,
+        // OFF by default, so every test written before native booking existed
+        // exercises exactly the path it always did.
+        isNativeBookingEnabled: () => false,
         isPushPaused: async () => false,
         isDryRunEnabled: () => false,
         getTokens: async () => ({ accessToken: "t", realmId: "r" }) as any,
@@ -2922,4 +2937,202 @@ test("the post-fill attribution check runs even when there was nothing to fill",
     // be passing because a guarded fill happened to run.
     assert.equal(rec.expenseUpdates.length, 0, "no fill was issued");
     assert.equal(rec.events.length, 0, "and nothing is logged as booked");
+});
+
+// ── NATIVE BOOKING: a job cost without a QuickBooks Purchase ───────────────
+//
+// The bank-only cutover. ProBuild owns receipts and job costing; QuickBooks is
+// the bank feed the bookkeeper works from. With `QBO_RECEIPT_PUSH_ENABLED` off
+// and `RECEIPT_BOOK_NATIVE` on, booking writes the Expense here and never calls
+// QuickBooks at all — so the identity key moves from `Expense.qbPurchaseId` to
+// `ReceiptIntake.expenseId`, which is `@unique` and therefore makes a
+// double-book a constraint violation rather than a silent second row.
+
+/**
+ * The native switches, plus a QuickBooks surface that THROWS if it is touched.
+ *
+ * "Makes no QBO calls" is the whole promise of this path, and a stub that
+ * quietly returns a Purchase would let a regression book one while every other
+ * assertion still passed. `isPushPaused` throws for its own reason: the pause
+ * switch means "stop writing to QuickBooks", so it must not even be consulted
+ * on a path that does not.
+ */
+const nativeOnly: Partial<BookDependencies> = {
+    isPushEnabled: () => false,
+    isNativeBookingEnabled: () => true,
+    getTokens: async () => { throw new Error("QBO must not be called"); },
+    createPurchase: async () => { throw new Error("QBO must not be called"); },
+    markSendAttempted: async () => { throw new Error("QBO must not be called"); },
+    isPushPaused: async () => { throw new Error("the pause switch must not gate a native booking"); },
+};
+
+test("NATIVE OFF: the push kill switch defers exactly as it always did", async () => {
+    // AC1. The flag is opt-IN, so an unset or "false" environment is the
+    // behaviour every other test in this file was written against.
+    const r = recorder({ isPushEnabled: () => false, isNativeBookingEnabled: () => false });
+    assert.deepEqual(await bookReceipt(row(), r.deps), { outcome: "deferred", reason: "push-disabled" });
+    assert.equal(r.purchaseCalls.length, 0);
+    assert.equal(r.expenses.length, 0, "and no Expense is written either");
+    assert.equal(r.events.length, 0);
+});
+
+test("NATIVE ON but the push is LIVE: QuickBooks still books it", async () => {
+    // AC2. The native branch is reachable only when the push is OFF. With both
+    // switches on, nothing about the QBO path changes.
+    const r = recorder({ isNativeBookingEnabled: () => true });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal((result as any).qbPurchaseId, "QB-1");
+    assert.equal(r.purchaseCalls.length, 1, "the Purchase was created");
+    assert.equal(r.expenses[0].qbPurchaseId, "QB-1");
+    assert.equal(r.events[0].detail.nativeBooking, undefined, "and it is not flagged as native");
+});
+
+test("NATIVE: one Expense, no QuickBooks call, linked to the intake row", async () => {
+    // AC3 and AC4 together — the money assertion and the "nothing was sent"
+    // assertion belong to the same booking.
+    const r = recorder(nativeOnly);
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal((result as any).qbPurchaseId, null, "there is no Purchase");
+    assert.equal((result as any).alreadyExisted, false);
+    assert.equal(r.purchaseCalls.length, 0);
+    assert.equal(r.sendMarks.length, 0, "nothing was ever marked as sent");
+
+    assert.equal(r.expenses.length, 1, "exactly one Expense");
+    const expense = r.expenses[0];
+    assert.equal(expense.qbPurchaseId, null);
+    assert.equal(expense.projectId, "proj-1");
+    assert.equal(expense.estimateId, "est-1");
+    assert.equal(expense.costCodeId, "cc-plumb");
+    assert.equal(expense.amount, 364.98);
+    assert.equal(expense.vendor, "Lowes");
+    assert.deepEqual(expense.date, startOfDateInTimeZone("2026-08-03", "America/Los_Angeles"));
+    assert.match(String(expense.description), /booked in ProBuild/);
+
+    // The link that IS the identity key on this path.
+    const linked = r.intakeUpdates.find((update: any) => "expenseId" in update);
+    assert.deepEqual(linked, { expenseId: "exp-1", claimToken: null, claimedAt: null });
+    // And the row records that it is not a QuickBooks booking.
+    const bookedWrite = r.intakeUpdates.find((update: any) => update.state === "BOOKED");
+    assert.equal(bookedWrite.qbPurchaseId, null);
+
+    // The evidence lock and its epoch bump are UNCONDITIONAL: a sweep
+    // certifying a cycle has to see evidence move under it either way.
+    assert.equal(r.lockCalls.length, 1);
+    assert.equal(r.epochBumps.length, 1);
+    // ...and the per-Purchase advisory lock is the ONE lock that is skipped —
+    // it is keyed on an id that does not exist. The Expense lock is untouched.
+    assert.deepEqual(r.locks, [], "no Purchase id to serialize on, and no Expense to lock yet");
+});
+
+test("NATIVE: re-running a booked row links, it never books twice", async () => {
+    // AC5. `ReceiptIntake.expenseId` is the identity: a row that already
+    // carries one cannot produce a second Expense.
+    const r = recorder(nativeOnly, {
+        intakeExpenseId: "exp-existing",
+        existingExpense: matchingExpense({ qbPurchaseId: null }),
+    });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal((result as any).expenseId, "exp-existing");
+    assert.equal((result as any).alreadyExisted, true);
+    assert.equal(r.expenses.length, 0, "no second Expense");
+    assert.equal(r.purchaseCalls.length, 0);
+    // The Expense row is still locked before anything is decided about it.
+    assert.deepEqual(r.locks, ["expense:exp-existing"]);
+    assert.equal(r.events[0].status, "already-exists");
+});
+
+test("NATIVE never outranks the dry run", async () => {
+    // AC6. Shadow mode is the safety promise of the whole phase, and it is
+    // checked FIRST. Both halves of it: the row's own persisted flag, and the
+    // global switch read fresh at booking time.
+    const perRow = recorder(nativeOnly);
+    assert.deepEqual(
+        await bookReceipt(row({ dryRun: true }), perRow.deps),
+        { outcome: "deferred", reason: "push-disabled" },
+    );
+    assert.equal(perRow.expenses.length, 0);
+
+    const global = recorder({ ...nativeOnly, isDryRunEnabled: () => true });
+    assert.deepEqual(
+        await bookReceipt(row({ dryRun: false }), global.deps),
+        { outcome: "deferred", reason: "push-disabled" },
+    );
+    assert.equal(global.expenses.length, 0);
+    assert.equal(global.events.length, 0);
+});
+
+test("NATIVE still logs the receipt-push event health reads", async () => {
+    // AC7, and it is load-bearing rather than tidiness: pipeline-health
+    // computes `lastReceiptPush` from this event with BOOKED_PUSH_STATUSES, and
+    // `no-receipts-72h` fires off it. Skip it and the digest reports a dead
+    // pipeline forever while it is booking every receipt correctly.
+    const r = recorder(nativeOnly);
+    await bookReceipt(row(), r.deps);
+
+    const event = r.events.find((e: any) => e.kind === "receipt-push");
+    assert.ok(event, "the event a health probe needs");
+    assert.equal(event.status, "created");
+    assert.equal(event.detail.nativeBooking, true);
+    assert.equal(event.detail.qbPurchaseId, null);
+    assert.equal(event.docNumber, undefined, "no Purchase, no DocNumber");
+    assert.equal(event.amountCents, 36498);
+    assert.equal(event.detail.expenseId, "exp-1");
+});
+
+test("NATIVE: a cost code that is no longer a phase still parks the row", async () => {
+    // AC8. The in-transaction phase invariant is not a QuickBooks guard and is
+    // not skipped with one. Posting money to a line the job does not have is
+    // exactly as wrong without a Purchase behind it.
+    // The same interleaving the QBO-path test uses: the phase is valid for both
+    // pre-write checks and gone by the time the transaction re-asks it. A
+    // blanket "no" would only prove that an unknown code books UNCODED.
+    let asked = 0;
+    const r = recorder({
+        ...nativeOnly,
+        isCostCodeAllowed: async () => { asked += 1; return asked < 3; },
+    });
+    const result = await bookReceipt(row({ costCodeId: "cc-demo" }), r.deps);
+    assert.equal(asked, 3, "asked again inside the transaction");
+
+    assert.equal(result.outcome, "needs-review");
+    assert.equal((result as any).reason, "phase-changed:not-a-phase");
+    assert.equal(r.expenses.length, 0, "no Expense was written");
+    assert.equal(
+        r.intakeUpdates.filter((update: any) => update.state === "BOOKED").length, 0,
+        "and nothing was marked BOOKED",
+    );
+});
+
+test("NATIVE: an estimate moved to another job still throws the attribution conflict", async () => {
+    // AC9 — the #512 guard. Writing `row.projectId` beside an estimate that now
+    // belongs elsewhere produces an expense on two jobs at once, and no
+    // QuickBooks Purchase is involved in that failure in either direction.
+    const r = recorder(nativeOnly);
+    r.state.estimateProjectId = "another-job";
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "needs-review");
+    assert.equal((result as any).reason, "expense-conflict:attribution");
+    assert.equal(r.expenses.length, 0, "nothing was written on either job");
+});
+
+test("NATIVE: a lost claim is stale, and nothing is reported as booked", async () => {
+    // AC10. The claim CAS is the last write in the transaction; losing it rolls
+    // the whole thing back, including the Expense and the BOOKED state.
+    const r = recorder(nativeOnly);
+    const tx = r.deps.db as any;
+    const claimFenced = tx.receiptIntake.updateMany;
+    tx.receiptIntake.updateMany = async (args: any) =>
+        args.where?.claimToken !== undefined ? { count: 0 } : claimFenced(args);
+
+    assert.deepEqual(await bookReceipt(row(), r.deps), { outcome: "stale" });
+    // The in-memory fake cannot roll a transaction back, so the durable
+    // assertion available here is that a superseded worker reported NOTHING:
+    // no audit row, and no `booked` result for the worker to persist.
+    assert.equal(r.events.length, 0, "a superseded worker logs nothing");
 });
