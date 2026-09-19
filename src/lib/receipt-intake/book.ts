@@ -2246,6 +2246,19 @@ class StaleClaimError extends Error {
  *
  * Deliberately NOT in RECOVERABLE_PARK_REASONS and not in RETRYABLE_REASONS:
  * re-running the booking finds exactly the same flag and the same question.
+ *
+ * THE EXIT, and what it does NOT do. The row sits in NEEDS_REVIEW with
+ * `sendAttempted: true`, so "Void" takes planParkWrites' KEEP branch (the
+ * release branch CASes on `sendAttempted: false` and cannot match): the row
+ * becomes VOID with `voided-by-user:possible-orphan-purchase` and its
+ * `dedupStrongKey` is DELIBERATELY LEFT IN PLACE. `dedupWeakKey` is never
+ * touched by any park write at all. So voiding does not free this receipt to be
+ * submitted again — it moves it into the Receipts tab's Exceptions group, where
+ * the unknown-orphan control is the real exit: "located" records the Purchase
+ * id and keeps the key held, "no purchase" (checked in QuickBooks, none exists)
+ * is the ONE path that clears `dedupStrongKey`. Until then a resubmission
+ * collides with that key, and with the weak key after it, and parks as a
+ * duplicate for a person rather than booking a second time.
  */
 export const NATIVE_QBO_RECONCILE_REASON = "native-qbo-reconciliation-required";
 

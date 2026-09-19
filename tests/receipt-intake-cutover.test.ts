@@ -23,6 +23,8 @@ import {
     type CutoverRow,
     type CutoverWriteClient,
 } from "../src/lib/receipt-intake/cutover";
+import { claimableStates, eligibleClaimWhere } from "../src/lib/receipt-intake/worker";
+import { serializeDetail } from "../src/lib/automation-events";
 
 test("a missing or malformed boundary is null — never epoch", () => {
     // The dangerous failure: `new Date(undefined)` style coercion yielding a
@@ -188,10 +190,35 @@ test("NATIVE changes nothing about evidence, the boundary, or the non-Drive quar
 });
 
 test("the native park reason is distinct from the non-Drive quarantine's", () => {
-    // They are terminal in the same state but they mean different things, and
-    // only one of them stops being true if the QuickBooks push comes back.
+    // Two different statements — "there is no shared identity here" versus
+    // "there is one, but the rail that used it is switched off" — so they are
+    // never collapsed into one reason, and they no longer even land in the
+    // same state (see the NEEDS_REVIEW park below).
     assert.equal(NATIVE_PRE_CUTOVER_REASON, "native-pre-cutover-unverified");
     assert.notEqual(NATIVE_PRE_CUTOVER_REASON, "no-v1-evidence");
+});
+
+test("BOTH SWITCHES ON is the QuickBooks rail — cutover included", async () => {
+    // book.ts computes `native = !pushEnabled && nativeEnabled`. With the push
+    // turned back on and native still armed (what a rollback looks like)
+    // booking goes through QuickBooks, so the Drive collapse that makes a
+    // requeue safe IS in play. Asked the bare flag instead, the triage parked
+    // those rows terminally against a collapse QuickBooks was about to make.
+    // The route's own derivation, pinned at the source in
+    // tests/receipt-intake-book.test.ts ("the worker cron wires ...").
+    const active = (pushEnabled: boolean, nativeEnabled: boolean) => !pushEnabled && nativeEnabled;
+    const rows = [candidate({ id: "before-drive", sourceRef: "drive:F2", createdAt: before })];
+
+    for (const [pushEnabled, nativeEnabled] of [[false, false], [true, false], [true, true]] as const) {
+        const cell = `push=${pushEnabled} native=${nativeEnabled}`;
+        const triage = triageCutoverRows(rows, BOUNDARY, new Set(), active(pushEnabled, nativeEnabled));
+        assert.deepEqual(triage.unevidenced, ["before-drive"], `${cell}: requeued exactly as before`);
+        assert.deepEqual(triage.nativeUnverified, [], `${cell}: nothing is parked`);
+    }
+
+    const native = triageCutoverRows(rows, BOUNDARY, new Set(), active(false, true));
+    assert.deepEqual(native.nativeUnverified, ["before-drive"], "only push-off + native-on parks");
+    assert.deepEqual(native.unevidenced, []);
 });
 
 // ── v2's own native bookings are not evidence that v1 booked anything ──────
@@ -235,6 +262,42 @@ test("a real v1 push is still evidence, and anything unreadable is read as one",
     assert.equal(isNativeBookingEvent(JSON.stringify({ nativeBooking: true })), true);
     assert.equal(isNativeBookingEvent(null), false);
     assert.equal(isNativeBookingEvent("{"), false);
+});
+
+test("`nativeBooking` survives serializeDetail however long the rest of the detail is", () => {
+    // THE FILTER ABOVE IS ONLY AS GOOD AS THE MARKER SURVIVING THE WRITE.
+    // `AutomationEvent.detail` goes through serializeDetail, which clips
+    // oversized values and — if that is still over the column budget — sheds
+    // keys LONGEST FIRST. `nativeBooking: true` is the cheapest value in the
+    // object (four characters), so it is the last thing that could ever go;
+    // losing it would make v2's own booking read back as v1 evidence and retire
+    // the next row for that file as SHADOW_DONE, silently.
+    const huge = "y".repeat(50_000);
+    const nativeDetail = (extra: Record<string, unknown>) => ({
+        fileId: "FILE-X",
+        qbPurchaseId: null,
+        nativeBooking: true,
+        intakeId: "intake-1",
+        expenseId: "exp-1",
+        ...extra,
+    });
+
+    // One oversized value: the clip stage alone brings it back under budget.
+    const clipped = serializeDetail(nativeDetail({ sourceRef: `drive:${huge}` })) as string;
+    assert.ok(clipped.length <= 4000, "the column budget is respected");
+    assert.equal(JSON.parse(clipped).nativeBooking, true);
+
+    // Many oversized values, so the SHED loop really runs and really drops
+    // keys — the case the marker has to outlive.
+    const shed = serializeDetail(nativeDetail(Object.fromEntries(
+        Array.from({ length: 20 }, (_, i) => [`field${i}`, huge]),
+    ))) as string;
+    assert.ok(shed.length <= 4000);
+    const parsed = JSON.parse(shed);
+    assert.equal(parsed.truncated, true, "this really is the truncating path");
+    assert.ok((parsed.droppedKeys ?? []).length > 0, "and keys really were dropped");
+    assert.equal(parsed.nativeBooking, true, "but never this one");
+    assert.equal(isNativeBookingEvent(shed), true, "so the cutover still reads it as ours");
 });
 
 test("the cutover asks the events for `detail`, or the filter has nothing to read", () => {
@@ -345,6 +408,102 @@ test("a row taken off the shadow switch mid-pass is not handed to v2 twice", asy
     state.rows[0].dryRun = false;
     const moved = await applyCutoverVerdict([observed], { dryRun: false, nextRetryAt: null }, db);
     assert.deepEqual(moved, { moved: 0, skippedMoved: 1 });
+});
+
+// ── The native park has a working human exit ───────────────────────────────
+//
+// SHADOW_QUARANTINE was the wrong place to leave these rows: it appears in no
+// Receipts-tab group, "Set job" refuses it, retry refuses it, and the "book
+// anyway" action the comment promised does not exist. So they went into a state
+// nobody could see and nobody could act on. NEEDS_REVIEW is the fix — the tab
+// renders it with the document link, and its two existing buttons are the two
+// decisions a person has to make.
+
+/** The verdict the worker cron writes for these rows. Pinned to the route below. */
+const NATIVE_PARK = {
+    state: "NEEDS_REVIEW",
+    stateReason: NATIVE_PRE_CUTOVER_REASON,
+    nextRetryAt: null,
+    dryRun: false,
+};
+
+/**
+ * The cutover's candidate predicate, mirrored from the route's `parked` where
+ * clause — pinned at the source in the test below, because a mirror that drifts
+ * would prove the opposite of what it claims.
+ */
+const isCutoverCandidate = (r: Record<string, unknown>) =>
+    r.dryRun === true && ["READ", "BOOKING"].includes(String(r.state));
+
+test("the native park lands in NEEDS_REVIEW, where a person can actually reach it", async () => {
+    const observed = row({ id: "before-drive", sourceRef: "drive:F2", createdAt: before });
+    // The strong dedup key rides along: these rows may correspond to a real
+    // Purchase, so nothing here may release it.
+    const { state, db } = store([{ ...observed, dedupStrongKey: "strong-1" }]);
+
+    const held = await applyCutoverVerdict([observed], NATIVE_PARK, db);
+    assert.deepEqual(held, { moved: 1, skippedMoved: 0 });
+
+    const parked = state.rows[0];
+    assert.equal(parked.state, "NEEDS_REVIEW", "the Receipts tab's Needs review group shows it");
+    assert.equal(parked.stateReason, NATIVE_PRE_CUTOVER_REASON, "and says why it is there");
+    assert.equal(parked.nextRetryAt, null, "nothing brings it back on a timer");
+    assert.equal(parked.dryRun, false, "it is off the shadow switch for good");
+    assert.equal(parked.dedupStrongKey, "strong-1", "the strong key is untouched");
+
+    // NEEDS_REVIEW is not claimable, so the worker cannot pick the row up and
+    // decide for the human while it waits.
+    assert.ok(!claimableStates(false).includes("NEEDS_REVIEW"), "no auto-claim");
+    // ...and the cutover itself will not revisit it: `dryRun: false` is not a
+    // candidate, whatever the switches say later.
+    assert.equal(isCutoverCandidate(parked), false);
+});
+
+test("SET JOB is the 'book it' exit: the next triage ignores the row and booking takes it", async () => {
+    const observed = row({ id: "before-drive", sourceRef: "drive:F2", createdAt: before });
+    const { state, db } = store([observed]);
+    await applyCutoverVerdict([observed], NATIVE_PARK, db);
+
+    // setReceiptIntakeJob's write, verbatim: the row goes back to READ with the
+    // reason cleared. `dryRun` stays false — the park already took it off the
+    // shadow switch — which is exactly what makes this row bookable.
+    Object.assign(state.rows[0], {
+        projectId: "proj-1", state: "READ", stateReason: null, lastError: null, nextRetryAt: null,
+    });
+    const requeued = state.rows[0];
+
+    // The cutover does not touch it a second time (it would otherwise re-park
+    // the row the human just released, forever).
+    assert.equal(isCutoverCandidate(requeued), false, "not a cutover candidate any more");
+
+    // And the worker's claim DOES take it: READ is claimable once the global
+    // dry run is off, and the shadow exclusion only bites `dryRun: true` rows.
+    assert.ok(claimableStates(false).includes("READ"));
+    assert.deepEqual(
+        eligibleClaimWhere(new Date("2026-09-01T00:00:00.000Z"), false).NOT,
+        { AND: [{ dryRun: true }, { state: { in: ["READ", "BOOKING"] } }] },
+        "a dryRun:false READ row is not excluded — it books on the next pass",
+    );
+});
+
+test("the worker cron really writes that park, and really selects on dryRun", () => {
+    // Both halves of the pair above are source facts: the state this park
+    // writes, and the predicate that decides it is never revisited. A silent
+    // return to SHADOW_QUARANTINE would make the row invisible again with every
+    // behavioural test still green.
+    const route = readFileSync(
+        path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+        "utf8",
+    );
+    assert.match(
+        route,
+        /rowsFor\(nativeUnverified\),\s*\{\s*state: "NEEDS_REVIEW",\s*stateReason: NATIVE_PRE_CUTOVER_REASON,/,
+    );
+    assert.match(route, /const parked: Prisma\.ReceiptIntakeWhereInput = \{\s*dryRun: true,\s*state: \{ in: \["READ", "BOOKING"\] \},\s*\};/);
+    // Counted on its own, never folded into the quarantine it no longer shares
+    // a state with.
+    assert.doesNotMatch(route, /shadowQuarantined \+= held\.moved;/);
+    assert.match(route, /nativeUnverifiedHeld = held\.moved;/);
 });
 
 test("the CAS carries the WHOLE parked predicate plus the observed evidence", async () => {

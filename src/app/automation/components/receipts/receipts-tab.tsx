@@ -111,11 +111,19 @@ export function ReceiptsTab({
     filters,
     jobs,
     filterHref,
+    nativeActive,
 }: {
     queue: ReceiptQueue;
     filters: ReceiptFilters;
     jobs: Array<{ id: string; name: string }>;
     filterHref: (overrides: { group?: string; owner?: string }) => string;
+    /**
+     * Is ProBuild booking these itself? The SAME derivation the pause control
+     * uses (`!pushEnabled && nativeBookingEnabled`), threaded in as a prop
+     * rather than re-read here, so the two surfaces cannot name different
+     * rails. With it on, nothing in this queue goes to QuickBooks.
+     */
+    nativeActive: boolean;
 }) {
     const counts: Record<ReceiptGroup, number> = {
         "needs-job": queue.counts.needsJob,
@@ -147,7 +155,13 @@ export function ReceiptsTab({
             </p>
             <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
                 <StatCard label="Waiting on a person (intake queue)" value={String(counts["needs-job"] + counts["needs-review"])} sub="Queue receipts that need a job or a decision" />
-                <StatCard label="In flight (intake queue)" value={String(counts.booking)} sub="Queue receipts booking into QuickBooks" />
+                <StatCard
+                    label="In flight (intake queue)"
+                    value={String(counts.booking)}
+                    sub={nativeActive
+                        ? "Queue receipts booking into ProBuild job costing"
+                        : "Queue receipts booking into QuickBooks"}
+                />
                 <StatCard label="Missing receipts" value={String(counts["missing-receipts"])} sub="Open receipt requests for bank charges" />
             </div>
 

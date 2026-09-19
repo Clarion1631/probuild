@@ -97,9 +97,16 @@ export interface CutoverTriage {
 /**
  * The park reason those rows carry.
  *
- * Distinct from `no-v1-evidence` (the non-Drive quarantine) on purpose: this
- * one is only unsafe BECAUSE booking is native, so if the QuickBooks push is
- * ever restored the same rows become requeueable again and the reason says why.
+ * Distinct from `no-v1-evidence` (the non-Drive quarantine) on purpose: that
+ * one says "there is no shared identity here", this one says "there is one, but
+ * the rail that used it is switched off".
+ *
+ * NOT reversible by restoring the QuickBooks push. The park writes
+ * `dryRun: false` and the cutover only ever selects `dryRun: true` rows, so no
+ * later pass revisits them whatever the switches say. A person is the only
+ * exit, which is why the row is parked in NEEDS_REVIEW where the Receipts tab
+ * shows it — see the write in the worker cron for the two buttons that are
+ * that exit.
  */
 export const NATIVE_PRE_CUTOVER_REASON = "native-pre-cutover-unverified";
 
@@ -197,7 +204,16 @@ export function triageCutoverRows(
     candidates: CutoverCandidate[],
     boundary: Date,
     bookedByV1: ReadonlySet<string>,
-    /** RECEIPT_BOOK_NATIVE. Off = the QuickBooks rail, unchanged. */
+    /**
+     * IS NATIVE BOOKING THE RAIL THAT WILL ACTUALLY BOOK THESE ROWS?
+     *
+     * Not the bare `RECEIPT_BOOK_NATIVE` flag: booking takes the native branch
+     * only while the QuickBooks push is OFF, so the caller must pass the
+     * EFFECTIVE predicate (`!pushEnabled && nativeEnabled`). Passing the flag
+     * alone parks rows terminally, in the one configuration where both are on,
+     * against a collapse QuickBooks was about to perform. Off = the QuickBooks
+     * rail, unchanged.
+     */
     nativeBooking = false,
 ): CutoverTriage {
     const triage: CutoverTriage = { evidenced: [], unevidenced: [], quarantined: [], nativeUnverified: [] };

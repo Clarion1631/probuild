@@ -3305,6 +3305,32 @@ test("NATIVE honours the Command Center pause, and writes NOTHING while paused",
     assert.equal(live.state.expenseRows.size, 1);
 });
 
+test("the PAUSE truth table: which switch answers first, in all four cells", async () => {
+    // The two remaining cells. The order of the gates is the subject: "the push
+    // is off and nothing replaces it" is answered BEFORE the pause is even
+    // read, so a paused, fully-off pipeline reports `push-disabled` rather than
+    // claiming a human paused it — and with the push LIVE the pause still wins
+    // over a native flag that is armed but unreachable.
+    const paused = { isPushPaused: async () => true } as const;
+
+    const bothOff = recorder({ isPushEnabled: () => false, isNativeBookingEnabled: () => false, ...paused });
+    assert.deepEqual(
+        await bookReceipt(row(), bothOff.deps),
+        { outcome: "deferred", reason: "push-disabled" },
+        "nothing is booking, so the pause is not the reason",
+    );
+    assert.equal(bothOff.state.expenseRows.size, 0);
+
+    const bothOn = recorder({ isPushEnabled: () => true, isNativeBookingEnabled: () => true, ...paused });
+    assert.deepEqual(
+        await bookReceipt(row(), bothOn.deps),
+        { outcome: "deferred", reason: "push-paused" },
+        "the QuickBooks rail is live and a human stopped it",
+    );
+    assert.equal(bothOn.purchaseCalls.length, 0);
+    assert.equal(bothOn.state.expenseRows.size, 0, "and nothing booked natively either");
+});
+
 test("NATIVE refuses a row a QuickBooks send was ever attempted for", async () => {
     // `sendAttempted` means a create was ISSUED — possibly successfully, with
     // the response lost. A native Expense carries no `qbPurchaseId`, so nothing
@@ -3350,6 +3376,35 @@ test("NATIVE re-reads sendAttempted INSIDE the transaction and aborts on it", as
     assert.equal(r.state.expenseRows.size, 0, "no Expense was committed");
     assert.equal(r.state.intake.state, "BOOKING", "and no BOOKED write survived");
     assert.equal(r.state.intake.expenseId, null);
+    assert.equal(r.events.length, 0);
+});
+
+test("NATIVE: the ENTRY gate refuses on the CLAIMED snapshot, before any work", async () => {
+    // The two checks are NOT redundant, and this is the case that proves it.
+    // Delete the entry gate and every other test here still passes, because
+    // their persisted `sendAttempted` agrees with the claimed one and the
+    // in-transaction re-read catches the row anyway. Here they DISAGREE: the
+    // claim saw a send this pass knows about and the stored row still says
+    // false, so the entry gate is the only thing that can refuse — and it has
+    // to refuse before the receipt is even fetched.
+    let downloads = 0;
+    const r = recorder({
+        ...nativeOnly,
+        downloadBytes: async () => {
+            downloads += 1;
+            return { ok: true as const, bytes: Buffer.from("bytes") };
+        },
+    }, { intakeSendAttempted: false });
+
+    const result = await bookReceipt(row({ sendAttempted: true }), r.deps);
+    assert.deepEqual(result, {
+        outcome: "needs-review",
+        reason: "native-qbo-reconciliation-required",
+        releaseStrongKey: false,
+    });
+    assert.equal(downloads, 0, "short-circuited before any work — no storage round trip");
+    assert.equal(r.state.expenseRows.size, 0, "no Expense");
+    assert.deepEqual(r.intakeUpdates, [], "and no write of any kind");
     assert.equal(r.events.length, 0);
 });
 
@@ -3440,16 +3495,33 @@ test("the worker cron wires RECEIPT_BOOK_NATIVE into booking AND into the cutove
     // The flag is only worth anything if the route reads it, and it has to
     // reach BOTH consumers: booking (which writes the Expense) and the cutover
     // triage (which decides whether a pre-boundary Drive row may be handed to
-    // booking at all). One reader, so the two cannot disagree.
+    // booking at all). One reader each, so the two cannot disagree.
     const route = readFileSync(
         path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
         "utf8",
     );
     assert.match(route, /const isNativeBookingEnabled = \(\) => process\.env\.RECEIPT_BOOK_NATIVE === "true";/);
-    assert.match(route, /triageCutoverRows\(candidates, opts\.boundary, bookedByV1, isNativeBookingEnabled\(\)\)/);
-    assert.match(route, /^\s*isNativeBookingEnabled,$/m, "and booking gets the same reader");
-    assert.equal(
-        route.split("process.env.RECEIPT_BOOK_NATIVE").length - 1, 1,
-        "exactly one read of the env var — a second copy is how two call sites drift",
+    assert.match(route, /const isPushEnabled = \(\) => process\.env\.QBO_RECEIPT_PUSH_ENABLED === "true";/);
+    assert.match(route, /^\s*isPushEnabled,$/m, "booking gets the push reader");
+    assert.match(route, /^\s*isNativeBookingEnabled,$/m, "and the native one");
+    for (const env of ["RECEIPT_BOOK_NATIVE", "QBO_RECEIPT_PUSH_ENABLED"]) {
+        assert.equal(
+            route.split(`process.env.${env}`).length - 1, 1,
+            `exactly one read of ${env} — a second copy is how two call sites drift`,
+        );
+    }
+
+    // THE CUTOVER IS ASKED THE EFFECTIVE QUESTION, not the bare flag.
+    //
+    // book.ts books natively only when `!pushEnabled && nativeEnabled`. With
+    // both switches on — native armed and the push turned back on, which is
+    // what a rollback looks like — booking goes to QuickBooks while the bare
+    // flag still says "native", and the triage would have terminally parked
+    // pre-boundary Drive rows against a collapse QuickBooks was about to make.
+    assert.match(
+        route,
+        /const isNativeBookingActive = \(\) => !isPushEnabled\(\) && isNativeBookingEnabled\(\);/,
+        "one derivation, from the same two readers booking uses",
     );
+    assert.match(route, /triageCutoverRows\(candidates, opts\.boundary, bookedByV1, isNativeBookingActive\(\)\)/);
 });

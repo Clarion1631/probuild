@@ -881,8 +881,15 @@ async function ReceiptsTabBranch({ sp }: { sp: Record<string, string | string[] 
         console.error("receipt queue fetch failed", error instanceof Error ? error.message : "UnknownError");
     }
 
+    // The SAME derivation the pause control is given (`!pushEnabled &&
+    // nativeBookingEnabled`): booking takes the native branch precisely when
+    // the QuickBooks push is off, so the tab must not promise QuickBooks on a
+    // rail that never calls it.
+    const nativeActive = process.env.QBO_RECEIPT_PUSH_ENABLED !== "true"
+        && process.env.RECEIPT_BOOK_NATIVE === "true";
+
     const body: ReactNode = queue
-        ? <ReceiptsTab queue={queue} filters={filters} jobs={jobs} filterHref={receiptFilterHref} />
+        ? <ReceiptsTab queue={queue} filters={filters} jobs={jobs} filterHref={receiptFilterHref} nativeActive={nativeActive} />
         : (
             <div className="hui-card p-5 text-sm text-hui-textMuted">
                 The receipt queue couldn&apos;t be loaded right now — the register is still available.

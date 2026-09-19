@@ -15,7 +15,7 @@ const queue: ReceiptQueue = {
 test("empty receipt queue explains its scope without asserting company-wide completion", () => {
     const html = renderToStaticMarkup(createElement(ReceiptsTab, {
         queue, filters: {group: null, projectId: null, owner: null}, jobs: [],
-        filterHref: () => "/automation?tab=receipts",
+        filterHref: () => "/automation?tab=receipts", nativeActive: false,
     }));
     assert.match(html, /href="\/automation\?tab=register"[^>]*>View register<\/a>/);
     assert.match(html, /Booked today[\s\S]*queue|queue[\s\S]*Booked today/);
@@ -27,9 +27,28 @@ test("empty receipt queue explains its scope without asserting company-wide comp
 test("scope and register navigation remain visible for a filtered empty group", () => {
     const html = renderToStaticMarkup(createElement(ReceiptsTab, {
         queue, filters: {group: "booked-today", projectId: "project-filter", owner: "Richard"}, jobs: [],
-        filterHref: () => "/automation?tab=receipts",
+        filterHref: () => "/automation?tab=receipts", nativeActive: false,
     }));
     assert.match(html, /href="\/automation\?tab=register"[^>]*>View register<\/a>/);
     assert.match(html, /queue/);
     assert.doesNotMatch(html, /every receipt|every bank charge/);
+});
+
+test("the in-flight tile names the rail these receipts are actually booking into", () => {
+    // With native booking live NOTHING in this queue is sent to QuickBooks, so
+    // "booking into QuickBooks" is simply false — the same rail question the
+    // pause control answers, and the same derivation (`!pushEnabled &&
+    // nativeBookingEnabled`), threaded in rather than re-read here.
+    const render = (nativeActive: boolean) => renderToStaticMarkup(createElement(ReceiptsTab, {
+        queue, filters: {group: null, projectId: null, owner: null}, jobs: [],
+        filterHref: () => "/automation?tab=receipts", nativeActive,
+    }));
+
+    const native = render(true);
+    assert.match(native, /Queue receipts booking into ProBuild job costing/);
+    assert.doesNotMatch(native, /booking into QuickBooks/);
+
+    const qbo = render(false);
+    assert.match(qbo, /Queue receipts booking into QuickBooks/, "the QuickBooks rail is unchanged");
+    assert.doesNotMatch(qbo, /booking into ProBuild job costing/);
 });
