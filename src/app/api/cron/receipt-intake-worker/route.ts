@@ -37,6 +37,8 @@ import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import {
     applyCutoverVerdict,
     driveFileIdOf,
+    NATIVE_PRE_CUTOVER_REASON,
+    v1BookedDriveIds,
     triageCutoverRows, resolveCutoverBoundary, type CutoverRow } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { bookReceipt, type BookPrismaClient } from "@/lib/receipt-intake/book";
@@ -142,6 +144,39 @@ const WORKER_ROW_SELECT = {
 const RELEASE_CLAIM = { claimToken: null, claimedAt: null } as const;
 
 /**
+ * RECEIPT_BOOK_NATIVE — opt-IN, and SEPARATE from the push switch on purpose:
+ * with the QuickBooks push off and this on, booking writes the ProBuild Expense
+ * natively and never calls QuickBooks.
+ *
+ * ONE reader for the whole route. Booking consults it (as an injected dep) and
+ * so does the cutover triage, and they must never disagree about which rail is
+ * live: the triage decides whether a pre-boundary Drive row may be handed to
+ * booking at all, and its whole safety argument is the QuickBooks idempotency
+ * that a native booking does not use. Read fresh at each call, like every other
+ * env switch here — the env var is the kill switch, so a cached copy would
+ * outlive a deploy that turned it off.
+ */
+const isNativeBookingEnabled = () => process.env.RECEIPT_BOOK_NATIVE === "true";
+
+/** QBO_RECEIPT_PUSH_ENABLED — ONE reader, for the same reason. */
+const isPushEnabled = () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true";
+
+/**
+ * IS THE NATIVE RAIL THE ONE THAT WILL ACTUALLY BOOK?
+ *
+ * `RECEIPT_BOOK_NATIVE` on its own does not answer that. book.ts takes the
+ * native branch only when the QuickBooks push is OFF (`!pushEnabled &&
+ * native`), so with BOTH switches on — native armed and the push turned back
+ * on, which is exactly what a rollback looks like — booking goes through
+ * QuickBooks while the bare flag still reads "native". The cutover triage asked
+ * the bare flag, and would have parked pre-boundary Drive rows for a human on
+ * the grounds that nothing could collapse a v1/v2 overlap, while QuickBooks was
+ * about to do precisely that. ONE derivation, from the same two readers booking
+ * itself uses, so the two can never disagree about which rail is live.
+ */
+const isNativeBookingActive = () => !isPushEnabled() && isNativeBookingEnabled();
+
+/**
  * How long the invocation lease is held for.
  *
  * Longer than the route's own `maxDuration = 60`, deliberately: a lease that
@@ -180,6 +215,8 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
         let shadowRetired = 0;
         let shadowQuarantined = 0;
         let requeued = 0;
+        /** Pre-boundary Drive rows parked because native booking cannot collapse a v1 overlap. */
+        let nativeUnverifiedHeld = 0;
         /** Rows that moved between the select and the write, so no verdict landed. */
         let shadowSkippedMoved = 0;
         if (!opts.dryRunGlobal) {
@@ -211,7 +248,10 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 // Everything else is handed to v2. That is safe for the Drive
                 // rows this applies to: they book under the DRIVE FILE ID, so
                 // QBO's DocNumber/requestid idempotency collapses a v1/v2
-                // overlap into one Purchase.
+                // overlap into one Purchase — WHILE v2 books through
+                // QuickBooks. With RECEIPT_BOOK_NATIVE on there is no QBO call
+                // and therefore no collapse, so those rows park instead; see
+                // triageCutoverRows.
                 // EVERY parked row, not just the ones older than the
                 // boundary. Evidence outranks the timestamp: the forwarder can
                 // hand over a file v1 had ALREADY booked minutes after the
@@ -242,16 +282,19 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                     .map(driveFileIdOf)
                     .filter((v): v is string => !!v);
 
+                // v2's OWN native bookings are filtered back out of this set —
+                // they carry the same kind, status and Drive file id as a v1
+                // push and mean the opposite thing. See v1BookedDriveIds.
                 const bookedByV1 = driveIds.length
-                    ? new Set(
-                        (await tx.automationEvent.findMany({
+                    ? v1BookedDriveIds(
+                        await tx.automationEvent.findMany({
                             where: {
                                 kind: "receipt-push",
                                 status: { in: ["created", "already-exists"] },
                                 driveFileId: { in: driveIds },
                             },
-                            select: { driveFileId: true },
-                        })).map(e => e.driveFileId).filter((v): v is string => !!v),
+                            select: { driveFileId: true, detail: true },
+                        }),
                     )
                     : new Set<string>();
 
@@ -273,10 +316,19 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 //                     double-paying; retiring risks losing a
                 //                     real expense. A human checks QBO and uses
                 //                     "book anyway".
-                // ONE implementation of the three-way split, in the lib, so
-                // it is testable without standing up a cron route.
-                const { evidenced, unevidenced, quarantined } =
-                    triageCutoverRows(candidates, opts.boundary, bookedByV1);
+                //   no evidence,
+                //     DRIVE row,   -> park. The collapse above is QuickBooks
+                //     NATIVE          doing it, and native booking never calls
+                //                     QuickBooks, so there is nothing to
+                //                     collapse against: v2 would write a
+                //                     ProBuild Expense for a spend v1 may
+                //                     already have booked, with no shared key
+                //                     to reconcile the two. A human decides,
+                //                     from Needs review.
+                // ONE implementation of the split, in the lib, so it is
+                // testable without standing up a cron route.
+                const { evidenced, unevidenced, quarantined, nativeUnverified } =
+                    triageCutoverRows(candidates, opts.boundary, bookedByV1, isNativeBookingActive());
 
                 // EVERY cutover write is a CAS over the row the verdict was
                 // reached about — see applyCutoverVerdict. Constraining only
@@ -315,6 +367,63 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                     shadowSkippedMoved += held.skippedMoved;
                 }
 
+                // A HUMAN DECISION, PARKED WHERE A HUMAN CAN REACH IT.
+                //
+                // `no-v1-evidence` says "there is no shared identity here";
+                // this one says "there is one, but the rail that used it is
+                // switched off". Neither is requeueable later: this write sets
+                // `dryRun: false`, and the candidate select above requires
+                // `dryRun: true`, so no subsequent cutover pass ever revisits
+                // these rows — restoring the QuickBooks push does NOT bring
+                // them back. The person is the only exit, so the row has to
+                // land somewhere a person actually looks.
+                //
+                // NEEDS_REVIEW, not SHADOW_QUARANTINE, for exactly that reason:
+                // SHADOW_QUARANTINE appears in no Receipts-tab group, is
+                // refused by "Set job" and by retry, and the "book anyway"
+                // action it was written for does not exist. NEEDS_REVIEW is
+                // rendered with the document link and the reason, and its two
+                // existing buttons ARE the two decisions:
+                //   "Set job" -> rewrites the row to READ (`dryRun` already
+                //                false, so the worker claims it and books it
+                //                natively) — the human "book it".
+                //   "Void"    -> VOID — the human "v1 already booked this".
+                //                These rows never reached QuickBooks from here,
+                //                so that park takes planParkWrites' RELEASE
+                //                branch and hands the strong dedup key back —
+                //                the usual pre-send rule. THIS receipt stays
+                //                VOID: `sourceRef` is unique, so a re-forward
+                //                of the same Drive file gets the VOID row back
+                //                (`alreadyReceived`) and cannot book. The
+                //                released key only matters for the same
+                //                document arriving under a different sourceRef.
+                // The pre-existing `no-v1-evidence` quarantine above is left
+                // exactly as it was; only this new native park moves.
+                //
+                // THIS WRITE leaves the strong dedup key alone — the row may
+                // correspond to a real Purchase, so the park itself never
+                // releases it. What a later Void does with it is above.
+                if (nativeUnverified.length) {
+                    const held = await applyCutoverVerdict(
+                        rowsFor(nativeUnverified),
+                        {
+                            state: "NEEDS_REVIEW",
+                            stateReason: NATIVE_PRE_CUTOVER_REASON,
+                            // Never on a retry timer: nothing here resolves
+                            // itself, and NEEDS_REVIEW is not claimable anyway.
+                            nextRetryAt: null,
+                            dryRun: false,
+                        },
+                        tx.receiptIntake,
+                    );
+                    // Its OWN counter, never folded into shadowQuarantined:
+                    // these rows are not in that state and counting them there
+                    // would overstate the quarantine in the one log line that
+                    // reports the cutover.
+                    nativeUnverifiedHeld = held.moved;
+                    shadowSkippedMoved += held.skippedMoved;
+                }
+
                 // Everything else is v2's to book. The list is built row by
                 // row above rather than re-derived from a createdAt predicate
                 // here, so the two can never disagree about which rows the
@@ -329,10 +438,11 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                     shadowSkippedMoved += handed.skippedMoved;
                 }
 
-                if (shadowRetired > 0 || requeued > 0 || shadowQuarantined > 0 || shadowSkippedMoved > 0) {
+                if (shadowRetired > 0 || requeued > 0 || shadowQuarantined > 0
+                    || nativeUnverifiedHeld > 0 || shadowSkippedMoved > 0) {
                     console.log("[cron/receipt-intake-worker] cutover", JSON.stringify({
                         boundary: opts.boundary.toISOString(),
-                        shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved,
+                        shadowRetired, requeued, shadowQuarantined, nativeUnverifiedHeld, shadowSkippedMoved,
                     }));
                 }
             }
@@ -970,7 +1080,10 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // remaining-milliseconds snapshot: that is measured once and then
             // decays silently while the work runs.
             deadline: invocationDeadline,
-            isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
+            // THE SAME two readers the cutover triage derives its verdict from
+            // — see isNativeBookingActive.
+            isPushEnabled,
+            isNativeBookingEnabled,
             isPushPaused: () => isPaused(PAUSE_KEYS.receiptPush),
             // Same env read as the worker's own isDryRunEnabled — read fresh
             // here too, since book() is the last stop before a real QBO write.
