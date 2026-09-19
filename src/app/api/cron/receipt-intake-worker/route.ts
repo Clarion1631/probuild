@@ -392,8 +392,11 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 //                so that park takes planParkWrites' RELEASE
                 //                branch and hands the strong dedup key back —
                 //                the usual pre-send rule. THIS receipt stays
-                //                parked; a later re-forward of the same file
-                //                could book.
+                //                VOID: `sourceRef` is unique, so a re-forward
+                //                of the same Drive file gets the VOID row back
+                //                (`alreadyReceived`) and cannot book. The
+                //                released key only matters for the same
+                //                document arriving under a different sourceRef.
                 // The pre-existing `no-v1-evidence` quarantine above is left
                 // exactly as it was; only this new native park moves.
                 //
