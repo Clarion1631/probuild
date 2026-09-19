@@ -286,8 +286,13 @@ export interface BookPrismaClient {
     /** For the shared per-qbPurchaseId advisory lock — see lockQboExpense. */
     $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
     receiptIntake: {
-        /** The NATIVE identity read: `expenseId` is `@unique` on this model. */
-        findUnique(args: any): Promise<{ expenseId: string | null } | null>;
+        /**
+         * The NATIVE identity read: `expenseId` is `@unique` on this model.
+         * `sendAttempted` comes back on the same read — it is the other thing
+         * the native path must know about the PERSISTED row rather than about
+         * the snapshot it was claimed with.
+         */
+        findUnique(args: any): Promise<{ expenseId: string | null; sendAttempted: boolean } | null>;
         update(args: any): Promise<unknown>;
         updateMany(args: any): Promise<{ count: number }>;
     };
@@ -494,12 +499,42 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     //    READ ONCE and threaded through, never re-read: the same discipline
     //    `dryRunGlobal` gets in worker.ts, and for the same reason — two
     //    readings of one switch is how a claim and a loop come to disagree.
-    const native = !deps.isPushEnabled() && deps.isNativeBookingEnabled();
-    if (!deps.isPushEnabled() && !native) return { outcome: "deferred", reason: "push-disabled" };
-    //    `receiptPushPaused` means "stop writing to QuickBooks", and a native
-    //    booking does not — gating on it here would make the Command Center
-    //    silently stop job costing.
-    if (!native && await deps.isPushPaused()) return { outcome: "deferred", reason: "push-paused" };
+    //    That applies to `isPushEnabled` itself, which is why it is SNAPSHOTTED
+    //    here rather than called twice on two lines that must agree.
+    const pushEnabled = deps.isPushEnabled();
+    const native = !pushEnabled && deps.isNativeBookingEnabled();
+    if (!pushEnabled && !native) return { outcome: "deferred", reason: "push-disabled" };
+    //    THE PAUSE GATES BOTH PATHS, native included.
+    //
+    //    It reads as a QuickBooks-only switch ("stop writing to QuickBooks"),
+    //    and on that reading a native booking could ignore it. But the Command
+    //    Center toggle is the only brake on this pipeline that takes effect
+    //    without a redeploy, and with the push off it is ALSO the go-live
+    //    switch for native booking — the one control an operator can reach when
+    //    receipts are booking to the wrong place. Exempting the native path
+    //    would leave a "pause" that pauses nothing while ProBuild keeps writing
+    //    job cost, which makes the label a lie in the direction that costs
+    //    money. `isPaused` fails CLOSED on a read error, so a settings outage
+    //    defers here exactly as it does on the QuickBooks path.
+    if (await deps.isPushPaused()) return { outcome: "deferred", reason: "push-paused" };
+
+    // A ROW THAT MAY ALREADY HOLD A PURCHASE IS NOT NATIVELY BOOKABLE.
+    //
+    // `sendAttempted` means a QuickBooks create was ISSUED for this row at some
+    // point — possibly successfully, with the response lost. A native booking
+    // writes an Expense carrying NO `qbPurchaseId`, so nothing links it to that
+    // Purchase: when the 4-hourly QBO importer later picks the Purchase up it
+    // creates a SECOND Expense for the same spend, and no join key exists that
+    // could ever reconcile the pair. The QuickBooks path is safe from this
+    // because DocNumber/requestid idempotency returns the same Purchase; the
+    // native path has no such collapse.
+    //
+    // So it parks for a human, who checks QuickBooks and decides. The strong
+    // key is RETAINED for the usual reason: a Purchase may exist, and releasing
+    // it would let a resubmission book the same receipt again.
+    if (native && row.sendAttempted) {
+        return { outcome: "needs-review", reason: NATIVE_QBO_RECONCILE_REASON, releaseStrongKey: false };
+    }
 
     // Runway check BEFORE anything else that could touch QuickBooks. Deferred,
     // not retried: the document is fine and this costs it no attempt — the
@@ -583,7 +618,25 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // is a fact about this file, known now — so refuse now, rather than
     // discovering it from `attachment:"skipped"` after a Purchase already
     // exists in the real books without its receipt.
-    const blocker = attachmentBlocker(row.mimeType, bytes.length);
+    //
+    // IT IS A QUICKBOOKS RULE, SO IT ONLY BINDS THE QUICKBOOKS PATH.
+    //
+    // `attachmentBlocker` mirrors QBO's Attachable mime list and its 8 MiB
+    // ceiling. A native booking uploads nothing to QuickBooks: the receipt
+    // lives in ProBuild's own bucket and `receiptUrl` points at it, so a file
+    // QBO would refuse is not a reason to park real job cost. The checks that
+    // are about the DOCUMENT rather than about QuickBooks stay unconditional
+    // and have already run above — the object must exist in storage and its
+    // bytes must still hash to what finalize verified.
+    //
+    // Today the two ceilings are deliberately ONE constant
+    // (intake-core's QBO_ATTACHMENT_MAX_BYTES is also MAX_STORED_BYTES) and the
+    // accepted mime set is exactly QBO's, so nothing that reaches here can be
+    // refused by this preflight. That equality exists only BECAUSE QuickBooks
+    // was the binding constraint; the moment it stops being one the intake
+    // ceiling can be raised, and this branch is what keeps that from parking
+    // every larger receipt.
+    const blocker = native ? null : attachmentBlocker(row.mimeType, bytes.length);
     if (blocker) return parkedBeforeSend(row, `unsupported-attachment:${blocker}`);
 
     // Phase check ONE: immediately before the QBO create. The project can be
@@ -1093,8 +1146,25 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             } else {
                 const intake = await tx.receiptIntake.findUnique({
                     where: { id: row.id },
-                    select: { expenseId: true },
+                    select: { expenseId: true, sendAttempted: true },
                 });
+                // AND THE SEND FLAG IS RE-READ HERE, not trusted from the
+                // claim snapshot.
+                //
+                // The entry gate above checked `row.sendAttempted` as it was
+                // when this pass claimed the row. An overlapping worker holding
+                // an older claim — one that is about to lose the CAS below, but
+                // has not got there yet — can reach QuickBooks and set the flag
+                // in between. Booking natively on top of that is the exact
+                // double-book the entry gate exists to prevent, arriving
+                // through the one door it cannot watch. Read under this
+                // transaction's locks, so from here the answer cannot change
+                // before the commit.
+                //
+                // Thrown rather than returned: everything this transaction has
+                // already done (the BOOKED fence is still ahead, but the
+                // evidence epoch bump is not) has to roll back with it.
+                if (intake?.sendAttempted) throw new NativeSendAttemptedError();
                 found = intake?.expenseId ? { id: intake.expenseId } : null;
                 nativeAlreadyBooked = found !== null;
             }
@@ -1542,9 +1612,12 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // and a bookkeeper supplies the real figure through
                     // `PATCH /api/expenses/[id]`, which accepts `taxAmount` and
                     // `taxAtSource` (bounded at 12% of the receipt) behind the
-                    // `financialReports` permission. NOT the PUT on that route
-                    // — PUT is guarded by assertExpenseMutableOutsideQbo and
-                    // every row booked here carries a qbPurchaseId.
+                    // `financialReports` permission. On the QuickBooks path
+                    // that is the ONLY way in: the PUT on the same route is
+                    // guarded by `assertExpenseMutableOutsideQbo`, which
+                    // refuses anything carrying a `qbPurchaseId`. A NATIVE row
+                    // carries none, so the guard lets it through and the PUT is
+                    // open on it as well — see the `status` note below.
                     taxAmount: taxToStore,
                     taxAtSource: taxToStore !== null,
                     // An implausible read is a question, not an answer: the row
@@ -1574,19 +1647,36 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // expense in the wrong period. The intake row keeps the
                     // calendar day; this makes the instant match it.
                     date: booked.date,
-                    // Booked with a qbPurchaseId already set — the Purchase is
-                    // live in QuickBooks by the time this row commits, so this
-                    // Expense is QBO-managed from birth, exactly like a QBO
-                    // import. `assertExpenseMutableOutsideQbo` (qbo-expense-guard.ts)
+                    // "Reviewed" FOR TWO DIFFERENT REASONS, one per path.
+                    //
+                    // ON THE QUICKBOOKS PATH the Purchase is live by the time
+                    // this row commits, so the Expense is QBO-managed from
+                    // birth, exactly like a QBO import.
+                    // `assertExpenseMutableOutsideQbo` (qbo-expense-guard.ts)
                     // rejects approve/edit/delete on anything carrying a
-                    // qbPurchaseId, and the bookkeeper queue (manager/receipts/page.tsx)
-                    // only lists `status: "Pending"` rows as actionable. Leaving
-                    // this "Pending" would put a QBO-managed row in that
-                    // actionable queue with no route able to act on it — and
-                    // a later QBO sync flipping it to "Reviewed" would look
-                    // like human review that never happened. "Reviewed" keeps
-                    // it out of the actionable queue and matches every other
-                    // QBO-linked Expense.
+                    // `qbPurchaseId`, and the bookkeeper queue
+                    // (manager/receipts/page.tsx) only lists `status: "Pending"`
+                    // rows as actionable. Leaving this "Pending" would put a
+                    // QBO-managed row in that actionable queue with no route
+                    // able to act on it — and a later QBO sync flipping it to
+                    // "Reviewed" would look like human review that never
+                    // happened.
+                    //
+                    // ON THE NATIVE PATH none of that applies. There is no
+                    // Purchase, so `qbPurchaseId` is null, so the guard lets
+                    // every mutation through: a native Expense IS editable and
+                    // deletable in ProBuild, which is the point — ProBuild is
+                    // the system of record now. "Reviewed" is kept here because
+                    // it is what posts the job cost immediately; the row does
+                    // not wait on a queue nobody has been told to work.
+                    //
+                    // OPEN OWNER DECISION: whether a native row should instead
+                    // land in `Pending` and enter the bookkeeper's review queue
+                    // (which lists only `Pending`). That is a workflow call
+                    // about who signs off on receipt-sourced job cost, not a
+                    // correctness one, and it is deliberately NOT being made
+                    // here. Do not change this value without the owner's answer
+                    // — it decides whether job cost posts today or on review.
                     status: "Reviewed",
                     receiptUrl,
                     // NULL on a native booking. `Expense.qbPurchaseId` is
@@ -1748,6 +1838,17 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             return {
                 outcome: "needs-review",
                 reason: `${EXPENSE_CONFLICT_PREFIX}${error.fields.join(",")}`,
+                releaseStrongKey: false,
+            };
+        }
+        // A QuickBooks send landed on this row between the entry gate and the
+        // identity read. Same verdict as the entry gate, for the same reason:
+        // a Purchase may exist, nothing here can link to it, and only a person
+        // can say whether one does. The key is retained.
+        if (error instanceof NativeSendAttemptedError) {
+            return {
+                outcome: "needs-review",
+                reason: NATIVE_QBO_RECONCILE_REASON,
                 releaseStrongKey: false,
             };
         }
@@ -2131,6 +2232,33 @@ class StaleClaimError extends Error {
     constructor() {
         super("the claim was superseded");
         this.name = "StaleClaimError";
+    }
+}
+
+/**
+ * THE PARK REASON FOR A NATIVE ROW THAT MAY ALREADY HAVE A PURCHASE.
+ *
+ * `sendAttempted` says a QuickBooks create was issued for this row. The native
+ * path writes an Expense with no `qbPurchaseId`, so it cannot be linked to that
+ * Purchase, and the 4-hourly QBO importer would later create a second Expense
+ * for the same spend with nothing to reconcile the two. Neither booking nor
+ * retiring is decidable from data here, so a person checks QuickBooks.
+ *
+ * Deliberately NOT in RECOVERABLE_PARK_REASONS and not in RETRYABLE_REASONS:
+ * re-running the booking finds exactly the same flag and the same question.
+ */
+export const NATIVE_QBO_RECONCILE_REASON = "native-qbo-reconciliation-required";
+
+/**
+ * Thrown inside the commit transaction when the PERSISTED `sendAttempted` turns
+ * out to be true on a native booking — an overlapping worker reached QuickBooks
+ * after this pass read the row. Its own class so the roll-back and the park
+ * reason travel together; see the read site for why the snapshot is not enough.
+ */
+class NativeSendAttemptedError extends Error {
+    constructor() {
+        super("a QuickBooks send was attempted for this row; it cannot book natively");
+        this.name = "NativeSendAttemptedError";
     }
 }
 

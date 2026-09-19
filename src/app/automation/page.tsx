@@ -250,6 +250,12 @@ export default async function AutomationPage(props: {
     }
 
     const pushEnabled = process.env.QBO_RECEIPT_PUSH_ENABLED === "true";
+    // RECEIPT_BOOK_NATIVE. With the push off and this on, booking writes the
+    // ProBuild Expense and calls QuickBooks not at all — and the pause toggle
+    // below still stops it, so the control has to stay on the page. Keyed on
+    // the push alone it vanished exactly when native booking turned on, which
+    // is the one configuration where it is the only brake there is.
+    const nativeBookingEnabled = process.env.RECEIPT_BOOK_NATIVE === "true";
     const syncCronEnabled = process.env.QBO_EXPENSE_SYNC_CRON_ENABLED !== "false";
 
     const endDate = new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
@@ -827,6 +833,7 @@ export default async function AutomationPage(props: {
                     hoursSavedLabel={hoursSavedLabel}
                     onARoll={onARoll}
                     pushEnabled={pushEnabled}
+                    nativeBookingEnabled={nativeBookingEnabled}
                     syncCronEnabled={syncCronEnabled}
                     receiptPushPaused={pauses.receiptPushPaused}
                     qboSyncPaused={pauses.qboSyncPaused}

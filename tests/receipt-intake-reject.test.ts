@@ -635,8 +635,8 @@ test("no cutover write updates by id alone", () => {
     const body = fn.slice(0, fn.indexOf("const ELIGIBLE ="));
     assert.equal(
         (body.match(/await applyCutoverVerdict\(/g) ?? []).length,
-        3,
-        "retire, quarantine and requeue all go through the fenced write",
+        4,
+        "retire, quarantine, native-unverified and requeue all go through the fenced write",
     );
     assert.ok(
         !/tx\.receiptIntake\.updateMany\(/.test(body),
@@ -652,7 +652,7 @@ test("no cutover write updates by id alone", () => {
     );
     // Rows whose CAS lost are reported, not silently dropped.
     assert.match(body, /shadowSkippedMoved \+= /);
-    assert.match(body, /shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved,/);
+    assert.match(body, /shadowRetired, requeued, shadowQuarantined, nativeUnverifiedHeld, shadowSkippedMoved,/);
 });
 
 // ── A /start REFRESH during an in-flight REJECT (Codex round-12 item 1) ─────

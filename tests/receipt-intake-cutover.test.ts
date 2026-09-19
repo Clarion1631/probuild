@@ -8,11 +8,16 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     parseCutoverBoundary,
     CUTOVER_SETTING_KEY,
     driveFileIdOf,
+    isNativeBookingEvent,
+    NATIVE_PRE_CUTOVER_REASON,
     triageCutoverRows,
+    v1BookedDriveIds,
     applyCutoverVerdict,
     type CutoverCandidate,
     type CutoverRow,
@@ -135,8 +140,114 @@ test("the boundary instant itself counts as AFTER, and every row lands in exactl
     assert.deepEqual(triage.unevidenced, ["at-boundary"]);
     assert.deepEqual(triage.evidenced, ["evidenced"]);
     assert.deepEqual(triage.quarantined, ["quarantine"]);
-    const all = [...triage.evidenced, ...triage.unevidenced, ...triage.quarantined];
+    const all = [
+        ...triage.evidenced, ...triage.unevidenced, ...triage.quarantined, ...triage.nativeUnverified,
+    ];
     assert.equal(all.length, rows.length, "no row is dropped or counted twice");
+});
+
+// ── Native booking removes the reason pre-boundary Drive rows were safe ────
+
+test("NATIVE: an unevidenced pre-boundary DRIVE row is parked, not requeued", async () => {
+    // The Drive exemption is a QUICKBOOKS fact: "safe because a v1/v2 overlap
+    // collapses into one Purchase" is QBO's DocNumber/requestid idempotency
+    // doing it, keyed on the Drive file id v1 also used. A native booking never
+    // talks to QuickBooks, so there is nothing to collapse against — it would
+    // write a ProBuild Expense for a spend v1 may already have booked, with no
+    // shared key able to reconcile the two.
+    const rows = [candidate({ id: "before-drive", sourceRef: "drive:F2", createdAt: before })];
+
+    const qbo = triageCutoverRows(rows, BOUNDARY, new Set(), false);
+    assert.deepEqual(qbo.unevidenced, ["before-drive"], "the QuickBooks rail is unchanged");
+    assert.deepEqual(qbo.nativeUnverified, []);
+
+    const native = triageCutoverRows(rows, BOUNDARY, new Set(), true);
+    assert.deepEqual(native.nativeUnverified, ["before-drive"]);
+    assert.deepEqual(native.unevidenced, [], "nothing is handed to booking");
+    assert.deepEqual(native.quarantined, [], "it is its own reason, not no-v1-evidence");
+    // The flag defaults OFF, so an un-updated caller keeps today's behaviour.
+    assert.deepEqual(triageCutoverRows(rows, BOUNDARY, new Set()).unevidenced, ["before-drive"]);
+});
+
+test("NATIVE changes nothing about evidence, the boundary, or the non-Drive quarantine", async () => {
+    // The flag decides ONE branch. A row v1 provably booked is still retired, a
+    // post-boundary row is still v2's to book (nothing else could have booked
+    // it), and a pre-boundary non-Drive row still quarantines under its own
+    // reason, which is about a missing shared identity rather than about rails.
+    const rows = [
+        candidate({ id: "evidenced", archivedByV1: true }),
+        candidate({ id: "after-drive", sourceRef: "drive:F3", createdAt: after }),
+        candidate({ id: "after-email", source: "email", sourceRef: "email:m1", createdAt: after }),
+        candidate({ id: "before-email", source: "email", sourceRef: "email:m2", createdAt: before }),
+    ];
+    const triage = triageCutoverRows(rows, BOUNDARY, new Set(), true);
+    assert.deepEqual(triage.evidenced, ["evidenced"]);
+    assert.deepEqual(triage.unevidenced, ["after-drive", "after-email"]);
+    assert.deepEqual(triage.quarantined, ["before-email"]);
+    assert.deepEqual(triage.nativeUnverified, []);
+});
+
+test("the native park reason is distinct from the non-Drive quarantine's", () => {
+    // They are terminal in the same state but they mean different things, and
+    // only one of them stops being true if the QuickBooks push comes back.
+    assert.equal(NATIVE_PRE_CUTOVER_REASON, "native-pre-cutover-unverified");
+    assert.notEqual(NATIVE_PRE_CUTOVER_REASON, "no-v1-evidence");
+});
+
+// ── v2's own native bookings are not evidence that v1 booked anything ──────
+
+test("a NATIVE receipt-push event is not v1 evidence, so it cannot retire a row", async () => {
+    // Native booking logs `kind: "receipt-push"`, `status: "created"` and the
+    // same Drive `fileId` as a v1 push — the typed `driveFileId` column is
+    // filled from it. Counting that as v1 evidence means the NEXT candidate row
+    // for the same file (a re-forward, a duplicate capture) is retired as
+    // SHADOW_DONE against evidence that says the opposite. Retirement is
+    // terminal and silent, so that row's receipt is simply gone.
+    const events = [
+        { driveFileId: "FILE-X", detail: JSON.stringify({ nativeBooking: true, intakeId: "i1" }) },
+    ];
+    const bookedByV1 = v1BookedDriveIds(events);
+    assert.deepEqual([...bookedByV1], [], "our own booking proves nothing about v1");
+
+    const triage = triageCutoverRows(
+        [candidate({ id: "another-row-for-X", sourceRef: "drive:FILE-X", createdAt: after })],
+        BOUNDARY,
+        bookedByV1,
+    );
+    assert.deepEqual(triage.evidenced, [], "NOT retired as SHADOW_DONE");
+    assert.deepEqual(triage.unevidenced, ["another-row-for-X"]);
+});
+
+test("a real v1 push is still evidence, and anything unreadable is read as one", () => {
+    // The filter must only ever REMOVE our own rows. `detail` is a JSON string
+    // column: a v1 or legacy event may carry none at all, and reading "no
+    // marker" as native would stop retiring rows v1 really did book — which
+    // hands the whole shadow backlog to v2 a second time.
+    assert.deepEqual([...v1BookedDriveIds([
+        { driveFileId: "A", detail: JSON.stringify({ fileId: "A", qbPurchaseId: "QB-1" }) },
+        { driveFileId: "B", detail: null },
+        { driveFileId: "C", detail: "not json at all" },
+        { driveFileId: "D", detail: JSON.stringify({ nativeBooking: false }) },
+        { driveFileId: "E", detail: JSON.stringify({ nativeBooking: "true" }) },
+        { driveFileId: null, detail: JSON.stringify({ nativeBooking: true }) },
+    ])], ["A", "B", "C", "D", "E"]);
+
+    assert.equal(isNativeBookingEvent(JSON.stringify({ nativeBooking: true })), true);
+    assert.equal(isNativeBookingEvent(null), false);
+    assert.equal(isNativeBookingEvent("{"), false);
+});
+
+test("the cutover asks the events for `detail`, or the filter has nothing to read", () => {
+    // A source pin, because the filter lives in the lib and its input comes
+    // from a Prisma `select` in the cron route: drop `detail` there and
+    // `isNativeBookingEvent` sees undefined for every row and answers false for
+    // all of them, silently restoring the bug.
+    const route = readFileSync(
+        path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+        "utf8",
+    );
+    assert.match(route, /select: \{ driveFileId: true, detail: true \}/);
+    assert.match(route, /const bookedByV1 = driveIds\.length\s*\n\s*\? v1BookedDriveIds\(/);
 });
 
 test("driveFileIdOf only claims a shared identity for a real drive ref", () => {
