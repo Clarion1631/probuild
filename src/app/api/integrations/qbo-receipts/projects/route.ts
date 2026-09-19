@@ -21,10 +21,14 @@ export async function GET(request: Request) {
     try {
         const projects = await prisma.project.findMany({
             where: { status: "In Progress" },
-            select: { name: true },
+            select: { id: true, name: true },
             orderBy: { name: "asc" },
         });
-        return NextResponse.json({ ok: true, projects: projects.map(p => p.name) });
+        return NextResponse.json({
+            ok: true,
+            projects: projects.map(p => p.name), // UNCHANGED — reconcileIntakeFolders.js depends on this shape
+            projectRefs: projects.map(p => ({ id: p.id, name: p.name })),
+        });
     } catch (error) {
         console.error("qbo-receipts/projects list failed", error instanceof Error ? error.name : "UnknownError");
         return NextResponse.json({ ok: false, reason: "list-failed" }, { status: 500 });
