@@ -51,6 +51,7 @@ test("the stub implements every storage method production code calls", () => {
         "list",
         "getPublicUrl",
         "createSignedUrl",
+        "createSignedUrls",
         "createSignedUploadUrl",
     ]) {
         assert.equal(typeof api[method], "function", `storage mock is missing ${method}()`);

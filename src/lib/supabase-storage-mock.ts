@@ -160,6 +160,26 @@ function bucketApi(bucket: string) {
             };
         },
 
+        /**
+         * The batch form `signReceiptDownloadUrls` calls. A MISSING object is
+         * an ITEM-level error here, not a call-level one, because that is the
+         * distinction the real API makes and the one the caller branches on
+         * when it decides which rows get a link. Omitting the method would not
+         * omit a behaviour, it would invent one (see the header).
+         */
+        async createSignedUrls(paths: string[], _ttlSeconds: number) {
+            return {
+                data: paths.map(path => (objects().has(key(bucket, path))
+                    ? {
+                        error: null,
+                        path,
+                        signedUrl: `${MOCK_PUBLIC_HOST}/storage/v1/object/sign/${bucket}/${path}?token=e2e-mock`,
+                    }
+                    : { error: "Object not found", path, signedUrl: null })),
+                error: null,
+            };
+        },
+
         async createSignedUploadUrl(path: string) {
             return {
                 data: {
