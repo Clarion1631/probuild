@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
 import { formatCurrency } from "@/lib/utils";
-import { resolveDocUrl } from "@/lib/secure-storage";
+import type { RouteDeadline } from "@/lib/quickbooks";
+import { signReceiptDownloadUrl } from "@/lib/receipt-intake/bucket";
+import { RECEIPT_URL_TTL_SECONDS } from "@/lib/receipt-intake/receipt-url";
 import { retryTargetFor } from "@/lib/receipt-intake/route-state";
 import { isPossibleOrphanReason } from "@/lib/receipt-intake/park";
 import { StatCard } from "../shared/stat-card";
@@ -78,12 +80,44 @@ function RowFacts({ row }: { row: IntakeRow }) {
 }
 
 /**
- * "Open receipt" is a short-lived signed URL minted at render time from the
- * private bucket — there is no public receipt URL to link to, and there must
- * not be one. A null result renders as nothing rather than a dead link.
+ * The signer shape withArchiveDownloadUrls injects, so every reader of an
+ * intake object signs it the same way and a test can supply its own.
  */
-async function ReceiptLink({ storagePath }: { storagePath: string }) {
-    const url = await resolveDocUrl(storagePath);
+type ReceiptSigner = (storagePath: string, ttlSeconds: number, deadline?: RouteDeadline) => Promise<string | null>;
+
+/**
+ * The href for one row's "Open receipt" link.
+ *
+ * `storagePath` is the RAW object path inside the intake feature's own PRIVATE
+ * bucket (`receipt-intake`). It is not a `receipt-intake://` reference and not a
+ * `secure:` one, so resolveDocUrl cannot read it: a bare path falls through to
+ * that function's legacy branch and comes back as a PUBLIC `project-files` URL,
+ * which is the wrong bucket and a 404 for every row on this tab. #443 shipped
+ * exactly that. Only the bucket's own signer can mint a link that opens.
+ *
+ * Never throws: a receipt that cannot be signed renders as no link at all,
+ * rather than taking the queue down or offering a dead one.
+ */
+export async function receiptLinkHref(
+    storagePath: string | null | undefined,
+    /** Injectable so the contract is testable without Supabase. */
+    sign: ReceiptSigner = signReceiptDownloadUrl,
+): Promise<string | null> {
+    if (!storagePath) return null;
+    try {
+        return await sign(storagePath, RECEIPT_URL_TTL_SECONDS);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * "Open receipt" is a short-lived signed URL minted at render time from the
+ * private receipt-intake bucket. There is no public receipt URL to link to, and
+ * there must not be one. No URL renders as nothing rather than a dead link.
+ */
+export async function ReceiptLink({ storagePath, sign }: { storagePath: string; sign?: ReceiptSigner }) {
+    const url = await receiptLinkHref(storagePath, sign);
     if (!url) return null;
     return (
         <a href={url} target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
