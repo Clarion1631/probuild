@@ -41,6 +41,7 @@ export function PipelineHealth({
     hoursSavedLabel,
     onARoll,
     pushEnabled,
+    nativeBookingEnabled,
     syncCronEnabled,
     receiptPushPaused,
     qboSyncPaused,
@@ -57,6 +58,8 @@ export function PipelineHealth({
     hoursSavedLabel: string;
     onARoll: boolean;
     pushEnabled: boolean;
+    /** RECEIPT_BOOK_NATIVE — the receipt control is live on either rail. */
+    nativeBookingEnabled: boolean;
     syncCronEnabled: boolean;
     receiptPushPaused: boolean;
     qboSyncPaused: boolean;
@@ -106,6 +109,7 @@ export function PipelineHealth({
                     <div className="space-y-3">
                         <PipelineControls
                             pushEnabled={pushEnabled}
+                            nativeBookingEnabled={nativeBookingEnabled}
                             syncCronEnabled={syncCronEnabled}
                             receiptPushPaused={receiptPushPaused}
                             qboSyncPaused={qboSyncPaused}

@@ -207,6 +207,16 @@ export interface PipelineHealth {
         ambiguousCount: number;
         /** Transactions the pull could not represent and nobody has accepted. */
         quarantinedCount?: number;
+        /** Transactions QuickBooks changed after we stored them; `-1` = unreadable. */
+        conflictCount?: number;
+        /** The serious subset: a stale row already copied into a canonical line. */
+        conflictLinkedCount?: number;
+        /**
+         * The entries themselves, so the digest can NAME the transactions. The
+         * verdict reads only the counts above — a reason nobody can act on is
+         * how a non-blocking alarm dies.
+         */
+        conflicts?: BankPullConflictEntry[];
         unclearedCount?: number;
         /** Ambiguity from before the last pulled window: reported, never a stamp blocker. */
         staleAmbiguous?: { count: number; keys: string[] };
@@ -454,6 +464,15 @@ export function purchaseSyncStaleHours(): number {
  *    schedule (which gives up on purpose after PROBE_RETRY_LIMIT attempts) and
  *    withholds the pull's freshness stamp until some run covers it, so without
  *    naming it the only symptom is a stamp that quietly stops moving.
+ *  - `bank-pull-conflict:<n>[:<m>-linked]` — transactions QuickBooks CHANGED
+ *    after ProBuild stored them. The stale observation is never overwritten and
+ *    never minted; the rest of the register carries on, so this is reported and
+ *    deliberately does NOT block the pull's freshness stamp. `<m>-linked` is
+ *    the subset already copied into a canonical `BankLine`, which only a human
+ *    can repair. Cleared by QuickBooks agreeing again, with no code and no SQL.
+ *  - `bank-conflict-unreadable` — the durable restatement record could not be
+ *    read or written. THIS one blocks the stamp, because it is the state in
+ *    which "never mint a conflicted observation" cannot be enforced.
  *  - `bank-ambiguous-stale:<n>:<keys>` — duplicate-identity groups reconcile
  *    could not pair, from BEFORE the window the pull last read. A backlog for a
  *    human, never a stamp blocker: gating on these meant one unresolvable pair
@@ -531,6 +550,10 @@ export function evaluatePipelineHealth(input: {
         ambiguousCount: number;
         /** Transactions the pull could not represent and nobody has accepted. */
         quarantinedCount?: number;
+        /** Transactions QuickBooks changed after we stored them; `-1` = unreadable. */
+        conflictCount?: number;
+        /** The serious subset: a stale row already copied into a canonical line. */
+        conflictLinkedCount?: number;
         unclearedCount?: number;
         staleAmbiguous?: { count: number; keys: string[] };
         blockedReason?: string | null;
@@ -809,6 +832,29 @@ export function evaluatePipelineHealth(input: {
         reasons.push(`bank-quarantine:${input.bankPull.quarantinedCount}`);
     }
 
+    /**
+     * TRANSACTIONS QUICKBOOKS CHANGED AFTER WE STORED THEM.
+     *
+     * DELIBERATELY NOT A STAMP BLOCKER — the asymmetry with the quarantine
+     * above is the whole point, so do not "tidy" it. The stored row is equally
+     * stale whether the pipeline moves or not, so blocking buys no correctness;
+     * it only stops receipts being collected for every other line, which is
+     * exactly the freeze one edited transaction caused for eleven days. What
+     * DOES block is a conflict store the pull could not read or write, because
+     * that is the state in which the mint exclusion cannot be enforced — and
+     * that arrives here as `-1`.
+     *
+     * The `-linked` suffix names the serious subset: a stale observation
+     * already copied into a canonical `BankLine`, whose `amountCents` is
+     * immutable by trigger and so beyond any code path in this repo.
+     */
+    if ((input.bankPull.conflictCount ?? 0) < 0) {
+        reasons.push("bank-conflict-unreadable");
+    } else if ((input.bankPull.conflictCount ?? 0) > 0) {
+        reasons.push(`bank-pull-conflict:${input.bankPull.conflictCount}`
+            + ((input.bankPull.conflictLinkedCount ?? 0) > 0 ? `:${input.bankPull.conflictLinkedCount}-linked` : ""));
+    }
+
     // AMBIGUITY OLDER THAN THE LAST PULLED WINDOW. Reported, and deliberately
     // separate from the line above: it is a real backlog somebody owes an
     // answer on, but it is NOT evidence that tonight's register is unsettled,
@@ -982,6 +1028,76 @@ export const BANK_PULL_SPLIT_MANIFEST_KEY = "bankRegisterPullSplitManifest";
  * judgement only a human can make.
  */
 export const BANK_PULL_QUARANTINE_ACCEPTED_KEY = "bankRegisterPullQuarantineAccepted";
+
+/**
+ * Transactions QuickBooks CHANGED after ProBuild stored them.
+ *
+ * The stored observation and QuickBooks no longer agree on the transaction's
+ * identity (date, amount, check number, payee). The pull excludes the line from
+ * its batch, commits the rest, and records it here — durably, because the
+ * disagreement outlives the run and the window that found it.
+ *
+ * DELIBERATELY NOT A STAMP BLOCKER, unlike the quarantine above. The stored row
+ * is equally stale whether the pipeline moves or not, so blocking buys no
+ * correctness — it only stops receipts being collected for every OTHER line,
+ * which is the freeze this record exists to end. It is cleared by QuickBooks
+ * agreeing again: a run that re-offers the id and gets no conflict deletes it.
+ */
+export const BANK_PULL_CONFLICT_KEY = "bankRegisterPullRestatementConflicts";
+
+export interface BankPullConflictEntry {
+    qbTxnId: string;
+    /** Which identity components moved. Never descriptor text. */
+    fields: string[];
+    /** The stale observation is already copied into a canonical BankLine. */
+    linked: boolean;
+    firstSeenAt: string;
+    lastSeenAt: string;
+}
+
+/**
+ * Parse the durable restatement-conflict list.
+ *
+ * `null` means UNREADABLE, which is a blocker — never "none". Absent is `[]`.
+ * Same discipline as `parseQuarantine`, and for a sharper reason here: this is
+ * the list the mint excludes, so a store that cannot be read is exactly the
+ * state in which a stale observation could be minted into a canonical line.
+ */
+export function parseBankPullConflicts(value: string | null | undefined): BankPullConflictEntry[] | null {
+    /**
+     * ONLY ABSENCE IS "NOTHING RESTATED". A row that exists and holds an empty
+     * or whitespace-only string is a store somebody or something truncated —
+     * `!value` used to read it as `[]`, which is exactly the "we do not know
+     * what is held" state being read as silence, and it is the state in which
+     * the mint exclusion cannot be enforced. The two sibling parsers keep their
+     * looser rule on purpose: this is the one the mint reads.
+     */
+    if (value === null || value === undefined) return [];
+    if (value.trim() === "") return null;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(value);
+    } catch {
+        return null;
+    }
+    if (!Array.isArray(parsed)) return null;
+    const out: BankPullConflictEntry[] = [];
+    for (const row of parsed) {
+        if (!row || typeof row !== "object") return null;
+        const entry = row as Partial<BankPullConflictEntry>;
+        if (typeof entry.qbTxnId !== "string" || !entry.qbTxnId) return null;
+        if (!Array.isArray(entry.fields) || !entry.fields.every(field => typeof field === "string")) return null;
+        if (typeof entry.linked !== "boolean") return null;
+        out.push({
+            qbTxnId: entry.qbTxnId,
+            fields: entry.fields as string[],
+            linked: entry.linked,
+            firstSeenAt: typeof entry.firstSeenAt === "string" ? entry.firstSeenAt : "",
+            lastSeenAt: typeof entry.lastSeenAt === "string" ? entry.lastSeenAt : "",
+        });
+    }
+    return out;
+}
 
 export interface BankPullQuarantineEntry {
     qbTxnId: string;
@@ -1199,6 +1315,9 @@ async function readBankPullState(): Promise<{
     lastSuccessAt: string | null;
     ambiguousCount: number;
     quarantinedCount: number;
+    conflictCount: number;
+    conflictLinkedCount: number;
+    conflicts: BankPullConflictEntry[];
     unclearedCount: number;
     staleAmbiguous: { count: number; keys: string[] };
     blockedReason: string | null;
@@ -1209,16 +1328,20 @@ async function readBankPullState(): Promise<{
     // not the pull — so with minting off (its shipped default) the pull could
     // be dead for weeks and health stayed green. The pull is scheduled in
     // vercel.json unconditionally, so it is expected to run unconditionally.
-    const [successRow, ambiguousRow, quarantineRow, quarantineAcceptedRow, unclearedRow, staleAmbiguousRow, blockedRow, uncertifiedRow] = await Promise.all([
+    const [successRow, ambiguousRow, quarantineRow, quarantineAcceptedRow, conflictRow, unclearedRow, staleAmbiguousRow, blockedRow, uncertifiedRow] = await Promise.all([
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_ACCEPTED_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_CONFLICT_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_UNCLEARED_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_STALE_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_BLOCKED_REASON_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_UNCERTIFIED_KEY } }),
     ]);
+    // Parsed ONCE: `null` is the unreadable signal and all three fields below
+    // have to agree about it.
+    const conflicts = parseBankPullConflicts(conflictRow?.value);
     const parsedAmbiguous = ambiguousRow?.value ? Number.parseInt(ambiguousRow.value, 10) : 0;
     const parsedUncleared = unclearedRow?.value ? Number.parseInt(unclearedRow.value, 10) : 0;
     return {
@@ -1239,6 +1362,15 @@ async function readBankPullState(): Promise<{
             if (entries === null || accepted === null) return -1;
             return outstandingQuarantine(entries, accepted).length;
         })(),
+        /**
+         * SAME `-1` SENTINEL, same reason. An unreadable restatement record is
+         * not an empty one — it is the state in which the pull cannot enforce
+         * "never mint a conflicted observation", so it has to read as a blocker
+         * rather than as silence.
+         */
+        conflictCount: conflicts === null ? -1 : conflicts.length,
+        conflictLinkedCount: (conflicts ?? []).filter(entry => entry.linked).length,
+        conflicts: conflicts ?? [],
         unclearedCount: Number.isFinite(parsedUncleared) ? parsedUncleared : 0,
         staleAmbiguous: parseStaleAmbiguous(staleAmbiguousRow?.value),
         blockedReason: blockedRow?.value || null,
@@ -1940,6 +2072,9 @@ export async function getPipelineHealth(deps: {
             lastSuccessAt: string | null;
             ambiguousCount: number;
             quarantinedCount: number;
+            conflictCount: number;
+            conflictLinkedCount: number;
+            conflicts: BankPullConflictEntry[];
             unclearedCount: number;
             staleAmbiguous: { count: number; keys: string[] };
             blockedReason: string | null;
@@ -1947,7 +2082,7 @@ export async function getPipelineHealth(deps: {
         }>(
             "bankPull",
             readBankPullState,
-            { enabled: false, lastSuccessAt: null, ambiguousCount: 0, quarantinedCount: 0, unclearedCount: 0, staleAmbiguous: { count: 0, keys: [] }, blockedReason: null, uncertifiedWindow: null },
+            { enabled: false, lastSuccessAt: null, ambiguousCount: 0, quarantinedCount: 0, conflictCount: 0, conflictLinkedCount: 0, conflicts: [], unclearedCount: 0, staleAmbiguous: { count: 0, keys: [] }, blockedReason: null, uncertifiedWindow: null },
         ),
         // Can we authenticate to Drive? Asked here rather than at the moment a
         // memo arrives, because the answer "no" produces no symptom anywhere
@@ -2057,6 +2192,15 @@ export async function getPipelineHealth(deps: {
             enabled: bankPull.value.enabled,
             lastSuccessAt: bankPull.value.lastSuccessAt,
             ambiguousCount: bankPull.value.ambiguousCount,
+            // READ BY THE PROBE, AND IT HAS TO REACH THE VERDICT. It was
+            // missing here, so `evaluatePipelineHealth` always saw `undefined`
+            // and `bank-quarantine:<n>` / `bank-quarantine-unreadable` — the
+            // reasons round 46 and round 48 added to stop a short register
+            // certifying itself — have never once fired in production.
+            quarantinedCount: bankPull.value.quarantinedCount,
+            conflictCount: bankPull.value.conflictCount,
+            conflictLinkedCount: bankPull.value.conflictLinkedCount,
+            conflicts: bankPull.value.conflicts,
             unclearedCount: bankPull.value.unclearedCount,
             staleAmbiguous: bankPull.value.staleAmbiguous,
             blockedReason: bankPull.value.blockedReason,
@@ -2200,7 +2344,25 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         `Receipt intake quarantined (cutover, needs a decision): ${
             health.intake?.quarantined?.status === "error" ? "unavailable (probe failed)" : health.intake?.quarantined?.count ?? "unavailable"
         }`,
+        // NAMED IN PLAIN ENGLISH, because the health reason is deliberately not
+        // a blocker: a daily line is most of what stops a non-blocking alarm
+        // dying quietly.
+        `Bank register restatements (QuickBooks changed a stored transaction): ${
+            health.bankPull?.status === "error" ? "unavailable (probe failed)"
+                : (health.bankPull?.conflictCount ?? 0) < 0 ? "unavailable (record unreadable)"
+                    : health.bankPull?.conflictCount ?? 0
+        }`,
     ];
+    if ((health.bankPull?.conflictCount ?? 0) > 0) {
+        // Ten is enough to act on; a longer list means the flood breaker is
+        // about to be the story instead.
+        const conflicts = (health.bankPull?.conflicts ?? []).slice(0, 10);
+        for (const conflict of conflicts) {
+            lines.push(`- Restated in QuickBooks: txn ${conflict.qbTxnId} (${
+                conflict.fields.length ? conflict.fields.join(", ") : "identity changed"
+            })${conflict.linked ? " [already in ledger]" : ""}`);
+        }
+    }
     const duplicates = health.qbo.duplicatePurchases;
     lines.push(`Possible duplicate QBO purchases: ${
         !duplicates ? "unavailable (not checked)"

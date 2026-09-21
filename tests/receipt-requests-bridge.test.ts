@@ -443,7 +443,7 @@ test("the bank pull fails on a stale fetch and on chunk errors; truncation is no
     // budget-truncated run read part of one window, which is not proof the
     // register is current. Behaviour lives in tests/bank-pull-window.test.ts.
     const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s\S]{0,140}?quarantineHeld\.length === 0 && !quarantineBlocked[\s]*&& !summary\.uncertified;/);
+    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0\s*&& quarantineHeld\.length === 0 && !quarantineBlocked(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*&& conflictOutcome\.ok(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*&& !summary\.conflictFlood(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*&& !summary\.uncertified;/);
     // The write itself, and the release of an owed stamp, are ONE transaction
     // (round-37 gate, finding 2) — the ONLY place stampPending is ever cleared.
     assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,300}await commitFreshnessStamp\(/);
@@ -519,7 +519,10 @@ test("reconciliation always runs; minting needs a fresh, conflict-free pull", ()
     const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
     // No early return that would skip the backlog on an empty fetch.
     assert.doesNotMatch(lib, /if \(lines\.length === 0\) return summary;/);
-    assert.match(lib, /const mintIsSafe = summary\.ok && summary\.complete && !fetched\.stale && clearedProbeOk && quarantined\.length === 0;/);
+    // AND NOT A RESTATEMENT FLOOD. A flood deliberately leaves `ok`/`complete`
+    // true — breaking the run wedged the continuation — so this conjunct is the
+    // only thing keeping the mint off fifty observations we believe are stale.
+    assert.match(lib, /const mintIsSafe = summary\.ok && summary\.complete && !fetched\.stale && clearedProbeOk\s*&& quarantined\.length === 0 && !conflictFlood;/);
     assert.match(lib, /summary\.mintSkipped = fetched\.stale\s*\n\s*\? "stale-fetch"/);
     // A truncated window has its own reason, distinct from a failed ingest.
     assert.match(lib, /\? "incomplete-window"/);
@@ -882,7 +885,7 @@ test("mintFromQbo reports truncation, and a truncated run stamps nothing", () =>
     assert.match(route, /const MINT_MAX_BATCHES = 10;/);
     assert.match(route, /remainingCursor = result\.nextId;/);
     // The freshness clock needs a run that was BOTH clean and whole.
-    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s\S]{0,140}?quarantineHeld\.length === 0 && !quarantineBlocked[\s]*&& !summary\.uncertified;/);
+    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0\s*&& quarantineHeld\.length === 0 && !quarantineBlocked(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*&& conflictOutcome\.ok(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*&& !summary\.conflictFlood(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*&& !summary\.uncertified;/);
     // The write itself, and the release of an owed stamp, are ONE transaction
     // (round-37 gate, finding 2) — the ONLY place stampPending is ever cleared.
     assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,300}await commitFreshnessStamp\(/);

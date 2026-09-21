@@ -224,7 +224,7 @@ test("a quarantine is reported, and does not fail the run", () => {
     assert.match(lib, /summary\.quarantinedQbTxnIds = quarantined\.map\(entry => entry\.qbTxnId\);/);
     // Minting stays blocked while rows are missing, which is a narrow and real
     // reason — blocking the MINT is not blocking the run.
-    assert.match(lib, /clearedProbeOk && quarantined\.length === 0;/);
+    assert.match(lib, /clearedProbeOk\s*&& quarantined\.length === 0 && !conflictFlood;/);
     assert.equal(MAX_SPLITS_PER_TXN > 1, true);
 });
 

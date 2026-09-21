@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
 import { formatCurrency } from "@/lib/utils";
-import { resolveDocUrl } from "@/lib/secure-storage";
+import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
+import { signReceiptDownloadUrls } from "@/lib/receipt-intake/bucket";
+import { RECEIPT_URL_TTL_SECONDS } from "@/lib/receipt-intake/receipt-url";
 import { retryTargetFor } from "@/lib/receipt-intake/route-state";
 import { isPossibleOrphanReason } from "@/lib/receipt-intake/park";
 import { StatCard } from "../shared/stat-card";
@@ -78,15 +80,94 @@ function RowFacts({ row }: { row: IntakeRow }) {
 }
 
 /**
- * "Open receipt" is a short-lived signed URL minted at render time from the
- * private bucket — there is no public receipt URL to link to, and there must
- * not be one. A null result renders as nothing rather than a dead link.
+ * The signer this tab needs: one call, many paths, a map back.
+ *
+ * Injectable so a test can render the real tab against a recorded signer
+ * rather than storage, the same seam bucket.ts offers its own callers.
  */
-async function ReceiptLink({ storagePath }: { storagePath: string }) {
-    const url = await resolveDocUrl(storagePath);
-    if (!url) return null;
+export type ReceiptBatchSigner = (
+    storagePaths: readonly string[],
+    ttlSeconds: number,
+    deadline: RouteDeadline | undefined,
+) => Promise<Map<string, string>>;
+
+/**
+ * How long a render will wait for its links, in total.
+ *
+ * The links are a convenience; the queue is the page. Without a shared budget
+ * every batch is handed the storage helper's own fifteen-second allowance, so a
+ * degraded storage day is minutes of blank page for a bookkeeper who only
+ * wanted to see what is waiting. One budget covers the whole signing step, and
+ * when it runs out the tab draws with the links it managed to get. Eight
+ * seconds is far more than a healthy batch needs and far less than anyone will
+ * wait for a page.
+ */
+export const RECEIPT_LINK_SIGN_BUDGET_MS = 8_000;
+
+/** The groups whose rows carry an intake object, in render order. */
+function linkedGroups(queue: ReceiptQueue): Array<[ReceiptGroup, IntakeRow[]]> {
+    return [
+        ["needs-job", queue.needsJob],
+        ["needs-review", queue.needsReview],
+        ["booking", queue.booking],
+        ["booked-today", queue.bookedToday],
+        ["duplicates", queue.duplicates],
+    ];
+}
+
+/**
+ * Every "Open receipt" href this render needs, in ONE round trip.
+ *
+ * A row's `storagePath` is the RAW object path inside the intake feature's own
+ * PRIVATE bucket (`receipt-intake`). It is not a `receipt-intake://` reference
+ * and not a `secure:` one, so resolveDocUrl cannot read it as it stands: a bare
+ * path falls through to that function's legacy branch and comes back as a
+ * PUBLIC `project-files` URL, which is the wrong bucket and a 404 for every row
+ * on this tab (#443). Two things would resolve it, wrapping each path in a
+ * `receipt-intake://` reference or signing it against the bucket it really
+ * lives in. This signs, because the tab is holding every path already and the
+ * batch call turns a page into one request instead of one per row.
+ *
+ * Only the groups `groupIsVisible` will draw: a filtered view must not pay to
+ * sign rows it is not going to show.
+ *
+ * Never throws. With no answer from storage every row renders without a link,
+ * which is exactly what a row with no signable object already does.
+ */
+async function signVisibleReceiptLinks(
+    queue: ReceiptQueue,
+    filters: ReceiptFilters,
+    sign: ReceiptBatchSigner = signReceiptDownloadUrls,
+): Promise<Map<string, string>> {
+    const paths = [...new Set(
+        linkedGroups(queue)
+            .filter(([group]) => groupIsVisible(group, filters))
+            .flatMap(([, rows]) => rows)
+            .map(row => row.storagePath)
+            .filter((path): path is string => !!path),
+    )];
+    if (paths.length === 0) return new Map();
+    // Minted here, at call time, so every chunk of the batch shares ONE wall
+    // clock rather than each starting a fresh allowance of its own.
+    const deadline = createRouteDeadline(RECEIPT_LINK_SIGN_BUDGET_MS);
+    try {
+        return await sign(paths, RECEIPT_URL_TTL_SECONDS, deadline);
+    } catch {
+        return new Map();
+    }
+}
+
+/**
+ * "Open receipt" points at a short-lived signed URL for an object in the
+ * private receipt-intake bucket, minted for the whole page at once by
+ * signVisibleReceiptLinks. There is no public receipt URL to link to, and there
+ * must not be one. A row whose object did not sign renders nothing rather than
+ * a dead link.
+ */
+function ReceiptLink({ href }: { href: string | null | undefined }) {
+    if (!href) return null;
     return (
-        <a href={url} target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
+        <a href={href} target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
             Open receipt ↗
         </a>
     );
@@ -106,17 +187,34 @@ function QuickBooksLink({ qbPurchaseId }: { qbPurchaseId: string }) {
     );
 }
 
-export function ReceiptsTab({
+export async function ReceiptsTab({
     queue,
     filters,
     jobs,
     filterHref,
+    nativeActive,
+    sign,
 }: {
     queue: ReceiptQueue;
     filters: ReceiptFilters;
     jobs: Array<{ id: string; name: string }>;
     filterHref: (overrides: { group?: string; owner?: string }) => string;
+    /**
+     * Is ProBuild booking these itself? The SAME derivation the pause control
+     * uses (`!pushEnabled && nativeBookingEnabled`), threaded in as a prop
+     * rather than re-read here, so the two surfaces cannot name different
+     * rails. With it on, nothing in this queue goes to QuickBooks.
+     */
+    nativeActive: boolean;
+    /** Injected only by tests: a production render takes the real signer. */
+    sign?: ReceiptBatchSigner;
 }) {
+    // ONE batched signing step for every row this render will draw, taken
+    // before any of it is drawn, under ONE budget. Per-row signing here is five
+    // hundred requests and five hundred Supabase clients on a page that is
+    // force-dynamic, and unbudgeted it is a page that can hang on storage.
+    const links = await signVisibleReceiptLinks(queue, filters, sign);
+
     const counts: Record<ReceiptGroup, number> = {
         "needs-job": queue.counts.needsJob,
         "needs-review": queue.counts.needsReview,
@@ -147,7 +245,13 @@ export function ReceiptsTab({
             </p>
             <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
                 <StatCard label="Waiting on a person (intake queue)" value={String(counts["needs-job"] + counts["needs-review"])} sub="Queue receipts that need a job or a decision" />
-                <StatCard label="In flight (intake queue)" value={String(counts.booking)} sub="Queue receipts booking into QuickBooks" />
+                <StatCard
+                    label="In flight (intake queue)"
+                    value={String(counts.booking)}
+                    sub={nativeActive
+                        ? "Queue receipts booking into ProBuild job costing"
+                        : "Queue receipts booking into QuickBooks"}
+                />
                 <StatCard label="Missing receipts" value={String(counts["missing-receipts"])} sub="Open receipt requests for bank charges" />
             </div>
 
@@ -256,7 +360,7 @@ export function ReceiptsTab({
                                 <RowFacts row={row} />
                                 <div className="flex items-center gap-3 flex-wrap">
                                     <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
-                                    <ReceiptLink storagePath={row.storagePath} />
+                                    <ReceiptLink href={links.get(row.storagePath)} />
                                     <VoidButton intakeId={row.id} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                 </div>
                             </RowShell>
@@ -294,7 +398,7 @@ export function ReceiptsTab({
                                 </div>
                                 <div className="flex items-center gap-3 flex-wrap">
                                     <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
-                                    <ReceiptLink storagePath={row.storagePath} />
+                                    <ReceiptLink href={links.get(row.storagePath)} />
                                     <MarkDuplicateControl intakeId={row.id} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                     {/* Only offered when a retry can actually
                                         do something. A document VERDICT
@@ -326,7 +430,7 @@ export function ReceiptsTab({
                                     </p>
                                 </div>
                                 <div className="flex items-center gap-3 flex-wrap">
-                                    <ReceiptLink storagePath={row.storagePath} />
+                                    <ReceiptLink href={links.get(row.storagePath)} />
                                     <RetryButton intakeId={row.id} expectedUpdatedAt={row.updatedAt} />
                                     <VoidButton intakeId={row.id} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                 </div>
@@ -345,7 +449,7 @@ export function ReceiptsTab({
                             <RowShell key={row.id}>
                                 <RowFacts row={row} />
                                 <div className="flex items-center gap-3 flex-wrap">
-                                    <ReceiptLink storagePath={row.storagePath} />
+                                    <ReceiptLink href={links.get(row.storagePath)} />
                                     {row.qbPurchaseId && <QuickBooksLink qbPurchaseId={row.qbPurchaseId} />}
                                 </div>
                             </RowShell>
@@ -418,7 +522,7 @@ export function ReceiptsTab({
                                     </p>
                                 </div>
                                 <div className="flex items-center gap-3 flex-wrap">
-                                    <ReceiptLink storagePath={row.storagePath} />
+                                    <ReceiptLink href={links.get(row.storagePath)} />
                                     <NotADuplicateButton intakeId={row.id} expectedUpdatedAt={row.updatedAt} />
                                 </div>
                             </RowShell>

@@ -551,6 +551,36 @@ test("only a CREATE refreshes the last-booked clock — a re-push does not", () 
     assert.equal(BOOKED_PUSH_STATUSES.includes("error"), false);
 });
 
+test("a NATIVE booking is booking — it keeps no-receipts-72h quiet on its own", () => {
+    // RECEIPT_BOOK_NATIVE writes the ProBuild Expense with no QuickBooks
+    // Purchase behind it, and logs the SAME `receipt-push` / `created` event
+    // (with `nativeBooking: true` in the detail) precisely so this probe keeps
+    // seeing a live pipeline. If the probe ever narrowed to QuickBooks-backed
+    // bookings, the digest would report a dead pipeline forever while every
+    // receipt booked correctly — and that is the failure this whole flag was
+    // shipped to avoid, arriving through the monitoring instead.
+
+    // 1. The event book.ts writes natively (tests/receipt-intake-book.ts pins
+    //    its status and detail) carries a status this probe counts.
+    const nativeEvent = { kind: "receipt-push", status: "created", detail: { nativeBooking: true, qbPurchaseId: null } };
+    assert.ok(BOOKED_PUSH_STATUSES.includes(nativeEvent.status));
+
+    // 2. And the probe selects on kind + status only. Anchored on the probe
+    //    DECLARATION so this reads that query and nothing else.
+    const src = readFileSync(path.resolve(__dirname, "..", "src/lib/pipeline-health.ts"), "utf8");
+    const declared = /probe<Date \| null>\(\r?\n\s*"lastReceiptPush",([\s\S]*?)\r?\n\s*null,\r?\n\s*\),/.exec(src);
+    assert.ok(declared, "the probe exists");
+    const branch = declared[1];
+    assert.match(branch, /kind: "receipt-push"/);
+    assert.match(branch, /status: \{ in: BOOKED_PUSH_STATUSES \}/);
+    assert.doesNotMatch(branch, /qbPurchaseId/, "a native booking has none, and still counts");
+    assert.doesNotMatch(branch, /nativeBooking/, "nor is it excluded by its own marker");
+
+    // 3. So a native booking three hours ago is a healthy pipeline.
+    const v = evaluatePipelineHealth(snapshot({ lastReceiptPush: { status: "ok", at: iso(3 * HOUR) } }));
+    assert.deepEqual(v, { ok: true, reasons: [] });
+});
+
 
 // ─── The payments rail is part of the pulse ─────────────────────────────────
 
@@ -1692,7 +1722,7 @@ test("the bank-pull read runs inside the Promise.all, as a probe", () => {
         join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
         "utf8",
     );
-    assert.match(source, /probe<\{[\s\S]{0,400}\}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
+    assert.match(source, /probe<\{[\s\S]{0,600}\}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
     assert.doesNotMatch(source, /bankPull: await readBankPullState\(\)/, "the unprobed await is gone");
     // The read no longer swallows its own failure — the probe reports it.
     const fn = source.slice(source.indexOf("async function readBankPullState("));

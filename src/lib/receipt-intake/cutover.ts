@@ -84,6 +84,84 @@ export interface CutoverTriage {
     unevidenced: string[];
     /** Cannot be settled from data. A human checks QuickBooks. */
     quarantined: string[];
+    /**
+     * Pre-boundary Drive rows with no v1 evidence, under NATIVE booking.
+     *
+     * They would be handed to v2 under the QuickBooks rail, because a v1/v2
+     * overlap collapses on the shared Drive file id. Native booking has no such
+     * collapse, so they park for a human instead — see triageCutoverRows.
+     */
+    nativeUnverified: string[];
+}
+
+/**
+ * The park reason those rows carry.
+ *
+ * Distinct from `no-v1-evidence` (the non-Drive quarantine) on purpose: that
+ * one says "there is no shared identity here", this one says "there is one, but
+ * the rail that used it is switched off".
+ *
+ * NOT reversible by restoring the QuickBooks push. The park writes
+ * `dryRun: false` and the cutover only ever selects `dryRun: true` rows, so no
+ * later pass revisits them whatever the switches say. A person is the only
+ * exit, which is why the row is parked in NEEDS_REVIEW where the Receipts tab
+ * shows it — see the write in the worker cron for the two buttons that are
+ * that exit.
+ */
+export const NATIVE_PRE_CUTOVER_REASON = "native-pre-cutover-unverified";
+
+/**
+ * Was this `receipt-push` AutomationEvent written by ProBuild's own NATIVE
+ * booking rather than by a QuickBooks push?
+ *
+ * book.ts stamps `nativeBooking: true` into the detail on that path, and that
+ * marker is the only thing telling the two apart — v1 evidence means "the Apps
+ * Script put a Purchase in QuickBooks", and a native event asserts the exact
+ * opposite about the same file id.
+ *
+ * `AutomationEvent.detail` is a JSON *string* column. Anything this cannot read
+ * — null, or not JSON at all — answers FALSE, which keeps the row counted as v1
+ * evidence exactly as it was before this filter existed. That is deliberate:
+ * a native event's detail is always written by `serializeDetail`, so it is
+ * always valid JSON and always carries this key (it is one of the cheapest
+ * values in the object, and truncation drops the most expensive first), while a
+ * legacy or Apps-Script event may carry no detail at all. Reading "unreadable"
+ * as native would stop retiring rows v1 really did book.
+ */
+export function isNativeBookingEvent(detail: string | null | undefined): boolean {
+    if (!detail) return false;
+    try {
+        const parsed = JSON.parse(detail) as { nativeBooking?: unknown };
+        return parsed?.nativeBooking === true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * THE DRIVE FILE IDS v1 IS EVIDENCED TO HAVE BOOKED.
+ *
+ * Built from `receipt-push` events, MINUS the ones this pipeline wrote itself.
+ *
+ * The set used to be every booked-status `receipt-push` event carrying a Drive
+ * file id, on the reasoning that only a QuickBooks push writes them. Native
+ * booking breaks that: it logs the same kind, the same `created` status and the
+ * same `fileId` for a Drive row — so v2's own booking would be read back as
+ * proof that v1 had booked the document, and the NEXT candidate row for that
+ * file (a re-forward, a duplicate capture) would be retired as SHADOW_DONE
+ * against evidence that says nothing of the kind. Retirement is terminal and
+ * silent, so that row's receipt would simply be gone.
+ */
+export function v1BookedDriveIds(
+    events: readonly { driveFileId: string | null; detail: string | null }[],
+): Set<string> {
+    const ids = new Set<string>();
+    for (const event of events) {
+        if (!event.driveFileId) continue;
+        if (isNativeBookingEvent(event.detail)) continue;
+        ids.add(event.driveFileId);
+    }
+    return ids;
 }
 
 /** The Drive file id a row books under, or null when it has no shared identity. */
@@ -110,13 +188,35 @@ export function driveFileIdOf(row: { source: string; sourceRef: string }): strin
  *     Drive file id, so a v1/v2 overlap collapses into one Purchase.
  *   - before it, anything else -> quarantine. Booking risks double-paying and
  *     retiring risks losing a real expense, so a human decides.
+ *
+ * ...AND THE DRIVE EXEMPTION IS A QUICKBOOKS FACT, NOT A CUTOVER ONE.
+ *
+ * "Safe because a v1/v2 overlap collapses into one Purchase" is true only
+ * while v2 books THROUGH QuickBooks: the collapse is QBO's DocNumber/requestid
+ * idempotency doing it, keyed on the Drive file id v1 also used. A NATIVE
+ * booking never talks to QuickBooks, so there is nothing to collapse against —
+ * it would write a ProBuild Expense for a spend v1 may already have put in the
+ * books, and the two carry no shared key that could ever reconcile them. Under
+ * native booking those rows therefore get the same treatment as the non-Drive
+ * ones: a human decides. Requeuing on a guess double-books real money.
  */
 export function triageCutoverRows(
     candidates: CutoverCandidate[],
     boundary: Date,
     bookedByV1: ReadonlySet<string>,
+    /**
+     * IS NATIVE BOOKING THE RAIL THAT WILL ACTUALLY BOOK THESE ROWS?
+     *
+     * Not the bare `RECEIPT_BOOK_NATIVE` flag: booking takes the native branch
+     * only while the QuickBooks push is OFF, so the caller must pass the
+     * EFFECTIVE predicate (`!pushEnabled && nativeEnabled`). Passing the flag
+     * alone parks rows terminally, in the one configuration where both are on,
+     * against a collapse QuickBooks was about to perform. Off = the QuickBooks
+     * rail, unchanged.
+     */
+    nativeBooking = false,
 ): CutoverTriage {
-    const triage: CutoverTriage = { evidenced: [], unevidenced: [], quarantined: [] };
+    const triage: CutoverTriage = { evidenced: [], unevidenced: [], quarantined: [], nativeUnverified: [] };
     for (const row of candidates) {
         const driveId = driveFileIdOf(row);
         if (row.archivedByV1 || (driveId && bookedByV1.has(driveId))) {
@@ -127,8 +227,9 @@ export function triageCutoverRows(
             triage.unevidenced.push(row.id);
             continue;
         }
-        if (driveId) triage.unevidenced.push(row.id);
-        else triage.quarantined.push(row.id);
+        if (!driveId) triage.quarantined.push(row.id);
+        else if (nativeBooking) triage.nativeUnverified.push(row.id);
+        else triage.unevidenced.push(row.id);
     }
     return triage;
 }
