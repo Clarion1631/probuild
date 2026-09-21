@@ -13,10 +13,24 @@ import {
     RECEIPT_GROUP_LABELS,
     OWNER_ORDER,
     groupIsVisible,
+    showsTodoView,
     type ReceiptFilters,
     type ReceiptGroup,
 } from "../../receipts-filters";
 import type { IntakeRow, MissingReceiptRow, ReceiptQueue } from "../../receipts-data";
+import {
+    CHECK_GUIDE_HREF,
+    PILE_AGE_MIN_DAYS,
+    TODO_COPY,
+    fillCopy,
+    planTodo,
+    rollUpDates,
+    rollUpSummary,
+    todoStoragePaths,
+    type TodoPile,
+    type TodoPlan,
+    type TodoRequestItem,
+} from "../../receipts-todo";
 import {
     AssignOwnerControl,
     MarkDuplicateControl,
@@ -56,6 +70,22 @@ function GroupCard({ title, count, children }: { title: string; count: number; c
     );
 }
 
+/**
+ * Every date this tab prints is the crew's date.
+ *
+ * Vercel runs in UTC, so a bare `toLocaleString` puts an evening receipt on
+ * tomorrow and a retry time hours off. receipts-data.ts already decides "booked
+ * today" in this zone (`pacificDayStart`); the tab has to agree with it.
+ */
+const PACIFIC = "America/Los_Angeles";
+
+/** A UTC instant as the crew's calendar day. Falls back to the raw prefix. */
+function pacificDay(iso: string): string {
+    const at = new Date(iso);
+    if (Number.isNaN(at.getTime())) return iso.slice(0, 10);
+    return at.toLocaleDateString("en-CA", { timeZone: PACIFIC });
+}
+
 function amountLabel(cents: number | null): string {
     if (cents === null) return "—";
     return formatCurrency(Math.abs(cents) / 100);
@@ -73,7 +103,7 @@ function RowFacts({ row }: { row: IntakeRow }) {
                 <span className="ml-2 font-normal tabular-nums">{amountLabel(row.totalCents)}</span>
             </p>
             <p className="text-xs text-hui-textMuted">
-                {row.txnDate ?? row.createdAt.slice(0, 10)} · {row.source}
+                {row.txnDate ?? pacificDay(row.createdAt)} · {row.source}
                 {row.projectName ? ` · ${row.projectName}` : ""}
             </p>
         </div>
@@ -168,6 +198,21 @@ async function signVisibleReceiptLinks(
             .map(row => row.storagePath)
             .filter((path): path is string => !!path),
     )];
+    return signPaths(paths, sign);
+}
+
+/**
+ * The signing step itself: ONE batch, ONE budget, never throws.
+ *
+ * Split out so a caller can hand over exactly the paths it is going to draw.
+ * The To-do view does that (`todoStoragePaths`), which is how "what we draw"
+ * and "what we sign" are kept from answering differently, and is also why that
+ * view signs a few dozen paths instead of five groups of a hundred.
+ */
+async function signPaths(
+    paths: readonly string[],
+    sign: ReceiptBatchSigner = signReceiptDownloadUrls,
+): Promise<Map<string, string>> {
     if (paths.length === 0) return new Map();
     // Minted here, at call time, so every chunk of the batch shares ONE wall
     // clock rather than each starting a fresh allowance of its own.
@@ -192,6 +237,63 @@ function ReceiptLink({ href }: { href: string | null | undefined }) {
         <a href={href} target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
             Open receipt ↗
         </a>
+    );
+}
+
+/**
+ * What these groups do and do not cover, and the way over to the register.
+ *
+ * Drawn by BOTH shapes of the tab. The claim it makes is narrow on purpose:
+ * these counts are this intake queue, not "every receipt the company has", and
+ * tests/receipt-queue-scope.test.ts fails the day that stops being true.
+ */
+function QueueScopeNote() {
+    return (
+        <p className="hui-card px-4 py-3 text-sm text-hui-textMuted">
+            Needs job, Needs review, Booking and Booked today cover only receipts in this intake queue.
+            Receipts handled through other email or photo paths may not appear in those totals.
+            Missing receipts is a separate list of open requests for bank charges.{" "}
+            <a href="/automation?tab=register" className="font-medium text-hui-primary hover:underline">
+                View register
+            </a>
+            .
+        </p>
+    );
+}
+
+/**
+ * The filter chips: Marge's list, then every group with its own count badge,
+ * then the whole thing.
+ *
+ * Each group chip keeps the exact `?group=` href it has always had. "Everything"
+ * is a real bookmarkable name for what a bare `?tab=receipts` used to draw, so
+ * nobody loses a page by the default moving.
+ */
+function ReceiptChipRow({ filters, counts, filterHref, todo = false }: {
+    filters: ReceiptFilters;
+    counts: Record<ReceiptGroup, number>;
+    filterHref: (overrides: { group?: string; owner?: string; view?: string }) => string;
+    todo?: boolean;
+}) {
+    const chip = (active: boolean) =>
+        `inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-full transition ${
+            active ? "bg-hui-primary text-white" : "bg-white border border-slate-300 text-slate-700 hover:bg-slate-50"
+        }`;
+    return (
+        <div className="flex gap-2 flex-wrap items-center">
+            <a href={filterHref({ group: "", owner: "", view: "todo" })} className={chip(todo)}>
+                {TODO_COPY.chipTodo}
+            </a>
+            {RECEIPT_GROUPS.map(group => (
+                <a key={group} href={filterHref({ group })} className={chip(filters.group === group)}>
+                    {RECEIPT_GROUP_LABELS[group]}
+                    <span className={`tabular-nums ${filters.group === group ? "text-white/80" : "text-slate-500"}`}>{counts[group]}</span>
+                </a>
+            ))}
+            <a href={filterHref({ group: "", owner: "", view: "all" })} className={chip(!todo && filters.group === null)}>
+                {TODO_COPY.chipEverything}
+            </a>
+        </div>
     );
 }
 
@@ -220,7 +322,7 @@ export async function ReceiptsTab({
     queue: ReceiptQueue;
     filters: ReceiptFilters;
     jobs: Array<{ id: string; name: string }>;
-    filterHref: (overrides: { group?: string; owner?: string }) => string;
+    filterHref: (overrides: { group?: string; owner?: string; view?: string }) => string;
     /**
      * Is ProBuild booking these itself? The SAME derivation the pause control
      * uses (`!pushEnabled && nativeBookingEnabled`), threaded in as a prop
@@ -231,11 +333,18 @@ export async function ReceiptsTab({
     /** Injected only by tests: a production render takes the real signer. */
     sign?: ReceiptBatchSigner;
 }) {
+    // Marge's list is the default shape of this tab, so the plan comes first:
+    // in that shape the rows worth signing are exactly the ones it says will be
+    // drawn, which is a few dozen rather than five groups of a hundred.
+    const todo = showsTodoView(filters) ? planTodo(queue) : null;
+
     // ONE batched signing step for every row this render will draw, taken
     // before any of it is drawn, under ONE budget. Per-row signing here is five
     // hundred requests and five hundred Supabase clients on a page that is
     // force-dynamic, and unbudgeted it is a page that can hang on storage.
-    const links = await signVisibleReceiptLinks(queue, filters, sign);
+    const links = todo
+        ? await signPaths(todoStoragePaths(todo), sign)
+        : await signVisibleReceiptLinks(queue, filters, sign);
 
     const counts: Record<ReceiptGroup, number> = {
         "needs-job": queue.counts.needsJob,
@@ -254,17 +363,29 @@ export async function ReceiptsTab({
     const unknownOwnerRows = queue.missingReceipts.filter(row => !OWNER_ORDER.includes(row.owner as never));
     if (unknownOwnerRows.length > 0) missingByOwner.push({ owner: "unassigned", rows: unknownOwnerRows });
 
+    if (todo) {
+        return (
+            <div className="space-y-6">
+                <QueueScopeNote />
+                <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
+                    <StatCard label={TODO_COPY.statNeedsYou} value={String(todo.needsYouCount)} sub={TODO_COPY.statNeedsYouSub} />
+                    <StatCard label={TODO_COPY.statHandled} value={String(todo.handledCount)} sub={TODO_COPY.statHandledSub} />
+                    <StatCard label={TODO_COPY.statBooked} value={String(counts["booked-today"])} sub={TODO_COPY.statBookedSub} />
+                </div>
+                <ReceiptChipRow filters={filters} counts={counts} filterHref={filterHref} todo />
+                {todo.needsYouCount === 0
+                    ? <TodoDone plan={todo} />
+                    : todo.piles
+                        .filter(pile => pile.items.length > 0)
+                        .map(pile => <TodoPileCard key={pile.key} pile={pile} jobs={jobs} links={links} />)}
+                <FoldedStrip plan={todo} />
+            </div>
+        );
+    }
+
     return (
         <div className="space-y-6">
-            <p className="hui-card px-4 py-3 text-sm text-hui-textMuted">
-                Needs job, Needs review, Booking and Booked today cover only receipts in this intake queue.
-                Receipts handled through other email or photo paths may not appear in those totals.
-                Missing receipts is a separate list of open requests for bank charges.{" "}
-                <a href="/automation?tab=register" className="font-medium text-hui-primary hover:underline">
-                    View register
-                </a>
-                .
-            </p>
+            <QueueScopeNote />
             <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
                 <StatCard label="Waiting on a person (intake queue)" value={String(counts["needs-job"] + counts["needs-review"])} sub="Queue receipts that need a job or a decision" />
                 <StatCard
@@ -278,28 +399,7 @@ export async function ReceiptsTab({
             </div>
 
             {/* Group filter chips, each carrying its own count badge. */}
-            <div className="flex gap-2 flex-wrap items-center">
-                <a
-                    href={filterHref({ group: "" })}
-                    className={`inline-flex items-center px-3 py-1 text-xs font-medium rounded-full transition ${
-                        filters.group === null ? "bg-hui-primary text-white" : "bg-white border border-slate-300 text-slate-700 hover:bg-slate-50"
-                    }`}
-                >
-                    All
-                </a>
-                {RECEIPT_GROUPS.map(group => (
-                    <a
-                        key={group}
-                        href={filterHref({ group })}
-                        className={`inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-full transition ${
-                            filters.group === group ? "bg-hui-primary text-white" : "bg-white border border-slate-300 text-slate-700 hover:bg-slate-50"
-                        }`}
-                    >
-                        {RECEIPT_GROUP_LABELS[group]}
-                        <span className={`tabular-nums ${filters.group === group ? "text-white/80" : "text-slate-500"}`}>{counts[group]}</span>
-                    </a>
-                ))}
-            </div>
+            <ReceiptChipRow filters={filters} counts={counts} filterHref={filterHref} />
 
             {groupIsVisible("uncertain-cards", filters) && queue.counts.uncertainCards > 0 && (
                 <GroupCard title={RECEIPT_GROUP_LABELS["uncertain-cards"]} count={counts["uncertain-cards"]}>
@@ -331,7 +431,7 @@ export async function ReceiptsTab({
                     <p className="px-4 py-2 text-xs text-red-700 bg-red-50 border-b border-red-100">
                         Each of these was voided or re-classified after the send to QuickBooks had already started.
                         Where the purchase id is known it is linked below — open it in QuickBooks, void it there, then
-                        mark it resolved. Nothing here can remove it for you.
+                        mark it resolved. Nothing here can remove it for you. {TODO_COPY.exceptionsNative}
                     </p>
                     {queue.exceptions.map(row => (
                         <RowShell key={row.id}>
@@ -454,7 +554,7 @@ export async function ReceiptsTab({
                                             ? <StateReason reason={row.stateReason} row={row} />
                                             : row.lastError ?? "Waiting for its turn"}
                                         {row.attempts > 0 && ` · attempt ${row.attempts}`}
-                                        {row.nextRetryAt && ` · next try ${new Date(row.nextRetryAt).toLocaleString("en-US", { dateStyle: "short", timeStyle: "short" })}`}
+                                        {row.nextRetryAt && ` · next try ${new Date(row.nextRetryAt).toLocaleString("en-US", { dateStyle: "short", timeStyle: "short", timeZone: PACIFIC })}`}
                                     </p>
                                 </div>
                                 <div className="flex items-center gap-3 flex-wrap">
@@ -508,10 +608,18 @@ export async function ReceiptsTab({
                         backlog past the display cap can never read as small);
                         this says how much of it is on screen, so the two numbers
                         can always be reconciled. */}
+                    {/* NEWEST, not oldest. The scan is
+                        `orderBy: { firstObservedAt: "desc" }` and the in-memory
+                        sort is newest first too (receipts-data.ts), so the old
+                        "(oldest are shown first)" was backwards about the one
+                        thing this line exists to explain. */}
                     {queue.counts.missingReceiptsShown !== queue.counts.missingReceipts && (
                         <p className="px-4 py-2 text-xs text-hui-textMuted border-b border-slate-100">
-                            Showing {queue.counts.missingReceiptsShown} of {queue.counts.missingReceipts}
-                            {filters.owner ? ` (filtered to ${filters.owner})` : " (oldest are shown first)"}.
+                            {fillCopy(filters.owner ? TODO_COPY.capLineOwner : TODO_COPY.capLine, {
+                                shown: queue.counts.missingReceiptsShown,
+                                total: queue.counts.missingReceipts,
+                                owner: filters.owner ?? "",
+                            })}
                         </p>
                     )}
                     {missingByOwner.length === 0 ? (
@@ -559,6 +667,212 @@ export async function ReceiptsTab({
                 </GroupCard>
             )}
         </div>
+    );
+}
+
+/**
+ * One pile of Marge's work: a title, one plain sentence saying what to do, and
+ * the rows. Piles are drawn in the planner's order, which is "how few people
+ * could possibly do this" rather than how big the pile is.
+ */
+function TodoPileCard({ pile, jobs, links }: {
+    pile: TodoPile;
+    jobs: Array<{ id: string; name: string }>;
+    links: Map<string, string>;
+}) {
+    // Sub-headed by person only where the action is "ask this person". The
+    // planner already ordered the items by OWNER_ORDER then by size, so this
+    // just names each run as it starts.
+    const showOwners = pile.key === "ask-for-these";
+    let lastOwner: string | null = null;
+    const rows: ReactNode[] = [];
+    for (const item of pile.items) {
+        if (showOwners && item.kind === "request" && item.item.owner !== lastOwner) {
+            lastOwner = item.item.owner;
+            rows.push(
+                <h3 key={`owner-${lastOwner}`} className="px-4 py-2 text-xs font-semibold text-hui-textMain bg-slate-50 border-b border-slate-100">
+                    {lastOwner}
+                </h3>,
+            );
+        }
+        rows.push(item.kind === "intake"
+            ? <TodoIntakeRowView key={item.row.id} row={item.row} pile={pile.key} jobs={jobs} links={links} />
+            : <TodoRequestItemView key={item.item.key} item={item.item} check={pile.key === "checks-and-sub-bills"} />);
+    }
+
+    return (
+        <section className="hui-card overflow-hidden">
+            <header className="px-4 py-3 border-b border-hui-border bg-slate-50">
+                <div className="flex items-center gap-2">
+                    <h2 className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">{pile.title}</h2>
+                    <span className="inline-flex items-center justify-center min-w-[1.5rem] px-1.5 py-0.5 text-xs font-semibold rounded-full bg-white border border-slate-300 text-slate-700">
+                        {pile.rowCount}
+                    </span>
+                </div>
+                <p className="text-xs text-hui-textMuted mt-1">{pile.note}</p>
+                {pile.oldestDays !== null && pile.oldestDays >= PILE_AGE_MIN_DAYS && (
+                    <p className="text-xs text-amber-700 mt-1">{fillCopy(TODO_COPY.pileAge, { n: pile.oldestDays })}</p>
+                )}
+            </header>
+            {rows}
+        </section>
+    );
+}
+
+/**
+ * One receipt waiting on a person: the facts, why it is parked, one action.
+ *
+ * "Set job" is offered only where picking a job is what finishes the row. A
+ * receipt nobody could read does not become readable by getting a job, so that
+ * pile draws the link and nothing else. Void, Mark duplicate and Retry stay on
+ * the group views: none of them is Marge's call.
+ */
+function TodoIntakeRowView({ row, pile, jobs, links }: {
+    row: IntakeRow;
+    pile: TodoPile["key"];
+    jobs: Array<{ id: string; name: string }>;
+    links: Map<string, string>;
+}) {
+    return (
+        <RowShell>
+            <div className="min-w-[16rem]">
+                <RowFacts row={row} />
+                {row.stateReason && (
+                    <p className="text-xs text-amber-700 mt-1">
+                        <StateReason reason={row.stateReason} row={row} />
+                    </p>
+                )}
+            </div>
+            <div className="flex items-center gap-3 flex-wrap">
+                {pile === "pick-the-job" && (
+                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
+                )}
+                <ReceiptLink href={links.get(row.storagePath)} />
+            </div>
+        </RowShell>
+    );
+}
+
+/**
+ * One bank charge with no receipt behind it.
+ *
+ * A check says "check paid" rather than "no card (office rail)": the rail is
+ * internal jargon, and on a check it is also the wrong fact to lead with. The
+ * procedure is a LINK to the guide, never a restatement of it, so the row and
+ * the guide cannot drift.
+ */
+function TodoRequestRowView({ row, check = false }: { row: MissingReceiptRow; check?: boolean }) {
+    return (
+        <RowShell>
+            <div className="min-w-[18rem]">
+                <p className="text-sm text-hui-textMain font-medium">
+                    {row.payee || row.rawDescriptor || "Unnamed charge"}
+                    <span className="ml-2 font-normal tabular-nums">{amountLabel(row.amountCents)}</span>
+                </p>
+                <p className="text-xs text-hui-textMuted">
+                    {row.postedDate || "date unknown"}
+                    {check
+                        ? ` · ${TODO_COPY.checkFacts}`
+                        : row.cardTail ? ` · card …${row.cardTail}` : ` · ${TODO_COPY.noCard}`}
+                </p>
+                {check && <p className="text-xs text-amber-700 mt-1">{TODO_COPY.checkSentence}</p>}
+            </div>
+            <div className="flex items-center gap-3 flex-wrap">
+                {row.owner === "unattributed" && <AssignOwnerControl issueId={row.id} currentOwner={row.owner} expectedVersion={row.version} />}
+                {check && (
+                    <a href={CHECK_GUIDE_HREF} className="text-xs font-medium text-hui-primary hover:underline">
+                        {TODO_COPY.checkLink}
+                    </a>
+                )}
+                {/* The same ack write the register uses, unchanged. It means "I
+                    asked, hide this until something changes": the row leaves
+                    this list and is counted in the grey strip below. On a check
+                    it means "I posted it", which is the same sentence. */}
+                <MarkReviewedButton
+                    issue={{ id: row.id, version: row.version, reasonHash: row.reasonHash, acknowledged: row.acknowledged }}
+                />
+            </div>
+        </RowShell>
+    );
+}
+
+/**
+ * The same errand, repeated: one line instead of ten.
+ *
+ * A native `<details>`, so the expander needs no JavaScript, works in a server
+ * component and is keyboard reachable for free. Children are ordinary rows,
+ * oldest first, so opening it reads as a history. Each child keeps its own
+ * "Mark reviewed": the ack is CAS-gated per row and there is no bulk write.
+ */
+function TodoRequestItemView({ item, check = false }: { item: TodoRequestItem; check?: boolean }) {
+    if (item.rows.length === 1) return <TodoRequestRowView row={item.rows[0]} check={check} />;
+    const oldestFirst = [...item.rows].sort((a, b) =>
+        (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1 : 0));
+    return (
+        <details className="border-b border-slate-100 last:border-b-0">
+            <summary className="px-4 py-3 cursor-pointer">
+                <span className="text-sm text-hui-textMain font-medium">
+                    {item.payee || item.rows[0].rawDescriptor || "Unnamed charge"}
+                    <span className="ml-2 font-normal tabular-nums">
+                        {rollUpSummary(amountLabel(item.amountCentsEach), item.rows.length, amountLabel(item.totalCents))}
+                    </span>
+                </span>
+                <span className="block text-xs text-hui-textMuted">
+                    {check
+                        ? `${item.firstDate || "date unknown"} to ${item.lastDate || "date unknown"} · ${TODO_COPY.checkFacts}`
+                        : rollUpDates(item.firstDate || "date unknown", item.lastDate || "date unknown", item.rows[0].cardTail)}
+                </span>
+            </summary>
+            <div className="border-t border-slate-100">
+                {oldestFirst.map(row => <TodoRequestRowView key={row.id} row={row} check={check} />)}
+            </div>
+        </details>
+    );
+}
+
+/**
+ * What nobody has to do anything about, and who owns the rest.
+ *
+ * ALWAYS drawn, even at zero. A strip that only appears when there is bad news
+ * is indistinguishable from a strip that broke. Every line links into the group
+ * view that holds those rows, so one click is still the whole truth.
+ */
+function FoldedStrip({ plan }: { plan: TodoPlan }) {
+    return (
+        <section className="hui-card px-4 py-3 bg-slate-50">
+            <p className="text-sm text-hui-textMuted">{fillCopy(TODO_COPY.stripHeader, { n: plan.handledCount })}</p>
+            {plan.folded.length > 0 && (
+                <ul className="mt-2 space-y-1">
+                    {plan.folded.map(line => (
+                        <li key={line.key} className="text-xs text-hui-textMuted">
+                            {line.href
+                                ? <a href={line.href} className="font-medium text-hui-primary hover:underline">{line.text}</a>
+                                : line.text}
+                        </li>
+                    ))}
+                </ul>
+            )}
+        </section>
+    );
+}
+
+/**
+ * Nothing is waiting on her.
+ *
+ * It says what the system is holding rather than claiming the company is
+ * finished: "every receipt has a job" would be a sentence this page cannot
+ * know is true, and tests/receipt-queue-scope.test.tsx forbids it by name.
+ */
+function TodoDone({ plan }: { plan: TodoPlan }) {
+    return (
+        <section className="hui-card px-4 py-8 text-center">
+            <p className="text-sm font-semibold text-hui-textMain">{TODO_COPY.doneTitle}</p>
+            <p className="text-sm text-hui-textMuted mt-1">
+                {plan.handledCount === 0
+                    ? TODO_COPY.doneNothing
+                    : fillCopy(TODO_COPY.doneSub, { n: plan.handledCount })}
+            </p>
+        </section>
     );
 }
 

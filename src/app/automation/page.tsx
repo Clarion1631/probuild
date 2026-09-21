@@ -859,14 +859,20 @@ export default async function AutomationPage(props: {
 async function ReceiptsTabBranch({ sp }: { sp: Record<string, string | string[] | undefined> }) {
     const filters = parseReceiptFilters(sp);
 
-    function receiptFilterHref(overrides: { group?: string; owner?: string }) {
+    // `view` rides along with group and owner so a chip keeps whatever shape the
+    // reader is already in. "todo" is the default and is never written to the
+    // URL, which is what leaves `?tab=receipts&group=needs-job` byte for byte
+    // the link it has always been.
+    function receiptFilterHref(overrides: { group?: string; owner?: string; view?: string }) {
         const params = new URLSearchParams();
         params.set("tab", "receipts");
         const nextGroup = overrides.group ?? filters.group ?? "";
         const nextOwner = overrides.owner ?? filters.owner ?? "";
+        const nextView = overrides.view ?? filters.view ?? "";
         if (nextGroup) params.set("group", nextGroup);
         if (nextOwner) params.set("owner", nextOwner);
         if (filters.projectId) params.set("projectId", filters.projectId);
+        if (nextView && nextView !== "todo") params.set("view", nextView);
         return `/automation?${params.toString()}`;
     }
 
