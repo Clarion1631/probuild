@@ -107,7 +107,13 @@ const DAY_MS = 86_400_000;
  */
 function utcMidnightOf(dayKey: string | null | undefined): number | null {
     const value = typeof dayKey === "string" ? dayKey : "";
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+    // The LENGTH is pinned beside the pattern, and deliberately so even though
+    // it is redundant today: JavaScript's `$` without the `m` flag matches only
+    // at the very end of the input — unlike Python's, which also matches before
+    // a trailing newline — so the pattern alone already rejects "2026-09-21\n".
+    // The tests pin that. This keeps the rejection true if the pattern ever
+    // grows an `m` flag or the input ever arrives pre-trimmed by a caller.
+    if (value.length !== 10 || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
     const year = Number(value.slice(0, 4));
     const month = Number(value.slice(5, 7));
     const day = Number(value.slice(8, 10));

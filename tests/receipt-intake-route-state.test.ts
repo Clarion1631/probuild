@@ -129,8 +129,46 @@ test("validation is SELF-CONTAINED and UTC — no host time zone, no 19xx mappin
     assert.equal(isValidDate("0026-09-17"), false, "the local-time helper's quirk, pinned");
 
     // The leap rules are the real calendar's, in UTC.
-    assert.equal(isImplausibleReceiptDate("2000-02-29", "2000-03-01"), false, "2000 IS a leap year");
-    assert.equal(isImplausibleReceiptDate("1900-02-29", "1900-03-01"), false, "1900 is NOT: not a real day");
+    //
+    // The references are DISTANT on purpose. Against a nearby one both a
+    // correct validator and a broken one answer false — the day is either
+    // rejected (null, so not judged) or accepted and one day old — so the
+    // assertion proves nothing. Twenty-six years apart makes the two answers
+    // disagree, which is the only way this can fail when it should.
+    assert.equal(
+        isImplausibleReceiptDate("2000-02-29", "2026-09-21"),
+        true,
+        "2000 IS a leap year, so this is a real day and a very old one; a validator that rejected it would say false",
+    );
+    assert.equal(
+        isImplausibleReceiptDate("1900-02-29", "2026-09-21"),
+        false,
+        "1900 is NOT, so there is no such day to judge; a validator that rolled it to 1900-03-01 would say true",
+    );
+});
+
+test("a day key is EXACTLY ten characters — no trailing whitespace is trimmed away", () => {
+    // JavaScript's `$` (no `m` flag) anchors at the very end of the input, so
+    // "2026-09-21\n" is already rejected — unlike in Python, where `$` also
+    // matches before a trailing newline. Pinned here so the rejection is a
+    // tested property of the guard rather than a quirk nobody re-checks, and so
+    // a later `.trim()` or `m` flag has to break a test to land.
+    for (const trailing of ["\n", "\r\n", "\t", "\r", " "]) {
+        assert.equal(
+            isImplausibleReceiptDate(`2023-09-17${trailing}`, ARRIVAL),
+            false,
+            `read date with trailing ${JSON.stringify(trailing)}`,
+        );
+        assert.equal(
+            isImplausibleReceiptDate("2023-09-17", `${ARRIVAL}${trailing}`),
+            false,
+            `reference day with trailing ${JSON.stringify(trailing)}`,
+        );
+    }
+    // The control: the same pair without the trailing character IS judged, and
+    // is implausible. Without this the loop above would pass against a
+    // predicate that answered false for everything.
+    assert.equal(isImplausibleReceiptDate("2023-09-17", ARRIVAL), true);
 });
 
 test("a fallback date measured against itself is always plausible", () => {
