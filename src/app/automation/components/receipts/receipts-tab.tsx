@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { formatCurrency } from "@/lib/utils";
-import type { RouteDeadline } from "@/lib/quickbooks";
+import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 import { signReceiptDownloadUrls } from "@/lib/receipt-intake/bucket";
 import { RECEIPT_URL_TTL_SECONDS } from "@/lib/receipt-intake/receipt-url";
 import { retryTargetFor } from "@/lib/receipt-intake/route-state";
@@ -88,8 +88,21 @@ function RowFacts({ row }: { row: IntakeRow }) {
 export type ReceiptBatchSigner = (
     storagePaths: readonly string[],
     ttlSeconds: number,
-    deadline?: RouteDeadline,
+    deadline: RouteDeadline | undefined,
 ) => Promise<Map<string, string>>;
+
+/**
+ * How long a render will wait for its links, in total.
+ *
+ * The links are a convenience; the queue is the page. Without a shared budget
+ * every batch is handed the storage helper's own fifteen-second allowance, so a
+ * degraded storage day is minutes of blank page for a bookkeeper who only
+ * wanted to see what is waiting. One budget covers the whole signing step, and
+ * when it runs out the tab draws with the links it managed to get. Eight
+ * seconds is far more than a healthy batch needs and far less than anyone will
+ * wait for a page.
+ */
+export const RECEIPT_LINK_SIGN_BUDGET_MS = 8_000;
 
 /** The groups whose rows carry an intake object, in render order. */
 function linkedGroups(queue: ReceiptQueue): Array<[ReceiptGroup, IntakeRow[]]> {
@@ -121,7 +134,7 @@ function linkedGroups(queue: ReceiptQueue): Array<[ReceiptGroup, IntakeRow[]]> {
  * Never throws. With no answer from storage every row renders without a link,
  * which is exactly what a row with no signable object already does.
  */
-export async function signVisibleReceiptLinks(
+async function signVisibleReceiptLinks(
     queue: ReceiptQueue,
     filters: ReceiptFilters,
     sign: ReceiptBatchSigner = signReceiptDownloadUrls,
@@ -134,8 +147,11 @@ export async function signVisibleReceiptLinks(
             .filter((path): path is string => !!path),
     )];
     if (paths.length === 0) return new Map();
+    // Minted here, at call time, so every chunk of the batch shares ONE wall
+    // clock rather than each starting a fresh allowance of its own.
+    const deadline = createRouteDeadline(RECEIPT_LINK_SIGN_BUDGET_MS);
     try {
-        return await sign(paths, RECEIPT_URL_TTL_SECONDS);
+        return await sign(paths, RECEIPT_URL_TTL_SECONDS, deadline);
     } catch {
         return new Map();
     }
@@ -193,9 +209,10 @@ export async function ReceiptsTab({
     /** Injected only by tests: a production render takes the real signer. */
     sign?: ReceiptBatchSigner;
 }) {
-    // ONE signing round trip for every row this render will draw, taken before
-    // any of it is drawn. Per-row signing here is five hundred requests and
-    // five hundred Supabase clients on a page that is force-dynamic.
+    // ONE batched signing step for every row this render will draw, taken
+    // before any of it is drawn, under ONE budget. Per-row signing here is five
+    // hundred requests and five hundred Supabase clients on a page that is
+    // force-dynamic, and unbudgeted it is a page that can hang on storage.
     const links = await signVisibleReceiptLinks(queue, filters, sign);
 
     const counts: Record<ReceiptGroup, number> = {

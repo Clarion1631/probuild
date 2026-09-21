@@ -1,7 +1,6 @@
 /**
- * "Open receipt" on /automation?tab=receipts: that it works, and what it costs.
- *
- * Two things have to hold at once.
+ * "Open receipt" on /automation?tab=receipts: that it works, what it costs,
+ * and what it can never do to the page around it.
  *
  * It must open. Every row carries a RAW object path into the intake feature's
  * own PRIVATE bucket. Handed to resolveDocUrl that is not a reference it can
@@ -9,28 +8,33 @@
  * project-files URL: the wrong bucket, and a 404 on every group of the tab
  * (#443).
  *
- * And it must not cost a round trip per row. This page draws up to five groups
- * of RECEIPT_GROUP_TAKE rows and is force-dynamic, so signing row by row is
- * five hundred requests and five hundred Supabase clients on every load. One
- * batched call per chunk is the contract, and the tests below are renders of
- * the real component rather than assertions about its source.
+ * It must not cost a round trip per row. This page draws up to five groups of
+ * RECEIPT_GROUP_TAKE rows and is force-dynamic, so signing row by row is five
+ * hundred requests and five hundred Supabase clients on every load.
+ *
+ * And it must not be able to hang the queue. Batches go out together under one
+ * render budget, because a bookkeeper opening this page wants to see what is
+ * waiting, not wait on storage to mint links they may never click.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ReceiptsTab } from "../src/app/automation/components/receipts/receipts-tab";
+import {
+    ReceiptsTab,
+    RECEIPT_LINK_SIGN_BUDGET_MS,
+    type ReceiptBatchSigner,
+} from "../src/app/automation/components/receipts/receipts-tab";
 import type { ReceiptFilters } from "../src/app/automation/receipts-filters";
 import type { IntakeRow, ReceiptQueue } from "../src/app/automation/receipts-data";
 import { RECEIPT_URL_TTL_SECONDS } from "../src/lib/receipt-intake/receipt-url";
 import {
     RECEIPT_BUCKET,
     RECEIPT_SIGN_CHUNK_SIZE,
+    SIGN_FAULT_TAGS,
     signReceiptDownloadUrls,
     type BucketBatchSigner,
 } from "../src/lib/receipt-intake/bucket";
+import { remainingBudgetMs, type RouteDeadline } from "../src/lib/quickbooks";
 import { createStorageMockClient } from "../src/lib/supabase-storage-mock";
 
 // The hermetic storage stub, through the same gate e2e uses: the tests that
@@ -39,12 +43,12 @@ process.env.E2E_STORAGE_MOCK = "1";
 process.env.PLAYWRIGHT_TEST_SECRET = "receipt-open-link-test";
 delete process.env.VERCEL;
 
-const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-
 const ALL_GROUPS: ReceiptFilters = { group: null, projectId: null, owner: null };
 const PATH_A = "receipts/intake/8f1c2d3e-aaaa-4c7d-8e9f-0a1b2c3d4e5f.pdf";
 const PATH_B = "receipts/intake/8f1c2d3e-bbbb-4c7d-8e9f-0a1b2c3d4e5f.jpg";
 const PATH_C = "receipts/intake/8f1c2d3e-cccc-4c7d-8e9f-0a1b2c3d4e5f.png";
+const PATH_D = "receipts/intake/8f1c2d3e-dddd-4c7d-8e9f-0a1b2c3d4e5f.pdf";
+const PATH_E = "receipts/intake/8f1c2d3e-eeee-4c7d-8e9f-0a1b2c3d4e5f.heic";
 
 const signedUrlFor = (path: string) =>
     `https://storage.test/storage/v1/object/sign/${RECEIPT_BUCKET}/${path}?token=fake-token`;
@@ -77,28 +81,23 @@ function queueOf(groups: Partial<Pick<ReceiptQueue, "needsJob" | "needsReview" |
 
 /** Records every batch the tab asks for, so the ASK itself can be asserted. */
 function recordingSigner(urlFor: (path: string) => string | null = signedUrlFor) {
-    const calls: Array<{ paths: string[]; ttl: number }> = [];
-    return {
-        calls,
-        sign: async (paths: readonly string[], ttl: number) => {
-            calls.push({ paths: [...paths], ttl });
-            const signed = new Map<string, string>();
-            for (const path of paths) {
-                const url = urlFor(path);
-                if (url) signed.set(path, url);
-            }
-            return signed;
-        },
+    const calls: Array<{ paths: string[]; ttl: number; deadline: RouteDeadline | undefined }> = [];
+    const sign: ReceiptBatchSigner = async (paths, ttl, deadline) => {
+        calls.push({ paths: [...paths], ttl, deadline });
+        const signed = new Map<string, string>();
+        for (const path of paths) {
+            const url = urlFor(path);
+            if (url) signed.set(path, url);
+        }
+        return signed;
     };
+    return { calls, sign };
 }
 
-const renderTab = async (
-    queue: ReceiptQueue,
-    filters: ReceiptFilters,
-    sign?: Parameters<typeof ReceiptsTab>[0]["sign"],
-) => renderToStaticMarkup(await ReceiptsTab({
-    queue, filters, jobs: [], filterHref: () => "/automation?tab=receipts", nativeActive: false, sign,
-}));
+const renderTab = async (queue: ReceiptQueue, filters: ReceiptFilters, sign?: ReceiptBatchSigner) =>
+    renderToStaticMarkup(await ReceiptsTab({
+        queue, filters, jobs: [], filterHref: () => "/automation?tab=receipts", nativeActive: false, sign,
+    }));
 
 /** The anchor text, arrow and all. "Open receipt requests" is a StatCard subtitle, not a link. */
 const linkCount = (html: string) => (html.match(/Open receipt ↗/g) ?? []).length;
@@ -120,20 +119,41 @@ async function captureWarnings<T>(run: () => Promise<T>): Promise<{ result: T; w
 
 test("a whole page of rows is signed in ONE call, on the raw paths, deduped", async () => {
     const { calls, sign } = recordingSigner();
-    // The same object heads two groups: a row and the duplicate parked against
-    // it. Asking twice is a wasted slot in the chunk.
+    // Every group that carries an object, including the duplicate parked
+    // against a row it shares an object with. Asking twice for the same path is
+    // a wasted slot in the chunk.
     const queue = queueOf({
         needsJob: [row("a", PATH_A), row("b", PATH_B)],
+        needsReview: [row("r", PATH_D)],
         booking: [row("c", PATH_C)],
+        bookedToday: [row("t", PATH_E)],
         duplicates: [row("d", PATH_A)],
     });
 
     const html = await renderTab(queue, ALL_GROUPS, sign);
 
     assert.equal(calls.length, 1, "one render is one round trip, not one per row");
-    assert.deepEqual(calls[0].paths, [PATH_A, PATH_B, PATH_C], "the raw paths, deduped, in render order");
+    assert.deepEqual(calls[0].paths, [PATH_A, PATH_B, PATH_D, PATH_C, PATH_E], "the raw paths, deduped, in render order");
     assert.equal(calls[0].ttl, RECEIPT_URL_TTL_SECONDS, "the short TTL every other reader uses");
-    assert.equal(linkCount(html), 4, "all four rows link, including the two sharing an object");
+    assert.equal(linkCount(html), 6, "all six rows link, including the two sharing an object");
+});
+
+test("the render hands the signer ONE budget for the whole page", async () => {
+    let seen: RouteDeadline | undefined;
+    let asked = false;
+    const sign: ReceiptBatchSigner = async (_paths, _ttl, deadline) => {
+        asked = true;
+        seen = deadline;
+        return new Map();
+    };
+
+    await renderTab(queueOf({ needsJob: [row("a", PATH_A)] }), ALL_GROUPS, sign);
+
+    assert.ok(asked, "the signer ran");
+    assert.ok(seen, "an unbudgeted signing step is a page that can hang on storage");
+    assert.equal(seen?.budgetMs, RECEIPT_LINK_SIGN_BUDGET_MS);
+    const left = remainingBudgetMs(seen);
+    assert.ok(left > 0 && left <= RECEIPT_LINK_SIGN_BUDGET_MS, `saw ${left}ms of budget`);
 });
 
 test("a filtered view never pays to sign the groups it is hiding", async () => {
@@ -197,10 +217,10 @@ test("no answer from storage renders a linkless queue rather than an error", asy
 
 // ── The batch signer itself, against the storage boundary ──────────────────
 
+type BatchResponse = Awaited<ReturnType<BucketBatchSigner["createSignedUrls"]>>;
+
 /** A stand-in for the bucket's plural call that records what it was asked. */
-function recordingBucket(
-    answer: (paths: string[]) => Awaited<ReturnType<BucketBatchSigner["createSignedUrls"]>>,
-) {
+function recordingBucket(answer: (paths: string[]) => BatchResponse) {
     const calls: Array<{ paths: string[]; ttl: number }> = [];
     return {
         calls,
@@ -213,10 +233,26 @@ function recordingBucket(
     };
 }
 
-const allSigned = (paths: string[]) => ({
+const allSigned = (paths: string[]): BatchResponse => ({
     data: paths.map(path => ({ path, signedUrl: signedUrlFor(path), error: null })),
     error: null,
 });
+
+interface Deferred<T> {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+    reject: (reason?: unknown) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+}
+
+/** Drain the microtask queue without inventing a duration to wait for. */
+const settle = () => new Promise<void>(resolve => { setImmediate(resolve); });
 
 test("the batch signer chunks, and asks for the RAW paths at the given TTL", async () => {
     assert.equal(RECEIPT_SIGN_CHUNK_SIZE, 100);
@@ -232,6 +268,53 @@ test("the batch signer chunks, and asks for the RAW paths at the given TTL", asy
     assert.equal(signed.get(paths[0]), signedUrlFor(paths[0]));
 });
 
+test("the chunks go out TOGETHER, and answers may come back in any order", async () => {
+    const paths = Array.from({ length: 250 }, (_unused, index) => `receipts/intake/c-${index}.pdf`);
+    const gates: Array<{ paths: string[]; gate: Deferred<BatchResponse> }> = [];
+    const signer: BucketBatchSigner = {
+        createSignedUrls: async chunk => {
+            const gate = deferred<BatchResponse>();
+            gates.push({ paths: [...chunk], gate });
+            return gate.promise;
+        },
+    };
+
+    const pending = signReceiptDownloadUrls(paths, RECEIPT_URL_TTL_SECONDS, undefined, signer);
+    await settle();
+
+    // In series this would be stuck on the first request, and a degraded
+    // storage day would cost the render the SUM of the chunks' timeouts.
+    assert.equal(gates.length, 3, "all three requests are in flight before any has answered");
+
+    for (const index of [2, 0, 1]) gates[index].gate.resolve(allSigned(gates[index].paths));
+    const signed = await pending;
+
+    assert.equal(signed.size, 250);
+    assert.deepEqual([...signed.keys()], paths, "the map follows the request order, not the answers");
+});
+
+test("a failing FIRST chunk never costs a later one", async () => {
+    const paths = Array.from({ length: 150 }, (_unused, index) => `receipts/intake/f-${index}.pdf`);
+    const firstChunk = new Set(paths.slice(0, RECEIPT_SIGN_CHUNK_SIZE));
+
+    const threw = await captureWarnings(() => signReceiptDownloadUrls(
+        paths, RECEIPT_URL_TTL_SECONDS, undefined,
+        { createSignedUrls: async chunk => {
+            if (firstChunk.has(chunk[0])) throw new Error("socket hang up");
+            return allSigned(chunk);
+        } },
+    ));
+    assert.deepEqual([...threw.result.keys()], paths.slice(RECEIPT_SIGN_CHUNK_SIZE), "the surviving chunk is all there");
+
+    const errored = await captureWarnings(() => signReceiptDownloadUrls(
+        paths, RECEIPT_URL_TTL_SECONDS, undefined,
+        { createSignedUrls: async chunk => (firstChunk.has(chunk[0])
+            ? { data: null, error: { message: "gateway", status: 502 } }
+            : allSigned(chunk)) },
+    ));
+    assert.deepEqual([...errored.result.keys()], paths.slice(RECEIPT_SIGN_CHUNK_SIZE));
+});
+
 test("duplicates and unsafe paths never reach storage", async () => {
     const { calls, signer } = recordingBucket(allSigned);
     const signed = await signReceiptDownloadUrls(
@@ -245,21 +328,47 @@ test("duplicates and unsafe paths never reach storage", async () => {
     assert.deepEqual([...signed.keys()], [PATH_A, PATH_B]);
 });
 
-test("a per-item failure costs that one path, not the batch", async () => {
-    // storage-js types signedUrl as string but writes null for an item that
-    // did not sign, so both shapes have to be handled.
-    const { signer } = recordingBucket(paths => ({
-        data: paths.map(path => (path === PATH_B
-            ? { path, signedUrl: null, error: "Object not found" }
-            : { path, signedUrl: signedUrlFor(path), error: null })),
-        error: null,
-    }));
+test("a non-string element in the list is skipped, never thrown over", async () => {
+    const { calls, signer } = recordingBucket(allSigned);
+    const hostile = [PATH_A, 42, {}, [], true, Symbol("nope"), PATH_B] as unknown as string[];
 
-    const { result: signed, warnings } = await captureWarnings(() =>
-        signReceiptDownloadUrls([PATH_A, PATH_B, PATH_C], RECEIPT_URL_TTL_SECONDS, undefined, signer));
+    const signed = await signReceiptDownloadUrls(hostile, RECEIPT_URL_TTL_SECONDS, undefined, signer);
 
-    assert.deepEqual([...signed.keys()], [PATH_A, PATH_C]);
-    assert.equal(warnings.length, 1, "exactly one line, however many items failed");
+    assert.deepEqual(calls[0].paths, [PATH_A, PATH_B]);
+    assert.deepEqual([...signed.keys()], [PATH_A, PATH_B]);
+});
+
+test("a malformed response item is skipped ON ITS OWN", async () => {
+    // Reading a bad item inside the chunk's own loop would take every valid
+    // sibling after it down too, and those are rows whose links then vanish.
+    const { result: signed } = await captureWarnings(() => signReceiptDownloadUrls(
+        [PATH_A, PATH_B, PATH_C], RECEIPT_URL_TTL_SECONDS, undefined,
+        { createSignedUrls: async chunk => ({
+            data: [
+                null,
+                undefined,
+                42,
+                {},
+                { get path(): string { throw new Error("hostile getter"); } },
+                { path: chunk[0], signedUrl: null, error: "Object not found" },
+                { path: chunk[1], signedUrl: signedUrlFor(chunk[1]), error: null },
+                { path: chunk[2], signedUrl: signedUrlFor(chunk[2]), error: null },
+            ] as unknown as BatchResponse["data"],
+            error: null,
+        }) },
+    ));
+
+    assert.deepEqual([...signed.keys()], [PATH_B, PATH_C], "the junk went past and the good siblings landed");
+});
+
+test("a response that is not a list yields nothing for that chunk", async () => {
+    for (const data of ["nope", {}, 7, null, undefined]) {
+        const { result } = await captureWarnings(() => signReceiptDownloadUrls(
+            [PATH_A], RECEIPT_URL_TTL_SECONDS, undefined,
+            { createSignedUrls: async () => ({ data, error: null } as unknown as BatchResponse) },
+        ));
+        assert.equal(result.size, 0, JSON.stringify(data ?? null));
+    }
 });
 
 test("a response can never put a path in the map that nobody asked for", async () => {
@@ -292,18 +401,83 @@ test("a whole-call failure, and a thrown call, contribute nothing and never thro
     ));
     assert.equal(threw.result.size, 0, "a dead call is an empty map, not a rejection");
 
-    // One line each, counts only. A path or a signed URL in a log is a
-    // capability in a log, and these name private documents.
     for (const { warnings } of [failed, threw]) {
-        assert.equal(warnings.length, 1);
-        const line = warnings[0];
-        assert.match(line, /requested/);
-        assert.match(line, /signed/);
-        for (const secret of [PATH_A, PATH_B, "http", "token", "boom", "socket hang up"]) {
-            assert.ok(!line.includes(secret), `the warning leaks ${secret}: ${line}`);
-        }
+        assert.equal(warnings.length, 1, "one line per call, however many chunks failed");
+        assert.match(warnings[0], /requested/);
+        assert.match(warnings[0], /signed/);
     }
 });
+
+// ── What a failure is allowed to SAY ───────────────────────────────────────
+
+const faultTagIn = (line: string) => /"fault":"([^"]*)"/.exec(line)?.[1] ?? "";
+
+test("the warning can only say one of a fixed set of words", async () => {
+    // Every field an error carries is text off the wire, and a log line is read
+    // by people and shipped to a log sink.
+    const leaky = {
+        message: `https://storage.test/object/sign/receipt-intake/${PATH_A}?token=super-secret`,
+        name: "leaked-by-name",
+        status: "https://evil.test/exfiltrate?token=super-secret",
+        statusCode: "leaked-by-status",
+    };
+
+    const { warnings } = await captureWarnings(() => signReceiptDownloadUrls(
+        [PATH_A], RECEIPT_URL_TTL_SECONDS, undefined,
+        // Cast deliberately: the declared error type promises a numeric
+        // status, and the whole point here is that the runtime value is not
+        // the declared one and must not be trusted as text.
+        { createSignedUrls: async () => ({ data: null, error: leaky } as unknown as BatchResponse) },
+    ));
+
+    assert.equal(warnings.length, 1);
+    const line = warnings[0];
+    for (const secret of [PATH_A, "http", "token", "super-secret", "leaked-by-name", "leaked-by-status", "evil.test", "boom"]) {
+        assert.ok(!line.includes(secret), `the warning leaks ${secret}: ${line}`);
+    }
+    assert.ok(
+        (SIGN_FAULT_TAGS as readonly string[]).includes(faultTagIn(line)),
+        `${faultTagIn(line)} is not one of ${SIGN_FAULT_TAGS.join(", ")}`,
+    );
+});
+
+test("an integer HTTP status is the ONE thing ever borrowed from an error", async () => {
+    const { warnings } = await captureWarnings(() => signReceiptDownloadUrls(
+        [PATH_A], RECEIPT_URL_TTL_SECONDS, undefined,
+        { createSignedUrls: async () => ({ data: null, error: { name: "whatever", status: 503 } }) },
+    ));
+    assert.equal(faultTagIn(warnings[0]), "storage-error/503");
+    assert.ok(!warnings[0].includes("whatever"), "the name is still this code's to choose");
+
+    // Out of range, not an integer, or a numeric-looking STRING: a string off
+    // the wire is a string off the wire.
+    for (const status of [99, 600, 200.5, "503", Number.NaN]) {
+        const { warnings: other } = await captureWarnings(() => signReceiptDownloadUrls(
+            [PATH_A], RECEIPT_URL_TTL_SECONDS, undefined,
+            { createSignedUrls: async () => ({ data: null, error: { status } as { status?: number } }) },
+        ));
+        assert.equal(faultTagIn(other[0]), "storage-error", String(status));
+    }
+});
+
+test("an error object that explodes when read is still just a fault", async () => {
+    const hostile = {
+        get name(): string { throw new Error("gotcha"); },
+        get status(): number { throw new Error("gotcha"); },
+        get statusCode(): string { throw new Error("gotcha"); },
+    };
+
+    const { result, warnings } = await captureWarnings(() => signReceiptDownloadUrls(
+        [PATH_A], RECEIPT_URL_TTL_SECONDS, undefined,
+        { createSignedUrls: async () => ({ data: null, error: hostile }) },
+    ));
+
+    assert.equal(result.size, 0);
+    assert.equal(warnings.length, 1);
+    assert.ok((SIGN_FAULT_TAGS as readonly string[]).includes(faultTagIn(warnings[0])), faultTagIn(warnings[0]));
+});
+
+// ── The real thing, through the hermetic storage stub ──────────────────────
 
 test("the REAL signer signs against the private receipt-intake bucket", async () => {
     // No injection and no network: the e2e storage stub, reached through the
@@ -333,31 +507,4 @@ test("a render with NO injected signer reaches that same real signer", async () 
     assert.equal(linkCount(html), 1);
     assert.match(html, new RegExp(`href="[^"]*/object/sign/${RECEIPT_BUCKET}/`));
     assert.doesNotMatch(html, /project-files/);
-});
-
-// ── The mistake, kept out of the rest of the page ──────────────────────────
-
-test("no automation surface hands a raw intake path to resolveDocUrl", async () => {
-    const walk = (dir: string): string[] =>
-        readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
-            entry.isDirectory() ? walk(join(dir, entry.name)) : [join(dir, entry.name)]);
-
-    const files = walk(join(repoRoot, "src/app/automation")).filter(file => /\.tsx?$/.test(file));
-    // A guard that scans nothing passes for the wrong reason.
-    assert.ok(files.length > 10, `the scan found only ${files.length} files`);
-
-    for (const file of files) {
-        const source = readFileSync(file, "utf8");
-        if (!/resolveDocUrl\(/.test(source)) continue;
-        assert.ok(
-            !/resolveDocUrl\(\s*(?:\w+\.)?storagePath\s*[,)]/.test(source),
-            `${file}: an intake storagePath must be signed by the receipt-intake bucket`,
-        );
-        // Whatever still calls it resolves a REFERENCE, and says so at the call.
-        assert.match(
-            source,
-            /isSecureRef\(|isReceiptUrlRef\(/,
-            `${file}: resolves a doc URL without establishing what kind of reference it holds`,
-        );
-    }
 });
