@@ -209,7 +209,7 @@
   <table>
     <tr><th>Person</th><th>Their part</th></tr>
     <tr><td>Field crew / anyone</td><td>Get the receipt into the job's Drive folder (email receipts go by themselves)</td></tr>
-    <tr><td>Marge</td><td>Get receipts in, pick the job when one needs it, do the daily check that the pipeline is working</td></tr>
+    <tr><td>Marge</td><td>Get receipts in, pick the job when one needs it, post checks and sub bills, do the daily check that the pipeline is working</td></tr>
     <tr><td>Vanessa</td><td>Book QuickBooks from the bank feed, reconcile it, file the monthly B&amp;O (sales tax) return</td></tr>
     <tr><td>Richard / CJ / Justin</td><td>Read the numbers: project Financial Overview and Reports → Company Financials</td></tr>
     <tr><td>The system</td><td>Everything between the receipt and the report</td></tr>
@@ -220,7 +220,7 @@
   <div class="tablewrap">
   <table>
     <tr><th>Question</th><th>Where to look</th></tr>
-    <tr><td>What is waiting on a person right now?</td><td>The <b>Receipts</b> tab on this page: <i>Needs job</i>, <i>Needs review</i>, <i>Booking</i>, <i>Booked today</i>, <i>Missing receipts</i> (grouped by whose card it was), <i>Duplicates</i>, <i>Exceptions</i> (QuickBooks may hold a purchase for a receipt somebody voided mid-send. Ask Vanessa or Justin to review it before anything is changed in QuickBooks.), <i>Uncertain deliveries</i> (a morning Chat card we asked for and never got a confirmed answer about: look in the Receipts Need Review space and mark it delivered, or resend it). Setting a job there hands the receipt straight back to the pipeline</td></tr>
+    <tr><td>What is waiting on a person right now?</td><td>The <b>Receipts</b> tab on this page. It opens on <b>your list</b>: <i>Whose card was this?</i>, <i>Pick the job</i>, <i>Needs a better photo</i>, <i>Ask for these receipts</i>, <i>Checks and sub bills</i>. Setting a job there hands the receipt straight back to the pipeline. The grey line under your list says what the system is handling, and nothing in it is yours. Everything else sits behind the <i>Everything</i> chip and is Justin's: <i>Needs review</i>, <i>Booking</i>, <i>Booked today</i>, <i>Duplicates</i>, <i>Exceptions</i> (QuickBooks may hold a purchase for a receipt somebody voided mid-send. Ask Vanessa or Justin to review it before anything is changed in QuickBooks.), <i>Uncertain deliveries</i> (a morning Chat card we asked for and never got a confirmed answer about: look in the Receipts Need Review space and mark it delivered, or resend it)</td></tr>
     <tr><td>Is money flowing?</td><td>This Automation page — receipts booked this month, hands-free rate, "Booked" chips on recent receipts</td></tr>
     <tr><td>Why is a job cost dot grey on the Register tab?</td><td>For a receipt ProBuild booked itself, that can stay grey for now. It is a known gap in how the Register tab matches rows, not a failure</td></tr>
     <tr><td>What's actually stuck?</td><td>A file still sitting in a job folder in Drive after an hour, instead of moving into <code>_Sent to ProBuild</code>. Tell Justin. Do not re-upload it or send it somewhere else</td></tr>
@@ -230,10 +230,11 @@
 
   <div class="callout">
     <h3>Missing receipts — how the chase works</h3>
-    <p>A bank charge more than 3 days old with no receipt or expense behind it opens a <b>missing receipt</b> item on the Receipts tab. Loan payments, insurance, bank fees, tax payments and owner transfers are exempt by rule — there is no merchant receipt to find, and the reason is shown rather than hidden. Items are grouped by whose card was used (…8516 CJ, …6098 Richard, …4297 Justin); charges with no card are the office's to chase and the crew never sees them.</p>
+    <p>A bank charge more than 3 days old with no receipt or expense behind it opens a <b>missing receipt</b> item on the Receipts tab. Loan payments, insurance, bank fees, tax payments and owner transfers are exempt by rule — there is no merchant receipt to find, and the reason is shown rather than hidden. Items are grouped by whose card was used (…8516 CJ, …6098 Richard, …4297 Justin); charges with no card are the office's to chase and the crew never sees them. Checks and sub bills are Marge's.</p>
     <ul>
       <li>These lists are switched off right now. This is how they work when they are on.</li>
       <li><b>It closes itself.</b> When matching evidence turns up — same amount to the cent, within 2 days, same merchant — the item disappears on the next nightly run. If that evidence is later deleted, the item comes back.</li>
+      <li><b>Some are held back on purpose.</b> When ProBuild already holds a document for the same amount inside a month, the item is held and nobody is asked for it. That document may not be the right one, so it is Justin's to reconcile, not yours to chase. Your list counts these under "have a document already".</li>
       <li><b>Three ways to answer</b> in the Chat thread: send a photo, reply with the job name, or reply "sign N" to sign a memo instead. A signed memo closes the item and its PDF link is kept on it.</li>
       <li><b>No emailed PDFs, ever.</b> The whole loop happens in the thread and on this page.</li>
       <li><b>One message per person per day.</b> The card is posted into the <b>Receipts Need Review</b> Chat space through an incoming webhook (the <code>RECEIPTS_CHAT_WEBHOOK</code> setting). If that setting is missing, the chase simply doesn't post — the Receipts tab still lists every item, so nothing goes unseen.</li>
@@ -255,11 +256,13 @@
     <span class="tag">Every morning</span>
     <div class="h3row"><h3>A quick look at the Automation page</h3></div>
     <ol style="padding-left: 1.2rem; font-size: .88rem;">
-      <li style="margin-bottom: .3rem;">Open <b>Automation</b> from the top menu. It opens on the <b>Register</b> tab. If you see "QuickBooks isn't connected", tell Justin.</li>
-      <li style="margin-bottom: .3rem;">Click the <b>Receipts</b> tab. Look at <i>Needs job</i>, <i>Needs review</i>, <i>Exceptions</i>, and <i>Duplicates</i>.</li>
-      <li><i>Needs job</i> is yours: each row has a "Choose a job…" list. Pick the right job and press "Set job". Anything in <i>Exceptions</i> or <i>Duplicates</i>, or any bookkeeping call (a category, a possible duplicate, fixing something in QuickBooks), goes to Justin or Vanessa. Do not fix those in QuickBooks yourself.</li>
-      <li>There is a switch on this page labeled "Receipt booking in ProBuild". Leave it alone unless Justin asks you to touch it.</li>
+      <li style="margin-bottom: .3rem;">Open <b>Automation</b> from the top menu. It opens on your list. If it says QuickBooks isn't connected, tell Justin and stop.</li>
+      <li style="margin-bottom: .3rem;">Pick whose card it was for anything under <i>Whose card was this?</i> Nobody else can do this one.</li>
+      <li style="margin-bottom: .3rem;">Pick the job for anything under <i>Pick the job</i>. Each one books itself once it has a job.</li>
+      <li style="margin-bottom: .3rem;">Ask for the missing receipts, biggest first. Message the person, then mark the row reviewed so it drops off tomorrow.</li>
+      <li>Post anything under <i>Checks and sub bills</i>: a photo of the front of the check, plus the bill it paid. Then mark it reviewed.</li>
     </ol>
+    <p style="margin-top: .6rem;">The grey line at the bottom says what the system is handling. Nothing there is yours. Leave the "Receipt booking in ProBuild" switch alone unless Justin asks you to touch it.</p>
   </div>
   <div class="arrow">▼</div>
 
@@ -268,7 +271,7 @@
     <div class="h3row"><h3>Three cases, three different answers</h3></div>
     <div class="split">
       <div class="cell"><b>Card purchase</b><p>If it was CJ's or Richard's card, they answer it themselves, in their own "Receipts needed" thread: a photo, or <code>@Beverly sign N</code> (N is the item number on their card). Type @, then pick Beverly from the list. A typed @Beverly that is not picked from the list does not reach her. You cannot sign for them, and nothing typed in your own thread counts as their sign off. A charge on Justin's card has no chase card at all, so flag it to him directly.</p></div>
-      <div class="cell"><b>Check or sub payment</b><p>Example: a $3,500 check to an electrician. That needs the sub's invoice, not a receipt. Ask Richard for the invoice. A missing-receipt memo is the wrong document for a check like this. Going forward, whoever writes a check posts it right away, see "Checks: what to post" below.</p></div>
+      <div class="cell"><b>Check or sub payment</b><p>Example: a $3,500 check to an electrician. That needs the sub's bill, not a receipt. It shows up under <b>Checks and sub bills</b> on your list. Post a photo of the check front and the bill it paid, then mark it reviewed. A missing-receipt memo is the wrong document for a check. Going forward, whoever writes a check posts it right away, see "Checks: what to post" below.</p></div>
     </div>
     <p style="margin-top: .6rem;"><b>Already have the file?</b> Photo it into the <b>Receipts Need Review</b> Chat space (swept roughly every 10 minutes), or drop it straight into the <b>New Receipts &amp; Checks</b> Drive folder, in the right job's folder. Once ProBuild has it, the bot moves the file into <code>_Sent to ProBuild</code> at the top of that folder. If a file is still sitting in a job folder after an hour, it has not been delivered: tell Justin, do not re-upload it or send it somewhere else.</p>
   </div>
@@ -296,7 +299,7 @@
   </div>
 
   <div class="callout">
-    <h3>Checks: what to post</h3>
+    <h3 id="checks-what-to-post">Checks: what to post</h3>
     <p>When you write a check, post it in the <b>Receipts Need Review</b> Chat space right away: a photo of the front of the check, plus the bill or invoice it pays. Put the payee, the job, the amount, and the check number in your message.</p>
     <p style="margin-top: .6rem;">The bank only shows a check number and an amount. This message is the only way ProBuild and Vanessa know who a check went to and what it paid for. Deposits coming in are matched to invoices by ProBuild already, this is only about checks going out.</p>
   </div>
