@@ -312,6 +312,126 @@ export async function createReceiptUploadUrl(
     }
 }
 
+/**
+ * How many paths ride in one createSignedUrls request.
+ *
+ * The storage API takes a list and answers per item, so a page costs a request
+ * per chunk instead of a request per row. A hundred matches the receipts
+ * queue's own per-group page size, which keeps the request body small and makes
+ * the worst case easy to state: five visible groups of a hundred rows is five
+ * requests, not five hundred.
+ */
+export const RECEIPT_SIGN_CHUNK_SIZE = 100;
+
+/**
+ * The plural storage call, narrowed to what this module uses.
+ *
+ * Injected only by tests, the same way receiptObjectSize takes a BucketLister:
+ * the batching and the per-item handling ARE the subject here, and neither is
+ * observable through a client that has to be talked to over a socket.
+ *
+ * `signedUrl` is typed `string | null` deliberately. @supabase/storage-js 2.99
+ * declares it `string`, but its own implementation writes
+ * `datum.signedURL ? encodeURI(...) : null`, so an item that did not sign comes
+ * back null at runtime and the declared type is a lie this file must not
+ * believe.
+ */
+export interface BucketBatchSigner {
+    createSignedUrls(
+        paths: string[],
+        ttlSeconds: number,
+    ): Promise<{
+        data: Array<{ path?: string | null; signedUrl?: string | null; error?: string | null }> | null;
+        error: { message?: string; name?: string; status?: number; statusCode?: string | number } | null;
+    }>;
+}
+
+/** A name and a status at most. Never a message, a path, or a payload. */
+function signFaultTag(fault: unknown): string {
+    if (fault instanceof Error) return fault.name || "Error";
+    if (fault && typeof fault === "object") {
+        const shape = fault as { name?: unknown; status?: unknown; statusCode?: unknown };
+        const name = typeof shape.name === "string" && shape.name ? shape.name : "StorageError";
+        const status = shape.status ?? shape.statusCode;
+        return typeof status === "number" || typeof status === "string" ? `${name}/${status}` : name;
+    }
+    return "StorageError";
+}
+
+/**
+ * Sign MANY objects in as few round trips as possible.
+ *
+ * The single signer is the wrong shape for a list. One render of the receipts
+ * queue is up to five groups of a hundred rows, and signing each row on its own
+ * is five hundred requests AND five hundred Supabase clients on every load of a
+ * force-dynamic page. Same rules as the single signer, applied per item: the
+ * same safePath gate, an unsafe or empty path skipped rather than thrown, and a
+ * path that did not sign simply absent from the map. Callers already render a
+ * missing entry as "no link", so a partial answer costs one row instead of the
+ * page.
+ *
+ * NEVER THROWS. A chunk that errors or times out contributes nothing and the
+ * remaining chunks still run.
+ */
+export async function signReceiptDownloadUrls(
+    storagePaths: readonly (string | null | undefined)[],
+    ttlSeconds: number,
+    deadline: RouteDeadline | undefined,
+    signer: BucketBatchSigner | null = null,
+): Promise<Map<string, string>> {
+    // Deduped in first-seen order: the same object can head more than one group
+    // (a row and the duplicate parked against it), and asking twice is a wasted
+    // slot in the chunk.
+    const wanted: string[] = [];
+    const seen = new Set<string>();
+    for (const candidate of storagePaths) {
+        if (!candidate || seen.has(candidate)) continue;
+        seen.add(candidate);
+        if (safePath(candidate)) wanted.push(candidate);
+    }
+
+    const signed = new Map<string, string>();
+    if (wanted.length === 0) return signed;
+
+    let fault = "";
+    for (let from = 0; from < wanted.length; from += RECEIPT_SIGN_CHUNK_SIZE) {
+        const chunk = wanted.slice(from, from + RECEIPT_SIGN_CHUNK_SIZE);
+        const asked = new Set(chunk);
+        try {
+            const { data, error } = signer
+                ? await signer.createSignedUrls(chunk, ttlSeconds)
+                : await withStorageDeadline("sign-downloads", deadline, client =>
+                    client.storage.from(RECEIPT_BUCKET).createSignedUrls(chunk, ttlSeconds));
+            if (error || !data) {
+                fault ||= signFaultTag(error);
+                continue;
+            }
+            for (const item of data) {
+                const path = item.path;
+                const url = item.signedUrl;
+                // Matched against what this chunk actually asked for, so a
+                // surprising response can never put a key in the map that no
+                // caller requested.
+                if (item.error || !path || !url || !asked.has(path)) continue;
+                signed.set(path, url);
+            }
+        } catch (error) {
+            fault ||= signFaultTag(error);
+        }
+    }
+
+    // ONE line per call, counts only. A path or a signed URL in a log is a
+    // capability in a log, and the receipts these name are private documents.
+    if (signed.size < wanted.length) {
+        console.warn("[receipts/intake] sign-downloads incomplete", {
+            requested: wanted.length,
+            signed: signed.size,
+            fault: fault || "per-item",
+        });
+    }
+    return signed;
+}
+
 /** A time-limited read URL, for the archive mirror. */
 export async function signReceiptDownloadUrl(
     storagePath: string,
