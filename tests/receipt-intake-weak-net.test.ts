@@ -53,11 +53,13 @@ test("confusable is every way one ref could be a misread of the other", () => {
     // The five worked rows from the design spec, in order.
     assert.equal(refsAreConfusable("tebo-4261862", "tebo-4261886"), false, "the Tapani case: two tickets");
     assert.equal(refsAreConfusable("INV-95870", "INV-95B70"), true, "the counter-case: one purchase, two reads");
-    assert.equal(refsAreConfusable("95870", "9587"), true, "a truncated read");
+    assert.equal(refsAreConfusable("95870", "9587"), true, "a truncated read, now caught by the length rule");
     assert.equal(refsAreConfusable("Check1041", "Check1042"), false, "two cheques");
-    // "NoInv" is not a confusion question at all — it is a missing ref, caught
-    // one level up by hasRealRef. The pair itself reads as different.
-    assert.equal(refsAreConfusable("NoInv", "4261862"), false);
+    // "NoInv" is not really a confusion question — it is a MISSING ref, and the
+    // park comes one level up from hasRealRef. It also happens to answer true
+    // here now (5 characters against 7), which is why the verdict is asserted
+    // where it is actually decided, in the twinIsDistinct table below.
+    assert.equal(twinIsDistinct(row("a", "NoInv"), row("b", "4261862")), false, "the verdict, at the level that owns it");
 
     // Empty on either side means we cannot tell, which parks.
     assert.equal(refsAreConfusable("", "4261862"), true);
@@ -65,9 +67,8 @@ test("confusable is every way one ref could be a misread of the other", () => {
     assert.equal(refsAreConfusable(null, null), true);
     assert.equal(refsAreConfusable("---", "4261862"), true, "punctuation only normalizes to nothing");
 
-    // Containment at EITHER end, since a read can lose a prefix as easily as a
-    // suffix.
-    assert.equal(refsAreConfusable("9587", "95870"), true, "suffix-truncated, argument order reversed");
+    // A truncation from either end, in either argument order.
+    assert.equal(refsAreConfusable("9587", "95870"), true, "argument order reversed");
     assert.equal(refsAreConfusable("95870", "5870"), true, "a dropped leading digit");
 
     // Symmetric by construction; asserted rather than assumed.
@@ -77,9 +78,39 @@ test("confusable is every way one ref could be a misread of the other", () => {
         ["95870", "9587"],
         ["Check1041", "Check1042"],
         ["", "4261862"],
+        ["WN12345678", "0098-221745"],
     ] as const) {
         assert.equal(refsAreConfusable(a, b), refsAreConfusable(b, a), `${a} / ${b}`);
     }
+});
+
+test("two refs of a different SHAPE are two different kinds of number, not one read twice", () => {
+    // The risk this closes: an order number read off one copy of a document and
+    // an invoice number off the other. Same vendor, same day, same amount, two
+    // real-looking refs that differ everywhere — the old rule called that
+    // distinct and booked the document twice.
+    //
+    // Both normalize to ten characters, so length alone does not separate them.
+    assert.equal(confusionNormalizeRef("WN12345678").length, 10);
+    assert.equal(confusionNormalizeRef("0098-221745").length, 10);
+    assert.equal(
+        refsAreConfusable("WN12345678", "0098-221745"),
+        true,
+        "letters-then-digits against all-digits: different shapes, so park",
+    );
+
+    // A digit rollover is the one thing the length rule costs us. It parks,
+    // which is the safe direction, and it is stated rather than hidden.
+    assert.equal(refsAreConfusable("999", "1000"), true, "the rollover, deliberately parked");
+
+    // And the case the module exists for is untouched: same vendor, same
+    // width, same shape, different digits.
+    assert.equal(refsAreConfusable("tebo-4261862", "tebo-4261886"), false);
+    assert.equal(
+        confusionNormalizeRef("tebo-4261862").length,
+        confusionNormalizeRef("tebo-4261886").length,
+        "vendors issue one width per format, which is what makes the length rule safe",
+    );
 });
 
 test("a real ref is the same test that decides whether a strong key may be minted", () => {
