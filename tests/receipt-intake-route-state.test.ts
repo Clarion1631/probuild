@@ -363,14 +363,27 @@ test("only transient FAILURES are retryable — never a document verdict", async
         assert.equal(retryTargetFor("NEEDS_REVIEW", "max-retries"), "BOOKING");
     });
 
+    await t.test("a weak-dup row resumes at READ — the RULE changed, so this is a re-decision", () => {
+        // The weak net now clears a pair whose reference numbers already tell
+        // them apart (weak-net.ts), so retrying one of these is not another
+        // attempt at the same verdict. READ, not RECEIVED: the document was
+        // read fine and only the dedup verdict is being taken again.
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "weak-dup:abc"), "READ");
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "weak-dup:cmg8x2q0000abcd"), "READ");
+        // Still a prefix rule, not a substring one.
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "not-weak-dup:abc"), null);
+    });
+
     await t.test("document verdicts are NOT retryable — another attempt parks them again", () => {
         for (const reason of [
             "multi-doc", "no-estimate", "refund-or-zero", "invalid-date", "zero-total",
             // A date this row cannot own is a VERDICT about the document, not a
             // transient failure: re-reading it produces the same misread and
-            // spends an attempt and a QuickBooks round trip doing it.
+            // spends an attempt and a QuickBooks round trip doing it. It stays
+            // non-retryable in phase 1; the repair that would change that is
+            // phase 2 work.
             DATE_IMPLAUSIBLE_REASON,
-            "weak-dup:abc", "strong-dup-amount-mismatch:abc", "vendor-mismatch:abc",
+            "strong-dup-amount-mismatch:abc", "vendor-mismatch:abc",
             "qbo-fault:account-config", "qbo-fault:vendor-duplicate", "voided-by-user",
         ]) {
             assert.equal(retryTargetFor("NEEDS_REVIEW", reason), null, reason);

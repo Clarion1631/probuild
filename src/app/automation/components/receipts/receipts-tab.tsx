@@ -4,6 +4,7 @@ import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 import { signReceiptDownloadUrls } from "@/lib/receipt-intake/bucket";
 import { RECEIPT_URL_TTL_SECONDS } from "@/lib/receipt-intake/receipt-url";
 import { retryTargetFor } from "@/lib/receipt-intake/route-state";
+import { describeStateReason } from "@/lib/receipt-intake/reason-text";
 import { isPossibleOrphanReason } from "@/lib/receipt-intake/park";
 import { StatCard } from "../shared/stat-card";
 import MarkReviewedButton from "../register/mark-reviewed-button";
@@ -76,6 +77,27 @@ function RowFacts({ row }: { row: IntakeRow }) {
                 {row.projectName ? ` · ${row.projectName}` : ""}
             </p>
         </div>
+    );
+}
+
+/**
+ * One park reason in plain words, with the raw code still beside it.
+ *
+ * The sentence is what a bookkeeper acts on; the code is what a developer
+ * greps, so both are drawn. A reason we have no words for answers with the code
+ * as its own headline, which is why the span is conditional: it would otherwise
+ * print the same token twice.
+ */
+function StateReason({ reason, row }: { reason: string | null; row: IntakeRow }) {
+    const described = describeStateReason(reason, row);
+    if (!described) return null;
+    return (
+        <>
+            {described.headline}
+            {described.raw !== described.headline && (
+                <span className="ml-1.5 font-mono text-hui-textMuted">{described.raw}</span>
+            )}
+        </>
     );
 }
 
@@ -317,7 +339,7 @@ export async function ReceiptsTab({
                                 <RowFacts row={row} />
                                 <p className="text-xs text-hui-textMuted mt-1">
                                     state <span className="font-mono">{row.state}</span>
-                                    {row.stateReason ? ` · ${row.stateReason}` : ""}
+                                    {row.stateReason ? <> · <StateReason reason={row.stateReason} row={row} /></> : ""}
                                 </p>
                                 {isPossibleOrphanReason(row.stateReason) && !row.postVoidQbPurchaseId && (
                                     <p className="text-xs text-red-700 mt-1">
@@ -379,7 +401,11 @@ export async function ReceiptsTab({
                                 <div className="min-w-[16rem]">
                                     <RowFacts row={row} />
                                     {(row.stateReason || row.lastError) && (
-                                        <p className="text-xs text-amber-700 mt-1">{row.stateReason ?? row.lastError}</p>
+                                        <p className="text-xs text-amber-700 mt-1">
+                                            {row.stateReason
+                                                ? <StateReason reason={row.stateReason} row={row} />
+                                                : row.lastError}
+                                        </p>
                                     )}
                                     {row.postVoidQbPurchaseId && (
                                         <p className="text-xs font-medium text-red-700 mt-1">
@@ -424,7 +450,9 @@ export async function ReceiptsTab({
                                 <div className="min-w-[16rem]">
                                     <RowFacts row={row} />
                                     <p className="text-xs text-hui-textMuted mt-1">
-                                        {row.stateReason ?? row.lastError ?? "Waiting for its turn"}
+                                        {row.stateReason
+                                            ? <StateReason reason={row.stateReason} row={row} />
+                                            : row.lastError ?? "Waiting for its turn"}
                                         {row.attempts > 0 && ` · attempt ${row.attempts}`}
                                         {row.nextRetryAt && ` · next try ${new Date(row.nextRetryAt).toLocaleString("en-US", { dateStyle: "short", timeStyle: "short" })}`}
                                     </p>

@@ -34,6 +34,7 @@ import { readReceipt } from "@/lib/receipt-intake/read";
 import { duplicateChainReason, withEvidenceAndChainLocks } from "@/lib/receipt-intake/duplicate-guard";
 import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
+import { judgeWeakGroup, MAX_WEAK_GROUP, type WeakVerdict } from "@/lib/receipt-intake/weak-net";
 import {
     applyCutoverVerdict,
     driveFileIdOf,
@@ -497,6 +498,25 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
     });
 }
 
+/**
+ * What `promoteToBooking` reports, spelled out rather than inferred.
+ *
+ * The transaction has four exits and the audit row needs a field only one of
+ * them produces, so an inferred union would make `result.autoDistinctFrom`
+ * unreachable without narrowing. `autoDistinctRefs` is NOT part of the worker's
+ * dependency contract — it rides along so the event logged after the commit can
+ * name both sides' reference numbers without re-reading rows that may have
+ * moved on by then.
+ */
+interface PromotionResult {
+    promoted: boolean;
+    conflictId?: string;
+    stale?: boolean;
+    /** The weak twins this promotion ruled distinct. Empty unless there were twins. */
+    autoDistinctFrom?: string[];
+    autoDistinctRefs?: { selfRef: string | null; twins: Array<{ id: string; refNumber: string | null }> };
+}
+
 function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
     return {
         acquireLease: () => acquireCronLease(WORKER_LEASE_KEY, WORKER_LEASE_MS),
@@ -864,14 +884,21 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             }
         },
 
-        findWeakHit: async (rowId, weakKey) => prisma.receiptIntake.findFirst({
+        // THE WHOLE LIVE GROUP, bounded. Same filter as before — DUPLICATE /
+        // VOID / NON_RECEIPT are settled, everything else is a live twin — but
+        // `refNumber` comes back with each row, because the verdict is now
+        // "is this row distinguished from ALL of them?" rather than "does one
+        // exist?". `take` is one past the cap so an over-large group is
+        // recognisable rather than silently truncated to a decidable size.
+        findWeakGroup: async (rowId, weakKey) => prisma.receiptIntake.findMany({
             where: {
                 dedupWeakKey: weakKey,
                 id: { not: rowId },
                 state: { notIn: ["DUPLICATE", "VOID", "NON_RECEIPT"] },
             },
-            select: { id: true },
+            select: { id: true, refNumber: true },
             orderBy: { createdAt: "asc" },
+            take: MAX_WEAK_GROUP + 1,
         }),
 
         /**
@@ -970,95 +997,154 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             liveSweepDepsFor(invocationDeadline),
         ),
 
-        promoteToBooking: async (rowId, weakKey, claimToken) => prisma.$transaction(async tx => {
-            // LAST weak-dedup check, taken INSIDE the transition. The check at
-            // read time can miss a pair that arrived in the same batch window,
-            // and READ -> BOOKING is the last instant before money moves.
-            //
-            // WHY A SECOND LOCK, keyed on the weak key rather than just relying
-            // on the global claim lock: that lock is transaction-scoped and is
-            // released the moment the CLAIM transaction commits, which is
-            // before any row is processed. Holding it across the whole pass
-            // instead would mean one long-lived transaction wrapping every
-            // Gemini and QuickBooks call — minutes of open transaction on a
-            // pgbouncer pool, which is exactly what the pooler cannot afford.
-            //
-            // So the serialization is narrowed to what actually needs it. Two
-            // rows sharing a weak key take the SAME lock here and go one at a
-            // time; the loser's SELECT then sees the winner already in BOOKING.
-            // Without it both SELECTs can run before either UPDATE commits
-            // (classic write skew, and READ COMMITTED will not catch it because
-            // neither row writes what the other read) and both documents book.
-            // Rows with different weak keys take different locks and never
-            // block each other.
-            if (weakKey) {
-                // $executeRaw, NOT $queryRaw. pg_advisory_xact_lock returns
-                // VOID: `SELECT` of it produces a row whose single column has no
-                // readable type, and Prisma's query path can reject that outright
-                // — which would throw INSIDE the promotion transaction and, on
-                // the retry path, look like a transient DB fault forever while
-                // the lock was never actually taken. $executeRaw runs the
-                // statement for its effect and asks nothing of the result.
-                await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${weakKey}, 0))`;
-                // EVERY LIVE STATE, not just the post-booking ones.
+        promoteToBooking: async (rowId, weakKey, claimToken) => {
+            const result: PromotionResult = await prisma.$transaction(async (tx): Promise<PromotionResult> => {
+                // The auto-distinct verdict, if the weak net reaches one. Both
+                // are filled under the lock and read only after the commit.
+                let autoDistinctFrom: string[] = [];
+                let autoDistinctRefs: PromotionResult["autoDistinctRefs"];
+                // LAST weak-dedup check, taken INSIDE the transition. The check
+                // at read time can miss a pair that arrived in the same batch
+                // window, and READ -> BOOKING is the last instant before money
+                // moves.
                 //
-                // Limiting this to BOOKING/BOOKED/ARCHIVED meant a twin sitting
-                // in NEEDS_REVIEW — which is exactly where the weak net puts
-                // the FIRST of a suspected pair — was invisible here, so the
-                // second copy sailed past the human decision that was still
-                // pending on the first and booked itself. A twin awaiting
-                // review is the strongest possible signal to stop, not the
-                // weakest.
+                // WHY A SECOND LOCK, keyed on the weak key rather than just
+                // relying on the global claim lock: that lock is
+                // transaction-scoped and is released the moment the CLAIM
+                // transaction commits, which is before any row is processed.
+                // Holding it across the whole pass instead would mean one
+                // long-lived transaction wrapping every Gemini and QuickBooks
+                // call — minutes of open transaction on a pgbouncer pool, which
+                // is exactly what the pooler cannot afford.
                 //
-                // DUPLICATE / VOID / NON_RECEIPT are excluded because those are
-                // settled: somebody already decided they are not a purchase.
-                const conflict = await tx.receiptIntake.findFirst({
-                    where: {
-                        dedupWeakKey: weakKey,
-                        id: { not: rowId },
-                        state: { notIn: ["DUPLICATE", "VOID", "NON_RECEIPT"] },
-                    },
-                    select: { id: true },
-                    orderBy: { createdAt: "asc" },
-                });
-                if (conflict) {
-                    await tx.receiptIntake.updateMany({
-                        where: { id: rowId, state: "READ", claimToken },
-                        data: {
-                            state: "NEEDS_REVIEW",
-                            stateReason: `weak-dup:${conflict.id}`,
-                            // Parked without ever reaching QuickBooks, so the
-                            // strong key goes back (same rule as book.ts).
-                            dedupStrongKey: null,
-                            nextRetryAt: null,
-                            ...RELEASE_CLAIM,
+                // So the serialization is narrowed to what actually needs it.
+                // Two rows sharing a weak key take the SAME lock here and go
+                // one at a time; the loser's SELECT then sees the winner
+                // already in BOOKING. Without it both SELECTs can run before
+                // either UPDATE commits (classic write skew, and READ COMMITTED
+                // will not catch it because neither row writes what the other
+                // read) and both documents book. Rows with different weak keys
+                // take different locks and never block each other.
+                if (weakKey) {
+                    // $executeRaw, NOT $queryRaw. pg_advisory_xact_lock returns
+                    // VOID: `SELECT` of it produces a row whose single column has no
+                    // readable type, and Prisma's query path can reject that outright
+                    // — which would throw INSIDE the promotion transaction and, on
+                    // the retry path, look like a transient DB fault forever while
+                    // the lock was never actually taken. $executeRaw runs the
+                    // statement for its effect and asks nothing of the result.
+                    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${weakKey}, 0))`;
+                    // EVERY LIVE STATE, not just the post-booking ones.
+                    //
+                    // Limiting this to BOOKING/BOOKED/ARCHIVED meant a twin sitting
+                    // in NEEDS_REVIEW — which is exactly where the weak net puts
+                    // the FIRST of a suspected pair — was invisible here, so the
+                    // second copy sailed past the human decision that was still
+                    // pending on the first and booked itself. A twin awaiting
+                    // review is the strongest possible signal to stop, not the
+                    // weakest.
+                    //
+                    // DUPLICATE / VOID / NON_RECEIPT are excluded because those are
+                    // settled: somebody already decided they are not a purchase.
+                    //
+                    // THE WHOLE GROUP, INCLUDING SELF, in one read — the verdict
+                    // is "is this row distinguished from ALL of them?", which a
+                    // findFirst cannot answer. SELF IS RE-READ HERE rather than
+                    // taken from the claim-time snapshot, and that is deliberate:
+                    // the version of this row that can still be true when the
+                    // promotion commits is the one fetched under this lock.
+                    const group = await tx.receiptIntake.findMany({
+                        where: {
+                            dedupWeakKey: weakKey,
+                            state: { notIn: ["DUPLICATE", "VOID", "NON_RECEIPT"] },
                         },
+                        select: { id: true, refNumber: true },
+                        orderBy: { createdAt: "asc" },
+                        take: MAX_WEAK_GROUP + 2,
                     });
-                    return { promoted: false, conflictId: conflict.id };
+                    const self = group.find(row => row.id === rowId);
+                    const twins = group.filter(row => row.id !== rowId);
+                    // DEFENSIVE. Self is missing from its own live group, so it
+                    // has moved since the claim — voided, marked a duplicate,
+                    // re-classified. Never promote on a view that stale; park,
+                    // the direction every unanswerable weak question takes. The
+                    // write below CASes on `state: "READ"` and so matches
+                    // nothing in every case that can really produce this, which
+                    // is the point: it fails closed instead of booking.
+                    const verdict: WeakVerdict = self
+                        ? judgeWeakGroup(self, twins)
+                        : { kind: "park", twinId: twins[0]?.id ?? rowId };
+                    if (verdict.kind === "park") {
+                        await tx.receiptIntake.updateMany({
+                            where: { id: rowId, state: "READ", claimToken },
+                            data: {
+                                state: "NEEDS_REVIEW",
+                                stateReason: `weak-dup:${verdict.twinId}`,
+                                // Parked without ever reaching QuickBooks, so the
+                                // strong key goes back (same rule as book.ts).
+                                dedupStrongKey: null,
+                                nextRetryAt: null,
+                                ...RELEASE_CLAIM,
+                            },
+                        });
+                        return { promoted: false, conflictId: verdict.twinId };
+                    }
+                    autoDistinctFrom = verdict.twinIds;
+                    autoDistinctRefs = { selfRef: self?.refNumber ?? null, twins };
                 }
-            }
-            // CAS: only the current claim holder promotes. A superseded worker
-            // must not move a row into BOOKING that its successor is handling.
-            //
-            // THE ONE TRANSITION THAT KEEPS THE CLAIM, deliberately: promotion
-            // hands the row straight to bookReceipt in this same pass, and both
-            // its send mark and its BOOKED commit CAS on this token. Releasing
-            // here would admit a second worker to the same booking.
-            //
-            // stateReason is left UNTOUCHED, not cleared: finishRouting is the
-            // ONLY path to READ (see worker.ts), and it never writes anything
-            // to this column besides null or "tax-implausible" — so whatever a
-            // READ row is carrying here is exactly that warning, and it must
-            // survive into BOOKING/BOOKED or an automatically booked receipt
-            // with a bad tax read becomes indistinguishable from one with no
-            // tax read at all.
-            const { count } = await tx.receiptIntake.updateMany({
-                where: { id: rowId, state: "READ", claimToken },
-                data: { state: "BOOKING" },
+                // CAS: only the current claim holder promotes. A superseded worker
+                // must not move a row into BOOKING that its successor is handling.
+                //
+                // THE ONE TRANSITION THAT KEEPS THE CLAIM, deliberately: promotion
+                // hands the row straight to bookReceipt in this same pass, and both
+                // its send mark and its BOOKED commit CAS on this token. Releasing
+                // here would admit a second worker to the same booking.
+                //
+                // stateReason is left UNTOUCHED, not cleared: finishRouting is the
+                // ONLY path to READ (see worker.ts), and it never writes anything
+                // to this column besides null or "tax-implausible" — so whatever a
+                // READ row is carrying here is exactly that warning, and it must
+                // survive into BOOKING/BOOKED or an automatically booked receipt
+                // with a bad tax read becomes indistinguishable from one with no
+                // tax read at all.
+                const { count } = await tx.receiptIntake.updateMany({
+                    where: { id: rowId, state: "READ", claimToken },
+                    data: { state: "BOOKING" },
+                });
+                if (count === 0) return { promoted: false, stale: true };
+                return { promoted: true, autoDistinctFrom, autoDistinctRefs };
             });
-            if (count === 0) return { promoted: false, stale: true };
-            return { promoted: true };
-        }),
+            // AFTER THE COMMIT, never inside it, and never inside the advisory
+            // lock — an audit row written by a transaction that then rolls back
+            // records a decision nothing acted on, and one written under the
+            // lock holds every other row sharing this weak key for the length of
+            // an insert.
+            //
+            // `logAutomationEvent` swallows its own failures by contract, and
+            // the catch here says the promotion does not depend on that
+            // contract holding: the books write outranks the audit row.
+            if (result.autoDistinctFrom?.length) {
+                await logAutomationEvent({
+                    kind: "receipt-stage",
+                    stage: "weak-net",
+                    status: "auto-distinct",
+                    source: "intake-worker",
+                    reason: `booked past ${result.autoDistinctFrom.length} weak twin(s) on distinct reference numbers`,
+                    detail: {
+                        intakeId: rowId,
+                        weakKey,
+                        twinIds: result.autoDistinctFrom,
+                        selfRef: result.autoDistinctRefs?.selfRef ?? null,
+                        twinRefs: result.autoDistinctRefs?.twins ?? [],
+                    },
+                }).catch(error => console.warn(
+                    "[cron/receipt-intake-worker] auto-distinct event log failed",
+                    rowId,
+                    error instanceof Error ? error.name : "UnknownError",
+                ));
+            }
+            return result;
+        },
 
         book: row => bookReceipt(row, {
             db: prisma as unknown as BookPrismaClient,

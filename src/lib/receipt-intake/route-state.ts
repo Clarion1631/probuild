@@ -304,26 +304,39 @@ export function backoffMs(attempts: number): number {
  * condition duplicated between the button and the action.
  *
  * The list is deliberately CLOSED. Most NEEDS_REVIEW reasons are verdicts about
- * the DOCUMENT — `multi-doc`, `no-estimate`, `weak-dup:<id>`,
- * `strong-dup-amount-mismatch:<id>`, `refund-or-zero`, `date-implausible` —
- * and retrying one of those just parks it again with the same reason while
- * spending an attempt and a QuickBooks round trip. Only reasons that describe
- * a TRANSIENT FAILURE of something other than the document are retryable.
+ * the DOCUMENT — `multi-doc`, `no-estimate`, `strong-dup-amount-mismatch:<id>`,
+ * `refund-or-zero`, `date-implausible` — and retrying one of those just parks
+ * it again with the same reason while spending an attempt and a QuickBooks
+ * round trip. Only reasons that describe a TRANSIENT FAILURE of something other
+ * than the document are retryable.
+ *
+ * `weak-dup:<id>` WAS in that list and no longer is, because the RULE changed
+ * rather than the row: the weak net now clears a pair whose reference numbers
+ * already tell them apart (weak-net.ts). A retry of one of those is therefore a
+ * RE-DECISION under the corrected rule, not another attempt at the same
+ * verdict — and a row that really is a duplicate simply re-parks with the same
+ * reason, so the button cannot loop or do harm.
  *
  * Where a row resumes matters as much as whether it may:
  *   - `ai-unavailable` and `file-missing` failed BEFORE the read, so they go
  *     back to RECEIVED and get read again. Sending them to BOOKING would book a
  *     row whose vendor/total were never extracted.
+ *   - `weak-dup:<id>` needs no re-read at all: the document was read, and only
+ *     the dedup verdict is being taken again. READ is where the weak net's last
+ *     word is spoken (promoteToBooking), so that is where it goes back to.
  *   - `qbo-timeout` / `qbo-5xx` / `max-retries` failed at the SEND, with the
  *     read already done, so they resume at BOOKING.
  */
-export type RetryTarget = "RECEIVED" | "BOOKING";
+export type RetryTarget = "RECEIVED" | "BOOKING" | "READ";
 
 const RETRYABLE_REASONS: Array<{ test: RegExp; target: RetryTarget }> = [
     // Gemini was down. The document was never read, so re-read it.
     { test: /^ai-unavailable$/, target: "RECEIVED" },
     // The upload never landed in the bucket; a human has since re-uploaded it.
     { test: /^file-missing$/, target: "RECEIVED" },
+    // The rule changed under this row: a weak twin no longer blocks a document
+    // whose own reference number tells it apart. Re-deciding, not re-reading.
+    { test: /^weak-dup:/, target: "READ" },
     // Transport-class QuickBooks failures, and the row that exhausted its
     // budget of them. The read is done; resume at the send.
     { test: /^qbo-timeout$/, target: "BOOKING" },

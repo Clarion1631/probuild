@@ -26,6 +26,7 @@ import {
     type ReceiptIntakeState,
 } from "./route-state";
 import { duplicateChainReason } from "./duplicate-guard";
+import { judgeWeakGroup, type WeakGroupRow } from "./weak-net";
 import {
     appliedTaxCents,
     buildGroups,
@@ -380,7 +381,15 @@ export interface WorkerDependencies {
         patch: ReadPatch & { state: "RECEIVED" },
         ownership: Ownership,
     ) => Promise<{ strongOwner: StrongOwner | null; owned: boolean }>;
-    findWeakHit: (rowId: string, weakKey: string) => Promise<{ id: string } | null>;
+    /**
+     * EVERY live row sharing this weak key, not just the first.
+     *
+     * A `findFirst` cannot answer the question the weak net now asks — "is this
+     * row distinguished from ALL of them?" — because the answer depends on the
+     * twin the query happened to return. The list is bounded by the caller at
+     * MAX_WEAK_GROUP + 1, which is also how an over-large group is recognised.
+     */
+    findWeakGroup: (rowId: string, weakKey: string) => Promise<WeakGroupRow[]>;
     /**
      * Park a routed DUPLICATE — or refuse to, if rows are already filed behind
      * this one (round-39 gate finding 2; made transactional by round-40 gate
@@ -420,7 +429,20 @@ export interface WorkerDependencies {
         rowId: string,
         weakKey: string | null,
         claimToken: string | null,
-    ) => Promise<{ promoted: boolean; conflictId?: string; stale?: boolean }>;
+    ) => Promise<{
+        promoted: boolean;
+        conflictId?: string;
+        stale?: boolean;
+        /**
+         * The weak twins this promotion ruled DISTINCT on reference numbers,
+         * non-empty only when there were twins and the group was cleared. The
+         * implementation logs one audit event off it once the transaction has
+         * committed; the worker itself has nothing to decide from it, and
+         * deliberately does not — the verdict is already durable as the
+         * promotion.
+         */
+        autoDistinctFrom?: string[];
+    }>;
     /** The pass's ONE absolute deadline — never a snapshot of "time left". */
     book: (row: BookableRow) => Promise<BookResult>;
     /** CAS'd on the claim: a superseded worker's result must write nothing. */
@@ -1267,17 +1289,27 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     }
 
     // No strong hit (or no strong key at all — a placeholder ref). The weak net
-    // is a plain query and never a claim (:1591-1596); a hit only ever asks a
-    // human, because two genuine same-day purchases from one vendor for the
-    // same amount do happen.
+    // is a plain query and never a claim (:1591-1596); when it stops a row it
+    // only ever asks a human, because two genuine same-day purchases from one
+    // vendor for the same amount do happen.
+    //
+    // BUT IT IS A FALLBACK, NOT AN OVERRIDE. The weak key is a coarse hash of
+    // vendor + day + amount; a reference number is the vendor's own identifier
+    // for the transaction. When BOTH documents carry a real one and the two are
+    // not plausibly misreads of each other, the question the weak net is asking
+    // has already been answered and it must not overrule that. judgeWeakGroup
+    // holds the whole rule; see weak-net.ts for why it reads `refNumber` rather
+    // than the strong key this very branch is about to release.
     //
     // A THROW here leaves the row RECEIVED with its keys already written, which
     // is exactly right: the next pass re-runs the identical claim (updating a
     // row to the strong key it already holds is a no-op, not a conflict) and
     // re-checks the weak net.
-    const weak = await deps.findWeakHit(row.id, keys.weak);
-    if (weak) {
-        const third = routeState(routeInput, { strong: null, weak }, hasProject);
+    const twins = await deps.findWeakGroup(row.id, keys.weak);
+    const self: WeakGroupRow = { id: row.id, refNumber: keys.ref, resolution: null };
+    const verdict = judgeWeakGroup(self, twins);
+    if (verdict.kind === "park") {
+        const third = routeState(routeInput, { strong: null, weak: { id: verdict.twinId } }, hasProject);
         // RELEASE the strong key. Nothing was sent to QuickBooks, so this row
         // is parked pre-send and the documented rule applies to it like any
         // other. Holding the key made a CORRECTED resend of the same receipt
