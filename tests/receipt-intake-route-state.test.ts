@@ -19,6 +19,9 @@ import {
     retryTargetFor,
     routeState,
 } from "../src/lib/receipt-intake/route-state";
+// Imported ONLY to pin the deliberate divergence documented below — the
+// predicate no longer uses it.
+import { isValidDate } from "../src/lib/receipt-intake/keys";
 
 const NO_HITS = { strong: null, weak: null };
 const clean = { docType: "receipt", amount: "364.98", totalCents: 36498, canonicalVendor: "lowes" };
@@ -105,6 +108,38 @@ test("month, year and leap-day boundaries are plain calendar arithmetic", () => 
     assert.equal(isImplausibleReceiptDate("2024-02-29", "2024-03-01"), false, "the leap day is a real day");
     assert.equal(isImplausibleReceiptDate("2024-02-29", "2024-06-28"), false, "exactly 120 counting it");
     assert.equal(isImplausibleReceiptDate("2024-02-29", "2024-06-29"), true, "121");
+});
+
+test("validation is SELF-CONTAINED and UTC — no host time zone, no 19xx mapping", () => {
+    // A four-digit year must mean itself. `Date.UTC(26, ...)` maps years 0-99
+    // into the 20th century, so a naive implementation reads "0026-09-17" as
+    // 1926-09-17 — and against a 1926 reference that flips the verdict from
+    // "nearly two millennia old" to "four days old". This is the assertion that
+    // catches it; against a 2026 reference both answers happen to agree.
+    assert.equal(isImplausibleReceiptDate("0026-09-17", "1926-09-21"), true, "year 26, not 1926");
+    assert.equal(isImplausibleReceiptDate("0026-09-17", "2026-09-21"), true, "and wildly old either way");
+
+    // DELIBERATE DIVERGENCE from keys.ts's isValidDate, which round-trips
+    // through host-local `new Date(y, m, d)` and therefore REJECTS "0026-09-17"
+    // via that same 19xx mapping. This predicate decides whether money posts,
+    // so it must not depend on the machine it runs on. The divergence is
+    // one-directional and safe: the extra day it accepts gets the correct
+    // (implausible) verdict, and the worker never hands it one anyway — see
+    // "a year the reader cannot have read off a document" in the worker tests.
+    assert.equal(isValidDate("0026-09-17"), false, "the local-time helper's quirk, pinned");
+
+    // The leap rules are the real calendar's, in UTC.
+    assert.equal(isImplausibleReceiptDate("2000-02-29", "2000-03-01"), false, "2000 IS a leap year");
+    assert.equal(isImplausibleReceiptDate("1900-02-29", "1900-03-01"), false, "1900 is NOT: not a real day");
+});
+
+test("a fallback date measured against itself is always plausible", () => {
+    // Load-bearing for the worker: when the reader found no usable date the
+    // keys substitute the row's arrival day, which is the very day the guard
+    // measures against. Zero days apart, so it can never trip.
+    for (const day of ["2026-09-21", "2024-02-29", "2026-01-01", "2026-12-31"]) {
+        assert.equal(isImplausibleReceiptDate(day, day), false, day);
+    }
 });
 
 test("a missing or unreadable day on EITHER side is not this guard's business", () => {

@@ -5,8 +5,6 @@
  * testable (tests/receipt-intake-route-state.test.ts).
  */
 
-import { isValidDate } from "./keys";
-
 export const RECEIPT_INTAKE_STATES = [
     // STAGING: the row exists but its file does not yet. Never claimable.
     "STAGING",
@@ -95,11 +93,33 @@ export const DATE_IMPLAUSIBLE_REASON = "date-implausible";
 
 const DAY_MS = 86_400_000;
 
-/** A YYYY-MM-DD calendar day as UTC midnight, or null when it is not one. */
+/**
+ * A YYYY-MM-DD calendar day as UTC midnight, or null when it is not one.
+ *
+ * SELF-CONTAINED, and deliberately not keys.ts's `isValidDate`: that one
+ * round-trips through `new Date(y, m, d)`, which is HOST-LOCAL, so what counts
+ * as a real day could in principle depend on the machine running it. A guard
+ * that decides whether money posts must not.
+ *
+ * `Date.UTC(26, ...)` maps years 0-99 to 19xx, so a four-digit "0026" would
+ * silently become 1926 and a wildly old date would read as merely old.
+ * `setUTCFullYear` is the only way to mean the year the string actually says.
+ */
 function utcMidnightOf(dayKey: string | null | undefined): number | null {
-    if (!isValidDate(dayKey)) return null;
-    const [year, month, day] = String(dayKey).split("-").map(Number);
-    return Date.UTC(year, month - 1, day);
+    const value = typeof dayKey === "string" ? dayKey : "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+    const year = Number(value.slice(0, 4));
+    const month = Number(value.slice(5, 7));
+    const day = Number(value.slice(8, 10));
+    const at = new Date(0);
+    at.setUTCFullYear(year, month - 1, day);
+    at.setUTCHours(0, 0, 0, 0);
+    // The setters ROLL OVER rather than reject, so "2026-02-30" becomes
+    // 2026-03-02. Reading the three fields back is what rejects it.
+    if (at.getUTCFullYear() !== year || at.getUTCMonth() !== month - 1 || at.getUTCDate() !== day) {
+        return null;
+    }
+    return at.getTime();
 }
 
 /**
@@ -111,8 +131,13 @@ function utcMidnightOf(dayKey: string | null | undefined): number | null {
  * a pause must not become implausible merely because time passed.
  *
  * A missing or unreadable date on EITHER side is not this guard's business and
- * answers false. Those cases already have owners: the dedup keys fall back to
- * the arrival day, and booking parks `invalid-date` on a null txnDate.
+ * answers false. An unreadable READ date never reaches here at all: the dedup
+ * keys substitute the row's arrival day, that substitute is what gets PERSISTED
+ * as `txnDate`, and the row books on it. (So book.ts's `invalid-date` check
+ * does NOT catch an unreadable read — it only ever sees a genuinely absent
+ * `txnDate`.) Booking an unreadable date on its arrival day is deliberate,
+ * long-standing behaviour, inherited from v1's use of the upload date; this
+ * guard does not revisit it.
  */
 export function isImplausibleReceiptDate(
     dateStr: string | null | undefined,

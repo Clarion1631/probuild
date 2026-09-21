@@ -574,16 +574,32 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // Hoisted so the calendar day is computed ONCE and both the QBO TxnDate and
     // the Expense.date instant are derived from the same value.
     const calendarDay = toCalendarDate(row.txnDate);
-    // A date the reader got WRONG survives the null check above, and until this
-    // gate nothing in the rail looked: a Sunbelt Rentals receipt read as
-    // 2023-09-17 on a row created 2026-09-21 reached BOOKING and would have
-    // posted an Expense dated 2023, into a closed year. DEFENCE IN DEPTH —
-    // routing refuses the same document — and it is also what catches the rows
-    // already sitting in BOOKING when this shipped. Gates BOTH rails, because
-    // it is above the native/QuickBooks split; a row that already sent follows
-    // its own reconciliation path further up and never reaches here on the
-    // native side.
-    if (isImplausibleReceiptDate(calendarDay, dayKeyInTimeZone(row.createdAt, timeZone))) {
+    // A date the reader got WRONG is not a null and so survives the check
+    // above, and until this gate nothing in the rail looked: a Sunbelt Rentals
+    // receipt read as 2023-09-17 on a row created 2026-09-21 reached BOOKING
+    // and would have posted an Expense dated 2023, into a closed year. DEFENCE
+    // IN DEPTH — routing refuses the same document before it can claim a dedup
+    // key — and this gate is also the only thing that catches the rows ALREADY
+    // sitting in BOOKING when it shipped. It covers both rails, being above the
+    // native/QuickBooks split.
+    //
+    // IT MAY ONLY STOP A **NEW** SEND, hence `!row.sendAttempted`.
+    //
+    // That flag means a create was already ISSUED for this row and may well
+    // have SUCCEEDED, with only its response, its attachment, or the local
+    // Expense commit lost — and the idempotent create below is precisely what
+    // re-finds that Purchase and finishes the local half. Parking such a row
+    // behind a NON-RETRYABLE verdict would strand real money in QuickBooks with
+    // nothing in ProBuild ever able to match it, which is strictly worse than
+    // an Expense carrying a wrong date that a human can edit. So a sent row
+    // continues down exactly the path it took before this guard existed.
+    //
+    // The exemption cannot become a hole: after this deploy no row can reach a
+    // FIRST send carrying an implausible date, because routing refuses it and
+    // so does this gate. The exempted set is only legacy rows already in
+    // flight. (The native rail never gets here with the flag set at all — it
+    // parks as `native-qbo-reconciliation-required` further up.)
+    if (!row.sendAttempted && isImplausibleReceiptDate(calendarDay, dayKeyInTimeZone(row.createdAt, timeZone))) {
         return parkedBeforeSend(row, DATE_IMPLAUSIBLE_REASON);
     }
 

@@ -1167,11 +1167,15 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         amount: keys.amount,
         totalCents,
         canonicalVendor: canonicalVendor(read.vendor),
-        // ONLY the DOCUMENT's own date is judged. When the reader found none,
-        // `keys.dateStr` is `arrivalDay` itself — measuring our own fallback
-        // against itself proves nothing and would make the guard look like it
-        // had an opinion about an unreadable date, which it deliberately has
-        // not (booking still parks those as `invalid-date`).
+        // ONLY the DOCUMENT's own date is judged. When the reader found none —
+        // or produced something malformed, which `dedupKeys` treats the same
+        // way — `keys.dateStr` is `arrivalDay` itself, and measuring our own
+        // substitute against itself proves nothing. Note what that means
+        // downstream: the substitute is PERSISTED as `txnDate` below, so such a
+        // row books on its arrival day. That is deliberate, long-standing
+        // behaviour (v1 used the upload date) and this guard does not revisit
+        // it — it has an opinion about a date the reader GOT WRONG, never about
+        // one it could not read.
         dateStr: keys.dateReadOffDocument ? keys.dateStr : null,
         referenceDay: arrivalDay,
     };
