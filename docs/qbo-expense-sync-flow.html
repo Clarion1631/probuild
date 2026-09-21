@@ -274,6 +274,28 @@
   </div>
 
   <div class="callout">
+    <h3>What the little codes on a receipt mean</h3>
+    <p>Some rows on the Receipts tab have a short code under the amount, like <code>push-paused</code> or <code>multi-doc</code>. The code says why that receipt has not booked yet. Most of them sit under <i>Needs review</i>. <code>push-paused</code> and <code>push-disabled</code> sit under <i>Booking</i>.</p>
+    <div class="tablewrap">
+    <table>
+      <tr><th>Code</th><th>What it means</th><th>What you do</th></tr>
+      <tr><td><code>push-paused</code></td><td>Booking is switched off for now, with the switch "Receipt booking in ProBuild" under Pipeline health. Nothing is wrong.</td><td>Nothing. The receipt books by itself when the switch is turned back on.</td></tr>
+      <tr><td><code>push-disabled</code></td><td>Booking is switched off in the system settings. That is not the switch on this page. Nothing is wrong with the receipt.</td><td>Nothing. If it is still there tomorrow, tell Justin.</td></tr>
+      <tr><td><code>multi-doc</code></td><td>The file has more than one receipt in it, so the system will not guess.</td><td>Save or scan each receipt as its own file. Drop those in the <b>New Receipts &amp; Checks</b> Drive folder, in the right job's folder. Then press "Void" on this row. Automatic splitting is being built.</td></tr>
+      <tr><td><code>weak-dup:</code> and a long id</td><td>This looks like it might be a copy of another receipt. Same store, same day, same amount.</td><td>If it really is a copy: copy the long id that comes after <code>weak-dup:</code>, paste it in the box that says "Duplicate of (receipt id)", then press "Mark duplicate". If it is a different purchase, say two dump tickets on one day, leave the row alone. Do not void it and do not press "Set job", it would only come back. An automatic fix for these is being built.</td></tr>
+      <tr><td><code>date-implausible</code></td><td>The date the system read looks wrong. It is months before the receipt arrived, or it is in the future.</td><td>Leave the row alone and tell Justin. Do not void it. An automatic fix is being built.</td></tr>
+      <tr><td><code>no-estimate</code></td><td>No job is set on this receipt, or the job it is on has no estimate. Either way there is nowhere to put the cost.</td><td>If the job is wrong or missing, pick the right one and press "Set job". If the job is right, tell Justin.</td></tr>
+      <tr><td><code>refund-or-zero</code></td><td>The amount read is zero, or it is money coming back, like a return.</td><td>Leave the row alone and tell Justin.</td></tr>
+      <tr><td><code>unreadable</code></td><td>The reader could not read the file. Usually a blurry photo or a bad scan.</td><td>If you can get a better photo of the same receipt, drop it in the job's Drive folder the normal way, then press "Void" on this row. If you cannot, tell Justin.</td></tr>
+      <tr><td><code>ai-unavailable</code>, <code>file-missing</code>, <code>max-retries</code>, <code>qbo-timeout</code>, <code>qbo-5xx</code>, or a <code>qbo-fault:</code> code</td><td>Nothing is wrong with the receipt itself. Something the system needed was missing, or it did not answer in time.</td><td>Press "Retry now" once, if the row has that button. If there is no button, or the row comes back, tell Justin.</td></tr>
+      <tr><td><code>native-qbo-reconciliation-required</code> or <code>native-pre-cutover-unverified</code></td><td>QuickBooks may already hold this one, so ProBuild will not book it again by itself. Somebody has to look in QuickBooks first.</td><td>Tell Justin or Vanessa. Never fix it in QuickBooks yourself.</td></tr>
+      <tr><td>Anything else</td><td>A technical reason that is not yours to sort out.</td><td>Leave the row alone and tell Justin.</td></tr>
+    </table>
+    </div>
+    <p style="margin-top: .6rem;"><b>Tip:</b> "Open receipt" links work for 10 minutes after the page loads. If one shows an error, refresh the page and click it again.</p>
+  </div>
+
+  <div class="callout">
     <h3>Checks: what to post</h3>
     <p>When you write a check, post it in the <b>Receipts Need Review</b> Chat space right away: a photo of the front of the check, plus the bill or invoice it pays. Put the payee, the job, the amount, and the check number in your message.</p>
     <p style="margin-top: .6rem;">The bank only shows a check number and an amount. This message is the only way ProBuild and Vanessa know who a check went to and what it paid for. Deposits coming in are matched to invoices by ProBuild already, this is only about checks going out.</p>
