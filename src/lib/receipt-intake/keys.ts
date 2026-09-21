@@ -136,6 +136,13 @@ export interface DedupKeys {
     weak: string;
     /** The date actually used (document date, else fallback) — what the row stores. */
     dateStr: string;
+    /**
+     * Whether `dateStr` is the DOCUMENT's own date or the fallback. The strong
+     * key cannot answer this — it is ALSO withheld for a placeholder ref — and
+     * a caller judging whether the date is plausible must not measure the
+     * fallback (the row's own arrival day) against itself.
+     */
+    dateReadOffDocument: boolean;
     /** The cleaned ref: "Check<num>" for checks, the cleaned invoice otherwise. */
     ref: string;
     /** cleanMoney output, 2dp. */
@@ -169,6 +176,7 @@ export function dedupKeys(input: DedupKeyInput): DedupKeys {
         strong,
         weak: makeWeakDedupKey(input.vendor, dateStr, amount),
         dateStr,
+        dateReadOffDocument,
         ref,
         amount,
     };

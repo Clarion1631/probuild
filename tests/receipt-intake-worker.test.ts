@@ -39,6 +39,8 @@ import {
     QBO_WRITING_STATES,
 } from "../src/lib/receipt-intake/worker";
 import { preservedTaxWarning } from "../src/lib/receipt-intake/route-state";
+// The call-site contract the date gate reads: see the fallback test below.
+import { dedupKeys } from "../src/lib/receipt-intake/keys";
 import { normalizeDocType, READ_BUDGET_MS, type ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
 import type { CutoverRequest } from "../src/lib/receipt-intake/worker";
@@ -963,6 +965,158 @@ test("a document-level gate short-circuits BOTH nets and claims no key", async (
         assert.equal(h.states[0].patch?.dedupStrongKey, null, reason);
         assert.equal(weakCalls, 0, `${reason}: dedup is not consulted at all`);
     }
+});
+
+// ── A read date that cannot belong to the row ──────────────────────────────
+
+/** The live row: Sunbelt Rentals, $1,597.03, arriving on 2026-09-21 Pacific. */
+const SUNBELT_ARRIVAL = new Date("2026-09-21T16:00:00.000Z");
+
+test("an implausible read date parks the row BEFORE it claims a dedup key", async () => {
+    // Read as 2023-09-17 on a row created 2026-09-21; the real date is almost
+    // certainly 2026-09-17. Nothing in the rail checked, so the row advanced to
+    // BOOKING and would have become an Expense dated 2023.
+    let weakCalls = 0;
+    const h = harness([workerRow({ createdAt: SUNBELT_ARRIVAL })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "2023-09-17" } } as ReadOutcome),
+        findWeakHit: async () => { weakCalls++; return { id: "row-twin" }; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states[0].reason, "date-implausible");
+    // The key is the point: "2023-09-17|82766" is one nothing real will ever
+    // collide with, so holding it would quarantine the corrected resend.
+    assert.equal(h.states[0].patch?.dedupStrongKey, null);
+    assert.equal(weakCalls, 0, "dedup is not consulted at all");
+    assert.equal(h.applied.length, 0, "and applyRead — the claim itself — never ran");
+});
+
+test("the same row read as the date it should have carried routes normally", async () => {
+    // The control for the test above.
+    const h = harness([workerRow({ createdAt: SUNBELT_ARRIVAL })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "2026-09-17" } } as ReadOutcome),
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { READ: 1 } });
+    assert.equal(h.applied[0].dedupStrongKey, "2026-09-17|82766");
+});
+
+test("a FALLBACK date never trips the guard — it is OUR value, not the document's", async () => {
+    // With no readable date the keys substitute the row's own arrival day, so
+    // judging it would be measuring that day against itself. Routing has to be
+    // exactly what it was before this guard existed.
+    const h = harness([workerRow({ createdAt: SUNBELT_ARRIVAL })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "" } } as ReadOutcome),
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { READ: 1 } });
+    assert.equal(h.applied[0].dedupWeakKey, "lowes|2026-09-21|364.98|amt");
+    assert.equal(h.applied[0].dedupStrongKey, null, "and still no strong key: a fallback is a guess");
+    // ...and the SUBSTITUTE IS PERSISTED, non-null. This is why book.ts's
+    // `invalid-date` check never sees an unreadable read: the row books on its
+    // arrival day, which is deliberate, long-standing behaviour.
+    assert.equal(h.applied[0].txnDate!.toISOString(), "2026-09-21T07:00:00.000Z");
+
+    // THE CONTRACT THE CALL SITE DEPENDS ON, asserted directly.
+    //
+    // The routing outcome above cannot distinguish `dateStr: keys.dateStr` from
+    // `dateStr: keys.dateReadOffDocument ? keys.dateStr : null`, because the
+    // substitute IS the reference day and zero days apart is always plausible.
+    // So the branch is pinned where it is observable: on the flag itself. Its
+    // true-direction counterpart — a document date forwarded even when no
+    // strong key exists — is the placeholder-ref test below.
+    const keys = dedupKeys({
+        docType: "receipt", vendor: "Lowes", date: "", invoice: "82766",
+        checkNumber: "", totalAmount: "364.98", fallbackDateStr: "2026-09-21",
+    });
+    assert.equal(keys.dateReadOffDocument, false, "so the call site forwards null, not the substitute");
+    assert.equal(keys.dateStr, "2026-09-21", "even though dateStr itself is populated");
+});
+
+test("an implausible date with a PLACEHOLDER ref still parks, with no strong key at all", async () => {
+    // The branch under test is `keys.dateReadOffDocument`, NOT `keys.strong`.
+    // Those are different questions: the strong key is also withheld when the
+    // invoice number is a placeholder, so a call site keyed on `strong !== null`
+    // would let exactly this row — a real misread date with an unusable ref —
+    // sail past the gate and claim the weak net instead.
+    let weakCalls = 0;
+    const h = harness([workerRow({ createdAt: SUNBELT_ARRIVAL })], {
+        read: async () => ({
+            ok: true,
+            read: { ...goodRead.read, date: "2023-09-17", invoice: "N/A" },
+        } as ReadOutcome),
+        findWeakHit: async () => { weakCalls++; return { id: "row-twin" }; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states[0].reason, "date-implausible");
+    assert.equal(h.states[0].patch?.dedupStrongKey, null, "there was never a strong key to claim");
+    assert.equal(weakCalls, 0, "and the weak net is not consulted either");
+    assert.equal(h.applied.length, 0);
+});
+
+test("a year the reader cannot have read off a document never reaches the guard", async () => {
+    // "0026-09-17" is a real calendar day, and passed to the predicate directly
+    // it is (correctly) implausible. But `dedupKeys` refuses it as a document
+    // date, so the worker substitutes the arrival day and the row routes
+    // normally. The predicate's stricter-than-isValidDate acceptance therefore
+    // cannot change anything the pipeline does.
+    const h = harness([workerRow({ createdAt: SUNBELT_ARRIVAL })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "0026-09-17" } } as ReadOutcome),
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { READ: 1 } });
+    assert.equal(h.applied[0].txnDate!.toISOString(), "2026-09-21T07:00:00.000Z", "the arrival day");
+    assert.equal(h.applied[0].dedupStrongKey, null);
+});
+
+test("the reference day is the COMPANY's, not UTC's, right at the midnight edge", async () => {
+    // 2026-09-22T06:30Z is 23:30 on the 21st in Pacific. The dates are chosen
+    // so the two readings disagree: 2026-05-24 is exactly 120 days before the
+    // 21st (plausible, the bound is inclusive) and 121 before the 22nd. If this
+    // used `toISOString().slice(0,10)` the row would park.
+    const h = harness([workerRow({ createdAt: new Date("2026-09-22T06:30:00.000Z") })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "2026-05-24" } } as ReadOutcome),
+        companyTimeZone: async () => "America/Los_Angeles",
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { READ: 1 } });
+    assert.equal(h.applied[0].dedupStrongKey, "2026-05-24|82766");
+
+    // THE CONTROL: one day further back is 121 from the Pacific day too.
+    const older = harness([workerRow({ createdAt: new Date("2026-09-22T06:30:00.000Z") })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "2026-05-23" } } as ReadOutcome),
+        companyTimeZone: async () => "America/Los_Angeles",
+    });
+    assert.deepEqual((await runIntakeWorker(older.deps)).byState, { NEEDS_REVIEW: 1 });
+    assert.equal(older.states[0].reason, "date-implausible");
+});
+
+test("a READ row carries its bad date INTO booking — routing is not re-run", async () => {
+    // The "Set job" bypass. `setReceiptIntakeJob` leaves a row at READ, past the
+    // routing gate, so a row parked NEEDS_JOB before this shipped — or one whose
+    // job a human assigns later — reaches BOOKING without routing ever judging
+    // its date again. That is exactly why book.ts carries its own gate; this
+    // asserts the handoff the gate has to catch (booking's refusal is asserted
+    // in tests/receipt-intake-book.test.ts).
+    const handed: { txnDate: Date | null; createdAt: Date }[] = [];
+    const h = harness([workerRow({
+        state: "READ",
+        dryRun: false,
+        txnDate: new Date("2023-09-17T00:00:00.000Z"),
+        createdAt: SUNBELT_ARRIVAL,
+    })], {
+        isDryRunEnabled: () => false,
+        book: async row => {
+            handed.push({ txnDate: row.txnDate, createdAt: row.createdAt });
+            return { outcome: "needs-review", reason: "date-implausible", releaseStrongKey: true } as BookResult;
+        },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(h.promoted, ["row-1"], "READ is not a safe harbour: it IS promoted");
+    assert.equal(handed.length, 1, "and handed to booking");
+    assert.equal(handed[0].txnDate!.toISOString(), "2023-09-17T00:00:00.000Z", "still carrying the misread");
+    assert.equal(handed[0].createdAt.toISOString(), SUNBELT_ARRIVAL.toISOString(), "and its arrival day");
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
 });
 
 // ── OCR'd tax is a reading, not a fact (Phase 3 gate, item b) ───────────────
