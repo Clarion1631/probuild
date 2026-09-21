@@ -1195,6 +1195,7 @@ test("every storage helper REQUIRES the deadline, so the compiler finds the call
         "removeReceiptObject",
         "createReceiptUploadUrl",
         "signReceiptDownloadUrl",
+        "signReceiptDownloadUrls",
     ]) {
         const at = src.indexOf(`export async function ${fn}(`);
         assert.ok(at > 0, `${fn} is exported`);
