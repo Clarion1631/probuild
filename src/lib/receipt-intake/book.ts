@@ -56,7 +56,14 @@ import {
 } from "@/lib/qbo-receipt-push";
 import type { AutomationEventInput } from "@/lib/automation-events";
 import type { VerifiedBytes } from "./stored-object";
-import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS, preservedTaxWarning } from "./route-state";
+import {
+    backoffMs,
+    DATE_IMPLAUSIBLE_REASON,
+    isImplausibleReceiptDate,
+    MAX_BOOK_ATTEMPTS,
+    NO_ARTIFACT_PARK_REASONS,
+    preservedTaxWarning,
+} from "./route-state";
 import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
@@ -93,6 +100,12 @@ export interface BookableRow {
     memo: string | null;
     /** What finalize recorded; every download of this row is checked against it. */
     fileSha256: string;
+    /**
+     * When the row arrived. The REFERENCE the read date is judged against —
+     * deliberately not "now", so a row that waited weeks behind a pause does
+     * not become implausible merely because time passed.
+     */
+    createdAt: Date;
     /**
      * The token this pass claimed the row with. Every write is a CAS on it, so
      * a worker whose claim was superseded cannot act on stale state.
@@ -561,6 +574,34 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // Hoisted so the calendar day is computed ONCE and both the QBO TxnDate and
     // the Expense.date instant are derived from the same value.
     const calendarDay = toCalendarDate(row.txnDate);
+    // A date the reader got WRONG is not a null and so survives the check
+    // above, and until this gate nothing in the rail looked: a Sunbelt Rentals
+    // receipt read as 2023-09-17 on a row created 2026-09-21 reached BOOKING
+    // and would have posted an Expense dated 2023, into a closed year. DEFENCE
+    // IN DEPTH — routing refuses the same document before it can claim a dedup
+    // key — and this gate is also the only thing that catches the rows ALREADY
+    // sitting in BOOKING when it shipped. It covers both rails, being above the
+    // native/QuickBooks split.
+    //
+    // IT MAY ONLY STOP A **NEW** SEND, hence `!row.sendAttempted`.
+    //
+    // That flag means a create was already ISSUED for this row and may well
+    // have SUCCEEDED, with only its response, its attachment, or the local
+    // Expense commit lost — and the idempotent create below is precisely what
+    // re-finds that Purchase and finishes the local half. Parking such a row
+    // behind a NON-RETRYABLE verdict would strand real money in QuickBooks with
+    // nothing in ProBuild ever able to match it, which is strictly worse than
+    // an Expense carrying a wrong date that a human can edit. So a sent row
+    // continues down exactly the path it took before this guard existed.
+    //
+    // The exemption cannot become a hole: after this deploy no row can reach a
+    // FIRST send carrying an implausible date, because routing refuses it and
+    // so does this gate. The exempted set is only legacy rows already in
+    // flight. (The native rail never gets here with the flag set at all — it
+    // parks as `native-qbo-reconciliation-required` further up.)
+    if (!row.sendAttempted && isImplausibleReceiptDate(calendarDay, dayKeyInTimeZone(row.createdAt, timeZone))) {
+        return parkedBeforeSend(row, DATE_IMPLAUSIBLE_REASON);
+    }
 
     // 2. The project's LATEST estimate — the same "primary estimate" rule the
     //    v1 receipt-ingest endpoint uses (route.ts:69). Expense.estimateId is

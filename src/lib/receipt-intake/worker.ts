@@ -1065,6 +1065,12 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     // Resolved BEFORE the keys: the fallback date is part of the dedup key, so
     // it has to be the company's calendar day from the start.
     const timeZone = await deps.companyTimeZone();
+    // The company's calendar day, not UTC's. `toISOString().slice(0,10)`
+    // rolls over at 16:00/17:00 local, so a receipt uploaded on a Pacific
+    // evening got TOMORROW's date as its fallback — changing its dedup key
+    // and its reporting period. Resolved once: it is both the dedup fallback
+    // and the reference the read date's plausibility is judged against.
+    const arrivalDay = dayKeyInTimeZone(row.createdAt, timeZone);
     const keys = dedupKeys({
         docType: read.docType,
         vendor: read.vendor,
@@ -1072,11 +1078,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         invoice: read.invoice,
         checkNumber: read.checkNumber,
         totalAmount: read.totalAmount,
-        // The company's calendar day, not UTC's. `toISOString().slice(0,10)`
-        // rolls over at 16:00/17:00 local, so a receipt uploaded on a Pacific
-        // evening got TOMORROW's date as its fallback — changing its dedup key
-        // and its reporting period.
-        fallbackDateStr: dayKeyInTimeZone(row.createdAt, timeZone),
+        fallbackDateStr: arrivalDay,
     });
 
     const totalCents = centsOf(keys.amount);
@@ -1165,6 +1167,17 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         amount: keys.amount,
         totalCents,
         canonicalVendor: canonicalVendor(read.vendor),
+        // ONLY the DOCUMENT's own date is judged. When the reader found none —
+        // or produced something malformed, which `dedupKeys` treats the same
+        // way — `keys.dateStr` is `arrivalDay` itself, and measuring our own
+        // substitute against itself proves nothing. Note what that means
+        // downstream: the substitute is PERSISTED as `txnDate` below, so such a
+        // row books on its arrival day. That is deliberate, long-standing
+        // behaviour (v1 used the upload date) and this guard does not revisit
+        // it — it has an opinion about a date the reader GOT WRONG, never about
+        // one it could not read.
+        dateStr: keys.dateReadOffDocument ? keys.dateStr : null,
+        referenceDay: arrivalDay,
     };
 
     // ORDER MATTERS, and it used to be wrong.
@@ -1176,11 +1189,11 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     // case it never got to see, and every re-sent receipt landed in a human's
     // queue.
     //
-    // So: the document-level gates first (multi, non-receipt, refund/zero, no
-    // job) because those outrank dedup entirely; then the STRONG claim, which
-    // is the only net that can answer DUPLICATE on its own; and only if the
-    // strong net is silent do we fall back to the weak one, which by design
-    // never decides anything itself.
+    // So: the document-level gates first (multi, non-receipt, refund/zero,
+    // implausible date, no job) because those outrank dedup entirely; then the
+    // STRONG claim, which is the only net that can answer DUPLICATE on its own;
+    // and only if the strong net is silent do we fall back to the weak one,
+    // which by design never decides anything itself.
     // A dropped tax reading is recorded, never parked: the receipt is fine and
     // its TOTAL is what the bank charge matches, so it must still book. The note
     // rides along with whatever state routing picks so the row shows it in the
@@ -1193,9 +1206,12 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
 
     const gate = routeState(routeInput, { strong: null, weak: null }, hasProject);
     if (gate.state !== "READ") {
-        // A multi-doc, a non-receipt, or a $0/negative misread must never hold
-        // a dedup key — it would quarantine the real receipt that arrives next
-        // (:531 and the v3.6 rationale).
+        // A multi-doc, a non-receipt, a $0/negative misread, or a date that
+        // cannot belong to this row must never hold a dedup key — it would
+        // quarantine the real receipt that arrives next (:531 and the v3.6
+        // rationale). The date matters here twice over: it is half the strong
+        // key, so a misread year invents one nothing else will ever collide
+        // with.
         //
         // Via applyState, NOT applyRead: this row is FINISHED — nothing else in
         // this pass will touch it — so the write that parks it must also hand

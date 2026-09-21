@@ -128,6 +128,9 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         mimeType: "image/jpeg",
         vendor: "Lowes",
         txnDate: new Date("2026-08-03T00:00:00.000Z"),
+        // The day after the purchase, in Pacific — an ordinary receipt, and the
+        // reference the date-plausibility gate measures txnDate against.
+        createdAt: new Date("2026-08-04T09:00:00.000Z"),
         totalCents: 36498,
         taxCents: 2920,
         docType: "receipt",
@@ -643,6 +646,7 @@ test("every PRE-send refusal releases the key; every POST-send one holds it", as
         [{ totalCents: 0 }, "refund-or-zero"],
         [{ totalCents: -2257 }, "refund-or-zero"],
         [{ txnDate: null }, "invalid-date"],
+        [{ txnDate: new Date("2023-08-03T00:00:00.000Z") }, "date-implausible"],
     ] as const) {
         const r = recorder();
         const result = await bookReceipt(row(rowOverrides), r.deps);
@@ -675,6 +679,10 @@ test("round-31 P0: row.sendAttempted from an EARLIER attempt survives into every
         [{ projectId: null }, "no-estimate"],
         [{ totalCents: 0 }, "refund-or-zero"],
         [{ txnDate: null }, "invalid-date"],
+        // `date-implausible` is deliberately NOT in this list: that gate is
+        // skipped entirely once a send was attempted, because the Purchase it
+        // would strand is worth more than the wrong date it would prevent. See
+        // "a sent row is EXEMPT from the date gate" below.
     ] as const) {
         const r = recorder();
         const result = await bookReceipt(row({ ...rowOverrides, sendAttempted: true }), r.deps);
@@ -1311,7 +1319,13 @@ test("Expense.date is re-anchored to the company's local midnight", async () => 
 
 test("winter dates use the winter offset — no hardcoded -07:00", async () => {
     const r = recorder();
-    await bookReceipt(row({ txnDate: new Date("2026-01-15T00:00:00.000Z") }), r.deps);
+    // The row arrives the next day, like any other: a January receipt on an
+    // August row would now be refused by the date-plausibility gate, which is a
+    // different assertion than the one this test makes.
+    await bookReceipt(row({
+        txnDate: new Date("2026-01-15T00:00:00.000Z"),
+        createdAt: new Date("2026-01-16T09:00:00.000Z"),
+    }), r.deps);
     assert.equal((r.expenses[0].date as Date).toISOString(), "2026-01-15T08:00:00.000Z");
 });
 
@@ -3524,4 +3538,148 @@ test("the worker cron wires RECEIPT_BOOK_NATIVE into booking AND into the cutove
         "one derivation, from the same two readers booking uses",
     );
     assert.match(route, /triageCutoverRows\(candidates, opts\.boundary, bookedByV1, isNativeBookingActive\(\)\)/);
+});
+
+// ── A txnDate that cannot belong to the row ────────────────────────────────
+//
+// Routing refuses the same document, so this gate is defence in depth — and it
+// is also the only thing that catches the rows ALREADY sitting in BOOKING when
+// it shipped, which is what the live Sunbelt Rentals row was.
+
+/** Read as 2023 on a row that arrived in 2026 — three years, not three days. */
+const MISREAD_YEAR = new Date("2023-08-03T00:00:00.000Z");
+
+test("an implausible txnDate parks the row on BOTH rails, before any send", async () => {
+    const qbo = recorder();
+    assert.deepEqual(await bookReceipt(row({ txnDate: MISREAD_YEAR }), qbo.deps), {
+        outcome: "needs-review",
+        reason: "date-implausible",
+        // Nothing was sent, so the key goes back for a corrected re-upload.
+        releaseStrongKey: true,
+    });
+    assert.equal(qbo.purchaseCalls.length, 0, "QuickBooks is never touched");
+    assert.equal(qbo.expenses.length, 0, "and no Expense is attempted");
+    assert.equal(qbo.state.expenseRows.size, 0, "let alone committed");
+    assert.deepEqual(qbo.intakeUpdates, [], "no write of any kind");
+
+    // The native rail runs the SAME gate: it sits above the split, so there is
+    // one decision rather than two that can drift.
+    const tripwire = nativeTripwire();
+    const native = recorder(tripwire.deps);
+    assert.deepEqual(await bookReceipt(row({ txnDate: MISREAD_YEAR }), native.deps), {
+        outcome: "needs-review",
+        reason: "date-implausible",
+        releaseStrongKey: true,
+    });
+    assert.deepEqual(tripwire.qbo, { getTokens: 0, createPurchase: 0, markSendAttempted: 0 });
+    assert.equal(native.expenses.length, 0);
+    assert.equal(native.state.expenseRows.size, 0);
+    assert.equal(native.state.intake.expenseId, null, "and nothing was linked");
+});
+
+test("CONTROL: a plausible txnDate books on both rails, exactly as before", async () => {
+    const qbo = recorder();
+    assert.equal((await bookReceipt(row(), qbo.deps)).outcome, "booked");
+    assert.equal(qbo.purchaseCalls.length, 1);
+
+    const native = recorder(nativeOnly);
+    assert.equal((await bookReceipt(row(), native.deps)).outcome, "booked");
+    assert.equal(native.state.expenseRows.size, 1);
+});
+
+test("a SENT row is EXEMPT from the date gate — recovery must reach its Purchase", async () => {
+    // THE ROUND-2 BLOCKER. `sendAttempted` means a create was already ISSUED
+    // and may have SUCCEEDED, with only its response, attachment or local
+    // Expense commit lost. The idempotent create is what re-finds that Purchase
+    // and finishes the local half. Parking the row behind a NON-RETRYABLE
+    // `date-implausible` would strand real money in QuickBooks with nothing in
+    // ProBuild able to match it — strictly worse than an Expense carrying a
+    // wrong date that a human can edit.
+    // `atExisting` models the idempotency query finding the Purchase and
+    // returning before qbCreateFn, so the input is captured here rather than
+    // through the recorder's create counter (which that branch never reaches).
+    const looked: any[] = [];
+    const r = recorder({
+        createPurchase: atExisting(async (_t: any, input: any) => {
+            looked.push(input);
+            return {
+                ok: true, qbPurchaseId: "QB-7", docNumber: input.fileId.slice(0, 21),
+                alreadyExists: true, attachment: "already-attached", existing: BOOKS_AGREE,
+            };
+        }) as any,
+    }, { intakeSendAttempted: true });
+    const result = await bookReceipt(row({ txnDate: MISREAD_YEAR, sendAttempted: true }), r.deps);
+
+    // Exactly the pre-PR lost-response recovery, unchanged by this branch.
+    assert.equal(looked.length, 1, "the idempotent lookup/create really ran");
+    assert.equal(result.outcome, "booked");
+    assert.equal((result as any).alreadyExisted, true);
+    assert.equal((result as any).qbPurchaseId, "QB-7");
+    assert.equal(r.events[0].status, "already-exists");
+    // The local half it exists to finish.
+    assert.equal(r.expenses.length, 1, "the Expense the lost attempt never wrote");
+    assert.equal(r.state.expenseRows.size, 1, "and it COMMITTED");
+    // It books under the bad date — the accepted cost, and one a human can
+    // edit. The alternative was money in QuickBooks with no Expense at all.
+    assert.equal(looked[0].date, "2023-08-03");
+
+    // The NATIVE rail is unaffected: it refuses a sent row further up, for its
+    // own reason, and never reaches the date gate at all.
+    const native = recorder(nativeOnly, { intakeSendAttempted: true });
+    assert.deepEqual(await bookReceipt(row({ txnDate: MISREAD_YEAR, sendAttempted: true }), native.deps), {
+        outcome: "needs-review",
+        reason: "native-qbo-reconciliation-required",
+        releaseStrongKey: false,
+    });
+    assert.equal(native.state.expenseRows.size, 0);
+
+    // CONTROL: the same bad date on a row that has NOT sent still parks.
+    const unsent = recorder();
+    assert.deepEqual(await bookReceipt(row({ txnDate: MISREAD_YEAR }), unsent.deps), {
+        outcome: "needs-review",
+        reason: "date-implausible",
+        releaseStrongKey: true,
+    });
+    assert.equal(unsent.purchaseCalls.length, 0);
+});
+
+test("the booking gate's reference day is the COMPANY's, not UTC's", async () => {
+    // 2026-09-22T06:30Z is 23:30 on the 21st in Pacific. 2026-05-24 is exactly
+    // 120 days before the 21st (plausible) and 121 before the 22nd, so reading
+    // the arrival instant as a UTC day instead would park a good row.
+    const ok = recorder();
+    const result = await bookReceipt(row({
+        txnDate: new Date("2026-05-24T00:00:00.000Z"),
+        createdAt: new Date("2026-09-22T06:30:00.000Z"),
+    }), ok.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(ok.purchaseCalls[0].date, "2026-05-24");
+
+    // The control: one day further back is 121 from the Pacific day too.
+    const parked = recorder();
+    assert.deepEqual(await bookReceipt(row({
+        txnDate: new Date("2026-05-23T00:00:00.000Z"),
+        createdAt: new Date("2026-09-22T06:30:00.000Z"),
+    }), parked.deps), {
+        outcome: "needs-review",
+        reason: "date-implausible",
+        releaseStrongKey: true,
+    });
+    assert.equal(parked.purchaseCalls.length, 0);
+});
+
+test("the reference is the row's ARRIVAL, not now — a paused backlog still books", async () => {
+    // `now` is 2026-09-01, so this receipt is ~200 days old by the clock. It
+    // arrived the day after the purchase and then waited behind a pause, a
+    // disabled push, or a retry backoff. Judging it against `now` would park a
+    // perfectly good row for no reason but that time passed — and the longer an
+    // outage lasted the more of the backlog behind it the guard would eat.
+    const r = recorder();
+    const result = await bookReceipt(row({
+        txnDate: new Date("2026-02-10T00:00:00.000Z"),
+        createdAt: new Date("2026-02-11T09:00:00.000Z"),
+    }), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.purchaseCalls[0].date, "2026-02-10", "and it books under its own date");
 });
