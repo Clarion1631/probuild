@@ -143,29 +143,64 @@ function ToggleRow({
     );
 }
 
+/**
+ * WHICH RAIL THE RECEIPT ROW IS DESCRIBING.
+ *
+ * `receiptPushPaused` is one setting governing two rails: the QuickBooks push,
+ * and (since RECEIPT_BOOK_NATIVE) ProBuild booking the Expense itself. Native
+ * booking runs PRECISELY when the QuickBooks push is off — book.ts only reaches
+ * that branch then — so the two are mutually exclusive and the row can say
+ * plainly which one it is pausing.
+ *
+ * With both off there is nothing to pause, and the row keeps its
+ * "Off by deployment" badge.
+ */
+function receiptRowCopy(nativeActive: boolean) {
+    return nativeActive
+        ? {
+            label: "Receipt booking in ProBuild",
+            switchLabel: "receipt booking in ProBuild",
+            description:
+                "ProBuild books receipts to job costing itself and nothing is sent to QuickBooks. "
+                + "Pause stops booking, and receipts keep arriving and wait.",
+            resumeConfirmText: "Resume booking receipts into ProBuild job costing?",
+        }
+        : {
+            label: "Receipt → QuickBooks push",
+            switchLabel: "receipt to QuickBooks push",
+            description: "Receipts drop straight into QuickBooks as they're scanned.",
+            resumeConfirmText: "Resume automatic booking to QuickBooks?",
+        };
+}
+
 export default function PipelineControls({
     pushEnabled,
+    nativeBookingEnabled,
     syncCronEnabled,
     receiptPushPaused,
     qboSyncPaused,
     isAdmin,
 }: {
     pushEnabled: boolean;
+    /** RECEIPT_BOOK_NATIVE — ProBuild books the Expense with no QuickBooks call. */
+    nativeBookingEnabled: boolean;
     syncCronEnabled: boolean;
     receiptPushPaused: boolean;
     qboSyncPaused: boolean;
     isAdmin: boolean;
 }) {
+    const nativeActive = !pushEnabled && nativeBookingEnabled;
     return (
         <div>
             <ToggleRow
-                label="Receipt → QuickBooks push"
-                switchLabel="receipt to QuickBooks push"
-                description="Receipts drop straight into QuickBooks as they're scanned."
-                envEnabled={pushEnabled}
+                {...receiptRowCopy(nativeActive)}
+                // EITHER rail makes this control live. Keyed on the push alone,
+                // the switch disappeared exactly when native booking turned on
+                // — which is the one configuration where this toggle is the
+                // only brake on receipts reaching job cost without a redeploy.
+                envEnabled={pushEnabled || nativeBookingEnabled}
                 paused={receiptPushPaused}
                 settingKey="receiptPushPaused"
-                resumeConfirmText="Resume automatic booking to QuickBooks?"
                 isAdmin={isAdmin}
             />
             <ToggleRow

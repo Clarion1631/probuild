@@ -250,6 +250,12 @@ export default async function AutomationPage(props: {
     }
 
     const pushEnabled = process.env.QBO_RECEIPT_PUSH_ENABLED === "true";
+    // RECEIPT_BOOK_NATIVE. With the push off and this on, booking writes the
+    // ProBuild Expense and calls QuickBooks not at all — and the pause toggle
+    // below still stops it, so the control has to stay on the page. Keyed on
+    // the push alone it vanished exactly when native booking turned on, which
+    // is the one configuration where it is the only brake there is.
+    const nativeBookingEnabled = process.env.RECEIPT_BOOK_NATIVE === "true";
     const syncCronEnabled = process.env.QBO_EXPENSE_SYNC_CRON_ENABLED !== "false";
 
     const endDate = new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
@@ -827,6 +833,7 @@ export default async function AutomationPage(props: {
                     hoursSavedLabel={hoursSavedLabel}
                     onARoll={onARoll}
                     pushEnabled={pushEnabled}
+                    nativeBookingEnabled={nativeBookingEnabled}
                     syncCronEnabled={syncCronEnabled}
                     receiptPushPaused={pauses.receiptPushPaused}
                     qboSyncPaused={pauses.qboSyncPaused}
@@ -874,8 +881,15 @@ async function ReceiptsTabBranch({ sp }: { sp: Record<string, string | string[] 
         console.error("receipt queue fetch failed", error instanceof Error ? error.message : "UnknownError");
     }
 
+    // The SAME derivation the pause control is given (`!pushEnabled &&
+    // nativeBookingEnabled`): booking takes the native branch precisely when
+    // the QuickBooks push is off, so the tab must not promise QuickBooks on a
+    // rail that never calls it.
+    const nativeActive = process.env.QBO_RECEIPT_PUSH_ENABLED !== "true"
+        && process.env.RECEIPT_BOOK_NATIVE === "true";
+
     const body: ReactNode = queue
-        ? <ReceiptsTab queue={queue} filters={filters} jobs={jobs} filterHref={receiptFilterHref} />
+        ? <ReceiptsTab queue={queue} filters={filters} jobs={jobs} filterHref={receiptFilterHref} nativeActive={nativeActive} />
         : (
             <div className="hui-card p-5 text-sm text-hui-textMuted">
                 The receipt queue couldn&apos;t be loaded right now — the register is still available.
