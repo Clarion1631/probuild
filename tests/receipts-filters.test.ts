@@ -12,11 +12,13 @@ import {
 
 test("parseReceiptFilters never trusts the query string", async t => {
     await t.test("nothing set → every group, no narrowing", () => {
-        assert.deepEqual(parseReceiptFilters({}), { group: null, projectId: null, owner: null });
+        // `view` is always set: a shape with no view at all would make the
+        // default depend on a missing key, and the To-do view is the default.
+        assert.deepEqual(parseReceiptFilters({}), { group: null, projectId: null, owner: null, view: "todo" });
     });
     await t.test("a known group and owner are kept", () => {
         assert.deepEqual(parseReceiptFilters({ group: "booking", owner: "CJ", projectId: "p1" }),
-            { group: "booking", projectId: "p1", owner: "CJ" });
+            { group: "booking", projectId: "p1", owner: "CJ", view: "todo" });
     });
     await t.test("an unknown group falls back to 'all', never throws", () => {
         assert.equal(parseReceiptFilters({ group: "../../etc/passwd" }).group, null);

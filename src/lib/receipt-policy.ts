@@ -158,6 +158,40 @@ export function classifyReceiptRequirement(line: ReceiptPolicyLine): ReceiptPoli
     };
 }
 
+/**
+ * A check descriptor, anchored at the start.
+ *
+ * `PAYCHECK DEPOSIT` and `CHECKR INC` must not match, which is the whole reason
+ * for the anchor and for what follows the word: a check line always carries
+ * PAID, a #, NO, or the number itself right after it.
+ */
+export const CHECK_DESCRIPTOR = /^\s*CHECK\s*(?:PAID|#|NO\b|\d)/i;
+
+/**
+ * Does this line need a check image and the bill it paid, rather than a receipt?
+ *
+ * `checkNumber` is authoritative when the caller has it, and that is what
+ * `classifyReceiptRequirement` above uses. The Receipts tab does NOT have it:
+ * `toMissingReceiptRow` reads `displayDetails`, which carries no check number,
+ * so the UI passes the descriptor alone and gets an approximation of this
+ * module's own verdict.
+ *
+ * State the asymmetry rather than hide it. A `CHECK PAID` descriptor with no
+ * check number is `ruleKey: "merchant"` to the engine and a check to this
+ * predicate, so a bookkeeper may be shown "post the check photo" for a line
+ * that is not one. That is mild and self correcting. The reverse, a real $3,500
+ * check sitting unowned forever, is what this replaces. When the check number
+ * reaches the row in a later slice, the same call site passes it and stops
+ * guessing: one predicate, two levels of confidence, never two engines.
+ */
+export function looksLikeCheckOrSubBill(
+    rawDescriptor: string | null | undefined,
+    checkNumber?: string | null,
+): boolean {
+    if (typeof checkNumber === "string" && checkNumber.trim() !== "") return true;
+    return typeof rawDescriptor === "string" && CHECK_DESCRIPTOR.test(rawDescriptor);
+}
+
 /** Collection stays active for office invoices; crew outreach does not. */
 export function isCrewReceiptRequest(line: ReceiptPolicyLine): boolean {
     const verdict = classifyReceiptRequirement(line);

@@ -18,6 +18,16 @@ export const RECEIPT_GROUPS = [
 
 export type ReceiptGroup = (typeof RECEIPT_GROUPS)[number];
 
+/**
+ * Which SHAPE of the tab a bare `?tab=receipts` draws. Beside `group` rather
+ * than overloading `group: null`, so every link that exists today keeps
+ * resolving to what it resolved to before: a `?group=` URL still renders that
+ * one group, and `?view=all` is a real, bookmarkable name for the old default.
+ */
+export const RECEIPT_VIEWS = ["todo", "all"] as const;
+
+export type ReceiptView = (typeof RECEIPT_VIEWS)[number];
+
 export const RECEIPT_GROUP_LABELS: Record<ReceiptGroup, string> = {
     "needs-job": "Needs job",
     "needs-review": "Needs review",
@@ -50,6 +60,13 @@ export interface ReceiptFilters {
     group: ReceiptGroup | null;
     projectId: string | null;
     owner: string | null;
+    /**
+     * OPTIONAL on purpose. `parseReceiptFilters` always sets it, so no URL ever
+     * reaches a render without one. A filter object built by hand that omits it
+     * is the pre-To-do shape and draws exactly what it drew before, which is
+     * what keeps the existing render tests honest pins rather than rewrites.
+     */
+    view?: ReceiptView;
 }
 
 function firstParam(value: string | string[] | undefined): string | null {
@@ -63,7 +80,21 @@ export function parseReceiptFilters(sp: Record<string, string | string[] | undef
     const group = RECEIPT_GROUPS.includes(rawGroup as ReceiptGroup) ? (rawGroup as ReceiptGroup) : null;
     const rawOwner = firstParam(sp.owner);
     const owner = rawOwner !== null && OWNER_ORDER.includes(rawOwner as ReceiptOwner) ? rawOwner : null;
-    return { group, projectId: firstParam(sp.projectId), owner };
+    const rawView = firstParam(sp.view);
+    const view = RECEIPT_VIEWS.includes(rawView as ReceiptView) ? (rawView as ReceiptView) : "todo";
+    return { group, projectId: firstParam(sp.projectId), owner, view };
+}
+
+/**
+ * Does this URL draw Marge's To-do list?
+ *
+ * Only a bare `?tab=receipts` does. A `group` is a request for one group and an
+ * `owner` is a request to narrow by person, and the To-do view does neither, so
+ * either one falls back to the view that can honour it. That is also what keeps
+ * every bookmark anyone already has pointing at the same page it always did.
+ */
+export function showsTodoView(filters: ReceiptFilters): boolean {
+    return filters.group === null && filters.owner === null && filters.view === "todo";
 }
 
 /** True when a group should be rendered at all under the current filters. */
