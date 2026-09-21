@@ -312,6 +312,215 @@ export async function createReceiptUploadUrl(
     }
 }
 
+/**
+ * How many paths ride in one createSignedUrls request.
+ *
+ * The storage API takes a list and answers per item, so a page costs a request
+ * per chunk instead of a request per row. A hundred matches the receipts
+ * queue's own per-group page size, which keeps the request body small and makes
+ * the worst case easy to state: five visible groups of a hundred rows is five
+ * requests, not five hundred.
+ */
+export const RECEIPT_SIGN_CHUNK_SIZE = 100;
+
+/**
+ * The plural storage call, narrowed to what this module uses.
+ *
+ * Injected only by tests, the same way receiptObjectSize takes a BucketLister:
+ * the batching and the per-item handling ARE the subject here, and neither is
+ * observable through a client that has to be talked to over a socket.
+ *
+ * `signedUrl` is typed `string | null` deliberately. @supabase/storage-js 2.99
+ * declares it `string`, but its own implementation writes
+ * `datum.signedURL ? encodeURI(...) : null`, so an item that did not sign comes
+ * back null at runtime and the declared type is a lie this file must not
+ * believe.
+ */
+export interface BucketBatchSigner {
+    createSignedUrls(
+        paths: string[],
+        ttlSeconds: number,
+    ): Promise<{
+        data: Array<{ path?: string | null; signedUrl?: string | null; error?: string | null }> | null;
+        error: { message?: string; name?: string; status?: number; statusCode?: string | number } | null;
+    }>;
+}
+
+/** The only fault words this module will ever log. */
+export const SIGN_FAULT_TAGS = ["timeout", "storage-error", "threw", "per-item"] as const;
+
+/**
+ * A CATEGORY THIS CODE CHOSE, never text that came off the error.
+ *
+ * `name`, `message`, `status` and `statusCode` all arrive from a remote
+ * service, so as far as this file is concerned they are arbitrary strings that
+ * could carry a path, a signed URL or anything else an operator would then read
+ * out of a log sink. So the tag is picked from a closed set, and the only thing
+ * borrowed from the error at all is a status, and only when it is already a
+ * plain integer in the HTTP range.
+ *
+ * Every read is guarded: the fault may be a Proxy or carry a throwing getter,
+ * and the line that reports a failure must not be able to become one.
+ */
+function signFaultTag(fault: unknown, thrown: boolean): string {
+    let tag: (typeof SIGN_FAULT_TAGS)[number] = thrown ? "threw" : "storage-error";
+    let status: number | null = null;
+    try {
+        if (thrown && isStorageTimeout(fault)) tag = "timeout";
+        if (fault && typeof fault === "object") {
+            const shape = fault as { status?: unknown; statusCode?: unknown };
+            for (const candidate of [shape.status, shape.statusCode]) {
+                // NUMBERS only. A numeric-looking string is still a string off
+                // the wire, and nothing off the wire is echoed.
+                if (typeof candidate !== "number" || !Number.isInteger(candidate)) continue;
+                if (candidate < 100 || candidate > 599) continue;
+                status = candidate;
+                break;
+            }
+        }
+    } catch {
+        // A hostile error object is simply a fault of the least specific kind.
+    }
+    return status === null ? tag : `${tag}/${status}`;
+}
+
+/**
+ * One response item, read defensively.
+ *
+ * A null, a number, or an object whose getters throw is skipped ON ITS OWN:
+ * reading it inside the chunk's loop would take every later item in the same
+ * chunk down with it, and those are rows whose links would then silently
+ * vanish.
+ */
+function signedPairFrom(item: unknown, asked: Set<string>): [string, string] | null {
+    try {
+        if (!item || typeof item !== "object") return null;
+        const shape = item as { path?: unknown; signedUrl?: unknown; error?: unknown };
+        if (shape.error) return null;
+        const path = shape.path;
+        const url = shape.signedUrl;
+        if (typeof path !== "string" || typeof url !== "string" || !url) return null;
+        // Matched against what this chunk actually asked for, so a surprising
+        // response can never put a key in the map that no caller requested.
+        return asked.has(path) ? [path, url] : null;
+    } catch {
+        return null;
+    }
+}
+
+/** One batch request. Its own try/catch, so a failure never costs its siblings. */
+async function signOneChunk(
+    chunk: string[],
+    ttlSeconds: number,
+    deadline: RouteDeadline | undefined,
+    signer: BucketBatchSigner | null,
+    faults: Set<string>,
+): Promise<Array<[string, string]>> {
+    const asked = new Set(chunk);
+    const pairs: Array<[string, string]> = [];
+    try {
+        const response = signer
+            ? await signer.createSignedUrls(chunk, ttlSeconds)
+            : await withStorageDeadline("sign-downloads", deadline, client =>
+                client.storage.from(RECEIPT_BUCKET).createSignedUrls(chunk, ttlSeconds));
+        const data = response?.data;
+        // Array.isArray, not truthiness: a string or an object here would be
+        // iterated as something it is not.
+        if (response?.error || !Array.isArray(data)) {
+            faults.add(signFaultTag(response?.error, false));
+            return pairs;
+        }
+        for (const item of data) {
+            const pair = signedPairFrom(item, asked);
+            if (pair) pairs.push(pair);
+        }
+    } catch (error) {
+        faults.add(signFaultTag(error, true));
+    }
+    return pairs;
+}
+
+/**
+ * Sign MANY objects in as few round trips as possible.
+ *
+ * The single signer is the wrong shape for a list. One render of the receipts
+ * queue is up to five groups of a hundred rows, and signing each row on its own
+ * is five hundred requests AND five hundred Supabase clients on every load of a
+ * force-dynamic page. Same rules as the single signer, applied per item: the
+ * same safePath gate, an unsafe or empty path skipped rather than thrown, and a
+ * path that did not sign simply absent from the map. Callers already render a
+ * missing entry as "no link", so a partial answer costs one row instead of the
+ * page.
+ *
+ * THE CHUNKS GO OUT TOGETHER. In series, each one would be handed its own fresh
+ * allowance by withStorageDeadline, so a degraded storage day would cost the
+ * caller the SUM of them, and the caller here is a page render. Concurrent, the
+ * whole step costs one chunk's wait, and a caller that passes a deadline caps
+ * even that.
+ *
+ * NEVER THROWS, literally: a bad input element, a hostile response, a fault
+ * object that explodes when read, or a logger that fails all come back as a map
+ * with fewer entries in it.
+ */
+export async function signReceiptDownloadUrls(
+    storagePaths: readonly (string | null | undefined)[],
+    ttlSeconds: number,
+    deadline: RouteDeadline | undefined,
+    signer: BucketBatchSigner | null = null,
+): Promise<Map<string, string>> {
+    const signed = new Map<string, string>();
+    const faults = new Set<string>();
+    let requested = 0;
+
+    try {
+        // Deduped in first-seen order: the same object can head more than one
+        // group (a row and the duplicate parked against it), and asking twice
+        // is a wasted slot in the chunk. A non-string element is skipped rather
+        // than thrown over, because this list is built from database rows and
+        // the contract above says never.
+        const wanted: string[] = [];
+        const seen = new Set<string>();
+        for (const candidate of storagePaths ?? []) {
+            if (typeof candidate !== "string" || !candidate || seen.has(candidate)) continue;
+            seen.add(candidate);
+            if (safePath(candidate)) wanted.push(candidate);
+        }
+        requested = wanted.length;
+        if (requested === 0) return signed;
+
+        const chunks: string[][] = [];
+        for (let from = 0; from < wanted.length; from += RECEIPT_SIGN_CHUNK_SIZE) {
+            chunks.push(wanted.slice(from, from + RECEIPT_SIGN_CHUNK_SIZE));
+        }
+
+        // Results come back in CHUNK order however the answers arrive, so the
+        // map reads the way the caller asked.
+        const answers = await Promise.all(
+            chunks.map(chunk => signOneChunk(chunk, ttlSeconds, deadline, signer, faults)),
+        );
+        for (const pairs of answers) {
+            for (const [path, url] of pairs) signed.set(path, url);
+        }
+    } catch {
+        faults.add("threw");
+    }
+
+    // ONE line per call, counts only. A path or a signed URL in a log is a
+    // capability in a log, and the receipts these name are private documents.
+    if (signed.size < requested) {
+        try {
+            console.warn("[receipts/intake] sign-downloads incomplete", {
+                requested,
+                signed: signed.size,
+                fault: [...faults][0] ?? "per-item",
+            });
+        } catch {
+            // Reporting a degraded render must not be how the render dies.
+        }
+    }
+    return signed;
+}
+
 /** A time-limited read URL, for the archive mirror. */
 export async function signReceiptDownloadUrl(
     storagePath: string,
