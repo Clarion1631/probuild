@@ -56,7 +56,14 @@ import {
 } from "@/lib/qbo-receipt-push";
 import type { AutomationEventInput } from "@/lib/automation-events";
 import type { VerifiedBytes } from "./stored-object";
-import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS, preservedTaxWarning } from "./route-state";
+import {
+    backoffMs,
+    DATE_IMPLAUSIBLE_REASON,
+    isImplausibleReceiptDate,
+    MAX_BOOK_ATTEMPTS,
+    NO_ARTIFACT_PARK_REASONS,
+    preservedTaxWarning,
+} from "./route-state";
 import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
@@ -93,6 +100,12 @@ export interface BookableRow {
     memo: string | null;
     /** What finalize recorded; every download of this row is checked against it. */
     fileSha256: string;
+    /**
+     * When the row arrived. The REFERENCE the read date is judged against —
+     * deliberately not "now", so a row that waited weeks behind a pause does
+     * not become implausible merely because time passed.
+     */
+    createdAt: Date;
     /**
      * The token this pass claimed the row with. Every write is a CAS on it, so
      * a worker whose claim was superseded cannot act on stale state.
@@ -561,6 +574,18 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // Hoisted so the calendar day is computed ONCE and both the QBO TxnDate and
     // the Expense.date instant are derived from the same value.
     const calendarDay = toCalendarDate(row.txnDate);
+    // A date the reader got WRONG survives the null check above, and until this
+    // gate nothing in the rail looked: a Sunbelt Rentals receipt read as
+    // 2023-09-17 on a row created 2026-09-21 reached BOOKING and would have
+    // posted an Expense dated 2023, into a closed year. DEFENCE IN DEPTH —
+    // routing refuses the same document — and it is also what catches the rows
+    // already sitting in BOOKING when this shipped. Gates BOTH rails, because
+    // it is above the native/QuickBooks split; a row that already sent follows
+    // its own reconciliation path further up and never reaches here on the
+    // native side.
+    if (isImplausibleReceiptDate(calendarDay, dayKeyInTimeZone(row.createdAt, timeZone))) {
+        return parkedBeforeSend(row, DATE_IMPLAUSIBLE_REASON);
+    }
 
     // 2. The project's LATEST estimate — the same "primary estimate" rule the
     //    v1 receipt-ingest endpoint uses (route.ts:69). Expense.estimateId is

@@ -5,6 +5,8 @@
  * testable (tests/receipt-intake-route-state.test.ts).
  */
 
+import { isValidDate } from "./keys";
+
 export const RECEIPT_INTAKE_STATES = [
     // STAGING: the row exists but its file does not yet. Never claimable.
     "STAGING",
@@ -42,6 +44,18 @@ export interface RouteInput {
     totalCents: number | null;
     /** canonicalVendor() of this document — see the vendor-mismatch rule below. */
     canonicalVendor: string;
+    /**
+     * The date READ OFF THE DOCUMENT, as a YYYY-MM-DD day. Absent (or null)
+     * when the reader found none: the keys then fall back to the row's own
+     * arrival day, which is OUR value and says nothing about the document.
+     */
+    dateStr?: string | null;
+    /**
+     * The company-calendar day this row ARRIVED on — what `dateStr` is judged
+     * against. Absent leaves the date gate silent, so every existing caller
+     * keeps its behaviour unchanged.
+     */
+    referenceDay?: string | null;
 }
 
 export interface DedupHits {
@@ -62,6 +76,56 @@ export interface RouteDecision {
 }
 
 /**
+ * How far behind the row's arrival a read date may sit and still be a reading
+ * of THIS document. Receipts reach the rail within days of the purchase, so a
+ * date four months back is a misread year or a misread month, not a late
+ * upload: a Sunbelt Rentals receipt was read as 2023-09-17 on a row created
+ * 2026-09-21, and nothing in the rail looked, so it advanced to BOOKING and
+ * would have posted an Expense dated 2023 — into a closed year.
+ *
+ * Deliberately generous. This is a MISREAD detector, not a filing policy; a
+ * genuinely stale receipt someone finds in a truck three months later still
+ * books itself.
+ */
+export const MAX_RECEIPT_AGE_DAYS = 120;
+/** Ahead of arrival is only ever clock skew or a date written a day early. */
+export const MAX_RECEIPT_FUTURE_DAYS = 3;
+/** The park reason both the routing gate and the booking gate write. */
+export const DATE_IMPLAUSIBLE_REASON = "date-implausible";
+
+const DAY_MS = 86_400_000;
+
+/** A YYYY-MM-DD calendar day as UTC midnight, or null when it is not one. */
+function utcMidnightOf(dayKey: string | null | undefined): number | null {
+    if (!isValidDate(dayKey)) return null;
+    const [year, month, day] = String(dayKey).split("-").map(Number);
+    return Date.UTC(year, month - 1, day);
+}
+
+/**
+ * Is this read date too far from the row's own arrival to be believable?
+ *
+ * PURE CALENDAR ARITHMETIC. Both sides are parsed as UTC midnight, so no time
+ * zone and no DST ever enters — and there is no clock in here: the reference
+ * day is passed in, never `Date.now()`, because a row that waited weeks behind
+ * a pause must not become implausible merely because time passed.
+ *
+ * A missing or unreadable date on EITHER side is not this guard's business and
+ * answers false. Those cases already have owners: the dedup keys fall back to
+ * the arrival day, and booking parks `invalid-date` on a null txnDate.
+ */
+export function isImplausibleReceiptDate(
+    dateStr: string | null | undefined,
+    referenceDay: string | null | undefined,
+): boolean {
+    const date = utcMidnightOf(dateStr);
+    const reference = utcMidnightOf(referenceDay);
+    if (date === null || reference === null) return false;
+    const diffDays = (reference - date) / DAY_MS;
+    return diffDays > MAX_RECEIPT_AGE_DAYS || diffDays < -MAX_RECEIPT_FUTURE_DAYS;
+}
+
+/**
  * First match wins. Order is the spec's, and it matters:
  *  - multi/non_receipt are triage answers about the FILE, decided before money.
  *  - a total that is zero OR NEGATIVE never books automatically. A $0.00 is
@@ -70,6 +134,9 @@ export interface RouteDecision {
  *    a human must place against the original purchase. Both are decided BEFORE
  *    any dedup key is claimed, so neither can quarantine the real receipt that
  *    arrives next.
+ *  - a date that cannot belong to this row is the same class of fact and sits
+ *    in the same block, for the same reason: the read date IS half the strong
+ *    key, so a misread year must not be allowed to claim one.
  *  - no project means nobody can job-cost it yet; that is a queue, not a fault.
  *  - a strong hit at the SAME total is the same purchase arriving twice —
  *    UNLESS the two documents name different vendors. The v3.6 key is
@@ -105,6 +172,12 @@ export function routeState(read: RouteInput, dedupHits: DedupHits, hasProject: b
     }
     if (read.totalCents === null || read.totalCents <= 0 || read.amount === "0.00") {
         return { state: "NEEDS_REVIEW", stateReason: "refund-or-zero", duplicateOfId: null };
+    }
+    // AFTER the three gates above, so their reasons keep priority — a $0
+    // multi-page scan is still triaged as a multi-page scan — and BEFORE every
+    // dedup verdict, so a misread date claims no key.
+    if (isImplausibleReceiptDate(read.dateStr, read.referenceDay)) {
+        return { state: "NEEDS_REVIEW", stateReason: DATE_IMPLAUSIBLE_REASON, duplicateOfId: null };
     }
     if (!hasProject) {
         return { state: "NEEDS_JOB", stateReason: null, duplicateOfId: null };
@@ -207,10 +280,10 @@ export function backoffMs(attempts: number): number {
  *
  * The list is deliberately CLOSED. Most NEEDS_REVIEW reasons are verdicts about
  * the DOCUMENT — `multi-doc`, `no-estimate`, `weak-dup:<id>`,
- * `strong-dup-amount-mismatch:<id>`, `refund-or-zero` — and retrying one of
- * those just parks it again with the same reason while spending an attempt and
- * a QuickBooks round trip. Only reasons that describe a TRANSIENT FAILURE of
- * something other than the document are retryable.
+ * `strong-dup-amount-mismatch:<id>`, `refund-or-zero`, `date-implausible` —
+ * and retrying one of those just parks it again with the same reason while
+ * spending an attempt and a QuickBooks round trip. Only reasons that describe
+ * a TRANSIENT FAILURE of something other than the document are retryable.
  *
  * Where a row resumes matters as much as whether it may:
  *   - `ai-unavailable` and `file-missing` failed BEFORE the read, so they go
@@ -259,9 +332,10 @@ export function retryTargetFor(state: string, stateReason: string | null): Retry
  * whose bytes are GONE, and nobody is ever asked for it again.
  *
  * Everything else book.ts parks — `no-estimate`, `refund-or-zero`,
- * `invalid-date`, a QBO fault — is about the row's METADATA. The document is
- * still in the bucket, still verified, and still proves the purchase has a
- * receipt; it just cannot be booked yet. Those rows remain evidence.
+ * `invalid-date`, `date-implausible`, a QBO fault — is about the row's
+ * METADATA. The document is still in the bucket, still verified, and still
+ * proves the purchase has a receipt; it just cannot be booked yet. Those rows
+ * remain evidence.
  */
 export const NO_ARTIFACT_PARK_REASONS = {
     /** An affirmative 404 from storage: the object is not there. */

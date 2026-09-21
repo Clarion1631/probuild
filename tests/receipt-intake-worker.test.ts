@@ -965,6 +965,52 @@ test("a document-level gate short-circuits BOTH nets and claims no key", async (
     }
 });
 
+// ── A read date that cannot belong to the row ──────────────────────────────
+
+/** The live row: Sunbelt Rentals, $1,597.03, arriving on 2026-09-21 Pacific. */
+const SUNBELT_ARRIVAL = new Date("2026-09-21T16:00:00.000Z");
+
+test("an implausible read date parks the row BEFORE it claims a dedup key", async () => {
+    // Read as 2023-09-17 on a row created 2026-09-21; the real date is almost
+    // certainly 2026-09-17. Nothing in the rail checked, so the row advanced to
+    // BOOKING and would have become an Expense dated 2023.
+    let weakCalls = 0;
+    const h = harness([workerRow({ createdAt: SUNBELT_ARRIVAL })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "2023-09-17" } } as ReadOutcome),
+        findWeakHit: async () => { weakCalls++; return { id: "row-twin" }; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states[0].reason, "date-implausible");
+    // The key is the point: "2023-09-17|82766" is one nothing real will ever
+    // collide with, so holding it would quarantine the corrected resend.
+    assert.equal(h.states[0].patch?.dedupStrongKey, null);
+    assert.equal(weakCalls, 0, "dedup is not consulted at all");
+    assert.equal(h.applied.length, 0, "and applyRead — the claim itself — never ran");
+});
+
+test("the same row read as the date it should have carried routes normally", async () => {
+    // The control for the test above.
+    const h = harness([workerRow({ createdAt: SUNBELT_ARRIVAL })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "2026-09-17" } } as ReadOutcome),
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { READ: 1 } });
+    assert.equal(h.applied[0].dedupStrongKey, "2026-09-17|82766");
+});
+
+test("a FALLBACK date never trips the guard — it is OUR value, not the document's", async () => {
+    // With no readable date the keys fall back to the row's own arrival day, so
+    // judging it would be measuring that day against itself. Routing has to be
+    // exactly what it was before this guard existed.
+    const h = harness([workerRow({ createdAt: SUNBELT_ARRIVAL })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "" } } as ReadOutcome),
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { READ: 1 } });
+    assert.equal(h.applied[0].dedupWeakKey, "lowes|2026-09-21|364.98|amt");
+    assert.equal(h.applied[0].dedupStrongKey, null, "and still no strong key: a fallback is a guess");
+});
+
 // ── OCR'd tax is a reading, not a fact (Phase 3 gate, item b) ───────────────
 
 test("an implausible tax is DROPPED and noted, and the receipt still books", () => {

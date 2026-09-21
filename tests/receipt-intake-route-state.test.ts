@@ -8,7 +8,17 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { backoffMs, MAX_BOOK_ATTEMPTS, preservedTaxWarning, retryTargetFor, routeState } from "../src/lib/receipt-intake/route-state";
+import {
+    backoffMs,
+    DATE_IMPLAUSIBLE_REASON,
+    isImplausibleReceiptDate,
+    MAX_BOOK_ATTEMPTS,
+    MAX_RECEIPT_AGE_DAYS,
+    MAX_RECEIPT_FUTURE_DAYS,
+    preservedTaxWarning,
+    retryTargetFor,
+    routeState,
+} from "../src/lib/receipt-intake/route-state";
 
 const NO_HITS = { strong: null, weak: null };
 const clean = { docType: "receipt", amount: "364.98", totalCents: 36498, canonicalVendor: "lowes" };
@@ -58,6 +68,115 @@ test("an unreadable total (null cents) is reviewed, not booked", () => {
         true,
     );
     assert.equal(d.stateReason, "refund-or-zero");
+});
+
+// ── The read date has to be believable ─────────────────────────────────────
+
+/** The day the live Sunbelt row arrived. Every offset below is measured from it. */
+const ARRIVAL = "2026-09-21";
+/** The misread that got through: a 2023 date on a row created in 2026. */
+const badDate = { dateStr: "2023-09-17", referenceDay: ARRIVAL } as const;
+
+test("the window is CLOSED at 120 days back and 3 days forward", () => {
+    assert.equal(MAX_RECEIPT_AGE_DAYS, 120);
+    assert.equal(MAX_RECEIPT_FUTURE_DAYS, 3);
+    // Exactly at each bound is still plausible; one day past it is not.
+    assert.equal(isImplausibleReceiptDate("2026-05-24", ARRIVAL), false, "120 days back");
+    assert.equal(isImplausibleReceiptDate("2026-05-23", ARRIVAL), true, "121 days back");
+    assert.equal(isImplausibleReceiptDate("2026-09-24", ARRIVAL), false, "3 days forward");
+    assert.equal(isImplausibleReceiptDate("2026-09-25", ARRIVAL), true, "4 days forward");
+    assert.equal(isImplausibleReceiptDate(ARRIVAL, ARRIVAL), false, "and the arrival day itself");
+});
+
+test("THE LIVE CASE: a 2023 date on a 2026 row is a misread, not a stale receipt", () => {
+    // Sunbelt Rentals, $1,597.03, read as 2023-09-17 on a row created
+    // 2026-09-21. Nothing in the rail checked, so it advanced to BOOKING and
+    // would have become an Expense dated 2023 — into a closed year.
+    assert.equal(isImplausibleReceiptDate("2023-09-17", ARRIVAL), true);
+    assert.equal(isImplausibleReceiptDate("2026-09-17", ARRIVAL), false, "the date it should have read");
+});
+
+test("month, year and leap-day boundaries are plain calendar arithmetic", () => {
+    // Both sides are UTC midnight, so no zone and no DST ever enters.
+    assert.equal(isImplausibleReceiptDate("2025-12-31", "2026-01-01"), false, "one day, not one year");
+    assert.equal(isImplausibleReceiptDate("2025-09-03", "2026-01-01"), false, "exactly 120, across the year end");
+    assert.equal(isImplausibleReceiptDate("2025-09-02", "2026-01-01"), true, "121");
+    assert.equal(isImplausibleReceiptDate("2026-01-31", "2026-02-01"), false, "a month end");
+    assert.equal(isImplausibleReceiptDate("2024-02-29", "2024-03-01"), false, "the leap day is a real day");
+    assert.equal(isImplausibleReceiptDate("2024-02-29", "2024-06-28"), false, "exactly 120 counting it");
+    assert.equal(isImplausibleReceiptDate("2024-02-29", "2024-06-29"), true, "121");
+});
+
+test("a missing or unreadable day on EITHER side is not this guard's business", () => {
+    // Those cases already have owners: the dedup keys fall back to the arrival
+    // day and booking parks a null txnDate as `invalid-date`. Claiming them
+    // here would park a row under a reason that does not describe it.
+    for (const bad of [
+        null, undefined, "", "   ", "not-a-date", "2026-13-05", "2026-02-30",
+        "2023-02-29", "20260917", "2026-9-17",
+        // A timestamp is NOT a calendar day here: both call sites hand a bare
+        // YYYY-MM-DD, and accepting a second spelling invites them to drift.
+        "2026-09-17T10:00:00Z",
+    ]) {
+        assert.equal(isImplausibleReceiptDate(bad, ARRIVAL), false, `date=${String(bad)}`);
+        assert.equal(isImplausibleReceiptDate("2023-09-17", bad), false, `reference=${String(bad)}`);
+    }
+});
+
+test("an implausible date parks the row BEFORE any dedup key is claimed", () => {
+    const d = routeState({ ...clean, ...badDate }, { strong: owner(), weak: { id: "row-b" } }, true);
+    assert.deepEqual(d, {
+        state: "NEEDS_REVIEW",
+        stateReason: "date-implausible",
+        duplicateOfId: null,
+    });
+    assert.equal(DATE_IMPLAUSIBLE_REASON, "date-implausible");
+});
+
+test("the document facts ABOVE it keep their priority", () => {
+    const blank = { amount: "0.00", totalCents: null, canonicalVendor: "" } as const;
+    assert.equal(
+        routeState({ docType: "multi", ...blank, ...badDate }, NO_HITS, true).stateReason,
+        "multi-doc",
+    );
+    assert.equal(
+        routeState({ docType: "non_receipt", ...blank, ...badDate }, NO_HITS, true).state,
+        "NON_RECEIPT",
+    );
+    assert.equal(
+        routeState({ ...clean, docType: "invoice", ...badDate }, NO_HITS, true).stateReason,
+        "unknown-doc-type",
+    );
+    assert.equal(
+        routeState({ ...clean, amount: "0.00", totalCents: 0, ...badDate }, NO_HITS, true).stateReason,
+        "refund-or-zero",
+    );
+});
+
+test("...and it outranks the job queue and BOTH dedup verdicts", () => {
+    // No job: the document fact is the more useful answer, exactly as a $0
+    // misread is — fixing the date is what unblocks the row either way.
+    assert.equal(routeState({ ...clean, ...badDate }, NO_HITS, false).stateReason, "date-implausible");
+    // A strong hit that would otherwise resolve to DUPLICATE on its own.
+    assert.equal(
+        routeState({ ...clean, ...badDate }, { strong: owner(), weak: null }, true).stateReason,
+        "date-implausible",
+    );
+    assert.equal(
+        routeState({ ...clean, ...badDate }, { strong: null, weak: { id: "row-b" } }, true).stateReason,
+        "date-implausible",
+    );
+});
+
+test("absent or plausible date fields leave every existing verdict untouched", () => {
+    // Every other test in this file omits the two fields entirely, which is the
+    // real assertion. This one says it out loud, including the shapes a caller
+    // passes when the reader found no date at all.
+    const READ = { state: "READ", stateReason: null, duplicateOfId: null };
+    assert.deepEqual(routeState(clean, NO_HITS, true), READ);
+    assert.deepEqual(routeState({ ...clean, dateStr: null, referenceDay: ARRIVAL }, NO_HITS, true), READ);
+    assert.deepEqual(routeState({ ...clean, ...badDate, referenceDay: null }, NO_HITS, true), READ);
+    assert.deepEqual(routeState({ ...clean, dateStr: "2026-09-17", referenceDay: ARRIVAL }, NO_HITS, true), READ);
 });
 
 test("no project means NEEDS_JOB — a queue, not a fault", () => {
@@ -212,6 +331,10 @@ test("only transient FAILURES are retryable — never a document verdict", async
     await t.test("document verdicts are NOT retryable — another attempt parks them again", () => {
         for (const reason of [
             "multi-doc", "no-estimate", "refund-or-zero", "invalid-date", "zero-total",
+            // A date this row cannot own is a VERDICT about the document, not a
+            // transient failure: re-reading it produces the same misread and
+            // spends an attempt and a QuickBooks round trip doing it.
+            DATE_IMPLAUSIBLE_REASON,
             "weak-dup:abc", "strong-dup-amount-mismatch:abc", "vendor-mismatch:abc",
             "qbo-fault:account-config", "qbo-fault:vendor-duplicate", "voided-by-user",
         ]) {
