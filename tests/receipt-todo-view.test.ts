@@ -140,6 +140,8 @@ test("every row in the queue lands in exactly one pile or exactly one folded lin
             intake("r-implausible", { stateReason: "date-implausible" }),
             intake("r-weak", { stateReason: "weak-dup:abc123" }),
             intake("r-strong", { stateReason: "strong-dup-amount-mismatch:abc123" }),
+            intake("r-strongdup", { stateReason: "strong-dup:abc123" }),
+            intake("r-chain", { stateReason: "duplicate-chain:abc123" }),
             intake("r-vendor", { stateReason: "vendor-mismatch:abc123" }),
             intake("r-refund", { stateReason: "refund-or-zero" }),
             intake("r-native", { stateReason: "native-qbo-reconciliation-required" }),
@@ -229,6 +231,8 @@ test("isOfficeManagerReason: the office manager's reasons, and an unknown one", 
         "invalid-date", "date-implausible", "weak-dup:x", "strong-dup-amount-mismatch:x",
         "vendor-mismatch:x", "refund-or-zero", "native-qbo-reconciliation-required",
         "qbo-purchase-mismatch:x", "ai-unavailable", "max-retries", "push-paused", "push-disabled",
+        // #522. Both are "are these two the same purchase", which is never hers.
+        "strong-dup:x", "duplicate-chain:x",
         // A Retry row, not a photo row: retryTargetFor sends file-missing back
         // to RECEIVED, so the action is Justin pressing the button.
         "file-missing",

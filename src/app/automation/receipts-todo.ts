@@ -386,7 +386,16 @@ const RETRYABLE_REASONS = new Set(["ai-unavailable", "file-missing", "max-retrie
 const BOOKKEEPING_REASONS = new Set([
     "invalid-date", "date-implausible", "refund-or-zero", "native-qbo-reconciliation-required",
 ]);
-const BOOKKEEPING_PREFIXES = ["weak-dup:", "strong-dup-amount-mismatch:", "vendor-mismatch:", "qbo-purchase-mismatch:"];
+// `strong-dup:` and `duplicate-chain:` arrived with #522 and are the same kind
+// of question as the rest of this list: whether two receipts are the same
+// purchase. That is a bookkeeping judgement with a money consequence, so it is
+// not the office manager's, and leaving them unclassified would have parked
+// them in "Tell Justin about these" under a sentence saying nobody knows what
+// stopped them, which reason-text.ts now plainly does.
+const BOOKKEEPING_PREFIXES = [
+    "weak-dup:", "strong-dup:", "strong-dup-amount-mismatch:", "duplicate-chain:",
+    "vendor-mismatch:", "qbo-purchase-mismatch:",
+];
 
 /**
  * Which pile (or which folded line) a parked intake row belongs to.
