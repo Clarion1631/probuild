@@ -221,9 +221,9 @@ export const CHECK_GUIDE_HREF = "/automation/guide#checks-what-to-post";
 export const PILE_AGE_MIN_DAYS = 7;
 
 type FoldedKey =
-    | "booking" | "booked-today" | "switched-off" | "retryable" | "held" | "office-invoice"
-    | "acknowledged" | "memo-signed" | "office-owner" | "bookkeeping"
-    | "duplicates" | "exceptions" | "uncertain-cards";
+    | "booking" | "booked-today" | "not-a-receipt" | "switched-off" | "retryable"
+    | "held" | "office-invoice" | "acknowledged" | "memo-signed" | "office-owner"
+    | "bookkeeping" | "duplicates" | "exceptions" | "uncertain-cards";
 
 interface FoldedCopy {
     /** Exactly one. Written out rather than pluralised by string surgery. */
@@ -258,6 +258,13 @@ export const FOLDED_COPY: Record<FoldedKey, FoldedCopy> = {
         one: "1 was booked today.",
         many: "{n} were booked today.",
         target: { group: "booked-today" },
+    },
+    "not-a-receipt": {
+        one: "1 was not a receipt, like a screenshot or a note. Nothing to do.",
+        many: "{n} were not receipts, like a screenshot or a note. Nothing to do.",
+        // The group that lists them: the loader's needs-review scope is
+        // ["NEEDS_REVIEW", "NON_RECEIPT"], so that chip is where they are.
+        target: { group: "needs-review" },
     },
     "switched-off": {
         one: "1 is waiting on the booking switch. Booking is paused.",
@@ -341,7 +348,7 @@ export const DYNAMIC_FOLDED_COPY = {
 } as const;
 
 const FOLDED_ORDER: FoldedKey[] = [
-    "booking", "booked-today", "switched-off", "retryable",
+    "booking", "booked-today", "not-a-receipt", "switched-off", "retryable",
     "held", "office-invoice", "acknowledged", "memo-signed",
     "office-owner", "bookkeeping",
     "duplicates", "exceptions", "uncertain-cards",
@@ -366,6 +373,26 @@ export function rollUpDates(firstDate: string, lastDate: string, cardTail: strin
 // ── Which reasons are a human's, and whose ────────────────────────────────
 
 type IntakeBucket = "pick-the-job" | "better-photo" | "tell-justin" | "switched-off" | "retryable" | "bookkeeping";
+
+/**
+ * The verdict that means "this file is not a purchase at all".
+ *
+ * `routeState` writes it for `docType === "non_receipt"` WITH A NULL REASON
+ * (route-state.ts), and the loader's needs-review scope is
+ * ["NEEDS_REVIEW", "NON_RECEIPT"], so these rows arrive in `queue.needsReview`
+ * carrying nothing for `intakeBucket` to read. Routed by reason they fell
+ * through to the unknown default and were drawn as "Tell Justin about these",
+ * under "No reason recorded." That is backwards: a screenshot classified as a
+ * screenshot is the pipeline WORKING, and the absent reason is the verdict
+ * being clean rather than a fact going missing.
+ *
+ * So the STATE is read first. A settled verdict is not somebody's work.
+ *
+ * Named here as a literal rather than imported from route-state.ts, which
+ * carries the worker with it; this module is a pure leaf that a unit test
+ * imports without a database.
+ */
+const NON_RECEIPT_STATE = "NON_RECEIPT";
 
 /** The booking switch is off. Nothing is wrong with the row and nobody presses anything. */
 const SWITCHED_OFF_REASONS = new Set(["push-paused", "push-disabled"]);
@@ -654,6 +681,8 @@ export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan 
         for (const row of rows) {
             if (group === "needs-job") { pickJob.push(row); continue; }
             if (group !== "needs-review") { fold(group, row.id); continue; }
+            // STATE before reason: see NON_RECEIPT_STATE.
+            if (row.state === NON_RECEIPT_STATE) { fold("not-a-receipt", row.id); continue; }
             const bucket = intakeBucket(row.stateReason);
             if (bucket === "pick-the-job") pickJob.push(row);
             else if (bucket === "better-photo") betterPhoto.push(row);

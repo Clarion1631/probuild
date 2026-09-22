@@ -316,6 +316,21 @@ test("a parked row with no code at all says so, rather than leaving a gap", asyn
     assert.ok(!needsJob.includes("No reason recorded."), "not noise on every row that has no reason");
 });
 
+test("a screenshot is not drawn as work, and the strip says what it was", async () => {
+    const html = await render(queueOf({
+        needsReview: [intake("shot", {
+            state: "NON_RECEIPT", stateReason: null, totalCents: 0,
+            vendor: null, fileName: "Screenshot_20260918-075934.png",
+        })],
+    }), parseReceiptFilters({}));
+
+    assert.doesNotMatch(html, /Tell Justin about these/, "a settled verdict is not a question");
+    assert.ok(!html.includes("No reason recorded."), "there is nothing to explain, so nothing was recorded");
+    assert.doesNotMatch(html, /Screenshot_20260918-075934\.png/, "the row itself is not drawn at all");
+    assert.ok(html.includes("1 was not a receipt, like a screenshot or a note. Nothing to do."));
+    assert.ok(html.includes(escaped(TODO_COPY.doneTitle)), "and with nothing else waiting, she is done");
+});
+
 test("the unknown pile offers no button, because nothing on this page answers it", async () => {
     const html = await render(queueOf({
         needsReview: [intake("x", { stateReason: "brand-new-failure-mode" })],

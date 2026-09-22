@@ -136,6 +136,9 @@ test("every row in the queue lands in exactly one pile or exactly one folded lin
             intake("r-multi", { stateReason: "multi-doc" }),
             intake("r-multi1", { stateReason: "multi-doc:one-page" }),
             intake("r-unknown", { stateReason: "brand-new-failure-mode" }),
+            // The live shape: routeState writes NON_RECEIPT with a NULL reason,
+            // and the loader's needs-review scope carries it here.
+            intake("r-nonreceipt", { state: "NON_RECEIPT", stateReason: null, totalCents: 0 }),
             intake("r-invalid", { stateReason: "invalid-date" }),
             intake("r-implausible", { stateReason: "date-implausible" }),
             intake("r-weak", { stateReason: "weak-dup:abc123" }),
@@ -208,6 +211,8 @@ test("every row in the queue lands in exactly one pile or exactly one folded lin
         ["r-unknown"],
         "an unrecognised reason is a HUMAN'S, and gets its own pile rather than a guess at the cause",
     );
+    assert.deepEqual(plan.folded.find(line => line.key === "not-a-receipt")?.ids, ["r-nonreceipt"],
+        "a settled verdict is not work, however empty its reason column is");
     assert.deepEqual(rowIdsIn(plan, "ask-for-these").sort(), ["m-cj", "m-rich"]);
     assert.deepEqual(rowIdsIn(plan, "checks-and-sub-bills"), ["m-check"]);
 });
@@ -266,6 +271,38 @@ test("a parked row that is nobody's to fix lands on exactly one folded line, and
     assert.equal(foldedCount(plan, "bookkeeping"), 1);
     assert.equal(plan.needsYouCount, 0);
     assert.equal(plan.handledCount, 5);
+});
+
+test("a file that is not a receipt is a finished verdict, not a question", () => {
+    // It arrives with NO reason, because there is nothing to explain: the
+    // classifier said screenshot and the pipeline agreed. Read by reason it
+    // fell through to the unknown default and was drawn as somebody's work
+    // under "No reason recorded.", which is the opposite of what happened.
+    const one = planTodo(queueOf({
+        needsReview: [intake("shot", { state: "NON_RECEIPT", stateReason: null, totalCents: 0 })],
+    }), NOW);
+    assert.equal(one.needsYouCount, 0, "nobody has anything to do with it");
+    assert.equal(one.folded.length, 1);
+    assert.equal(one.folded[0].key, "not-a-receipt");
+    assert.equal(one.folded[0].text, "1 was not a receipt, like a screenshot or a note. Nothing to do.");
+    assert.deepEqual(one.folded[0].target, { group: "needs-review" },
+        "the chip that lists them, because the loader's scope is NEEDS_REVIEW plus NON_RECEIPT");
+
+    const two = planTodo(queueOf({
+        needsReview: [
+            intake("a", { state: "NON_RECEIPT", stateReason: null }),
+            intake("b", { state: "NON_RECEIPT", stateReason: null }),
+        ],
+    }), NOW);
+    assert.equal(two.folded[0].text, "2 were not receipts, like a screenshot or a note. Nothing to do.");
+
+    // The STATE decides, so a stray reason cannot drag the verdict back onto
+    // somebody's list.
+    const withReason = planTodo(queueOf({
+        needsReview: [intake("c", { state: "NON_RECEIPT", stateReason: "something-unrecognised" })],
+    }), NOW);
+    assert.equal(withReason.needsYouCount, 0);
+    assert.equal(foldedCount(withReason, "not-a-receipt"), 1);
 });
 
 test("a reason nobody has words for is its own pile, in front of the crew chases", () => {
