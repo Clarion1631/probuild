@@ -46,6 +46,16 @@ jobs:
           printf '%s' "$CODEX_AUTH_JSON" > ~/.codex/auth.json
           chmod 600 ~/.codex/auth.json
 
+      - name: Allow unprivileged user namespaces (Codex sandbox needs bwrap)
+        # ubuntu-latest (24.04) restricts unprivileged user namespace creation
+        # by default (kernel.apparmor_restrict_unprivileged_userns=1). Codex's
+        # Linux sandbox uses bubblewrap, which needs an unprivileged userns to
+        # set up its network namespace even under --sandbox read-only. Without
+        # this, bwrap fails before Codex can read any file:
+        # "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted".
+        # Sandbox stays on (read-only) — this only unblocks bwrap's own setup.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Codex adversarial review
         id: review
         env:
@@ -65,7 +75,7 @@ jobs:
           # effort high, not xhigh: xhigh blew the review budget on ~40KB diffs
           # (same finding as the fleet's review_chain.py, 2026-08-28)
           codex exec \
-            --model gpt-5.6-sol \
+            --model gpt-6-astra \
             -c model_reasoning_effort="high" \
             --sandbox read-only \
             "You are a rigorous but fair code reviewer acting as a merge gate. Review
