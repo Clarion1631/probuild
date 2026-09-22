@@ -235,21 +235,37 @@ test("the ONE twin a human already ruled on is dropped before anything is judged
         }
     });
 
-    await t.test("the cap applies to what REMAINS, so an over-large group still parks", () => {
+    await t.test("the cap counts the group as FETCHED: an exemption cannot hide a truncated group", () => {
+        // The cap is the OVERFLOW SENTINEL for promoteToBooking's
+        // `take: MAX_WEAK_GROUP + 2` (self plus up to eleven twins): eleven twins
+        // back means there may be a twelfth and a thirteenth row nobody fetched.
+        // Counting what REMAINED after the exemption let one human-ruled twin
+        // drop eleven to ten and book past rows this function never saw.
         const many = (count: number) => [
             row("row-owner", "4261862"),
             ...Array.from({ length: count }, (_, i) => row(`t${i}`, `426180${i}`)),
         ];
+        // Eleven FETCHED, one of them exempt: still eleven, still a person's call.
         assert.deepEqual(
-            judgeWeakGroup(human("row-owner", "4261862"), many(MAX_WEAK_GROUP + 1)),
-            { kind: "park", twinId: "t0" },
-            "eleven twins left after the exemption is still eleven twins",
+            judgeWeakGroup(human("row-owner", "4261862"), many(MAX_WEAK_GROUP)),
+            { kind: "park", twinId: "row-owner" },
+            "the exemption does not shrink the group the cap is measuring",
         );
-        // One fewer and it clears, so the park above is the cap's doing and not
-        // the exemption failing to apply.
+        // The named twin is purely the fetch order's first row, exempt or not —
+        // which is the honest thing for a verdict that judged nobody to say.
         assert.deepEqual(
-            judgeWeakGroup(human("row-owner", "4261862"), many(MAX_WEAK_GROUP)).kind,
-            "distinct",
+            judgeWeakGroup(human("row-owner", "4261862"), [...many(MAX_WEAK_GROUP).slice(1), row("row-owner", "4261862")]),
+            { kind: "park", twinId: "t0" },
+        );
+        // Ten fetched is inside the cap, so the exemption applies and the other
+        // nine are judged on their refs — the ordinary path, unchanged.
+        assert.deepEqual(
+            judgeWeakGroup(human("row-owner", "4261862"), many(MAX_WEAK_GROUP - 1)),
+            {
+                kind: "distinct",
+                twinIds: Array.from({ length: MAX_WEAK_GROUP - 1 }, (_, i) => `t${i}`),
+                humanDistinctFrom: "row-owner",
+            },
         );
     });
 });

@@ -1181,6 +1181,17 @@ test("the REAL weak-net queries read the whole group, and log the verdict outsid
         "the lock is taken before the group is read — a read taken first is one the other claimant can invalidate",
     );
     assert.match(promote, /take: MAX_WEAK_GROUP \+ 2/, "the cap plus self");
+    // AND THE CAP MUST COUNT WHAT THAT `take` RETURNED. The two numbers are one
+    // rule split across two files: a full result is the overflow sentinel for
+    // this query, so the cap has to measure the FETCHED group. Counting a
+    // post-exemption remainder let one human-ruled twin drop eleven twins to ten
+    // and decide a group whose later rows were never read. Pinned here, beside
+    // the `take` it belongs to, so the two cannot drift apart again.
+    const weakNet = readFileSync(
+        path.join(__dirname, "..", "src/lib/receipt-intake/weak-net.ts"),
+        "utf8",
+    );
+    assert.match(weakNet, /if \(twins\.length > MAX_WEAK_GROUP\)/, "the cap reads the fetched count, not the judged one");
     assert.ok(
         !promote.includes("id: { not: rowId }"),
         "self is INCLUDED: its refNumber under the lock is the only version that can still be true at commit",
@@ -2967,6 +2978,7 @@ test("a key that is legitimately unobtainable is not invented, and the row still
         ["no read at all", { readJson: null }],
         ["a refNumber edited away from the read", { refNumber: "99999" }],
         ["a txnDate edited away from the read", { txnDate: new Date("2026-08-04T00:00:00.000Z") }],
+        ["a totalCents edited away from the read", { totalCents: 36497 }],
         ["a docType the row and the read disagree about", { docType: "check" }],
     ];
     for (const [label, over] of cases) {
@@ -3204,11 +3216,14 @@ test("recoverStrongKey re-derives the key with the SAME rule routing used", () =
         referenceDay: "2026-08-20",
     });
 
-    // A CHECK keys off its check number, exactly as dedupKeys does.
+    // A CHECK keys off its check number, exactly as dedupKeys does. `totalCents`
+    // moves WITH the read: it is written from these keys at read time, so the
+    // recovery refuses a row whose money disagrees with its own JSON.
     const check = recoverStrongKey({
         ...base,
         docType: "check",
         refNumber: "Check4178",
+        totalCents: 120000,
         readJson: '{"doc_type":"check","vendor":"Bob the Sub","date":"2026-08-03","check_number":"4178","total_amount":"1200.00"}',
     }, "America/Los_Angeles");
     assert.equal(check?.key, "2026-08-03|check4178");
@@ -3231,6 +3246,20 @@ test("recoverStrongKey re-derives the key with the SAME rule routing used", () =
         null,
     );
     assert.equal(recoverStrongKey({ ...base, txnDate: null }, "America/Los_Angeles"), null);
+
+    // AND SO DOES A TOTAL THAT DISAGREES. `totalCents` was written from these
+    // same keys at read time, so a row whose money no longer matches its read is
+    // a row somebody edited, and this key is no longer its identity — the same
+    // test refNumber and txnDate get, on the third column routing wrote.
+    assert.equal(
+        recoverStrongKey({ ...base, totalCents: 36497 }, "America/Los_Angeles"),
+        null,
+        "one cent out is still a column that was edited",
+    );
+    assert.equal(recoverStrongKey({ ...base, totalCents: null }, "America/Los_Angeles"), null);
+    // THE CONTROL, so the two nulls above are the new check and not the
+    // re-derivation quietly breaking.
+    assert.equal(recoverStrongKey({ ...base, totalCents: 36498 }, "America/Los_Angeles")?.key, "2026-08-03|82766");
     assert.equal(recoverStrongKey({ ...base, readJson: null }, "America/Los_Angeles"), null);
     assert.equal(recoverStrongKey({ ...base, readJson: "{" }, "America/Los_Angeles"), null);
 });

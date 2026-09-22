@@ -179,10 +179,30 @@ export function twinIsDistinct(self: WeakGroupRow, twin: WeakGroupRow): boolean 
  * parks it `weak-dup:` on the very row the review named — same vendor, same day,
  * same amount, same ref — so every button the human presses loops.
  *
- * EVERY OTHER TWIN IS STILL JUDGED, and the cap applies to what remains: the
- * exemption is one named row, never a licence to book past a group.
+ * EVERY OTHER TWIN IS STILL JUDGED, and the cap is applied to the group AS
+ * FETCHED, ahead of the exemption: the exemption is one named row, never a
+ * licence to book past a group nobody has fully seen.
  */
 export function judgeWeakGroup(self: WeakGroupRow, twins: readonly WeakGroupRow[]): WeakVerdict {
+    // More twins than a real weak collision can have. Whatever is going on —
+    // a vendor token that over-collapses, a run of identical small purchases —
+    // it is not something to decide automatically, so it parks whatever the
+    // refs say. The oldest twin is named because that is the order both call
+    // sites fetch in, so the reason is stable across passes.
+    //
+    // COUNTED ON THE GROUP AS FETCHED, BEFORE THE EXEMPTION, because the cap is
+    // an OVERFLOW SENTINEL tied to the caller's `take` — promoteToBooking reads
+    // `MAX_WEAK_GROUP + 2` rows, self plus up to eleven twins — so a full result
+    // means "there may be MORE rows than we fetched" and this view of the group
+    // is truncated. Counting what remained after the exemption let one
+    // human-ruled twin drop eleven to ten, pass the cap, and decide a group
+    // whose twelfth and thirteenth rows — one of them possibly a booked legacy
+    // duplicate with an unreadable ref — this function never saw. A human
+    // exempting ONE twin is never a reason to decide an over-large, possibly
+    // truncated group automatically.
+    if (twins.length > MAX_WEAK_GROUP) {
+        return { kind: "park", twinId: twins[0].id };
+    }
     // Only a twin ACTUALLY IN THIS GROUP is exempt. A `duplicateOfId` pointing
     // at a row that shares no weak key (or has since been voided) names nobody
     // here and changes nothing.
@@ -191,14 +211,6 @@ export function judgeWeakGroup(self: WeakGroupRow, twins: readonly WeakGroupRow[
         : null;
     const judged = exempt ? twins.filter(twin => twin.id !== exempt.id) : twins;
 
-    // More twins than a real weak collision can have. Whatever is going on —
-    // a vendor token that over-collapses, a run of identical small purchases —
-    // it is not something to decide automatically, so it parks whatever the
-    // refs say. The oldest twin is named because that is the order both call
-    // sites fetch in, so the reason is stable across passes.
-    if (judged.length > MAX_WEAK_GROUP) {
-        return { kind: "park", twinId: judged[0].id };
-    }
     for (const twin of judged) {
         if (!twinIsDistinct(self, twin)) return { kind: "park", twinId: twin.id };
     }

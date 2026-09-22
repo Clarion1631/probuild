@@ -776,12 +776,18 @@ export function recoverStrongKey(
     // of them afterwards and this key is no longer this row's identity.
     if (keys.ref !== row.refNumber) return null;
     if (keys.dateStr !== toDateStr(row.txnDate)) return null;
+    // Same reason, same column-was-edited test: `totalCents` is written from
+    // these keys at read time (`base` below), so a disagreement means the money
+    // no longer matches the document this key names. It also makes the document
+    // gates below see exactly the cents routing saw.
+    if (centsOf(keys.amount) !== row.totalCents) return null;
 
     const routeInput: RouteInput = {
         docType: read.docType,
         amount: keys.amount,
         // The ROW's total, not the read's: it is what a strong-key owner is
-        // compared against everywhere else, and a human may have corrected it.
+        // compared against everywhere else. The check above means the two agree,
+        // so this is the number routing itself gated on either way.
         totalCents: row.totalCents,
         canonicalVendor: canonicalVendor(read.vendor),
         dateStr: keys.dateReadOffDocument ? keys.dateStr : null,
