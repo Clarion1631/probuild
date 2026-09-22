@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { planReceiptRequests, groupCompetingLines, loadComponentToClosure, componentVersionOf, componentVersionsMatch } from '../src/lib/receipt-requests';
 import { bankAuthPurchaseDate, observedReceiptMerchantMatches } from '../src/lib/receipt-source-recognition';
+import { normalizePayee } from '../src/lib/bank-ledger';
 import { cycleStillValid, parseSweepCycle } from '../src/lib/receipt-sweep-marker';
 
 /**
@@ -253,6 +254,178 @@ test('a generic ARCO label does not alias to AMPM #82887 (no store-number stripp
   // Existing same-brand matching is unchanged; this test constrains cross-brand additions.
 });
 
+
+// ── The Rockery / Tapani (owner-confirmed 2026-09-21) ───────────────────────
+
+// The REAL rawDescriptor shapes, read from production on 2026-09-21. All 15
+// live Rockery lines carry this merchant text; only the card ref and the rail
+// trailer vary, across cards C#6098 and C#8516.
+//
+// The table key is DERIVED from these, not typed: normalizePayee cuts the
+// ' DBT CRD ...' trailer and the C#NNNN card ref, then its 6-or-more-digit
+// reference-number strip removes '6666718' from '360-6666718' and leaves the
+// '360-' stub. So every one of the 15 reduces to 'THE ROCKERY NW 360- WA'.
+// That is also the text the page shows, because the page displays
+// normalizePayee(rawDescriptor) -- it is the same string, not a second one.
+const ROCKERY_RAW_6098 = 'MISCELLANEOUS DEBIT THE ROCKERY NW 360-6666718 WA C#6098 DBT CRD 0945 09/16/26 31403395';
+const ROCKERY_RAW_8516 = 'MISCELLANEOUS DEBIT THE ROCKERY NW 360-6666718 WA C#8516 DBT CRD 1410 09/14/26 90335774';
+const ROCKERY_KEY = 'THE ROCKERY NW 360- WA';
+const ROCKERY_CENTS = 4000; // a $40 dump ticket, the live amount
+const ROCKERY_VENDORS = ['Tapani Materials', 'Tapani Materials Tebo']; // the only two live spellings
+
+// Each card with its own real posting/purchase pair (DBT CRD settles a couple
+// of days after the swipe), so these run through the ordinary +/-2 day window.
+const ROCKERY_LINES = [
+  { id: 'rockery-6098', raw: ROCKERY_RAW_6098, posted: '2026-09-18', date: '2026-09-16' },
+  { id: 'rockery-8516', raw: ROCKERY_RAW_8516, posted: '2026-09-16', date: '2026-09-14' },
+];
+
+function rockery(raw: string = ROCKERY_RAW_6098, source: object = STATEMENT): any {
+  return line('rockery', '2026-09-18', -ROCKERY_CENTS, raw, source);
+}
+
+const rockeryReceipt = (vendor = ROCKERY_VENDORS[0], date = '2026-09-16', cents = ROCKERY_CENTS): any =>
+  receipt('e', date, vendor, cents);
+
+test('both live Rockery card shapes close against both live Tapani spellings', () => {
+  for (const l of ROCKERY_LINES) {
+    for (const vendor of ROCKERY_VENDORS) {
+      const closed = satisfied([line(l.id, l.posted, -ROCKERY_CENTS, l.raw)], [receipt('e', l.date, vendor, ROCKERY_CENTS)]);
+      assert.deepEqual(closed, [l.id], `${l.id} / ${vendor}`);
+    }
+  }
+});
+
+test('every live Rockery rawDescriptor reduces to the one table key', () => {
+  // normalizePayee is what the planner hands the alias lookup, so this is the
+  // real derivation, not a restatement of the constant.
+  for (const raw of [ROCKERY_RAW_6098, ROCKERY_RAW_8516]) {
+    assert.equal(normalizePayee(raw), `MISCELLANEOUS DEBIT ${ROCKERY_KEY}`, raw);
+    assert.equal(observedReceiptMerchantMatches(normalizePayee(raw), 'Tapani Materials'), true, raw);
+  }
+  // And the key itself is what the table holds.
+  assert.equal(observedReceiptMerchantMatches(ROCKERY_KEY, 'Tapani Materials'), true);
+});
+
+test('the displayed payee and the raw descriptor are ONE key, not two', () => {
+  // The page renders normalizePayee(rawDescriptor), so its 'THE ROCKERY NW
+  // 360- WA' is the same string the key is built from. Pinned because reading
+  // the key off the page looks like guessing and is not.
+  assert.equal(normalizeBankPayeeOf(ROCKERY_RAW_6098), normalizeBankPayeeOf(`MISCELLANEOUS DEBIT ${ROCKERY_KEY}`));
+  assert.deepEqual(
+    satisfied([rockery(`MISCELLANEOUS DEBIT ${ROCKERY_KEY}`)], [rockeryReceipt()]),
+    ['rockery'],
+  );
+});
+function normalizeBankPayeeOf(raw: string): string {
+  return normalizePayee(raw).replace(/^MISCELLANEOUS DEBIT /, '');
+}
+
+test('the Rockery label survives the card ref and the rail trailer', () => {
+  for (const raw of [
+    'MISCELLANEOUS DEBIT THE ROCKERY NW 360-6666718 WA',
+    'MISCELLANEOUS DEBIT THE ROCKERY NW 360-6666718 WA C#6098',
+    'MISCELLANEOUS DEBIT THE ROCKERY NW 360-6666718 WA C#6098 POS DEB 1305 09/16/26 60884400',
+    'THE ROCKERY NW 360-6666718 WA DBT CRD 0945 09/16/26 31403395',
+  ]) {
+    assert.deepEqual(satisfied([rockery(raw)], [rockeryReceipt()]), ['rockery'], raw);
+  }
+});
+
+test('observed alias: the Rockery label maps to both Tapani labels and nothing else', () => {
+  assert.equal(observedReceiptMerchantMatches(ROCKERY_KEY, 'Tapani Materials'), true);
+  assert.equal(observedReceiptMerchantMatches(ROCKERY_KEY, 'Tapani Materials Tebo'), true);
+  assert.equal(observedReceiptMerchantMatches('  the   rockery nw 360- wa  ', 'tapani  materials'), true);
+  assert.equal(observedReceiptMerchantMatches(ROCKERY_KEY, 'Tapani Plumbing'), false);
+  assert.equal(observedReceiptMerchantMatches(ROCKERY_KEY, 'Tapani'), false);
+  assert.equal(observedReceiptMerchantMatches(ROCKERY_KEY, 'Tapani Materials Tebo Extra'), false);
+});
+
+test('a receipt from another Tapani business does not close a Rockery charge', () => {
+  for (const vendor of ['Tapani Plumbing', 'Tapani', 'Tapani Trucking', 'Materials', 'Tapani Materials Extra']) {
+    assert.deepEqual(satisfied([rockery()], [rockeryReceipt(vendor)]), [], vendor);
+  }
+});
+
+test('only the observed Rockery label aliases; a differently spelled one does not', () => {
+  // Whole label on the bank side too. The last entry is what this merchant
+  // would reduce to if a descriptor ever carried a 3-3-4 hyphenated phone:
+  // normalizePayee strips that as a phone number, leaving a DIFFERENT key
+  // that is deliberately not in the table. Production does not use that
+  // shape (it writes 360-6666718), so this is a guard, not a gap.
+  for (const raw of [
+    'MISCELLANEOUS DEBIT THE ROCKERY GARDEN CENTER',
+    'MISCELLANEOUS DEBIT THE ROCKERY NW 360-6666718 OR',
+    'MISCELLANEOUS DEBIT THE ROCKERY NW 360-6666718 WA OTHER',
+    'MISCELLANEOUS DEBIT ROCKERY NW 360-6666718 WA',
+    'MISCELLANEOUS DEBIT THE ROCKERY NW 360-666-6718 WA',
+  ]) {
+    assert.deepEqual(satisfied([rockery(raw)], [rockeryReceipt()]), [], raw);
+    assert.equal(observedReceiptMerchantMatches(normalizePayee(raw), 'Tapani Materials'), false, raw);
+  }
+});
+
+test('the Rockery alias obeys the same gate as every other observed label', () => {
+  assert.deepEqual(satisfied([rockery()], [rockeryReceipt()], { flag: false }), [], 'recognition off');
+  for (const source of [WRONG_SOURCE, WRONG_ACCOUNT, NO_SOURCE]) {
+    assert.deepEqual(satisfied([rockery(ROCKERY_RAW_6098, source)], [rockeryReceipt()]), [], JSON.stringify(source));
+  }
+});
+
+test('the Rockery alias never loosens amount or date', () => {
+  assert.deepEqual(satisfied([rockery()], [rockeryReceipt(ROCKERY_VENDORS[0], '2026-09-16', ROCKERY_CENTS + 1)]), [], 'one cent off');
+  // 2026-09-09 is outside +/-2 of the 2026-09-18 posting, and outside the
+  // 2026-09-16 authorization date this descriptor carries.
+  assert.deepEqual(satisfied([rockery()], [rockeryReceipt(ROCKERY_VENDORS[0], '2026-09-09')]), [], 'seven days early');
+});
+
+test('a Tapani ReceiptIntake closes a Rockery line with no Expense at all', () => {
+  // The intake pool is a separate evidence branch from expenses. NEEDS_JOB is
+  // the state a crew photo sits in after it is read and before it books, which
+  // is exactly the row Marge is looking at, so the charge must stop being
+  // chased then and not only once an Expense exists.
+  const intakes = [{
+    id: 'intake-rockery',
+    stateReason: null,
+    expenseId: null,
+    qbPurchaseId: null,
+    totalCents: ROCKERY_CENTS,
+    txnDate: '2026-09-16',
+    vendor: 'Tapani Materials Tebo',
+    state: 'NEEDS_JOB',
+  }];
+  assert.deepEqual(satisfied([rockery()], [], { intakes }), ['rockery']);
+  // Same gate as every other observed label, on the intake path too.
+  assert.deepEqual(satisfied([rockery()], [], { intakes, flag: false }), []);
+  // And the same narrowness: another Tapani business is not this merchant.
+  const other = [{ ...intakes[0], vendor: 'Tapani Plumbing' }];
+  assert.deepEqual(satisfied([rockery()], [], { intakes: other }), []);
+});
+
+test('a wrapped multiline PDF descriptor is the same Rockery key, not a second one', () => {
+  // Statement PDF activity cells wrap mid-descriptor. normalizePayee collapses
+  // CR/LF before it does anything else, so the wrapped form reduces to the one
+  // key rather than silently missing the table.
+  const wrapped = 'MISCELLANEOUS DEBIT THE ROCKERY NW 360-6666718 WA\nC#6098 DBT CRD 0945\n09/16/26 31403395';
+  assert.equal(normalizePayee(wrapped), `MISCELLANEOUS DEBIT ${ROCKERY_KEY}`);
+  assert.deepEqual(satisfied([rockery(wrapped)], [rockeryReceipt()]), ['rockery']);
+});
+
+test('a Rockery line 3 days after the swipe closes on its authorization date', () => {
+  // Posted 2026-09-19, and the DBT CRD trace carries purchase date 2026-09-16:
+  // outside the ordinary +/-2 day window, inside the bounded settlement
+  // allowance. Merchant identity is still required, and the alias is what
+  // supplies it, so this exercises both halves of the gate at once.
+  const l = line('rockery-auth', '2026-09-19', -ROCKERY_CENTS, ROCKERY_RAW_6098);
+  assert.equal(bankAuthPurchaseDate(l), '2026-09-16');
+  const onPurchaseDate = [rockeryReceipt(ROCKERY_VENDORS[0], '2026-09-16')];
+  assert.deepEqual(satisfied([l], onPurchaseDate), ['rockery-auth']);
+  // With recognition off, 3 days is just 3 days: no auth date, no alias.
+  assert.deepEqual(satisfied([l], onPurchaseDate, { flag: false }), []);
+  // The allowance is a date, not a widened window: a receipt one day off the
+  // purchase date is still outside +/-2 of the posting and is still chased.
+  assert.deepEqual(satisfied([l], [rockeryReceipt(ROCKERY_VENDORS[0], '2026-09-15')]), []);
+});
 test('Parkrose bank labels alias only to Parkrose Hardware, not to other Parkrose names', () => {
   const f = FIXTURES[1];
   for (const vendor of ['Parkrose Bakery', 'Parkrose Plumbing', 'Hazel Dell Hardware']) {
