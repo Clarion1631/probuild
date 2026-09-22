@@ -378,6 +378,54 @@ test('the Rockery alias never loosens amount or date', () => {
   // 2026-09-16 authorization date this descriptor carries.
   assert.deepEqual(satisfied([rockery()], [rockeryReceipt(ROCKERY_VENDORS[0], '2026-09-09')]), [], 'seven days early');
 });
+
+test('a Tapani ReceiptIntake closes a Rockery line with no Expense at all', () => {
+  // The intake pool is a separate evidence branch from expenses. NEEDS_JOB is
+  // the state a crew photo sits in after it is read and before it books, which
+  // is exactly the row Marge is looking at, so the charge must stop being
+  // chased then and not only once an Expense exists.
+  const intakes = [{
+    id: 'intake-rockery',
+    stateReason: null,
+    expenseId: null,
+    qbPurchaseId: null,
+    totalCents: ROCKERY_CENTS,
+    txnDate: '2026-09-16',
+    vendor: 'Tapani Materials Tebo',
+    state: 'NEEDS_JOB',
+  }];
+  assert.deepEqual(satisfied([rockery()], [], { intakes }), ['rockery']);
+  // Same gate as every other observed label, on the intake path too.
+  assert.deepEqual(satisfied([rockery()], [], { intakes, flag: false }), []);
+  // And the same narrowness: another Tapani business is not this merchant.
+  const other = [{ ...intakes[0], vendor: 'Tapani Plumbing' }];
+  assert.deepEqual(satisfied([rockery()], [], { intakes: other }), []);
+});
+
+test('a wrapped multiline PDF descriptor is the same Rockery key, not a second one', () => {
+  // Statement PDF activity cells wrap mid-descriptor. normalizePayee collapses
+  // CR/LF before it does anything else, so the wrapped form reduces to the one
+  // key rather than silently missing the table.
+  const wrapped = 'MISCELLANEOUS DEBIT THE ROCKERY NW 360-6666718 WA\nC#6098 DBT CRD 0945\n09/16/26 31403395';
+  assert.equal(normalizePayee(wrapped), `MISCELLANEOUS DEBIT ${ROCKERY_KEY}`);
+  assert.deepEqual(satisfied([rockery(wrapped)], [rockeryReceipt()]), ['rockery']);
+});
+
+test('a Rockery line 3 days after the swipe closes on its authorization date', () => {
+  // Posted 2026-09-19, and the DBT CRD trace carries purchase date 2026-09-16:
+  // outside the ordinary +/-2 day window, inside the bounded settlement
+  // allowance. Merchant identity is still required, and the alias is what
+  // supplies it, so this exercises both halves of the gate at once.
+  const l = line('rockery-auth', '2026-09-19', -ROCKERY_CENTS, ROCKERY_RAW_6098);
+  assert.equal(bankAuthPurchaseDate(l), '2026-09-16');
+  const onPurchaseDate = [rockeryReceipt(ROCKERY_VENDORS[0], '2026-09-16')];
+  assert.deepEqual(satisfied([l], onPurchaseDate), ['rockery-auth']);
+  // With recognition off, 3 days is just 3 days: no auth date, no alias.
+  assert.deepEqual(satisfied([l], onPurchaseDate, { flag: false }), []);
+  // The allowance is a date, not a widened window: a receipt one day off the
+  // purchase date is still outside +/-2 of the posting and is still chased.
+  assert.deepEqual(satisfied([l], [rockeryReceipt(ROCKERY_VENDORS[0], '2026-09-15')]), []);
+});
 test('Parkrose bank labels alias only to Parkrose Hardware, not to other Parkrose names', () => {
   const f = FIXTURES[1];
   for (const vendor of ['Parkrose Bakery', 'Parkrose Plumbing', 'Hazel Dell Hardware']) {
