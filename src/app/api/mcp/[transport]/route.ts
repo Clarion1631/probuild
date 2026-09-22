@@ -1195,7 +1195,8 @@ function createHandler(actor: RouteMcpActor) {
                 title: "Who owes us money (all projects)",
                 annotations: { readOnlyHint: true },
                 description:
-                    "Accounts receivable across ALL projects: every invoice with a balance due, its unpaid milestones, age in days, and overdue flags (past due date or 30+ days old). " +
+                    "Accounts receivable across ALL projects: money BILLED to clients and not yet paid (milestones emailed as a payment request or with a QuickBooks invoice), per invoice, with age since billing and overdue flags (past due date, or 30+ days since billed). " +
+                    "`receivable` is what is owed now; `balanceDue` is the remaining contract and includes unbilled milestones (backlog, not receivables; see `unbilledBacklog`). " +
                     "Use for 'who owes us money?', 'what's overdue?', 'total outstanding?'.",
                 inputSchema: {},
             },

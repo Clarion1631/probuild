@@ -66,6 +66,7 @@ export function outageNote(error: unknown): string {
 }
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
+import { computeInvoiceReceivable, isLiveQboLink } from "./receivables";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
@@ -176,52 +177,87 @@ export async function getProjectBilling(projectId: string) {
 // Accounts receivable: every invoice still owed money, across all projects.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function listReceivables() {
-    const now = Date.now();
+export async function listReceivables(now: number = Date.now()) {
     const invoices = await prisma.invoice.findMany({
-        where: { balanceDue: { gt: 0 }, status: { notIn: ["Draft"] } },
+        where: { balanceDue: { gt: 0 }, status: { not: "Canceled" } },
         orderBy: { issueDate: "asc" },
         select: {
             id: true, code: true, status: true, totalAmount: true, balanceDue: true,
             issueDate: true, sentAt: true, createdAt: true,
             project: { select: { id: true, name: true } },
             client: { select: { name: true, email: true } },
+            _count: { select: { payments: true } },
             payments: {
                 where: { status: "Pending" },
                 orderBy: { createdAt: "asc" },
-                select: { id: true, name: true, amount: true, dueDate: true, qbInvoiceSentAt: true, qbSyncError: true },
+                select: {
+                    id: true, name: true, amount: true, status: true, dueDate: true, createdAt: true,
+                    qbInvoiceId: true, qbInvoiceSentAt: true, qbSyncError: true, qbSyncedAt: true,
+                },
+            },
+            progressBillings: {
+                where: { status: { in: ["Staged", "Sent"] } },
+                select: {
+                    id: true, code: true, status: true, total: true,
+                    qbInvoiceId: true, qbSyncError: true, qbSyncedAt: true, qbInvoiceSentAt: true, sentAt: true, createdAt: true,
+                    lines: { select: { scheduleId: true } },
+                },
             },
         },
     });
 
-    const rows = invoices.map(inv => {
-        const anchor = inv.issueDate ?? inv.sentAt ?? inv.createdAt;
-        const ageDays = Math.floor((now - anchor.getTime()) / 86_400_000);
-        // Due dates are business dates: a milestone isn't "past due" until the
-        // whole due day has elapsed (24h grace covers timezone-of-storage skew).
-        const pastDue = inv.payments.some(p => p.dueDate && p.dueDate.getTime() + 86_400_000 < now);
-        return {
+    // Per invoice: which billed items are still open, aged from the earliest
+    // billing evidence (src/lib/receivables.ts) — not the whole balanceDue,
+    // which includes milestones that were only ever scheduled.
+    const computed = invoices.map(inv => ({
+        inv,
+        receivable: computeInvoiceReceivable({ ...inv, milestoneCount: inv._count.payments }, now),
+    }));
+
+    const billed = computed.filter(({ receivable }) => receivable.receivableCents > 0);
+
+    const rows = billed
+        .map(({ inv, receivable }) => ({
             invoiceId: inv.id,
             code: inv.code,
             status: inv.status,
             project: inv.project?.name ?? null,
             projectId: inv.project?.id ?? null,
             client: inv.client?.name ?? null,
-            balanceDue: Number(inv.balanceDue),
             total: Number(inv.totalAmount),
-            ageDays,
-            overdue: pastDue || ageDays > 30,
+            balanceDue: Number(inv.balanceDue),
+            ageDays: receivable.ageDays,
+            overdue: receivable.overdue,
+            receivable: receivable.receivableCents / 100,
+            unbilled: receivable.unbilledCents / 100,
+            overdueAmount: receivable.overdueCents / 100,
+            notEmailedAmount: receivable.notRequestedCents / 100,
+            billedItems: receivable.items.map(it => ({
+                kind: it.kind, id: it.id, label: it.label, amount: it.cents / 100,
+                billedAt: it.billedAt, dueDate: it.dueDate, ageDays: it.ageDays, overdue: it.overdue,
+                requested: it.requested, inQuickBooks: it.inQuickBooks,
+            })),
             unpaidMilestones: inv.payments.map(p => ({
                 id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
                 lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
+                billed: p.qbInvoiceSentAt != null || isLiveQboLink(p.qbInvoiceId, p.qbSyncError),
             })),
-        };
-    });
+        }))
+        // Oldest open billed item first — standard AR aging; collections work oldest first.
+        .sort((a, b) => (b.ageDays ?? -1) - (a.ageDays ?? -1));
+
+    const totalOutstandingCents = billed.reduce((s, { receivable }) => s + receivable.receivableCents, 0);
+    const overdueOutstandingCents = billed.reduce((s, { receivable }) => s + receivable.overdueCents, 0);
+    // Backlog is summed over every fetched invoice, not just the ones with a
+    // billed item — an invoice that is 100% unbilled still belongs in it.
+    const unbilledBacklogCents = computed.reduce((s, { receivable }) => s + receivable.unbilledCents, 0);
 
     return {
-        totalOutstanding: Math.round(rows.reduce((s, r) => s + r.balanceDue, 0) * 100) / 100,
-        overdueOutstanding: Math.round(rows.filter(r => r.overdue).reduce((s, r) => s + r.balanceDue, 0) * 100) / 100,
+        totalOutstanding: totalOutstandingCents / 100,
+        overdueOutstanding: overdueOutstandingCents / 100,
         invoiceCount: rows.length,
+        unbilledBacklog: unbilledBacklogCents / 100,
+        unbilledInvoiceCount: computed.filter(({ receivable }) => receivable.unbilledCents > 0).length,
         invoices: rows,
     };
 }
@@ -244,7 +280,7 @@ export async function sendArDigest() {
             <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.code)}${r.overdue ? " ⚠️" : ""}</td>
             <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.project ?? "—")}</td>
             <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.client ?? "—")}</td>
-            <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${formatCurrency(r.balanceDue)}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${formatCurrency(r.receivable)}${r.notEmailedAmount > 0 ? `<div style="color:#64748b;font-size:11px;font-weight:normal;">not emailed from ProBuild</div>` : ""}</td>
             <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${r.ageDays}d</td>
         </tr>`;
 
@@ -253,12 +289,12 @@ export async function sendArDigest() {
         `AR digest — ${formatCurrency(ar.totalOutstanding)} outstanding across ${ar.invoiceCount} invoice${ar.invoiceCount === 1 ? "" : "s"}${ar.overdueOutstanding > 0 ? ` (${formatCurrency(ar.overdueOutstanding)} overdue)` : ""}`,
         `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 640px; margin: 0 auto; padding: 24px; color: #333;">
             <h2 style="font-size:18px;">Accounts receivable</h2>
-            <p><strong>${formatCurrency(ar.totalOutstanding)}</strong> outstanding · <strong style="color:#b91c1c;">${formatCurrency(ar.overdueOutstanding)}</strong> overdue (30+ days or past due date)</p>
+            <p><strong>${formatCurrency(ar.totalOutstanding)}</strong> billed and unpaid · <strong style="color:#b91c1c;">${formatCurrency(ar.overdueOutstanding)}</strong> overdue (30+ days since billed, or past due date)</p>
             <table style="border-collapse:collapse;width:100%;font-size:13px;">
-                <tr style="text-align:left;color:#64748b;"><th style="padding:6px 10px;">Invoice</th><th style="padding:6px 10px;">Project</th><th style="padding:6px 10px;">Client</th><th style="padding:6px 10px;text-align:right;">Balance</th><th style="padding:6px 10px;text-align:right;">Age</th></tr>
+                <tr style="text-align:left;color:#64748b;"><th style="padding:6px 10px;">Invoice</th><th style="padding:6px 10px;">Project</th><th style="padding:6px 10px;">Client</th><th style="padding:6px 10px;text-align:right;">Billed & unpaid</th><th style="padding:6px 10px;text-align:right;">Age</th></tr>
                 ${ar.invoices.map(row).join("")}
             </table>
-            <p style="color:#64748b;font-size:12px;margin-top:16px;">Ask ChatGPT "who owes us money?" for the live view, or "resend the invoice on [project]" to nudge with a fresh payment link.</p>
+            <p style="color:#64748b;font-size:12px;margin-top:16px;">Ask ChatGPT "who owes us money?" for the live view, or "resend the payment request for [milestone] on [project]" to nudge. Not counted here: ${formatCurrency(ar.unbilledBacklog)} of scheduled milestones not yet billed (backlog, not receivables).</p>
         </div>`,
         undefined,
         { fromName: settings?.companyName || "ProBuild" },
