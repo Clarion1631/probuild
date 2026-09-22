@@ -20,7 +20,9 @@ const ROW: ReasonTextRow = {
 const KNOWN: Array<[string, string]> = [
     ["weak-dup:cmg8x2q0000abcd", "their ticket numbers do not settle it."],
     ["strong-dup-amount-mismatch:cmg8x2q0000abcd", "a different total. The two do not agree."],
+    ["strong-dup:cmg8x2q0000abcd", "Another receipt already holds this one's date and reference number."],
     ["vendor-mismatch:cmg8x2q0000abcd", "but a different vendor name."],
+    ["duplicate-chain:cmg8x2q0000abcd,cmg8x2q0000efgh", "Unmark the ones filed behind it first"],
     ["date-implausible", "which is 4 days before it arrived."],
     ["invalid-date", "I could not read a date on this one."],
     ["multi-doc", "This file has more than one receipt in it."],
@@ -99,6 +101,20 @@ test("no sentence uses a dash as punctuation", () => {
         assert.ok(!headline.includes("–"), `${reason}: en dash`);
         assert.ok(!headline.includes(" - "), `${reason}: spaced hyphen`);
     }
+});
+
+test("the two strong-dup codes do not answer for each other", () => {
+    // `strong-dup:` and `strong-dup-amount-mismatch:` are different verdicts, and
+    // the first is a prefix of the second up to its colon. Pinned so neither
+    // pattern can start swallowing the other's rows.
+    assert.match(
+        describeStateReason("strong-dup:row-a", ROW)!.headline,
+        /^Another receipt already holds this one's date and reference number\./,
+    );
+    assert.match(
+        describeStateReason("strong-dup-amount-mismatch:row-a", ROW)!.headline,
+        /^Same invoice number as another receipt but a different total\./,
+    );
 });
 
 test("a reason we have no words for is shown exactly as it is", () => {

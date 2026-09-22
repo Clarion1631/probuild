@@ -629,6 +629,12 @@ function bookingRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         readAt: new Date("2026-09-21T19:00:00.000Z"),
         createdAt: new Date("2026-09-21T18:00:00.000Z"),
         dedupWeakKey: "arco|2026-09-16|93.09|amt",
+        // Already owns its identity, so healStrongKey's fast path (#522)
+        // returns immediately — these rows are about evidence-close, not
+        // about strong-key recovery, and this keeps them out of that path.
+        dedupStrongKey: "strong-row-1",
+        readJson: null,
+        duplicateOfId: null,
         busyPasses: 0,
         lastError: null,
         sendAttempted: false,
@@ -660,6 +666,9 @@ function workerHarness(result: BookResult, overrides: Partial<WorkerDependencies
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         read: async () => { throw new Error("a BOOKING row is never read"); },
         applyRead: async () => ({ owned: true, strongOwner: null }),
+        // Never actually invoked: bookingRow() already carries a dedupStrongKey,
+        // so healStrongKey's (#522) fast path returns before calling this.
+        claimStrongKey: async () => { throw new Error("bookingRow already owns a strong key"); },
         findWeakGroup: async () => [],
         applyState: async () => true,
         finishRouting: async () => {},

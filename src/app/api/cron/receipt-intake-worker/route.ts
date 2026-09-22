@@ -64,6 +64,7 @@ import {
     runIntakeWorker,
     uploadLeaseActive,
     type ReadPatch,
+    type StrongOwner,
     type WorkerDependencies,
     type WorkerRow,
 } from "@/lib/receipt-intake/worker";
@@ -133,6 +134,10 @@ const WORKER_ROW_SELECT = {
     suggestedConfidence: true, sendAttempted: true, claimToken: true, fileSha256: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true, stateReason: true,
     taxWarning: true,
+    // The heal's three columns: what routing claimed (or null), the read it
+    // re-derives the key from, and the row a human has already compared this one
+    // to. See healStrongKey in worker.ts.
+    dedupStrongKey: true, readJson: true, duplicateOfId: true,
 } as const;
 
 /**
@@ -527,7 +532,50 @@ interface PromotionResult {
     stale?: boolean;
     /** The weak twins this promotion ruled distinct. Empty unless there were twins. */
     autoDistinctFrom?: string[];
+    /**
+     * The ONE twin the weak net did not judge because a human already had
+     * (`duplicateOfId`), or null. The audit row says so rather than reporting a
+     * person's decision as the rail's.
+     */
+    humanDistinctFrom?: string | null;
     autoDistinctRefs?: { selfRef: string | null; twins: Array<{ id: string; refNumber: string | null }> };
+}
+
+/**
+ * A REJECTED STRONG-KEY CLAIM, TURNED INTO THE OWNER THAT REJECTED IT.
+ *
+ * The partial unique index is the lock the Apps Script did with Script
+ * Properties, so the violation IS the dedup hit; the caller only needs to know
+ * who holds the key. Which constraint fired is resolved by looking the owner up
+ * BY dedupStrongKey — a fact about the DATA — rather than by string-matching
+ * Prisma's `meta`, whose shape is version dependent and is empty for a partial
+ * index on some engine builds (i.e. exactly this index).
+ *
+ * No findable owner means some OTHER unique constraint rejected the write, so it
+ * RE-THROWS rather than reporting a dedup hit that isn't. Shared by the routing
+ * claim (`applyRead`) and the heal (`claimStrongKey`) so the two cannot come to
+ * different conclusions about the same rejection.
+ */
+async function strongOwnerOrRethrow(
+    error: unknown,
+    rowId: string,
+    key: string | null,
+): Promise<StrongOwner> {
+    if (!isUniqueViolation(error) || !key) throw error;
+    const owner = await prisma.receiptIntake.findFirst({
+        where: {
+            dedupStrongKey: key,
+            state: { notIn: ["DUPLICATE", "VOID"] },
+            id: { not: rowId },
+        },
+        select: { id: true, totalCents: true, vendor: true },
+    });
+    if (!owner) throw error;
+    return {
+        id: owner.id,
+        totalCents: owner.totalCents,
+        canonicalVendor: owner.vendor ? canonicalVendor(owner.vendor) : null,
+    };
 }
 
 function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
@@ -866,34 +914,27 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 });
                 return { strongOwner: null, owned: count > 0 };
             } catch (error) {
-                // The partial unique index refused the claim — the DATABASE is
-                // the lock the Apps Script did with Script Properties. Load the
-                // owner so the caller can compare totals.
-                // Which constraint fired is resolved by looking the owner up
-                // BY dedupStrongKey — a fact about the data — rather than by
-                // string-matching Prisma's `meta`, whose shape is version
-                // dependent and is empty for a partial index on some engine
-                // builds (i.e. exactly this index).
-                if (!isUniqueViolation(error) || !patch.dedupStrongKey) throw error;
-                const owner = await prisma.receiptIntake.findFirst({
-                    where: {
-                        dedupStrongKey: patch.dedupStrongKey,
-                        state: { notIn: ["DUPLICATE", "VOID"] },
-                        id: { not: rowId },
-                    },
-                    select: { id: true, totalCents: true, vendor: true },
+                return { owned: true, strongOwner: await strongOwnerOrRethrow(error, rowId, patch.dedupStrongKey) };
+            }
+        },
+
+        // THE SECOND CLAIM OF THE SAME KEY, for a row that reached READ/BOOKING
+        // without one (healStrongKey in worker.ts). Same CAS, same index, same
+        // owner resolution — so a heal and a routing claim cannot disagree about
+        // what a conflict means.
+        //
+        // It deliberately does NOT release the claim: like markSendAttempted, it
+        // is not a completing transition. The row goes on to promote and book
+        // under this same token in this same pass.
+        claimStrongKey: async (rowId, key, ownership) => {
+            try {
+                const { count } = await evidenceUpdateMany({
+                    where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
+                    data: { dedupStrongKey: key },
                 });
-                // No owner means some OTHER unique constraint rejected the
-                // write; re-throw rather than reporting a dedup hit that isn't.
-                if (!owner) throw error;
-                return {
-                    owned: true,
-                    strongOwner: {
-                        id: owner.id,
-                        totalCents: owner.totalCents,
-                        canonicalVendor: owner.vendor ? canonicalVendor(owner.vendor) : null,
-                    },
-                };
+                return { owned: count > 0, strongOwner: null };
+            } catch (error) {
+                return { owned: true, strongOwner: await strongOwnerOrRethrow(error, rowId, key) };
             }
         },
 
@@ -1016,6 +1057,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // are filled under the lock and read only after the commit.
                 let autoDistinctFrom: string[] = [];
                 let autoDistinctRefs: PromotionResult["autoDistinctRefs"];
+                // The twin a human already ruled on, which the net skips.
+                let humanDistinctFrom: string | null = null;
                 // LAST weak-dedup check, taken INSIDE the transition. The check
                 // at read time can miss a pair that arrived in the same batch
                 // window, and READ -> BOOKING is the last instant before money
@@ -1066,12 +1109,18 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // taken from the claim-time snapshot, and that is deliberate:
                     // the version of this row that can still be true when the
                     // promotion commits is the one fetched under this lock.
+                    //
+                    // `duplicateOfId` COMES WITH THEM, because it is what makes
+                    // the strong net's exit real: a row only carries one when a
+                    // human pressed Set job on a review that NAMED that row, and
+                    // the weak net must not re-park it on the twin they already
+                    // ruled on. Only SELF's copy is consulted (weak-net.ts).
                     const group = await tx.receiptIntake.findMany({
                         where: {
                             dedupWeakKey: weakKey,
                             state: { notIn: ["DUPLICATE", "VOID", "NON_RECEIPT"] },
                         },
-                        select: { id: true, refNumber: true },
+                        select: { id: true, refNumber: true, duplicateOfId: true },
                         orderBy: { createdAt: "asc" },
                         take: MAX_WEAK_GROUP + 2,
                     });
@@ -1117,7 +1166,15 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         return { promoted: false, conflictId: verdict.twinId };
                     }
                     autoDistinctFrom = verdict.twinIds;
-                    autoDistinctRefs = { selfRef: self?.refNumber ?? null, twins };
+                    humanDistinctFrom = verdict.humanDistinctFrom;
+                    // The twins' OWN two columns, mapped rather than passed
+                    // through: `duplicateOfId` was fetched for self's sake and is
+                    // not a fact about the twins, so the audit payload stays
+                    // exactly the pair of columns it named before.
+                    autoDistinctRefs = {
+                        selfRef: self?.refNumber ?? null,
+                        twins: twins.map(twin => ({ id: twin.id, refNumber: twin.refNumber })),
+                    };
                 }
                 // CAS: only the current claim holder promotes. A superseded worker
                 // must not move a row into BOOKING that its successor is handling.
@@ -1139,7 +1196,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     data: { state: "BOOKING" },
                 });
                 if (count === 0) return { promoted: false, stale: true };
-                return { promoted: true, autoDistinctFrom, autoDistinctRefs };
+                return { promoted: true, autoDistinctFrom, autoDistinctRefs, humanDistinctFrom };
             });
             // AFTER THE COMMIT, never inside it, and never inside the advisory
             // lock — an audit row written by a transaction that then rolls back
@@ -1163,18 +1220,26 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // The booking itself runs after this and can still park or fail, so
             // an event claiming the row booked would be a claim this code is in
             // no position to make.
-            if (result.autoDistinctFrom?.length) {
+            //
+            // A HUMAN EXEMPTION IS ALSO AN EVENT, even with nothing else in the
+            // group: "this row was promoted past the twin somebody had already
+            // ruled on" is exactly the decision an audit trail needs to carry,
+            // and the status says WHOSE verdict it was rather than crediting the
+            // rail with a person's call.
+            const autoCount = result.autoDistinctFrom?.length ?? 0;
+            if (autoCount > 0 || result.humanDistinctFrom) {
                 await Promise.race([
                     logAutomationEvent({
                         kind: "receipt-stage",
                         stage: "weak-net",
-                        status: "auto-distinct",
+                        status: result.humanDistinctFrom ? "human-distinct" : "auto-distinct",
                         source: "intake-worker",
-                        reason: `promoted past ${result.autoDistinctFrom.length} weak twin(s) on distinct reference numbers`,
+                        reason: `promoted past ${autoCount} weak twin(s) on distinct reference numbers${result.humanDistinctFrom ? ", and one a human had already ruled on" : ""}`,
                         detail: {
                             intakeId: rowId,
                             weakKey,
-                            twinIds: result.autoDistinctFrom,
+                            twinIds: result.autoDistinctFrom ?? [],
+                            humanDistinctFrom: result.humanDistinctFrom ?? null,
                             selfRef: result.autoDistinctRefs?.selfRef ?? null,
                             twinRefs: result.autoDistinctRefs?.twins ?? [],
                         },
@@ -1290,9 +1355,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         stateReason: result.reason,
                         nextRetryAt: null,
                         ...RELEASE_CLAIM,
-                        // Parked before any QBO send: hand the strong key back,
-                        // or a corrected re-send of the same receipt would be
-                        // quarantined against a row that never became a purchase.
+                        // Only for a row that has OUTLIVED ITS DOCUMENT and never
+                        // sent — book.ts's mayReleaseStrongKey decides, and it is
+                        // false for every other park: a parked row still IS its
+                        // receipt, and a human revives it without routing it
+                        // again, so a key handed back here never comes back.
                         ...(result.releaseStrongKey ? { dedupStrongKey: null } : {}),
                     },
                 });
