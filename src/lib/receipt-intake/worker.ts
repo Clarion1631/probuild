@@ -474,6 +474,14 @@ export interface WorkerDependencies {
          * promotion.
          */
         autoDistinctFrom?: string[];
+        /**
+         * The ONE weak twin the net did not judge, because a human already had
+         * (`duplicateOfId`) — see healStrongKey's override below, which this is
+         * the second half of. Reported for the same audit row, and for the same
+         * reason the worker ignores `autoDistinctFrom`: nothing is left to
+         * decide.
+         */
+        humanDistinctFrom?: string | null;
     }>;
     /** The pass's ONE absolute deadline — never a snapshot of "time left". */
     book: (row: BookableRow) => Promise<BookResult>;
@@ -725,7 +733,9 @@ export interface StrongKeyRecovery {
  * fallback is OUR value, never the document's), a read that no longer parses,
  * or a docType routing would never have keyed. The persisted refNumber and
  * txnDate must agree with the re-derivation; if they do not, a column was
- * edited after routing and nothing is claimed.
+ * edited after routing and nothing is claimed. Routing's DOCUMENT GATES are run
+ * again at the end for the same reason, so this can only ever hand back a key
+ * routing itself would have minted for the same row.
  *
  * `txnDate` is compared as its UTC day, which is what `dateOnly` produces for
  * every zone at or behind UTC (the company's is America/Los_Angeles). A zone
@@ -767,19 +777,33 @@ export function recoverStrongKey(
     if (keys.ref !== row.refNumber) return null;
     if (keys.dateStr !== toDateStr(row.txnDate)) return null;
 
-    return {
-        key: keys.strong,
-        routeInput: {
-            docType: read.docType,
-            amount: keys.amount,
-            // The ROW's total, not the read's: it is what a strong-key owner is
-            // compared against everywhere else, and a human may have corrected it.
-            totalCents: row.totalCents,
-            canonicalVendor: canonicalVendor(read.vendor),
-            dateStr: keys.dateReadOffDocument ? keys.dateStr : null,
-            referenceDay: arrivalDay,
-        },
+    const routeInput: RouteInput = {
+        docType: read.docType,
+        amount: keys.amount,
+        // The ROW's total, not the read's: it is what a strong-key owner is
+        // compared against everywhere else, and a human may have corrected it.
+        totalCents: row.totalCents,
+        canonicalVendor: canonicalVendor(read.vendor),
+        dateStr: keys.dateReadOffDocument ? keys.dateStr : null,
+        referenceDay: arrivalDay,
     };
+
+    // ROUTING'S OWN DOCUMENT GATES, RUN AGAIN — the gates that WITHHELD the key
+    // at routing withhold it here too: a date that cannot belong to this row ("a
+    // misread year must not be allowed to claim one", route-state.ts), a zero or
+    // negative total, a docType nothing keys. Without this, a row parked
+    // `date-implausible` (which never claimed a key, on purpose) and then revived
+    // by Set job would come through here, claim the identity routing deliberately
+    // refused it, and park `date-implausible` all over again — now HOLDING a key
+    // that belongs to no verified document.
+    //
+    // `hasProject: true` because a MISSING JOB is not a document gate: it is a
+    // verdict about our records, and book.ts owns it. Feeding the row's real job
+    // in would make the identity depend on whether anyone has filed it yet, which
+    // is the coupling the claim-before-the-job-gate change exists to remove.
+    if (routeState(routeInput, { strong: null, weak: null }, true).state !== "READ") return null;
+
+    return { key: keys.strong, routeInput };
 }
 
 /** One pass. Never throws for a single bad row — one poison document must not stall the queue. */
@@ -1098,6 +1122,13 @@ async function healStrongKey(
     // it against the same row would overrule that decision with the very fact
     // they were shown, so the row books — keyless, which is the honest state: the
     // identity belongs to the other row.
+    //
+    // THE OTHER HALF OF THIS EXEMPTION IS IN promoteToBooking: the owner named
+    // here is a live twin with the same vendor, day, amount and ref, so the weak
+    // net would have parked the row `weak-dup:<owner>` the instant this branch
+    // let it past — every button looping. `judgeWeakGroup` therefore drops the
+    // twin `self.duplicateOfId` names (weak-net.ts), which is what makes this
+    // exit real end to end rather than a two-step version of the same stop.
     if (claim.strongOwner.id === row.duplicateOfId) {
         console.warn(
             "[receipt-intake] strong key held by the row a human already compared it to; booking without one",

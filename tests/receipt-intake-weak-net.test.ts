@@ -146,14 +146,14 @@ test("twinIsDistinct needs a real ref on BOTH sides, and is symmetric", () => {
 test("no twins is distinct, and names nobody", () => {
     assert.deepEqual(
         judgeWeakGroup(row("self", "4261862"), []),
-        { kind: "distinct", twinIds: [] },
+        { kind: "distinct", twinIds: [], humanDistinctFrom: null },
     );
 });
 
 test("one twin: distinct refs clear it, confusable refs park on it", () => {
     assert.deepEqual(
         judgeWeakGroup(row("self", "tebo-4261862"), [row("twin", "tebo-4261886")]),
-        { kind: "distinct", twinIds: ["twin"] },
+        { kind: "distinct", twinIds: ["twin"], humanDistinctFrom: null },
     );
     assert.deepEqual(
         judgeWeakGroup(row("self", "INV-95870"), [row("twin", "INV-95B70")]),
@@ -183,8 +183,75 @@ test("EVERY twin must be distinct, and the park names the one that is not", () =
     // and not an artefact of the group's size.
     assert.deepEqual(
         judgeWeakGroup(row("self", "4261862"), [row("b", "4261886"), row("c", "4261901")]),
-        { kind: "distinct", twinIds: ["b", "c"] },
+        { kind: "distinct", twinIds: ["b", "c"], humanDistinctFrom: null },
     );
+});
+
+test("the ONE twin a human already ruled on is dropped before anything is judged", async t => {
+    // THE EXIT THE STRONG NET ADVERTISES, made real. A row parked
+    // `strong-dup:row-owner` and then given a job by a person reaches promotion
+    // keyless with `duplicateOfId: "row-owner"` — and row-owner is a live twin on
+    // the same weak key carrying the SAME reference number. Judged, it parks
+    // `weak-dup:row-owner`, so Set job, Retry and Set job again all loop.
+    const human = (duplicateOfId: string | null | undefined, ref = "82766"): WeakGroupRow =>
+        ({ ...row("self", ref), duplicateOfId });
+
+    await t.test("the exempted twin is named, and judged by nobody", () => {
+        assert.deepEqual(
+            judgeWeakGroup(human("row-owner"), [row("row-owner", "82766")]),
+            { kind: "distinct", twinIds: [], humanDistinctFrom: "row-owner" },
+            "identical refs, which is exactly the pair a person was shown and cleared",
+        );
+    });
+
+    await t.test("EVERY OTHER twin is still judged", () => {
+        // The exemption is one named row, not a licence: a second twin nobody
+        // has ruled on still stops the promotion, and the park names IT.
+        assert.deepEqual(
+            judgeWeakGroup(human("row-owner"), [row("row-owner", "82766"), row("row-other", "82766")]),
+            { kind: "park", twinId: "row-other" },
+        );
+    });
+
+    await t.test("a duplicateOfId naming a row that is not in this group changes nothing", () => {
+        assert.deepEqual(
+            judgeWeakGroup(human("row-gone"), [row("row-owner", "82766")]),
+            { kind: "park", twinId: "row-owner" },
+        );
+    });
+
+    await t.test("no duplicateOfId at all is the ordinary rule, unchanged", () => {
+        for (const none of [null, undefined]) {
+            assert.deepEqual(
+                judgeWeakGroup(human(none), [row("row-owner", "82766")]),
+                { kind: "park", twinId: "row-owner" },
+                String(none),
+            );
+            assert.deepEqual(
+                judgeWeakGroup(human(none, "tebo-4261862"), [row("t", "tebo-4261886")]),
+                { kind: "distinct", twinIds: ["t"], humanDistinctFrom: null },
+                String(none),
+            );
+        }
+    });
+
+    await t.test("the cap applies to what REMAINS, so an over-large group still parks", () => {
+        const many = (count: number) => [
+            row("row-owner", "4261862"),
+            ...Array.from({ length: count }, (_, i) => row(`t${i}`, `426180${i}`)),
+        ];
+        assert.deepEqual(
+            judgeWeakGroup(human("row-owner", "4261862"), many(MAX_WEAK_GROUP + 1)),
+            { kind: "park", twinId: "t0" },
+            "eleven twins left after the exemption is still eleven twins",
+        );
+        // One fewer and it clears, so the park above is the cap's doing and not
+        // the exemption failing to apply.
+        assert.deepEqual(
+            judgeWeakGroup(human("row-owner", "4261862"), many(MAX_WEAK_GROUP)).kind,
+            "distinct",
+        );
+    });
 });
 
 test("an over-large weak group goes to a person whatever the refs say", () => {

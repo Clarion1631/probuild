@@ -41,6 +41,9 @@ import {
     QBO_WRITING_STATES,
 } from "../src/lib/receipt-intake/worker";
 import { preservedTaxWarning } from "../src/lib/receipt-intake/route-state";
+// THE REAL weak net, run by the promotion fake below: the strong net's human
+// override is only an exit if this function honours it too.
+import { judgeWeakGroup, type WeakVerdict } from "../src/lib/receipt-intake/weak-net";
 // The call-site contract the date gate reads: see the fallback test below.
 import { dedupKeys } from "../src/lib/receipt-intake/keys";
 import { normalizeDocType, READ_BUDGET_MS, type ReadOutcome } from "../src/lib/receipt-intake/read";
@@ -1182,6 +1185,11 @@ test("the REAL weak-net queries read the whole group, and log the verdict outsid
         !promote.includes("id: { not: rowId }"),
         "self is INCLUDED: its refNumber under the lock is the only version that can still be true at commit",
     );
+    // AND `duplicateOfId` COMES WITH THE GROUP. Without it `self` reaches
+    // judgeWeakGroup carrying no record of the collision a human already ruled
+    // on, and the `strong-dup:` exit the heal honours is undone one step later:
+    // the row parks `weak-dup:` on the very twin the review named.
+    assert.match(promote, /select: \{ id: true, refNumber: true, duplicateOfId: true \}/);
     assert.match(promote, /const self = group\.find\(row => row\.id === rowId\)/);
     assert.match(promote, /const twins = group\.filter\(row => row\.id !== rowId\)/);
     assert.match(promote, /judgeWeakGroup\(self, twins\)/, "the SAME pure rule routing runs");
@@ -1207,7 +1215,7 @@ test("the REAL weak-net queries read the whole group, and log the verdict outsid
     // 5. The audit row is written AFTER the commit, never inside the
     //    transaction holding the advisory lock, and never at the cost of the
     //    booking.
-    const commit = "return { promoted: true, autoDistinctFrom, autoDistinctRefs };";
+    const commit = "return { promoted: true, autoDistinctFrom, autoDistinctRefs, humanDistinctFrom };";
     const txBody = promote.slice(promote.indexOf("prisma.$transaction("), promote.indexOf(commit));
     assert.ok(!txBody.includes("logAutomationEvent"), "nothing inside the transaction logs");
     assert.ok(
@@ -1216,7 +1224,17 @@ test("the REAL weak-net queries read the whole group, and log the verdict outsid
     );
     assert.match(promote, /kind: "receipt-stage"/);
     assert.match(promote, /stage: "weak-net"/);
-    assert.match(promote, /status: "auto-distinct"/);
+    // TWO statuses, because they are two different decisions: the rail ruled a
+    // twin distinct on its reference number, or a PERSON did and the net merely
+    // honoured it. One label for both would credit the rail with a human's call.
+    assert.match(
+        promote,
+        /status: result\.humanDistinctFrom \? "human-distinct" : "auto-distinct"/,
+    );
+    // And a human exemption is logged even when no twin was auto-judged — that
+    // is the whole event in the case this fix exists for.
+    assert.match(promote, /if \(autoCount > 0 \|\| result\.humanDistinctFrom\)/);
+    assert.match(promote, /humanDistinctFrom: result\.humanDistinctFrom \?\? null/, "and the detail names it");
     assert.match(
         promote.slice(promote.indexOf("logAutomationEvent")),
         /\}\)\.catch\(error => console\.warn\(/,
@@ -3006,32 +3024,98 @@ test("a collision that DISAGREES gets the reason routing would have written", as
     }
 });
 
+/** The live row holding the key — same day, same vendor, same amount, same ref. */
+const OWNER: StrongOwner = { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" };
+
+/**
+ * The cron's promotion with the REAL weak net inside it, rather than a stub that
+ * always says yes.
+ *
+ * That stub is what hid the loop: `row-owner` is a live twin on the same weak key
+ * carrying the SAME reference number, so the weak net parks this row
+ * `weak-dup:row-owner` the instant the heal lets it past — and Set job, Retry,
+ * Set job all come back to the same stop. The exemption has to hold in BOTH
+ * places or the exit the strong net advertises is not an exit.
+ *
+ * `self` is looked up from the rows array by id, exactly as the real promotion
+ * re-reads it under the advisory lock.
+ */
+function weakNetPromotion(
+    rows: WorkerRow[],
+    seen: WeakVerdict[],
+): WorkerDependencies["promoteToBooking"] {
+    return async rowId => {
+        const row = rows.find(r => r.id === rowId)!;
+        const verdict = judgeWeakGroup(
+            { id: row.id, refNumber: row.refNumber, duplicateOfId: row.duplicateOfId },
+            [{ id: "row-owner", refNumber: "82766" }],
+        );
+        seen.push(verdict);
+        return verdict.kind === "park"
+            ? { promoted: false, conflictId: verdict.twinId }
+            : {
+                promoted: true,
+                autoDistinctFrom: verdict.twinIds,
+                humanDistinctFrom: verdict.humanDistinctFrom,
+            };
+    };
+}
+
 test("a human who already saw THIS collision is not overruled: the row books keyless", async () => {
     // `duplicateOfId` is the row the review named, and Set job keeps it. Pressing
     // it means "book this one anyway", so re-parking it against the same row
     // would answer their decision with the very fact they were shown.
-    const h = harness([keylessRead({ duplicateOfId: "row-owner" })], {
+    //
+    // END TO END, through the real weak net: the heal proceeding keyless is only
+    // half an exit, and the half that was missing is the one the loop ran through.
+    const rows = [keylessRead({ duplicateOfId: "row-owner" })];
+    const seen: WeakVerdict[] = [];
+    const h = harness(rows, {
         ...LIVE,
-        claimStrongKey: async () => ({
-            owned: true,
-            strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" },
-        }),
+        claimStrongKey: async () => ({ owned: true, strongOwner: OWNER }),
+        promoteToBooking: weakNetPromotion(rows, seen),
     });
     assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 });
     assert.deepEqual(h.states, [], "nothing parked");
-    assert.deepEqual(h.promoted, ["row-1"]);
+    assert.deepEqual(
+        seen,
+        [{ kind: "distinct", twinIds: [], humanDistinctFrom: "row-owner" }],
+        "the weak net SKIPPED the twin the human ruled on, and says so",
+    );
+    assert.equal(h.books, 1);
     assert.equal(h.bookedRows[0].dedupStrongKey, null, "keyless, which is honest: the other row owns it");
 
-    // THE CONTROL: a DIFFERENT owner is not the collision anybody signed off.
-    const other = harness([keylessRead({ duplicateOfId: "row-somebody-else" })], {
-        ...LIVE,
-        claimStrongKey: async () => ({
-            owned: true,
-            strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" },
-        }),
-    });
-    assert.deepEqual((await runIntakeWorker(other.deps)).byState, { NEEDS_REVIEW: 1 });
-    assert.equal(other.states[0].reason, "strong-dup:row-owner");
+    // THE CONTROL: a DIFFERENT owner is not the collision anybody signed off, and
+    // neither is no owner at all. Both are stopped by the heal and never promoted.
+    for (const duplicateOfId of [null, "row-other"]) {
+        const controlRows = [keylessRead({ duplicateOfId })];
+        const controlSeen: WeakVerdict[] = [];
+        const control = harness(controlRows, {
+            ...LIVE,
+            claimStrongKey: async () => ({ owned: true, strongOwner: OWNER }),
+            promoteToBooking: weakNetPromotion(controlRows, controlSeen),
+        });
+        assert.deepEqual((await runIntakeWorker(control.deps)).byState, { NEEDS_REVIEW: 1 }, String(duplicateOfId));
+        assert.equal(control.states[0].reason, "strong-dup:row-owner", String(duplicateOfId));
+        assert.deepEqual(controlSeen, [], `${duplicateOfId}: parked by the heal, never promoted`);
+        assert.equal(control.books, 0, String(duplicateOfId));
+    }
+});
+
+test("the exemption does not depend on the heal: a row that KEEPS its key is cleared too", async () => {
+    // The key is free here, so the heal claims it and never reaches its override
+    // branch at all. The human's decision still has to survive the weak net —
+    // `row-owner` is a live twin with the same ref either way, and the row would
+    // otherwise park `weak-dup:row-owner` holding the very key it just claimed.
+    const rows = [keylessRead({ duplicateOfId: "row-owner" })];
+    const seen: WeakVerdict[] = [];
+    const h = harness(rows, { ...LIVE, promoteToBooking: weakNetPromotion(rows, seen) });
+
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 });
+    assert.deepEqual(h.strongClaims.map(c => c.key), ["2026-08-03|82766"], "the key was free and it took it");
+    assert.deepEqual(seen, [{ kind: "distinct", twinIds: [], humanDistinctFrom: "row-owner" }]);
+    assert.deepEqual(h.states, [], "nothing parked");
+    assert.equal(h.bookedRows[0].dedupStrongKey, "2026-08-03|82766");
 });
 
 test("a heal that loses its fence books nothing and reports STALE", async () => {
@@ -3063,6 +3147,24 @@ test("a row that already HOLDS its key spends no round trip on the heal", async 
     assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 });
     assert.deepEqual(h.strongClaims, [], "the overwhelming majority of rows are this one");
     assert.equal(h.bookedRows[0].dedupStrongKey, "2026-08-03|82766");
+});
+
+test("a revived row does not claim the key its routing gates WITHHELD", async () => {
+    // The row parked `date-implausible` at routing and claimed nothing, on
+    // purpose: the read date is half the strong key, so a misread year must not
+    // be allowed to mint one. Set job sends it to READ, where the heal re-derives
+    // that very key — and must refuse it for that very reason. Otherwise the row
+    // parks `date-implausible` all over again, now HOLDING a key routing
+    // deliberately kept from it.
+    const h = harness([keylessRead({
+        txnDate: new Date("2026-02-01T00:00:00.000Z"),
+        readJson: '{"doc_type":"receipt","vendor":"Lowes","date":"2026-02-01","invoice":"82766","total_amount":"364.98"}',
+    })], LIVE);
+
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 });
+    assert.deepEqual(h.strongClaims, [], "no claim was even attempted");
+    assert.equal(h.books, 1, "and the row still reaches book.ts, which owns the date verdict");
+    assert.equal(h.bookedRows[0].dedupStrongKey, null);
 });
 
 test("a dry-run row is not healed: it is not about to book", async () => {
@@ -3131,4 +3233,70 @@ test("recoverStrongKey re-derives the key with the SAME rule routing used", () =
     assert.equal(recoverStrongKey({ ...base, txnDate: null }, "America/Los_Angeles"), null);
     assert.equal(recoverStrongKey({ ...base, readJson: null }, "America/Los_Angeles"), null);
     assert.equal(recoverStrongKey({ ...base, readJson: "{" }, "America/Los_Angeles"), null);
+});
+
+test("recoverStrongKey runs routing's DOCUMENT GATES, so a heal cannot claim what routing refused", () => {
+    // The row arrived on 2026-08-20 Pacific. Each case below is a document
+    // routing would have parked BEFORE the strong claim, so the heal — which
+    // runs after a human revived the row, with routing long gone — must reach
+    // the same answer rather than handing it an identity on the way to booking.
+    const base = {
+        docType: "receipt",
+        refNumber: "82766",
+        txnDate: new Date("2026-08-03T00:00:00.000Z") as Date | null,
+        totalCents: 36498 as number | null,
+        createdAt: new Date("2026-08-20T09:00:00.000Z"),
+        readJson: '{"doc_type":"receipt","vendor":"Lowes","date":"2026-08-03","invoice":"82766","total_amount":"364.98"}' as string | null,
+    };
+    const read = (over: Record<string, string>) => JSON.stringify({
+        doc_type: "receipt", vendor: "Lowes", date: "2026-08-03",
+        invoice: "82766", total_amount: "364.98", ...over,
+    });
+
+    // THE CONTROL: the plausible row still gets its key, so every null below is
+    // the gate speaking and not the re-derivation failing.
+    assert.equal(recoverStrongKey(base, "America/Los_Angeles")?.key, "2026-08-03|82766");
+
+    // 200 days back: a misread year or month, not a late upload (the Sunbelt
+    // 2023 read). txnDate agrees with the read, so only the gate can refuse it.
+    assert.equal(
+        recoverStrongKey({
+            ...base,
+            txnDate: new Date("2026-02-01T00:00:00.000Z"),
+            readJson: read({ date: "2026-02-01" }),
+        }, "America/Los_Angeles"),
+        null,
+        "a date 200 days before arrival",
+    );
+    // Ten days ahead of arrival is past the three days clock skew allows for.
+    assert.equal(
+        recoverStrongKey({
+            ...base,
+            txnDate: new Date("2026-08-30T00:00:00.000Z"),
+            readJson: read({ date: "2026-08-30" }),
+        }, "America/Los_Angeles"),
+        null,
+        "a date 10 days after arrival",
+    );
+    // A $0.00 read never books automatically, and never keys.
+    assert.equal(
+        recoverStrongKey({
+            ...base,
+            totalCents: 0,
+            readJson: read({ total_amount: "0.00" }),
+        }, "America/Los_Angeles"),
+        null,
+        "a zero total",
+    );
+    // A negative total is a refund: a real document, but one a human has to
+    // place against the original purchase.
+    assert.equal(
+        recoverStrongKey({
+            ...base,
+            totalCents: -2257,
+            readJson: read({ total_amount: "-22.57" }),
+        }, "America/Los_Angeles"),
+        null,
+        "a negative total",
+    );
 });

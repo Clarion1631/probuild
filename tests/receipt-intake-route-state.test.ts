@@ -448,6 +448,14 @@ test("the release list is EXACTLY the no-artifact reasons, not a copy of them", 
         [...NO_ARTIFACT_STATE_REASONS].filter(r => !parkReleasesStrongKey(r)).length,
         0,
     );
+    // AND THE SET HAS EXACTLY TWO MEMBERS. The loop above is satisfied by any
+    // set, so a third reason added to NO_ARTIFACT_STATE_REASONS would quietly
+    // start releasing strong keys with this test still green — which is the whole
+    // failure mode the release rule exists to prevent.
+    assert.deepEqual(
+        [...NO_ARTIFACT_STATE_REASONS].sort(),
+        ["content-changed", "receipt-bytes-missing"],
+    );
 });
 
 test("backoff is 5m / 15m / 1h / 6h and then stays at 6h", () => {
