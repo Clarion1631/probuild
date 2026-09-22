@@ -1097,6 +1097,83 @@ test("THE INVARIANT: a document whose own identity is readable never parks weak 
     assert.equal(placeholderRef.applied[0].dedupStrongKey, null, "there was never a key to hold");
 });
 
+// ── A SECOND read may not erase an identity it failed to re-derive ─────────
+//
+// Rows are read more than once now: Retry sends a `weak-dup:` row back to
+// RECEIVED, and setReceiptIntakeJob sends any NEEDS_REVIEW row to READ. The
+// strong key is withheld whenever the date was not read off the document, even
+// with a perfectly real ref — so a second read that happens to miss the date
+// used to write that null straight over a key the row had already claimed.
+
+test("a re-read that derives NO key keeps the one the row already holds", async () => {
+    const h = harness([workerRow({ dedupStrongKey: "2026-08-03|82766" })], {
+        // Same real invoice, no readable date this time.
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "" } } as ReadOutcome),
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(
+        h.applied[0].dedupStrongKey,
+        "2026-08-03|82766",
+        "the established identity survives a read that could not re-derive it",
+    );
+});
+
+test("a re-read that derives a DIFFERENT key replaces the old one", async () => {
+    // The read is authoritative when it actually produced an answer: a
+    // corrected date or invoice must move the claim, not be ignored.
+    const h = harness([workerRow({ dedupStrongKey: "2026-08-03|82766" })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, invoice: "82999" } } as ReadOutcome),
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.applied[0].dedupStrongKey, "2026-08-03|82999");
+});
+
+test("a FIRST read is unchanged: no prior key, so whatever it derives stands", async () => {
+    const derived = harness([workerRow()]);
+    await runIntakeWorker(derived.deps);
+    assert.equal(derived.applied[0].dedupStrongKey, "2026-08-03|82766");
+
+    // ...and a first read that derives nothing still writes null, rather than
+    // `undefined`, so the column is explicitly cleared as it always was.
+    const none = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "" } } as ReadOutcome),
+    });
+    await runIntakeWorker(none.deps);
+    assert.equal(none.applied[0].dedupStrongKey, null);
+    assert.ok("dedupStrongKey" in none.applied[0], "written explicitly, not omitted");
+});
+
+test("the GATE branch still nulls the key, even on a row that holds one", async () => {
+    // A multi-doc / non-receipt / $0 / implausible-date row must claim no key
+    // at all — including giving back one an earlier read had claimed, because
+    // this read says the document is not a bookable purchase.
+    for (const [read, reason] of [
+        [{ ...goodRead.read, docType: "multi" }, "multi-doc"],
+        [{ ...goodRead.read, totalAmount: "0.00" }, "refund-or-zero"],
+    ] as const) {
+        const h = harness([workerRow({ dedupStrongKey: "2026-08-03|82766" })], {
+            read: async () => ({ ok: true, read } as ReadOutcome),
+        });
+        await runIntakeWorker(h.deps);
+        assert.ok(h.states[0].reason?.startsWith(reason), reason);
+        assert.equal(h.states[0].patch?.dedupStrongKey, null, `${reason}: the gate releases it`);
+    }
+});
+
+test("the STRONG-OWNER branch still nulls the key — the index just refused this row", async () => {
+    // The claim was REJECTED, so this row never held that key; the null is
+    // correcting the patch, not surrendering an identity.
+    const h = harness([workerRow({ dedupStrongKey: "2026-08-03|82766" })], {
+        applyRead: async (_id, patch) => {
+            h.applied.push(patch);
+            return { owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } };
+        },
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.states[0].state, "DUPLICATE");
+    assert.equal(h.states[0].patch?.dedupStrongKey, null);
+});
+
 test("a re-routed row re-claims the key it ALREADY owns, and that is not a conflict", async () => {
     // The Retry path for `weak-dup:` sends the row back to RECEIVED, so routing
     // runs again and issues the IDENTICAL strong claim against a row that (from
@@ -1211,9 +1288,16 @@ test("the REAL weak-net queries read the whole group, and log the verdict outsid
     //    lease is this pass's, the identity is the document's.
     assert.match(promote, /stateReason: `weak-dup:\$\{verdict\.twinId\}`/);
     assert.match(promote, /\.\.\.RELEASE_CLAIM/);
-    assert.ok(
-        !promote.includes("dedupStrongKey"),
-        "the promotion path does not touch the strong key anywhere — a weak park keeps it",
+    // Scoped to the park write's `data` object, not the whole function, and
+    // matching an ASSIGNMENT rather than the bare word: the ban is on writing
+    // the column, so a comment that explains why it is left alone stays legal.
+    const parkBranch = promote.slice(promote.indexOf('if (verdict.kind === "park")'));
+    const parkData = parkBranch.slice(parkBranch.indexOf("data: {"), parkBranch.indexOf("});"));
+    assert.ok(parkData.includes("stateReason: `weak-dup:"), "sliced the right object");
+    assert.doesNotMatch(
+        parkData,
+        /dedupStrongKey\s*:/,
+        "the weak park assigns no strong key — the row keeps the one it claimed",
     );
 
     // 4. The audit row is BOUNDED as well as awaited, and it says PROMOTED.

@@ -167,16 +167,23 @@ test("the date sentence counts real days, and never counts backwards", () => {
         /reads as 2027-09-17, which is after it arrived/,
     );
     // STRICTLY NEGATIVE. A read on the row's own arrival day is zero days
-    // apart and is never implausible, so "after it arrived" would be false.
-    assert.match(
+    // apart and is never implausible, so "after it arrived" would be false —
+    // and "0 days before it arrived" is true but reads like a bug.
+    assert.equal(
         describeStateReason("date-implausible", { ...ROW, txnDate: "2026-09-21" })!.headline,
-        /which is 0 days before it arrived/,
-        "same day is not 'after'",
+        "The date on this one reads as 2026-09-21, which is the day it arrived.",
     );
-    // No usable date on the row: say so rather than printing a NaN.
-    assert.match(
-        describeStateReason("date-implausible", { ...ROW, txnDate: null })!.headline,
-        /does not fit when it arrived/,
+
+    // No usable date on the row: say so rather than printing a NaN, and STOP
+    // there. This branch used to diagnose too ("that is almost certainly a
+    // misread"), which the renderer does not get to decide.
+    const noDate = describeStateReason("date-implausible", { ...ROW, txnDate: null })!.headline;
+    assert.equal(noDate, "The date on this one does not fit when it arrived.");
+    assert.ok(!noDate.includes("almost certainly"), "state the gap, do not call the verdict");
+    // Same for an unparseable one, which reaches the same branch.
+    assert.equal(
+        describeStateReason("date-implausible", { ...ROW, txnDate: "not-a-date" })!.headline,
+        "The date on this one does not fit when it arrived.",
     );
 });
 
