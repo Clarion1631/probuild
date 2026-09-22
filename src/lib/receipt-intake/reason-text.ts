@@ -70,7 +70,7 @@ function dateSentence(row: ReasonTextRow): string {
     const read = utcDay(row.txnDate);
     const arrived = utcDay(row.createdAt);
     if (read === null || arrived === null) {
-        return "The date on this one does not fit when it arrived. That is almost certainly a misread.";
+        return "The date on this one does not fit when it arrived.";
     }
     const days = Math.round((arrived - read) / DAY_MS);
     const when = row.txnDate as string;
@@ -80,6 +80,10 @@ function dateSentence(row: ReasonTextRow): string {
     // here.
     if (days < 0) {
         return `The date on this one reads as ${when}, which is after it arrived.`;
+    }
+    // "0 days before it arrived" is true and reads like a bug.
+    if (days === 0) {
+        return `The date on this one reads as ${when}, which is the day it arrived.`;
     }
     return `The date on this one reads as ${when}, which is ${days} day${days === 1 ? "" : "s"} before it arrived.`;
 }

@@ -14,14 +14,20 @@
  *   A weak twin blocks promotion ONLY when the two rows are not already
  *   distinguished by their own reference numbers.
  *
- * `refNumber` is the source, and deliberately NOT `dedupStrongKey`. A weak park
- * RELEASES the strong key — in worker.ts's weak branch and again in the cron's
- * promoteToBooking — so that a corrected resend does not collide with a row
- * that never booked. Every row already parked `weak-dup:` therefore has no
- * strong key left, and so would the SECOND arrival in any group, which means a
- * rule reading that column would answer "cannot tell" for the entire existing
- * backlog and for every third ticket. `refNumber` is written once at read time
- * (worker.ts's `base`) and no park, transition or book path ever nulls it.
+ * `refNumber` is the source, and deliberately NOT `dedupStrongKey`, for two
+ * reasons that both still hold now that a weak park KEEPS the key.
+ *
+ * First, the strong key answers a narrower question than this module asks. It
+ * is minted only when the date was read off the document AND `refLooksReal`
+ * passes, so a null key cannot tell a placeholder ref ("NoInv") from a perfectly
+ * real ref on a document whose date was unreadable. The second of those is a row
+ * this module can and should separate from its twins; a rule keyed on the strong
+ * key would lump both into "cannot tell".
+ *
+ * Second, rows parked `weak-dup:` BEFORE this change had their key released by
+ * the old code, so they carry none at all. `refNumber` is written once at read
+ * time (worker.ts's `base`) and no park, transition or book path ever nulls it,
+ * which is why the rule works on the existing backlog as well as on new rows.
  *
  * PURE: no I/O, no clock, no database. Both decision sites — routing and
  * promoteToBooking — run this same function over the same shape, so they cannot
