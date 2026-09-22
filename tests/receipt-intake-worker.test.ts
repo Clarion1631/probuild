@@ -17,7 +17,9 @@ import {
     dateOnly,
     isTerminalQboFault,
     isUniqueViolation,
+    recoverStrongKey,
     toDateStr,
+    type StrongOwner,
     MAX_BUSY_PASSES,
     MAX_PLAUSIBLE_TAX_RATE,
     validateTaxCents,
@@ -39,6 +41,9 @@ import {
     QBO_WRITING_STATES,
 } from "../src/lib/receipt-intake/worker";
 import { preservedTaxWarning } from "../src/lib/receipt-intake/route-state";
+// THE REAL weak net, run by the promotion fake below: the strong net's human
+// override is only an exit if this function honours it too.
+import { judgeWeakGroup, type WeakVerdict } from "../src/lib/receipt-intake/weak-net";
 // The call-site contract the date gate reads: see the fallback test below.
 import { dedupKeys } from "../src/lib/receipt-intake/keys";
 import { normalizeDocType, READ_BUDGET_MS, type ReadOutcome } from "../src/lib/receipt-intake/read";
@@ -94,6 +99,11 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         claimToken: LIVE_TOKEN,
         fileSha256: "s".repeat(64),
         stateReason: null,
+        // The three columns the strong-key heal reads. Null is the shape that
+        // MATTERS: it is how a row revived by a human reaches booking.
+        dedupStrongKey: null,
+        readJson: null,
+        duplicateOfId: null,
         ...overrides,
     };
 }
@@ -146,6 +156,10 @@ interface Harness {
     clock: number;
     sendReads: string[];
     persistedSendAttempted?: boolean;
+    /** Every strong-key claim the heal attempted, with the ownership it CAS'd on. */
+    strongClaims: { id: string; key: string; ownership: { state: string; claimToken: string | null } }[];
+    /** The row as `book` was actually handed it — the heal's result has to reach here. */
+    bookedRows: WorkerRow[];
 }
 
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
@@ -153,7 +167,7 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         reads: 0, books: 0, applied: [], states: [], promoted: [], finished: [], deferred: [],
         retried: [], releasedClaims: [], releasedUnprocessed: [], leaseAcquires: 0, leaseReleases: 0,
         claimOpts: [], sweepCalls: 0, cleanupCalls: 0, bookBudgets: [], clock: 0,
-        sendReads: [],
+        sendReads: [], strongClaims: [], bookedRows: [],
         boundary: new Date("2026-08-25T00:00:00.000Z"),
         deps: null as unknown as WorkerDependencies,
     };
@@ -185,6 +199,11 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         read: async () => { h.reads++; return goodRead; },
         applyRead: async (_id, patch) => { h.applied.push(patch); return { owned: true, strongOwner: null }; },
+        // The default is the common case: the key was free and the claim took it.
+        claimStrongKey: async (id, key, ownership) => {
+            h.strongClaims.push({ id, key, ownership });
+            return { owned: true, strongOwner: null };
+        },
         findWeakGroup: async () => [],
         applyState: async (id, state, reason, patch, ownership) => {
             h.states.push({ id, state, reason, patch, ownership });
@@ -195,8 +214,9 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         },
         companyTimeZone: async () => "America/Los_Angeles",
         promoteToBooking: async id => { h.promoted.push(id); return { promoted: true }; },
-        book: async () => {
+        book: async row => {
             h.books++;
+            h.bookedRows.push(row as WorkerRow);
             return { outcome: "booked", qbPurchaseId: "QB-1", expenseId: "e1", alreadyExisted: false } as BookResult;
         },
         applyBookResult: async () => {},
@@ -1161,10 +1181,26 @@ test("the REAL weak-net queries read the whole group, and log the verdict outsid
         "the lock is taken before the group is read — a read taken first is one the other claimant can invalidate",
     );
     assert.match(promote, /take: MAX_WEAK_GROUP \+ 2/, "the cap plus self");
+    // AND THE CAP MUST COUNT WHAT THAT `take` RETURNED. The two numbers are one
+    // rule split across two files: a full result is the overflow sentinel for
+    // this query, so the cap has to measure the FETCHED group. Counting a
+    // post-exemption remainder let one human-ruled twin drop eleven twins to ten
+    // and decide a group whose later rows were never read. Pinned here, beside
+    // the `take` it belongs to, so the two cannot drift apart again.
+    const weakNet = readFileSync(
+        path.join(__dirname, "..", "src/lib/receipt-intake/weak-net.ts"),
+        "utf8",
+    );
+    assert.match(weakNet, /if \(twins\.length > MAX_WEAK_GROUP\)/, "the cap reads the fetched count, not the judged one");
     assert.ok(
         !promote.includes("id: { not: rowId }"),
         "self is INCLUDED: its refNumber under the lock is the only version that can still be true at commit",
     );
+    // AND `duplicateOfId` COMES WITH THE GROUP. Without it `self` reaches
+    // judgeWeakGroup carrying no record of the collision a human already ruled
+    // on, and the `strong-dup:` exit the heal honours is undone one step later:
+    // the row parks `weak-dup:` on the very twin the review named.
+    assert.match(promote, /select: \{ id: true, refNumber: true, duplicateOfId: true \}/);
     assert.match(promote, /const self = group\.find\(row => row\.id === rowId\)/);
     assert.match(promote, /const twins = group\.filter\(row => row\.id !== rowId\)/);
     assert.match(promote, /judgeWeakGroup\(self, twins\)/, "the SAME pure rule routing runs");
@@ -1190,7 +1226,7 @@ test("the REAL weak-net queries read the whole group, and log the verdict outsid
     // 5. The audit row is written AFTER the commit, never inside the
     //    transaction holding the advisory lock, and never at the cost of the
     //    booking.
-    const commit = "return { promoted: true, autoDistinctFrom, autoDistinctRefs };";
+    const commit = "return { promoted: true, autoDistinctFrom, autoDistinctRefs, humanDistinctFrom };";
     const txBody = promote.slice(promote.indexOf("prisma.$transaction("), promote.indexOf(commit));
     assert.ok(!txBody.includes("logAutomationEvent"), "nothing inside the transaction logs");
     assert.ok(
@@ -1199,7 +1235,17 @@ test("the REAL weak-net queries read the whole group, and log the verdict outsid
     );
     assert.match(promote, /kind: "receipt-stage"/);
     assert.match(promote, /stage: "weak-net"/);
-    assert.match(promote, /status: "auto-distinct"/);
+    // TWO statuses, because they are two different decisions: the rail ruled a
+    // twin distinct on its reference number, or a PERSON did and the net merely
+    // honoured it. One label for both would credit the rail with a human's call.
+    assert.match(
+        promote,
+        /status: result\.humanDistinctFrom \? "human-distinct" : "auto-distinct"/,
+    );
+    // And a human exemption is logged even when no twin was auto-judged — that
+    // is the whole event in the case this fix exists for.
+    assert.match(promote, /if \(autoCount > 0 \|\| result\.humanDistinctFrom\)/);
+    assert.match(promote, /humanDistinctFrom: result\.humanDistinctFrom \?\? null/, "and the detail names it");
     assert.match(
         promote.slice(promote.indexOf("logAutomationEvent")),
         /\}\)\.catch\(error => console\.warn\(/,
@@ -1610,6 +1656,86 @@ test("the control: a re-read that ANSWERS 'no job' still parks NEEDS_JOB", async
     assert.deepEqual(h.retried, []);
 });
 
+// ── A jobless row claims its key BEFORE it parks ───────────────────────────
+//
+// The job gate used to run before the strong claim, so EVERY jobless receipt
+// parked keyless, was given a job, went to READ — which never routes again — and
+// booked owning no identity. The second copy of the same document then missed
+// both nets and booked too. Two Expenses, one document.
+
+test("a jobless row claims its strong key, then parks NEEDS_JOB HOLDING it", async () => {
+    let weakCalls = 0;
+    const h = harness([workerRow({ projectId: null })], {
+        refreshProjectId: async () => null,
+        findWeakGroup: async () => { weakCalls++; return []; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { NEEDS_JOB: 1 });
+    assert.equal(h.applied.length, 1, "the claim ran");
+    assert.equal(h.applied[0].dedupStrongKey, "2026-08-03|82766");
+    assert.equal(h.applied[0].state, "RECEIVED", "and it kept the lease, like every other claim");
+    assert.equal(h.states[0].state, "NEEDS_JOB");
+    assert.equal(h.states[0].reason, null);
+    // THE PATCH SAYS NOTHING ABOUT THE KEY, which is how it keeps it: applyRead
+    // already committed the claim, so the correct park is silent about the column.
+    assert.ok(
+        !("dedupStrongKey" in (h.states[0].patch ?? {})),
+        "the park does not touch the claim it just made",
+    );
+    assert.equal(weakCalls, 0, "the weak net is not consulted for a row nobody can book yet");
+    assert.deepEqual(h.finished, [], "and NEEDS_JOB is not READ");
+});
+
+test("a jobless row whose claim LOSES to a twin at the same total is still a DUPLICATE", async () => {
+    // The point of claiming before the gate: the copy that arrives second now
+    // collides, instead of becoming a second NEEDS_JOB row for one document.
+    const h = harness([workerRow({ projectId: null })], {
+        refreshProjectId: async () => null,
+        applyRead: async (_id, patch) => {
+            h.applied.push(patch);
+            return { owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } };
+        },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { DUPLICATE: 1 });
+    assert.equal(h.states[0].state, "DUPLICATE");
+    assert.equal(h.states[0].patch?.duplicateOfId, "row-owner");
+    // A DUPLICATE is retired, and the partial unique index stops covering it, so
+    // this one really does hand the key back.
+    assert.equal(h.states[0].patch?.dedupStrongKey, null);
+});
+
+test("a jobless row against a DIFFERENT total goes to a human, not to the job queue", async () => {
+    const h = harness([workerRow({ projectId: null })], {
+        refreshProjectId: async () => null,
+        applyRead: async (_id, patch) => {
+            h.applied.push(patch);
+            return { owned: true, strongOwner: { id: "row-owner", totalCents: 20000, canonicalVendor: "lowes" } };
+        },
+    });
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states[0].reason, "strong-dup-amount-mismatch:row-owner");
+});
+
+test("a jobless row that loses its fence mid-claim reports STALE and parks nothing", async () => {
+    const h = harness([workerRow({ projectId: null })], {
+        refreshProjectId: async () => null,
+        applyRead: async () => ({ owned: false, strongOwner: null }),
+    });
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { STALE: 1 });
+    assert.deepEqual(h.states, [], "the successor owns this row now");
+});
+
+test("a jobless row that loses its fence at the PARK reports STALE", async () => {
+    const h = harness([workerRow({ projectId: null })], {
+        refreshProjectId: async () => null,
+        applyState: async () => false,
+    });
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { STALE: 1 });
+});
+
 test("the deadline starts at invocation entry, so a slow sweep cannot overrun it", async () => {
     // The sweep downloads objects. Timing it OUT of the budget meant it could
     // eat the platform timeout and the worker would still go on to start a 25s
@@ -1684,32 +1810,37 @@ test("a failing cleanup pass never takes the run down", async () => {
     assert.deepEqual(summary.byState, { READ: 1 }, "the batch still ran");
 });
 
-// ── A row that never sent releases its key, whatever killed it (item 7) ────
+// ── A park releases the key only for the reason, not just the send (item 7) ─
 
-test("a weak-lookup failure at the retry limit RELEASES the strong key", async () => {
+test("a weak-lookup failure at the retry limit KEEPS the strong key", async () => {
     // This row exhausted its attempts entirely on a database fault and never
-    // touched QuickBooks. Holding its key quarantines the corrected resend
-    // against a row that never became a purchase.
+    // touched QuickBooks — and it still keeps its key. `max-retries` is not a
+    // no-artifact reason: the object is in the bucket, the row still IS that
+    // document, and "Retry now" resumes it at BOOKING, which does not route it
+    // and so could never re-claim a key given back here.
     const h = harness([workerRow({ attempts: 19, sendAttempted: false })], {
         findWeakGroup: async () => { throw new Error("connection reset"); },
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
     assert.equal(h.states[0].reason, "max-retries");
-    assert.equal(h.states[0].patch?.dedupStrongKey, null, "the key goes back");
+    assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})), "the patch does not touch the key");
+    // AND THE ROUND TRIP IS NOT SPENT. A release is not on the table for this
+    // reason, so there is nothing for the persisted send flag to decide.
+    assert.deepEqual(h.sendReads, [], "the flag is not even re-read");
 });
 
-test("a finishRouting failure at the retry limit also releases the key", async () => {
+test("a finishRouting failure at the retry limit also keeps the key", async () => {
     const h = harness([workerRow({ attempts: 19, sendAttempted: false })], {
         finishRouting: async () => { throw new Error("connection reset"); },
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.states[0].reason, "max-retries");
-    assert.equal(h.states[0].patch?.dedupStrongKey, null);
+    assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})));
 });
 
 test("a row that DID send keeps its key at the retry limit", async () => {
-    // QuickBooks may hold a Purchase whose response we lost.
+    // QuickBooks may hold a Purchase whose response we lost. Now true twice over.
     const h = harness([workerRow({ attempts: 19, sendAttempted: true })], {
         findWeakGroup: async () => { throw new Error("connection reset"); },
     });
@@ -1733,6 +1864,19 @@ test("a read whose bytes no longer match the recorded sha is TERMINAL", async ()
     assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
     assert.equal(h.states[0].reason, "content-changed");
     assert.equal(h.reads, 0, "the model never sees bytes we cannot vouch for");
+    // This row OUTLIVED ITS DOCUMENT, which is one of exactly two reasons that
+    // hand the strong key back: the bytes behind that identity are not there any
+    // more, so a corrected re-upload must be able to claim it.
+    assert.equal(h.states[0].patch?.dedupStrongKey, null, "and its identity is genuinely unclaimed");
+
+    // ...unless a send may have created a Purchase, in which case the key stays
+    // even though the document is gone.
+    const sent = harness([workerRow({ sendAttempted: true })], {
+        downloadBytes: async () => ({ ok: false as const, kind: "sha-mismatch" as const, message: "x" }),
+    });
+    await runIntakeWorker(sent.deps);
+    assert.equal(sent.states[0].reason, "content-changed");
+    assert.ok(!("dedupStrongKey" in (sent.states[0].patch ?? {})), "a Purchase may exist");
 });
 
 test("the recorded sha is what the download is checked against", async () => {
@@ -1878,20 +2022,31 @@ test("every mutation is offered the row's OWN state and token", async () => {
 
 // ── One parkTerminal decides the key release (round-10 item 4) ─────────────
 
-test("EVERY pre-send terminal park releases the strong key", async () => {
-    // Each of these used to decide independently, and the ones that forgot held
-    // a dedup key against a Purchase that never existed — so the corrected
-    // resubmission collided with nothing.
-    const cases: Array<[string, Partial<WorkerDependencies>]> = [
-        ["file-missing", { downloadBytes: async () => ({ ok: false as const, kind: "missing" as const }) }],
-        ["content-changed", { downloadBytes: async () => ({ ok: false as const, kind: "sha-mismatch" as const, message: "x" }) }],
-        ["unreadable", { read: async () => ({ ok: false, decisive: true }) }],
+test("only the park reasons that mean the DOCUMENT is gone release the strong key", async () => {
+    // The release is a property of the REASON as well as of the row. Exactly one
+    // of these three parks means the row outlived its document; the other two
+    // leave a row a human can revive, and a key released for those is never
+    // re-claimed because a revival does not route the row again.
+    const cases: Array<[string, Partial<WorkerDependencies>, boolean]> = [
+        // An affirmative 404 at the read step is `file-missing`, NOT one of the
+        // two no-artifact reasons — and that asymmetry is deliberate: "Retry now"
+        // is offered for exactly this reason, and it resumes the row at RECEIVED
+        // after a person re-uploads the object to the same path.
+        ["file-missing", { downloadBytes: async () => ({ ok: false as const, kind: "missing" as const }) }, false],
+        ["content-changed", { downloadBytes: async () => ({ ok: false as const, kind: "sha-mismatch" as const, message: "x" }) }, true],
+        ["unreadable", { read: async () => ({ ok: false, decisive: true }) }, false],
     ];
-    for (const [reason, over] of cases) {
+    for (const [reason, over, releases] of cases) {
         const h = harness([workerRow({ sendAttempted: false })], over);
         await runIntakeWorker(h.deps);
         assert.equal(h.states[0].reason, reason);
-        assert.equal(h.states[0].patch?.dedupStrongKey, null, `${reason} must release the key`);
+        if (releases) {
+            assert.equal(h.states[0].patch?.dedupStrongKey, null, `${reason} releases the key`);
+            assert.deepEqual(h.sendReads, ["row-1"], `${reason}: the send flag decides, so it is read`);
+        } else {
+            assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})), `${reason} keeps the key`);
+            assert.deepEqual(h.sendReads, [], `${reason}: no release is on the table, so no round trip`);
+        }
     }
 
     // ...and the AI-unavailable ceiling, which is a different code path again.
@@ -1900,12 +2055,13 @@ test("EVERY pre-send terminal park releases the strong key", async () => {
     });
     await runIntakeWorker(busy.deps);
     assert.equal(busy.states[0].reason, "ai-unavailable");
-    assert.equal(busy.states[0].patch?.dedupStrongKey, null);
+    assert.ok(!("dedupStrongKey" in (busy.states[0].patch ?? {})), "the row is alive; Retry re-reads it");
 });
 
 test("a park AFTER a send keeps the key, on every one of those paths", async () => {
     for (const over of [
         { downloadBytes: async () => ({ ok: false as const, kind: "missing" as const }) },
+        { downloadBytes: async () => ({ ok: false as const, kind: "sha-mismatch" as const, message: "x" }) },
         { read: async () => ({ ok: false as const, decisive: true }) },
     ]) {
         const h = harness([workerRow({ sendAttempted: true })], over);
@@ -2107,10 +2263,15 @@ test("EVERY early terminal outcome releases the claim in the same write", async 
         assert.deepEqual(h.finished, [], `${label}: finishRouting is for READ only`);
     }
 
-    // The no-job park takes the same road.
+    // The no-job park takes the same road OUT — one applyState, fenced on the
+    // row's own ownership, releasing the claim with the transition. What it does
+    // NOT skip any more is the claim itself: it goes through applyRead first, so
+    // the row parks holding its strong key.
     const noJob = harness([workerRow({ projectId: null })], { refreshProjectId: async () => null });
     assert.deepEqual((await runIntakeWorker(noJob.deps)).byState, { NEEDS_JOB: 1 });
-    assert.deepEqual(noJob.applied, [], "no-project is terminal too");
+    assert.equal(noJob.applied.length, 1, "no-project claims its key on the way past");
+    assert.equal(noJob.applied[0].dedupStrongKey, "2026-08-03|82766");
+    assert.equal(noJob.states.length, 1, "and exactly one write ends the row");
     assert.deepEqual(noJob.states[0].ownership, { state: "RECEIVED", claimToken: "claim-1" });
 });
 
@@ -2145,9 +2306,13 @@ test("a park decided AFTER a send reads the PERSISTED flag, not the claim snapsh
     // That snapshot says "nothing sent", so the dedup key went back for a row
     // with a Purchase in the real books, and the next submission of the same
     // receipt booked it a second time.
-    const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
-        isDryRunEnabled: () => false,
-        book: async () => { throw new Error("connection reset after the create"); },
+    //
+    // A `content-changed` park is the shape that still asks the question at all:
+    // the release rule now also requires a reason that means the row outlived its
+    // document, and `max-retries` never does (asserted above). This row's bytes
+    // are gone AND a send may have happened, so the flag is what decides.
+    const h = harness([workerRow({ sendAttempted: false })], {
+        downloadBytes: async () => ({ ok: false as const, kind: "sha-mismatch" as const, message: "x" }),
     });
     h.persistedSendAttempted = true; // markSendAttempted got there first
     await runIntakeWorker(h.deps);
@@ -2161,12 +2326,11 @@ test("a park decided AFTER a send reads the PERSISTED flag, not the claim snapsh
     );
 });
 
-test("a park with nothing ever sent still releases the key", async () => {
-    // The control. Holding a key against a booking that never happened sends
-    // the corrected resubmission to a human for no reason.
-    const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
-        isDryRunEnabled: () => false,
-        book: async () => { throw new Error("connection reset"); },
+test("a park with nothing ever sent releases the key — when the reason allows it", async () => {
+    // The control for the test above. The document is gone and nothing was sent,
+    // so the identity really is unclaimed.
+    const h = harness([workerRow({ sendAttempted: false })], {
+        downloadBytes: async () => ({ ok: false as const, kind: "sha-mismatch" as const, message: "x" }),
     });
     h.persistedSendAttempted = false;
     await runIntakeWorker(h.deps);
@@ -2175,13 +2339,28 @@ test("a park with nothing ever sent still releases the key", async () => {
 
 test("an unreadable send flag RETAINS the key", async () => {
     // Retaining costs a review item; releasing wrongly costs a second Purchase.
-    const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
-        isDryRunEnabled: () => false,
-        book: async () => { throw new Error("boom"); },
+    const h = harness([workerRow({ sendAttempted: false })], {
+        downloadBytes: async () => ({ ok: false as const, kind: "sha-mismatch" as const, message: "x" }),
         sendAttemptedNow: async () => { throw new Error("db is down"); },
     });
     await runIntakeWorker(h.deps);
+    assert.equal(h.states[0].reason, "content-changed");
     assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})));
+});
+
+test("a generic post-send failure at the retry limit keeps the key on BOTH grounds", async () => {
+    // What the three tests above used to cover through `max-retries`, kept as its
+    // own case: a throw after the create parks the row, and the key stays because
+    // the reason is not a no-artifact one — the send flag never even gets asked.
+    const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
+        isDryRunEnabled: () => false,
+        book: async () => { throw new Error("connection reset after the create"); },
+    });
+    h.persistedSendAttempted = true;
+    await runIntakeWorker(h.deps);
+    assert.equal(h.states[0].reason, "max-retries");
+    assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})));
+    assert.deepEqual(h.sendReads, [], "no release is possible, so no round trip is spent");
 });
 
 // ── An inline STAGING orphan is not waiting for a URL (round-15 item 3) ────
@@ -2699,5 +2878,454 @@ test("every routing exit carries the durable marker, not just the READ one", asy
         (h.states[0].patch as { taxWarning?: string | null }).taxWarning,
         "tax-implausible",
         "and the durable one, in the same write",
+    );
+});
+
+// ── A row must not book without the identity it should own ─────────────────
+//
+// READ and BOOKING are reached WITHOUT routing: `setReceiptIntakeJob` and
+// `unmarkReceiptIntakeDuplicate` write READ straight onto a parked row, and
+// "Retry now" resumes a row at BOOKING. None of them claims a strong key. So a
+// row whose key was released at park time, or never claimed because the row was
+// jobless, would book owning nothing — and the same document re-sent, read with
+// a different total, would miss both nets and book a second time.
+
+/** The Lowes row as a human revival leaves it: at READ, live, and keyless. */
+function keylessRead(over: Partial<WorkerRow> = {}): WorkerRow {
+    return workerRow({
+        state: "READ",
+        dryRun: false,
+        dedupStrongKey: null,
+        docType: "receipt",
+        refNumber: "82766",
+        txnDate: new Date("2026-08-03T00:00:00.000Z"),
+        totalCents: 36498,
+        vendor: "Lowes",
+        readJson: '{"doc_type":"receipt","vendor":"Lowes","date":"2026-08-03","invoice":"82766","total_amount":"364.98"}',
+        ...over,
+    });
+}
+
+const LIVE: Partial<WorkerDependencies> = { isDryRunEnabled: () => false };
+
+test("INVARIANT: a row with a real ref and a document date never reaches booking with a null dedupStrongKey unless its key is legitimately unobtainable", async () => {
+    const order: string[] = [];
+    const h = harness([keylessRead()], {
+        ...LIVE,
+        claimStrongKey: async (id, key, ownership) => {
+            order.push("claim");
+            h.strongClaims.push({ id, key, ownership });
+            return { owned: true, strongOwner: null };
+        },
+        promoteToBooking: async id => { order.push("promote"); h.promoted.push(id); return { promoted: true }; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { BOOKED: 1 });
+    assert.deepEqual(order, ["claim", "promote"], "the claim happens BEFORE the promotion");
+    assert.deepEqual(h.strongClaims, [{
+        id: "row-1",
+        key: "2026-08-03|82766",
+        // CAS'd on the row's own ownership, like every other write here.
+        ownership: { state: "READ", claimToken: LIVE_TOKEN },
+    }]);
+    // AND THE CLAIM REACHES THE BOOKING. A claim the in-memory row does not carry
+    // forward is a claim book.ts cannot see.
+    assert.equal(h.bookedRows.length, 1);
+    assert.equal(h.bookedRows[0].dedupStrongKey, "2026-08-03|82766");
+});
+
+test("a BOOKING row claims its key before the send, on the same rule", async () => {
+    // "Retry now" on a parked row resumes it here, past routing entirely.
+    const order: string[] = [];
+    const h = harness([keylessRead({ state: "BOOKING" })], {
+        ...LIVE,
+        claimStrongKey: async (id, key, ownership) => {
+            order.push("claim");
+            h.strongClaims.push({ id, key, ownership });
+            return { owned: true, strongOwner: null };
+        },
+        book: async row => {
+            order.push("book");
+            h.books++;
+            h.bookedRows.push(row as WorkerRow);
+            return { outcome: "booked", qbPurchaseId: "QB-1", expenseId: "e1", alreadyExisted: false } as BookResult;
+        },
+    });
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 });
+    assert.deepEqual(order, ["claim", "book"]);
+    assert.deepEqual(h.strongClaims[0].ownership, { state: "BOOKING", claimToken: LIVE_TOKEN });
+    assert.equal(h.bookedRows[0].dedupStrongKey, "2026-08-03|82766");
+    assert.deepEqual(h.promoted, [], "a BOOKING row is not promoted again");
+});
+
+test("a key that is legitimately unobtainable is not invented, and the row still books", async () => {
+    // The other half of the invariant. Each of these rows could NEVER have held a
+    // strong key, so booking keyless is the honest outcome rather than a hole —
+    // exactly what routing itself does with the same document.
+    const cases: Array<[string, Partial<WorkerRow>]> = [
+        ["a placeholder ref", {
+            refNumber: "NoInv",
+            readJson: '{"doc_type":"receipt","vendor":"Lowes","date":"2026-08-03","invoice":"NoInv","total_amount":"364.98"}',
+        }],
+        ["no date the reader could find", {
+            // The keys substitute the row's arrival day, which is OUR value: it
+            // says nothing about the document, so it cannot be half an identity.
+            txnDate: new Date("2026-08-20T07:00:00.000Z"),
+            readJson: '{"doc_type":"receipt","vendor":"Lowes","date":"","invoice":"82766","total_amount":"364.98"}',
+        }],
+        ["a read that no longer parses", { readJson: "{not json" }],
+        ["no read at all", { readJson: null }],
+        ["a refNumber edited away from the read", { refNumber: "99999" }],
+        ["a txnDate edited away from the read", { txnDate: new Date("2026-08-04T00:00:00.000Z") }],
+        ["a totalCents edited away from the read", { totalCents: 36497 }],
+        ["a docType the row and the read disagree about", { docType: "check" }],
+    ];
+    for (const [label, over] of cases) {
+        const h = harness([keylessRead(over)], LIVE);
+        assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 }, label);
+        assert.deepEqual(h.strongClaims, [], `${label}: nothing was claimed`);
+        assert.deepEqual(h.promoted, ["row-1"], `${label}: and it still promoted`);
+        assert.equal(h.bookedRows[0].dedupStrongKey, null, `${label}: keyless, as it always was`);
+    }
+});
+
+test("a collision sends the row to a human, and NEVER auto-quarantines it", async () => {
+    // Routing would answer DUPLICATE here. The heal must not: a row is keyless at
+    // this point largely because a PERSON revived it, and retiring their row
+    // without asking is not this path's call.
+    const h = harness([keylessRead()], {
+        ...LIVE,
+        claimStrongKey: async (id, key, ownership) => {
+            h.strongClaims.push({ id, key, ownership });
+            return { owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } };
+        },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.deepEqual(h.promoted, [], "not promoted");
+    assert.equal(h.books, 0, "and never booked");
+    assert.equal(h.states.length, 1);
+    assert.equal(h.states[0].state, "NEEDS_REVIEW");
+    assert.equal(h.states[0].reason, "strong-dup:row-owner", "the reason NAMES the row that holds the key");
+    assert.deepEqual(h.states[0].patch, { duplicateOfId: "row-owner" }, "and records the evidence for the decision");
+    assert.deepEqual(h.states[0].ownership, { state: "READ", claimToken: LIVE_TOKEN });
+});
+
+test("a collision that DISAGREES gets the reason routing would have written", async () => {
+    // The verdict still comes from routeState, so the heal and routing cannot
+    // describe the same collision two different ways.
+    const owners: Array<[Partial<StrongOwner>, string]> = [
+        [{ totalCents: 20000 }, "strong-dup-amount-mismatch:row-owner"],
+        [{ totalCents: null }, "strong-dup-amount-mismatch:row-owner"],
+        [{ canonicalVendor: "homedepot" }, "vendor-mismatch:row-owner"],
+        [{ canonicalVendor: null }, "vendor-mismatch:row-owner"],
+    ];
+    for (const [over, reason] of owners) {
+        const h = harness([keylessRead()], {
+            ...LIVE,
+            claimStrongKey: async () => ({
+                owned: true,
+                strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes", ...over },
+            }),
+        });
+        assert.deepEqual((await runIntakeWorker(h.deps)).byState, { NEEDS_REVIEW: 1 }, reason);
+        assert.equal(h.states[0].reason, reason);
+        assert.equal(h.books, 0, reason);
+    }
+});
+
+/** The live row holding the key — same day, same vendor, same amount, same ref. */
+const OWNER: StrongOwner = { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" };
+
+/**
+ * The cron's promotion with the REAL weak net inside it, rather than a stub that
+ * always says yes.
+ *
+ * That stub is what hid the loop: `row-owner` is a live twin on the same weak key
+ * carrying the SAME reference number, so the weak net parks this row
+ * `weak-dup:row-owner` the instant the heal lets it past — and Set job, Retry,
+ * Set job all come back to the same stop. The exemption has to hold in BOTH
+ * places or the exit the strong net advertises is not an exit.
+ *
+ * `self` is looked up from the rows array by id, exactly as the real promotion
+ * re-reads it under the advisory lock.
+ */
+function weakNetPromotion(
+    rows: WorkerRow[],
+    seen: WeakVerdict[],
+): WorkerDependencies["promoteToBooking"] {
+    return async rowId => {
+        const row = rows.find(r => r.id === rowId)!;
+        const verdict = judgeWeakGroup(
+            { id: row.id, refNumber: row.refNumber, duplicateOfId: row.duplicateOfId },
+            [{ id: "row-owner", refNumber: "82766" }],
+        );
+        seen.push(verdict);
+        return verdict.kind === "park"
+            ? { promoted: false, conflictId: verdict.twinId }
+            : {
+                promoted: true,
+                autoDistinctFrom: verdict.twinIds,
+                humanDistinctFrom: verdict.humanDistinctFrom,
+            };
+    };
+}
+
+test("a human who already saw THIS collision is not overruled: the row books keyless", async () => {
+    // `duplicateOfId` is the row the review named, and Set job keeps it. Pressing
+    // it means "book this one anyway", so re-parking it against the same row
+    // would answer their decision with the very fact they were shown.
+    //
+    // END TO END, through the real weak net: the heal proceeding keyless is only
+    // half an exit, and the half that was missing is the one the loop ran through.
+    const rows = [keylessRead({ duplicateOfId: "row-owner" })];
+    const seen: WeakVerdict[] = [];
+    const h = harness(rows, {
+        ...LIVE,
+        claimStrongKey: async () => ({ owned: true, strongOwner: OWNER }),
+        promoteToBooking: weakNetPromotion(rows, seen),
+    });
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 });
+    assert.deepEqual(h.states, [], "nothing parked");
+    assert.deepEqual(
+        seen,
+        [{ kind: "distinct", twinIds: [], humanDistinctFrom: "row-owner" }],
+        "the weak net SKIPPED the twin the human ruled on, and says so",
+    );
+    assert.equal(h.books, 1);
+    assert.equal(h.bookedRows[0].dedupStrongKey, null, "keyless, which is honest: the other row owns it");
+
+    // THE CONTROL: a DIFFERENT owner is not the collision anybody signed off, and
+    // neither is no owner at all. Both are stopped by the heal and never promoted.
+    for (const duplicateOfId of [null, "row-other"]) {
+        const controlRows = [keylessRead({ duplicateOfId })];
+        const controlSeen: WeakVerdict[] = [];
+        const control = harness(controlRows, {
+            ...LIVE,
+            claimStrongKey: async () => ({ owned: true, strongOwner: OWNER }),
+            promoteToBooking: weakNetPromotion(controlRows, controlSeen),
+        });
+        assert.deepEqual((await runIntakeWorker(control.deps)).byState, { NEEDS_REVIEW: 1 }, String(duplicateOfId));
+        assert.equal(control.states[0].reason, "strong-dup:row-owner", String(duplicateOfId));
+        assert.deepEqual(controlSeen, [], `${duplicateOfId}: parked by the heal, never promoted`);
+        assert.equal(control.books, 0, String(duplicateOfId));
+    }
+});
+
+test("the exemption does not depend on the heal: a row that KEEPS its key is cleared too", async () => {
+    // The key is free here, so the heal claims it and never reaches its override
+    // branch at all. The human's decision still has to survive the weak net —
+    // `row-owner` is a live twin with the same ref either way, and the row would
+    // otherwise park `weak-dup:row-owner` holding the very key it just claimed.
+    const rows = [keylessRead({ duplicateOfId: "row-owner" })];
+    const seen: WeakVerdict[] = [];
+    const h = harness(rows, { ...LIVE, promoteToBooking: weakNetPromotion(rows, seen) });
+
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 });
+    assert.deepEqual(h.strongClaims.map(c => c.key), ["2026-08-03|82766"], "the key was free and it took it");
+    assert.deepEqual(seen, [{ kind: "distinct", twinIds: [], humanDistinctFrom: "row-owner" }]);
+    assert.deepEqual(h.states, [], "nothing parked");
+    assert.equal(h.bookedRows[0].dedupStrongKey, "2026-08-03|82766");
+});
+
+test("a heal that loses its fence books nothing and reports STALE", async () => {
+    const h = harness([keylessRead()], {
+        ...LIVE,
+        claimStrongKey: async () => ({ owned: false, strongOwner: null }),
+    });
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { STALE: 1 });
+    assert.deepEqual(h.promoted, [], "the successor owns this row");
+    assert.equal(h.books, 0);
+    assert.deepEqual(h.states, [], "and nothing was written");
+});
+
+test("a heal whose PARK loses its fence reports STALE too", async () => {
+    const h = harness([keylessRead()], {
+        ...LIVE,
+        claimStrongKey: async () => ({
+            owned: true,
+            strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" },
+        }),
+        applyState: async () => false,
+    });
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { STALE: 1 });
+    assert.equal(h.books, 0);
+});
+
+test("a row that already HOLDS its key spends no round trip on the heal", async () => {
+    const h = harness([keylessRead({ dedupStrongKey: "2026-08-03|82766" })], LIVE);
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 });
+    assert.deepEqual(h.strongClaims, [], "the overwhelming majority of rows are this one");
+    assert.equal(h.bookedRows[0].dedupStrongKey, "2026-08-03|82766");
+});
+
+test("a revived row does not claim the key its routing gates WITHHELD", async () => {
+    // The row parked `date-implausible` at routing and claimed nothing, on
+    // purpose: the read date is half the strong key, so a misread year must not
+    // be allowed to mint one. Set job sends it to READ, where the heal re-derives
+    // that very key — and must refuse it for that very reason. Otherwise the row
+    // parks `date-implausible` all over again, now HOLDING a key routing
+    // deliberately kept from it.
+    const h = harness([keylessRead({
+        txnDate: new Date("2026-02-01T00:00:00.000Z"),
+        readJson: '{"doc_type":"receipt","vendor":"Lowes","date":"2026-02-01","invoice":"82766","total_amount":"364.98"}',
+    })], LIVE);
+
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { BOOKED: 1 });
+    assert.deepEqual(h.strongClaims, [], "no claim was even attempted");
+    assert.equal(h.books, 1, "and the row still reaches book.ts, which owns the date verdict");
+    assert.equal(h.bookedRows[0].dedupStrongKey, null);
+});
+
+test("a dry-run row is not healed: it is not about to book", async () => {
+    for (const [label, row, over] of [
+        ["the row's own flag", keylessRead({ dryRun: true }), LIVE],
+        ["the global switch", keylessRead(), { isDryRunEnabled: () => true }],
+    ] as const) {
+        const h = harness([row], over);
+        assert.deepEqual((await runIntakeWorker(h.deps)).byState, { READ: 1 }, label);
+        assert.deepEqual(h.strongClaims, [], `${label}: no claim`);
+        assert.equal(h.books, 0, label);
+        assert.equal(h.releasedClaims.length, 1, `${label}: parked for dry run, claim handed back`);
+    }
+});
+
+// ── recoverStrongKey, on its own ───────────────────────────────────────────
+
+test("recoverStrongKey re-derives the key with the SAME rule routing used", () => {
+    const base = {
+        docType: "receipt",
+        refNumber: "82766",
+        txnDate: new Date("2026-08-03T00:00:00.000Z") as Date | null,
+        totalCents: 36498 as number | null,
+        createdAt: new Date("2026-08-20T09:00:00.000Z"),
+        readJson: '{"doc_type":"receipt","vendor":"Lowes","date":"2026-08-03","invoice":"82766","total_amount":"364.98"}' as string | null,
+    };
+    const recovered = recoverStrongKey(base, "America/Los_Angeles");
+    assert.equal(recovered?.key, "2026-08-03|82766");
+    // The RouteInput a collision is judged with: the row's own total, the read's
+    // canonical vendor, and the document's date (never the arrival fallback).
+    assert.deepEqual(recovered?.routeInput, {
+        docType: "receipt",
+        amount: "364.98",
+        totalCents: 36498,
+        canonicalVendor: "lowes",
+        dateStr: "2026-08-03",
+        referenceDay: "2026-08-20",
+    });
+
+    // A CHECK keys off its check number, exactly as dedupKeys does. `totalCents`
+    // moves WITH the read: it is written from these keys at read time, so the
+    // recovery refuses a row whose money disagrees with its own JSON.
+    const check = recoverStrongKey({
+        ...base,
+        docType: "check",
+        refNumber: "Check4178",
+        totalCents: 120000,
+        readJson: '{"doc_type":"check","vendor":"Bob the Sub","date":"2026-08-03","check_number":"4178","total_amount":"1200.00"}',
+    }, "America/Los_Angeles");
+    assert.equal(check?.key, "2026-08-03|check4178");
+    assert.equal(check?.routeInput.docType, "check");
+
+    // A row RE-CLASSIFIED after the read is not the document this JSON describes.
+    assert.equal(recoverStrongKey({ ...base, docType: "check" }, "America/Los_Angeles"), null);
+    assert.equal(
+        recoverStrongKey({
+            ...base,
+            readJson: '{"doc_type":"multi","vendor":"Lowes","date":"2026-08-03","invoice":"82766","total_amount":"364.98"}',
+        }, "America/Los_Angeles"),
+        null,
+        "and a docType routing would never have keyed answers null",
+    );
+
+    // A txnDate that disagrees with the read means a column was edited.
+    assert.equal(
+        recoverStrongKey({ ...base, txnDate: new Date("2026-08-04T00:00:00.000Z") }, "America/Los_Angeles"),
+        null,
+    );
+    assert.equal(recoverStrongKey({ ...base, txnDate: null }, "America/Los_Angeles"), null);
+
+    // AND SO DOES A TOTAL THAT DISAGREES. `totalCents` was written from these
+    // same keys at read time, so a row whose money no longer matches its read is
+    // a row somebody edited, and this key is no longer its identity — the same
+    // test refNumber and txnDate get, on the third column routing wrote.
+    assert.equal(
+        recoverStrongKey({ ...base, totalCents: 36497 }, "America/Los_Angeles"),
+        null,
+        "one cent out is still a column that was edited",
+    );
+    assert.equal(recoverStrongKey({ ...base, totalCents: null }, "America/Los_Angeles"), null);
+    // THE CONTROL, so the two nulls above are the new check and not the
+    // re-derivation quietly breaking.
+    assert.equal(recoverStrongKey({ ...base, totalCents: 36498 }, "America/Los_Angeles")?.key, "2026-08-03|82766");
+    assert.equal(recoverStrongKey({ ...base, readJson: null }, "America/Los_Angeles"), null);
+    assert.equal(recoverStrongKey({ ...base, readJson: "{" }, "America/Los_Angeles"), null);
+});
+
+test("recoverStrongKey runs routing's DOCUMENT GATES, so a heal cannot claim what routing refused", () => {
+    // The row arrived on 2026-08-20 Pacific. Each case below is a document
+    // routing would have parked BEFORE the strong claim, so the heal — which
+    // runs after a human revived the row, with routing long gone — must reach
+    // the same answer rather than handing it an identity on the way to booking.
+    const base = {
+        docType: "receipt",
+        refNumber: "82766",
+        txnDate: new Date("2026-08-03T00:00:00.000Z") as Date | null,
+        totalCents: 36498 as number | null,
+        createdAt: new Date("2026-08-20T09:00:00.000Z"),
+        readJson: '{"doc_type":"receipt","vendor":"Lowes","date":"2026-08-03","invoice":"82766","total_amount":"364.98"}' as string | null,
+    };
+    const read = (over: Record<string, string>) => JSON.stringify({
+        doc_type: "receipt", vendor: "Lowes", date: "2026-08-03",
+        invoice: "82766", total_amount: "364.98", ...over,
+    });
+
+    // THE CONTROL: the plausible row still gets its key, so every null below is
+    // the gate speaking and not the re-derivation failing.
+    assert.equal(recoverStrongKey(base, "America/Los_Angeles")?.key, "2026-08-03|82766");
+
+    // 200 days back: a misread year or month, not a late upload (the Sunbelt
+    // 2023 read). txnDate agrees with the read, so only the gate can refuse it.
+    assert.equal(
+        recoverStrongKey({
+            ...base,
+            txnDate: new Date("2026-02-01T00:00:00.000Z"),
+            readJson: read({ date: "2026-02-01" }),
+        }, "America/Los_Angeles"),
+        null,
+        "a date 200 days before arrival",
+    );
+    // Ten days ahead of arrival is past the three days clock skew allows for.
+    assert.equal(
+        recoverStrongKey({
+            ...base,
+            txnDate: new Date("2026-08-30T00:00:00.000Z"),
+            readJson: read({ date: "2026-08-30" }),
+        }, "America/Los_Angeles"),
+        null,
+        "a date 10 days after arrival",
+    );
+    // A $0.00 read never books automatically, and never keys.
+    assert.equal(
+        recoverStrongKey({
+            ...base,
+            totalCents: 0,
+            readJson: read({ total_amount: "0.00" }),
+        }, "America/Los_Angeles"),
+        null,
+        "a zero total",
+    );
+    // A negative total is a refund: a real document, but one a human has to
+    // place against the original purchase.
+    assert.equal(
+        recoverStrongKey({
+            ...base,
+            totalCents: -2257,
+            readJson: read({ total_amount: "-22.57" }),
+        }, "America/Los_Angeles"),
+        null,
+        "a negative total",
     );
 });

@@ -90,6 +90,19 @@ export const MAX_RECEIPT_AGE_DAYS = 120;
 export const MAX_RECEIPT_FUTURE_DAYS = 3;
 /** The park reason both the routing gate and the booking gate write. */
 export const DATE_IMPLAUSIBLE_REASON = "date-implausible";
+/**
+ * The verdict a row gets when the strong key it should hold is already held by
+ * a LIVE row, and the collision was not resolved automatically.
+ *
+ * Routing itself never writes this: with both documents routed, an agreeing
+ * pair is DUPLICATE and a disagreeing one is `strong-dup-amount-mismatch:` or
+ * `vendor-mismatch:`. It belongs to the heal in worker.ts, which claims a key
+ * for a row that reached READ/BOOKING without one — a row that got there by a
+ * HUMAN reviving it, so its collision is never auto-quarantined. Named here,
+ * beside the reasons routing writes, so the queue's vocabulary lives in one
+ * file.
+ */
+export const STRONG_DUP_REASON_PREFIX = "strong-dup:";
 
 const DAY_MS = 86_400_000;
 
@@ -169,6 +182,13 @@ export function isImplausibleReceiptDate(
  *    in the same block, for the same reason: the read date IS half the strong
  *    key, so a misread year must not be allowed to claim one.
  *  - no project means nobody can job-cost it yet; that is a queue, not a fault.
+ *    Decided AFTER the strong net, because a jobless row must still CLAIM its
+ *    key: Set job sends it to READ, and READ never routes again (see
+ *    worker.ts), so the claim happens during this pass or never. With the key
+ *    held, its copy arriving later becomes DUPLICATE or a mismatch review
+ *    instead of a second NEEDS_JOB row for the same document. It stays BEFORE
+ *    the weak net, whose verdict is deferred to promotion anyway for a row
+ *    nobody can book yet.
  *  - a strong hit at the SAME total is the same purchase arriving twice —
  *    UNLESS the two documents name different vendors. The v3.6 key is
  *    deliberately vendor-less (:1545–1557: one store's own formats spell its
@@ -210,9 +230,6 @@ export function routeState(read: RouteInput, dedupHits: DedupHits, hasProject: b
     if (isImplausibleReceiptDate(read.dateStr, read.referenceDay)) {
         return { state: "NEEDS_REVIEW", stateReason: DATE_IMPLAUSIBLE_REASON, duplicateOfId: null };
     }
-    if (!hasProject) {
-        return { state: "NEEDS_JOB", stateReason: null, duplicateOfId: null };
-    }
     if (dedupHits.strong) {
         // A null owner total means a claim we cannot confirm the amount of —
         // read that as "can't confirm the totals match", never as a match.
@@ -241,6 +258,11 @@ export function routeState(read: RouteInput, dedupHits: DedupHits, hasProject: b
             stateReason: `strong-dup-amount-mismatch:${dedupHits.strong.id}`,
             duplicateOfId: dedupHits.strong.id,
         };
+    }
+    // AFTER the strong verdict, BEFORE the weak one — see the ordering note
+    // above: a jobless row has to claim its key on the one pass that routes it.
+    if (!hasProject) {
+        return { state: "NEEDS_JOB", stateReason: null, duplicateOfId: null };
     }
     if (dedupHits.weak) {
         return {
@@ -404,4 +426,23 @@ export const NO_ARTIFACT_STATE_REASONS: ReadonlySet<string> = new Set(Object.val
  */
 export function intakeArtifactIsVerified(stateReason: string | null | undefined): boolean {
     return !(typeof stateReason === "string" && NO_ARTIFACT_STATE_REASONS.has(stateReason));
+}
+
+/**
+ * May a terminal park hand the strong dedup key back?
+ *
+ * ONLY when the row has OUTLIVED ITS DOCUMENT — the two NO_ARTIFACT reasons.
+ * Every other parked row is alive: it still represents its document and a
+ * human can revive it (Set job sends a NEEDS_JOB / NEEDS_REVIEW row to READ,
+ * Retry resumes at RECEIVED or BOOKING). A revived row books WITHOUT passing
+ * through routing again, so a key given back at park time is never re-claimed.
+ * That was the double-booking hole: A parks `no-estimate` and releases its key;
+ * the same document is re-sent, its total read differently, misses both nets
+ * and books; A is then given a job and books too.
+ *
+ * The caller still ANDs this with "no send may have happened": a row whose
+ * bytes are gone but which may already hold a Purchase keeps its key.
+ */
+export function parkReleasesStrongKey(reason: string): boolean {
+    return NO_ARTIFACT_STATE_REASONS.has(reason);
 }

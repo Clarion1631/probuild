@@ -20,10 +20,13 @@ import {
     backoffMs,
     MAX_BOOK_ATTEMPTS,
     NO_ARTIFACT_PARK_REASONS,
+    parkReleasesStrongKey,
     routeState,
+    STRONG_DUP_REASON_PREFIX,
     TAX_IMPLAUSIBLE_REASON,
     type DedupHits,
     type ReceiptIntakeState,
+    type RouteInput,
 } from "./route-state";
 import { duplicateChainReason } from "./duplicate-guard";
 import { judgeWeakGroup, type WeakGroupRow } from "./weak-net";
@@ -40,7 +43,7 @@ import {
     QboPurchaseFaultError,
     QboVendorDuplicateError,
 } from "@/lib/qbo-receipt-push";
-import { READ_BUDGET_MS, type ProjectPhase, type ReadOutcome } from "./read";
+import { parseReadJson, READ_BUDGET_MS, type ProjectPhase, type ReadOutcome } from "./read";
 import type { VerifiedBytes } from "./stored-object";
 import { STORAGE_TIMEOUT_MESSAGE } from "./bucket";
 
@@ -285,6 +288,29 @@ export interface WorkerRow extends BookableRow {
     fileSize: number;
     readAt: Date | null;
     dedupWeakKey: string | null;
+    /**
+     * The document's identity, as routing claimed it — or null.
+     *
+     * Null on a row that reached READ/BOOKING without one: routing released it
+     * (the old rule), or never claimed it because the row was jobless. THIS FILE
+     * IS THE ONLY PLACE THAT CAN PUT IT BACK, because a human revival
+     * (`setReceiptIntakeJob`, `unmarkReceiptIntakeDuplicate`) writes READ
+     * directly and READ never routes again.
+     */
+    dedupStrongKey: string | null;
+    /**
+     * The model's raw JSON, persisted at read time. `recoverStrongKey` re-derives
+     * the key from it with the SAME `dedupKeys` routing used, so the heal cannot
+     * invent an identity routing would not have given the row.
+     */
+    readJson: string | null;
+    /**
+     * The row this one was last compared to — set by whichever review named it
+     * (`strong-dup-amount-mismatch:`, `vendor-mismatch:`, `strong-dup:`). Set job
+     * keeps the column, so a heal colliding with exactly that row means a human
+     * has already seen this pair and chosen to book anyway.
+     */
+    duplicateOfId: string | null;
     busyPasses: number;
     /**
      * The fallback transaction date when the document's own date is
@@ -382,6 +408,12 @@ export interface WorkerDependencies {
         ownership: Ownership,
     ) => Promise<{ strongOwner: StrongOwner | null; owned: boolean }>;
     /**
+     * Claim the strong key for a row that reached READ/BOOKING without one.
+     * CAS'd on ownership like every other write. When the partial unique index
+     * refuses the claim, returns the live owner instead of throwing.
+     */
+    claimStrongKey: (rowId: string, key: string, ownership: Ownership) => Promise<{ owned: boolean; strongOwner: StrongOwner | null }>;
+    /**
      * EVERY live row sharing this weak key, not just the first.
      *
      * A `findFirst` cannot answer the question the weak net now asks — "is this
@@ -442,6 +474,14 @@ export interface WorkerDependencies {
          * promotion.
          */
         autoDistinctFrom?: string[];
+        /**
+         * The ONE weak twin the net did not judge, because a human already had
+         * (`duplicateOfId`) — see healStrongKey's override below, which this is
+         * the second half of. Reported for the same audit row, and for the same
+         * reason the worker ignores `autoDistinctFrom`: nothing is left to
+         * decide.
+         */
+        humanDistinctFrom?: string | null;
     }>;
     /** The pass's ONE absolute deadline — never a snapshot of "time left". */
     book: (row: BookableRow) => Promise<BookResult>;
@@ -681,6 +721,97 @@ export function toDateStr(date: Date): string {
     return date.toISOString().slice(0, 10);
 }
 
+export interface StrongKeyRecovery {
+    key: string;
+    routeInput: RouteInput;
+}
+
+/**
+ * The strong key this row SHOULD hold, re-derived from its persisted read with
+ * the very same dedupKeys() routing used — or null when it is legitimately
+ * unobtainable: a placeholder ref, a date the reader could not find (the
+ * fallback is OUR value, never the document's), a read that no longer parses,
+ * or a docType routing would never have keyed. The persisted refNumber and
+ * txnDate must agree with the re-derivation; if they do not, a column was
+ * edited after routing and nothing is claimed. Routing's DOCUMENT GATES are run
+ * again at the end for the same reason, so this can only ever hand back a key
+ * routing itself would have minted for the same row.
+ *
+ * `txnDate` is compared as its UTC day, which is what `dateOnly` produces for
+ * every zone at or behind UTC (the company's is America/Los_Angeles). A zone
+ * ahead of UTC would store the previous UTC day and every comparison here would
+ * disagree — in the safe direction: no key is claimed, and the row books
+ * exactly as it does today.
+ *
+ * PURE. The whole point of re-deriving rather than trusting a column is that
+ * this can be asserted without a database.
+ */
+export function recoverStrongKey(
+    row: Pick<WorkerRow, "readJson" | "refNumber" | "txnDate" | "docType" | "totalCents" | "createdAt">,
+    timeZone: string,
+): StrongKeyRecovery | null {
+    if (!row.readJson || !row.txnDate) return null;
+    // No phases: a suggestion is not part of any key, and offering none cannot
+    // change what the keys come out as.
+    const read = parseReadJson(row.readJson, []);
+    if (!read) return null;
+    // The two docTypes routing keys, AND the row must still agree with the read:
+    // a re-classified row is not the document this JSON describes.
+    if (read.docType !== "receipt" && read.docType !== "check") return null;
+    if (row.docType !== read.docType) return null;
+
+    const arrivalDay = dayKeyInTimeZone(row.createdAt, timeZone);
+    const keys = dedupKeys({
+        docType: read.docType,
+        vendor: read.vendor,
+        date: read.date,
+        invoice: read.invoice,
+        checkNumber: read.checkNumber,
+        totalAmount: read.totalAmount,
+        fallbackDateStr: arrivalDay,
+    });
+    if (!keys.strong) return null;
+    // The row's own columns are the check on the re-derivation: they were written
+    // FROM these keys at read time, so a disagreement means somebody edited one
+    // of them afterwards and this key is no longer this row's identity.
+    if (keys.ref !== row.refNumber) return null;
+    if (keys.dateStr !== toDateStr(row.txnDate)) return null;
+    // Same reason, same column-was-edited test: `totalCents` is written from
+    // these keys at read time (`base` below), so a disagreement means the money
+    // no longer matches the document this key names. It also makes the document
+    // gates below see exactly the cents routing saw.
+    if (centsOf(keys.amount) !== row.totalCents) return null;
+
+    const routeInput: RouteInput = {
+        docType: read.docType,
+        amount: keys.amount,
+        // The ROW's total, not the read's: it is what a strong-key owner is
+        // compared against everywhere else. The check above means the two agree,
+        // so this is the number routing itself gated on either way.
+        totalCents: row.totalCents,
+        canonicalVendor: canonicalVendor(read.vendor),
+        dateStr: keys.dateReadOffDocument ? keys.dateStr : null,
+        referenceDay: arrivalDay,
+    };
+
+    // ROUTING'S OWN DOCUMENT GATES, RUN AGAIN — the gates that WITHHELD the key
+    // at routing withhold it here too: a date that cannot belong to this row ("a
+    // misread year must not be allowed to claim one", route-state.ts), a zero or
+    // negative total, a docType nothing keys. Without this, a row parked
+    // `date-implausible` (which never claimed a key, on purpose) and then revived
+    // by Set job would come through here, claim the identity routing deliberately
+    // refused it, and park `date-implausible` all over again — now HOLDING a key
+    // that belongs to no verified document.
+    //
+    // `hasProject: true` because a MISSING JOB is not a document gate: it is a
+    // verdict about our records, and book.ts owns it. Feeding the row's real job
+    // in would make the identity depend on whether anyone has filed it yet, which
+    // is the coupling the claim-before-the-job-gate change exists to remove.
+    if (routeState(routeInput, { strong: null, weak: null }, true).state !== "READ") return null;
+
+    return { key: keys.strong, routeInput };
+}
+
 /** One pass. Never throws for a single bad row — one poison document must not stall the queue. */
 export interface CutoverRequest {
     /**
@@ -845,7 +976,14 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
                 // that kept the claim left the row owned by a finished pass.
                 const live = !row.dryRun && !dryRunGlobal;
                 if (!live) { bump(await parkForDryRun(row, deps)); continue; }
-                const promotion = await deps.promoteToBooking(row.id, row.dedupWeakKey, row.claimToken);
+                // BEFORE the promotion, because this is the last point at which a
+                // row that was revived by a human (Set job, Retry) can still
+                // claim the identity routing never gave it. A dry-run row never
+                // gets here, which is correct: it is not about to book.
+                const healedRead = await healStrongKey(row, deps);
+                if ("parked" in healedRead) { bump(healedRead.parked); continue; }
+                current = healedRead.row;
+                const promotion = await deps.promoteToBooking(current.id, current.dedupWeakKey, current.claimToken);
                 if (promotion.stale) {
                     // Superseded between the claim and the promotion. The
                     // successor owns this row; write nothing, book nothing.
@@ -867,14 +1005,19 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
                 // "READ". The claim token is unchanged — promoteToBooking is
                 // fenced on it and does not reissue it — so the rest of the
                 // ownership tuple still holds.
-                current = { ...row, state: "BOOKING", dryRun: false };
+                current = { ...current, state: "BOOKING", dryRun: false };
                 const result = await deps.book(current);
                 await deps.applyBookResult(current.id, result, current.claimToken);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
                 if (row.dryRun || dryRunGlobal) { bump(await parkForDryRun(row, deps)); continue; }
-                const result = await deps.book(row);
-                await deps.applyBookResult(row.id, result, row.claimToken);
+                // Same heal, for the row that resumes here: "Retry now" sends a
+                // parked row straight back to BOOKING without routing it.
+                const healedBooking = await healStrongKey(row, deps);
+                if ("parked" in healedBooking) { bump(healedBooking.parked); continue; }
+                current = healedBooking.row;
+                const result = await deps.book(current);
+                await deps.applyBookResult(current.id, result, current.claimToken);
                 bump(stateForBookResult(result));
             }
         } catch (error) {
@@ -931,6 +1074,95 @@ async function parkForDryRun(row: WorkerRow, deps: WorkerDependencies): Promise<
         ownershipOf(row),
     ).catch(() => false);
     return released ? row.state : "STALE";
+}
+
+/**
+ * A row about to book without its strong key claims it now, or learns that it
+ * cannot.
+ *
+ * READ AND BOOKING ARE REACHED WITHOUT ROUTING. `setReceiptIntakeJob` and
+ * `unmarkReceiptIntakeDuplicate` write READ straight onto a parked row, and
+ * "Retry now" resumes a row at BOOKING; none of them runs the routing that
+ * claims a strong key. So a row whose key was released at park time (the old
+ * rule), or never claimed because the row was jobless, would book owning no
+ * identity at all — and the same document re-sent, read with a different total,
+ * would miss both nets and book a second time.
+ *
+ * The key is RE-DERIVED from the row's persisted read rather than trusted from
+ * anywhere, so this can never claim an identity routing itself would not have
+ * given the row. A null recovery is a legitimate answer and the row books as it
+ * always did.
+ *
+ * Returns the row to carry forward, a terminal state name when the row was
+ * parked here, or "STALE" when ownership was lost.
+ */
+async function healStrongKey(
+    row: WorkerRow,
+    deps: WorkerDependencies,
+): Promise<{ row: WorkerRow } | { parked: string }> {
+    // Already owns one. No dep call: the overwhelming majority of rows are here.
+    if (row.dedupStrongKey !== null) return { row };
+
+    const recovery = recoverStrongKey(row, await deps.companyTimeZone());
+    if (!recovery) {
+        // Every other null is a property of the DOCUMENT (no readable date, a
+        // placeholder ref, a docType nothing keys) and is not news. A read that
+        // no longer parses is a property of OUR data, so it gets a line.
+        if (row.readJson && !parseReadJson(row.readJson, [])) {
+            console.warn(
+                "[receipt-intake] readJson no longer parses, so no strong key can be recovered",
+                JSON.stringify({ rowId: row.id }),
+            );
+        }
+        return { row };
+    }
+
+    const claim = await deps.claimStrongKey(row.id, recovery.key, ownershipOf(row));
+    // Lost the row mid-pass. Write nothing, book nothing.
+    if (!claim.owned) return { parked: "STALE" };
+    if (claim.strongOwner === null) return { row: { ...row, dedupStrongKey: recovery.key } };
+
+    // A HUMAN ALREADY SAW THIS EXACT COLLISION. The review that parked the row
+    // named the owner in `duplicateOfId` (`strong-dup:`, `vendor-mismatch:`,
+    // `strong-dup-amount-mismatch:`), and they pressed Set job anyway. Re-parking
+    // it against the same row would overrule that decision with the very fact
+    // they were shown, so the row books — keyless, which is the honest state: the
+    // identity belongs to the other row.
+    //
+    // THE OTHER HALF OF THIS EXEMPTION IS IN promoteToBooking: the owner named
+    // here is a live twin with the same vendor, day, amount and ref, so the weak
+    // net would have parked the row `weak-dup:<owner>` the instant this branch
+    // let it past — every button looping. `judgeWeakGroup` therefore drops the
+    // twin `self.duplicateOfId` names (weak-net.ts), which is what makes this
+    // exit real end to end rather than a two-step version of the same stop.
+    if (claim.strongOwner.id === row.duplicateOfId) {
+        console.warn(
+            "[receipt-intake] strong key held by the row a human already compared it to; booking without one",
+            JSON.stringify({ rowId: row.id, key: recovery.key, ownerId: claim.strongOwner.id }),
+        );
+        return { row };
+    }
+
+    const decision = routeState(recovery.routeInput, { strong: claim.strongOwner, weak: null }, true);
+    // NEVER AUTO-QUARANTINE FROM HERE. A row is keyless at this point largely
+    // because a human put it here, so DUPLICATE — which retires the row without
+    // asking — is not this function's to write. The same collision that routing
+    // resolves automatically becomes a review item instead, naming the owner.
+    const verdict = decision.state === "DUPLICATE"
+        ? {
+            state: "NEEDS_REVIEW" as ReceiptIntakeState,
+            stateReason: STRONG_DUP_REASON_PREFIX + claim.strongOwner.id,
+            duplicateOfId: claim.strongOwner.id,
+        }
+        : decision;
+    const owned = await deps.applyState(
+        row.id,
+        verdict.state,
+        verdict.stateReason,
+        { duplicateOfId: verdict.duplicateOfId },
+        ownershipOf(row),
+    ).catch(() => false);
+    return { parked: owned ? verdict.state : "STALE" };
 }
 
 /**
@@ -1227,13 +1459,18 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     };
 
     const gate = routeState(routeInput, { strong: null, weak: null }, hasProject);
-    if (gate.state !== "READ") {
+    if (gate.state !== "READ" && gate.state !== "NEEDS_JOB") {
         // A multi-doc, a non-receipt, a $0/negative misread, or a date that
         // cannot belong to this row must never hold a dedup key — it would
         // quarantine the real receipt that arrives next (:531 and the v3.6
         // rationale). The date matters here twice over: it is half the strong
         // key, so a misread year invents one nothing else will ever collide
         // with.
+        //
+        // NEEDS_JOB IS NOT ONE OF THOSE. It is a verdict about our records, not
+        // about the document: the receipt is perfectly readable and perfectly
+        // real, it just has nobody to bill yet. So it falls through to the
+        // claim below and parks HOLDING its key.
         //
         // Via applyState, NOT applyRead: this row is FINISHED — nothing else in
         // this pass will touch it — so the write that parks it must also hand
@@ -1286,6 +1523,20 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
             duplicateOfId: second.duplicateOfId,
         }, ownershipOf(row), note);
         return applied2.owned ? applied2.state : "STALE";
+    }
+
+    // NO JOB YET: parked AFTER the claim, HOLDING the key. Set job sends this
+    // row to READ, and READ never routes again — the strong claim happens here
+    // or never. The patch deliberately carries no `dedupStrongKey`, so the
+    // claim applyRead committed stands. The weak net is not consulted for a row
+    // nobody can book yet; promotion runs it when the row is actually about to
+    // book, exactly as before.
+    if (gate.state === "NEEDS_JOB") {
+        const jobless = await applyRoutedState(deps, row.id, gate, {
+            ...base,
+            duplicateOfId: null,
+        }, ownershipOf(row), note);
+        return jobless.owned ? jobless.state : "STALE";
     }
 
     // No strong hit (or no strong key at all — a placeholder ref). The weak net
@@ -1352,12 +1603,18 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
  * THE one place a row is parked terminally, and the one place the strong-key
  * release is decided.
  *
- * The rule is a property of the ROW, not of the reason string: if no QBO send
- * was ever attempted, no Purchase can exist, so the dedup key must go back or a
- * corrected resubmission collides with a row that never became a purchase. That
- * was previously re-derived at each call site, and the branches that forgot it
- * (file-missing, unreadable, ai-unavailable, worker-error) each held a key
- * against nothing.
+ * IT TAKES BOTH A PROPERTY OF THE ROW AND A PROPERTY OF THE REASON.
+ *
+ *   - THE REASON: only a row that has OUTLIVED ITS DOCUMENT gives its key back
+ *     (`parkReleasesStrongKey` — `receipt-bytes-missing`, `content-changed`).
+ *     Every other park here — `file-missing`, `unreadable`, `ai-unavailable`,
+ *     `storage-timeout`, `max-retries`, a worker error — leaves a row that
+ *     still represents its document and that a human revives with Set job or
+ *     Retry. Neither of those routes the row again, so a key released at park
+ *     time is never re-claimed: the same document re-sent with a differently
+ *     read total misses both nets and books, and the parked row then books too.
+ *   - THE ROW: if a QBO send may have happened, a Purchase may exist, and the
+ *     key stays claimed whatever the reason says.
  *
  * `sendAttempted` is the PERSISTED flag — markSendAttempted writes it before
  * the create precisely so this decision survives a process that died mid-send,
@@ -1372,9 +1629,11 @@ async function parkTerminal(
     reason: string,
     patch?: Partial<ReadPatch>,
 ): Promise<string> {
-    // Re-read, never the claim-time snapshot: see sendAttemptedNow.
-    const sent = row.sendAttempted || await deps.sendAttemptedNow(row.id).catch(() => true);
-    const release = sent ? {} : { dedupStrongKey: null };
+    // The re-read is only worth a round trip when a release is on the table.
+    const release = parkReleasesStrongKey(reason)
+        && !(row.sendAttempted || await deps.sendAttemptedNow(row.id).catch(() => true))
+        ? { dedupStrongKey: null }
+        : {};
     const owned = await deps
         .applyState(row.id, "NEEDS_REVIEW", reason, { ...(patch ?? {}), ...release }, ownershipOf(row))
         .catch(() => false);

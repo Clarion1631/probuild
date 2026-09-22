@@ -283,6 +283,7 @@
       <tr><td><code>push-disabled</code></td><td>Booking is switched off in the system settings. That is not the switch on this page. Nothing is wrong with the receipt.</td><td>Nothing. If it is still there tomorrow, tell Justin.</td></tr>
       <tr><td><code>multi-doc</code></td><td>The file has more than one receipt in it, so the system will not guess.</td><td>Save or scan each receipt as its own file. Drop those in the <b>New Receipts &amp; Checks</b> Drive folder, in the right job's folder. Then press "Void" on this row. Automatic splitting is being built.</td></tr>
       <tr><td><code>weak-dup:</code> and a long id</td><td>This looks like it might be a copy of another receipt. Same store, same day, same amount. It is often two real purchases, like two dump tickets on one day.</td><td>Press "Retry now" once. The system now tells two real purchases apart when each has its own ticket number, and books them. If the row comes back, leave it alone and tell Justin. Do not void it.</td></tr>
+      <tr><td><code>strong-dup:</code> and a long id</td><td>Another receipt already holds this one's date and reference number.</td><td>Set a job to book it anyway, or mark it a duplicate. If you are not sure which, leave the row alone and tell Justin.</td></tr>
       <tr><td><code>date-implausible</code></td><td>The date the system read looks wrong. It is months before the receipt arrived, or it is in the future.</td><td>Leave the row alone and tell Justin. Do not void it. An automatic fix is being built.</td></tr>
       <tr><td><code>no-estimate</code></td><td>No job is set on this receipt, or the job it is on has no estimate. Either way there is nowhere to put the cost.</td><td>If the job is wrong or missing, pick the right one and press "Set job". If the job is right, tell Justin.</td></tr>
       <tr><td><code>refund-or-zero</code></td><td>The amount read is zero, or it is money coming back, like a return.</td><td>Leave the row alone and tell Justin.</td></tr>
@@ -292,6 +293,7 @@
       <tr><td>Anything else</td><td>A technical reason that is not yours to sort out.</td><td>Leave the row alone and tell Justin.</td></tr>
     </table>
     </div>
+    <p style="margin-top: .6rem;">A parked receipt keeps its place in line. If the same receipt is sent again while the first copy is still parked, the new copy is filed as its duplicate. To replace a parked receipt with a corrected copy, void the parked one first, then send the new one.</p>
     <p style="margin-top: .6rem;"><b>Tip:</b> "Open receipt" links work for 10 minutes after the page loads. If one shows an error, refresh the page and click it again.</p>
   </div>
 
