@@ -240,7 +240,11 @@ function TeamPageInner() {
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-hui-border text-sm">
-                                {filteredUsers.map(user => {
+                                {filteredUsers.length === 0 ? (
+                                    <tr>
+                                        <td colSpan={8} className="p-6 text-center text-hui-textMuted">No team members found.</td>
+                                    </tr>
+                                ) : filteredUsers.map(user => {
                                     const status = getStatus(user);
                                     let badgeBg = "bg-slate-100";
                                     let badgeText = "text-slate-800";
@@ -321,9 +325,6 @@ function TeamPageInner() {
                                 })}
                             </tbody>
                         </table>
-                        {filteredUsers.length === 0 && (
-                            <div className="p-6 text-center text-hui-textMuted">No team members found.</div>
-                        )}
                     </div>
                 )}
 
