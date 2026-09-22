@@ -113,6 +113,17 @@ const REASON_TEXTS: Array<{ test: RegExp; text: (row: ReasonTextRow) => string }
         test: /^vendor-mismatch:/,
         text: () => "Same invoice number and total as another receipt, but a different vendor name.",
     },
+    {
+        // Written only by the worker's duplicate transition: routing said
+        // DUPLICATE, but rows are already filed behind this one, so it cannot
+        // become a copy itself (duplicate-guard.ts). The action is on the rows
+        // behind it. Said out loud because this row still carries
+        // `duplicateOfId`, and Set job on it would book it past the twin it
+        // matches, exactly as it does for `strong-dup:`. That is a decision a
+        // person may make, but not one they should make by accident.
+        test: /^duplicate-chain:/,
+        text: () => "Other receipts are filed as duplicates of this one, and it matches another receipt itself. Unmark the ones filed behind it first, or leave it and tell Justin.",
+    },
     { test: /^date-implausible$/, text: dateSentence },
     { test: /^invalid-date$/, text: () => "I could not read a date on this one." },
     {

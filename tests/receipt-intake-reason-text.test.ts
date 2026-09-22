@@ -22,6 +22,7 @@ const KNOWN: Array<[string, string]> = [
     ["strong-dup-amount-mismatch:cmg8x2q0000abcd", "a different total. The two do not agree."],
     ["strong-dup:cmg8x2q0000abcd", "Another receipt already holds this one's date and reference number."],
     ["vendor-mismatch:cmg8x2q0000abcd", "but a different vendor name."],
+    ["duplicate-chain:cmg8x2q0000abcd,cmg8x2q0000efgh", "Unmark the ones filed behind it first"],
     ["date-implausible", "which is 4 days before it arrived."],
     ["invalid-date", "I could not read a date on this one."],
     ["multi-doc", "This file has more than one receipt in it."],
