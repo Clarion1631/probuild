@@ -202,11 +202,13 @@ function depsFor(s: Store, overrides: Partial<EvidenceCloseDeps> = {}): Evidence
     return {
         lookbackDays: LOOKBACK,
         findLines: async () => s.lines.map(id => ({ id })),
-        openIssueKeys: async ids => new Set(
-            ids.filter(id => {
-                const issue = s.issues.get(id);
-                return !!issue && issue.clearedAt === null;
-            }),
+        openIssueKeys: async ids => new Map(
+            ids
+                .filter(id => {
+                    const issue = s.issues.get(id);
+                    return !!issue && issue.clearedAt === null;
+                })
+                .map(id => [id, s.issues.get(id)!.id]),
         ),
         recompute: async targetKey => { s.recomputes.push(targetKey); return []; },
         applyCodes: realApplyCodes(s),
@@ -244,7 +246,7 @@ test("running twice clears once: the second pass reaches the lifecycle and gets 
     // already cleared -> noop), not the open-issue filter, that keeps this
     // second pass from writing again.
     const second = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
-        openIssueKeys: async () => new Set(["line-open"]),
+        openIssueKeys: async () => new Map([["line-open", "issue-line-open"]]),
     }));
     assert.deepEqual(second.cleared, [], "the lifecycle's own decision was noop, not clear — nothing to count");
     assert.equal(second.examined, 1);
@@ -252,7 +254,7 @@ test("running twice clears once: the second pass reaches the lifecycle and gets 
     assert.equal(s.writes.length, writesAfterFirst, "no second write of any kind");
 });
 
-test("a non-empty verdict leaves the issue open — there is no force-close", async () => {
+test("a non-empty verdict leaves the issue open — there is no force-close, and it is recorded in `judged`", async () => {
     const s = store(["line-open"], ["line-open"]);
     const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
         recompute: async targetKey => { s.recomputes.push(targetKey); return ["MISSING_RECEIPT"] as ReasonCode[]; },
@@ -261,6 +263,8 @@ test("a non-empty verdict leaves the issue open — there is no force-close", as
     assert.deepEqual(result.cleared, []);
     assert.equal(result.examined, 1);
     assert.equal(result.errors, 0);
+    // ids only — never a descriptor, amount or payee (Codex round-2 addendum).
+    assert.deepEqual(result.judged, [{ lineId: "line-open", issueId: "issue-line-open", codes: ["MISSING_RECEIPT"] }]);
     assert.equal(s.issues.get("line-open")!.clearedAt, null);
     assert.deepEqual(s.writes, [], "a still-owed charge is not written to at all");
 });
@@ -299,7 +303,7 @@ test("an exhausted caller deadline skips the whole step", async () => {
         findLines: async () => { throw new Error("no query may be issued past the deadline"); },
     }));
 
-    assert.deepEqual(result, { examined: 0, cleared: [], errors: 0, stale: 0 });
+    assert.deepEqual(result, { examined: 0, cleared: [], errors: 0, stale: 0, judged: [] });
 });
 
 test("THE FENCE: a close writes nothing to the cycle record, either cursor, or chaserCompletedAt", async () => {
@@ -398,7 +402,7 @@ test("REGRESSION, ARCO $93.09 on 2026-09-16: the booked receipt closes the open 
         }),
     );
 
-    assert.deepEqual(result, { examined: 1, cleared: [BANK_LINE], errors: 0, stale: 0 });
+    assert.deepEqual(result, { examined: 1, cleared: [BANK_LINE], errors: 0, stale: 0, judged: [] });
     assert.equal(s.issues.get(BANK_LINE)!.clearedAt !== null, true);
     assert.equal(seen.length, 1);
     assert.equal(seen[0].strict, undefined, "LENIENT: strictCompleteness is never passed — strict is for card release");
@@ -431,7 +435,7 @@ test("an epoch that moves between judging and applying withholds every clear, co
         },
     }));
 
-    assert.deepEqual(result, { examined: 1, cleared: [], errors: 0, stale: 1 });
+    assert.deepEqual(result, { examined: 1, cleared: [], errors: 0, stale: 1, judged: [] });
     assert.equal(s.issues.get("line-open")!.clearedAt, null, "no lifecycle write happened");
     assert.deepEqual(s.writes, [], "the fence caught it before the CAS ever ran");
 });
@@ -442,7 +446,7 @@ test("a stable epoch clears normally — the fence only withholds on an actual m
         readEpochs: async () => ({ evidence: "7", ledger: "3" }),
     }));
 
-    assert.deepEqual(result, { examined: 1, cleared: ["line-open"], errors: 0, stale: 0 });
+    assert.deepEqual(result, { examined: 1, cleared: ["line-open"], errors: 0, stale: 0, judged: [] });
 });
 
 test("a setup failure — the candidate query, the open-issue lookup, or the epoch read — is counted, never thrown", async () => {
@@ -451,17 +455,17 @@ test("a setup failure — the candidate query, the open-issue lookup, or the epo
     const findLinesThrows = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
         findLines: async () => { throw new Error("pool timeout"); },
     }));
-    assert.deepEqual(findLinesThrows, { examined: 0, cleared: [], errors: 1, stale: 0 });
+    assert.deepEqual(findLinesThrows, { examined: 0, cleared: [], errors: 1, stale: 0, judged: [] });
 
     const openIssueKeysThrows = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
         openIssueKeys: async () => { throw new Error("pool timeout"); },
     }));
-    assert.deepEqual(openIssueKeysThrows, { examined: 0, cleared: [], errors: 1, stale: 0 });
+    assert.deepEqual(openIssueKeysThrows, { examined: 0, cleared: [], errors: 1, stale: 0, judged: [] });
 
     const readEpochsThrows = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
         readEpochs: async () => { throw new Error("pool timeout"); },
     }));
-    assert.deepEqual(readEpochsThrows, { examined: 0, cleared: [], errors: 1, stale: 0 });
+    assert.deepEqual(readEpochsThrows, { examined: 0, cleared: [], errors: 1, stale: 0, judged: [] });
 });
 
 test("the freshness re-check failing (not just drifting) is also counted, not thrown", async () => {
@@ -475,7 +479,7 @@ test("the freshness re-check failing (not just drifting) is also counted, not th
         },
     }));
 
-    assert.deepEqual(result, { examined: 1, cleared: [], errors: 1, stale: 0 });
+    assert.deepEqual(result, { examined: 1, cleared: [], errors: 1, stale: 0, judged: [] });
     assert.deepEqual(s.writes, [], "no clear was attempted without a confirmed-fresh read");
 });
 

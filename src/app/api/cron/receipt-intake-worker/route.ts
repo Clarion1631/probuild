@@ -1242,7 +1242,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             const evidence = await loadBookedEvidence(expenseId);
             if (!evidence) return;
             const closed = await closeRequestsSatisfiedByEvidence(evidence, { deadlineExceeded });
-            if (closed.cleared.length > 0 || closed.errors > 0 || closed.stale > 0) {
+            // `judged` is included so this expenseId-correlated line also
+            // fires for a booking whose evidence-close left something open —
+            // `closeRequestsSatisfiedBy` already warns internally, but without
+            // the expenseId that ties it back to this specific booking.
+            if (closed.cleared.length > 0 || closed.errors > 0 || closed.stale > 0 || closed.judged.length > 0) {
                 console.log("[cron/receipt-intake-worker] evidence close", JSON.stringify({ expenseId, ...closed }));
             }
         },

@@ -100,8 +100,10 @@ export interface EpochSnapshot {
 
 export interface EvidenceCloseDeps {
     findLines?: (query: CandidateBankLineQuery) => Promise<Array<{ id: string }>>;
-    /** Which of those lines have an OPEN missing-receipt issue right now. */
-    openIssueKeys?: (ids: string[]) => Promise<Set<string>>;
+    /** Which of those lines have an OPEN missing-receipt issue right now,
+     *  mapped to that issue's OWN id — not just its targetKey — so a judged
+     *  candidate can be logged with something pasteable into a row lookup. */
+    openIssueKeys?: (ids: string[]) => Promise<Map<string, string>>;
     recompute?: (
         targetKey: string,
         cache?: Map<string, ReasonCode[]>,
@@ -121,6 +123,16 @@ export interface EvidenceCloseDeps {
     readEpochs?: () => Promise<EpochSnapshot>;
 }
 
+/**
+ * A candidate the judge looked at and left OPEN — ids only, never a
+ * descriptor, amount or payee, so this is safe to log verbatim.
+ */
+export interface JudgedCandidate {
+    lineId: string;
+    issueId: string;
+    codes: ReasonCode[];
+}
+
 export interface EvidenceCloseResult {
     /** Candidates considered, open issue or not. */
     examined: number;
@@ -136,6 +148,14 @@ export interface EvidenceCloseResult {
      * genuinely still owed.
      */
     stale: number;
+    /**
+     * Candidates the judge looked at and left OPEN (a non-empty verdict) —
+     * the one place a case that stays open is explained without a database
+     * query. Bounded by the same cap as everything else here
+     * (MAX_EVIDENCE_CLOSE_CANDIDATES): every openExamined candidate lands in
+     * either this or `toClear`, never both.
+     */
+    judged: JudgedCandidate[];
 }
 
 async function defaultFindLines(query: CandidateBankLineQuery): Promise<Array<{ id: string }>> {
@@ -159,12 +179,14 @@ async function defaultFindLines(query: CandidateBankLineQuery): Promise<Array<{ 
     });
 }
 
-async function defaultOpenIssueKeys(ids: string[]): Promise<Set<string>> {
+async function defaultOpenIssueKeys(ids: string[]): Promise<Map<string, string>> {
     const rows = await prisma.reviewIssue.findMany({
         where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: ids }, clearedAt: null },
-        select: { targetKey: true },
+        // `id` alongside `targetKey`, in the SAME query — not a second round
+        // trip — so a judged candidate can be logged with the issue's own id.
+        select: { targetKey: true, id: true },
     });
-    return new Set(rows.map(row => row.targetKey));
+    return new Map(rows.map(row => [row.targetKey, row.id]));
 }
 
 /**
@@ -219,7 +241,7 @@ export async function closeRequestsSatisfiedBy(
     evidence: BookedEvidence,
     deps: EvidenceCloseDeps = {},
 ): Promise<EvidenceCloseResult> {
-    const result: EvidenceCloseResult = { examined: 0, cleared: [], errors: 0, stale: 0 };
+    const result: EvidenceCloseResult = { examined: 0, cleared: [], errors: 0, stale: 0, judged: [] };
     const deadlineExceeded = deps.deadlineExceeded ?? (() => false);
     const query = candidateBankLineQuery(evidence, deps.lookbackDays ?? EVIDENCE_LOOKBACK_DAYS);
     if (!query || deadlineExceeded()) return result;
@@ -235,7 +257,7 @@ export async function closeRequestsSatisfiedBy(
     // failure in any of the three is a READ, not a verdict — counted and
     // swallowed like every other failure here, never thrown.
     let lines: Array<{ id: string }>;
-    let open: Set<string>;
+    let open: Map<string, string>;
     let epochBefore: EpochSnapshot;
     try {
         lines = await findLines(query);
@@ -276,8 +298,15 @@ export async function closeRequestsSatisfiedBy(
         try {
             const codes = await recompute(line.id, cache, deadlineExceeded);
             // STILL OWED. There is no force-close: a non-empty verdict leaves
-            // the issue exactly as it was.
-            if (codes.length > 0) continue;
+            // the issue exactly as it was — but it is RECORDED, ids only, so a
+            // case that stays open is explained without a database query
+            // (production case, 2026-09-21: the planner said "close" for
+            // ARCO $93.09, the sweep judged it and left it open with no error,
+            // and nobody could see why).
+            if (codes.length > 0) {
+                result.judged.push({ lineId: line.id, issueId: open.get(line.id)!, codes });
+                continue;
+            }
             toClear.push(line.id);
         } catch (error) {
             result.errors++;
@@ -286,6 +315,21 @@ export async function closeRequestsSatisfiedBy(
             // The clock is not going to come back. Retrying the next candidate
             // would only spend another round trip to throw the same way.
             if (isComponentDeadlineExceeded(error)) break;
+        }
+    }
+
+    // THE SINGLE END-OF-CALL SUMMARY of everything judged and left open —
+    // logged once, right after judging, independent of whatever the
+    // freshness check or the apply loop below decide: this reports what the
+    // JUDGE saw, not what got written. Ids only — never a descriptor, amount
+    // or payee — so it is safe to log verbatim. Wrapped: a logging failure
+    // must not be how this "never throws" module throws.
+    if (result.judged.length > 0) {
+        try {
+            console.warn("[receipt-intake/evidence-close] judged, not cleared",
+                JSON.stringify({ judged: result.judged }));
+        } catch {
+            // Never let a logging failure escape — see the module header.
         }
     }
 
