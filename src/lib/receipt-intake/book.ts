@@ -585,20 +585,30 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     //
     // IT MAY ONLY STOP A **NEW** SEND, hence `!row.sendAttempted`.
     //
-    // That flag means a create was already ISSUED for this row and may well
-    // have SUCCEEDED, with only its response, its attachment, or the local
-    // Expense commit lost — and the idempotent create below is precisely what
-    // re-finds that Purchase and finishes the local half. Parking such a row
-    // behind a NON-RETRYABLE verdict would strand real money in QuickBooks with
-    // nothing in ProBuild ever able to match it, which is strictly worse than
-    // an Expense carrying a wrong date that a human can edit. So a sent row
-    // continues down exactly the path it took before this guard existed.
+    // That flag does not mean a Purchase exists; it means one MAY. It is
+    // written by the claim-fenced `markSendAttempted` CAS immediately BEFORE
+    // the network call, so a process that dies in between leaves it true with
+    // nothing ever sent — and a call that did go out may have succeeded with
+    // only its response, its attachment, or the local Expense commit lost. The
+    // idempotent create below is what resolves that either way: it re-finds a
+    // Purchase if there is one and creates it if there is not.
     //
-    // The exemption cannot become a hole: after this deploy no row can reach a
-    // FIRST send carrying an implausible date, because routing refuses it and
-    // so does this gate. The exempted set is only legacy rows already in
-    // flight. (The native rail never gets here with the flag set at all — it
-    // parks as `native-qbo-reconciliation-required` further up.)
+    // THAT "may" is the whole justification for the exemption. Parking such a
+    // row behind a NON-RETRYABLE verdict would leave real money possibly
+    // sitting in QuickBooks with nothing in ProBuild able to go and match it,
+    // which is worse than an Expense carrying a wrong date a human can edit. So
+    // a row carrying the flag continues down exactly the path it took before
+    // this guard existed — ANY such row, not only legacy ones: nothing here
+    // asks when it was sent.
+    //
+    // The exemption is still not a hole, because of what it takes to reach it.
+    // A row cannot get a FIRST send with an implausible date: routing refuses
+    // the document before it claims a key, and so does this gate. So a row that
+    // arrives here with the flag set had a date this predicate accepted when it
+    // passed on the way out, and the predicate has no clock — both sides are
+    // fixed columns of the row — so its answer cannot change underneath it.
+    // (The native rail never gets here with the flag set at all — it parks as
+    // `native-qbo-reconciliation-required` further up.)
     if (!row.sendAttempted && isImplausibleReceiptDate(calendarDay, dayKeyInTimeZone(row.createdAt, timeZone))) {
         return parkedBeforeSend(row, DATE_IMPLAUSIBLE_REASON);
     }

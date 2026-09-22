@@ -185,7 +185,7 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         read: async () => { h.reads++; return goodRead; },
         applyRead: async (_id, patch) => { h.applied.push(patch); return { owned: true, strongOwner: null }; },
-        findWeakHit: async () => null,
+        findWeakGroup: async () => [],
         applyState: async (id, state, reason, patch, ownership) => {
             h.states.push({ id, state, reason, patch, ownership });
             return true;
@@ -883,7 +883,7 @@ test("an EXACT duplicate becomes DUPLICATE, not NEEDS_REVIEW", async () => {
             h.applied.push(patch);
             return { owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } };
         },
-        findWeakHit: async () => { order.push("weak-lookup"); return { id: "row-owner" }; },
+        findWeakGroup: async () => { order.push("weak-lookup"); return [{ id: "row-owner", refNumber: null }]; },
     });
     const summary = await runIntakeWorker(h.deps);
 
@@ -896,7 +896,7 @@ test("the strong claim is attempted with the key, before any weak lookup", async
     const order: string[] = [];
     const h = harness([workerRow()], {
         applyRead: async (_id, patch) => { order.push("strong-claim"); h.applied.push(patch); return { owned: true, strongOwner: null }; },
-        findWeakHit: async () => { order.push("weak-lookup"); return null; },
+        findWeakGroup: async () => { order.push("weak-lookup"); return []; },
     });
     await runIntakeWorker(h.deps);
     assert.deepEqual(order, ["strong-claim", "weak-lookup"]);
@@ -923,7 +923,7 @@ test("a weak lookup that THROWS leaves the row RECEIVED, retryable, never READ",
     // counted it as fully deduped — a silent false negative in the one report
     // the cutover decision rests on.
     const h = harness([workerRow({ attempts: 0 })], {
-        findWeakHit: async () => { throw new Error("connection reset"); },
+        findWeakGroup: async () => { throw new Error("connection reset"); },
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { RETRY: 1 });
@@ -935,16 +935,276 @@ test("a weak lookup that THROWS leaves the row RECEIVED, retryable, never READ",
 test("a weak-only hit still asks a human, and KEEPS the strong key", async () => {
     // This row is the live owner of that date|ref. Releasing the key would let
     // a third copy claim it and book while the pair is still unresolved.
-    const h = harness([workerRow()], { findWeakHit: async () => ({ id: "row-twin" }) });
+    const h = harness([workerRow()], { findWeakGroup: async () => [{ id: "row-twin", refNumber: null }] });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
     assert.equal(h.states[0].reason, "weak-dup:row-twin");
     assert.equal(h.states[0].state, "NEEDS_REVIEW");
-    // ...and it RELEASES the strong key: nothing was sent to QuickBooks, so the
-    // documented pre-send rule applies here like anywhere else. Holding it made
-    // a CORRECTED resend collide with a row that was never booked, leaving two
-    // rows in review and neither able to proceed.
-    assert.equal(h.states[0].patch?.dedupStrongKey, null);
+    // ...and the key STAYS. This branch used to null it, which was harmless
+    // only while a weak-parked row could never book. It can now (Retry, and the
+    // pre-existing Set job), so a released key let the same document, re-sent
+    // with a differently read total, miss both nets and book a second time.
+    //
+    // The patch must not MENTION the column, rather than mentioning it with the
+    // old value: applyRead already committed the claim, so the correct patch is
+    // silent about it.
+    assert.ok(
+        !("dedupStrongKey" in (h.states[0].patch ?? {})),
+        "the weak park does not touch the strong key at all",
+    );
+});
+
+// ── The corrected weak-net invariant ───────────────────────────────────────
+//
+// The weak key is a coarse hash of vendor + day + amount; a reference number is
+// the vendor's own transaction id. Letting the hash overrule the identifier is
+// backwards, and it is why three Tapani dump tickets bought on one day for $40
+// each could never book.
+
+test("weak twins with real, different refs are DISTINCT purchases and all book", async () => {
+    // The Tapani shape: three tickets, one vendor, one day, one amount, three
+    // real ticket numbers. Every one of these used to park.
+    const refs: Record<string, string> = {
+        "row-1": "tebo-4261862",
+        "row-2": "tebo-4261886",
+        "row-3": "tebo-4261901",
+    };
+    const rows = Object.keys(refs).map(id => workerRow({ id, storagePath: `receipts/intake/${id}.jpg` }));
+    let reads = 0;
+    const weakLookups: string[] = [];
+    const h = harness(rows, {
+        // Rows are processed in claim order, so call N is row N.
+        read: async () => ({
+            ok: true,
+            read: { ...goodRead.read, invoice: refs[`row-${++reads}`] },
+        } as ReadOutcome),
+        // What the real query returns: every OTHER live row on this weak key,
+        // each carrying its own refNumber.
+        findWeakGroup: async rowId => {
+            weakLookups.push(rowId);
+            return Object.entries(refs)
+                .filter(([id]) => id !== rowId)
+                .map(([id, refNumber]) => ({ id, refNumber }));
+        },
+    });
+
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { READ: 3 }, "all three route through, none parked");
+    assert.deepEqual(h.states, [], "and nothing was parked at all");
+    assert.deepEqual(weakLookups, ["row-1", "row-2", "row-3"], "the group is still consulted once per row");
+    assert.deepEqual(h.finished.map(f => f.id), ["row-1", "row-2", "row-3"]);
+});
+
+test("a twin with NO readable ref still parks the row — and the row KEEPS its strong key", async () => {
+    // The weak net's real job: neither document can be identified on its own,
+    // so the coarse hash is the only evidence and a person decides.
+    //
+    // This row's OWN ref is real ("82766") and its date was read off the
+    // document, so it holds a strong key and must go on holding it while it
+    // waits. That identity is not in doubt just because a twin's is.
+    const h = harness([workerRow()], {
+        findWeakGroup: async () => [{ id: "row-first", refNumber: "NoInv" }],
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states[0].reason, "weak-dup:row-first");
+    assert.equal(h.applied[0].dedupStrongKey, "2026-08-03|82766", "claimed on the way in");
+    assert.ok(
+        !("dedupStrongKey" in (h.states[0].patch ?? {})),
+        "and the park leaves that claim alone",
+    );
+});
+
+test("a ref that is plausibly a MISREAD of the twin's still parks", async () => {
+    // One purchase arriving twice, as an email receipt and a paper photo, with
+    // the 8 read as a B on one of them. This must not be split.
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, invoice: "INV-95870" } } as ReadOutcome),
+        findWeakGroup: async () => [{ id: "row-first", refNumber: "INV-95B70" }],
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { NEEDS_REVIEW: 1 } });
+    assert.equal(h.states[0].reason, "weak-dup:row-first");
+});
+
+test("ONE twin it cannot tell apart parks the row, and the reason names THAT twin", async () => {
+    // The quantifier, at the call site. A findFirst-shaped rule would have
+    // answered on `row-b` — provably a different purchase — and booked.
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, invoice: "4261862" } } as ReadOutcome),
+        findWeakGroup: async () => [
+            { id: "row-b", refNumber: "4261886" },
+            { id: "row-c", refNumber: "4261901" },
+            { id: "row-d", refNumber: "4261B62" },
+        ],
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { NEEDS_REVIEW: 1 } });
+    assert.equal(h.states[0].reason, "weak-dup:row-d", "the twin that actually stopped it");
+    assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})), "and it keeps its own key while it waits");
+});
+
+test("THE INVARIANT: a document whose own identity is readable never parks weak without its key", async () => {
+    // Stated once, over every weak-park shape, because this is the property the
+    // round-2 blocker was about. After this change a row can only reach a park
+    // (or a promotion) with a null strong key when it could NEVER have had one:
+    // no date read off the document, or a ref that refLooksReal rejects.
+    const cases: Array<[string, Partial<WorkerDependencies>, Record<string, unknown>]> = [
+        ["a twin with no readable ref", { findWeakGroup: async () => [{ id: "t", refNumber: "NoInv" }] }, {}],
+        // "8Z766" folds to "82766", which IS this row's ref: one document read
+        // twice with the 2 misread as a Z.
+        ["a confusable twin", { findWeakGroup: async () => [{ id: "t", refNumber: "8Z766" }] }, {}],
+        ["an over-large group", {
+            findWeakGroup: async () => Array.from({ length: 11 }, (_, i) => ({ id: `t${i}`, refNumber: `9000${i}` })),
+        }, {}],
+    ];
+    for (const [label, overrides] of cases) {
+        const h = harness([workerRow()], overrides);
+        await runIntakeWorker(h.deps);
+        assert.ok(h.states[0].reason?.startsWith("weak-dup:"), label);
+        // The claim went in...
+        assert.equal(h.applied[0].dedupStrongKey, "2026-08-03|82766", `${label}: claimed`);
+        // ...and nothing on the way out took it away.
+        assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})), `${label}: still held`);
+    }
+
+    // THE CONTROL, and the other half of the invariant: a row that could never
+    // have held a key still parks with none, and that is not a release.
+    const placeholderRef = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, invoice: "N/A" } } as ReadOutcome),
+        findWeakGroup: async () => [{ id: "t", refNumber: "4261862" }],
+    });
+    await runIntakeWorker(placeholderRef.deps);
+    assert.ok(placeholderRef.states[0].reason?.startsWith("weak-dup:"));
+    assert.equal(placeholderRef.applied[0].dedupStrongKey, null, "there was never a key to hold");
+});
+
+test("a re-routed row re-claims the key it ALREADY owns, and that is not a conflict", async () => {
+    // The Retry path for `weak-dup:` sends the row back to RECEIVED, so routing
+    // runs again and issues the IDENTICAL strong claim against a row that (from
+    // this deploy on) still holds that key. `applyRead`'s conflict branch
+    // resolves the owner with `id: { not: rowId }` and RE-THROWS when there is
+    // no other owner, so a row can never be reported as a duplicate of itself;
+    // and re-writing a column to the value it already has is not a unique
+    // violation in Postgres, which is what worker.ts's own comment has always
+    // relied on ("updating a row to the strong key it already holds is a no-op,
+    // not a conflict") for the throw-and-retry path.
+    //
+    // What is pinned here is the call shape: the re-routed row issues the same
+    // claim, gets no strongOwner back, and routes on normally.
+    const h = harness([workerRow({
+        // As Retry leaves it: back to RECEIVED, reason cleared, key still held.
+        state: "RECEIVED",
+        stateReason: null,
+    })], {
+        // A real twin, same width and shape as this row's own "82766": two
+        // sequential tickets, so the weak net clears them and routing runs to
+        // the end rather than stopping at a park.
+        findWeakGroup: async () => [{ id: "row-twin", refNumber: "82767" }],
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { READ: 1 } });
+    assert.equal(h.applied.length, 1, "one claim, not a read-then-compare");
+    assert.equal(h.applied[0].dedupStrongKey, "2026-08-03|82766", "the same key it already owns");
+    assert.deepEqual(h.states, [], "no park, no duplicate verdict against itself");
+});
+
+test("a promotion that cleared weak twins reports them, and books exactly as before", async () => {
+    // The verdict's audit row is written by the cron's promoteToBooking once
+    // its transaction commits; the worker has nothing to decide from the field
+    // and must carry on booking. Asserted so a future reader cannot mistake it
+    // for a signal.
+    const h = harness([workerRow({ state: "READ", dryRun: false })], {
+        isDryRunEnabled: () => false,
+        promoteToBooking: async id => {
+            h.promoted.push(id);
+            return { promoted: true, autoDistinctFrom: ["row-twin"] };
+        },
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { BOOKED: 1 } });
+    assert.deepEqual(h.promoted, ["row-1"]);
+    assert.equal(h.books, 1);
+    assert.deepEqual(h.states, [], "nothing parked");
+});
+
+test("a promotion that found a real conflict still parks NEEDS_REVIEW", async () => {
+    // Unchanged behaviour, pinned beside the case above so the two cannot drift.
+    const h = harness([workerRow({ state: "READ", dryRun: false })], {
+        isDryRunEnabled: () => false,
+        promoteToBooking: async id => { h.promoted.push(id); return { promoted: false, conflictId: "row-twin" }; },
+    });
+    assert.deepEqual(await runIntakeWorker(h.deps), { processed: 1, byState: { NEEDS_REVIEW: 1 } });
+    assert.equal(h.books, 0, "and it never reaches the money path");
+});
+
+test("the REAL weak-net queries read the whole group, and log the verdict outside the transaction", () => {
+    // `buildDeps` is module-private and every one of its dependencies talks to
+    // Prisma, so the cron's own implementations have no runtime seam — the
+    // file's existing convention for them is to assert on the source, as the
+    // sweep-query test below does. These are the four properties the injected
+    // fakes above cannot prove.
+    const cron = readFileSync(
+        path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+        "utf8",
+    );
+
+    // 1. ROUTING'S lookup: the whole live group, bounded, with the refs.
+    const lookup = cron.slice(cron.indexOf("findWeakGroup: async"), cron.indexOf("applyDuplicateTransition:"));
+    assert.match(lookup, /prisma\.receiptIntake\.findMany\(/, "findMany, not findFirst");
+    assert.match(lookup, /select: \{ id: true, refNumber: true \}/);
+    assert.match(lookup, /id: \{ not: rowId \}/);
+    assert.match(lookup, /state: \{ notIn: \["DUPLICATE", "VOID", "NON_RECEIPT"\] \}/, "the same live filter as before");
+    assert.match(lookup, /orderBy: \{ createdAt: "asc" \}/);
+    assert.match(lookup, /take: MAX_WEAK_GROUP \+ 1/, "one past the cap, so an over-large group is recognisable");
+
+    // 2. THE LAST GATE: the same group read, including self, under the lock.
+    const promote = cron.slice(cron.indexOf("promoteToBooking: async"), cron.indexOf("book: row =>"));
+    assert.ok(
+        promote.indexOf("pg_advisory_xact_lock") < promote.indexOf("findMany"),
+        "the lock is taken before the group is read — a read taken first is one the other claimant can invalidate",
+    );
+    assert.match(promote, /take: MAX_WEAK_GROUP \+ 2/, "the cap plus self");
+    assert.ok(
+        !promote.includes("id: { not: rowId }"),
+        "self is INCLUDED: its refNumber under the lock is the only version that can still be true at commit",
+    );
+    assert.match(promote, /const self = group\.find\(row => row\.id === rowId\)/);
+    assert.match(promote, /const twins = group\.filter\(row => row\.id !== rowId\)/);
+    assert.match(promote, /judgeWeakGroup\(self, twins\)/, "the SAME pure rule routing runs");
+    assert.match(promote, /: \{ kind: "park", twinId: twins\[0\]\?\.id \?\? rowId \}/, "self absent fails closed");
+
+    // 3. The park write releases the CLAIM and keeps the KEY. Those are two
+    //    different things and only one of them belongs to a parked row: the
+    //    lease is this pass's, the identity is the document's.
+    assert.match(promote, /stateReason: `weak-dup:\$\{verdict\.twinId\}`/);
+    assert.match(promote, /\.\.\.RELEASE_CLAIM/);
+    assert.ok(
+        !promote.includes("dedupStrongKey"),
+        "the promotion path does not touch the strong key anywhere — a weak park keeps it",
+    );
+
+    // 4. The audit row is BOUNDED as well as awaited, and it says PROMOTED.
+    assert.match(promote, /Promise\.race\(\[/, "awaited, but not unbounded");
+    assert.match(promote, /setTimeout\(resolve, AUTO_DISTINCT_EVENT_BUDGET_MS\)/, "and the timer RESOLVES");
+    assert.match(cron, /const AUTO_DISTINCT_EVENT_BUDGET_MS = 1500;/);
+    assert.match(promote, /reason: `promoted past /, "READ -> BOOKING is all that happened; booking can still fail");
+    assert.ok(!promote.includes("booked past"), "no event may claim a booking this code has not seen");
+
+    // 5. The audit row is written AFTER the commit, never inside the
+    //    transaction holding the advisory lock, and never at the cost of the
+    //    booking.
+    const commit = "return { promoted: true, autoDistinctFrom, autoDistinctRefs };";
+    const txBody = promote.slice(promote.indexOf("prisma.$transaction("), promote.indexOf(commit));
+    assert.ok(!txBody.includes("logAutomationEvent"), "nothing inside the transaction logs");
+    assert.ok(
+        promote.indexOf("logAutomationEvent") > promote.indexOf(commit),
+        "the event is logged once the transaction has resolved",
+    );
+    assert.match(promote, /kind: "receipt-stage"/);
+    assert.match(promote, /stage: "weak-net"/);
+    assert.match(promote, /status: "auto-distinct"/);
+    assert.match(
+        promote.slice(promote.indexOf("logAutomationEvent")),
+        /\}\)\.catch\(error => console\.warn\(/,
+        "an event-log failure warns; it never fails a promotion that already committed",
+    );
 });
 
 test("a document-level gate short-circuits BOTH nets and claims no key", async () => {
@@ -956,7 +1216,7 @@ test("a document-level gate short-circuits BOTH nets and claims no key", async (
         let weakCalls = 0;
         const h = harness([workerRow()], {
             read: async () => ({ ok: true, read } as ReadOutcome),
-            findWeakHit: async () => { weakCalls++; return { id: "row-twin" }; },
+            findWeakGroup: async () => { weakCalls++; return [{ id: "row-twin", refNumber: null }]; },
         });
         await runIntakeWorker(h.deps);
         // The tax note rides along with whatever state routing picked — a
@@ -979,7 +1239,7 @@ test("an implausible read date parks the row BEFORE it claims a dedup key", asyn
     let weakCalls = 0;
     const h = harness([workerRow({ createdAt: SUNBELT_ARRIVAL })], {
         read: async () => ({ ok: true, read: { ...goodRead.read, date: "2023-09-17" } } as ReadOutcome),
-        findWeakHit: async () => { weakCalls++; return { id: "row-twin" }; },
+        findWeakGroup: async () => { weakCalls++; return [{ id: "row-twin", refNumber: null }]; },
     });
     const summary = await runIntakeWorker(h.deps);
 
@@ -1044,7 +1304,7 @@ test("an implausible date with a PLACEHOLDER ref still parks, with no strong key
             ok: true,
             read: { ...goodRead.read, date: "2023-09-17", invoice: "N/A" },
         } as ReadOutcome),
-        findWeakHit: async () => { weakCalls++; return { id: "row-twin" }; },
+        findWeakGroup: async () => { weakCalls++; return [{ id: "row-twin", refNumber: null }]; },
     });
     const summary = await runIntakeWorker(h.deps);
 
@@ -1188,7 +1448,7 @@ test("an implausible tax nulls taxCents, notes the row, and does NOT park it", a
 test("the tax note survives alongside a dedup reason", async () => {
     const h = harness([workerRow()], {
         read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
-        findWeakHit: async () => ({ id: "row-twin" }),
+        findWeakGroup: async () => [{ id: "row-twin", refNumber: null }],
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.states[0].reason, "weak-dup:row-twin;tax-implausible");
@@ -1431,7 +1691,7 @@ test("a weak-lookup failure at the retry limit RELEASES the strong key", async (
     // touched QuickBooks. Holding its key quarantines the corrected resend
     // against a row that never became a purchase.
     const h = harness([workerRow({ attempts: 19, sendAttempted: false })], {
-        findWeakHit: async () => { throw new Error("connection reset"); },
+        findWeakGroup: async () => { throw new Error("connection reset"); },
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
@@ -1451,7 +1711,7 @@ test("a finishRouting failure at the retry limit also releases the key", async (
 test("a row that DID send keeps its key at the retry limit", async () => {
     // QuickBooks may hold a Purchase whose response we lost.
     const h = harness([workerRow({ attempts: 19, sendAttempted: true })], {
-        findWeakHit: async () => { throw new Error("connection reset"); },
+        findWeakGroup: async () => { throw new Error("connection reset"); },
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.states[0].reason, "max-retries");
@@ -2431,7 +2691,7 @@ test("every routing exit carries the durable marker, not just the READ one", asy
     // place, and a new exit gets it for free.
     const h = harness([workerRow()], {
         read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
-        findWeakHit: async () => ({ id: "row-twin" }),
+        findWeakGroup: async () => [{ id: "row-twin", refNumber: null }],
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.states[0].reason, "weak-dup:row-twin;tax-implausible", "the display copy");

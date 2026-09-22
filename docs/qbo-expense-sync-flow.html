@@ -275,14 +275,14 @@
 
   <div class="callout">
     <h3>What the little codes on a receipt mean</h3>
-    <p>Some rows on the Receipts tab have a short code under the amount, like <code>push-paused</code> or <code>multi-doc</code>. The code says why that receipt has not booked yet. Most of them sit under <i>Needs review</i>. <code>push-paused</code> and <code>push-disabled</code> sit under <i>Booking</i>.</p>
+    <p>Some rows on the Receipts tab say why that receipt has not booked yet. Each one shows a plain sentence, with a short code in small grey text next to it, like <code>push-paused</code> or <code>multi-doc</code>. Most of them sit under <i>Needs review</i>. <code>push-paused</code> and <code>push-disabled</code> sit under <i>Booking</i>.</p>
     <div class="tablewrap">
     <table>
       <tr><th>Code</th><th>What it means</th><th>What you do</th></tr>
       <tr><td><code>push-paused</code></td><td>Booking is switched off for now, with the switch "Receipt booking in ProBuild" under Pipeline health. Nothing is wrong.</td><td>Nothing. The receipt books by itself when the switch is turned back on.</td></tr>
       <tr><td><code>push-disabled</code></td><td>Booking is switched off in the system settings. That is not the switch on this page. Nothing is wrong with the receipt.</td><td>Nothing. If it is still there tomorrow, tell Justin.</td></tr>
       <tr><td><code>multi-doc</code></td><td>The file has more than one receipt in it, so the system will not guess.</td><td>Save or scan each receipt as its own file. Drop those in the <b>New Receipts &amp; Checks</b> Drive folder, in the right job's folder. Then press "Void" on this row. Automatic splitting is being built.</td></tr>
-      <tr><td><code>weak-dup:</code> and a long id</td><td>This looks like it might be a copy of another receipt. Same store, same day, same amount. It is often two real purchases, like two dump tickets on one day.</td><td>Leave the row alone. Do not void it and do not press "Set job", it would only come back. The system is being taught to sort these out by itself. If the row is still there after a few days, tell Justin.</td></tr>
+      <tr><td><code>weak-dup:</code> and a long id</td><td>This looks like it might be a copy of another receipt. Same store, same day, same amount. It is often two real purchases, like two dump tickets on one day.</td><td>Press "Retry now" once. The system now tells two real purchases apart when each has its own ticket number, and books them. If the row comes back, leave it alone and tell Justin. Do not void it.</td></tr>
       <tr><td><code>date-implausible</code></td><td>The date the system read looks wrong. It is months before the receipt arrived, or it is in the future.</td><td>Leave the row alone and tell Justin. Do not void it. An automatic fix is being built.</td></tr>
       <tr><td><code>no-estimate</code></td><td>No job is set on this receipt, or the job it is on has no estimate. Either way there is nowhere to put the cost.</td><td>If the job is wrong or missing, pick the right one and press "Set job". If the job is right, tell Justin.</td></tr>
       <tr><td><code>refund-or-zero</code></td><td>The amount read is zero, or it is money coming back, like a return.</td><td>Leave the row alone and tell Justin.</td></tr>

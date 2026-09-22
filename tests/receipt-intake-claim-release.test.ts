@@ -164,7 +164,7 @@ test("applyRead is the ONE lease-keeping write, and it can only say RECEIVED", (
     assert.match(worker, /patch: ReadPatch & \{ state: "RECEIVED" \}/);
 
     const fn = route.slice(route.indexOf("applyRead: async"));
-    const body = fn.slice(0, fn.indexOf("findWeakHit:"));
+    const body = fn.slice(0, fn.indexOf("findWeakGroup:"));
     assert.match(body, /where: \{ id: rowId, state: ownership\.state, claimToken: ownership\.claimToken \}/,
         "still fenced on ownership like every other write");
     assert.ok(!/RELEASE_CLAIM/.test(body), "and deliberately does NOT release: routing is not finished");

@@ -129,8 +129,46 @@ test("validation is SELF-CONTAINED and UTC — no host time zone, no 19xx mappin
     assert.equal(isValidDate("0026-09-17"), false, "the local-time helper's quirk, pinned");
 
     // The leap rules are the real calendar's, in UTC.
-    assert.equal(isImplausibleReceiptDate("2000-02-29", "2000-03-01"), false, "2000 IS a leap year");
-    assert.equal(isImplausibleReceiptDate("1900-02-29", "1900-03-01"), false, "1900 is NOT: not a real day");
+    //
+    // The references are DISTANT on purpose. Against a nearby one both a
+    // correct validator and a broken one answer false — the day is either
+    // rejected (null, so not judged) or accepted and one day old — so the
+    // assertion proves nothing. Twenty-six years apart makes the two answers
+    // disagree, which is the only way this can fail when it should.
+    assert.equal(
+        isImplausibleReceiptDate("2000-02-29", "2026-09-21"),
+        true,
+        "2000 IS a leap year, so this is a real day and a very old one; a validator that rejected it would say false",
+    );
+    assert.equal(
+        isImplausibleReceiptDate("1900-02-29", "2026-09-21"),
+        false,
+        "1900 is NOT, so there is no such day to judge; a validator that rolled it to 1900-03-01 would say true",
+    );
+});
+
+test("a day key is EXACTLY ten characters — no trailing whitespace is trimmed away", () => {
+    // JavaScript's `$` (no `m` flag) anchors at the very end of the input, so
+    // "2026-09-21\n" is already rejected — unlike in Python, where `$` also
+    // matches before a trailing newline. Pinned here so the rejection is a
+    // tested property of the guard rather than a quirk nobody re-checks, and so
+    // a later `.trim()` or `m` flag has to break a test to land.
+    for (const trailing of ["\n", "\r\n", "\t", "\r", " "]) {
+        assert.equal(
+            isImplausibleReceiptDate(`2023-09-17${trailing}`, ARRIVAL),
+            false,
+            `read date with trailing ${JSON.stringify(trailing)}`,
+        );
+        assert.equal(
+            isImplausibleReceiptDate("2023-09-17", `${ARRIVAL}${trailing}`),
+            false,
+            `reference day with trailing ${JSON.stringify(trailing)}`,
+        );
+    }
+    // The control: the same pair without the trailing character IS judged, and
+    // is implausible. Without this the loop above would pass against a
+    // predicate that answered false for everything.
+    assert.equal(isImplausibleReceiptDate("2023-09-17", ARRIVAL), true);
 });
 
 test("a fallback date measured against itself is always plausible", () => {
@@ -363,14 +401,43 @@ test("only transient FAILURES are retryable — never a document verdict", async
         assert.equal(retryTargetFor("NEEDS_REVIEW", "max-retries"), "BOOKING");
     });
 
+    await t.test("a weak-dup row resumes at RECEIVED — the re-route is what restores its key", () => {
+        // The weak net now clears a pair whose reference numbers already tell
+        // them apart (weak-net.ts), so retrying one of these is a re-decision
+        // rather than another attempt at the same verdict.
+        //
+        // RECEIVED, not READ, and the re-read is the point rather than a side
+        // effect: rows parked by the OLD code had their dedupStrongKey released
+        // on the way in, and ROUTING is the only path that claims one. Sent
+        // back to READ they would book still owning no identity, which is the
+        // hole this whole round is about.
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "weak-dup:abc"), "RECEIVED");
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "weak-dup:cmg8x2q0000abcd"), "RECEIVED");
+        // Still a prefix rule, not a substring one.
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "not-weak-dup:abc"), null);
+    });
+
+    await t.test("READ is not a retry target at all", () => {
+        // Phase 2's auto re-sweep may want one; phase 1 does not have one, and
+        // an unused member of the union is a target `retryReceiptIntake` would
+        // happily write without anything having thought about it.
+        const targets = new Set(
+            ["ai-unavailable", "file-missing", "weak-dup:abc", "qbo-timeout", "qbo-5xx", "max-retries"]
+                .map(reason => retryTargetFor("NEEDS_REVIEW", reason)),
+        );
+        assert.deepEqual([...targets].sort(), ["BOOKING", "RECEIVED"]);
+    });
+
     await t.test("document verdicts are NOT retryable — another attempt parks them again", () => {
         for (const reason of [
             "multi-doc", "no-estimate", "refund-or-zero", "invalid-date", "zero-total",
             // A date this row cannot own is a VERDICT about the document, not a
             // transient failure: re-reading it produces the same misread and
-            // spends an attempt and a QuickBooks round trip doing it.
+            // spends an attempt and a QuickBooks round trip doing it. It stays
+            // non-retryable in phase 1; the repair that would change that is
+            // phase 2 work.
             DATE_IMPLAUSIBLE_REASON,
-            "weak-dup:abc", "strong-dup-amount-mismatch:abc", "vendor-mismatch:abc",
+            "strong-dup-amount-mismatch:abc", "vendor-mismatch:abc",
             "qbo-fault:account-config", "qbo-fault:vendor-duplicate", "voided-by-user",
         ]) {
             assert.equal(retryTargetFor("NEEDS_REVIEW", reason), null, reason);

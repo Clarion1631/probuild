@@ -107,7 +107,13 @@ const DAY_MS = 86_400_000;
  */
 function utcMidnightOf(dayKey: string | null | undefined): number | null {
     const value = typeof dayKey === "string" ? dayKey : "";
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+    // The LENGTH is pinned beside the pattern, and deliberately so even though
+    // it is redundant today: JavaScript's `$` without the `m` flag matches only
+    // at the very end of the input — unlike Python's, which also matches before
+    // a trailing newline — so the pattern alone already rejects "2026-09-21\n".
+    // The tests pin that. This keeps the rejection true if the pattern ever
+    // grows an `m` flag or the input ever arrives pre-trimmed by a caller.
+    if (value.length !== 10 || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
     const year = Number(value.slice(0, 4));
     const month = Number(value.slice(5, 7));
     const day = Number(value.slice(8, 10));
@@ -304,16 +310,30 @@ export function backoffMs(attempts: number): number {
  * condition duplicated between the button and the action.
  *
  * The list is deliberately CLOSED. Most NEEDS_REVIEW reasons are verdicts about
- * the DOCUMENT — `multi-doc`, `no-estimate`, `weak-dup:<id>`,
- * `strong-dup-amount-mismatch:<id>`, `refund-or-zero`, `date-implausible` —
- * and retrying one of those just parks it again with the same reason while
- * spending an attempt and a QuickBooks round trip. Only reasons that describe
- * a TRANSIENT FAILURE of something other than the document are retryable.
+ * the DOCUMENT — `multi-doc`, `no-estimate`, `strong-dup-amount-mismatch:<id>`,
+ * `refund-or-zero`, `date-implausible` — and retrying one of those just parks
+ * it again with the same reason while spending an attempt and a QuickBooks
+ * round trip. Only reasons that describe a TRANSIENT FAILURE of something other
+ * than the document are retryable.
+ *
+ * `weak-dup:<id>` WAS in that list and no longer is, because the RULE changed
+ * rather than the row: the weak net now clears a pair whose reference numbers
+ * already tell them apart (weak-net.ts). A retry of one of those is therefore a
+ * RE-DECISION under the corrected rule, not another attempt at the same
+ * verdict — and a row that really is a duplicate simply re-parks with the same
+ * reason, so the button cannot loop or do harm.
  *
  * Where a row resumes matters as much as whether it may:
  *   - `ai-unavailable` and `file-missing` failed BEFORE the read, so they go
  *     back to RECEIVED and get read again. Sending them to BOOKING would book a
  *     row whose vendor/total were never extracted.
+ *   - `weak-dup:<id>` goes back to RECEIVED too, and the re-READ is the point
+ *     rather than a side effect. Rows parked by the OLD code had their
+ *     `dedupStrongKey` released on the way in (this PR stops that, but it
+ *     cannot retro-fit a key that is already gone). Only the full routing path
+ *     re-claims a strong key, so RECEIVED is what heals them; a bare re-decide
+ *     from READ would book them still owning nothing. The cost is one AI read
+ *     per press, which is accepted.
  *   - `qbo-timeout` / `qbo-5xx` / `max-retries` failed at the SEND, with the
  *     read already done, so they resume at BOOKING.
  */
@@ -324,6 +344,10 @@ const RETRYABLE_REASONS: Array<{ test: RegExp; target: RetryTarget }> = [
     { test: /^ai-unavailable$/, target: "RECEIVED" },
     // The upload never landed in the bucket; a human has since re-uploaded it.
     { test: /^file-missing$/, target: "RECEIVED" },
+    // The rule changed under this row: a weak twin no longer blocks a document
+    // whose own reference number tells it apart. Re-read and re-routed in full,
+    // because routing is the only path that re-claims a strong key — see above.
+    { test: /^weak-dup:/, target: "RECEIVED" },
     // Transport-class QuickBooks failures, and the row that exhausted its
     // budget of them. The read is done; resume at the send.
     { test: /^qbo-timeout$/, target: "BOOKING" },
