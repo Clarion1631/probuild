@@ -60,6 +60,7 @@ import {
     runIntakeWorker,
     uploadLeaseActive,
     type ReadPatch,
+    type StrongOwner,
     type WorkerDependencies,
     type WorkerRow,
 } from "@/lib/receipt-intake/worker";
@@ -129,6 +130,10 @@ const WORKER_ROW_SELECT = {
     suggestedConfidence: true, sendAttempted: true, claimToken: true, fileSha256: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true, stateReason: true,
     taxWarning: true,
+    // The heal's three columns: what routing claimed (or null), the read it
+    // re-derives the key from, and the row a human has already compared this one
+    // to. See healStrongKey in worker.ts.
+    dedupStrongKey: true, readJson: true, duplicateOfId: true,
 } as const;
 
 /**
@@ -526,6 +531,43 @@ interface PromotionResult {
     autoDistinctRefs?: { selfRef: string | null; twins: Array<{ id: string; refNumber: string | null }> };
 }
 
+/**
+ * A REJECTED STRONG-KEY CLAIM, TURNED INTO THE OWNER THAT REJECTED IT.
+ *
+ * The partial unique index is the lock the Apps Script did with Script
+ * Properties, so the violation IS the dedup hit; the caller only needs to know
+ * who holds the key. Which constraint fired is resolved by looking the owner up
+ * BY dedupStrongKey — a fact about the DATA — rather than by string-matching
+ * Prisma's `meta`, whose shape is version dependent and is empty for a partial
+ * index on some engine builds (i.e. exactly this index).
+ *
+ * No findable owner means some OTHER unique constraint rejected the write, so it
+ * RE-THROWS rather than reporting a dedup hit that isn't. Shared by the routing
+ * claim (`applyRead`) and the heal (`claimStrongKey`) so the two cannot come to
+ * different conclusions about the same rejection.
+ */
+async function strongOwnerOrRethrow(
+    error: unknown,
+    rowId: string,
+    key: string | null,
+): Promise<StrongOwner> {
+    if (!isUniqueViolation(error) || !key) throw error;
+    const owner = await prisma.receiptIntake.findFirst({
+        where: {
+            dedupStrongKey: key,
+            state: { notIn: ["DUPLICATE", "VOID"] },
+            id: { not: rowId },
+        },
+        select: { id: true, totalCents: true, vendor: true },
+    });
+    if (!owner) throw error;
+    return {
+        id: owner.id,
+        totalCents: owner.totalCents,
+        canonicalVendor: owner.vendor ? canonicalVendor(owner.vendor) : null,
+    };
+}
+
 function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
     return {
         acquireLease: () => acquireCronLease(WORKER_LEASE_KEY, WORKER_LEASE_MS),
@@ -862,34 +904,27 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 });
                 return { strongOwner: null, owned: count > 0 };
             } catch (error) {
-                // The partial unique index refused the claim — the DATABASE is
-                // the lock the Apps Script did with Script Properties. Load the
-                // owner so the caller can compare totals.
-                // Which constraint fired is resolved by looking the owner up
-                // BY dedupStrongKey — a fact about the data — rather than by
-                // string-matching Prisma's `meta`, whose shape is version
-                // dependent and is empty for a partial index on some engine
-                // builds (i.e. exactly this index).
-                if (!isUniqueViolation(error) || !patch.dedupStrongKey) throw error;
-                const owner = await prisma.receiptIntake.findFirst({
-                    where: {
-                        dedupStrongKey: patch.dedupStrongKey,
-                        state: { notIn: ["DUPLICATE", "VOID"] },
-                        id: { not: rowId },
-                    },
-                    select: { id: true, totalCents: true, vendor: true },
+                return { owned: true, strongOwner: await strongOwnerOrRethrow(error, rowId, patch.dedupStrongKey) };
+            }
+        },
+
+        // THE SECOND CLAIM OF THE SAME KEY, for a row that reached READ/BOOKING
+        // without one (healStrongKey in worker.ts). Same CAS, same index, same
+        // owner resolution — so a heal and a routing claim cannot disagree about
+        // what a conflict means.
+        //
+        // It deliberately does NOT release the claim: like markSendAttempted, it
+        // is not a completing transition. The row goes on to promote and book
+        // under this same token in this same pass.
+        claimStrongKey: async (rowId, key, ownership) => {
+            try {
+                const { count } = await evidenceUpdateMany({
+                    where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
+                    data: { dedupStrongKey: key },
                 });
-                // No owner means some OTHER unique constraint rejected the
-                // write; re-throw rather than reporting a dedup hit that isn't.
-                if (!owner) throw error;
-                return {
-                    owned: true,
-                    strongOwner: {
-                        id: owner.id,
-                        totalCents: owner.totalCents,
-                        canonicalVendor: owner.vendor ? canonicalVendor(owner.vendor) : null,
-                    },
-                };
+                return { owned: count > 0, strongOwner: null };
+            } catch (error) {
+                return { owned: true, strongOwner: await strongOwnerOrRethrow(error, rowId, key) };
             }
         },
 
@@ -1261,9 +1296,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         stateReason: result.reason,
                         nextRetryAt: null,
                         ...RELEASE_CLAIM,
-                        // Parked before any QBO send: hand the strong key back,
-                        // or a corrected re-send of the same receipt would be
-                        // quarantined against a row that never became a purchase.
+                        // Only for a row that has OUTLIVED ITS DOCUMENT and never
+                        // sent — book.ts's mayReleaseStrongKey decides, and it is
+                        // false for every other park: a parked row still IS its
+                        // receipt, and a human revives it without routing it
+                        // again, so a key handed back here never comes back.
                         ...(result.releaseStrongKey ? { dedupStrongKey: null } : {}),
                     },
                 });

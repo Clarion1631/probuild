@@ -102,6 +102,14 @@ const REASON_TEXTS: Array<{ test: RegExp; text: (row: ReasonTextRow) => string }
         text: () => "Same invoice number as another receipt but a different total. The two do not agree.",
     },
     {
+        // The colon is what keeps this apart from `strong-dup-amount-mismatch:`,
+        // so the two do not depend on their order here. The heal in worker.ts
+        // writes it: the row reached booking without the key it should own, and
+        // a live row holds it.
+        test: /^strong-dup:/,
+        text: () => "Another receipt already holds this one's date and reference number. Set a job to book it anyway, or mark it a duplicate.",
+    },
+    {
         test: /^vendor-mismatch:/,
         text: () => "Same invoice number and total as another receipt, but a different vendor name.",
     },

@@ -15,6 +15,8 @@ import {
     MAX_BOOK_ATTEMPTS,
     MAX_RECEIPT_AGE_DAYS,
     MAX_RECEIPT_FUTURE_DAYS,
+    NO_ARTIFACT_STATE_REASONS,
+    parkReleasesStrongKey,
     preservedTaxWarning,
     retryTargetFor,
     routeState,
@@ -257,6 +259,51 @@ test("no project means NEEDS_JOB — a queue, not a fault", () => {
     assert.deepEqual(d, { state: "NEEDS_JOB", stateReason: null, duplicateOfId: null });
 });
 
+// ── The job gate sits AFTER the strong verdict ──────────────────────────────
+//
+// It used to come first, so every jobless receipt parked NEEDS_JOB before the
+// strong claim was ever attempted, got a job from a person, went to READ — which
+// never routes again — and booked owning no identity at all. The second copy of
+// the same document then missed both nets and booked too.
+
+test("a jobless row's STRONG verdict is reached: the same purchase twice is still a DUPLICATE", () => {
+    assert.deepEqual(routeState(clean, { strong: owner(), weak: null }, false), {
+        state: "DUPLICATE", stateReason: null, duplicateOfId: "row-a",
+    });
+});
+
+test("a jobless row at a DIFFERENT total is the mismatch review, not a job queue item", () => {
+    assert.deepEqual(routeState(clean, { strong: owner({ totalCents: 20000 }), weak: null }, false), {
+        state: "NEEDS_REVIEW", stateReason: "strong-dup-amount-mismatch:row-a", duplicateOfId: "row-a",
+    });
+});
+
+test("a jobless row against another VENDOR is the vendor-mismatch review", () => {
+    assert.deepEqual(routeState(clean, { strong: owner({ canonicalVendor: "homedepot" }), weak: null }, false), {
+        state: "NEEDS_REVIEW", stateReason: "vendor-mismatch:row-a", duplicateOfId: "row-a",
+    });
+});
+
+test("the job gate still PRECEDES the weak net", () => {
+    // Deliberate: the weak verdict is re-taken at promotion anyway, and a row
+    // nobody can book yet does not need a human looking at a maybe-twin.
+    assert.deepEqual(routeState(clean, { strong: null, weak: { id: "row-b" } }, false), {
+        state: "NEEDS_JOB", stateReason: null, duplicateOfId: null,
+    });
+});
+
+test("the DOCUMENT gates still outrank the job gate AND the strong net", () => {
+    // Moving the job gate down must not move anything above it.
+    assert.equal(
+        routeState({ ...clean, amount: "0.00", totalCents: 0 }, { strong: owner({ totalCents: 0 }), weak: null }, false).stateReason,
+        "refund-or-zero",
+    );
+    assert.equal(
+        routeState({ ...clean, ...badDate }, { strong: owner(), weak: null }, false).stateReason,
+        DATE_IMPLAUSIBLE_REASON,
+    );
+});
+
 test("a strong hit at the same total AND the same vendor is the same purchase twice", () => {
     const d = routeState(clean, { strong: owner(), weak: null }, true);
     assert.deepEqual(d, { state: "DUPLICATE", stateReason: null, duplicateOfId: "row-a" });
@@ -369,6 +416,38 @@ test("the tax warning is read from its OWN column, not from stateReason", () => 
     assert.equal(preservedTaxWarning({ taxWarning: null, stateReason: null }), null);
     // A column carrying something ELSE is not the marker.
     assert.equal(preservedTaxWarning({ taxWarning: "something-else" }), null);
+});
+
+// ── Which parks give the strong key back ───────────────────────────────────
+
+test("ONLY a row that outlived its document releases the strong key", () => {
+    // The whole rule, in one table. A parked row is ALIVE: it still represents
+    // its document and a human revives it with Set job or Retry, neither of
+    // which routes it again — so a key released at park time is never
+    // re-claimed, and the re-sent copy books a second time.
+    for (const reason of ["receipt-bytes-missing", "content-changed"]) {
+        assert.equal(parkReleasesStrongKey(reason), true, reason);
+    }
+    for (const reason of [
+        "no-estimate", "refund-or-zero", "invalid-date", "date-implausible",
+        "source-document-review", "unsupported-attachment:mime:text/plain",
+        "qbo-fault:missing-vendor", "qbo-duplicate:1", "qbo-create-pending:x",
+        "max-retries", "weak-dup:x", "strong-dup:x", "unreadable",
+        "ai-unavailable", "file-missing", "storage-timeout", "multi-doc", "",
+    ]) {
+        assert.equal(parkReleasesStrongKey(reason), false, JSON.stringify(reason));
+    }
+});
+
+test("the release list is EXACTLY the no-artifact reasons, not a copy of them", () => {
+    // Two spellings of one rule is how the chaser and the parker drifted before.
+    for (const reason of [...NO_ARTIFACT_STATE_REASONS]) {
+        assert.equal(parkReleasesStrongKey(reason), true, reason);
+    }
+    assert.equal(
+        [...NO_ARTIFACT_STATE_REASONS].filter(r => !parkReleasesStrongKey(r)).length,
+        0,
+    );
 });
 
 test("backoff is 5m / 15m / 1h / 6h and then stays at 6h", () => {

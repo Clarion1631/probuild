@@ -257,7 +257,9 @@ test("both callers take the SAME function, so they cannot diverge", () => {
 
     const worker = readFileSync(join(repoRoot, "src/lib/receipt-intake/worker.ts"), "utf8");
     assert.match(worker, /async function applyRoutedState\(/);
-    assert.equal((worker.match(/await applyRoutedState\(/g) ?? []).length, 3, "all three routing outcomes");
+    // FOUR since the job gate moved below the strong claim: the document gates,
+    // the strong-owner verdict, the jobless park, and the weak park.
+    assert.equal((worker.match(/await applyRoutedState\(/g) ?? []).length, 4, "all four routing outcomes");
     assert.doesNotMatch(worker, /guardDuplicateChain/, "the two-step version is gone");
 });
 
