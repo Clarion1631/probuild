@@ -5,8 +5,9 @@ import { test, expect, type APIRequestContext } from "@playwright/test";
  * surface (throwaway CI Postgres — data.setup.ts guards prod, docs/TESTING.md).
  *
  * Two things source-reading cannot prove and these can:
- *   1. `/automation?tab=receipts` renders the six group headings for an ADMIN
- *      session instead of hitting the route error boundary.
+ *   1. `/automation?tab=receipts` renders the To-do list, and
+ *      `?view=all` still renders the six group headings, for an ADMIN session
+ *      rather than hitting the route error boundary.
  *   2. The bridge endpoints answer 401 JSON — not a 307 to /login — for an
  *      anonymous caller AND for one carrying a bogus session cookie. That
  *      second case is the getclients-auth-gate lesson: a cookie must not be a
@@ -26,8 +27,31 @@ const ANSWERS_PATH = "/api/automation/receipt-requests/answers";
 const GROUP_HEADINGS = ["Needs job", "Needs review", "Booking", "Booked today", "Missing receipts", "Duplicates"];
 
 test.describe("Receipts tab", () => {
-    test("an ADMIN sees all six groups, and the register stays reachable", async ({ page }) => {
+    test("a bare ?tab=receipts opens on the To-do list, with a way to everything else", async ({ page }) => {
+        // The default moved. This is the page an office manager lands on, and
+        // the grey strip is drawn even at zero, so it is the one thing that is
+        // always there to assert.
         await page.goto("/automation?tab=receipts");
+        await expect(page.getByRole("heading", { name: "Automation" })).toBeVisible();
+        await expect(page.getByRole("link", { name: "To-do", exact: true })).toBeVisible();
+        await expect(page.getByRole("link", { name: "Everything", exact: true })).toBeVisible();
+        await expect(page.getByText(/Outside your list: \d+ of these\./)).toBeVisible();
+
+        // The group panels are NOT here any more, which is the whole point.
+        for (const heading of GROUP_HEADINGS) {
+            await expect(page.getByRole("heading", { name: heading, exact: true })).toHaveCount(0);
+        }
+
+        // And neither the register nor the old view is a dead end.
+        await expect(page.getByRole("link", { name: "Register", exact: true })).toBeVisible();
+        await expect(page.getByRole("link", { name: "Receipts", exact: true })).toBeVisible();
+        await expect(page.getByRole("link", { name: "View register", exact: true })).toBeVisible();
+    });
+
+    test("an ADMIN sees all six groups under ?view=all, and the register stays reachable", async ({ page }) => {
+        // The legacy contract, under the name it now has. Every `?group=` URL
+        // is unchanged; only a bare `?tab=receipts` moved.
+        await page.goto("/automation?tab=receipts&view=all");
         await expect(page.getByRole("heading", { name: "Automation" })).toBeVisible();
         for (const heading of GROUP_HEADINGS) {
             await expect(page.getByRole("heading", { name: heading, exact: true })).toBeVisible();
@@ -46,6 +70,10 @@ test.describe("Receipts tab", () => {
     });
 
     test("an unknown group falls back to every group instead of an error", async ({ page }) => {
+        // A URL that ASKED for a group and named one this page does not know
+        // still means "show me the groups". It resolved that way before the
+        // To-do view existed, and bouncing a typo somewhere new would be a
+        // behaviour change hiding inside a typo.
         await page.goto("/automation?tab=receipts&group=not-a-real-group");
         for (const heading of GROUP_HEADINGS) {
             await expect(page.getByRole("heading", { name: heading, exact: true })).toBeVisible();

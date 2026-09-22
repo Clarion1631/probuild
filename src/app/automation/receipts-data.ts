@@ -12,10 +12,16 @@ import { POSSIBLE_ORPHAN_REASON } from "@/lib/receipt-intake/park";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
 import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner } from "@/lib/receipt-requests";
 import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
-import { missingReceiptMatchesFilters, ownerRank, type ReceiptFilters } from "./receipts-filters";
+import { RECEIPT_GROUP_TAKE, missingReceiptMatchesFilters, ownerRank, type ReceiptFilters } from "./receipts-filters";
 
-/** Per-group display cap. Badge counts come from count queries, never from these. */
-export const RECEIPT_GROUP_TAKE = 100;
+/**
+ * Per-group display cap. Badge counts come from count queries, never from these.
+ *
+ * Declared in receipts-filters.ts (a pure module) and re-exported here so the
+ * To-do planner can read it without importing Prisma, and so every caller that
+ * already imports it from this file keeps working.
+ */
+export { RECEIPT_GROUP_TAKE };
 
 const NEEDS_REVIEW_STATES = ["NEEDS_REVIEW", "NON_RECEIPT"];
 const BOOKED_STATES = ["BOOKED", "ARCHIVED"];
