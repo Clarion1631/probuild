@@ -18,14 +18,11 @@
  *    `evaluateReviewIssue(..., [], ...)` — an empty reason set that can only
  *    ever reach `clear` or `noop` (`decideLifecycle` step 1); it cannot
  *    create an issue, cannot reopen one, and touches no cycle record, no
- *    cursor and no `chaserCompletedAt`. This holds on every one of the
- *    lifecycle's own internal version-conflict retries too, not just the
- *    first attempt: this module hands `evaluateReviewIssue` no way to
- *    re-derive the codes it retries with (see FENCED below), so a retry can
- *    only ever reapply the SAME empty set — never `touch`, `suppress`,
- *    `supersede` or `reopen`. There is no exception to this any more; an
- *    earlier version of this module had one, and removing it is what fixed
- *    round-3 blockers 1 and 2 (see FENCED).
+ *    cursor and no `chaserCompletedAt`. There is no exception to this any
+ *    more; an earlier version of this module had one, and removing it is
+ *    what fixed round-3 blockers 1 and 2. A lost lifecycle CAS on this
+ *    module's own write is never retried at all any more, not even once
+ *    internally — see the ROW-LEVEL CAS paragraph under FENCED.
  * 3. IDEMPOTENT. That write is the CAS'd lifecycle, which returns `noop` when
  *    the codes are unchanged — and only a genuine `clear` is ever counted in
  *    `cleared`; a `noop` (something else cleared the issue in the gap between
@@ -77,26 +74,33 @@
  *    THE ROW-LEVEL CAS is a separate, narrower concern from the epoch fence
  *    above: it catches a concurrent write to THIS ONE issue row, between
  *    `evaluateReviewIssue`'s own read and write, not a stale evidence
- *    snapshot. On a lost CAS, `evaluateReviewIssue` retries the WHOLE
- *    evaluation itself, internally, up to five times (review-alert-
- *    lifecycle.ts, unmodified by this module). This module hands it no
- *    `recomputeCodes` (round 4, blocker 1): every retry therefore reapplies
- *    the SAME already-decided `[]`, which — per SUBTRACTIVE — can only reach
- *    `clear` or `noop` again, never anything a fresher read might have
- *    justified instead. That is deliberately the simple, safe answer rather
- *    than a cleverer one: an earlier version of this module tried to
- *    re-judge on the retry, using the SAME cache-backed `recomputeCodesFor`
- *    the judge phase had already populated — which handed back the cache's
- *    STALE verdict, not a fresh one, so the "re-judge" was fake (blocker 1)
- *    and could also have overwritten a richer `displayDetails` with `null`
- *    on whatever non-empty action it reached instead (blocker 2). Neither
- *    can occur once a retry cannot leave `[]`. If EVERY retry loses the race
- *    — real, sustained contention on this one row — `evaluateReviewIssue`
- *    itself throws once its attempts are exhausted; this module recognises
- *    that specific throw and counts it as a `conflict`, never as `errors`
- *    and never as `cleared` (`EvidenceCloseResult.conflicts`), and does
- *    nothing further for that issue — exactly like a stale epoch, it is left
- *    for the nightly sweep, which carries no retry budget to exhaust.
+ *    snapshot. Left to itself, `evaluateReviewIssue` retries a lost CAS
+ *    internally — re-reading and re-deciding — for up to five attempts in
+ *    total (review-alert-lifecycle.ts, unmodified by this module); with no
+ *    `recomputeCodes` handed to it (round 4, blocker 1), any such retry could
+ *    only ever reapply the SAME already-decided `[]`. THE FIRST lost CAS on
+ *    this module's one write is never given that chance at all:
+ *    `courtesyClient` (below) wraps the client `evaluateReviewIssue` is
+ *    handed so that the underlying `updateMany` reporting `{count: 0}`
+ *    throws a `CourtesyCasConflict` immediately, from inside the wrapped
+ *    call itself, before `evaluateReviewIssue`'s own retry loop ever sees it.
+ *    `CourtesyCasConflict` is deliberately NOT an `instanceof` the
+ *    lifecycle's own module-private `VersionConflict`, so the loop's `catch
+ *    (error) { if (error instanceof VersionConflict) continue; throw error;
+ *    }` cannot recognise it as one — it propagates straight out, uncaught, on
+ *    the very first attempt, whether or not a second attempt would
+ *    eventually have won the race. This module recognises that specific
+ *    error and counts it as a `conflict`, never as `errors` and never as
+ *    `cleared` (`EvidenceCloseResult.conflicts`), and does nothing further
+ *    for that issue — exactly like a stale epoch, it is left for the nightly
+ *    sweep, which carries no such reluctance to retry. An earlier version of
+ *    this module instead let the lifecycle retry and tried to re-judge on
+ *    it, using the SAME cache-backed `recomputeCodesFor` the judge phase had
+ *    already populated — which handed back the cache's STALE verdict, not a
+ *    fresh one, so the "re-judge" was fake (blocker 1) and could also have
+ *    overwritten a richer `displayDetails` with `null` on whatever
+ *    non-empty action it reached instead (blocker 2). Neither can happen
+ *    once no retry ever runs at all.
  * 6. BOUNDED AND BEST EFFORT. One indexed candidate query, capped at
  *    `MAX_EVIDENCE_CLOSE_QUERY_ROWS` (50) raw rows; at most
  *    `MAX_EVIDENCE_CLOSE_CANDIDATES` (10) recomputes, capped AFTER the
@@ -113,10 +117,10 @@
  *    fired by elapsed time or by the worker's cancel latch (see FENCED).
  *    Every failure, including one in the candidate query, the open-issue
  *    lookup, or an epoch read, is counted and swallowed; a lost lifecycle
- *    CAS is counted separately as a `conflict` rather than an `error`,
- *    because contention is not a bug. The money has already moved; a failed
- *    courtesy close must not disturb it, and the nightly sweep is still the
- *    backstop.
+ *    CAS on this module's one write is terminal on the first attempt and
+ *    counted separately as a `conflict` rather than an `error`, because
+ *    contention is not a bug. The money has already moved; a failed courtesy
+ *    close must not disturb it, and the nightly sweep is still the backstop.
  *
  * Injection over mocking throughout: the `deps` bag is the same seam
  * `receipt-request-cards/route.ts:390,415` uses, and it is what lets every test
@@ -130,7 +134,7 @@ import {
     isComponentDeadlineExceeded,
     RECEIPT_REQUEST_TARGET_TYPE,
 } from "@/lib/receipt-requests";
-import { evaluateReviewIssue } from "@/lib/review-alert-lifecycle";
+import { evaluateReviewIssue, type ReviewIssueLifecycleClient } from "@/lib/review-alert-lifecycle";
 import type { ReasonCode } from "@/lib/review-alert-reasons";
 // THE FRESHNESS FENCE'S two readers (see FENCED in the module header) — the
 // SAME functions the sweep's own completion fence and
@@ -180,6 +184,16 @@ export interface EvidenceCloseDeps {
      * to retry around.
      */
     applyCodes?: (targetKey: string, codes: ReasonCode[]) => Promise<boolean>;
+    /**
+     * The lifecycle client `defaultApplyCodes` hands to `evaluateReviewIssue`
+     * (wrapped in `courtesyClient` — see the module header's ROW-LEVEL CAS
+     * paragraph), used whenever `applyCodes` is NOT itself overridden.
+     * Injected so tests can exercise the real production `defaultApplyCodes`
+     * — including the CAS-conflict wrapper — against an in-memory fake,
+     * rather than reimplementing the apply step themselves. Defaults to the
+     * real prisma client.
+     */
+    client?: ReviewIssueLifecycleClient;
     /** The CALLER's absolute clock — the worker invocation's, not a fresh one. */
     deadlineExceeded?: () => boolean;
     /** Overridable only so the window is testable; production uses the sweep's. */
@@ -211,11 +225,11 @@ export interface EvidenceCloseResult {
      *  Never a verdict. */
     errors: number;
     /**
-     * Applies withheld because `evaluateReviewIssue` lost the lifecycle CAS on
-     * this issue row and exhausted its own retries (see FENCED). Contention,
-     * not a bug — distinct from `errors` so a log line never conflates the
-     * two. Zero lifecycle writes happened for these; left to the nightly
-     * sweep, exactly like `stale`.
+     * Applies withheld because the lifecycle lost the CAS on this issue row,
+     * on this module's one and only write attempt — never retried (see
+     * FENCED). Contention, not a bug — distinct from `errors` so a log line
+     * never conflates the two. Zero lifecycle writes happened for these; left
+     * to the nightly sweep, exactly like `stale`.
      */
     conflicts: number;
     /**
@@ -279,10 +293,51 @@ function errorCategory(error: unknown): string {
 }
 
 /**
+ * Thrown from inside `courtesyClient`'s wrapped `updateMany`, the instant the
+ * underlying write reports a lost CAS (`{count: 0}`) — see the module
+ * header's ROW-LEVEL CAS paragraph for why this exists as its own class
+ * rather than reusing anything from review-alert-lifecycle.ts: it must NOT be
+ * an `instanceof` that module's module-private `VersionConflict`, so
+ * `evaluateReviewIssue`'s own retry loop cannot recognise and swallow it.
+ * Bucketed into `EvidenceCloseResult.conflicts`, apart from `errors`, so the
+ * two are never confused in a log line.
+ */
+class CourtesyCasConflict extends Error {}
+
+/**
+ * Wraps a lifecycle client so THIS module's one write can never be retried by
+ * `evaluateReviewIssue` itself — see `CourtesyCasConflict` and the module
+ * header's ROW-LEVEL CAS paragraph. Every call other than the write
+ * (`reviewIssue.updateMany`) passes straight through to the real client
+ * unchanged; `$transaction` re-wraps whatever transactional client the real
+ * `$transaction` hands back, so the same interception reaches the write
+ * wherever it actually runs.
+ */
+function courtesyClient(client: ReviewIssueLifecycleClient): ReviewIssueLifecycleClient {
+    return {
+        reviewIssue: {
+            findUnique: args => client.reviewIssue.findUnique(args),
+            create: args => client.reviewIssue.create(args),
+            updateMany: async args => {
+                const result = await client.reviewIssue.updateMany(args);
+                if (result.count === 0) throw new CourtesyCasConflict();
+                return result;
+            },
+        },
+        reviewAlertEpisode: {
+            create: args => client.reviewAlertEpisode.create(args),
+            updateMany: args => client.reviewAlertEpisode.updateMany(args),
+        },
+        $transaction: fn => client.$transaction(tx => fn(courtesyClient(tx))),
+    };
+}
+
+/**
  * THE ONLY WRITE THIS MODULE MAKES, and it refuses to be anything but a clear
- * — on every attempt, including the lifecycle's own internal version-conflict
- * retries. See SUBTRACTIVE and FENCED in the module header for why no
- * recompute callback is handed to `evaluateReviewIssue` any more (round 4).
+ * — on its one and only attempt (see `courtesyClient` and the module
+ * header's ROW-LEVEL CAS paragraph for why there is never a second one). See
+ * SUBTRACTIVE and FENCED in the module header for why no recompute callback
+ * is handed to `evaluateReviewIssue` any more (round 4).
  *
  * `displayDetails` is null on purpose: the lifecycle's `clear` branch writes
  * `clearedAt`, the acknowledgement columns and the version, and never touches
@@ -293,37 +348,26 @@ function errorCategory(error: unknown): string {
  * Returns whether the lifecycle's OWN decision was `clear` — false for `noop`
  * (something else already cleared this issue since the open-issue read), so a
  * caller never counts a write that did not actually happen (see IDEMPOTENT in
- * the module header). Lets `evaluateReviewIssue`'s own exhausted-retries
- * error propagate uncaught — the caller (`closeRequestsSatisfiedBy`) is what
- * recognises and counts it as a `conflict`.
+ * the module header). Lets a lost CAS propagate as `CourtesyCasConflict`,
+ * uncaught — the caller (`closeRequestsSatisfiedBy`) is what recognises and
+ * counts it as a `conflict`.
  */
-async function defaultApplyCodes(targetKey: string, codes: ReasonCode[]): Promise<boolean> {
+async function defaultApplyCodes(
+    targetKey: string,
+    codes: ReasonCode[],
+    client: ReviewIssueLifecycleClient,
+): Promise<boolean> {
     // Structural already (the caller only reaches here on an empty verdict);
     // asserted anyway, because "subtractive" is the property that lets this
     // path run without a certified cycle.
     if (codes.length > 0) throw new Error("evidence-close may only clear an issue, never open one");
     const { decision } = await evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, targetKey, codes, null, {
+        client: courtesyClient(client),
         // Delivery is the per-owner digest, never the per-issue drainer — the
         // same choice the sweep makes for every receipt-request write.
         episodeStatus: "SUPPRESSED",
     });
     return decision.action === "clear";
-}
-
-/**
- * The one error `evaluateReviewIssue` throws from ITS OWN version-conflict
- * retry loop, once contention exhausts every attempt
- * (review-alert-lifecycle.ts: `` `evaluateReviewIssue: exceeded ${N}
- * version-conflict retries for ${targetType}:${targetKey}` ``). Matched by
- * message, not `instanceof`: the loop's own `VersionConflict` class is
- * module-private and never escapes it, and this module must not add an
- * exported one to shared code for a caller that no longer even asks it to
- * retry (see the module header, FENCED). Contention on one issue row is not a
- * bug — bucketed into `EvidenceCloseResult.conflicts`, apart from `errors`,
- * so the two are never confused in a log line.
- */
-function isVersionConflictExhausted(error: unknown): boolean {
-    return error instanceof Error && error.message.includes("version-conflict retries");
 }
 
 /**
@@ -361,7 +405,9 @@ export async function closeRequestsSatisfiedBy(
     const openIssueKeys = deps.openIssueKeys ?? defaultOpenIssueKeys;
     const readEpochs = deps.readEpochs ?? defaultReadEpochs;
     const recompute = deps.recompute ?? recomputeCodesFor;
-    const applyCodes = deps.applyCodes ?? defaultApplyCodes;
+    const lifecycleClient = deps.client ?? (prisma as unknown as ReviewIssueLifecycleClient);
+    const applyCodes = deps.applyCodes ??
+        ((targetKey: string, codes: ReasonCode[]) => defaultApplyCodes(targetKey, codes, lifecycleClient));
 
     // SETUP: the candidate query, the open-issue lookup, and the freshness
     // snapshot every verdict below will be measured against (see FENCED). A
@@ -508,20 +554,20 @@ export async function closeRequestsSatisfiedBy(
 
         const targetKey = toClear[i];
         try {
-            // No recompute callback any more (round 4, blocker 1): a version
-            // conflict on the write itself — someone else committed to THIS
-            // row between the read just above and the write about to happen
-            // — is left to `evaluateReviewIssue`'s own internal retry, which
-            // (with no way to re-derive the codes) can only ever reapply this
-            // SAME empty verdict (see SUBTRACTIVE). If contention persists
-            // through every one of its attempts, it throws, and that throw is
-            // recognised below and counted as a `conflict`, not an `error`.
+            // A version conflict on the write itself — someone else committed
+            // to THIS row between the read just above and the write about to
+            // happen — is terminal on the first attempt (round 4, blocker 1):
+            // `courtesyClient` stops `evaluateReviewIssue`'s own retry loop
+            // from ever running a second one (see the module header's
+            // ROW-LEVEL CAS paragraph), and the resulting
+            // `CourtesyCasConflict` is recognised below and counted as a
+            // `conflict`, not an `error`.
             const cleared = await applyCodes(targetKey, []);
             // Only a genuine `clear` is counted — a `noop` (something else
             // cleared it first) is not this call's doing (see IDEMPOTENT).
             if (cleared) result.cleared.push(targetKey);
         } catch (error) {
-            if (isVersionConflictExhausted(error)) {
+            if (error instanceof CourtesyCasConflict) {
                 result.conflicts++;
                 console.warn("[receipt-intake/evidence-close] lost the lifecycle CAS; leaving it to the sweep", targetKey);
             } else {

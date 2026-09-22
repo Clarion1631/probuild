@@ -27,7 +27,6 @@ import {
     type EvidenceCloseDeps,
 } from "../src/lib/receipt-intake/evidence-close-store";
 import {
-    evaluateReviewIssue,
     type ReviewIssueLifecycleClient,
     type ReviewIssueRow,
 } from "../src/lib/review-alert-lifecycle";
@@ -209,22 +208,6 @@ function lifecycleClient(
     return client as unknown as ReviewIssueLifecycleClient;
 }
 
-/** The real lifecycle, driven against the in-memory ledger. Returns whether
- *  the decision was an actual CLEAR (false for a noop). No `recomputeCodes`
- *  is passed — the same wiring `defaultApplyCodes` does in production (round
- *  4) — so a version-conflict retry inside `evaluateReviewIssue` can only
- *  ever reapply the SAME empty `codes` it started with. */
-function realApplyCodes(s: Store, opts: { conflictOnceFor?: Set<string>; conflictAlwaysFor?: Set<string> } = {}) {
-    return async (targetKey: string, codes: ReasonCode[]) => {
-        const { decision } = await evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, targetKey, codes, null, {
-            client: lifecycleClient(s, opts),
-            episodeStatus: "SUPPRESSED",
-            now: () => new Date("2026-09-21T20:00:00.000Z"),
-        });
-        return decision.action === "clear";
-    };
-}
-
 function depsFor(s: Store, overrides: Partial<EvidenceCloseDeps> = {}): EvidenceCloseDeps {
     return {
         lookbackDays: LOOKBACK,
@@ -238,7 +221,13 @@ function depsFor(s: Store, overrides: Partial<EvidenceCloseDeps> = {}): Evidence
                 .map(id => [id, s.issues.get(id)!.id]),
         ),
         recompute: async targetKey => { s.recomputes.push(targetKey); return []; },
-        applyCodes: realApplyCodes(s),
+        // Production's OWN `defaultApplyCodes`, not a test reimplementation of
+        // it: every test below that does not override `applyCodes` exercises
+        // the real apply path — including the `courtesyClient` CAS wrapper
+        // (round 4, blocker 1) — against this in-memory fake. Before round 4
+        // no test ever ran production `defaultApplyCodes` at all, so blockers
+        // 1 and 2 had no regression guard.
+        client: lifecycleClient(s),
         // Stable across both reads by default — no drift, no staleness. Tests
         // that care about the freshness fence override this explicitly.
         readEpochs: async () => ({ evidence: "1", ledger: "1" }),
@@ -498,12 +487,12 @@ test("an epoch that moves between two applies withholds the second one, counting
     assert.equal(s.issues.get("line-b")!.clearedAt, null, "never touched");
 });
 
-test("a CAS conflict that exhausts every retry does not re-judge, does not apply anything, and is counted as a conflict, never cleared", async () => {
+test("a CAS conflict that would never resolve is still terminal on the very first attempt — no re-judge, nothing applied, counted as a conflict, never cleared", async () => {
     const s = store(["line-open"], ["line-open"]);
     const conflictAlwaysFor = new Set([s.issues.get("line-open")!.id]);
     let recomputeCalls = 0;
     const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
-        applyCodes: realApplyCodes(s, { conflictAlwaysFor }),
+        client: lifecycleClient(s, { conflictAlwaysFor }),
         recompute: async targetKey => { recomputeCalls++; s.recomputes.push(targetKey); return []; },
     }));
 
@@ -511,24 +500,28 @@ test("a CAS conflict that exhausts every retry does not re-judge, does not apply
     assert.deepEqual(result.cleared, [], "never counted as cleared");
     assert.equal(result.errors, 0, "a lost lifecycle CAS is not an `errors`-bucket failure");
     assert.equal(recomputeCalls, 1, "judged once, in the judge phase — no re-judge on the conflict (round 4, blocker 1: there is no recomputeCodes callback any more)");
+    const updateManyAttempts = s.writes.filter(w => w.model === "reviewIssue" && w.op === "updateMany").length;
+    assert.equal(updateManyAttempts, 1, "exactly one write attempt, even though this fake would keep losing the CAS forever — courtesyClient never gives evaluateReviewIssue's own retry loop the chance to try a second time");
     assert.deepEqual(s.writes.filter(w => w.model === "reviewAlertEpisode"), [], "nothing was ever actually applied");
-    assert.equal(s.issues.get("line-open")!.version, 1, "the row's version never advanced — every attempt lost the CAS");
+    assert.equal(s.issues.get("line-open")!.version, 1, "the row's version never advanced — the one attempt lost the CAS");
     assert.equal(s.issues.get("line-open")!.clearedAt, null, "left exactly as it was, for the nightly sweep");
 });
 
-test("a transient CAS conflict retries the lifecycle's SAME clear-only verdict once contention clears — never a re-judge", async () => {
+test("a lost lifecycle CAS is terminal on the first attempt even when the conflicting writer would have gotten out of the way a moment later — counted as a conflict, never cleared, never retried (round 4, blocker 1)", async () => {
     const s = store(["line-open"], ["line-open"]);
     const conflictOnceFor = new Set([s.issues.get("line-open")!.id]);
     let recomputeCalls = 0;
     const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
-        applyCodes: realApplyCodes(s, { conflictOnceFor }),
+        client: lifecycleClient(s, { conflictOnceFor }),
         recompute: async targetKey => { recomputeCalls++; s.recomputes.push(targetKey); return []; },
     }));
 
-    assert.deepEqual(result.cleared, ["line-open"], "the SAME empty verdict landed once the conflicting writer got out of the way");
-    assert.equal(result.conflicts, 0, "the retry succeeded — no exhaustion to count");
-    assert.equal(recomputeCalls, 1, "the lifecycle's own internal retry reapplied the fixed `[]` — it never asked to re-judge");
-    assert.equal(s.issues.get("line-open")!.clearedAt !== null, true);
+    assert.equal(result.conflicts, 1, "a lost CAS is terminal on the first attempt, not retried until the conflicting writer clears");
+    assert.deepEqual(result.cleared, [], "never counted as cleared");
+    assert.equal(recomputeCalls, 1, "judged once, in the judge phase — no re-judge on the conflict");
+    const updateManyAttempts = s.writes.filter(w => w.model === "reviewIssue" && w.op === "updateMany").length;
+    assert.equal(updateManyAttempts, 1, "exactly one write attempt — courtesyClient stops evaluateReviewIssue's own retry loop from ever running a second one, so this transient conflict is never given the chance to resolve itself");
+    assert.equal(s.issues.get("line-open")!.clearedAt, null, "left exactly as it was, for the nightly sweep");
 });
 
 test("a courtesy clear writes displayDetails exactly like the sweep's own clear: the column is not touched at all", async () => {
