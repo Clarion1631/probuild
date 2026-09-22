@@ -19,7 +19,12 @@ review_content=""
 [ -f "$REVIEW_FILE" ] && review_content=$(cat "$REVIEW_FILE")
 
 # Case A: Codex could not sign in (expired/reused login token).
-if printf '%s' "$stderr_content" | grep -qE 'refresh_token_reused|token_expired|401 Unauthorized'; then
+# grep -q exits as soon as it finds a match, without draining the rest of
+# its input; piping a large `printf` into it can then kill the printf with
+# SIGPIPE and, under `pipefail`, flip this condition's exit status. A
+# here-string has no concurrent writer to kill, so it doesn't have that
+# failure mode.
+if grep -qE 'refresh_token_reused|token_expired|401 Unauthorized' <<< "$stderr_content"; then
   template=$(cat <<'MSGEOF'
 ProBuild PR check: Codex can't sign in (its GitHub login expired). PRs are not getting a Codex review until this is fixed. On Justin's PC, in PowerShell, run these 2 commands:
 1) New-Item -ItemType Directory -Force "$HOME\.codex-ci" | Out-Null; $env:CODEX_HOME = "$HOME\.codex-ci"; codex login; Remove-Item Env:CODEX_HOME
@@ -33,7 +38,8 @@ fi
 
 # Case B: no verdict line at all (sandbox error, crash, missing review file).
 # Mirrors the exact pattern the gate itself uses to extract the verdict.
-if ! printf '%s' "$review_content" | grep -qE 'VERDICT: (APPROVE|REQUEST_CHANGES)'; then
+# Same here-string reasoning as the case A check above.
+if ! grep -qE 'VERDICT: (APPROVE|REQUEST_CHANGES)' <<< "$review_content"; then
   printf '%s' "ProBuild PR check: Codex couldn't finish a review (no verdict). PRs are not getting a Codex review until this is fixed. Check the failed run: ${RUN_URL}"
   exit 0
 fi
