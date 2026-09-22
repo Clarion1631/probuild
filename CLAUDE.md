@@ -30,6 +30,21 @@
 - Supabase hosts Postgres and Storage — project ref: `ghzdbzdnwjxazvmcefbh`. Application auth is **NextAuth** (`src/lib/auth.ts`, Prisma-backed users), not Supabase Auth — GoogleProvider in production, plus a test-only CredentialsProvider registered only when `PLAYWRIGHT_TEST_SECRET` is set
 - Auto-deploy is **ON** — pushes build previews, merges to `main` ship to prod. See "Deploying to Vercel"
 
+## Code map — read before exploring (saves tokens)
+- Start at `C:\Users\jat00\workspaces\vaults\Workspace\Projects\ProBuild\ProBuild Code Map.md`, then the one `PB <Domain>.md` note that owns the path you're touching. Only then open source files. Do not grep the whole tree for orientation.
+- Generated nightly beside the Code Map (`_generated\gtr-probuild-site\`): `Routes.md` (every API route + method), `Symbol Index.md` (exports + line numbers for every file over 1,500 lines), `Prisma Models.md` (model → line range), `Hot Files.md`, `Modules.md`.
+- AST graph of `origin/main` (rebuilt 01:30, no LLM): `C:\Users\jat00\workspaces\_shared\probuild-graph\gtr-probuild-site\code\graphify-out\graph.json` — `/graphify query "<q>" --graph <that path>` for "what calls what". The `code\` folder next to it is a read-only snapshot of main; this checkout is often on a feature branch.
+
+## Token hygiene — execution rules
+Context is the scarce resource in this repo. These are hard rules, not preferences.
+- **Never Read `src/lib/actions.ts` (15K lines) or `prisma/schema.prisma` (3K lines) whole.** Look the symbol or model up in `Symbol Index.md` / `Prisma Models.md`, then Read with `offset` + `limit` (40–80 lines). Same for any file over ~1,500 lines (`EstimateEditor.tsx`, `schedule-core.ts`, `ScheduleBoard.tsx`, `billing-core.ts`, the MCP route).
+- **Checks go through the quiet scripts:** `npm run check:quiet` (typecheck + lint + unit tests), or `npm run typecheck:quiet` / `lint:quiet` / `test:quiet`. Targeted tests: `node scripts/quiet-check.mjs test tests/foo.test.ts`. They print one summary line per step plus the first 15 failures; full output lands in `.quiet-check/<step>.log` — grep that, don't rerun the raw command. Never run bare `tsc`, `eslint`, `next build`, or `tsx --test` in the main session.
+- **Builds and test runs belong in the checker subagent** (Sonnet) when verifying a worker's change: it runs `check:quiet`, reads the logs, and reports PASS/FAIL with `path:line` evidence. Only that verdict enters the main context.
+- **Dev server, Playwright, `vercel logs`, `prisma migrate`:** run in the background with output redirected to a file, then `grep`/`tail` the file. Never stream them into the conversation.
+- **git:** `git diff --stat` and `git log --oneline -n 10` first; open a full diff only for the files you need. Never `git diff` the whole branch.
+- **Shell output:** anything that can exceed ~50 lines gets `| tail -40` or a `grep` filter. If you need the whole thing, write it to a file and Read selectively.
+- **Delegate exploration** ("where is X used", "does Y exist") to the Explore agent — it reads excerpts, and only the conclusion comes back.
+
 ## Room Studio (3D room designer)
 - Lives in `src/components/studio/` + `src/lib/studio/` (react-three-fiber). The legacy `room-designer` modules are gone — don't recreate them.
 - Document model: `RoomDesign.layoutJson` holds a v2 `DesignDoc` (`lib/studio/doc.ts`); placed items mirror into `RoomAsset` rows. v1 layouts upgrade on load.
