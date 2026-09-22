@@ -1242,12 +1242,15 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             const evidence = await loadBookedEvidence(expenseId);
             if (!evidence) return;
             const closed = await closeRequestsSatisfiedByEvidence(evidence, { deadlineExceeded });
-            // `judged` is included so this expenseId-correlated line also
-            // fires for a booking whose evidence-close left something open —
-            // `closeRequestsSatisfiedBy` already warns internally, but without
-            // the expenseId that ties it back to this specific booking.
-            if (closed.cleared.length > 0 || closed.errors > 0 || closed.stale > 0 || closed.judged.length > 0) {
-                console.log("[cron/receipt-intake-worker] evidence close", JSON.stringify({ expenseId, ...closed }));
+            // ONE detailed log for `judged` — `closeRequestsSatisfiedBy`
+            // already wrote it, per-candidate, ids only (Codex round 3,
+            // should-fix 2). This line stays a COUNTS-only summary, with the
+            // expenseId that line cannot carry, rather than a second copy of
+            // the same per-candidate detail.
+            const { judged, ...counts } = closed;
+            if (counts.cleared.length > 0 || counts.errors > 0 || counts.stale > 0 || judged.length > 0) {
+                console.log("[cron/receipt-intake-worker] evidence close",
+                    JSON.stringify({ expenseId, ...counts, judgedCount: judged.length }));
             }
         },
 

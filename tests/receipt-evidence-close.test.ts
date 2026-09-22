@@ -32,7 +32,7 @@ import {
     type ReviewIssueRow,
 } from "../src/lib/review-alert-lifecycle";
 import { ComponentDeadlineExceededError, RECEIPT_REQUEST_TARGET_TYPE } from "../src/lib/receipt-requests";
-import type { ReasonCode } from "../src/lib/review-alert-reasons";
+import { canonicalizeReasonCodes, hashReasonCodes, type ReasonCode } from "../src/lib/review-alert-reasons";
 import {
     CLOSE_REQUESTS_MIN_BUDGET_MS,
     RUN_HARD_BUDGET_MS,
@@ -118,9 +118,13 @@ function store(lineIds: string[], openKeys: string[], clearedKeys: string[] = []
         targetKey,
         version: 1,
         reasonCodes: JSON.stringify(["MISSING_RECEIPT"]),
-        // The real hash for ["MISSING_RECEIPT"] is irrelevant to a CLEAR: step 1
-        // of decideLifecycle never compares hashes.
-        reasonHash: "hash-missing-receipt",
+        // THE REAL hash — not a placeholder. A CLEAR (step 1) never compares
+        // hashes, so it did not used to matter; a version-conflict RETRY that
+        // re-judges to the SAME non-empty codes (Codex round 3) reaches step 5
+        // ("touch") only when this matches what `decideLifecycle` computes,
+        // and a mismatched placeholder pushed that case into "supersede"
+        // instead, which opens an episode this fixture is not built for.
+        reasonHash: hashReasonCodes(canonicalizeReasonCodes(["MISSING_RECEIPT"])),
         displayDetails: JSON.stringify({ payee: "ARCO #82887", amountCents: -9_309 }),
         acknowledgedCodes: "[]",
         acknowledgedAt: null,
@@ -139,8 +143,14 @@ function store(lineIds: string[], openKeys: string[], clearedKeys: string[] = []
  * settings store: `automationSetting` is wired so a write to the cycle key or
  * either cursor would be RECORDED rather than merely impossible, which is what
  * makes the fence test below an assertion instead of a hope.
+ *
+ * `conflictOnceFor` (Codex round 3): the set of issue ids whose FIRST
+ * `updateMany` should report a lost CAS — `{ count: 0 }` — regardless of
+ * whether the version actually matches, exactly as a real concurrent writer
+ * committing between the caller's read and its write would look from here.
+ * Consumed on the first hit, so a retry's own write behaves normally.
  */
-function lifecycleClient(s: Store): ReviewIssueLifecycleClient {
+function lifecycleClient(s: Store, opts: { conflictOnceFor?: Set<string> } = {}): ReviewIssueLifecycleClient {
     const client = {
         reviewIssue: {
             findUnique: async (args: { where: { targetType_targetKey?: { targetKey: string }; id?: string } }) => {
@@ -154,8 +164,13 @@ function lifecycleClient(s: Store): ReviewIssueLifecycleClient {
             },
             updateMany: async (args: { where: { id: string; version: number }; data: Record<string, unknown> }) => {
                 s.writes.push({ model: "reviewIssue", op: "updateMany", data: args.data });
-                const row = [...s.issues.values()].find(r => r.id === args.where.id && r.version === args.where.version);
+                const row = [...s.issues.values()].find(r => r.id === args.where.id);
                 if (!row) return { count: 0 };
+                if (opts.conflictOnceFor?.has(row.id)) {
+                    opts.conflictOnceFor.delete(row.id);
+                    return { count: 0 };
+                }
+                if (row.version !== args.where.version) return { count: 0 };
                 Object.assign(row, {
                     ...args.data,
                     version: row.version + 1,
@@ -186,13 +201,17 @@ function lifecycleClient(s: Store): ReviewIssueLifecycleClient {
 }
 
 /** The real lifecycle, driven against the in-memory ledger. Returns whether
- *  the decision was an actual CLEAR (false for a noop). */
-function realApplyCodes(s: Store) {
-    return async (targetKey: string, codes: ReasonCode[]) => {
+ *  the decision was an actual CLEAR (false for a noop or anything else the
+ *  general lifecycle reached on a version-conflict retry). `recomputeCodes`
+ *  is threaded straight into `evaluateReviewIssue`'s own retry option, never
+ *  invoked here — the same wiring `defaultApplyCodes` does in production. */
+function realApplyCodes(s: Store, opts: { conflictOnceFor?: Set<string> } = {}) {
+    return async (targetKey: string, codes: ReasonCode[], recomputeCodes: () => Promise<ReasonCode[]>) => {
         const { decision } = await evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, targetKey, codes, null, {
-            client: lifecycleClient(s),
+            client: lifecycleClient(s, opts),
             episodeStatus: "SUPPRESSED",
             now: () => new Date("2026-09-21T20:00:00.000Z"),
+            recomputeCodes,
         });
         return decision.action === "clear";
     };
@@ -449,6 +468,98 @@ test("a stable epoch clears normally — the fence only withholds on an actual m
     assert.deepEqual(result, { examined: 1, cleared: ["line-open"], errors: 0, stale: 0, judged: [] });
 });
 
+test("an epoch that moves between two applies withholds the second one, counting only the first", async () => {
+    // Codex round 3: the freshness read now happens IMMEDIATELY before EACH
+    // apply, not once for the whole batch — this is the test that tells the
+    // two designs apart, since the single-candidate version above cannot.
+    const s = store(["line-a", "line-b"], ["line-a", "line-b"]);
+    let reads = 0;
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        readEpochs: async () => {
+            reads++;
+            // #1 = setup (before judging); #2 = right before applying
+            // line-a; #3 = right before applying line-b, where the ledger
+            // has now moved under it.
+            return reads <= 2 ? { evidence: "1", ledger: "1" } : { evidence: "1", ledger: "2" };
+        },
+    }));
+
+    assert.deepEqual(result.cleared, ["line-a"], "the first apply already committed under still-current evidence");
+    assert.equal(result.stale, 1, "the second apply — and everything still queued behind it — is withheld");
+    assert.equal(s.issues.get("line-a")!.clearedAt !== null, true);
+    assert.equal(s.issues.get("line-b")!.clearedAt, null, "never touched");
+});
+
+test("a CAS conflict on apply re-judges via the callback; a non-empty re-judge leaves the issue open, not cleared", async () => {
+    const s = store(["line-open"], ["line-open"]);
+    const conflictOnceFor = new Set([s.issues.get("line-open")!.id]);
+    let recomputeCalls = 0;
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        applyCodes: realApplyCodes(s, { conflictOnceFor }),
+        recompute: async targetKey => {
+            recomputeCalls++;
+            s.recomputes.push(targetKey);
+            // FIRST call: the judge phase — satisfied. SECOND call: the
+            // lifecycle's OWN version-conflict retry, reached only through
+            // the `recomputeCodes` callback — genuinely still owed, proving
+            // it re-runs recomputeCodesFor rather than replaying the fixed
+            // `[]` this call already decided on moments ago.
+            return recomputeCalls === 1 ? [] : ["MISSING_RECEIPT"] as ReasonCode[];
+        },
+    }));
+
+    assert.deepEqual(result.cleared, [], "the retry's own re-judge said still-owed — nothing was actually cleared");
+    assert.equal(recomputeCalls, 2, "the callback ran the SAME recomputeCodesFor a second time, on the conflict");
+    assert.equal(s.issues.get("line-open")!.clearedAt, null, "left open, exactly as the fresh re-judge said");
+});
+
+test("a deadline that fires exactly when judging finishes stops before any apply starts", async () => {
+    const s = store(["line-open"], ["line-open"]);
+    let deadlineHit = false;
+    let applyCalls = 0;
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        deadlineExceeded: () => deadlineHit,
+        recompute: async targetKey => {
+            s.recomputes.push(targetKey);
+            const codes: ReasonCode[] = [];
+            // The invocation's budget runs out the instant judging is done —
+            // before the apply phase's own "after judging" check ever runs.
+            deadlineHit = true;
+            return codes;
+        },
+        applyCodes: async () => { applyCalls++; return false; },
+    }));
+
+    assert.equal(applyCalls, 0, "the after-judging check stopped it before the apply phase began");
+    assert.deepEqual(result.cleared, []);
+    assert.equal(result.stale, 0, "a deadline stop, not a freshness one — nothing is counted stale");
+});
+
+test("a late-settling judge does not start an apply — the store's own deadline predicate stops it", async () => {
+    const s = store(["line-open"], ["line-open"]);
+    let deadlineHit = false;
+    let applyCalls = 0;
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        deadlineExceeded: () => deadlineHit,
+        recompute: async targetKey => {
+            s.recomputes.push(targetKey);
+            // The SAME predicate the worker's own outer race flips (see
+            // worker.ts's closeDeadlineExceeded) is flipped WHILE this call
+            // is still in flight, and only THEN does this call settle, on a
+            // later tick — with a SATISFIED verdict that would otherwise
+            // have gone on to clear. Deterministic: one controlled promise
+            // tick, no timers.
+            deadlineHit = true;
+            await Promise.resolve();
+            return [];
+        },
+        applyCodes: async () => { applyCalls++; return false; },
+    }));
+
+    assert.equal(applyCalls, 0, "no apply was ever started once the deadline had fired, however late the judge settled");
+    assert.deepEqual(result.cleared, []);
+});
+
 test("a setup failure — the candidate query, the open-issue lookup, or the epoch read — is counted, never thrown", async () => {
     const s = store(["line-open"], ["line-open"]);
 
@@ -549,7 +660,7 @@ function workerHarness(result: BookResult, overrides: Partial<WorkerDependencies
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         read: async () => { throw new Error("a BOOKING row is never read"); },
         applyRead: async () => ({ owned: true, strongOwner: null }),
-        findWeakHit: async () => null,
+        findWeakGroup: async () => [],
         applyState: async () => true,
         finishRouting: async () => {},
         companyTimeZone: async () => "America/Los_Angeles",

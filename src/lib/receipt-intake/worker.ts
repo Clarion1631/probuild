@@ -1029,8 +1029,12 @@ async function closeRequestsSatisfiedByBooking(
     const closePromise = deps.closeRequestsSatisfiedBy(result.expenseId, closeDeadlineExceeded)
         .then(() => false as const)
         .catch(error => {
+            // Error NAME only, never the message (Codex round 3, should-fix
+            // 2) — a message can echo query parameters or other unbounded
+            // text; a name is one of a small, fixed set, so this line stays
+            // ids-only the same way evidence-close's own warns do.
             console.warn("[cron/receipt-intake-worker] evidence close failed", result.expenseId,
-                error instanceof Error ? error.message : "UnknownError");
+                error instanceof Error ? error.name : "UnknownError");
             return false as const;
         });
 
