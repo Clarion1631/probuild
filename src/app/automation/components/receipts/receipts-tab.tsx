@@ -373,12 +373,24 @@ export async function ReceiptsTab({
                     <StatCard label={TODO_COPY.statBooked} value={String(counts["booked-today"])} sub={TODO_COPY.statBookedSub} />
                 </div>
                 <ReceiptChipRow filters={filters} counts={counts} filterHref={filterHref} todo />
-                {todo.needsYouCount === 0
+                {/* "Done" is a claim about the WHOLE queue, and this view only
+                    ever sees the newest 100 requests. With older ones still
+                    unloaded the empty piles are a display limit, not an empty
+                    inbox, so the coverage note takes the place of the claim. */}
+                {todo.needsYouCount === 0 && todo.notLoadedCount === 0
                     ? <TodoDone plan={todo} />
                     : todo.piles
                         .filter(pile => pile.items.length > 0)
                         .map(pile => <TodoPileCard key={pile.key} pile={pile} jobs={jobs} links={links} />)}
-                <FoldedStrip plan={todo} />
+                {todo.notLoadedCount > 0 && (
+                    <TodoCoverageNote
+                        shown={queue.counts.missingReceiptsShown}
+                        total={queue.counts.missingReceipts}
+                        notLoaded={todo.notLoadedCount}
+                        filterHref={filterHref}
+                    />
+                )}
+                <FoldedStrip plan={todo} filterHref={filterHref} />
             </div>
         );
     }
@@ -431,7 +443,7 @@ export async function ReceiptsTab({
                     <p className="px-4 py-2 text-xs text-red-700 bg-red-50 border-b border-red-100">
                         Each of these was voided or re-classified after the send to QuickBooks had already started.
                         Where the purchase id is known it is linked below — open it in QuickBooks, void it there, then
-                        mark it resolved. Nothing here can remove it for you. {TODO_COPY.exceptionsNative}
+                        mark it resolved. Nothing here can remove it for you.
                     </p>
                     {queue.exceptions.map(row => (
                         <RowShell key={row.id}>
@@ -778,7 +790,15 @@ function TodoRequestRowView({ row, check = false }: { row: MissingReceiptRow; ch
                 {check && <p className="text-xs text-amber-700 mt-1">{TODO_COPY.checkSentence}</p>}
             </div>
             <div className="flex items-center gap-3 flex-wrap">
-                {row.owner === "unattributed" && <AssignOwnerControl issueId={row.id} currentOwner={row.owner} expectedVersion={row.version} />}
+                {/* BOTH unattributed and unassigned. setMissingReceiptOwner
+                    (actions.ts) gates on target type, clearedAt and the
+                    rendered version, and never on the current owner, so it
+                    takes an unrecognised card tail exactly as it takes a
+                    missing one. Without this the pile had a row nobody could
+                    act on, which is worse than not listing it. */}
+                {(row.owner === "unattributed" || row.owner === "unassigned") && (
+                    <AssignOwnerControl issueId={row.id} currentOwner={row.owner} expectedVersion={row.version} />
+                )}
                 {check && (
                     <a href={CHECK_GUIDE_HREF} className="text-xs font-medium text-hui-primary hover:underline">
                         {TODO_COPY.checkLink}
@@ -837,7 +857,10 @@ function TodoRequestItemView({ item, check = false }: { item: TodoRequestItem; c
  * is indistinguishable from a strip that broke. Every line links into the group
  * view that holds those rows, so one click is still the whole truth.
  */
-function FoldedStrip({ plan }: { plan: TodoPlan }) {
+function FoldedStrip({ plan, filterHref }: {
+    plan: TodoPlan;
+    filterHref: (overrides: { group?: string; owner?: string; view?: string }) => string;
+}) {
     return (
         <section className="hui-card px-4 py-3 bg-slate-50">
             <p className="text-sm text-hui-textMuted">{fillCopy(TODO_COPY.stripHeader, { n: plan.handledCount })}</p>
@@ -845,13 +868,49 @@ function FoldedStrip({ plan }: { plan: TodoPlan }) {
                 <ul className="mt-2 space-y-1">
                     {plan.folded.map(line => (
                         <li key={line.key} className="text-xs text-hui-textMuted">
-                            {line.href
-                                ? <a href={line.href} className="font-medium text-hui-primary hover:underline">{line.text}</a>
-                                : line.text}
+                            {/* Built HERE, through the same builder the chips
+                                use, so an active project filter survives the
+                                click. The planner knows the group, not the URL. */}
+                            <a
+                                href={filterHref({ group: line.target.group, owner: line.target.owner ?? "" })}
+                                className="font-medium text-hui-primary hover:underline"
+                            >
+                                {line.text}
+                            </a>
                         </li>
                     ))}
                 </ul>
             )}
+        </section>
+    );
+}
+
+/**
+ * What this view could not load.
+ *
+ * The request loader takes the newest 100 open items (receipts-data.ts), so on
+ * a big backlog the piles are a window, not the queue. Saying so, with a way
+ * through to the whole list, is the difference between a short list and a short
+ * list that is lying.
+ */
+function TodoCoverageNote({ shown, total, notLoaded, filterHref }: {
+    shown: number;
+    total: number;
+    notLoaded: number;
+    filterHref: (overrides: { group?: string; owner?: string; view?: string }) => string;
+}) {
+    return (
+        <section className="hui-card px-4 py-3">
+            <p className="text-sm text-hui-textMuted">{fillCopy(TODO_COPY.capLine, { shown, total })}</p>
+            <p className="text-sm text-hui-textMuted mt-1">
+                {notLoaded === 1 ? TODO_COPY.notLoadedOne : fillCopy(TODO_COPY.notLoaded, { n: notLoaded })}{" "}
+                <a
+                    href={filterHref({ group: "missing-receipts", owner: "", view: "all" })}
+                    className="font-medium text-hui-primary hover:underline"
+                >
+                    {TODO_COPY.openFullList}
+                </a>
+            </p>
         </section>
     );
 }
@@ -870,7 +929,9 @@ function TodoDone({ plan }: { plan: TodoPlan }) {
             <p className="text-sm text-hui-textMuted mt-1">
                 {plan.handledCount === 0
                     ? TODO_COPY.doneNothing
-                    : fillCopy(TODO_COPY.doneSub, { n: plan.handledCount })}
+                    : plan.handledCount === 1
+                        ? TODO_COPY.doneSubOne
+                        : fillCopy(TODO_COPY.doneSub, { n: plan.handledCount })}
             </p>
         </section>
     );

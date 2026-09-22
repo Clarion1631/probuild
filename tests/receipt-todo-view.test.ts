@@ -2,11 +2,13 @@
  * The To-do planner: what is a person's work, what the system is handling, and
  * the one thing this view is never allowed to do.
  *
- * THE LEAD ASSERTION IS CONSERVATION. Every row the queue hands `planTodo`
- * lands in exactly one pile or exactly one folded line. Never both, never
- * neither. A row that falls through every rule disappears off the only page
- * that lists it, and nobody finds out until a bank reconciliation does. That
- * test is written first on purpose.
+ * THE LEAD ASSERTION IS CONSERVATION, over RECEIPTS. Every distinct row the
+ * queue hands `planTodo` lands in exactly one pile or exactly one folded line.
+ * Never both, never neither. A row that falls through every rule disappears off
+ * the only page that lists it, and nobody finds out until a bank reconciliation
+ * does. The fixture deliberately puts the SAME row object in two groups,
+ * because `fetchReceiptQueue` really does that: `exceptions` is selected on
+ * `postVoidQbPurchaseId` or the orphan suffix and is not state-scoped.
  *
  * Amounts here are NEGATIVE, because a bank charge is. Sorting "biggest first"
  * therefore has to be by magnitude, and a fixture full of positive numbers
@@ -16,6 +18,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
     CHECK_GUIDE_HREF,
+    DYNAMIC_FOLDED_COPY,
     FOLDED_COPY,
     PILE_AGE_MIN_DAYS,
     ROLLUP_WINDOW_DAYS,
@@ -86,10 +89,16 @@ function queueOf(over: Partial<ReceiptQueue> = {}): ReceiptQueue {
     };
 }
 
-const totalRows = (queue: ReceiptQueue) =>
-    queue.needsJob.length + queue.needsReview.length + queue.booking.length
-    + queue.bookedToday.length + queue.duplicates.length + queue.exceptions.length
-    + queue.uncertainCards.length + queue.missingReceipts.length;
+/** Distinct rows, which is what conservation is about. Not list entries. */
+function distinctRowIds(queue: ReceiptQueue): Set<string> {
+    const ids = new Set<string>();
+    for (const rows of [queue.exceptions, queue.booking, queue.bookedToday, queue.duplicates, queue.needsJob, queue.needsReview]) {
+        for (const row of rows) ids.add(row.id);
+    }
+    for (const entry of queue.uncertainCards) ids.add(entry.id);
+    for (const row of queue.missingReceipts) ids.add(row.id);
+    return ids;
+}
 
 const pile = (plan: TodoPlan, key: TodoPileKey) => {
     const found = plan.piles.find(entry => entry.key === key);
@@ -103,14 +112,24 @@ const rowIdsIn = (plan: TodoPlan, key: TodoPileKey): string[] =>
 const allPileRowIds = (plan: TodoPlan): string[] => plan.piles.flatMap(entry =>
     entry.items.flatMap(item => item.kind === "intake" ? [item.row.id] : item.item.rows.map(row => row.id)));
 
+const allFoldedRowIds = (plan: TodoPlan): string[] => plan.folded.flatMap(line => line.ids);
+
 const foldedCount = (plan: TodoPlan, key: string) => plan.folded.find(line => line.key === key)?.count ?? 0;
 
 // ── 1. Conservation, first ────────────────────────────────────────────────
 
 test("every row in the queue lands in exactly one pile or exactly one folded line", () => {
-    // One row of every shape this page can hold.
+    // ONE row object in TWO groups, which is the real shape: exceptionsWhere
+    // keys on postVoidQbPurchaseId or the orphan suffix and is not
+    // state-scoped, so a row re-routed to NEEDS_JOB after "Not a duplicate"
+    // comes back in both arrays with `booked-after-void` still on it.
+    const overlapping = intake("overlap", { state: "NEEDS_JOB", postVoidQbPurchaseId: "qb-7", stateReason: "booked-after-void" });
+    // And the same trap on the DUPLICATE group, which is where handledCount
+    // used to double count.
+    const overlappingDuplicate = intake("overlap-dup", { state: "DUPLICATE", stateReason: "x:possible-orphan-purchase", postVoidQbPurchaseId: "qb-8" });
+
     const queue = queueOf({
-        needsJob: [intake("nj", { state: "NEEDS_JOB", stateReason: null })],
+        needsJob: [intake("nj", { state: "NEEDS_JOB", stateReason: null }), overlapping],
         needsReview: [
             intake("r-noest", { stateReason: "no-estimate" }),
             intake("r-unread", { stateReason: "unreadable" }),
@@ -133,8 +152,8 @@ test("every row in the queue lands in exactly one pile or exactly one folded lin
         ],
         booking: [intake("bk", { state: "BOOKING" })],
         bookedToday: [intake("bt", { state: "BOOKED" })],
-        duplicates: [intake("dup", { state: "DUPLICATE" })],
-        exceptions: [intake("exc", { postVoidQbPurchaseId: "qb-1" })],
+        duplicates: [intake("dup", { state: "DUPLICATE" }), overlappingDuplicate],
+        exceptions: [intake("exc", { postVoidQbPurchaseId: "qb-1" }), overlapping, overlappingDuplicate],
         uncertainCards: [card("uc")],
         missingReceipts: [
             request("m-cj", { owner: "CJ" }),
@@ -151,21 +170,28 @@ test("every row in the queue lands in exactly one pile or exactly one folded lin
     });
 
     const plan = planTodo(queue, NOW);
-
-    assert.equal(
-        plan.needsYouCount + plan.handledCount,
-        totalRows(queue),
-        "a row is counted once, somewhere. Neither is a rounding error",
-    );
+    const expected = distinctRowIds(queue);
 
     const inPiles = allPileRowIds(plan);
-    assert.equal(new Set(inPiles).size, inPiles.length, "no row is drawn in two piles");
-    assert.equal(inPiles.length, plan.needsYouCount, "needsYouCount counts rows, not rolled-up lines");
+    const inFolded = allFoldedRowIds(plan);
+    const everywhere = [...inPiles, ...inFolded];
+
+    assert.equal(new Set(everywhere).size, everywhere.length, "no row is counted twice, in any combination");
+    assert.deepEqual(new Set(everywhere), expected, "and every row the queue holds is somewhere");
     assert.equal(
-        plan.folded.reduce((sum, line) => sum + line.count, 0),
-        plan.handledCount,
-        "the strip's own lines add up to the number in its header",
+        plan.needsYouCount + plan.handledCount,
+        expected.size,
+        "a row is counted once, somewhere. Neither is a rounding error",
     );
+    assert.equal(inPiles.length, plan.needsYouCount, "needsYouCount counts rows, not rolled-up lines");
+    assert.equal(inFolded.length, plan.handledCount);
+
+    // The overlapping rows in particular: exceptions wins, once each.
+    assert.equal(everywhere.filter(id => id === "overlap").length, 1);
+    assert.equal(everywhere.filter(id => id === "overlap-dup").length, 1);
+    assert.ok(!inPiles.includes("overlap"), "a row with an orphaned QuickBooks purchase is never drawn as routine work");
+    assert.deepEqual(plan.folded.find(line => line.key === "exceptions")?.ids, ["exc", "overlap", "overlap-dup"]);
+    assert.equal(foldedCount(plan, "duplicates"), 1, "the overlapping DUPLICATE is not counted again here");
 
     // And the split itself, named.
     assert.deepEqual(rowIdsIn(plan, "whose-card").sort(), ["m-unassigned", "m-unattr"]);
@@ -184,7 +210,8 @@ test("the folded strip is always drawn, even with nothing in it", () => {
     assert.deepEqual(plan.folded, [], "no line claims a count it does not have");
     assert.equal(plan.handledCount, 0);
     assert.equal(plan.needsYouCount, 0);
-    assert.equal(fillCopy(TODO_COPY.stripHeader, { n: 0 }), "The system is handling 0 of these.");
+    assert.equal(plan.notLoadedCount, 0);
+    assert.equal(fillCopy(TODO_COPY.stripHeader, { n: 0 }), "Not yours: 0 of these.");
 });
 
 // ── 2. Which reasons are a person's ───────────────────────────────────────
@@ -208,19 +235,24 @@ test("isOfficeManagerReason: the office manager's reasons, and an unknown one", 
     assert.equal(isOfficeManagerReason("unreadable;tax-implausible"), true);
 });
 
-test("a parked row that is nobody's to fix lands on exactly one folded line", () => {
+test("a parked row that is nobody's to fix lands on exactly one folded line, and the line says who acts", () => {
     const plan = planTodo(queueOf({
         needsReview: [
             intake("a", { stateReason: "ai-unavailable" }),
-            intake("b", { stateReason: "push-paused" }),
-            intake("c", { stateReason: "refund-or-zero" }),
+            intake("b", { stateReason: "max-retries" }),
+            intake("c", { stateReason: "push-paused" }),
+            intake("d", { stateReason: "refund-or-zero" }),
         ],
     }), NOW);
 
-    assert.equal(foldedCount(plan, "retrying"), 2, "the system will try these again");
-    assert.equal(foldedCount(plan, "bookkeeping"), 1, "this one needs a person who is not her");
+    // NOT one "waiting on another try" line. `retryTargetFor` is explicitly
+    // about a MANUAL retry, so nothing here is retried on a timer, and the two
+    // cases have different answers to "who does something".
+    assert.equal(foldedCount(plan, "retryable"), 2);
+    assert.equal(foldedCount(plan, "switched-off"), 1);
+    assert.equal(foldedCount(plan, "bookkeeping"), 1);
     assert.equal(plan.needsYouCount, 0);
-    assert.equal(plan.handledCount, 3);
+    assert.equal(plan.handledCount, 4);
 });
 
 // ── 3. Roll-up ────────────────────────────────────────────────────────────
@@ -248,10 +280,17 @@ test("a run of the same errand rolls up; a stretched one splits rather than losi
     assert.deepEqual(stretched.flatMap(item => item.rows.map(row => row.id)).sort(), ["a", "b"], "and nothing was dropped");
 });
 
-test("a cent of difference, a different person, or an unreadable payee is not a repeat", () => {
+test("a cent, a person, a CARD, or an unreadable payee all break the repeat", () => {
     assert.equal(rollUpRepeats([repeat("a", "2026-09-01"), repeat("b", "2026-09-02", { amountCents: -4_001 })]).length, 2);
     assert.equal(rollUpRepeats([repeat("a", "2026-09-01"), repeat("b", "2026-09-02", { owner: "Richard" })]).length, 2,
         "a merged line across two people has nobody to ask");
+    // The summary prints ONE card tail. Merging two cards would print a tail
+    // that is wrong for half the rows underneath it.
+    const twoCards = rollUpRepeats([
+        repeat("a", "2026-09-01", { cardTail: "8516" }),
+        repeat("b", "2026-09-02", { cardTail: "6098" }),
+    ]);
+    assert.equal(twoCards.length, 2, "two cards are two runs");
     assert.equal(rollUpRepeats([repeat("a", "2026-09-01", { payee: "" }), repeat("b", "2026-09-02", { payee: "" })]).length, 2,
         "with no payee the only thing left matching is the amount, and that is a coincidence");
     assert.equal(rollUpRepeats([repeat("a", ""), repeat("b", "")]).length, 2, "and with no date there is no window");
@@ -266,30 +305,37 @@ test("one charge is an item holding one row", () => {
 
 // ── 4. Sort ───────────────────────────────────────────────────────────────
 
-test("biggest dollars first, and a roll-up sorts by its total", () => {
+test("biggest dollars first, and a roll-up sorts by its TOTAL", () => {
+    // The middle charge is the point. $250 sits ABOVE each dump ticket ($40)
+    // and BELOW the run's total ($400), so sorting by the per-charge amount
+    // would put it in the wrong place and this test would fail.
+    const plan = planTodo(queueOf({
+        missingReceipts: [
+            request("rent", { payee: "SUNBELT RENTALS", amountCents: -58_000, postedDate: "2026-09-10" }),
+            request("middle", { payee: "LOWES", amountCents: -25_000, postedDate: "2026-09-11" }),
+            ...Array.from({ length: 10 }, (_unused, index) =>
+                request(`dump-${index}`, { payee: "THE ROCKERY NW", amountCents: -4_000, postedDate: `2026-08-2${index}`.slice(0, 10) })),
+        ],
+    }), NOW);
+
+    const ask = pile(plan, "ask-for-these").items;
+    assert.equal(ask.length, 3, "ten dump tickets are one line");
+    const totals = ask.map(item => (item.kind === "request" ? item.item.totalCents : 0));
+    assert.deepEqual(totals, [-58_000, -40_000, -25_000], "$400 of dump tickets outranks a single $250 charge");
+    assert.equal(ask[1].kind === "request" ? ask[1].item.rows.length : 0, 10);
+    assert.equal(ask[1].kind === "request" ? ask[1].item.amountCentsEach : 0, -4_000,
+        "and each ticket is smaller than the charge it outranks");
+});
+
+test("intake piles are ordered by size too", () => {
     const plan = planTodo(queueOf({
         needsJob: [
             intake("small", { state: "NEEDS_JOB", totalCents: -1_000 }),
             intake("big", { state: "NEEDS_JOB", totalCents: -58_000 }),
             intake("mid", { state: "NEEDS_JOB", totalCents: -9_900 }),
         ],
-        missingReceipts: [
-            request("rent", { payee: "SUNBELT RENTALS", amountCents: -58_000, postedDate: "2026-09-10" }),
-            ...Array.from({ length: 10 }, (_unused, index) =>
-                request(`dump-${index}`, { payee: "THE ROCKERY NW", amountCents: -4_000, postedDate: `2026-08-2${index}`.slice(0, 10) })),
-        ],
     }), NOW);
-
     assert.deepEqual(rowIdsIn(plan, "pick-the-job"), ["big", "mid", "small"]);
-
-    const ask = pile(plan, "ask-for-these").items;
-    assert.equal(ask.length, 2, "ten dump tickets are one line");
-    assert.ok(ask[0].kind === "request" && ask[1].kind === "request");
-    // $400 of dump tickets beats a $580 rental only if the roll-up sorts by
-    // the SUM. It does not, so the rental leads.
-    assert.equal(ask[0].kind === "request" ? ask[0].item.totalCents : 0, -58_000);
-    assert.equal(ask[1].kind === "request" ? ask[1].item.rows.length : 0, 10);
-    assert.equal(ask[1].kind === "request" ? ask[1].item.totalCents : 0, -40_000);
 });
 
 test("the ask pile is ordered by person first, then by size inside each person", () => {
@@ -332,8 +378,8 @@ test("acknowledged, held and answered rows leave the piles and are each counted 
         assert.equal(plan.handledCount, 1, name);
         assert.equal(plan.folded.length, 1, `${name}: exactly one line, never two`);
         assert.equal(plan.folded[0].key, line, name);
-        assert.equal(plan.folded[0].count, 1, name);
-        assert.ok(plan.folded[0].href?.startsWith("/automation?tab=receipts&group="), `${name}: the line links to a real group view`);
+        assert.deepEqual(plan.folded[0].ids, ["x"], name);
+        assert.ok(plan.folded[0].target.group, `${name}: the line points at a real group`);
     }
 });
 
@@ -350,9 +396,34 @@ test("an acknowledged row folds however it got there", () => {
     assert.equal(foldedCount(plan, "acknowledged"), 2);
 });
 
-test("an unrecognised resolution stays visible instead of folding", () => {
-    const plan = planTodo(queueOf({ missingReceipts: [request("x", { resolution: "something-new" })] }), NOW);
-    assert.deepEqual(rowIdsIn(plan, "ask-for-these"), ["x"], "a shape nobody has words for must not go quiet");
+test("a hold or a resolution nobody has words for is NAMED, and quotes itself", () => {
+    // Neither silently folded nor leaked into "Ask for these receipts": a new
+    // code would otherwise either hide a charge or chase one somebody has
+    // already answered.
+    const hold = planTodo(queueOf({
+        missingReceipts: [
+            request("h1", { outreachHold: "awaiting-vendor-portal" }),
+            request("h2", { outreachHold: "awaiting-vendor-portal" }),
+            request("h3", { outreachHold: "some-other-new-thing", rawDescriptor: "CHECK PAID 9" , cardTail: null, owner: "office" }),
+        ],
+    }), NOW);
+    assert.equal(hold.needsYouCount, 0, "including the check, which must not be drawn as work");
+    assert.equal(hold.handledCount, 3);
+    assert.deepEqual(
+        hold.folded.map(line => line.text),
+        [
+            "2 are held for a reason I do not know: awaiting-vendor-portal. Justin checks those.",
+            "1 is held for a reason I do not know: some-other-new-thing. Justin checks that one.",
+        ],
+        "one line per distinct code, so the sentence stays true",
+    );
+
+    const resolved = planTodo(queueOf({
+        missingReceipts: [request("r1", { resolution: "closed-by-vanessa" })],
+    }), NOW);
+    assert.equal(resolved.needsYouCount, 0);
+    assert.equal(resolved.folded[0].text, "1 was answered in a way I do not know: closed-by-vanessa. Justin checks that one.");
+    assert.deepEqual(resolved.folded[0].ids, ["r1"]);
 });
 
 // ── 6. Only the paths the view actually draws ─────────────────────────────
@@ -374,9 +445,10 @@ test("todoStoragePaths returns the piles' paths, deduped, and nothing else", () 
     assert.deepEqual(todoStoragePaths(plan), [shared], "one path, once, and only from a pile");
 });
 
-// ── 7. House style over every string this view can print ──────────────────
+// ── 7. What every string is allowed to say ────────────────────────────────
 
-test("no em dash, no en dash, no spaced hyphen, anywhere in the new copy", () => {
+/** Every user-visible string this module can print, composed forms included. */
+function everyString(): string[] {
     const strings: string[] = [];
     const walk = (value: unknown) => {
         if (typeof value === "string") strings.push(value);
@@ -385,20 +457,28 @@ test("no em dash, no en dash, no spaced hyphen, anywhere in the new copy", () =>
     walk(TODO_COPY);
     walk(TODO_PILE_COPY);
     walk(FOLDED_COPY);
-    // The composed sentences too, not just their parts.
+    walk(DYNAMIC_FOLDED_COPY);
     strings.push(rollUpSummary("$40.00", 10, "$400.00"));
     strings.push(rollUpDates("2026-08-14", "2026-09-02", "6098"));
     strings.push(rollUpDates("2026-08-14", "2026-09-02", null));
     for (const key of Object.keys(FOLDED_COPY) as Array<keyof typeof FOLDED_COPY>) {
         strings.push(fillCopy(FOLDED_COPY[key].many, { n: 7 }));
     }
+    for (const key of Object.keys(DYNAMIC_FOLDED_COPY) as Array<keyof typeof DYNAMIC_FOLDED_COPY>) {
+        strings.push(fillCopy(DYNAMIC_FOLDED_COPY[key].many, { n: 7, raw: "some-new-code" }));
+    }
     strings.push(fillCopy(TODO_COPY.stripHeader, { n: 81 }));
     strings.push(fillCopy(TODO_COPY.doneSub, { n: 81 }));
     strings.push(fillCopy(TODO_COPY.pileAge, { n: 9 }));
     strings.push(fillCopy(TODO_COPY.capLine, { shown: 97, total: 109 }));
     strings.push(fillCopy(TODO_COPY.capLineOwner, { shown: 12, total: 109, owner: "Richard" }));
+    strings.push(fillCopy(TODO_COPY.notLoaded, { n: 12 }));
+    return strings;
+}
 
-    assert.ok(strings.length > 40, `only ${strings.length} strings were scanned`);
+test("no em dash, no en dash, no spaced hyphen, anywhere in the new copy", () => {
+    const strings = everyString();
+    assert.ok(strings.length > 50, `only ${strings.length} strings were scanned`);
     for (const line of strings) {
         assert.ok(!line.includes("—"), `em dash: ${line}`);
         assert.ok(!line.includes("–"), `en dash: ${line}`);
@@ -406,13 +486,35 @@ test("no em dash, no en dash, no spaced hyphen, anywhere in the new copy", () =>
     }
 });
 
+test("no string promises an outcome the pipeline is not in a position to deliver", () => {
+    // The same rule reason-text.ts states for its own sentences. Say what is
+    // true about the row and what action exists; never predict what happens
+    // next. A promise that does not come true is how a bookkeeper learns to
+    // stop reading the page.
+    const BANNED: Array<[RegExp, string]> = [
+        [/books? itself/i, "it may park again on the very next step"],
+        [/will book/i, "same promise, different words"],
+        [/\bclears\b/i, "nothing here can promise a row clears"],
+        [/would fix|fixes it|fix it\b/i, "a fix is a prediction, not a fact about the row"],
+        [/as soon as it has/i, "the job is one of several gates, not the last one"],
+        [/tomorrow morning/i, "the crew chase lists are switched off, so nothing goes out tomorrow"],
+        [/automatically/i, "say who or what acts, not that it is automatic"],
+    ];
+    for (const line of everyString()) {
+        for (const [pattern, why] of BANNED) {
+            assert.ok(!pattern.test(line), `"${line}" promises an outcome (${why})`);
+        }
+    }
+});
+
 test("every folded line has a singular and a plural, and the count is substituted", () => {
-    for (const key of Object.keys(FOLDED_COPY) as Array<keyof typeof FOLDED_COPY>) {
-        const copy = FOLDED_COPY[key];
+    const all = { ...FOLDED_COPY, ...DYNAMIC_FOLDED_COPY };
+    for (const key of Object.keys(all) as Array<keyof typeof all>) {
+        const copy = all[key];
         assert.ok(copy.one.startsWith("1 "), `${key}: the singular says one`);
         assert.ok(copy.many.includes("{n}"), `${key}: the plural has somewhere to put the count`);
         assert.ok(!copy.one.includes("{n}"), `${key}: the singular never prints a placeholder`);
-        assert.equal(fillCopy(copy.many, { n: 12 }).includes("12"), true, key);
+        assert.equal(fillCopy(copy.many, { n: 12, raw: "x" }).includes("12"), true, key);
     }
 });
 
@@ -433,7 +535,7 @@ test("a bare ?tab=receipts is the To-do view, and every other shape is what it w
     assert.equal(showsTodoView(parseReceiptFilters({ owner: "CJ" })), false, "an owner filter asks for something To-do cannot do");
     assert.equal(showsTodoView(parseReceiptFilters({ projectId: "p1" })), true, "a project filter still narrows the queue underneath");
 
-    assert.equal(parseReceiptFilters({ view: "nonsense" }).view, "todo", "junk never lands anywhere but the default");
+    assert.equal(parseReceiptFilters({ view: "nonsense" }).view, "todo", "junk in `view` lands on the default");
     assert.equal(parseReceiptFilters({ view: ["all", "todo"] }).view, "all", "a repeated param takes the first value");
     assert.equal(parseReceiptFilters({ view: "todo" }).view, "todo");
 
@@ -442,16 +544,43 @@ test("a bare ?tab=receipts is the To-do view, and every other shape is what it w
     assert.equal(showsTodoView({ group: null, projectId: null, owner: null }), false);
 });
 
+test("a group or owner this page does not know still means 'show me the groups'", () => {
+    // It resolved to the all-groups view before the To-do view existed.
+    // Bouncing a typo somewhere new is a behaviour change hiding in a typo.
+    for (const sp of [
+        { group: "" },
+        { group: "../../etc/passwd" },
+        { group: ["nonsense"] },
+        { owner: "" },
+        { owner: "Mallory" },
+        { group: "", owner: "" },
+    ] as Array<Record<string, string | string[]>>) {
+        const filters = parseReceiptFilters(sp);
+        assert.equal(filters.view, "all", JSON.stringify(sp));
+        assert.equal(showsTodoView(filters), false, JSON.stringify(sp));
+    }
+    // An explicit `view` still wins: it is the one thing that named a view.
+    assert.equal(parseReceiptFilters({ group: "", view: "todo" }).view, "todo");
+});
+
 // ── 9. Checks and sub bills ───────────────────────────────────────────────
 
-test("looksLikeCheckOrSubBill: anchored, bounded, and beaten by a real check number", () => {
-    for (const descriptor of ["CHECK PAID 1042", "CHECK #1042", "  check paid", "CHECK NO 88", "CHECK 1042", "CHECK1042"]) {
+test("looksLikeCheckOrSubBill: anchored, bounded at both ends, beaten by a real check number", () => {
+    for (const descriptor of [
+        "CHECK PAID 1042", "CHECK #1042", "  check paid", "CHECK NO 88", "CHECK 1042", "CHECK1042",
+        "CHK 1031", "CHK#1031", "CHK NO 1031", "chk 1031", "CHECK-1031", "CHECK:1031", "CHK - 1031",
+    ]) {
         assert.equal(looksLikeCheckOrSubBill(descriptor), true, descriptor);
     }
-    // The two the anchor and the boundary exist for.
-    assert.equal(looksLikeCheckOrSubBill("PAYCHECK DEPOSIT"), false);
-    assert.equal(looksLikeCheckOrSubBill("CHECKR INC"), false);
-    assert.equal(looksLikeCheckOrSubBill("CHECKING ACCOUNT FEE"), false);
+    // The cases the anchor and the two boundaries exist for. A debit card rail
+    // is not a check, and neither is a payroll deposit or a background check
+    // vendor.
+    for (const descriptor of [
+        "CHECK CARD PURCHASE", "CHK CARD PURCHASE", "CHECK PAIDOFF LOANS",
+        "PAYCHECK DEPOSIT", "CHECKR INC", "CHECKING ACCOUNT FEE",
+    ]) {
+        assert.equal(looksLikeCheckOrSubBill(descriptor), false, descriptor);
+    }
     for (const empty of [null, undefined, "", "   "]) {
         assert.equal(looksLikeCheckOrSubBill(empty), false, JSON.stringify(empty));
     }
@@ -491,12 +620,21 @@ test("a check that is held, answered or already reviewed stays folded", () => {
     }
 });
 
-test("a hand set owner and a card tail both beat the descriptor", () => {
-    const assigned = planTodo(queueOf({
+test("assigning a check to a PERSON routes it to them; assigning it to the office does not delete the pile", () => {
+    const toPerson = planTodo(queueOf({
         missingReceipts: [request("c", { owner: "Richard", cardTail: null, ownerAssigned: true, rawDescriptor: "CHECK PAID 1042" })],
     }), NOW);
-    assert.deepEqual(rowIdsIn(assigned, "ask-for-these"), ["c"], "somebody already answered whose this is");
-    assert.equal(rowIdsIn(assigned, "checks-and-sub-bills").length, 0);
+    assert.deepEqual(rowIdsIn(toPerson, "ask-for-these"), ["c"], "somebody already answered whose this is");
+    assert.equal(rowIdsIn(toPerson, "checks-and-sub-bills").length, 0);
+
+    // Assigning a check to "office" is AGREEMENT with the descriptor, not an
+    // override of it. Treating it as one would let attributing a check quietly
+    // delete the pile that tells somebody to post it.
+    const toOffice = planTodo(queueOf({
+        missingReceipts: [request("c", { owner: "office", cardTail: null, ownerAssigned: true, rawDescriptor: "CHECK PAID 1042" })],
+    }), NOW);
+    assert.deepEqual(rowIdsIn(toOffice, "checks-and-sub-bills"), ["c"]);
+    assert.equal(toOffice.handledCount, 0);
 
     const carded = planTodo(queueOf({
         missingReceipts: [request("c", { owner: "CJ", cardTail: "8516", rawDescriptor: "CHECK PAID 1042" })],
@@ -510,4 +648,43 @@ test("the check pile's procedure is a link into the guide, not a copy of it", ()
     assert.equal(TODO_PILE_COPY["checks-and-sub-bills"].title, "Checks and sub bills");
     assert.equal(TODO_COPY.checkFacts, "check paid");
     assert.notEqual(TODO_COPY.checkFacts, TODO_COPY.noCard, "office rail is internal jargon and the wrong fact on a check");
+});
+
+// ── 10. What this view could not load ─────────────────────────────────────
+
+test("notLoadedCount is the gap the display cap leaves, and never negative", () => {
+    const capped = queueOf({ missingReceipts: [request("a", { acknowledged: true })] });
+    capped.counts.missingReceipts = 109;
+    capped.counts.missingReceiptsShown = 1;
+
+    const plan = planTodo(capped, NOW);
+    assert.equal(plan.notLoadedCount, 108);
+    assert.equal(plan.needsYouCount, 0, "the loaded page is all acknowledged");
+    // Which is exactly the shape that must NOT say "you're done": 108 older
+    // requests are still open and none of them was even read.
+    assert.ok(plan.notLoadedCount > 0);
+
+    const whole = queueOf({ missingReceipts: [request("a")] });
+    assert.equal(planTodo(whole, NOW).notLoadedCount, 0);
+
+    const odd = queueOf({ missingReceipts: [request("a"), request("b")] });
+    odd.counts.missingReceipts = 1;
+    assert.equal(planTodo(odd, NOW).notLoadedCount, 0, "a count that is somehow smaller is zero, never negative");
+});
+
+// ── 11. Where a folded line points ────────────────────────────────────────
+
+test("a folded line carries a TARGET, so the render can keep the rest of the URL", () => {
+    const plan = planTodo(queueOf({
+        booking: [intake("bk", { state: "BOOKING" })],
+        missingReceipts: [request("o", { owner: "office", cardTail: null, rawDescriptor: "ACH DEBIT" })],
+    }), NOW);
+
+    const booking = plan.folded.find(line => line.key === "booking");
+    assert.deepEqual(booking?.target, { group: "booking" });
+    const office = plan.folded.find(line => line.key === "office-owner");
+    assert.deepEqual(office?.target, { group: "missing-receipts", owner: "office" });
+    // An href built in here could not know about a project filter, so there is
+    // none to be found.
+    assert.ok(!("href" in (booking ?? {})), "the planner does not build URLs");
 });

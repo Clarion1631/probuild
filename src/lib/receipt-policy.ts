@@ -159,13 +159,16 @@ export function classifyReceiptRequirement(line: ReceiptPolicyLine): ReceiptPoli
 }
 
 /**
- * A check descriptor, anchored at the start.
+ * A check descriptor, anchored at the start, and bounded at BOTH ends of the
+ * token that follows.
  *
- * `PAYCHECK DEPOSIT` and `CHECKR INC` must not match, which is the whole reason
- * for the anchor and for what follows the word: a check line always carries
- * PAID, a #, NO, or the number itself right after it.
+ * Anchored, so `PAYCHECK DEPOSIT` cannot match. Bounded after `CHECK`/`CHK`,
+ * so `CHECKR INC` and `CHECKING ACCOUNT FEE` cannot. Bounded after what
+ * follows, so `CHECK PAIDOFF LOANS` cannot, and so `CHECK CARD PURCHASE` (a
+ * debit card rail, not a check) stays out: a real check line carries PAID, or a
+ * number behind #, NO, or nothing at all.
  */
-export const CHECK_DESCRIPTOR = /^\s*CHECK\s*(?:PAID|#|NO\b|\d)/i;
+export const CHECK_DESCRIPTOR = /^\s*CH(?:ECK|K)\s*[-:]?\s*(?:PAID\b|#\s*\d|NO\b\s*\d|\d)/i;
 
 /**
  * Does this line need a check image and the bill it paid, rather than a receipt?

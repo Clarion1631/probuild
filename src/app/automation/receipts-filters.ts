@@ -80,8 +80,15 @@ export function parseReceiptFilters(sp: Record<string, string | string[] | undef
     const group = RECEIPT_GROUPS.includes(rawGroup as ReceiptGroup) ? (rawGroup as ReceiptGroup) : null;
     const rawOwner = firstParam(sp.owner);
     const owner = rawOwner !== null && OWNER_ORDER.includes(rawOwner as ReceiptOwner) ? rawOwner : null;
+    // A URL that ASKED for a group or an owner and named one this page does not
+    // know still means "show me the groups". It fell back to the all-groups
+    // view before the To-do view existed, and bouncing it somewhere new is a
+    // behaviour change hiding inside a typo.
+    const askedForGroups = ("group" in sp && group === null) || ("owner" in sp && owner === null);
     const rawView = firstParam(sp.view);
-    const view = RECEIPT_VIEWS.includes(rawView as ReceiptView) ? (rawView as ReceiptView) : "todo";
+    const view = rawView === null && askedForGroups
+        ? "all"
+        : RECEIPT_VIEWS.includes(rawView as ReceiptView) ? (rawView as ReceiptView) : "todo";
     return { group, projectId: firstParam(sp.projectId), owner, view };
 }
 
