@@ -194,7 +194,7 @@ export const PILE_AGE_MIN_DAYS = 7;
 type FoldedKey =
     | "booking" | "booked-today" | "switched-off" | "retryable" | "held" | "office-invoice"
     | "acknowledged" | "memo-signed" | "office-owner" | "bookkeeping"
-    | "duplicates" | "exceptions" | "uncertain-cards" | "unassigned-card";
+    | "duplicates" | "exceptions" | "uncertain-cards";
 
 interface FoldedCopy {
     /** Exactly one. Written out rather than pluralised by string surgery. */
@@ -208,8 +208,8 @@ interface FoldedCopy {
  * Every fixed folded line, in render order: what the pipeline is doing first,
  * then what belongs to a named person.
  *
- * `switched-off`, `retryable`, `bookkeeping` and `unassigned-card` are not in
- * the original design's table. They have to exist: a parked receipt that is not
+ * `switched-off`, `retryable` and `bookkeeping` are not in the original
+ * design's table. They have to exist: a parked receipt that is not
  * the office manager's is still a row in the queue, and without a line of its
  * own it would be counted nowhere and conservation would fail.
  *
@@ -269,11 +269,6 @@ export const FOLDED_COPY: Record<FoldedKey, FoldedCopy> = {
         many: "{n} are other office charges. Justin checks those for now.",
         target: { group: "missing-receipts", owner: "office" },
     },
-    "unassigned-card": {
-        one: "1 has a card number I do not recognise. Justin checks that one.",
-        many: "{n} have a card number I do not recognise. Justin checks those.",
-        target: { group: "missing-receipts", owner: "unassigned" },
-    },
     bookkeeping: {
         one: "1 is parked for a bookkeeping call. Justin checks that one.",
         many: "{n} are parked for a bookkeeping call. Justin checks those.",
@@ -319,7 +314,7 @@ export const DYNAMIC_FOLDED_COPY = {
 const FOLDED_ORDER: FoldedKey[] = [
     "booking", "booked-today", "switched-off", "retryable",
     "held", "office-invoice", "acknowledged", "memo-signed",
-    "office-owner", "unassigned-card", "bookkeeping",
+    "office-owner", "bookkeeping",
     "duplicates", "exceptions", "uncertain-cards",
 ];
 
