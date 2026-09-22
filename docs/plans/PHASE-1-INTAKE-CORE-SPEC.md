@@ -285,11 +285,15 @@ missing bucket policy is invisible until a 400 MB object is already stored.
   | docType "multi" | NEEDS_REVIEW `multi-doc` |
   | docType "non_receipt" | NON_RECEIPT |
   | total "0.00" (unreadable-total rule, :531) | NEEDS_REVIEW `zero-total` |
-  | no projectId | NEEDS_JOB |
   | strong hit, same totalCents | DUPLICATE (+`duplicateOfId`) |
   | strong hit, different total | NEEDS_REVIEW `strong-dup-amount-mismatch:<id>` |
+  | no projectId | NEEDS_JOB (the key it claimed is KEPT) |
   | weak hit (another live row, different id) | NEEDS_REVIEW `weak-dup:<id>` |
   | otherwise | READ |
+  `no projectId` sits AFTER the strong verdict (moved 2026-09-21): a jobless row must still
+  claim its key on the one pass that routes it, because "Set job" sends it to READ and READ
+  never routes again. Its copy arriving later is then a DUPLICATE or a mismatch review, not a
+  second NEEDS_JOB row for the same document.
   The strong-key CLAIM is the partial unique index: the read step UPDATEs the row with its
   keys and treats a unique violation as the hit signal, then loads the owner row to compare
   totals — the database replaces the Apps Script Properties lock. Weak hits are a plain
@@ -448,9 +452,15 @@ Also changed, all with tests:
 - **A second weak-dedup check runs INSIDE the READ→BOOKING transaction**, the last instant
   before money moves. The claim advisory lock is one global constant so only one batch runs
   at a time.
-- **A NEEDS_REVIEW park RELEASES the strong key unless a QBO send was attempted** (v3.5
-  rule): otherwise the key is held by a document that never became a purchase, and a
-  corrected re-send is quarantined against nothing.
+- **A NEEDS_REVIEW park KEEPS the strong key** (changed 2026-09-21; the v3.5 "release
+  unless sent" rule is gone). Only a row that has OUTLIVED ITS DOCUMENT
+  (`receipt-bytes-missing`, `content-changed` — `parkReleasesStrongKey` in route-state.ts)
+  hands the key back, and only if no send may have happened. Every other parked row still
+  represents its document and a human revives it (Set job, Retry) without routing it again,
+  so a key released at park time was never re-claimed and the same document re-sent could
+  book twice. A row that reaches READ/BOOKING keyless anyway (prod backlog, an unmarked
+  manual duplicate) re-derives its key from `readJson` and claims it before booking
+  (`healStrongKey` in worker.ts); a collision with a live owner parks `strong-dup:<id>`.
 - **Transient throws (storage, Prisma, network) retry on the normal backoff.** Only the
   classified QBO fault types are terminal. `MAX_BOOK_ATTEMPTS` is now `>=`, so it means 20
   attempts in total.
