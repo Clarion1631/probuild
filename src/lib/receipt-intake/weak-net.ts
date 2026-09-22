@@ -43,6 +43,16 @@ export interface WeakGroupRow {
     refNumber: string | null;
     /** Reserved for phase 2's human override; always null until then. */
     resolution?: string | null;
+    /**
+     * The row this one was last compared to — ONLY meaningful on `self`, which
+     * is why it is optional: a twin's own pointer is a fact about the twin.
+     *
+     * A row carries a non-null value here exactly when a HUMAN pressed Set job
+     * on a review that named that row: routing's `applyRead` writes
+     * `duplicateOfId: null`, `unmarkReceiptIntakeDuplicate` clears it, and
+     * `setReceiptIntakeJob` keeps it. See `judgeWeakGroup`.
+     */
+    duplicateOfId?: string | null;
 }
 
 /** Bounded: an 11-way weak collision is pathological and goes to a person. */
@@ -50,7 +60,16 @@ export const MAX_WEAK_GROUP = 10;
 
 export type WeakVerdict =
     | { kind: "park"; twinId: string }
-    | { kind: "distinct"; twinIds: string[] };
+    | {
+        kind: "distinct";
+        twinIds: string[];
+        /**
+         * The ONE twin this verdict did not judge, because a human already did
+         * (`self.duplicateOfId`), or null. Reported so the audit row can say
+         * whose decision cleared the row rather than claiming the weak net's.
+         */
+        humanDistinctFrom: string | null;
+    };
 
 /**
  * The OCR confusions that actually occur on printed reference numbers, and
@@ -150,6 +169,19 @@ export function twinIsDistinct(self: WeakGroupRow, twin: WeakGroupRow): boolean 
  *
  * The park verdict names a twin that is NOT distinct, so the `weak-dup:<id>`
  * reason points a reviewer at the row that actually caused the stop.
+ *
+ * A HUMAN'S STRONG-NET DECISION OUTRANKS THE WEAK NET FOR THE ONE TWIN THEY
+ * WERE SHOWN. `self.duplicateOfId` is non-null only when somebody pressed Set
+ * job on a review naming that row, so that twin is a collision a person has
+ * already ruled on and it is dropped BEFORE anything is judged. Without this the
+ * exit the strong net advertises is a lie: the heal (worker.ts `healStrongKey`)
+ * honours the override and lets the row through keyless, and then this function
+ * parks it `weak-dup:` on the very row the review named — same vendor, same day,
+ * same amount, same ref — so every button the human presses loops.
+ *
+ * EVERY OTHER TWIN IS STILL JUDGED, and the cap is applied to the group AS
+ * FETCHED, ahead of the exemption: the exemption is one named row, never a
+ * licence to book past a group nobody has fully seen.
  */
 export function judgeWeakGroup(self: WeakGroupRow, twins: readonly WeakGroupRow[]): WeakVerdict {
     // More twins than a real weak collision can have. Whatever is going on —
@@ -157,13 +189,36 @@ export function judgeWeakGroup(self: WeakGroupRow, twins: readonly WeakGroupRow[
     // it is not something to decide automatically, so it parks whatever the
     // refs say. The oldest twin is named because that is the order both call
     // sites fetch in, so the reason is stable across passes.
+    //
+    // COUNTED ON THE GROUP AS FETCHED, BEFORE THE EXEMPTION, because the cap is
+    // an OVERFLOW SENTINEL tied to the caller's `take` — promoteToBooking reads
+    // `MAX_WEAK_GROUP + 2` rows, self plus up to eleven twins — so a full result
+    // means "there may be MORE rows than we fetched" and this view of the group
+    // is truncated. Counting what remained after the exemption let one
+    // human-ruled twin drop eleven to ten, pass the cap, and decide a group
+    // whose twelfth and thirteenth rows — one of them possibly a booked legacy
+    // duplicate with an unreadable ref — this function never saw. A human
+    // exempting ONE twin is never a reason to decide an over-large, possibly
+    // truncated group automatically.
     if (twins.length > MAX_WEAK_GROUP) {
         return { kind: "park", twinId: twins[0].id };
     }
-    for (const twin of twins) {
+    // Only a twin ACTUALLY IN THIS GROUP is exempt. A `duplicateOfId` pointing
+    // at a row that shares no weak key (or has since been voided) names nobody
+    // here and changes nothing.
+    const exempt = self.duplicateOfId
+        ? twins.find(twin => twin.id === self.duplicateOfId) ?? null
+        : null;
+    const judged = exempt ? twins.filter(twin => twin.id !== exempt.id) : twins;
+
+    for (const twin of judged) {
         if (!twinIsDistinct(self, twin)) return { kind: "park", twinId: twin.id };
     }
     // Includes the no-twins case, which is the ordinary "nothing shares this
     // key" path and reports an empty list rather than a verdict about nobody.
-    return { kind: "distinct", twinIds: twins.map(twin => twin.id) };
+    return {
+        kind: "distinct",
+        twinIds: judged.map(twin => twin.id),
+        humanDistinctFrom: exempt?.id ?? null,
+    };
 }

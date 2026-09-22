@@ -272,7 +272,10 @@ test("the three write paths all take the guard, and the worker refuses in its ow
     const cron = readFileSync(join(repoRoot, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
     assert.match(worker, /async function applyRoutedState\(/);
     assert.match(worker, /return deps\.applyDuplicateTransition\(rowId, decision, patch, ownership\);/);
-    assert.equal((worker.match(/await applyRoutedState\(/g) ?? []).length, 3);
+    // FOUR routing exits since the job gate moved below the strong claim: the
+    // document gates, the strong-owner verdict, the jobless park, and the weak
+    // park. Every one of them goes through the guard.
+    assert.equal((worker.match(/await applyRoutedState\(/g) ?? []).length, 4);
     assert.match(cron, /applyDuplicateTransition: async \(rowId, decision, patch, ownership\) => withEvidenceAndChainLocks\(/);
 });
 

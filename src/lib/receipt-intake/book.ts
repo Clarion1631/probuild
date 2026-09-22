@@ -62,6 +62,7 @@ import {
     isImplausibleReceiptDate,
     MAX_BOOK_ATTEMPTS,
     NO_ARTIFACT_PARK_REASONS,
+    parkReleasesStrongKey,
     preservedTaxWarning,
 } from "./route-state";
 import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
@@ -212,14 +213,19 @@ export type BookResult =
     /**
      * Terminal: a human must look at it. No further automatic attempt.
      *
-     * `releaseStrongKey` mirrors the Apps Script v3.5 rule. A parked row keeps
-     * holding `dedupStrongKey` (the partial unique index covers every state
-     * except DUPLICATE/VOID), so if we park BEFORE ever reaching QuickBooks —
-     * the job has no estimate, the date is unusable — the key is being held by
-     * a document that never became a purchase. A corrected re-send of the same
-     * receipt would then be quarantined against a row that represents nothing.
-     * Release in exactly that case. Once a send was ATTEMPTED the key must be
-     * held: QBO may have created the Purchase and lost the response.
+     * `releaseStrongKey` is TRUE only for a row that has outlived its document
+     * — `receipt-bytes-missing` or `content-changed` — and only when no send may
+     * have happened. See `mayReleaseStrongKey`, which is the one place that
+     * decides it, and `parkReleasesStrongKey` in route-state.ts for the reason
+     * half of the rule.
+     *
+     * Every other park KEEPS the key. A parked row still holds
+     * `dedupStrongKey` (the partial unique index covers every state except
+     * DUPLICATE/VOID) because it still represents its document: a human revives
+     * it with Set job or Retry, and neither of those routes it again, so a key
+     * released here is never re-claimed and the re-sent copy books a second
+     * time. Once a send was ATTEMPTED the key must be held for the other
+     * reason too: QBO may have created the Purchase and lost the response.
      */
     | { outcome: "needs-review"; reason: string; releaseStrongKey: boolean }
     /**
@@ -556,12 +562,13 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         deps.deadline !== undefined && remainingBudgetMs(deps.deadline) < MIN_BOOKING_BUDGET_MS;
     if (outOfRunway()) return { outcome: "deferred", reason: "out-of-budget" };
 
-    // Everything down to the QBO call is a PRE-SEND refusal for THIS attempt —
-    // but row.sendAttempted (persisted when the row was claimed) can already be
+    // Everything down to the QBO call is a PRE-SEND refusal for THIS attempt.
+    // That alone does not hand the strong key back: parkedBeforeSend releases it
+    // only for a reason that means the row has outlived its document, and only
+    // when no attempt — past or present — may have created a Purchase.
+    // (row.sendAttempted, persisted when the row was claimed, can already be
     // true from an EARLIER attempt that reached QBO before a later re-read hit
-    // one of these checks (e.g. the estimate was deleted between attempts).
-    // parkedBeforeSend folds that in, so the strong key is handed back only
-    // when no attempt, past or present, may have created a Purchase.
+    // one of these checks: the estimate was deleted between attempts, say.)
     // Manual queue transitions and retries must not bypass source triage.
     // A plausible amount on a bank/error screenshot or reconstructed memo
     // is not permission to create a merchant Purchase.
@@ -792,7 +799,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // Purchase whose response we lost, so the key stays claimed even
             // though the row is parked.
             if (terminal) {
-                return { outcome: "needs-review", reason: terminal, releaseStrongKey: mayReleaseStrongKey(row, sent) };
+                return {
+                    outcome: "needs-review",
+                    reason: terminal,
+                    releaseStrongKey: mayReleaseStrongKey(row, terminal, sent),
+                };
             }
             // QBTimeoutError, QBNotConnectedError, network/fetch errors, QBO
             // 429/5xx and DB errors are all transport-class: try again later.
@@ -806,36 +817,39 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 // Keep both kinds of evidence visible within the queue reason's limit.
                 // The durable guard event retains the complete lists.
                 const completeReason = `qbo-create-pending:${pendingIds}${candidateIds ? `;qbo-duplicate:${candidateIds}` : ""}`;
-                const reason = completeReason.length > 400 && candidateIds
+                const reason = (completeReason.length > 400 && candidateIds
                     ? `qbo-create-pending:${pendingIds.slice(0,180)};qbo-duplicate:${candidateIds.slice(0,180)}`
-                    : completeReason;
-                return {outcome:"needs-review",reason:reason.slice(0,400),
-                    releaseStrongKey:mayReleaseStrongKey(row,sent)};
+                    : completeReason).slice(0, 400);
+                return {outcome:"needs-review",reason,
+                    releaseStrongKey:mayReleaseStrongKey(row,reason,sent)};
             }
             if (result.reason === "duplicate-purchase-review") {
+                const reason = `qbo-duplicate:${result.candidates.map(c => c.id).join(",")}:${result.attachment}`.slice(0, 400);
                 return {
                     outcome: "needs-review",
-                    reason: `qbo-duplicate:${result.candidates.map(c => c.id).join(",")}:${result.attachment}`.slice(0, 400),
-                    releaseStrongKey: mayReleaseStrongKey(row, sent),
+                    reason,
+                    releaseStrongKey: mayReleaseStrongKey(row, reason, sent),
                 };
             }
-            // Every ok:false reason is a deterministic refusal, and — this is the
-            // part that was wrong — EVERY one of them is decided BEFORE qbCreateFn
-            // runs: project-not-matched, missing-vendor, invalid-date,
-            // invalid-group-amount, amount-mismatch, duplicate-name,
-            // overhead-*, and docnumber-conflict (which is the idempotency QUERY
-            // finding somebody else's Purchase, not one of ours).
+            // Every ok:false reason is a deterministic refusal, and EVERY one of
+            // them is decided BEFORE qbCreateFn runs: project-not-matched,
+            // missing-vendor, invalid-date, invalid-group-amount,
+            // amount-mismatch, duplicate-name, overhead-*, and
+            // docnumber-conflict (which is the idempotency QUERY finding
+            // somebody else's Purchase, not one of ours).
             //
-            // So THIS attempt created no Purchase, and holding the strong key would
-            // quarantine the corrected re-submission against a booking that never
-            // happened. Release it — UNLESS an earlier attempt already reached QBO
-            // (row.sendAttempted), in which case a Purchase may already exist and
-            // the key stays claimed. A THROWN fault is different — it can come from
-            // inside the create — and keeps the key.
+            // So THIS attempt created no Purchase — and the key is KEPT anyway.
+            // None of these reasons means the row has outlived its document: the
+            // object is still in the bucket, the row still IS that receipt, and
+            // a human can send it on with Set job or Retry, neither of which
+            // routes it again. A key handed back here is one nothing will ever
+            // re-claim, so a corrected re-send sails past both nets and books a
+            // second time. `mayReleaseStrongKey` states that rule once.
+            const reason = `qbo-fault:${result.reason}`;
             return {
                 outcome: "needs-review",
-                reason: `qbo-fault:${result.reason}`,
-                releaseStrongKey: mayReleaseStrongKey(row, sent),
+                reason,
+                releaseStrongKey: mayReleaseStrongKey(row, reason, sent),
             };
         }
 
@@ -1935,18 +1949,27 @@ function purchaseMayExist(sent: { attempted: boolean; purchaseKnownToExist: bool
 /**
  * Centralized strong-key release decision for every needs-review path.
  *
- * A Purchase may exist for this row because of THIS attempt's send (`sent`)
- * or because of an EARLIER attempt's send — `row.sendAttempted`, persisted
- * when the row was claimed, so it survives even when this attempt never
- * reaches QBO at all (a re-read hitting a deleted estimate, a missing
- * object, or any other pre-send/ok:false refusal on a retry). The strong key
- * may only be released when neither is true.
+ * TWO CONDITIONS, and both have to hold.
+ *
+ * THE REASON: only a row that has OUTLIVED ITS DOCUMENT gives its key back —
+ * `parkReleasesStrongKey`, i.e. exactly `receipt-bytes-missing` and
+ * `content-changed`. Every other park leaves a row that still represents its
+ * document and that a human can revive (Set job, Retry), and a revived row
+ * books without routing again, so a key released here would never be
+ * re-claimed. That is the double-booking hole.
+ *
+ * THE ROW: a Purchase may exist because of THIS attempt's send (`sent`) or
+ * because of an EARLIER attempt's — `row.sendAttempted`, persisted when the row
+ * was claimed, so it survives even when this attempt never reaches QBO at all
+ * (a re-read hitting a deleted estimate, a missing object, or any other
+ * pre-send/ok:false refusal on a retry).
  */
 function mayReleaseStrongKey(
     row: BookableRow,
+    reason: string,
     sent: { attempted: boolean; purchaseKnownToExist: boolean } = { attempted: false, purchaseKnownToExist: false },
 ): boolean {
-    return !(row.sendAttempted || purchaseMayExist(sent));
+    return parkReleasesStrongKey(reason) && !(row.sendAttempted || purchaseMayExist(sent));
 }
 
 function describe(error: unknown): string {
@@ -2409,18 +2432,19 @@ async function resolvePhase(
 }
 
 /**
- * A refusal reached WITHOUT any QBO call in THIS attempt — the strong key goes
- * back, UNLESS row.sendAttempted (persisted at claim time) means an EARLIER
- * attempt may already hold a Purchase for this row.
+ * A refusal reached WITHOUT any QBO call in THIS attempt.
  *
- * The rule is about the SEND, not about the reason: any terminal park that
- * provably created no Purchase — this attempt or any prior one — releases the
- * key, whatever the reason string says. Holding it makes a corrected
- * resubmission collide with a row that never became a purchase, and the
- * reviewer then has two stuck rows instead of one.
+ * "Nothing was sent" is only HALF of what a release needs, and it is the half
+ * that used to be checked alone. The reason has to say the row has outlived its
+ * document too — `receipt-bytes-missing` or `content-changed`. Every other
+ * refusal here (`no-estimate`, `refund-or-zero`, `invalid-date`,
+ * `date-implausible`, `source-document-review`, `unsupported-attachment:*`)
+ * leaves a row that still IS its receipt and that a human revives with Set job
+ * or Retry — neither of which routes it again, so the key would never come
+ * back. `mayReleaseStrongKey` holds both conditions.
  */
 function parkedBeforeSend(row: BookableRow, reason: string): BookResult {
-    return { outcome: "needs-review", reason, releaseStrongKey: mayReleaseStrongKey(row) };
+    return { outcome: "needs-review", reason, releaseStrongKey: mayReleaseStrongKey(row, reason) };
 }
 
 function retry(
@@ -2442,11 +2466,19 @@ function retry(
     const attempts = row.attempts + 1;
     // `>=`, so MAX_BOOK_ATTEMPTS reads as "20 attempts in total" rather than 21.
     if (attempts >= MAX_BOOK_ATTEMPTS) {
-        // Keyed on whether a send ever happened, not on the assumption that
-        // reaching the retry limit implies one. A row can exhaust its attempts
-        // entirely on storage faults, having never touched QuickBooks — and
-        // holding its key then quarantines the corrected resend against nothing.
-        return { outcome: "needs-review", reason: "max-retries", releaseStrongKey: !sendAttempted };
+        // FALSE, always — `max-retries` is never a no-artifact reason. Written as
+        // the expression rather than the answer so the rule is stated once, in
+        // one place, and a change to it reaches here.
+        //
+        // A row that exhausted its attempts is still ALIVE: its object is in the
+        // bucket, it still represents its document, and "Retry now" resumes it at
+        // BOOKING — where it has to still own its key, because that resume does
+        // not route it again and so cannot re-claim one.
+        return {
+            outcome: "needs-review",
+            reason: "max-retries",
+            releaseStrongKey: !sendAttempted && parkReleasesStrongKey("max-retries"),
+        };
     }
     return {
         outcome: "retry",

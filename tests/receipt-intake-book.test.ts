@@ -628,30 +628,55 @@ test("the audit event calls a DRIVE id fileId, and everything else intakeId", as
     assert.equal(driveDetail.intakeId, "intake-9", "and the row id is still carried");
 });
 
-test("a project with no estimate is terminal, spends NO attempt, and RELEASES the strong key", async () => {
-    // Nothing was ever sent, so the row is holding a dedup key on behalf of a
-    // document that never became a purchase. A corrected re-send of the same
-    // receipt would be quarantined against it (v3.5 rule).
+test("a project with no estimate is terminal, spends NO attempt, and KEEPS the strong key", async () => {
+    // The row is alive. Its object is in the bucket, it still IS that receipt,
+    // and a person revives it by setting a job — which writes READ and never
+    // routes it again, so a key handed back here would never be re-claimed. The
+    // same document re-sent with a differently read total would then miss both
+    // nets and book, and this row would book as well.
     const r = recorder({}, { estimates: [] });
     const result = await bookReceipt(row(), r.deps);
-    assert.deepEqual(result, { outcome: "needs-review", reason: "no-estimate", releaseStrongKey: true });
+    assert.deepEqual(result, { outcome: "needs-review", reason: "no-estimate", releaseStrongKey: false });
     assert.equal(r.purchaseCalls.length, 0, "QuickBooks is never touched");
     assert.equal(r.expenses.length, 0);
 });
 
-test("every PRE-send refusal releases the key; every POST-send one holds it", async () => {
-    // Pre-send: nothing exists in QuickBooks, so the key must go back.
+test("a PRE-send refusal is not enough to release the key — the reason has to say the document is gone", async () => {
+    // "Nothing was sent" used to be the whole test, and it was half the rule.
+    // Every reason below leaves a row a human can revive, so the key stays.
     for (const [rowOverrides, reason] of [
         [{ projectId: null }, "no-estimate"],
         [{ totalCents: 0 }, "refund-or-zero"],
         [{ totalCents: -2257 }, "refund-or-zero"],
         [{ txnDate: null }, "invalid-date"],
         [{ txnDate: new Date("2023-08-03T00:00:00.000Z") }, "date-implausible"],
+        [{ docType: "invoice" }, "source-document-review"],
     ] as const) {
         const r = recorder();
         const result = await bookReceipt(row(rowOverrides), r.deps);
-        assert.deepEqual(result, { outcome: "needs-review", reason, releaseStrongKey: true }, reason);
+        assert.deepEqual(result, { outcome: "needs-review", reason, releaseStrongKey: false }, reason);
         assert.equal(r.purchaseCalls.length, 0, reason);
+    }
+
+    // THE TWO THAT DO: the row has outlived its document, so its identity is
+    // genuinely unclaimed and a corrected re-upload must be able to take it.
+    for (const download of [
+        { kind: "missing" as const, reason: "receipt-bytes-missing" },
+        { kind: "sha-mismatch" as const, reason: "content-changed", message: "x" },
+    ]) {
+        const r = recorder({ downloadBytes: async () => ({ ok: false, ...download }) as any });
+        assert.deepEqual(
+            await bookReceipt(row({ sendAttempted: false }), r.deps),
+            { outcome: "needs-review", reason: download.reason, releaseStrongKey: true },
+            download.reason,
+        );
+        // ...and not even those, once a send may have created a Purchase.
+        const sent = recorder({ downloadBytes: async () => ({ ok: false, ...download }) as any });
+        assert.equal(
+            (await bookReceipt(row({ sendAttempted: true }), sent.deps) as any).releaseStrongKey,
+            false,
+            `${download.reason} with a send behind it`,
+        );
     }
 
     // Post-send: QBO may hold a Purchase whose response we lost, so the key
@@ -771,10 +796,9 @@ test("QBO business-rule faults are TERMINAL, never retried", async () => {
     });
 
     // The ENSURES — resolving the expense account, creating the vendor — run
-    // BEFORE the create, so nothing was posted and the strong key goes back.
-    // This is what moving the fenced send mark to the create bought: these two
-    // used to quarantine the corrected re-submission against a booking that
-    // never happened.
+    // BEFORE the create, so nothing was posted. The key is still KEPT: the
+    // document is fine and the row is alive, so a person fixes the vendor or the
+    // account and Retry resumes it at BOOKING, where it must still own its key.
     const preCreate: [unknown, string][] = [
         [new QboAccountConfigError("bad account"), "qbo-fault:account-config"],
         [new QboVendorDuplicateError("Lowes"), "qbo-fault:vendor-duplicate"],
@@ -782,7 +806,7 @@ test("QBO business-rule faults are TERMINAL, never retried", async () => {
     for (const [error, reason] of preCreate) {
         const r = recorder({ createPurchase: async () => { throw error; } });
         const result = await bookReceipt(row(), r.deps);
-        assert.deepEqual(result, { outcome: "needs-review", reason, releaseStrongKey: true }, reason);
+        assert.deepEqual(result, { outcome: "needs-review", reason, releaseStrongKey: false }, reason);
         assert.deepEqual(r.sendMarks, [], "the create was never reached");
         assert.equal(r.expenses.length, 0);
     }
@@ -793,7 +817,9 @@ test("duplicate candidate parks v2 with QBO ids, no sent mark and no Expense", a
         candidates:[{id:"6761",date:"2024-09-08",amount:575,vendor:"Bigfoot",match:"same-month-day-other-year"}],
         attachment:"already-attached"})});
     assert.deepEqual(await bookReceipt(row(),r.deps), {
-        outcome:"needs-review",reason:"qbo-duplicate:6761:already-attached",releaseStrongKey:true,
+        // KEPT: nothing was sent, but the row is alive and a human resolves the
+        // duplicate question. Releasing here would let the resend book.
+        outcome:"needs-review",reason:"qbo-duplicate:6761:already-attached",releaseStrongKey:false,
     });
     assert.deepEqual(r.sendMarks,[]);
     assert.deepEqual(r.expenses,[]);
@@ -801,7 +827,7 @@ test("duplicate candidate parks v2 with QBO ids, no sent mark and no Expense", a
 
 test("unknown earlier create parks v2 with source ids without attempting another send", async () => {
     const r = recorder({createPurchase:async()=>({ok:false,reason:"duplicate-create-pending",pendingFileIds:["capture-A"],candidates:[]})});
-    assert.deepEqual(await bookReceipt(row(),r.deps),{outcome:"needs-review",reason:"qbo-create-pending:capture-A",releaseStrongKey:true});
+    assert.deepEqual(await bookReceipt(row(),r.deps),{outcome:"needs-review",reason:"qbo-create-pending:capture-A",releaseStrongKey:false});
     assert.deepEqual(r.sendMarks,[]);assert.deepEqual(r.expenses,[]);
 });
 
@@ -827,13 +853,15 @@ test("a mixed review reason uses its full budget before shortening candidate evi
     assert.match(result.reason,/capture-A/);
 });
 
-test("EVERY ok:false happens before the create, so all of them RELEASE the key", async () => {
+test("EVERY ok:false happens before the create, and every one of them KEEPS the key", async () => {
     // The list is exhaustive on purpose: project-not-matched, missing-vendor,
     // invalid-date, amount-mismatch, duplicate-name and the overhead cases are
     // all decided before qbCreateFn runs, and docnumber-conflict is the
     // idempotency QUERY finding somebody ELSE'S Purchase. So no Purchase exists
-    // for this row, and holding the strong key would quarantine the corrected
-    // re-submission against a booking that never happened.
+    // for this row — and that is only half of what a release needs. None of
+    // these means the row has outlived its document: the object is still there,
+    // the row still IS that receipt, and Retry resumes it at BOOKING without
+    // routing it, so a released key is one nothing will re-claim.
     const reasons = [
         "docnumber-conflict", "project-not-matched", "missing-vendor", "invalid-date",
         "amount-mismatch", "duplicate-name", "invalid-group-amount",
@@ -844,7 +872,7 @@ test("EVERY ok:false happens before the create, so all of them RELEASE the key",
         assert.deepEqual(await bookReceipt(row(), r.deps), {
             outcome: "needs-review",
             reason: `qbo-fault:${reason}`,
-            releaseStrongKey: true,
+            releaseStrongKey: false,
         }, reason);
         assert.equal(r.expenses.length, 0, reason);
     }
@@ -861,7 +889,11 @@ test("a format QBO cannot attach is refused BEFORE the Purchase is created", asy
     const result = await bookReceipt(row({ mimeType: "text/plain" }), r.deps);
     assert.equal(result.outcome, "needs-review");
     assert.match((result as any).reason, /^unsupported-attachment:mime:text\/plain/);
-    assert.equal((result as any).releaseStrongKey, true, "nothing was sent");
+    assert.equal(
+        (result as any).releaseStrongKey,
+        false,
+        "nothing was sent, but the row is alive: a .txt receipt is still that receipt",
+    );
     assert.equal(r.purchaseCalls.length, 0, "no Purchase is created");
 });
 
@@ -982,14 +1014,17 @@ test("a plain network error retries; MAX_BOOK_ATTEMPTS means 20 attempts in TOTA
     });
 
     // ...and a row that burned all 20 attempts WITHOUT ever reaching QuickBooks
-    // (storage faults, say) created no Purchase, so its key must go back.
+    // (storage faults, say) created no Purchase — and STILL keeps its key.
+    // `max-retries` is never a no-artifact reason: the object is in the bucket,
+    // and "Retry now" resumes exactly this row at BOOKING, where it has to own
+    // its identity because that resume does not route it again.
     const neverSent = recorder({
         downloadBytes: async () => ({ ok: false, kind: "transient", message: "ECONNRESET" }),
     });
     assert.deepEqual(await bookReceipt(row({ attempts: 19, sendAttempted: false }), neverSent.deps), {
         outcome: "needs-review",
         reason: "max-retries",
-        releaseStrongKey: true,
+        releaseStrongKey: false,
     });
 });
 
@@ -1534,10 +1569,11 @@ test("a human's explicit pick is not labelled a suggestion", async () => {
 
 // ── sendAttempted is marked at the LAST possible moment (round-8 item 4) ────
 
-test("a token failure leaves sendAttempted UNSET, so the key is released", async () => {
+test("a token failure leaves sendAttempted UNSET, which is what makes the row retryable", async () => {
     // Marking before the token refresh meant a refresh that threw left
-    // sendAttempted=true on a row that never reached QuickBooks — and its
-    // strong key was then held forever against a Purchase that does not exist.
+    // sendAttempted=true on a row that never reached QuickBooks. The flag still
+    // matters — the native rail refuses a row carrying it, and the date gate
+    // exempts one — even though the strong key no longer turns on it alone.
     const r = recorder({
         getTokens: async () => { throw new Error("QBNotConnectedError"); },
     });
@@ -1545,7 +1581,7 @@ test("a token failure leaves sendAttempted UNSET, so the key is released", async
     assert.deepEqual(r.sendMarks, [], "never marked — nothing was sent");
     assert.equal(result.outcome, "needs-review");
     assert.equal((result as any).reason, "max-retries");
-    assert.equal((result as any).releaseStrongKey, true, "so the key goes back");
+    assert.equal((result as any).releaseStrongKey, false, "and the key stays: the row is alive");
 });
 
 test("budget exhausted AFTER the token refresh also leaves it unset", async () => {
@@ -1689,13 +1725,17 @@ test("attempt 20 RETAINS the key when the POST-create DB write failed", async ()
     assert.equal((result as any).releaseStrongKey, false, "the Purchase exists even though the row does not know");
 });
 
-test("attempt 20 RELEASES the key only when nothing was ever sent", async () => {
+test("attempt 20 KEEPS the key even when nothing was ever sent", async () => {
+    // It used to release here, and that was the hole: Retry sends this exact row
+    // back to BOOKING, which does not route it, so the key would never return —
+    // and the same document re-sent with a differently read total would miss both
+    // nets, book, and then this row would book too.
     const r = recorder({
         downloadBytes: async () => ({ ok: false, kind: "transient", message: "ECONNRESET" }),
     });
     const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
     assert.equal((result as any).reason, "max-retries");
-    assert.equal((result as any).releaseStrongKey, true);
+    assert.equal((result as any).releaseStrongKey, false);
     assert.deepEqual(r.sendMarks, [], "never reached the create");
 });
 
@@ -3499,7 +3539,8 @@ test("NATIVE books a file QuickBooks would refuse on size; the QBO path still pa
     assert.deepEqual(await bookReceipt(row(), qbo.deps), {
         outcome: "needs-review",
         reason: `unsupported-attachment:size:${oversize.length}`,
-        releaseStrongKey: true,
+        // A file QuickBooks will not take is still this row's document.
+        releaseStrongKey: false,
     });
     assert.equal(qbo.purchaseCalls.length, 0, "refused BEFORE the Purchase, as before");
     assert.equal(qbo.state.expenseRows.size, 0);
@@ -3554,8 +3595,10 @@ test("an implausible txnDate parks the row on BOTH rails, before any send", asyn
     assert.deepEqual(await bookReceipt(row({ txnDate: MISREAD_YEAR }), qbo.deps), {
         outcome: "needs-review",
         reason: "date-implausible",
-        // Nothing was sent, so the key goes back for a corrected re-upload.
-        releaseStrongKey: true,
+        // Nothing was sent, and the key is STILL kept: a misread date does not
+        // make the row stop being this document, and a person fixing the date
+        // does not route it again.
+        releaseStrongKey: false,
     });
     assert.equal(qbo.purchaseCalls.length, 0, "QuickBooks is never touched");
     assert.equal(qbo.expenses.length, 0, "and no Expense is attempted");
@@ -3569,7 +3612,7 @@ test("an implausible txnDate parks the row on BOTH rails, before any send", asyn
     assert.deepEqual(await bookReceipt(row({ txnDate: MISREAD_YEAR }), native.deps), {
         outcome: "needs-review",
         reason: "date-implausible",
-        releaseStrongKey: true,
+        releaseStrongKey: false,
     });
     assert.deepEqual(tripwire.qbo, { getTokens: 0, createPurchase: 0, markSendAttempted: 0 });
     assert.equal(native.expenses.length, 0);
@@ -3638,7 +3681,7 @@ test("a SENT row is EXEMPT from the date gate — recovery must reach its Purcha
     assert.deepEqual(await bookReceipt(row({ txnDate: MISREAD_YEAR }), unsent.deps), {
         outcome: "needs-review",
         reason: "date-implausible",
-        releaseStrongKey: true,
+        releaseStrongKey: false,
     });
     assert.equal(unsent.purchaseCalls.length, 0);
 });
@@ -3663,7 +3706,7 @@ test("the booking gate's reference day is the COMPANY's, not UTC's", async () =>
     }), parked.deps), {
         outcome: "needs-review",
         reason: "date-implausible",
-        releaseStrongKey: true,
+        releaseStrongKey: false,
     });
     assert.equal(parked.purchaseCalls.length, 0);
 });
