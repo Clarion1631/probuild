@@ -206,7 +206,7 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     },
 
     // ---- billing ------------------------------------------------------------
-    "lib/billing-core.ts:1486::updateMany": {
+    "lib/billing-core.ts:1522::updateMany": {
         kind: "exempt",
         why: "the invoice claim: stamps invoiceId/invoicedAt inside the billing transaction. It changes no hours, no cost and no readiness flag, and every payroll writer already refuses an entry once it is billed",
     },
