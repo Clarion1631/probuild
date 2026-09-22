@@ -54,7 +54,7 @@ import { toSerializedJourney } from "./components/register/serialize-journey";
 import { fetchCheckImagePanelData, type CheckImagePanelRow } from "./check-images-data";
 import { CheckImagesPanel } from "./components/check-images-panel";
 import { fetchReceiptQueue, fetchJobOptions } from "./receipts-data";
-import { parseReceiptFilters } from "./receipts-filters";
+import { parseReceiptFilters, receiptFilterHref } from "./receipts-filters";
 import { ReceiptsTab } from "./components/receipts/receipts-tab";
 
 export const dynamic = "force-dynamic";
@@ -859,16 +859,11 @@ export default async function AutomationPage(props: {
 async function ReceiptsTabBranch({ sp }: { sp: Record<string, string | string[] | undefined> }) {
     const filters = parseReceiptFilters(sp);
 
-    function receiptFilterHref(overrides: { group?: string; owner?: string }) {
-        const params = new URLSearchParams();
-        params.set("tab", "receipts");
-        const nextGroup = overrides.group ?? filters.group ?? "";
-        const nextOwner = overrides.owner ?? filters.owner ?? "";
-        if (nextGroup) params.set("group", nextGroup);
-        if (nextOwner) params.set("owner", nextOwner);
-        if (filters.projectId) params.set("projectId", filters.projectId);
-        return `/automation?${params.toString()}`;
-    }
+    // The shared builder, bound to this render's filters. Living in
+    // receipts-filters.ts is what lets a test exercise the real thing rather
+    // than a copy of it.
+    const filterHref = (overrides: { group?: string; owner?: string; view?: string }) =>
+        receiptFilterHref(filters, overrides);
 
     // Only DATA is computed inside the try — JSX construction is lazy, so
     // building elements in here couldn't catch their render errors anyway
@@ -889,7 +884,7 @@ async function ReceiptsTabBranch({ sp }: { sp: Record<string, string | string[] 
         && process.env.RECEIPT_BOOK_NATIVE === "true";
 
     const body: ReactNode = queue
-        ? <ReceiptsTab queue={queue} filters={filters} jobs={jobs} filterHref={receiptFilterHref} nativeActive={nativeActive} />
+        ? <ReceiptsTab queue={queue} filters={filters} jobs={jobs} filterHref={filterHref} nativeActive={nativeActive} />
         : (
             <div className="hui-card p-5 text-sm text-hui-textMuted">
                 The receipt queue couldn&apos;t be loaded right now — the register is still available.

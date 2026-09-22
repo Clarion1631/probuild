@@ -326,6 +326,12 @@ export interface WorkerRow extends BookableRow {
      * IS THE ONLY PLACE THAT CAN PUT IT BACK, because a human revival
      * (`setReceiptIntakeJob`, `unmarkReceiptIntakeDuplicate`) writes READ
      * directly and READ never routes again.
+     *
+     * It is also the only place that could TAKE IT AWAY by accident. A row is
+     * read more than once now, and a second read that misses the document's
+     * date derives no key even when the ref is still perfectly real, so the
+     * claim below falls back to this value rather than writing that null over
+     * an identity the row had already proved.
      */
     dedupStrongKey: string | null;
     /**
@@ -1672,11 +1678,34 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     //     as fully deduped. A silent false negative in the one report the
     //     cutover decision rests on.
     // READ is now reached only by finishRouting(), after every net has spoken.
+
+    // A RE-READ MAY NOT ERASE AN IDENTITY IT FAILED TO RE-DERIVE.
+    //
+    // `keys.strong` is null whenever the date was not read off the document,
+    // even with a perfectly real ref. A row is read more than once now — Retry
+    // sends a `weak-dup:` row back to RECEIVED, and setReceiptIntakeJob sends
+    // any NEEDS_REVIEW row to READ — so a second read that happens to miss the
+    // date would otherwise write that null straight over a key this row had
+    // already claimed. The row keeps what it had; only a key the read DID
+    // derive replaces it.
+    //
+    // AND THE HEAL CANNOT COVER THIS CASE, which is why the fallback is here
+    // rather than left to `recoverStrongKey`. That heal re-derives the key from
+    // the PERSISTED `readJson` — but `readJson` is part of `base`, so this very
+    // write replaces it with the bad read's JSON in the same statement that
+    // would have nulled the key. By the time promotion or booking looks, the
+    // evidence the heal needs is the evidence that lost the date. Preserving
+    // the key here is the only point at which the old value still exists.
+    //
+    // Deliberately NOT applied to the two branches that null it on purpose: a
+    // gated row (multi / non-receipt / zero / implausible date) must claim no
+    // key at all, and the strong-owner branch is correcting a claim the index
+    // just rejected.
     const applied = await deps.applyRead(row.id, {
         ...base,
         state: "RECEIVED",
         stateReason: note(null),
-        dedupStrongKey: keys.strong,
+        dedupStrongKey: keys.strong ?? row.dedupStrongKey ?? null,
         duplicateOfId: null,
     }, ownershipOf(row));
     // Lost the row mid-read. Everything after this — the strong claim, the weak
@@ -1718,7 +1747,8 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     // not plausibly misreads of each other, the question the weak net is asking
     // has already been answered and it must not overrule that. judgeWeakGroup
     // holds the whole rule; see weak-net.ts for why it reads `refNumber` rather
-    // than the strong key this very branch is about to release.
+    // than the strong key, which is withheld for an unreadable date even when
+    // the ref itself is perfectly real.
     //
     // A THROW here leaves the row RECEIVED with its keys already written, which
     // is exactly right: the next pass re-runs the identical claim (updating a

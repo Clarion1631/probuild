@@ -158,6 +158,43 @@ export function classifyReceiptRequirement(line: ReceiptPolicyLine): ReceiptPoli
     };
 }
 
+/**
+ * A check descriptor, anchored at the start, and bounded at BOTH ends of the
+ * token that follows.
+ *
+ * Anchored, so `PAYCHECK DEPOSIT` cannot match. Bounded after `CHECK`/`CHK`,
+ * so `CHECKR INC` and `CHECKING ACCOUNT FEE` cannot. Bounded after what
+ * follows, so `CHECK PAIDOFF LOANS` cannot, and so `CHECK CARD PURCHASE` (a
+ * debit card rail, not a check) stays out: a real check line carries PAID, or a
+ * number behind #, NO, or nothing at all.
+ */
+export const CHECK_DESCRIPTOR = /^\s*CH(?:ECK|K)\s*[-:]?\s*(?:PAID\b|#\s*\d|NO\b\s*\d|\d)/i;
+
+/**
+ * Does this line need a check image and the bill it paid, rather than a receipt?
+ *
+ * `checkNumber` is authoritative when the caller has it, and that is what
+ * `classifyReceiptRequirement` above uses. The Receipts tab does NOT have it:
+ * `toMissingReceiptRow` reads `displayDetails`, which carries no check number,
+ * so the UI passes the descriptor alone and gets an approximation of this
+ * module's own verdict.
+ *
+ * State the asymmetry rather than hide it. A `CHECK PAID` descriptor with no
+ * check number is `ruleKey: "merchant"` to the engine and a check to this
+ * predicate, so a bookkeeper may be shown "post the check photo" for a line
+ * that is not one. That is mild and self correcting. The reverse, a real $3,500
+ * check sitting unowned forever, is what this replaces. When the check number
+ * reaches the row in a later slice, the same call site passes it and stops
+ * guessing: one predicate, two levels of confidence, never two engines.
+ */
+export function looksLikeCheckOrSubBill(
+    rawDescriptor: string | null | undefined,
+    checkNumber?: string | null,
+): boolean {
+    if (typeof checkNumber === "string" && checkNumber.trim() !== "") return true;
+    return typeof rawDescriptor === "string" && CHECK_DESCRIPTOR.test(rawDescriptor);
+}
+
 /** Collection stays active for office invoices; crew outreach does not. */
 export function isCrewReceiptRequest(line: ReceiptPolicyLine): boolean {
     const verdict = classifyReceiptRequirement(line);

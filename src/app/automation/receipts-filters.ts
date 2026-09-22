@@ -5,6 +5,18 @@
  */
 import type { ReceiptOwner } from "@/lib/receipt-policy";
 
+/**
+ * Per-group display cap. Badge counts come from count queries, never from
+ * these lists.
+ *
+ * It lives HERE, in the pure module, rather than beside the queries that use
+ * it: the To-do planner has to know when a loaded group hit the cap (a full
+ * page is a window, not an inbox), and it is a pure function that must not
+ * drag Prisma into a unit test to find out. `receipts-data.ts` re-exports it,
+ * so every existing import path is unchanged.
+ */
+export const RECEIPT_GROUP_TAKE = 100;
+
 export const RECEIPT_GROUPS = [
     "needs-job",
     "needs-review",
@@ -17,6 +29,16 @@ export const RECEIPT_GROUPS = [
 ] as const;
 
 export type ReceiptGroup = (typeof RECEIPT_GROUPS)[number];
+
+/**
+ * Which SHAPE of the tab a bare `?tab=receipts` draws. Beside `group` rather
+ * than overloading `group: null`, so every link that exists today keeps
+ * resolving to what it resolved to before: a `?group=` URL still renders that
+ * one group, and `?view=all` is a real, bookmarkable name for the old default.
+ */
+export const RECEIPT_VIEWS = ["todo", "all"] as const;
+
+export type ReceiptView = (typeof RECEIPT_VIEWS)[number];
 
 export const RECEIPT_GROUP_LABELS: Record<ReceiptGroup, string> = {
     "needs-job": "Needs job",
@@ -50,6 +72,13 @@ export interface ReceiptFilters {
     group: ReceiptGroup | null;
     projectId: string | null;
     owner: string | null;
+    /**
+     * OPTIONAL on purpose. `parseReceiptFilters` always sets it, so no URL ever
+     * reaches a render without one. A filter object built by hand that omits it
+     * is the pre-To-do shape and draws exactly what it drew before, which is
+     * what keeps the existing render tests honest pins rather than rewrites.
+     */
+    view?: ReceiptView;
 }
 
 function firstParam(value: string | string[] | undefined): string | null {
@@ -63,7 +92,55 @@ export function parseReceiptFilters(sp: Record<string, string | string[] | undef
     const group = RECEIPT_GROUPS.includes(rawGroup as ReceiptGroup) ? (rawGroup as ReceiptGroup) : null;
     const rawOwner = firstParam(sp.owner);
     const owner = rawOwner !== null && OWNER_ORDER.includes(rawOwner as ReceiptOwner) ? rawOwner : null;
-    return { group, projectId: firstParam(sp.projectId), owner };
+    // A URL that ASKED for a group or an owner and named one this page does not
+    // know still means "show me the groups". It fell back to the all-groups
+    // view before the To-do view existed, and bouncing it somewhere new is a
+    // behaviour change hiding inside a typo.
+    const askedForGroups = ("group" in sp && group === null) || ("owner" in sp && owner === null);
+    const rawView = firstParam(sp.view);
+    const view = rawView === null && askedForGroups
+        ? "all"
+        : RECEIPT_VIEWS.includes(rawView as ReceiptView) ? (rawView as ReceiptView) : "todo";
+    return { group, projectId: firstParam(sp.projectId), owner, view };
+}
+
+/**
+ * Does this URL draw Marge's To-do list?
+ *
+ * Only a bare `?tab=receipts` does. A `group` is a request for one group and an
+ * `owner` is a request to narrow by person, and the To-do view does neither, so
+ * either one falls back to the view that can honour it. That is also what keeps
+ * every bookmark anyone already has pointing at the same page it always did.
+ */
+export function showsTodoView(filters: ReceiptFilters): boolean {
+    return filters.group === null && filters.owner === null && filters.view === "todo";
+}
+
+/**
+ * The Receipts tab's URL builder: one chip, one folded line, one link.
+ *
+ * Exported so the page and its tests use the SAME function. A copy in a test
+ * proves the copy works, which is not the question anyone was asking.
+ *
+ * `view` rides along with group and owner so a link keeps whatever shape the
+ * reader is already in. "todo" is the default and is never written to the URL,
+ * which is what leaves `?tab=receipts&group=needs-job` byte for byte the link
+ * it has always been.
+ */
+export function receiptFilterHref(
+    filters: ReceiptFilters,
+    overrides: { group?: string; owner?: string; view?: string },
+): string {
+    const params = new URLSearchParams();
+    params.set("tab", "receipts");
+    const nextGroup = overrides.group ?? filters.group ?? "";
+    const nextOwner = overrides.owner ?? filters.owner ?? "";
+    const nextView = overrides.view ?? filters.view ?? "";
+    if (nextGroup) params.set("group", nextGroup);
+    if (nextOwner) params.set("owner", nextOwner);
+    if (filters.projectId) params.set("projectId", filters.projectId);
+    if (nextView && nextView !== "todo") params.set("view", nextView);
+    return `/automation?${params.toString()}`;
 }
 
 /** True when a group should be rendered at all under the current filters. */
