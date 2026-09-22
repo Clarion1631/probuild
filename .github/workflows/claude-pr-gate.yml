@@ -103,11 +103,14 @@ jobs:
 
              PR title: $PR_TITLE
              PR body: $(gh pr view ${{ github.event.pull_request.number }} --json body -q .body)" \
+            2> >(tee /tmp/codex-stderr.log >&2) \
             | tee /tmp/review.txt
           VERDICT=$(grep -oE 'VERDICT: (APPROVE|REQUEST_CHANGES)' /tmp/review.txt | tail -1)
           echo "verdict=${VERDICT#VERDICT: }" >> "$GITHUB_OUTPUT"
           gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/review.txt
-        # Comment always posts; the gate is enforced below.
+        # Comment always posts; the gate is enforced below. Stderr is tee'd to
+        # /tmp/codex-stderr.log (still printed to the job log as before) so a
+        # login failure can be told apart from a normal REQUEST_CHANGES below.
 
       - name: Fail gate if changes requested
         if: steps.review.outputs.verdict != 'APPROVE'
@@ -115,6 +118,21 @@ jobs:
           echo "Codex did not APPROVE. Read its newest PR comment, address every"
           echo "numbered item (or dispute it in a reply), push, and this gate re-runs."
           exit 1
+
+      - name: Alert on gate infrastructure failure
+        # Only when the gate job actually failed. A normal REQUEST_CHANGES
+        # (the step above) is not an infrastructure failure and gets no alert.
+        if: failure()
+        continue-on-error: true
+        env:
+          CHAT_WEBHOOK: ${{ secrets.GCHAT_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -z "$CHAT_WEBHOOK" ] && exit 0
+          MSG=$(bash .github/scripts/codex-gate-alert.sh /tmp/codex-stderr.log /tmp/review.txt "$RUN_URL")
+          [ -z "$MSG" ] && exit 0
+          curl -s -X POST "$CHAT_WEBHOOK" -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "$MSG" '{text:$text}')"
 
   fix-review-feedback:
     needs: codex-review
