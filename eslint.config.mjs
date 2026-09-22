@@ -7,6 +7,14 @@ const eslintConfig = defineConfig([
   ...nextTs,
   globalIgnores([
     ".next/**",
+    // Nested worktrees live inside the repo; their .next output is megabytes of
+    // generated chunks and linting it OOMs Node (8GB heap exhausted, 2026-09-02).
+    "**/.next/**",
+    ".claude/worktrees/**",
+    ".worktrees/**",
+    // Untracked local scratch folder on the dev machine (Codex reports, CSV exports,
+    // a minified pdf-lib copy, old node test scripts); never app code.
+    "gtr-probuild/**",
     "out/**",
     "build/**",
     "next-env.d.ts",
@@ -16,6 +24,10 @@ const eslintConfig = defineConfig([
     "qa-report/**",
   ]),
   {
+    // Scope to the file types eslint-config-next registers the react-hooks plugin for.
+    // Without this the rules below also apply to *.cjs (tests/fixed-date-preload.cjs),
+    // where the plugin is not loaded, and ESLint aborts with "could not find plugin".
+    files: ["**/*.{js,jsx,mjs,ts,tsx}"],
     rules: {
       // Warn instead of error until existing code is cleaned up
       "@typescript-eslint/no-explicit-any": "warn",
