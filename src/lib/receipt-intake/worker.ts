@@ -1158,30 +1158,6 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
  * SAME predicate immediately before every apply, so once the timer has fired
  * no new apply can start, whatever the clock says.
  */
-
-/**
- * A bounded classification for a failure from the injected close dependency
- * — never its name or message, both of which are attacker- or
- * dependency-controlled free text (Codex round 4, #3: an earlier version of
- * this catch logged `error.name` on the claim that "a name is one of a
- * small, fixed set" — it is not, since `name` is a plain mutable string
- * property). This mirrors evidence-close-store.ts's own `errorCategory`, but
- * is not imported from it — nothing in this module imports that one (see
- * closeRequestsSatisfiedByBooking's own doc comment), so the same small
- * check is repeated here rather than shared.
- */
-function errorCategory(error: unknown): "timeout" | "db" | "other" {
-    if (isComponentDeadlineExceeded(error)) return "timeout";
-    if (
-        error instanceof Prisma.PrismaClientKnownRequestError ||
-        error instanceof Prisma.PrismaClientUnknownRequestError ||
-        error instanceof Prisma.PrismaClientRustPanicError ||
-        error instanceof Prisma.PrismaClientInitializationError ||
-        error instanceof Prisma.PrismaClientValidationError
-    ) return "db";
-    return "other";
-}
-
 async function closeRequestsSatisfiedByBooking(
     result: BookResult,
     deps: WorkerDependencies,
@@ -1267,6 +1243,30 @@ async function closeRequestsSatisfiedByBooking(
     } finally {
         clearTimeout(timer);
     }
+}
+
+/**
+ * A bounded classification for a failure from the injected close dependency
+ * — never its name or message, both of which are attacker- or
+ * dependency-controlled free text (Codex round 4, #3: an earlier version of
+ * this catch logged `error.name` on the claim that "a name is one of a
+ * small, fixed set" — it is not, since `name` is a plain mutable string
+ * property). This mirrors evidence-close-store.ts's own `errorCategory`, but
+ * is not imported from it — nothing in this module imports that one (see
+ * evidence-close-store.ts's own comment by its `EVIDENCE_LOOKBACK_DAYS`
+ * import: "Nothing in `worker.ts` imports this file"), so the same small
+ * check is repeated here rather than shared.
+ */
+function errorCategory(error: unknown): "timeout" | "db" | "other" {
+    if (isComponentDeadlineExceeded(error)) return "timeout";
+    if (
+        error instanceof Prisma.PrismaClientKnownRequestError ||
+        error instanceof Prisma.PrismaClientUnknownRequestError ||
+        error instanceof Prisma.PrismaClientRustPanicError ||
+        error instanceof Prisma.PrismaClientInitializationError ||
+        error instanceof Prisma.PrismaClientValidationError
+    ) return "db";
+    return "other";
 }
 
 /**

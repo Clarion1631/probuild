@@ -289,8 +289,9 @@ async function defaultOpenIssueKeys(ids: string[]): Promise<Map<string, string>>
  * verbatim, on the claim that "a name is one of a small, fixed set" — it is
  * not: `name` is a plain mutable string property, and nothing stops a
  * dependency from setting it to text that echoes a vendor or account
- * reference. Every warn line in this module logs only this category, the
- * same way `judged` stays ids-only.
+ * reference. Every warn line in this module that classifies a caught error
+ * through this function logs only that category (plus, at most, the
+ * candidate's own id), the same way `judged` stays ids-only.
  */
 function errorCategory(error: unknown): "timeout" | "db" | "other" {
     if (isComponentDeadlineExceeded(error)) return "timeout";
