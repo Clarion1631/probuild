@@ -118,12 +118,11 @@ function store(lineIds: string[], openKeys: string[], clearedKeys: string[] = []
         targetKey,
         version: 1,
         reasonCodes: JSON.stringify(["MISSING_RECEIPT"]),
-        // THE REAL hash — not a placeholder. A CLEAR (step 1) never compares
-        // hashes, so it did not used to matter; a version-conflict RETRY that
-        // re-judges to the SAME non-empty codes (Codex round 3) reaches step 5
-        // ("touch") only when this matches what `decideLifecycle` computes,
-        // and a mismatched placeholder pushed that case into "supersede"
-        // instead, which opens an episode this fixture is not built for.
+        // THE REAL hash — not a placeholder, kept honest even though a
+        // courtesy close (round 4) only ever reaches step 1 (clear/noop) and
+        // never reads this field: other fixtures in this file reuse `store`
+        // for the general-purpose lifecycle machinery, and a placeholder here
+        // would silently mismatch `decideLifecycle`'s own computation.
         reasonHash: hashReasonCodes(canonicalizeReasonCodes(["MISSING_RECEIPT"])),
         displayDetails: JSON.stringify({ payee: "ARCO #82887", amountCents: -9_309 }),
         acknowledgedCodes: "[]",
@@ -144,13 +143,22 @@ function store(lineIds: string[], openKeys: string[], clearedKeys: string[] = []
  * either cursor would be RECORDED rather than merely impossible, which is what
  * makes the fence test below an assertion instead of a hope.
  *
- * `conflictOnceFor` (Codex round 3): the set of issue ids whose FIRST
- * `updateMany` should report a lost CAS — `{ count: 0 }` — regardless of
- * whether the version actually matches, exactly as a real concurrent writer
- * committing between the caller's read and its write would look from here.
- * Consumed on the first hit, so a retry's own write behaves normally.
+ * `conflictOnceFor`: the set of issue ids whose FIRST `updateMany` should
+ * report a lost CAS — `{ count: 0 }` — regardless of whether the version
+ * actually matches, exactly as a real concurrent writer committing between
+ * the caller's read and its write would look from here. Consumed on the
+ * first hit, so a retry's own write behaves normally (the transient-conflict
+ * shape: contention clears and the SAME empty verdict lands a moment later).
+ *
+ * `conflictAlwaysFor`: the set of issue ids whose `updateMany` NEVER
+ * succeeds — every one of `evaluateReviewIssue`'s own retry attempts loses
+ * the CAS, so it exhausts its budget and throws (the sustained-contention
+ * shape, round 4: counted as a `conflict`, never applied).
  */
-function lifecycleClient(s: Store, opts: { conflictOnceFor?: Set<string> } = {}): ReviewIssueLifecycleClient {
+function lifecycleClient(
+    s: Store,
+    opts: { conflictOnceFor?: Set<string>; conflictAlwaysFor?: Set<string> } = {},
+): ReviewIssueLifecycleClient {
     const client = {
         reviewIssue: {
             findUnique: async (args: { where: { targetType_targetKey?: { targetKey: string }; id?: string } }) => {
@@ -166,6 +174,7 @@ function lifecycleClient(s: Store, opts: { conflictOnceFor?: Set<string> } = {})
                 s.writes.push({ model: "reviewIssue", op: "updateMany", data: args.data });
                 const row = [...s.issues.values()].find(r => r.id === args.where.id);
                 if (!row) return { count: 0 };
+                if (opts.conflictAlwaysFor?.has(row.id)) return { count: 0 };
                 if (opts.conflictOnceFor?.has(row.id)) {
                     opts.conflictOnceFor.delete(row.id);
                     return { count: 0 };
@@ -201,17 +210,16 @@ function lifecycleClient(s: Store, opts: { conflictOnceFor?: Set<string> } = {})
 }
 
 /** The real lifecycle, driven against the in-memory ledger. Returns whether
- *  the decision was an actual CLEAR (false for a noop or anything else the
- *  general lifecycle reached on a version-conflict retry). `recomputeCodes`
- *  is threaded straight into `evaluateReviewIssue`'s own retry option, never
- *  invoked here — the same wiring `defaultApplyCodes` does in production. */
-function realApplyCodes(s: Store, opts: { conflictOnceFor?: Set<string> } = {}) {
-    return async (targetKey: string, codes: ReasonCode[], recomputeCodes: () => Promise<ReasonCode[]>) => {
+ *  the decision was an actual CLEAR (false for a noop). No `recomputeCodes`
+ *  is passed — the same wiring `defaultApplyCodes` does in production (round
+ *  4) — so a version-conflict retry inside `evaluateReviewIssue` can only
+ *  ever reapply the SAME empty `codes` it started with. */
+function realApplyCodes(s: Store, opts: { conflictOnceFor?: Set<string>; conflictAlwaysFor?: Set<string> } = {}) {
+    return async (targetKey: string, codes: ReasonCode[]) => {
         const { decision } = await evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, targetKey, codes, null, {
             client: lifecycleClient(s, opts),
             episodeStatus: "SUPPRESSED",
             now: () => new Date("2026-09-21T20:00:00.000Z"),
-            recomputeCodes,
         });
         return decision.action === "clear";
     };
@@ -322,7 +330,7 @@ test("an exhausted caller deadline skips the whole step", async () => {
         findLines: async () => { throw new Error("no query may be issued past the deadline"); },
     }));
 
-    assert.deepEqual(result, { examined: 0, cleared: [], errors: 0, stale: 0, judged: [] });
+    assert.deepEqual(result, { examined: 0, cleared: [], errors: 0, conflicts: 0, stale: 0, judged: [] });
 });
 
 test("THE FENCE: a close writes nothing to the cycle record, either cursor, or chaserCompletedAt", async () => {
@@ -421,7 +429,7 @@ test("REGRESSION, ARCO $93.09 on 2026-09-16: the booked receipt closes the open 
         }),
     );
 
-    assert.deepEqual(result, { examined: 1, cleared: [BANK_LINE], errors: 0, stale: 0, judged: [] });
+    assert.deepEqual(result, { examined: 1, cleared: [BANK_LINE], errors: 0, conflicts: 0, stale: 0, judged: [] });
     assert.equal(s.issues.get(BANK_LINE)!.clearedAt !== null, true);
     assert.equal(seen.length, 1);
     assert.equal(seen[0].strict, undefined, "LENIENT: strictCompleteness is never passed — strict is for card release");
@@ -454,7 +462,7 @@ test("an epoch that moves between judging and applying withholds every clear, co
         },
     }));
 
-    assert.deepEqual(result, { examined: 1, cleared: [], errors: 0, stale: 1, judged: [] });
+    assert.deepEqual(result, { examined: 1, cleared: [], errors: 0, conflicts: 0, stale: 1, judged: [] });
     assert.equal(s.issues.get("line-open")!.clearedAt, null, "no lifecycle write happened");
     assert.deepEqual(s.writes, [], "the fence caught it before the CAS ever ran");
 });
@@ -465,7 +473,7 @@ test("a stable epoch clears normally — the fence only withholds on an actual m
         readEpochs: async () => ({ evidence: "7", ledger: "3" }),
     }));
 
-    assert.deepEqual(result, { examined: 1, cleared: ["line-open"], errors: 0, stale: 0, judged: [] });
+    assert.deepEqual(result, { examined: 1, cleared: ["line-open"], errors: 0, conflicts: 0, stale: 0, judged: [] });
 });
 
 test("an epoch that moves between two applies withholds the second one, counting only the first", async () => {
@@ -490,27 +498,51 @@ test("an epoch that moves between two applies withholds the second one, counting
     assert.equal(s.issues.get("line-b")!.clearedAt, null, "never touched");
 });
 
-test("a CAS conflict on apply re-judges via the callback; a non-empty re-judge leaves the issue open, not cleared", async () => {
+test("a CAS conflict that exhausts every retry does not re-judge, does not apply anything, and is counted as a conflict, never cleared", async () => {
+    const s = store(["line-open"], ["line-open"]);
+    const conflictAlwaysFor = new Set([s.issues.get("line-open")!.id]);
+    let recomputeCalls = 0;
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        applyCodes: realApplyCodes(s, { conflictAlwaysFor }),
+        recompute: async targetKey => { recomputeCalls++; s.recomputes.push(targetKey); return []; },
+    }));
+
+    assert.equal(result.conflicts, 1, "contention on the row, not a bug — its own bucket");
+    assert.deepEqual(result.cleared, [], "never counted as cleared");
+    assert.equal(result.errors, 0, "a lost lifecycle CAS is not an `errors`-bucket failure");
+    assert.equal(recomputeCalls, 1, "judged once, in the judge phase — no re-judge on the conflict (round 4, blocker 1: there is no recomputeCodes callback any more)");
+    assert.deepEqual(s.writes.filter(w => w.model === "reviewAlertEpisode"), [], "nothing was ever actually applied");
+    assert.equal(s.issues.get("line-open")!.version, 1, "the row's version never advanced — every attempt lost the CAS");
+    assert.equal(s.issues.get("line-open")!.clearedAt, null, "left exactly as it was, for the nightly sweep");
+});
+
+test("a transient CAS conflict retries the lifecycle's SAME clear-only verdict once contention clears — never a re-judge", async () => {
     const s = store(["line-open"], ["line-open"]);
     const conflictOnceFor = new Set([s.issues.get("line-open")!.id]);
     let recomputeCalls = 0;
     const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
         applyCodes: realApplyCodes(s, { conflictOnceFor }),
-        recompute: async targetKey => {
-            recomputeCalls++;
-            s.recomputes.push(targetKey);
-            // FIRST call: the judge phase — satisfied. SECOND call: the
-            // lifecycle's OWN version-conflict retry, reached only through
-            // the `recomputeCodes` callback — genuinely still owed, proving
-            // it re-runs recomputeCodesFor rather than replaying the fixed
-            // `[]` this call already decided on moments ago.
-            return recomputeCalls === 1 ? [] : ["MISSING_RECEIPT"] as ReasonCode[];
-        },
+        recompute: async targetKey => { recomputeCalls++; s.recomputes.push(targetKey); return []; },
     }));
 
-    assert.deepEqual(result.cleared, [], "the retry's own re-judge said still-owed — nothing was actually cleared");
-    assert.equal(recomputeCalls, 2, "the callback ran the SAME recomputeCodesFor a second time, on the conflict");
-    assert.equal(s.issues.get("line-open")!.clearedAt, null, "left open, exactly as the fresh re-judge said");
+    assert.deepEqual(result.cleared, ["line-open"], "the SAME empty verdict landed once the conflicting writer got out of the way");
+    assert.equal(result.conflicts, 0, "the retry succeeded — no exhaustion to count");
+    assert.equal(recomputeCalls, 1, "the lifecycle's own internal retry reapplied the fixed `[]` — it never asked to re-judge");
+    assert.equal(s.issues.get("line-open")!.clearedAt !== null, true);
+});
+
+test("a courtesy clear writes displayDetails exactly like the sweep's own clear: the column is not touched at all", async () => {
+    const s = store(["line-open"], ["line-open"]);
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s));
+
+    assert.deepEqual(result.cleared, ["line-open"]);
+    const clearWrite = s.writes.find(w => w.model === "reviewIssue" && w.op === "updateMany");
+    assert.ok(clearWrite, "the clear happened");
+    assert.equal(
+        Object.prototype.hasOwnProperty.call(clearWrite!.data as object, "displayDetails"),
+        false,
+        "applyReceiptRequestPlan's own evaluate(targetKey, [], null) reaches the SAME lifecycle `clear` branch, which never writes displayDetails — a courtesy clear leaves the row identical to a sweep clear",
+    );
 });
 
 test("a deadline that fires exactly when judging finishes stops before any apply starts", async () => {
@@ -560,23 +592,51 @@ test("a late-settling judge does not start an apply — the store's own deadline
     assert.deepEqual(result.cleared, []);
 });
 
+test("a deadline that fires during the apply-phase epoch re-read stops that apply before it starts (round 4, blocker 3)", async () => {
+    // The pre-existing top-of-loop check cannot catch this: the deadline
+    // flips AFTER it has already passed, WHILE the epoch re-read itself is
+    // in flight — proving the check right after that re-read, with no await
+    // before the apply, is what actually stops it.
+    const s = store(["line-open"], ["line-open"]);
+    let deadlineHit = false;
+    let applyCalls = 0;
+    let reads = 0;
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        deadlineExceeded: () => deadlineHit,
+        readEpochs: async () => {
+            reads++;
+            // #1 = setup (before judging), still fresh. #2 = the apply
+            // phase's own re-read, right before the one candidate judging
+            // produced — flips the deadline DURING it, evidence staying
+            // fresh so this cannot be mistaken for a staleness stop.
+            if (reads === 2) deadlineHit = true;
+            return { evidence: "1", ledger: "1" };
+        },
+        applyCodes: async () => { applyCalls++; return true; },
+    }));
+
+    assert.equal(applyCalls, 0, "checked again right after the epoch re-read, before the apply started");
+    assert.deepEqual(result.cleared, []);
+    assert.equal(result.stale, 0, "evidence never moved — this is a deadline stop, not a freshness one");
+});
+
 test("a setup failure — the candidate query, the open-issue lookup, or the epoch read — is counted, never thrown", async () => {
     const s = store(["line-open"], ["line-open"]);
 
     const findLinesThrows = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
         findLines: async () => { throw new Error("pool timeout"); },
     }));
-    assert.deepEqual(findLinesThrows, { examined: 0, cleared: [], errors: 1, stale: 0, judged: [] });
+    assert.deepEqual(findLinesThrows, { examined: 0, cleared: [], errors: 1, conflicts: 0, stale: 0, judged: [] });
 
     const openIssueKeysThrows = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
         openIssueKeys: async () => { throw new Error("pool timeout"); },
     }));
-    assert.deepEqual(openIssueKeysThrows, { examined: 0, cleared: [], errors: 1, stale: 0, judged: [] });
+    assert.deepEqual(openIssueKeysThrows, { examined: 0, cleared: [], errors: 1, conflicts: 0, stale: 0, judged: [] });
 
     const readEpochsThrows = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
         readEpochs: async () => { throw new Error("pool timeout"); },
     }));
-    assert.deepEqual(readEpochsThrows, { examined: 0, cleared: [], errors: 1, stale: 0, judged: [] });
+    assert.deepEqual(readEpochsThrows, { examined: 0, cleared: [], errors: 1, conflicts: 0, stale: 0, judged: [] });
 });
 
 test("the freshness re-check failing (not just drifting) is also counted, not thrown", async () => {
@@ -590,7 +650,7 @@ test("the freshness re-check failing (not just drifting) is also counted, not th
         },
     }));
 
-    assert.deepEqual(result, { examined: 1, cleared: [], errors: 1, stale: 0, judged: [] });
+    assert.deepEqual(result, { examined: 1, cleared: [], errors: 1, conflicts: 0, stale: 0, judged: [] });
     assert.deepEqual(s.writes, [], "no clear was attempted without a confirmed-fresh read");
 });
 
@@ -785,4 +845,30 @@ test("a never-resolving close times out; the pass still completes and accounts t
     };
     const summary = await runIntakeWorker(h.deps);
     assert.equal(summary.byState.BOOKED, 1, "accounting proceeded even though the close never settled");
+});
+
+test("once the timer wins the race, the deadline predicate latches true independent of the clock (round 4, blocker 3)", async () => {
+    const h = workerHarness(BOOKED, {
+        // NEVER settles, exactly like the timeout test above — the point
+        // here is what `deadlineExceeded` reports afterward, not the timing.
+        closeRequestsSatisfiedBy: async (expenseId, deadlineExceeded) => {
+            h.closes.push({ expenseId, deadlineExceeded });
+            return new Promise(() => {});
+        },
+    });
+    // Pinned to the close's budget floor (3s), same as the timeout test, so
+    // this test's one real timer stays short.
+    h.deps.book = async () => {
+        h.clock = RUN_HARD_BUDGET_MS - CLOSE_REQUESTS_MIN_BUDGET_MS;
+        return BOOKED;
+    };
+    await runIntakeWorker(h.deps);
+
+    assert.equal(h.closes.length, 1);
+    // The injected clock is a plain variable, frozen at whatever `book()` set
+    // it to — it never advances on its own. The only way the predicate can
+    // now read `true` is the timer's own latch, not the elapsed-time
+    // arithmetic: proof that "once cancelled, no new apply may start" does
+    // not depend on real time having actually passed.
+    assert.equal(h.closes[0].deadlineExceeded(), true, "the timer winning latches the flag");
 });

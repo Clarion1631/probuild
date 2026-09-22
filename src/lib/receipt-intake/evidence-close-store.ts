@@ -14,14 +14,18 @@
  *    evidence's own amount+date window are the sweep's job to reach, through
  *    its own per-issue pass over every bank line. So the fast path is a
  *    SUBSET, never a superset, of what a full sweep cycle would close.
- * 2. SUBTRACTIVE, on the write this call itself decides to make. The FIRST
- *    attempt at every apply is always `evaluateReviewIssue(..., [], ...)` —
- *    an empty reason set that can only ever reach `clear` or `noop`
- *    (`decideLifecycle` step 1); it cannot create an issue, cannot reopen
- *    one, and touches no cycle record, no cursor and no `chaserCompletedAt`.
- *    A version-conflict RETRY on that same write is the one documented
- *    exception — see FENCED below, blocker 1b, for what it can reach and why
- *    that is still correct rather than a hole in this property.
+ * 2. SUBTRACTIVE, STRICTLY (round 4). Every apply is always
+ *    `evaluateReviewIssue(..., [], ...)` — an empty reason set that can only
+ *    ever reach `clear` or `noop` (`decideLifecycle` step 1); it cannot
+ *    create an issue, cannot reopen one, and touches no cycle record, no
+ *    cursor and no `chaserCompletedAt`. This holds on every one of the
+ *    lifecycle's own internal version-conflict retries too, not just the
+ *    first attempt: this module hands `evaluateReviewIssue` no way to
+ *    re-derive the codes it retries with (see FENCED below), so a retry can
+ *    only ever reapply the SAME empty set — never `touch`, `suppress`,
+ *    `supersede` or `reopen`. There is no exception to this any more; an
+ *    earlier version of this module had one, and removing it is what fixed
+ *    round-3 blockers 1 and 2 (see FENCED).
  * 3. IDEMPOTENT. That write is the CAS'd lifecycle, which returns `noop` when
  *    the codes are unchanged — and only a genuine `clear` is ever counted in
  *    `cleared`; a `noop` (something else cleared the issue in the gap between
@@ -36,46 +40,63 @@
  *    active outreach hold — and this path must never throw (see BOUNDED
  *    below), so strict is simply incompatible with it. Freshness against a
  *    moving ledger is a separate concern; see FENCED.
- * 5. FENCED, PER APPLY. `receiptEvidenceEpoch` and `bankLedgerEpoch` — the
- *    same two counters the sweep's own completion fence reads
- *    (receipt-evidence-lock.ts / bank-ledger-epoch.ts) — are read once before
- *    judging and again immediately before EACH lifecycle apply, not once for
- *    the whole batch: an epoch that moves between two applies withholds the
- *    second one (and everything still queued behind it), counted `stale`,
- *    without disturbing the first, which already committed under evidence
- *    that was still current when it ran. The CAS on an issue's own version
- *    catches a concurrent write to THAT row; it says nothing about whether
- *    the evidence or ledger a verdict was reasoned from is still what is on
- *    disk, which is what this second read is for.
+ * 5. FENCED, PER APPLY, AND LATCHED (round 4). `receiptEvidenceEpoch` and
+ *    `bankLedgerEpoch` — the same two counters the sweep's own completion
+ *    fence reads (receipt-evidence-lock.ts / bank-ledger-epoch.ts) — are read
+ *    once before judging and again immediately before EACH lifecycle apply,
+ *    not once for the whole batch: an epoch that moves between two applies
+ *    withholds the second one (and everything still queued behind it),
+ *    counted `stale`, without disturbing the first, which already committed
+ *    under evidence that was still current when it ran. `deadlineExceeded()`
+ *    is checked AGAIN right after that same re-read, with no `await` between
+ *    the check and starting the apply, so a cancellation or deadline that
+ *    lands during the epoch re-read's own round trip cannot slip a new apply
+ *    out past it. Once the worker's timer wins its race against this whole
+ *    call (see `closeRequestsSatisfiedByBooking` in worker.ts), that SAME
+ *    predicate answers `true` for the rest of this call too, from that
+ *    instant on — not only once the elapsed-time arithmetic would separately
+ *    agree.
  *
- *    THE EXACT RESIDUAL, stated honestly (Codex round 3): the read and the
- *    write are still two separate round trips, not one atomic operation. A
- *    write already IN FLIGHT when an epoch bumps can still land after that
- *    bump — the read confirmed freshness a moment before the write, not AT
- *    the write. Such a write is not wrong when it lands (the evidence it
- *    read was real at the time it read it), but it can be STALE by the time
- *    it commits. The next certified sweep re-judges the line from current
- *    data regardless and reopens it if the clear no longer holds, so a
- *    stale-landing write self-corrects within one nightly cycle rather than
- *    persisting silently — it is not left uncaught. Closing this gap for
- *    real needs an atomic version taken under the SAME writer locks the
- *    sweep uses. That is a documented follow-up, not done here, because
- *    taking that lock from the booking path changes its lock order and
- *    deserves its own review rather than riding in on this one.
+ *    THE EXACT RESIDUAL, stated honestly: the read and the write are still
+ *    two separate round trips, not one atomic operation, and the deadline
+ *    check is cooperative, not preemptive. An apply already IN FLIGHT — past
+ *    its own epoch/deadline check, already inside `applyCodes` — when the
+ *    epoch bumps or the worker's timer fires can still land after that. That
+ *    is accepted, and safe: it is a single CAS'd `clear` (or a `noop`),
+ *    never anything else (see SUBTRACTIVE), so the worst it can do is settle
+ *    a moment later than the check would have liked — and the next
+ *    certified sweep re-judges the line from current data regardless and
+ *    reopens it if the clear no longer holds, so nothing is left uncaught.
+ *    No NEW apply starts after that point; only the one already running can
+ *    still finish. Closing this gap for real needs an atomic version taken
+ *    under the SAME writer locks the sweep uses. That is a documented
+ *    follow-up, not done here, because taking that lock from the booking
+ *    path changes its lock order and deserves its own review rather than
+ *    riding in on this one.
  *
- *    THE VERSION-CONFLICT RETRY (blocker 1b) is what makes the per-apply
- *    read meaningful rather than decorative: `defaultApplyCodes` passes
- *    `recomputeCodes` — the SAME `recomputeCodesFor`, the SAME shared cache
- *    — into `evaluateReviewIssue`'s own retry option, so a lost CAS re-judges
- *    from current data instead of replaying the `[]` this call already
- *    decided on. A re-judge that comes back non-empty leaves the issue open:
- *    `decideLifecycle` can reach `touch`, `suppress` or `supersede` for it
- *    (never `create` — the row already exists), and `reopen` only in the
- *    narrow case where some OTHER writer cleared this exact row in the same
- *    window and the fresh re-judge disagrees with that clear. Every one of
- *    those is `decideLifecycle`'s own general-purpose, already-correct
- *    behavior — this module is not re-deriving it, only feeding it the truth
- *    instead of a stale snapshot.
+ *    THE ROW-LEVEL CAS is a separate, narrower concern from the epoch fence
+ *    above: it catches a concurrent write to THIS ONE issue row, between
+ *    `evaluateReviewIssue`'s own read and write, not a stale evidence
+ *    snapshot. On a lost CAS, `evaluateReviewIssue` retries the WHOLE
+ *    evaluation itself, internally, up to five times (review-alert-
+ *    lifecycle.ts, unmodified by this module). This module hands it no
+ *    `recomputeCodes` (round 4, blocker 1): every retry therefore reapplies
+ *    the SAME already-decided `[]`, which — per SUBTRACTIVE — can only reach
+ *    `clear` or `noop` again, never anything a fresher read might have
+ *    justified instead. That is deliberately the simple, safe answer rather
+ *    than a cleverer one: an earlier version of this module tried to
+ *    re-judge on the retry, using the SAME cache-backed `recomputeCodesFor`
+ *    the judge phase had already populated — which handed back the cache's
+ *    STALE verdict, not a fresh one, so the "re-judge" was fake (blocker 1)
+ *    and could also have overwritten a richer `displayDetails` with `null`
+ *    on whatever non-empty action it reached instead (blocker 2). Neither
+ *    can occur once a retry cannot leave `[]`. If EVERY retry loses the race
+ *    — real, sustained contention on this one row — `evaluateReviewIssue`
+ *    itself throws once its attempts are exhausted; this module recognises
+ *    that specific throw and counts it as a `conflict`, never as `errors`
+ *    and never as `cleared` (`EvidenceCloseResult.conflicts`), and does
+ *    nothing further for that issue — exactly like a stale epoch, it is left
+ *    for the nightly sweep, which carries no retry budget to exhaust.
  * 6. BOUNDED AND BEST EFFORT. One indexed candidate query, capped at
  *    `MAX_EVIDENCE_CLOSE_QUERY_ROWS` (50) raw rows; at most
  *    `MAX_EVIDENCE_CLOSE_CANDIDATES` (10) recomputes, capped AFTER the
@@ -87,11 +108,15 @@
  *    fetched at all, and this call simply cannot see them — truncation, not
  *    a repeat of the shadowing bug the two-cap split exists to fix. The
  *    caller's deadline is threaded through every phase — setup, judging,
- *    and immediately before each apply — and no new apply is ever started
- *    once it fires. Every failure, including one in the candidate query, the
- *    open-issue lookup, or an epoch read, is counted and swallowed. The
- *    money has already moved; a failed courtesy close must not disturb it,
- *    and the nightly sweep is still the backstop.
+ *    immediately after every epoch re-read, and immediately before every
+ *    apply — and no new apply is ever started once it fires, whether it
+ *    fired by elapsed time or by the worker's cancel latch (see FENCED).
+ *    Every failure, including one in the candidate query, the open-issue
+ *    lookup, or an epoch read, is counted and swallowed; a lost lifecycle
+ *    CAS is counted separately as a `conflict` rather than an `error`,
+ *    because contention is not a bug. The money has already moved; a failed
+ *    courtesy close must not disturb it, and the nightly sweep is still the
+ *    backstop.
  *
  * Injection over mocking throughout: the `deps` bag is the same seam
  * `receipt-request-cards/route.ts:390,415` uses, and it is what lets every test
@@ -148,16 +173,13 @@ export interface EvidenceCloseDeps {
     ) => Promise<ReasonCode[]>;
     /**
      * Resolves to whether the write was an actual CLEAR — never true for a
-     * noop (see IDEMPOTENT). `recomputeCodes` is what a version-conflict
-     * retry re-judges from — see FENCED, blocker 1b — and MUST be the same
-     * `recompute(targetKey, cache, deadlineExceeded)` the judge phase used,
-     * never a fresh one.
+     * noop (see IDEMPOTENT), and never invoked with a non-empty `codes` (see
+     * SUBTRACTIVE). No recompute callback is threaded through any more
+     * (round 4, blocker 1) — a lost lifecycle CAS is the caller's problem to
+     * notice via a thrown error, not something this hook can be handed a way
+     * to retry around.
      */
-    applyCodes?: (
-        targetKey: string,
-        codes: ReasonCode[],
-        recomputeCodes: () => Promise<ReasonCode[]>,
-    ) => Promise<boolean>;
+    applyCodes?: (targetKey: string, codes: ReasonCode[]) => Promise<boolean>;
     /** The CALLER's absolute clock — the worker invocation's, not a fresh one. */
     deadlineExceeded?: () => boolean;
     /** Overridable only so the window is testable; production uses the sweep's. */
@@ -185,8 +207,17 @@ export interface EvidenceCloseResult {
     examined: number;
     /** Target keys whose issue this call cleared. */
     cleared: string[];
-    /** Candidates whose verdict or write threw. Never a verdict. */
+    /** Candidates whose verdict or write threw — a real failure, not contention.
+     *  Never a verdict. */
     errors: number;
+    /**
+     * Applies withheld because `evaluateReviewIssue` lost the lifecycle CAS on
+     * this issue row and exhausted its own retries (see FENCED). Contention,
+     * not a bug — distinct from `errors` so a log line never conflates the
+     * two. Zero lifecycle writes happened for these; left to the nightly
+     * sweep, exactly like `stale`.
+     */
+    conflicts: number;
     /**
      * Clears withheld because `receiptEvidenceEpoch` or `bankLedgerEpoch`
      * moved between judging and applying (see FENCED). Zero lifecycle writes
@@ -249,30 +280,24 @@ function errorCategory(error: unknown): string {
 
 /**
  * THE ONLY WRITE THIS MODULE MAKES, and it refuses to be anything but a clear
- * — on the FIRST attempt. See FENCED (blocker 1b) in the module header for
- * what a version-conflict retry can reach and why.
+ * — on every attempt, including the lifecycle's own internal version-conflict
+ * retries. See SUBTRACTIVE and FENCED in the module header for why no
+ * recompute callback is handed to `evaluateReviewIssue` any more (round 4).
  *
  * `displayDetails` is null on purpose: the lifecycle's `clear` branch writes
  * `clearedAt`, the acknowledgement columns and the version, and never touches
  * the details blob — exactly as the sweep's own close does
- * (`applyReceiptRequestPlan`'s `evaluate(targetKey, [], null)`).
- *
- * `recomputeCodes` is handed straight to `evaluateReviewIssue`'s own retry
- * option — never invoked here directly. It is what lets a lost CAS re-judge
- * from current data instead of blindly reapplying the `[]` this call already
- * decided on moments ago.
+ * (`applyReceiptRequestPlan`'s `evaluate(targetKey, [], null)`), so a
+ * courtesy clear leaves the row identical to a sweep clear either way.
  *
  * Returns whether the lifecycle's OWN decision was `clear` — false for `noop`
- * (something else already cleared this issue since the open-issue read) and
- * false for whatever a non-empty retry re-judge reached instead, so a caller
- * never counts a write that did not actually happen (see IDEMPOTENT in the
- * module header).
+ * (something else already cleared this issue since the open-issue read), so a
+ * caller never counts a write that did not actually happen (see IDEMPOTENT in
+ * the module header). Lets `evaluateReviewIssue`'s own exhausted-retries
+ * error propagate uncaught — the caller (`closeRequestsSatisfiedBy`) is what
+ * recognises and counts it as a `conflict`.
  */
-async function defaultApplyCodes(
-    targetKey: string,
-    codes: ReasonCode[],
-    recomputeCodes: () => Promise<ReasonCode[]>,
-): Promise<boolean> {
+async function defaultApplyCodes(targetKey: string, codes: ReasonCode[]): Promise<boolean> {
     // Structural already (the caller only reaches here on an empty verdict);
     // asserted anyway, because "subtractive" is the property that lets this
     // path run without a certified cycle.
@@ -281,9 +306,24 @@ async function defaultApplyCodes(
         // Delivery is the per-owner digest, never the per-issue drainer — the
         // same choice the sweep makes for every receipt-request write.
         episodeStatus: "SUPPRESSED",
-        recomputeCodes,
     });
     return decision.action === "clear";
+}
+
+/**
+ * The one error `evaluateReviewIssue` throws from ITS OWN version-conflict
+ * retry loop, once contention exhausts every attempt
+ * (review-alert-lifecycle.ts: `` `evaluateReviewIssue: exceeded ${N}
+ * version-conflict retries for ${targetType}:${targetKey}` ``). Matched by
+ * message, not `instanceof`: the loop's own `VersionConflict` class is
+ * module-private and never escapes it, and this module must not add an
+ * exported one to shared code for a caller that no longer even asks it to
+ * retry (see the module header, FENCED). Contention on one issue row is not a
+ * bug — bucketed into `EvidenceCloseResult.conflicts`, apart from `errors`,
+ * so the two are never confused in a log line.
+ */
+function isVersionConflictExhausted(error: unknown): boolean {
+    return error instanceof Error && error.message.includes("version-conflict retries");
 }
 
 /**
@@ -312,7 +352,7 @@ export async function closeRequestsSatisfiedBy(
     evidence: BookedEvidence,
     deps: EvidenceCloseDeps = {},
 ): Promise<EvidenceCloseResult> {
-    const result: EvidenceCloseResult = { examined: 0, cleared: [], errors: 0, stale: 0, judged: [] };
+    const result: EvidenceCloseResult = { examined: 0, cleared: [], errors: 0, conflicts: 0, stale: 0, judged: [] };
     const deadlineExceeded = deps.deadlineExceeded ?? (() => false);
     const query = candidateBankLineQuery(evidence, deps.lookbackDays ?? EVIDENCE_LOOKBACK_DAYS);
     if (!query || deadlineExceeded()) return result;
@@ -454,22 +494,40 @@ export async function closeRequestsSatisfiedBy(
             break;
         }
 
+        // RIGHT AFTER THE EPOCH RE-READ, WITH NO AWAIT BEFORE THE APPLY BELOW
+        // (round 4, blocker 3): that re-read was itself an await, so a
+        // deadline or the worker's cancel latch (see FENCED in the module
+        // header) could have landed during it. Checking again here, with
+        // nothing but a synchronous array index between this check and
+        // `applyCodes` starting, is what makes "once cancelled, no new apply
+        // may start" true rather than aspirational.
+        if (deadlineExceeded()) {
+            console.warn("[receipt-intake/evidence-close] out of budget right after the epoch re-read; leaving the rest to the sweep");
+            break;
+        }
+
         const targetKey = toClear[i];
         try {
-            // A version conflict on the write itself means someone else
-            // committed to THIS row between the read just above and the
-            // write about to happen. `recomputeCodes` lets the lifecycle's
-            // own retry re-judge from current data — the SAME recompute, the
-            // SAME cache — instead of replaying the `[]` this call already
-            // decided on (see FENCED, blocker 1b, for what a non-empty
-            // re-judge can reach and why that is correct).
-            const cleared = await applyCodes(targetKey, [], () => recompute(targetKey, cache, deadlineExceeded));
+            // No recompute callback any more (round 4, blocker 1): a version
+            // conflict on the write itself — someone else committed to THIS
+            // row between the read just above and the write about to happen
+            // — is left to `evaluateReviewIssue`'s own internal retry, which
+            // (with no way to re-derive the codes) can only ever reapply this
+            // SAME empty verdict (see SUBTRACTIVE). If contention persists
+            // through every one of its attempts, it throws, and that throw is
+            // recognised below and counted as a `conflict`, not an `error`.
+            const cleared = await applyCodes(targetKey, []);
             // Only a genuine `clear` is counted — a `noop` (something else
             // cleared it first) is not this call's doing (see IDEMPOTENT).
             if (cleared) result.cleared.push(targetKey);
         } catch (error) {
-            result.errors++;
-            console.warn("[receipt-intake/evidence-close] clear failed", targetKey, errorCategory(error));
+            if (isVersionConflictExhausted(error)) {
+                result.conflicts++;
+                console.warn("[receipt-intake/evidence-close] lost the lifecycle CAS; leaving it to the sweep", targetKey);
+            } else {
+                result.errors++;
+                console.warn("[receipt-intake/evidence-close] clear failed", targetKey, errorCategory(error));
+            }
         }
     }
 

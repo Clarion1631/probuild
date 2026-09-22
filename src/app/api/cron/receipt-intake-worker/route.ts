@@ -1313,7 +1313,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // expenseId that line cannot carry, rather than a second copy of
             // the same per-candidate detail.
             const { judged, ...counts } = closed;
-            if (counts.cleared.length > 0 || counts.errors > 0 || counts.stale > 0 || judged.length > 0) {
+            // `conflicts` (round 4) is contention, not a verdict — but it must
+            // still trip this line, or a call that only lost lifecycle CASes
+            // would log nothing at all despite the module header's promise
+            // that conflicts "show in logs".
+            if (counts.cleared.length > 0 || counts.errors > 0 || counts.conflicts > 0 || counts.stale > 0 || judged.length > 0) {
                 console.log("[cron/receipt-intake-worker] evidence close",
                     JSON.stringify({ expenseId, ...counts, judgedCount: judged.length }));
             }

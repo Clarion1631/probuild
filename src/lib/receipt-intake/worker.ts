@@ -1140,6 +1140,16 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
  *     background — there is no cancelling a promise — and is left for the
  *     nightly sweep to finish from wherever it lands, exactly like one that
  *     threw or ran out of candidates.
+ *
+ * THE TIMER LATCHES, IT DOES NOT JUST TIME (round 4, blocker 3): once the
+ * race's own timer fires, `closeDeadlineExceeded()` returns `true` from that
+ * instant on, for every future call, regardless of what the elapsed-time
+ * arithmetic would separately say. A purely time-based predicate leaves a gap
+ * — an apply already past its budget when the timer fires but not yet at its
+ * own next check would still read "not yet" off the clock alone. The flag
+ * closes that gap outright: the close (evidence-close-store.ts) checks this
+ * SAME predicate immediately before every apply, so once the timer has fired
+ * no new apply can start, whatever the clock says.
  */
 async function closeRequestsSatisfiedByBooking(
     result: BookResult,
@@ -1159,7 +1169,9 @@ async function closeRequestsSatisfiedByBooking(
     // whatever rows are still queued after it.
     const closeBudgetMs = Math.min(remaining - CLOSE_REQUESTS_SAFETY_MARGIN_MS, CLOSE_REQUESTS_MAX_BUDGET_MS);
     const closeStartedAt = deps.monotonicMs();
-    const closeDeadlineExceeded = () => deps.monotonicMs() - closeStartedAt >= closeBudgetMs;
+    // LATCHED below by the race's own timer — see the module comment above.
+    let cancelled = false;
+    const closeDeadlineExceeded = () => cancelled || deps.monotonicMs() - closeStartedAt >= closeBudgetMs;
 
     // `.then`/`.catch` attached to the call's OWN promise, before the race
     // below even starts — not to the race's result. A close that loses the
@@ -1191,7 +1203,15 @@ async function closeRequestsSatisfiedByBooking(
     // finish from wherever it was, exactly like one that threw.
     let timer!: ReturnType<typeof setTimeout>;
     const timedOut = new Promise<true>(resolve => {
-        timer = setTimeout(() => resolve(true), closeBudgetMs);
+        timer = setTimeout(() => {
+            // LATCH FIRST, resolve second: any deadlineExceeded() call from
+            // this instant forward — including one already in flight inside
+            // the still-running closePromise — sees `cancelled`, even one
+            // whose own elapsed-time arithmetic has not yet crossed the
+            // budget (round 4, blocker 3).
+            cancelled = true;
+            resolve(true);
+        }, closeBudgetMs);
     });
     try {
         if (await Promise.race([closePromise, timedOut])) {
