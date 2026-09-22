@@ -508,6 +508,15 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
  * name both sides' reference numbers without re-reading rows that may have
  * moved on by then.
  */
+/**
+ * How long the auto-distinct audit row may hold up a promoted receipt.
+ *
+ * The event is worth awaiting (a floating promise is lost when Vercel suspends
+ * the function) and is not worth a stalled booking, so it is raced against a
+ * timer rather than given the pass's whole remaining budget.
+ */
+const AUTO_DISTINCT_EVENT_BUDGET_MS = 1500;
+
 interface PromotionResult {
     promoted: boolean;
     conflictId?: string;
@@ -1064,13 +1073,21 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     });
                     const self = group.find(row => row.id === rowId);
                     const twins = group.filter(row => row.id !== rowId);
-                    // DEFENSIVE. Self is missing from its own live group, so it
-                    // has moved since the claim — voided, marked a duplicate,
-                    // re-classified. Never promote on a view that stale; park,
-                    // the direction every unanswerable weak question takes. The
-                    // write below CASes on `state: "READ"` and so matches
-                    // nothing in every case that can really produce this, which
-                    // is the point: it fails closed instead of booking.
+                    // SELF MISSING FROM ITS OWN LIVE GROUP. Two things produce
+                    // this, and parking is right for both.
+                    //
+                    //   - The row moved since the claim (voided, marked a
+                    //     duplicate, re-classified). It is then no longer READ,
+                    //     so the write below — CAS'd on `state: "READ"` — is a
+                    //     no-op, and the decision belongs to whoever moved it.
+                    //   - The group is LARGER than `take`, and self is not
+                    //     among the oldest MAX_WEAK_GROUP + 2. The row is
+                    //     perfectly alive and the write DOES land. That is the
+                    //     correct outcome: a group that big is exactly what
+                    //     judgeWeakGroup parks unconditionally anyway.
+                    //
+                    // Never promote on a view this incomplete; park, the
+                    // direction every unanswerable weak question takes.
                     const verdict: WeakVerdict = self
                         ? judgeWeakGroup(self, twins)
                         : { kind: "park", twinId: twins[0]?.id ?? rowId };
@@ -1078,11 +1095,17 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         await tx.receiptIntake.updateMany({
                             where: { id: rowId, state: "READ", claimToken },
                             data: {
+                                // THE STRONG KEY IS KEPT. This write used to
+                                // null it; see the matching comment in
+                                // worker.ts's weak branch. A row parked for a
+                                // decision still represents its document, and
+                                // the partial unique index already limits key
+                                // ownership to rows that are not DUPLICATE or
+                                // VOID. Releasing here let the same document,
+                                // re-sent with a differently read total, miss
+                                // both nets and book a second time.
                                 state: "NEEDS_REVIEW",
                                 stateReason: `weak-dup:${verdict.twinId}`,
-                                // Parked without ever reaching QuickBooks, so the
-                                // strong key goes back (same rule as book.ts).
-                                dedupStrongKey: null,
                                 nextRetryAt: null,
                                 ...RELEASE_CLAIM,
                             },
@@ -1123,25 +1146,41 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // `logAutomationEvent` swallows its own failures by contract, and
             // the catch here says the promotion does not depend on that
             // contract holding: the books write outranks the audit row.
+            //
+            // AWAITED, BUT BOUNDED. Not awaiting it at all would lose the audit
+            // silently on a suspended serverless function and risk an unhandled
+            // rejection; awaiting it unbounded would let one stuck insert eat
+            // the pass's budget with the row already promoted and the booking
+            // still to do. So it races a timer that RESOLVES — never rejects —
+            // and 1500ms cannot meaningfully dent a 60s invocation while still
+            // landing the event whenever the database is healthy.
+            //
+            // PROMOTED, not "booked": all that has happened is READ -> BOOKING.
+            // The booking itself runs after this and can still park or fail, so
+            // an event claiming the row booked would be a claim this code is in
+            // no position to make.
             if (result.autoDistinctFrom?.length) {
-                await logAutomationEvent({
-                    kind: "receipt-stage",
-                    stage: "weak-net",
-                    status: "auto-distinct",
-                    source: "intake-worker",
-                    reason: `booked past ${result.autoDistinctFrom.length} weak twin(s) on distinct reference numbers`,
-                    detail: {
-                        intakeId: rowId,
-                        weakKey,
-                        twinIds: result.autoDistinctFrom,
-                        selfRef: result.autoDistinctRefs?.selfRef ?? null,
-                        twinRefs: result.autoDistinctRefs?.twins ?? [],
-                    },
-                }).catch(error => console.warn(
-                    "[cron/receipt-intake-worker] auto-distinct event log failed",
-                    rowId,
-                    error instanceof Error ? error.name : "UnknownError",
-                ));
+                await Promise.race([
+                    logAutomationEvent({
+                        kind: "receipt-stage",
+                        stage: "weak-net",
+                        status: "auto-distinct",
+                        source: "intake-worker",
+                        reason: `promoted past ${result.autoDistinctFrom.length} weak twin(s) on distinct reference numbers`,
+                        detail: {
+                            intakeId: rowId,
+                            weakKey,
+                            twinIds: result.autoDistinctFrom,
+                            selfRef: result.autoDistinctRefs?.selfRef ?? null,
+                            twinRefs: result.autoDistinctRefs?.twins ?? [],
+                        },
+                    }).catch(error => console.warn(
+                        "[cron/receipt-intake-worker] auto-distinct event log failed",
+                        rowId,
+                        error instanceof Error ? error.name : "UnknownError",
+                    )),
+                    new Promise<void>(resolve => setTimeout(resolve, AUTO_DISTINCT_EVENT_BUDGET_MS)),
+                ]);
             }
             return result;
         },

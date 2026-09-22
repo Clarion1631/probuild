@@ -401,15 +401,31 @@ test("only transient FAILURES are retryable — never a document verdict", async
         assert.equal(retryTargetFor("NEEDS_REVIEW", "max-retries"), "BOOKING");
     });
 
-    await t.test("a weak-dup row resumes at READ — the RULE changed, so this is a re-decision", () => {
+    await t.test("a weak-dup row resumes at RECEIVED — the re-route is what restores its key", () => {
         // The weak net now clears a pair whose reference numbers already tell
-        // them apart (weak-net.ts), so retrying one of these is not another
-        // attempt at the same verdict. READ, not RECEIVED: the document was
-        // read fine and only the dedup verdict is being taken again.
-        assert.equal(retryTargetFor("NEEDS_REVIEW", "weak-dup:abc"), "READ");
-        assert.equal(retryTargetFor("NEEDS_REVIEW", "weak-dup:cmg8x2q0000abcd"), "READ");
+        // them apart (weak-net.ts), so retrying one of these is a re-decision
+        // rather than another attempt at the same verdict.
+        //
+        // RECEIVED, not READ, and the re-read is the point rather than a side
+        // effect: rows parked by the OLD code had their dedupStrongKey released
+        // on the way in, and ROUTING is the only path that claims one. Sent
+        // back to READ they would book still owning no identity, which is the
+        // hole this whole round is about.
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "weak-dup:abc"), "RECEIVED");
+        assert.equal(retryTargetFor("NEEDS_REVIEW", "weak-dup:cmg8x2q0000abcd"), "RECEIVED");
         // Still a prefix rule, not a substring one.
         assert.equal(retryTargetFor("NEEDS_REVIEW", "not-weak-dup:abc"), null);
+    });
+
+    await t.test("READ is not a retry target at all", () => {
+        // Phase 2's auto re-sweep may want one; phase 1 does not have one, and
+        // an unused member of the union is a target `retryReceiptIntake` would
+        // happily write without anything having thought about it.
+        const targets = new Set(
+            ["ai-unavailable", "file-missing", "weak-dup:abc", "qbo-timeout", "qbo-5xx", "max-retries"]
+                .map(reason => retryTargetFor("NEEDS_REVIEW", reason)),
+        );
+        assert.deepEqual([...targets].sort(), ["BOOKING", "RECEIVED"]);
     });
 
     await t.test("document verdicts are NOT retryable — another attempt parks them again", () => {

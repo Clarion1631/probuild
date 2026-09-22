@@ -26,6 +26,14 @@
  * PURE: no I/O, no clock, no database. Both decision sites — routing and
  * promoteToBooking — run this same function over the same shape, so they cannot
  * reach different verdicts about one group.
+ *
+ * ONE BOUNDED RESIDUAL, recorded rather than fixed: `sanitize` in keys.ts
+ * DELETES non-ASCII characters rather than folding them, so a fullwidth digit
+ * would vanish from `refNumber` before it ever reaches this module. Deletion
+ * only ever shortens a ref, and the length rule below parks any pair whose
+ * lengths differ, so such a pair fails safe. Normalizing upstream would change
+ * strong-key derivation for existing rows, which is not worth it for input no
+ * US construction supplier produces.
  */
 import { refLooksReal } from "./keys";
 
@@ -67,13 +75,37 @@ export function confusionNormalizeRef(ref: string | null | undefined): string {
 }
 
 /**
+ * The SHAPE of a normalized ref: every digit as D, every letter as L.
+ *
+ * A vendor issues one format. Two refs of the same length whose shapes differ
+ * are two different KINDS of number — an order number read off one copy and an
+ * invoice number off the other — not one number read twice.
+ *
+ * ONE PASS, deliberately. The obvious two-pass spelling —
+ * `.replace(/[0-9]/g, "D").replace(/[A-Z]/g, "L")` — is broken: "D" is itself
+ * in `[A-Z]`, so the second pass rewrites the markers the first one wrote and
+ * every input collapses to a run of "L"s. That makes classOf a function of
+ * length alone and silently turns this whole guard off.
+ */
+function classOf(normalized: string): string {
+    return normalized.replace(/[0-9A-Z]/g, ch => (ch >= "0" && ch <= "9" ? "D" : "L"));
+}
+
+/**
  * True when one ref is plausibly a misread of the other, so they must not be
  * split.
  *
- * FAILS TOWARDS PARK at every step: an empty normalization, an equality, or
- * either kind of containment all answer true. The counter-case this guards is
- * one big-box purchase arriving twice, as an email receipt and a paper photo,
- * with the number read slightly differently on each.
+ * FAILS TOWARDS PARK at every step: an empty normalization, an equality, a
+ * length difference and a shape difference all answer true. The counter-case
+ * this guards is one big-box purchase arriving twice, as an email receipt and a
+ * paper photo, with the number read slightly differently on each.
+ *
+ * Only two refs of the SAME LENGTH and the SAME SHAPE are ever called distinct.
+ * That is safe because vendors issue fixed-width refs per format, so two
+ * genuine same-day tickets from one vendor match on both. It costs exactly one
+ * case: a digit rollover ("999" to "1000") parks. That is the right direction,
+ * and it buys the order-number-versus-invoice-number class, which is a real way
+ * to read one document twice and conclude it is two.
  */
 export function refsAreConfusable(a: string | null | undefined, b: string | null | undefined): boolean {
     const na = confusionNormalizeRef(a);
@@ -82,9 +114,12 @@ export function refsAreConfusable(a: string | null | undefined, b: string | null
     if (!na || !nb) return true;
     // "INV-95870" vs "INV-95B70" collapse to the same string.
     if (na === nb) return true;
-    // A truncated read: "95870" vs "9587", either end.
-    if (na.startsWith(nb) || nb.startsWith(na)) return true;
-    if (na.endsWith(nb) || nb.endsWith(na)) return true;
+    // A truncated read: "95870" vs "9587". Equal lengths also make strict
+    // containment impossible, so this subsumes the prefix/suffix rules it
+    // replaced rather than sitting beside them.
+    if (na.length !== nb.length) return true;
+    // Same length, different kind of number.
+    if (classOf(na) !== classOf(nb)) return true;
     return false;
 }
 

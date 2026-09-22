@@ -1310,15 +1310,28 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     const verdict = judgeWeakGroup(self, twins);
     if (verdict.kind === "park") {
         const third = routeState(routeInput, { strong: null, weak: { id: verdict.twinId } }, hasProject);
-        // RELEASE the strong key. Nothing was sent to QuickBooks, so this row
-        // is parked pre-send and the documented rule applies to it like any
-        // other. Holding the key made a CORRECTED resend of the same receipt
-        // collide with a row that was never booked — the review queue then had
-        // two rows and neither could proceed. The weak pair is still visible to
-        // a human through duplicateOfId and the reason.
+        // THE STRONG KEY IS KEPT, and the patch says so by saying nothing: it
+        // carries no `dedupStrongKey`, so the claim applyRead already committed
+        // stands.
+        //
+        // This branch used to release it. The partial unique index is
+        // `WHERE dedupStrongKey IS NOT NULL AND state NOT IN ('DUPLICATE','VOID')`
+        // — the index itself encodes the rule that DEAD rows give keys back. A
+        // row parked NEEDS_REVIEW awaiting a decision is not dead; it still
+        // represents its document, and releasing its key asserts that the
+        // document's identity is unclaimed, which is false.
+        //
+        // The release's own justification was that the parked row had no exit,
+        // so a corrected resend would collide with a row that could never
+        // proceed. This PR dissolves that premise: the row now has three exits
+        // (it auto-clears, Retry re-routes it, Set job revives it). And leaving
+        // the key held is what makes the resend cases correct — an identical
+        // resend hits the index and routes DUPLICATE, a resend with a corrected
+        // total routes `strong-dup-amount-mismatch:<owner>`, which is exactly
+        // what the strong net exists to say when it cannot tell which total is
+        // right. Released, both of those sail past every net and book twice.
         const applied3 = await applyRoutedState(deps, row.id, third, {
             ...base,
-            dedupStrongKey: null,
             duplicateOfId: third.duplicateOfId,
         }, ownershipOf(row), note);
         return applied3.owned ? applied3.state : "STALE";

@@ -327,13 +327,17 @@ export function backoffMs(attempts: number): number {
  *   - `ai-unavailable` and `file-missing` failed BEFORE the read, so they go
  *     back to RECEIVED and get read again. Sending them to BOOKING would book a
  *     row whose vendor/total were never extracted.
- *   - `weak-dup:<id>` needs no re-read at all: the document was read, and only
- *     the dedup verdict is being taken again. READ is where the weak net's last
- *     word is spoken (promoteToBooking), so that is where it goes back to.
+ *   - `weak-dup:<id>` goes back to RECEIVED too, and the re-READ is the point
+ *     rather than a side effect. Rows parked by the OLD code had their
+ *     `dedupStrongKey` released on the way in (this PR stops that, but it
+ *     cannot retro-fit a key that is already gone). Only the full routing path
+ *     re-claims a strong key, so RECEIVED is what heals them; a bare re-decide
+ *     from READ would book them still owning nothing. The cost is one AI read
+ *     per press, which is accepted.
  *   - `qbo-timeout` / `qbo-5xx` / `max-retries` failed at the SEND, with the
  *     read already done, so they resume at BOOKING.
  */
-export type RetryTarget = "RECEIVED" | "BOOKING" | "READ";
+export type RetryTarget = "RECEIVED" | "BOOKING";
 
 const RETRYABLE_REASONS: Array<{ test: RegExp; target: RetryTarget }> = [
     // Gemini was down. The document was never read, so re-read it.
@@ -341,8 +345,9 @@ const RETRYABLE_REASONS: Array<{ test: RegExp; target: RetryTarget }> = [
     // The upload never landed in the bucket; a human has since re-uploaded it.
     { test: /^file-missing$/, target: "RECEIVED" },
     // The rule changed under this row: a weak twin no longer blocks a document
-    // whose own reference number tells it apart. Re-deciding, not re-reading.
-    { test: /^weak-dup:/, target: "READ" },
+    // whose own reference number tells it apart. Re-read and re-routed in full,
+    // because routing is the only path that re-claims a strong key — see above.
+    { test: /^weak-dup:/, target: "RECEIVED" },
     // Transport-class QuickBooks failures, and the row that exhausted its
     // budget of them. The read is done; resume at the send.
     { test: /^qbo-timeout$/, target: "BOOKING" },

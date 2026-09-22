@@ -18,6 +18,13 @@
  * HOUSE STYLE for every sentence: small words, short, no em dash, no en dash,
  * and no " - " used as punctuation. `tests/receipt-intake-reason-text.test.ts`
  * asserts it over every string below rather than trusting review to catch it.
+ *
+ * AND THE RULE THAT MATTERS MORE: state what is true about the row and what
+ * action exists. NEVER predict an outcome. "Upload it again and this one
+ * clears", "a clearer photo would fix it" and "it goes as soon as the switch is
+ * back on" all read as promises the pipeline is in no position to make, and a
+ * promise that does not come true is how a bookkeeper learns to stop reading
+ * these.
  */
 
 /** The row facts a sentence may quote. A subset of `IntakeRow`. */
@@ -67,10 +74,14 @@ function dateSentence(row: ReasonTextRow): string {
     }
     const days = Math.round((arrived - read) / DAY_MS);
     const when = row.txnDate as string;
-    if (days <= 0) {
-        return `The date on this one reads as ${when}, which is after it arrived. That is almost certainly a misread.`;
+    // STRICTLY NEGATIVE, not `<= 0`. A read date on the row's own arrival day
+    // is zero days apart and is never what this reason is about, so calling it
+    // "after it arrived" would be false. Only a genuinely future date lands
+    // here.
+    if (days < 0) {
+        return `The date on this one reads as ${when}, which is after it arrived.`;
     }
-    return `The date on this one reads as ${when}, which is ${days} day${days === 1 ? "" : "s"} before it arrived. That is almost certainly a misread.`;
+    return `The date on this one reads as ${when}, which is ${days} day${days === 1 ? "" : "s"} before it arrived.`;
 }
 
 /**
@@ -80,12 +91,15 @@ function dateSentence(row: ReasonTextRow): string {
  */
 const REASON_TEXTS: Array<{ test: RegExp; text: (row: ReasonTextRow) => string }> = [
     {
+        // NOT "I could not find a ticket number on both". That is only one of
+        // the three ways this parks: the refs can also be readable but too
+        // alike to separate, or the group can be too big to decide at all.
         test: /^weak-dup:/,
-        text: () => "Might be the same purchase as another receipt. Same vendor, same day, same amount, and I could not find a ticket number on both to tell them apart.",
+        text: () => "Might be the same purchase as another receipt. Same vendor, same day, same amount, and their ticket numbers do not settle it.",
     },
     {
         test: /^strong-dup-amount-mismatch:/,
-        text: () => "Same invoice number as another receipt but a different total. One of the two was misread.",
+        text: () => "Same invoice number as another receipt but a different total. The two do not agree.",
     },
     {
         test: /^vendor-mismatch:/,
@@ -95,7 +109,7 @@ const REASON_TEXTS: Array<{ test: RegExp; text: (row: ReasonTextRow) => string }
     { test: /^invalid-date$/, text: () => "I could not read a date on this one." },
     {
         test: /^multi-doc:one-page$/,
-        text: () => "Several receipts are on one page, so I cannot split them. A separate photo of each would book them all.",
+        text: () => "Several receipts are on one page, so I cannot split them. A separate photo of each would let me read them.",
     },
     { test: /^multi-doc$/, text: () => "This file has more than one receipt in it." },
     {
@@ -103,18 +117,23 @@ const REASON_TEXTS: Array<{ test: RegExp; text: (row: ReasonTextRow) => string }
         text: row => `The total reads as ${money(row.totalCents)}. A refund or a zero needs a person to place it.`,
     },
     { test: /^no-estimate$/, text: () => "No job on this one yet." },
-    { test: /^unreadable$/, text: () => "I could not read this file. A clearer photo of the receipt would fix it." },
+    { test: /^unreadable$/, text: () => "I could not read this file. It is usually a blurry photo or a bad scan. A clearer photo of the same receipt can be sent in." },
     { test: /^ai-unavailable$/, text: () => "The reader was down when this one came through. Retry gives it another go." },
-    { test: /^file-missing$/, text: () => "The file never landed in storage. Upload it again and this one clears." },
+    // NOT "upload it again and this one clears": a re-upload is a NEW row, and
+    // what Retry does to THIS one is look for the object again.
+    { test: /^file-missing$/, text: () => "The file never landed in storage, so there is nothing here to read. Retry looks again." },
     { test: /^max-retries$/, text: () => "This one tried to book too many times and gave up. Retry sends it back." },
-    { test: /^push-paused$/, text: () => "Booking is paused right now. This one goes as soon as it is switched back on." },
-    { test: /^push-disabled$/, text: () => "Booking is switched off right now. This one waits for it to come back." },
+    { test: /^push-paused$/, text: () => "Booking is paused right now, with the switch on this page. Nothing is wrong with this receipt." },
+    { test: /^push-disabled$/, text: () => "Booking is switched off in the settings, not with the switch on this page. Nothing is wrong with this receipt." },
     // book.ts's NATIVE_QBO_RECONCILE_REASON and QBO_PURCHASE_MISMATCH_PREFIX.
     // Matched as literals rather than imported: this module is a pure leaf and
     // book.ts carries Prisma and QuickBooks with it.
     {
+        // "MAY have started", not "already started": the flag is written just
+        // before the network call, so a process that died in between set it
+        // with nothing ever sent. See the long note at book.ts's gate.
         test: /^native-qbo-reconciliation-required$/,
-        text: () => "A send to QuickBooks already started for this one, so a purchase may be sitting there. Check QuickBooks before it books here.",
+        text: () => "A send to QuickBooks may have started for this one, so a purchase may be sitting there. Somebody has to look in QuickBooks first.",
     },
     {
         test: /^qbo-purchase-mismatch:/,
