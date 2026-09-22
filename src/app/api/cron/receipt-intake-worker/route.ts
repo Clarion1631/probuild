@@ -1047,6 +1047,36 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             liveSweepDepsFor(invocationDeadline),
         ),
 
+        /**
+         * WHAT IS LEFT OF THE KEYLESS-PROMOTION RESIDUAL, and why it is now
+         * narrow enough to accept.
+         *
+         * Rows parked `weak-dup:` under the OLD rule had their strong key
+         * released, and a human revival could promote them owning no identity.
+         * `healStrongKey` closes that: it re-derives the key from the persisted
+         * `readJson` with the same `dedupKeys` routing used, so any such row
+         * whose read is intact claims its identity back before it books.
+         *
+         * The gap the heal cannot close is a row whose `readJson` no longer
+         * describes the document it was keyed from. `readJson` is written by the
+         * SAME `applyRead` statement that writes the key, so a second read that
+         * lost the date used to replace both at once: the key became null and
+         * the evidence needed to recover it became the read that lost it. That
+         * is now prevented at the source — the claim keeps the established key
+         * when the re-read cannot derive one (see worker.ts) — so from this
+         * change on, the two cannot drift apart.
+         *
+         * What remains is only rows where that drift ALREADY happened before
+         * this deploy: a bounded, non-growing set. Nothing here can tell them
+         * apart from a document that legitimately never had a key (a gas receipt
+         * reading "NoInv"), and a guard that refused to promote on a null key
+         * would park every one of those forever — a much larger and entirely
+         * silent loss than the hole it closes. So they are handled
+         * operationally: the operator retries them after the deploy, which
+         * re-reads and re-routes each one, and the /automation guide already
+         * tells Marge to leave a `weak-dup:` row alone if Retry does not clear
+         * it, so nobody is asked to act on one meanwhile.
+         */
         promoteToBooking: async (rowId, weakKey, claimToken) => {
             const result: PromotionResult = await prisma.$transaction(async (tx): Promise<PromotionResult> => {
                 // The auto-distinct verdict, if the weak net reaches one. Both
@@ -1122,18 +1152,28 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     });
                     const self = group.find(row => row.id === rowId);
                     const twins = group.filter(row => row.id !== rowId);
-                    // SELF MISSING FROM ITS OWN LIVE GROUP. Two things produce
-                    // this, and parking is right for both.
+                    // SELF MISSING FROM ITS OWN LIVE GROUP. Exactly two things
+                    // produce it, because the query filters only on the weak
+                    // key and the live states, and parking is right for both.
                     //
-                    //   - The row moved since the claim (voided, marked a
-                    //     duplicate, re-classified). It is then no longer READ,
-                    //     so the write below — CAS'd on `state: "READ"` — is a
-                    //     no-op, and the decision belongs to whoever moved it.
-                    //   - The group is LARGER than `take`, and self is not
-                    //     among the oldest MAX_WEAK_GROUP + 2. The row is
-                    //     perfectly alive and the write DOES land. That is the
-                    //     correct outcome: a group that big is exactly what
+                    //   - The row MOVED since the claim (voided, marked a
+                    //     duplicate, re-classified, or re-read back to
+                    //     RECEIVED). It is then no longer READ, so the write
+                    //     below — CAS'd on `state: "READ"` — matches nothing,
+                    //     and the decision belongs to whoever moved it.
+                    //   - The group is LARGER than `take` and self is not among
+                    //     the oldest MAX_WEAK_GROUP + 2. The row is perfectly
+                    //     alive, so the write DOES land, and that is the right
+                    //     outcome: `twins` is then the full `take` of 12, which
+                    //     is past MAX_WEAK_GROUP, so a group this size is one
                     //     judgeWeakGroup parks unconditionally anyway.
+                    //
+                    // `twins[0]` is therefore always present in the second case
+                    // (a group too big to fit cannot be empty), so the `??
+                    // rowId` fallback is reachable only when the group came
+                    // back completely empty — which means self is dead, which
+                    // means the CAS matches nothing. No row can be persisted
+                    // carrying `weak-dup:` pointed at itself.
                     //
                     // Never promote on a view this incomplete; park, the
                     // direction every unanswerable weak question takes.
@@ -1224,28 +1264,40 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // rail with a person's call.
             const autoCount = result.autoDistinctFrom?.length ?? 0;
             if (autoCount > 0 || result.humanDistinctFrom) {
-                await Promise.race([
-                    logAutomationEvent({
-                        kind: "receipt-stage",
-                        stage: "weak-net",
-                        status: result.humanDistinctFrom ? "human-distinct" : "auto-distinct",
-                        source: "intake-worker",
-                        reason: `promoted past ${autoCount} weak twin(s) on distinct reference numbers${result.humanDistinctFrom ? ", and one a human had already ruled on" : ""}`,
-                        detail: {
-                            intakeId: rowId,
-                            weakKey,
-                            twinIds: result.autoDistinctFrom ?? [],
-                            humanDistinctFrom: result.humanDistinctFrom ?? null,
-                            selfRef: result.autoDistinctRefs?.selfRef ?? null,
-                            twinRefs: result.autoDistinctRefs?.twins ?? [],
-                        },
-                    }).catch(error => console.warn(
-                        "[cron/receipt-intake-worker] auto-distinct event log failed",
-                        rowId,
-                        error instanceof Error ? error.name : "UnknownError",
-                    )),
-                    new Promise<void>(resolve => setTimeout(resolve, AUTO_DISTINCT_EVENT_BUDGET_MS)),
-                ]);
+                // The handle is hoisted and cleared in `finally` so the WINNING
+                // case does not leave a pending timer holding the event loop
+                // open for the rest of its budget — on a serverless function
+                // that is the difference between returning now and returning in
+                // a second and a half, on every promotion that clears twins.
+                let timer: ReturnType<typeof setTimeout> | undefined;
+                try {
+                    await Promise.race([
+                        logAutomationEvent({
+                            kind: "receipt-stage",
+                            stage: "weak-net",
+                            status: result.humanDistinctFrom ? "human-distinct" : "auto-distinct",
+                            source: "intake-worker",
+                            reason: `promoted past ${autoCount} weak twin(s) on distinct reference numbers${result.humanDistinctFrom ? ", and one a human had already ruled on" : ""}`,
+                            detail: {
+                                intakeId: rowId,
+                                weakKey,
+                                twinIds: result.autoDistinctFrom ?? [],
+                                humanDistinctFrom: result.humanDistinctFrom ?? null,
+                                selfRef: result.autoDistinctRefs?.selfRef ?? null,
+                                twinRefs: result.autoDistinctRefs?.twins ?? [],
+                            },
+                        }).catch(error => console.warn(
+                            "[cron/receipt-intake-worker] auto-distinct event log failed",
+                            rowId,
+                            error instanceof Error ? error.name : "UnknownError",
+                        )),
+                        new Promise<void>(resolve => {
+                            timer = setTimeout(resolve, AUTO_DISTINCT_EVENT_BUDGET_MS);
+                        }),
+                    ]);
+                } finally {
+                    if (timer !== undefined) clearTimeout(timer);
+                }
             }
             return result;
         },
