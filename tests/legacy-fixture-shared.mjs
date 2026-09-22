@@ -2,7 +2,11 @@
  * The queue, the URLs and the extraction used BOTH to capture the legacy
  * fixture from `origin/claude/weak-net-distinct-refs` and to check the current
  * render against it. One definition, so the two halves cannot drift.
+ *
+ * An entry is [name, filters, queueFactory?]; the factory defaults to
+ * `legacyQueue`.
  */
+import { parseReceiptFilters } from "../src/app/automation/receipts-filters";
 
 /** Only the group panels: not the scope note, the stat tiles or the chip row. */
 export function groupSections(html) {
@@ -20,6 +24,10 @@ export const LEGACY_URLS = [
     ["group=missing-receipts", { group: "missing-receipts", projectId: null, owner: null }],
     ["group=missing-receipts&owner=Richard", { group: "missing-receipts", projectId: null, owner: "Richard" }],
     ["all groups", { group: null, projectId: null, owner: null }],
+    // Through REAL URL parsing, and with the queue narrowed the way the loader
+    // narrows it. `?owner=Richard` names an owner, which the To-do view cannot
+    // honour, so this URL draws the groups exactly as it always did.
+    ["owner=Richard (parsed)", parseReceiptFilters({ tab: "receipts", owner: "Richard" }), () => richardOnlyQueue()],
 ];
 
 function intake(id, over = {}) {
@@ -52,6 +60,21 @@ function request(id, over = {}) {
  * unset: the two approved differences that would otherwise show up as date
  * text are exercised by their own tests, not smuggled into this one.
  */
+/**
+ * What `fetchReceiptQueue` returns for `?owner=Richard`: the owner filter is
+ * applied in the LOADER, not the renderer, so the narrowing has to be in the
+ * fixture's data rather than in the component under test.
+ */
+export function richardOnlyQueue() {
+    const whole = legacyQueue();
+    const mine = whole.missingReceipts.filter(row => row.owner === "Richard");
+    return {
+        ...whole,
+        missingReceipts: mine,
+        counts: { ...whole.counts, missingReceiptsShown: mine.length },
+    };
+}
+
 export function legacyQueue() {
     const groups = {
         needsJob: [

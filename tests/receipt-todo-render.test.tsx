@@ -24,7 +24,12 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ReceiptsTab, type ReceiptBatchSigner } from "../src/app/automation/components/receipts/receipts-tab";
-import { parseReceiptFilters, type ReceiptFilters } from "../src/app/automation/receipts-filters";
+import {
+    RECEIPT_GROUP_TAKE,
+    parseReceiptFilters,
+    receiptFilterHref,
+    type ReceiptFilters,
+} from "../src/app/automation/receipts-filters";
 import { TODO_COPY } from "../src/app/automation/receipts-todo";
 import type { IntakeRow, MissingReceiptRow, ReceiptQueue } from "../src/app/automation/receipts-data";
 import { LEGACY_URLS, legacyQueue, groupSections } from "./legacy-fixture-shared.mjs";
@@ -104,25 +109,23 @@ const render = async (queue: ReceiptQueue, filters: ReceiptFilters, sign: Receip
         filterHref: () => "/automation?tab=receipts", nativeActive: false, sign,
     }));
 
-/** The real builder from page.tsx, so href tests exercise what ships. */
-const realFilterHref = (filters: ReceiptFilters) => (overrides: { group?: string; owner?: string; view?: string }) => {
-    const params = new URLSearchParams();
-    params.set("tab", "receipts");
-    const nextGroup = overrides.group ?? filters.group ?? "";
-    const nextOwner = overrides.owner ?? filters.owner ?? "";
-    const nextView = overrides.view ?? filters.view ?? "";
-    if (nextGroup) params.set("group", nextGroup);
-    if (nextOwner) params.set("owner", nextOwner);
-    if (filters.projectId) params.set("projectId", filters.projectId);
-    if (nextView && nextView !== "todo") params.set("view", nextView);
-    return `/automation?${params.toString()}`;
-};
-
+/**
+ * The production builder itself, bound the way page.tsx binds it. A copy of it
+ * here would only ever prove the copy works.
+ */
 const renderWithHrefs = async (queue: ReceiptQueue, filters: ReceiptFilters) =>
     renderToStaticMarkup(await ReceiptsTab({
-        queue, filters, jobs: [], filterHref: realFilterHref(filters),
+        queue, filters, jobs: [],
+        filterHref: overrides => receiptFilterHref(filters, overrides),
         nativeActive: false, sign: recordingSigner().sign,
     }));
+
+/**
+ * Just the grey strip. The chip row emits some of the same hrefs, so an
+ * assertion over the whole page cannot tell the two apart.
+ */
+const foldedStrip = (html: string) =>
+    /<section class="hui-card px-4 py-3 bg-slate-50">[\s\S]*?<\/section>/.exec(html)?.[0] ?? "";
 
 // ── The default, and the empty day ────────────────────────────────────────
 
@@ -152,7 +155,7 @@ test("an empty queue says she is done, and still explains what this page covers"
 
 test("the grey strip is drawn even when it is empty", async () => {
     const html = await render(queueOf(), parseReceiptFilters({}));
-    assert.ok(html.includes("Not yours: 0 of these."),
+    assert.ok(html.includes("Outside your list: 0 of these."),
         "a strip that only appears with bad news is indistinguishable from a strip that broke");
 });
 
@@ -195,15 +198,19 @@ test("every legacy URL still draws what the base branch drew, bar the approved d
     const sign: ReceiptBatchSigner = async paths =>
         new Map(paths.map(path => [path, `https://storage.test/sign/${path}`]));
 
-    for (const [name, filters] of LEGACY_URLS) {
+    for (const [name, filters, queueFactory] of LEGACY_URLS as Array<[string, ReceiptFilters, (() => ReceiptQueue) | undefined]>) {
         const html = renderToStaticMarkup(await ReceiptsTab({
-            queue: legacyQueue() as ReceiptQueue, filters: filters as ReceiptFilters,
+            queue: queueFactory ? queueFactory() : (legacyQueue() as ReceiptQueue),
+            filters,
             jobs: [{ id: "p1", name: "Mueller Remodel" }],
             filterHref: () => "/automation?tab=receipts", nativeActive: false, sign,
         }));
-        const expected = APPROVED_DIFFERENCES.reduce((text, diff) => diff.apply(text), fixture[name as string]);
-        assert.equal(groupSections(html), expected, `${name as string}: an unapproved change to a legacy view`);
+        const expected = APPROVED_DIFFERENCES.reduce((text, diff) => diff.apply(text), fixture[name]);
+        assert.equal(groupSections(html), expected, `${name}: an unapproved change to a legacy view`);
     }
+    // One of those cases goes through real URL parsing rather than a
+    // hand-built filter object, so the parser is pinned too.
+    assert.ok(Object.keys(fixture).includes("owner=Richard (parsed)"));
 });
 
 test("the fixture is a real pin: without the approved rewrites it does NOT match", async () => {
@@ -263,20 +270,36 @@ test("a held row is in no pile, and the strip names who owns it", async () => {
     assert.doesNotMatch(html, /SUNBELT RENTALS/, "it is not drawn as work");
     assert.ok(html.includes("1 has a possible document already. Justin checks that one."));
     assert.doesNotMatch(html, /has a document already/, "the hold is same-amount within a month, with no payee test at all");
-    assert.ok(html.includes("Not yours: 1 of these."));
+    assert.ok(html.includes("Outside your list: 1 of these."));
     assert.ok(html.includes(escaped(TODO_COPY.doneTitle)), "and with nothing else waiting, she is done");
 });
 
-test("a reason nobody has words for is HERS, with the raw code beside it", async () => {
+test("a reason nobody has words for gets named as such, not filed under photos", async () => {
     const html = await render(queueOf({
-        needsReview: [intake("x", { stateReason: "brand-new-failure-mode", vendor: "Tapani Materials" })],
+        needsReview: [
+            intake("x", { stateReason: "brand-new-failure-mode", vendor: "Tapani Materials" }),
+            intake("y", { stateReason: "unreadable", vendor: "Home Depot" }),
+        ],
     }), parseReceiptFilters({}));
 
-    assert.match(html, /Needs a better photo/);
+    assert.match(html, /Tell Justin about these/);
     assert.match(html, /Tapani Materials/);
-    assert.match(html, /brand-new-failure-mode/, "the code she can read out to a developer");
-    assert.ok(html.includes("I could not finish these. The reason is under each one."),
-        "the note cannot claim every row here is unreadable: this one is not");
+    assert.match(html, /brand-new-failure-mode/, "the code to pass on");
+    assert.ok(html.includes("Something I do not know stopped these. Send Justin the code shown under each one."));
+    // And the photo pile is still there, for the reason that IS about a photo.
+    assert.match(html, /Needs a better photo/);
+    assert.ok(html.indexOf("Needs a better photo") < html.indexOf("Tell Justin about these"));
+    assert.ok(html.includes("I could not read these."),
+        "which it can only claim now that the unknowns have moved out");
+});
+
+test("the unknown pile offers no button, because nothing on this page answers it", async () => {
+    const html = await render(queueOf({
+        needsReview: [intake("x", { stateReason: "brand-new-failure-mode" })],
+    }), parseReceiptFilters({}));
+
+    assert.doesNotMatch(html, />Set job</, "a job is a guess at a cause nobody knows");
+    assert.match(html, /Open receipt ↗/, "the document itself is still one click away");
 });
 
 test("the To-do view offers no button that is not hers", async () => {
@@ -376,8 +399,23 @@ test("a page of already-handled rows never claims she is done while older ones a
     assert.ok(!html.includes(escaped(TODO_COPY.doneTitle)),
         "108 open requests were never even loaded: 'done' would be a display limit talking");
     assert.ok(html.includes("Showing the 1 newest of 109."));
-    assert.ok(html.includes("108 older requests are not loaded here yet."));
-    assert.match(html, /href="\/automation\?tab=receipts&amp;group=missing-receipts&amp;view=all"[^>]*>Open the full list\.<\/a>/);
+    assert.ok(html.includes("108 older requests are not loaded here yet. They come up as newer ones clear."));
+    // NO link. Every view of this queue reads the same capped hundred and
+    // nothing pages past it, so a way through to "the full list" does not
+    // exist to offer.
+    assert.ok(!html.includes("Open the full list"));
+    assert.doesNotMatch(html, /group=missing-receipts&amp;view=all/);
+});
+
+test("a group that came back full also stops the done state, and says why", async () => {
+    const html = await renderWithHrefs(queueOf({
+        booking: Array.from({ length: RECEIPT_GROUP_TAKE }, (_unused, index) => intake(`bk-${index}`, { state: "BOOKING" })),
+    }), parseReceiptFilters({}));
+
+    assert.ok(!html.includes(escaped(TODO_COPY.doneTitle)),
+        "the intake lists are capped at the same hundred, and nothing pages past them either");
+    assert.ok(html.includes("Some receipt groups have more rows than this page loads. Justin checks those."));
+    assert.ok(foldedStrip(html).includes("Some receipt groups have more rows"), "and it is said in the strip");
 });
 
 test("one unloaded request says so in the singular, and a whole queue says nothing at all", async () => {
@@ -385,7 +423,7 @@ test("one unloaded request says so in the singular, and a whole queue says nothi
     one.counts.missingReceipts = 2;
     one.counts.missingReceiptsShown = 1;
     const html = await renderWithHrefs(one, parseReceiptFilters({}));
-    assert.ok(html.includes("1 older request is not loaded here yet."));
+    assert.ok(html.includes("1 older request is not loaded here yet. It comes up as newer ones clear."));
 
     const whole = await renderWithHrefs(queueOf({ missingReceipts: [request("a")] }), parseReceiptFilters({}));
     assert.ok(!whole.includes("not loaded here yet"), "nothing missing, nothing to say");
@@ -398,11 +436,32 @@ test("a folded line keeps the project filter it was clicked from", async () => {
         booking: [intake("bk", { state: "BOOKING" })],
         missingReceipts: [request("o", { owner: "office", cardTail: null, rawDescriptor: "ACH DEBIT" })],
     });
-    const html = await renderWithHrefs(queue, parseReceiptFilters({ projectId: "p1" }));
+    const strip = foldedStrip(await renderWithHrefs(queue, parseReceiptFilters({ projectId: "p1" })));
 
-    assert.match(html, /href="\/automation\?tab=receipts&amp;group=booking&amp;projectId=p1"/,
+    // Scoped to the strip: the chip row emits the same booking href, so a
+    // whole-page match would pass even if the strip's own link were wrong.
+    assert.match(strip, /href="\/automation\?tab=receipts&amp;group=booking&amp;projectId=p1"/,
         "a link built inside the pure planner could not have known about the project");
-    assert.match(html, /href="\/automation\?tab=receipts&amp;group=missing-receipts&amp;owner=office&amp;projectId=p1"/);
+    assert.match(strip, /href="\/automation\?tab=receipts&amp;group=missing-receipts&amp;owner=office&amp;projectId=p1"/);
+});
+
+test("a hold this page has no words for is quoted where the strip sends you", async () => {
+    // The strip links an unknown hold to the missing-receipts group. Arriving
+    // there to find it labelled "Existing document needs reconciliation" is a
+    // different claim, and loses the value the link was carrying.
+    const html = await render(queueOf({
+        missingReceipts: [
+            request("odd", { outreachHold: "awaiting-vendor-portal" }),
+            request("known", { outreachHold: "existing-evidence-review" }),
+            request("answered", { resolution: "closed-by-vanessa" }),
+        ],
+    }), { ...PRE_VIEW, group: "missing-receipts" });
+
+    assert.match(html, /awaiting-vendor-portal<\/span>/);
+    assert.match(html, /Answered in a way this page has no words for\.[\s\S]{0,120}closed-by-vanessa<\/span>/);
+    // The known ones keep their existing wording, untouched.
+    assert.match(html, /Existing document needs reconciliation\. Crew request held\./);
+    assert.equal((html.match(/font-mono/g) ?? []).length, 2, "only the two it has no words for are quoted");
 });
 
 // ── What a render costs ───────────────────────────────────────────────────

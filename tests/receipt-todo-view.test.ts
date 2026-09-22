@@ -34,7 +34,7 @@ import {
     type TodoPileKey,
     type TodoPlan,
 } from "../src/app/automation/receipts-todo";
-import { parseReceiptFilters, showsTodoView } from "../src/app/automation/receipts-filters";
+import { RECEIPT_GROUP_TAKE, parseReceiptFilters, showsTodoView } from "../src/app/automation/receipts-filters";
 import { looksLikeCheckOrSubBill } from "../src/lib/receipt-policy";
 import type { IntakeRow, MissingReceiptRow, ReceiptQueue, UncertainCardRow } from "../src/app/automation/receipts-data";
 
@@ -133,7 +133,6 @@ test("every row in the queue lands in exactly one pile or exactly one folded lin
         needsReview: [
             intake("r-noest", { stateReason: "no-estimate" }),
             intake("r-unread", { stateReason: "unreadable" }),
-            intake("r-missing", { stateReason: "file-missing" }),
             intake("r-multi", { stateReason: "multi-doc" }),
             intake("r-multi1", { stateReason: "multi-doc:one-page" }),
             intake("r-unknown", { stateReason: "brand-new-failure-mode" }),
@@ -146,6 +145,7 @@ test("every row in the queue lands in exactly one pile or exactly one folded lin
             intake("r-native", { stateReason: "native-qbo-reconciliation-required" }),
             intake("r-qbo", { stateReason: "qbo-purchase-mismatch:abc123" }),
             intake("r-ai", { stateReason: "ai-unavailable" }),
+            intake("r-missing", { stateReason: "file-missing" }),
             intake("r-max", { stateReason: "max-retries" }),
             intake("r-paused", { stateReason: "push-paused" }),
             intake("r-disabled", { stateReason: "push-disabled" }),
@@ -198,8 +198,13 @@ test("every row in the queue lands in exactly one pile or exactly one folded lin
     assert.deepEqual(rowIdsIn(plan, "pick-the-job").sort(), ["nj", "r-noest"]);
     assert.deepEqual(
         rowIdsIn(plan, "better-photo").sort(),
-        ["r-missing", "r-multi", "r-multi1", "r-unknown", "r-unread"],
-        "an unrecognised reason is HERS, not folded",
+        ["r-multi", "r-multi1", "r-unread"],
+        "only the reasons a photograph can actually answer",
+    );
+    assert.deepEqual(
+        rowIdsIn(plan, "tell-justin"),
+        ["r-unknown"],
+        "an unrecognised reason is a HUMAN'S, and gets its own pile rather than a guess at the cause",
     );
     assert.deepEqual(rowIdsIn(plan, "ask-for-these").sort(), ["m-cj", "m-rich"]);
     assert.deepEqual(rowIdsIn(plan, "checks-and-sub-bills"), ["m-check"]);
@@ -211,19 +216,22 @@ test("the folded strip is always drawn, even with nothing in it", () => {
     assert.equal(plan.handledCount, 0);
     assert.equal(plan.needsYouCount, 0);
     assert.equal(plan.notLoadedCount, 0);
-    assert.equal(fillCopy(TODO_COPY.stripHeader, { n: 0 }), "Not yours: 0 of these.");
+    assert.equal(fillCopy(TODO_COPY.stripHeader, { n: 0 }), "Outside your list: 0 of these.");
 });
 
 // ── 2. Which reasons are a person's ───────────────────────────────────────
 
 test("isOfficeManagerReason: the office manager's reasons, and an unknown one", () => {
-    for (const reason of ["no-estimate", "unreadable", "file-missing", "multi-doc", "multi-doc:one-page"]) {
+    for (const reason of ["no-estimate", "unreadable", "multi-doc", "multi-doc:one-page"]) {
         assert.equal(isOfficeManagerReason(reason), true, reason);
     }
     for (const reason of [
         "invalid-date", "date-implausible", "weak-dup:x", "strong-dup-amount-mismatch:x",
         "vendor-mismatch:x", "refund-or-zero", "native-qbo-reconciliation-required",
         "qbo-purchase-mismatch:x", "ai-unavailable", "max-retries", "push-paused", "push-disabled",
+        // A Retry row, not a photo row: retryTargetFor sends file-missing back
+        // to RECEIVED, so the action is Justin pressing the button.
+        "file-missing",
     ]) {
         assert.equal(isOfficeManagerReason(reason), false, reason);
     }
@@ -240,6 +248,7 @@ test("a parked row that is nobody's to fix lands on exactly one folded line, and
         needsReview: [
             intake("a", { stateReason: "ai-unavailable" }),
             intake("b", { stateReason: "max-retries" }),
+            intake("e", { stateReason: "file-missing" }),
             intake("c", { stateReason: "push-paused" }),
             intake("d", { stateReason: "refund-or-zero" }),
         ],
@@ -248,11 +257,30 @@ test("a parked row that is nobody's to fix lands on exactly one folded line, and
     // NOT one "waiting on another try" line. `retryTargetFor` is explicitly
     // about a MANUAL retry, so nothing here is retried on a timer, and the two
     // cases have different answers to "who does something".
-    assert.equal(foldedCount(plan, "retryable"), 2);
+    assert.equal(foldedCount(plan, "retryable"), 3);
     assert.equal(foldedCount(plan, "switched-off"), 1);
     assert.equal(foldedCount(plan, "bookkeeping"), 1);
     assert.equal(plan.needsYouCount, 0);
-    assert.equal(plan.handledCount, 4);
+    assert.equal(plan.handledCount, 5);
+});
+
+test("a reason nobody has words for is its own pile, in front of the crew chases", () => {
+    const plan = planTodo(queueOf({
+        needsReview: [
+            intake("mystery", { stateReason: "brand-new-failure-mode" }),
+            intake("silent", { stateReason: null }),
+            intake("blank", { stateReason: "   " }),
+        ],
+    }), NOW);
+
+    assert.deepEqual(rowIdsIn(plan, "tell-justin").sort(), ["blank", "mystery", "silent"],
+        "a parked row with NO reason at all is unexplained too");
+    assert.equal(plan.handledCount, 0, "nothing here is folded away");
+    assert.deepEqual(
+        plan.piles.map(entry => entry.key),
+        ["whose-card", "pick-the-job", "better-photo", "tell-justin", "ask-for-these", "checks-and-sub-bills"],
+        "it sits in front of the crew chases, and checks stay last",
+    );
 });
 
 // ── 3. Roll-up ────────────────────────────────────────────────────────────
@@ -520,9 +548,9 @@ test("every folded line has a singular and a plural, and the count is substitute
 
 test("a line with one row uses the singular, and two use the plural", () => {
     const one = planTodo(queueOf({ booking: [intake("a", { state: "BOOKING" })] }), NOW);
-    assert.equal(one.folded[0].text, "1 is booking right now.");
+    assert.equal(one.folded[0].text, "1 is in the booking queue.");
     const two = planTodo(queueOf({ booking: [intake("a", { state: "BOOKING" }), intake("b", { state: "BOOKING" })] }), NOW);
-    assert.equal(two.folded[0].text, "2 are booking right now.");
+    assert.equal(two.folded[0].text, "2 are in the booking queue.");
 });
 
 // ── 8. The URL that picks this view ───────────────────────────────────────
@@ -670,6 +698,27 @@ test("notLoadedCount is the gap the display cap leaves, and never negative", () 
     const odd = queueOf({ missingReceipts: [request("a"), request("b")] });
     odd.counts.missingReceipts = 1;
     assert.equal(planTodo(odd, NOW).notLoadedCount, 0, "a count that is somehow smaller is zero, never negative");
+});
+
+test("a group that came back FULL is a window, and the plan says so", () => {
+    const full = queueOf({
+        booking: Array.from({ length: RECEIPT_GROUP_TAKE }, (_unused, index) => intake(`bk-${index}`, { state: "BOOKING" })),
+    });
+    const plan = planTodo(full, NOW);
+    assert.deepEqual(plan.cappedGroups, ["booking"],
+        "every list is read with take: RECEIPT_GROUP_TAKE and none of them pages");
+    assert.equal(plan.needsYouCount, 0);
+    // Which is the shape that must NOT say done: the piles are empty because
+    // the page stopped reading, not because the queue did.
+    assert.ok(plan.cappedGroups.length > 0);
+
+    const short = queueOf({
+        booking: Array.from({ length: RECEIPT_GROUP_TAKE - 1 }, (_unused, index) => intake(`bk-${index}`, { state: "BOOKING" })),
+    });
+    assert.deepEqual(planTodo(short, NOW).cappedGroups, [], "one short of the cap is the whole group");
+
+    // Counts GROUPS, so it is deliberately outside the counted lines.
+    assert.equal(planTodo(full, NOW).handledCount, RECEIPT_GROUP_TAKE, "conservation is untouched by it");
 });
 
 // ── 11. Where a folded line points ────────────────────────────────────────

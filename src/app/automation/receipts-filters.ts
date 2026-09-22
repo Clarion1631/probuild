@@ -5,6 +5,18 @@
  */
 import type { ReceiptOwner } from "@/lib/receipt-policy";
 
+/**
+ * Per-group display cap. Badge counts come from count queries, never from
+ * these lists.
+ *
+ * It lives HERE, in the pure module, rather than beside the queries that use
+ * it: the To-do planner has to know when a loaded group hit the cap (a full
+ * page is a window, not an inbox), and it is a pure function that must not
+ * drag Prisma into a unit test to find out. `receipts-data.ts` re-exports it,
+ * so every existing import path is unchanged.
+ */
+export const RECEIPT_GROUP_TAKE = 100;
+
 export const RECEIPT_GROUPS = [
     "needs-job",
     "needs-review",
@@ -102,6 +114,33 @@ export function parseReceiptFilters(sp: Record<string, string | string[] | undef
  */
 export function showsTodoView(filters: ReceiptFilters): boolean {
     return filters.group === null && filters.owner === null && filters.view === "todo";
+}
+
+/**
+ * The Receipts tab's URL builder: one chip, one folded line, one link.
+ *
+ * Exported so the page and its tests use the SAME function. A copy in a test
+ * proves the copy works, which is not the question anyone was asking.
+ *
+ * `view` rides along with group and owner so a link keeps whatever shape the
+ * reader is already in. "todo" is the default and is never written to the URL,
+ * which is what leaves `?tab=receipts&group=needs-job` byte for byte the link
+ * it has always been.
+ */
+export function receiptFilterHref(
+    filters: ReceiptFilters,
+    overrides: { group?: string; owner?: string; view?: string },
+): string {
+    const params = new URLSearchParams();
+    params.set("tab", "receipts");
+    const nextGroup = overrides.group ?? filters.group ?? "";
+    const nextOwner = overrides.owner ?? filters.owner ?? "";
+    const nextView = overrides.view ?? filters.view ?? "";
+    if (nextGroup) params.set("group", nextGroup);
+    if (nextOwner) params.set("owner", nextOwner);
+    if (filters.projectId) params.set("projectId", filters.projectId);
+    if (nextView && nextView !== "todo") params.set("view", nextView);
+    return `/automation?${params.toString()}`;
 }
 
 /** True when a group should be rendered at all under the current filters. */

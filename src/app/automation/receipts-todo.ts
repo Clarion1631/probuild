@@ -25,11 +25,13 @@
  *    routine work while the strip called it handled.
  *
  *    Intake rows are therefore deduplicated by id, exceptions first.
- * 2. AN UNKNOWN REASON IS A HUMAN'S. A `stateReason` this module does not
- *    recognise goes INTO the "Needs a better photo" pile rather than being
- *    folded away. Folding an unknown reason is how a brand new failure mode
- *    goes quiet for a month. The row still draws `describeStateReason`'s
- *    fallback, which is the raw code, so it can be read out to a developer.
+ * 2. AN UNKNOWN REASON IS A HUMAN'S, AND SAYS SO. A `stateReason` this module
+ *    does not recognise gets its OWN pile, "Tell Justin about these". Folding
+ *    it is how a brand new failure mode goes quiet for a month; filing it
+ *    under "Needs a better photo" is a guess about a cause nobody knows, and
+ *    would send somebody chasing a photograph for a bug. The row draws
+ *    `describeStateReason`'s fallback, which is the raw code, and the only
+ *    thing asked of a reader is to pass that code on.
  * 3. AN UNKNOWN HOLD OR RESOLUTION IS NAMED, NOT GUESSED. A request carrying an
  *    `outreachHold` or `resolution` value this module has never heard of gets
  *    its own folded line QUOTING the raw value, rather than falling through
@@ -52,10 +54,11 @@
 import { normalizePayee } from "@/lib/bank-ledger";
 import { looksLikeCheckOrSubBill } from "@/lib/receipt-policy";
 import type { IntakeRow, MissingReceiptRow, ReceiptQueue } from "./receipts-data";
-import { ownerRank, type ReceiptGroup } from "./receipts-filters";
+import { RECEIPT_GROUP_TAKE, ownerRank, type ReceiptGroup } from "./receipts-filters";
 
 export type TodoPileKey =
-    | "whose-card" | "pick-the-job" | "better-photo" | "ask-for-these" | "checks-and-sub-bills";
+    | "whose-card" | "pick-the-job" | "better-photo" | "tell-justin"
+    | "ask-for-these" | "checks-and-sub-bills";
 
 /** A rolled-up run of identical charges, or a single one (rows.length === 1). */
 export interface TodoRequestItem {
@@ -119,6 +122,18 @@ export interface TodoPlan {
      * be a lie told by a display limit.
      */
     notLoadedCount: number;
+    /**
+     * Intake groups whose loaded list came back FULL, which is the only signal
+     * this page gets that there are more behind it.
+     *
+     * Every group is read with `take: RECEIPT_GROUP_TAKE`, so a group of
+     * exactly the cap is indistinguishable from a group of five hundred. The
+     * badge counts are real count queries and stay honest either way; the
+     * LISTS are a window, and the done state must not be claimed over one.
+     * Deliberately not a folded line: it counts groups, not rows, and adding
+     * it to `handledCount` would break conservation.
+     */
+    cappedGroups: ReceiptGroup[];
 }
 
 /** Two weeks. Not 7: a fortnight of dump tickets is one errand repeated, and a
@@ -142,7 +157,11 @@ export const TODO_PILE_COPY: Record<TodoPileKey, { title: string; note: string }
     },
     "better-photo": {
         title: "Needs a better photo",
-        note: "I could not finish these. The reason is under each one. A clearer photo of the same receipt goes back through the normal steps.",
+        note: "I could not read these. The reason is under each one. A clearer photo of the same receipt goes back through the normal steps.",
+    },
+    "tell-justin": {
+        title: "Tell Justin about these",
+        note: "Something I do not know stopped these. Send Justin the code shown under each one.",
     },
     "ask-for-these": {
         title: "Ask for these receipts",
@@ -157,13 +176,13 @@ export const TODO_PILE_COPY: Record<TodoPileKey, { title: string; note: string }
 export const TODO_COPY = {
     statNeedsYou: "Needs you today",
     statNeedsYouSub: "Rows waiting on you",
-    statHandled: "Not yours",
-    statHandledSub: "Rows somebody else owns",
+    statHandled: "Outside your list",
+    statHandledSub: "Rows outside your list",
     statBooked: "Booked today",
     statBookedSub: "Receipts that reached job costing today",
     chipTodo: "To-do",
     chipEverything: "Everything",
-    stripHeader: "Not yours: {n} of these.",
+    stripHeader: "Outside your list: {n} of these.",
     doneTitle: "You're done for today.",
     doneSub: "Nothing needs you. The other {n} are somebody else's.",
     doneSubOne: "Nothing needs you. The other one is somebody else's.",
@@ -171,9 +190,12 @@ export const TODO_COPY = {
     pileAge: "Oldest here is {n} days old.",
     capLine: "Showing the {shown} newest of {total}.",
     capLineOwner: "Showing the {shown} newest of {total}, filtered to {owner}.",
-    notLoaded: "{n} older requests are not loaded here yet.",
-    notLoadedOne: "1 older request is not loaded here yet.",
-    openFullList: "Open the full list.",
+    // NO LINK, and no promise of one. Every view of this queue is capped at
+    // the same hundred rows and nothing anywhere pages past it, so "open the
+    // full list" would be a button that cannot do what it says.
+    notLoaded: "{n} older requests are not loaded here yet. They come up as newer ones clear.",
+    notLoadedOne: "1 older request is not loaded here yet. It comes up as newer ones clear.",
+    cappedGroups: "Some receipt groups have more rows than this page loads. Justin checks those.",
     noCard: "no card (office rail)",
     checkFacts: "check paid",
     checkSentence: "Needs the check photo and the bill it paid.",
@@ -221,8 +243,8 @@ interface FoldedCopy {
  */
 export const FOLDED_COPY: Record<FoldedKey, FoldedCopy> = {
     booking: {
-        one: "1 is booking right now.",
-        many: "{n} are booking right now.",
+        one: "1 is in the booking queue.",
+        many: "{n} are in the booking queue.",
         target: { group: "booking" },
     },
     "booked-today": {
@@ -231,8 +253,8 @@ export const FOLDED_COPY: Record<FoldedKey, FoldedCopy> = {
         target: { group: "booked-today" },
     },
     "switched-off": {
-        one: "1 is waiting on the booking switch. Nothing is wrong with it.",
-        many: "{n} are waiting on the booking switch. Nothing is wrong with them.",
+        one: "1 is waiting on the booking switch. Booking is paused.",
+        many: "{n} are waiting on the booking switch. Booking is paused.",
         target: { group: "needs-review" },
     },
     retryable: {
@@ -336,18 +358,22 @@ export function rollUpDates(firstDate: string, lastDate: string, cardTail: strin
 
 // ── Which reasons are a human's, and whose ────────────────────────────────
 
-type IntakeBucket = "pick-the-job" | "better-photo" | "switched-off" | "retryable" | "bookkeeping";
+type IntakeBucket = "pick-the-job" | "better-photo" | "tell-justin" | "switched-off" | "retryable" | "bookkeeping";
 
 /** The booking switch is off. Nothing is wrong with the row and nobody presses anything. */
 const SWITCHED_OFF_REASONS = new Set(["push-paused", "push-disabled"]);
 
 /**
- * Codes a MANUAL Retry can send back through. Kept as a literal list rather
- * than imported from route-state.ts, which carries the worker with it; the
- * folded line only says who presses the button, and the truth it depends on
- * (that nothing here retries on a timer) is stated in FOLDED_COPY.
+ * Codes a MANUAL Retry can send back through, and therefore Justin's.
+ *
+ * `file-missing` belongs here and not in a photo pile: `retryTargetFor` sends
+ * it back to RECEIVED, so the action is the Retry button, not a new picture.
+ * Kept as a literal list rather than imported from route-state.ts, which
+ * carries the worker with it; the folded line only says who presses the
+ * button, and the truth it depends on (that nothing here retries on a timer)
+ * is stated in FOLDED_COPY.
  */
-const RETRYABLE_REASONS = new Set(["ai-unavailable", "max-retries"]);
+const RETRYABLE_REASONS = new Set(["ai-unavailable", "file-missing", "max-retries"]);
 
 /** Codes that need a bookkeeping call: a duplicate judgement, a refund, a date, QuickBooks. */
 const BOOKKEEPING_REASONS = new Set([
@@ -365,21 +391,23 @@ const BOOKKEEPING_PREFIXES = ["weak-dup:", "strong-dup-amount-mismatch:", "vendo
 function intakeBucket(stateReason: string | null): IntakeBucket {
     const code = (stateReason ?? "").trim().split(";")[0].trim();
     if (code === "no-estimate") return "pick-the-job";
-    if (code === "unreadable" || code === "file-missing" || code === "multi-doc" || code === "multi-doc:one-page") {
+    if (code === "unreadable" || code === "multi-doc" || code === "multi-doc:one-page") {
         return "better-photo";
     }
     if (SWITCHED_OFF_REASONS.has(code)) return "switched-off";
     if (RETRYABLE_REASONS.has(code)) return "retryable";
     if (BOOKKEEPING_REASONS.has(code)) return "bookkeeping";
     if (BOOKKEEPING_PREFIXES.some(prefix => code.startsWith(prefix))) return "bookkeeping";
-    // Unknown, or no reason at all. Hers on purpose: see the header.
-    return "better-photo";
+    // Unknown, or no reason at all. A human's on purpose, and its own pile: see
+    // the header. Guessing "needs a better photo" would send somebody chasing a
+    // photograph for something that may be a bug.
+    return "tell-justin";
 }
 
 /** True when a park reason is one a non bookkeeper can act on. Unknown reasons are TRUE on purpose. */
 export function isOfficeManagerReason(stateReason: string | null): boolean {
     const bucket = intakeBucket(stateReason);
-    return bucket === "pick-the-job" || bucket === "better-photo";
+    return bucket === "pick-the-job" || bucket === "better-photo" || bucket === "tell-justin";
 }
 
 /** Holds this module has words for. Anything else is quoted back, never guessed at. */
@@ -569,6 +597,27 @@ function dedupedIntakeGroups(queue: ReceiptQueue): Array<[FoldedKey | "needs-job
     ];
 }
 
+/**
+ * Groups whose loaded list came back exactly full.
+ *
+ * That is the only evidence available here that more rows exist: every list is
+ * read with `take: RECEIPT_GROUP_TAKE` and none of them pages. A group at the
+ * cap might hold exactly a hundred rows, in which case this over-reports by
+ * one line of hedging, which is the right way round to be wrong.
+ */
+function cappedIntakeGroups(queue: ReceiptQueue): ReceiptGroup[] {
+    const groups: Array<[ReceiptGroup, { length: number }]> = [
+        ["needs-job", queue.needsJob],
+        ["needs-review", queue.needsReview],
+        ["booking", queue.booking],
+        ["booked-today", queue.bookedToday],
+        ["duplicates", queue.duplicates],
+        ["exceptions", queue.exceptions],
+        ["uncertain-cards", queue.uncertainCards],
+    ];
+    return groups.filter(([, rows]) => rows.length >= RECEIPT_GROUP_TAKE).map(([group]) => group);
+}
+
 /** The whole view, from data fetchReceiptQueue already returns. Pure: no clock except `now`. */
 export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan {
     /** Folded row ids, per line key. Counts are derived, never tracked separately. */
@@ -584,6 +633,7 @@ export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan 
     //    hers.
     const pickJob: IntakeRow[] = [];
     const betterPhoto: IntakeRow[] = [];
+    const tellJustin: IntakeRow[] = [];
     for (const [group, rows] of dedupedIntakeGroups(queue)) {
         for (const row of rows) {
             if (group === "needs-job") { pickJob.push(row); continue; }
@@ -591,6 +641,7 @@ export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan 
             const bucket = intakeBucket(row.stateReason);
             if (bucket === "pick-the-job") pickJob.push(row);
             else if (bucket === "better-photo") betterPhoto.push(row);
+            else if (bucket === "tell-justin") tellJustin.push(row);
             else fold(bucket, row.id);
         }
     }
@@ -634,6 +685,7 @@ export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan 
     const checkItems = rollUpRepeats(checks).sort(byAmountDesc);
     const pickJobRows = [...pickJob].sort(intakeByAmount);
     const betterPhotoRows = [...betterPhoto].sort(intakeByAmount);
+    const tellJustinRows = [...tellJustin].sort(intakeByAmount);
 
     const requestDays = (items: TodoRequestItem[]) =>
         items.flatMap(item => item.rows.map(row => utcDay(row.postedDate)));
@@ -642,6 +694,7 @@ export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan 
         pileOf("whose-card", whoseCardItems.map(item => ({ kind: "request" as const, item })), requestDays(whoseCardItems), now),
         pileOf("pick-the-job", pickJobRows.map(row => ({ kind: "intake" as const, row })), pickJobRows.map(intakeDay), now),
         pileOf("better-photo", betterPhotoRows.map(row => ({ kind: "intake" as const, row })), betterPhotoRows.map(intakeDay), now),
+        pileOf("tell-justin", tellJustinRows.map(row => ({ kind: "intake" as const, row })), tellJustinRows.map(intakeDay), now),
         pileOf("ask-for-these", askItems.map(item => ({ kind: "request" as const, item })), requestDays(askItems), now),
         // LAST, despite holding the biggest amounts. Every other pile finishes
         // inside the five minutes this page is for; a check waits on a third
@@ -680,6 +733,7 @@ export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan 
         handledCount: folded.reduce((sum, entry) => sum + entry.count, 0),
         needsYouCount: piles.reduce((sum, pile) => sum + pile.rowCount, 0),
         notLoadedCount: Math.max(0, queue.counts.missingReceipts - queue.counts.missingReceiptsShown),
+        cappedGroups: cappedIntakeGroups(queue),
     };
 }
 

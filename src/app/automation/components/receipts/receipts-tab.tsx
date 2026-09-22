@@ -86,6 +86,13 @@ function pacificDay(iso: string): string {
     return at.toLocaleDateString("en-CA", { timeZone: PACIFIC });
 }
 
+/**
+ * Holds this page has words for. Anything else is quoted verbatim rather than
+ * labelled as one of these, and mirrors KNOWN_HOLDS in receipts-todo.ts, which
+ * decides the same question for the folded strip.
+ */
+const KNOWN_HOLD_VALUES: ReadonlySet<string> = new Set(["existing-evidence-review", "office-invoice"]);
+
 function amountLabel(cents: number | null): string {
     if (cents === null) return "—";
     return formatCurrency(Math.abs(cents) / 100);
@@ -373,11 +380,12 @@ export async function ReceiptsTab({
                     <StatCard label={TODO_COPY.statBooked} value={String(counts["booked-today"])} sub={TODO_COPY.statBookedSub} />
                 </div>
                 <ReceiptChipRow filters={filters} counts={counts} filterHref={filterHref} todo />
-                {/* "Done" is a claim about the WHOLE queue, and this view only
-                    ever sees the newest 100 requests. With older ones still
-                    unloaded the empty piles are a display limit, not an empty
-                    inbox, so the coverage note takes the place of the claim. */}
-                {todo.needsYouCount === 0 && todo.notLoadedCount === 0
+                {/* "Done" is a claim about the WHOLE queue, and every list on
+                    this page is capped at the same hundred rows with nothing
+                    anywhere paging past it. Unloaded requests, or any group
+                    that came back full, mean the empty piles are a display
+                    limit rather than an empty inbox. */}
+                {todo.needsYouCount === 0 && todo.notLoadedCount === 0 && todo.cappedGroups.length === 0
                     ? <TodoDone plan={todo} />
                     : todo.piles
                         .filter(pile => pile.items.length > 0)
@@ -387,7 +395,6 @@ export async function ReceiptsTab({
                         shown={queue.counts.missingReceiptsShown}
                         total={queue.counts.missingReceipts}
                         notLoaded={todo.notLoadedCount}
-                        filterHref={filterHref}
                     />
                 )}
                 <FoldedStrip plan={todo} filterHref={filterHref} />
@@ -756,6 +763,10 @@ function TodoIntakeRowView({ row, pile, jobs, links }: {
                 )}
             </div>
             <div className="flex items-center gap-3 flex-wrap">
+                {/* Only where picking a job is what finishes the row. A receipt
+                    nobody could read does not become readable by getting a job,
+                    and a row parked for a reason nobody has words for needs the
+                    code passed on, not a guess acted on. */}
                 {pile === "pick-the-job" && (
                     <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                 )}
@@ -864,8 +875,15 @@ function FoldedStrip({ plan, filterHref }: {
     return (
         <section className="hui-card px-4 py-3 bg-slate-50">
             <p className="text-sm text-hui-textMuted">{fillCopy(TODO_COPY.stripHeader, { n: plan.handledCount })}</p>
-            {plan.folded.length > 0 && (
+            {(plan.folded.length > 0 || plan.cappedGroups.length > 0) && (
                 <ul className="mt-2 space-y-1">
+                    {/* Counts GROUPS, not rows, so it is deliberately not one
+                        of the counted lines: adding it to handledCount would
+                        break conservation. No link either, because no URL on
+                        this page shows more than the same hundred. */}
+                    {plan.cappedGroups.length > 0 && (
+                        <li className="text-xs text-hui-textMuted">{TODO_COPY.cappedGroups}</li>
+                    )}
                     {plan.folded.map(line => (
                         <li key={line.key} className="text-xs text-hui-textMuted">
                             {/* Built HERE, through the same builder the chips
@@ -889,27 +907,24 @@ function FoldedStrip({ plan, filterHref }: {
  * What this view could not load.
  *
  * The request loader takes the newest 100 open items (receipts-data.ts), so on
- * a big backlog the piles are a window, not the queue. Saying so, with a way
- * through to the whole list, is the difference between a short list and a short
- * list that is lying.
+ * a big backlog the piles are a window, not the queue. Saying so is the
+ * difference between a short list and a short list that is lying.
+ *
+ * There is NO LINK here on purpose. Every view of this queue reads the same
+ * capped hundred and nothing anywhere pages past it, so "open the full list"
+ * would be a button that cannot do what it says. What is true is that the
+ * window moves: a row leaves as it is answered, and the next one comes up.
  */
-function TodoCoverageNote({ shown, total, notLoaded, filterHref }: {
+function TodoCoverageNote({ shown, total, notLoaded }: {
     shown: number;
     total: number;
     notLoaded: number;
-    filterHref: (overrides: { group?: string; owner?: string; view?: string }) => string;
 }) {
     return (
         <section className="hui-card px-4 py-3">
             <p className="text-sm text-hui-textMuted">{fillCopy(TODO_COPY.capLine, { shown, total })}</p>
             <p className="text-sm text-hui-textMuted mt-1">
-                {notLoaded === 1 ? TODO_COPY.notLoadedOne : fillCopy(TODO_COPY.notLoaded, { n: notLoaded })}{" "}
-                <a
-                    href={filterHref({ group: "missing-receipts", owner: "", view: "all" })}
-                    className="font-medium text-hui-primary hover:underline"
-                >
-                    {TODO_COPY.openFullList}
-                </a>
+                {notLoaded === 1 ? TODO_COPY.notLoadedOne : fillCopy(TODO_COPY.notLoaded, { n: notLoaded })}
             </p>
         </section>
     );
@@ -954,6 +969,19 @@ function MissingReceiptRowView({ row }: { row: MissingReceiptRow }) {
                         {row.outreachHold === "office-invoice"
                             ? "Office invoice — collect from billing email. Crew request held."
                             : "Existing document needs reconciliation. Crew request held."}
+                        {/* A hold this page has no words for was being LABELLED
+                            as an evidence hold, which is a different claim. The
+                            To-do strip links here by that raw value, so it has to
+                            be findable once you arrive. */}
+                        {!KNOWN_HOLD_VALUES.has(row.outreachHold) && (
+                            <span className="ml-1.5 font-mono text-hui-textMuted">{row.outreachHold}</span>
+                        )}
+                    </p>
+                )}
+                {row.resolution !== null && row.resolution !== "memo-signed" && (
+                    <p className="text-xs text-amber-700 mt-1">
+                        Answered in a way this page has no words for.
+                        <span className="ml-1.5 font-mono text-hui-textMuted">{row.resolution}</span>
                     </p>
                 )}
                 {row.resolution === "memo-signed" && (
