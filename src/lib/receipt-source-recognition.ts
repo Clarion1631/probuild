@@ -245,12 +245,37 @@ export function bankAuthPurchaseDate(line: ReceiptSourceLine): string | null {
 
 // ── Observed merchant aliases ────────────────────────────────────────────
 
-/** Complete normalized bank payee (post-normalizePayee) → complete normalized vendor. */
-const OBSERVED_ALIASES: ReadonlyMap<string, string> = new Map([
-  ['COLUMBIA RESOURCE COMP VANCOUVER WA', 'CRC-WEST VAN'],
-    ['PARKROSE HAZEL DELL - PARKROSE HAZEL DEL', 'PARKROSE HARDWARE'],
-    ['PARKROSE HAZEL DELL - HAZEL DELL WA', 'PARKROSE HARDWARE'],
-    ['ARCO#82887KT KANSO LLC 2 3817 MAIN ST', 'AMPM #82887'],
+/**
+ * Complete normalized bank payee (post-normalizePayee) → the complete
+ * normalized vendor labels the receipt reader actually produces for it.
+ *
+ * A bank label may carry SEVERAL vendor labels, because one merchant's
+ * documents are not all spelled the same way. That is still a list of
+ * COMPLETE labels and never a rule: both sides are compared whole, so there
+ * is no brand rule, no store-number stripping, no substring, no token.
+ */
+const OBSERVED_ALIASES: ReadonlyMap<string, readonly string[]> = new Map([
+  ['COLUMBIA RESOURCE COMP VANCOUVER WA', ['CRC-WEST VAN', 'CRC - WEST VAN']],
+    ['PARKROSE HAZEL DELL - PARKROSE HAZEL DEL', ['PARKROSE HARDWARE']],
+    ['PARKROSE HAZEL DELL - HAZEL DELL WA', ['PARKROSE HARDWARE']],
+    ['ARCO#82887KT KANSO LLC 2 3817 MAIN ST', ['AMPM #82887']],
+    // The Rockery's dump tickets are written by Tapani, so this bank label
+    // and those receipts name one merchant. Owner-confirmed by Justin on
+    // 2026-09-21.
+    //
+    // The key is DERIVED from live `rawDescriptor` values read on 2026-09-21,
+    // not typed from a screen: all 15 open Rockery lines, across cards C#6098
+    // and C#8516, carry the merchant text 'THE ROCKERY NW 360-6666718 WA' and
+    // differ only in the card ref and the rail trailer. normalizePayee cuts
+    // those, then its 6-or-more-digit reference strip takes '6666718' out of
+    // '360-6666718' and leaves the '360-' stub, so all 15 reduce to this one
+    // key. The two vendor labels are the only spellings the reader produces
+    // for this merchant today (5 + 2 intakes, 3 + 2 expenses).
+    //
+    // Deliberately a COMPLETE label and not a token alias on 'ROCKERY': a
+    // token would also claim 'THE ROCKERY GARDEN CENTER', and would let a
+    // 'Tapani Plumbing' receipt close a dump-ticket charge.
+    ['THE ROCKERY NW 360- WA', ['TAPANI MATERIALS', 'TAPANI MATERIALS TEBO']],
 ]);
 
 function collapse(s: string): string {
@@ -264,13 +289,13 @@ export function normalizeBankPayee(payee: string): string {
 
 /**
  * True only when the complete normalized bank payee is one of the observed
- * labels and the complete normalized vendor is its exact mapped vendor.
- * No brand rules, no store-number stripping, no partial matches.
+ * labels and the complete normalized vendor is one of that label's exact
+ * mapped vendors. No brand rules, no store-number stripping, no partial
+ * matches: an appended word on either side is a different label.
  */
 export function observedReceiptMerchantMatches(bankPayee: string, vendor: string | null | undefined): boolean {
     if (typeof bankPayee !== 'string' || typeof vendor !== 'string') return false;
     const mapped = OBSERVED_ALIASES.get(normalizeBankPayee(bankPayee));
     const normalizedVendor = collapse(vendor);
-    return mapped !== undefined && (mapped === normalizedVendor
-        || (mapped === 'CRC-WEST VAN' && normalizedVendor === 'CRC - WEST VAN'));
+    return mapped !== undefined && mapped.includes(normalizedVendor);
 }
