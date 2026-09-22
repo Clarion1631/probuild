@@ -39,4 +39,4 @@ stripe trigger payment_intent.succeeded
 
 Dev server must be on port 3000 — see the `probuild-dev-server` skill.
 
-> Money-path changes (payments, signing, payment mirrors, notifications) also need `e2e/money-pipeline.spec.ts` green and a codex-peer-review pass on the diff.
+> Money-path changes (payments, signing, payment mirrors, notifications) also need `e2e/money-pipeline.spec.ts` green and a codex-reviewer agent pass on the diff.
