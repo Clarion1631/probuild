@@ -137,6 +137,36 @@ export const RUN_SOFT_DEADLINE_MS = 40_000;
  */
 export const RUN_HARD_BUDGET_MS = 55_000;
 /**
+ * Runway below which the evidence-driven close is not even started.
+ *
+ * It is a COURTESY on top of a completed booking: one indexed candidate query
+ * plus up to a handful of component walks. Begun with too little runway left
+ * it would only be killed mid-walk, having spent the round trips and decided
+ * nothing — so it is skipped with a warn instead, and the nightly sweep
+ * (which is still the backstop for every one of these closes) picks it up.
+ *
+ * Raised from 3s to 8s (Codex round 2, blocker 2a). 3s was only enough to
+ * ADMIT the close — it left nothing for the close's OWN budget once
+ * CLOSE_REQUESTS_SAFETY_MARGIN_MS is set aside; see
+ * closeRequestsSatisfiedByBooking's own derivation below.
+ */
+export const CLOSE_REQUESTS_MIN_BUDGET_MS = 8_000;
+/**
+ * Runway the close's own budget must always leave behind for whatever this
+ * pass still has to do once it returns — this row's own accounting
+ * (`bump()`), and any later row still waiting in the same batch. The close
+ * never gets to spend the invocation down to zero just because it started
+ * with room to spare.
+ */
+export const CLOSE_REQUESTS_SAFETY_MARGIN_MS = 5_000;
+/**
+ * The most the close's own budget may ever be, however much runway is left.
+ * One booking's courtesy close must not be able to eat the rest of a 60s
+ * invocation — later rows, their accounting, and their own claim release all
+ * still have to fit behind it.
+ */
+export const CLOSE_REQUESTS_MAX_BUDGET_MS = 8_000;
+/**
  * How long a row may sit in STAGING before it is presumed to have lost its
  * upload. Generous on purpose: the intake route uploads inline, so a row that
  * is still STAGING after this either crashed mid-request or hit a storage
@@ -447,6 +477,27 @@ export interface WorkerDependencies {
     book: (row: BookableRow) => Promise<BookResult>;
     /** CAS'd on the claim: a superseded worker's result must write nothing. */
     applyBookResult: (rowId: string, result: BookResult, claimToken: string | null) => Promise<void>;
+    /**
+     * CLOSE ANY MISSING-RECEIPT REQUEST THIS BOOKING NOW ANSWERS.
+     *
+     * Called only after `applyBookResult` has committed a `booked` outcome, and
+     * deliberately NOT inside `book.ts`: that transaction runs under
+     * `lockReceiptEvidence` with a documented lock order, and taking
+     * issue-lifecycle writes inside it invites a deadlock. Outside the
+     * transaction, a slow close also cannot extend a money-path lock.
+     *
+     * `deadlineExceeded` is the CLOSE's OWN budget (CLOSE_REQUESTS_MAX_BUDGET_MS,
+     * CLOSE_REQUESTS_SAFETY_MARGIN_MS below), not the invocation's whole
+     * remaining runway. It is only checked BETWEEN the close's own queries, so
+     * it cannot alone stop a single slow one from overrunning that budget — the
+     * caller also races the WHOLE call against the same budget from outside
+     * (see closeRequestsSatisfiedByBooking).
+     *
+     * OPTIONAL, and its absence is not a degraded mode: the sweep still closes
+     * these overnight. Every worker test that does not care about it simply
+     * omits it, and the one that throws from it proves the pass survives.
+     */
+    closeRequestsSatisfiedBy?: (expenseId: string, deadlineExceeded: () => boolean) => Promise<unknown>;
     /** AI unavailable: park for a later pass WITHOUT spending an attempt. */
     deferRead: (rowId: string, busyPasses: number, reason: string, ownership: Ownership) => Promise<boolean>;
     /**
@@ -742,6 +793,11 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
     // STILL go on to start a 25s Gemini read and a QBO round trip.
     const startedAt = deps.monotonicMs();
     const outOfTime = () => deps.monotonicMs() - startedAt >= RUN_SOFT_DEADLINE_MS;
+    // What is left of the invocation's REAL ceiling, not of the soft deadline:
+    // anything that runs after a booking has already crossed the soft one by
+    // definition, and measures its runway against the hard budget the same way
+    // `deps.book` does.
+    const remainingRunMs = () => RUN_HARD_BUDGET_MS - (deps.monotonicMs() - startedAt);
 
     // CUTOVER. Rows received while dry-run was on were booked by v1, so v2 must
     // never book them: they are RETIRED as SHADOW_DONE, not requeued.
@@ -870,11 +926,13 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
                 current = { ...row, state: "BOOKING", dryRun: false };
                 const result = await deps.book(current);
                 await deps.applyBookResult(current.id, result, current.claimToken);
+                await closeRequestsSatisfiedByBooking(result, deps, remainingRunMs);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
                 if (row.dryRun || dryRunGlobal) { bump(await parkForDryRun(row, deps)); continue; }
                 const result = await deps.book(row);
                 await deps.applyBookResult(row.id, result, row.claimToken);
+                await closeRequestsSatisfiedByBooking(result, deps, remainingRunMs);
                 bump(stateForBookResult(result));
             }
         } catch (error) {
@@ -909,6 +967,92 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
         ...(staged ? { staleStagingSwept: staged } : {}),
         ...(cleaned ? { orphansCleaned: cleaned } : {}),
     };
+}
+
+/**
+ * THE COURTESY CLOSE, after the booking is already written.
+ *
+ * A booked receipt frequently IS the answer to a missing-receipt request that
+ * is still open, and the nightly sweep is the only thing that notices — except
+ * that every native booking bumps `receiptEvidenceEpoch`, which the sweep reads
+ * as a stale cycle and restarts its open-issue pass for. On a day with a
+ * booking every few minutes it never reaches the end of the list, so a charge
+ * whose receipt is already booked keeps being chased for hours. Judging it here
+ * removes the starvation rather than racing it.
+ *
+ * BEST EFFORT, FOUR WAYS, because the money has already moved and a courtesy
+ * must never disturb it:
+ *   - it only runs for a `booked` outcome, after the result was applied;
+ *   - it is SKIPPED with a warn when the invocation has no runway left, rather
+ *     than started and killed mid-walk;
+ *   - it gets its OWN budget, never the invocation's whole remaining runway
+ *     (Codex round 2, blocker 2b) — capped at CLOSE_REQUESTS_MAX_BUDGET_MS and
+ *     always leaving CLOSE_REQUESTS_SAFETY_MARGIN_MS behind for whatever this
+ *     pass still has to do after it;
+ *   - that budget is enforced from OUTSIDE the close too (blocker 2c): the
+ *     whole call is RACED against a timer of the same length, because the
+ *     `deadlineExceeded` predicate threaded into it is only checked BETWEEN
+ *     its own queries and cannot alone stop one slow round trip from
+ *     overrunning it. A close that loses the race keeps running in the
+ *     background — there is no cancelling a promise — and is left for the
+ *     nightly sweep to finish from wherever it lands, exactly like one that
+ *     threw or ran out of candidates.
+ */
+async function closeRequestsSatisfiedByBooking(
+    result: BookResult,
+    deps: WorkerDependencies,
+    remainingRunMs: () => number,
+): Promise<void> {
+    if (result.outcome !== "booked" || !deps.closeRequestsSatisfiedBy) return;
+    const remaining = remainingRunMs();
+    if (remaining < CLOSE_REQUESTS_MIN_BUDGET_MS) {
+        console.warn("[cron/receipt-intake-worker] evidence close skipped: out of budget", result.expenseId);
+        return;
+    }
+
+    // THE CLOSE'S OWN BUDGET — never the invocation's whole remaining runway.
+    // Capped at CLOSE_REQUESTS_MAX_BUDGET_MS, and always leaving
+    // CLOSE_REQUESTS_SAFETY_MARGIN_MS behind for this row's own accounting and
+    // whatever rows are still queued after it.
+    const closeBudgetMs = Math.min(remaining - CLOSE_REQUESTS_SAFETY_MARGIN_MS, CLOSE_REQUESTS_MAX_BUDGET_MS);
+    const closeStartedAt = deps.monotonicMs();
+    const closeDeadlineExceeded = () => deps.monotonicMs() - closeStartedAt >= closeBudgetMs;
+
+    // `.then`/`.catch` attached to the call's OWN promise, before the race
+    // below even starts — not to the race's result. A close that loses the
+    // race keeps running with nothing else awaiting it, so if a rejection
+    // were only handled after `Promise.race` settled, one landing after that
+    // point would be unhandled. Attaching the handling here means it is
+    // always in place, whichever side of the race the call lands on — and
+    // both branches resolve to `false`, so the race's own result can only
+    // ever mean "the timer won".
+    const closePromise = deps.closeRequestsSatisfiedBy(result.expenseId, closeDeadlineExceeded)
+        .then(() => false as const)
+        .catch(error => {
+            console.warn("[cron/receipt-intake-worker] evidence close failed", result.expenseId,
+                error instanceof Error ? error.message : "UnknownError");
+            return false as const;
+        });
+
+    // THE WHOLE CALL is raced against the SAME budget, not just polled by it.
+    // `closeDeadlineExceeded` is cooperative — checked only between the
+    // close's own queries — so one slow round trip could still overrun the
+    // budget with nothing there to notice. Racing the call is what actually
+    // bounds how long THIS pass waits: on a timeout the close is abandoned
+    // from the worker's point of view (it keeps running in the background;
+    // nothing here can cancel a promise) and left for the nightly sweep to
+    // finish from wherever it was, exactly like one that threw.
+    let timer!: ReturnType<typeof setTimeout>;
+    const timedOut = new Promise<true>(resolve => {
+        timer = setTimeout(() => resolve(true), closeBudgetMs);
+    });
+    try {
+        if (await Promise.race([closePromise, timedOut])) {
+            console.warn("[cron/receipt-intake-worker] evidence close timed-out; leaving it to the nightly sweep", result.expenseId);
+        }
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /**

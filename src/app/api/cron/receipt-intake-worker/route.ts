@@ -43,6 +43,10 @@ import {
     triageCutoverRows, resolveCutoverBoundary, type CutoverRow } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { bookReceipt, type BookPrismaClient } from "@/lib/receipt-intake/book";
+import {
+    closeRequestsSatisfiedBy as closeRequestsSatisfiedByEvidence,
+    loadBookedEvidence,
+} from "@/lib/receipt-intake/evidence-close-store";
 import { backoffMs } from "@/lib/receipt-intake/route-state";
 import {
     BATCH_SIZE,
@@ -1224,6 +1228,24 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             logEvent: logAutomationEvent,
             now: () => new Date(),
         }),
+
+        /**
+         * The evidence-driven close, built here like every other dependency so
+         * `worker.ts` never imports the receipt-requests route module.
+         *
+         * Two reads and no throw of its own: the Expense that just booked is
+         * turned into the evidence the candidate query needs, and a row that
+         * cannot produce usable evidence simply does nothing. The worker
+         * swallows anything this raises.
+         */
+        closeRequestsSatisfiedBy: async (expenseId, deadlineExceeded) => {
+            const evidence = await loadBookedEvidence(expenseId);
+            if (!evidence) return;
+            const closed = await closeRequestsSatisfiedByEvidence(evidence, { deadlineExceeded });
+            if (closed.cleared.length > 0 || closed.errors > 0 || closed.stale > 0) {
+                console.log("[cron/receipt-intake-worker] evidence close", JSON.stringify({ expenseId, ...closed }));
+            }
+        },
 
         applyBookResult: async (rowId, result, claimToken) => {
             const now = new Date();
