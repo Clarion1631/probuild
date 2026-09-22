@@ -285,12 +285,35 @@ test("a reason nobody has words for gets named as such, not filed under photos",
     assert.match(html, /Tell Justin about these/);
     assert.match(html, /Tapani Materials/);
     assert.match(html, /brand-new-failure-mode/, "the code to pass on");
-    assert.ok(html.includes("Something I do not know stopped these. Send Justin the code shown under each one."));
+    assert.ok(html.includes("Something I do not know stopped these. Send Justin the code under each one, or the vendor and amount if there is no code."));
     // And the photo pile is still there, for the reason that IS about a photo.
     assert.match(html, /Needs a better photo/);
     assert.ok(html.indexOf("Needs a better photo") < html.indexOf("Tell Justin about these"));
     assert.ok(html.includes("I could not read these."),
         "which it can only claim now that the unknowns have moved out");
+});
+
+test("a parked row with no code at all says so, rather than leaving a gap", async () => {
+    // The pile note asks a reader to pass the code on. A row with nothing to
+    // pass on has to say that out loud; an empty space is indistinguishable
+    // from a rendering bug.
+    for (const [name, stateReason] of [["null", null], ["blank", "   "]] as Array<[string, string | null]>) {
+        const html = await render(queueOf({
+            needsReview: [intake("x", { stateReason, vendor: "Tapani Materials" })],
+        }), parseReceiptFilters({}));
+
+        assert.match(html, /Tell Justin about these/, name);
+        assert.ok(html.includes("No reason recorded."), name);
+        assert.match(html, /Tapani Materials/, `${name}: the facts it does have are still on screen`);
+    }
+
+    // And it is said ONLY where it means something. A NEEDS_JOB row has no
+    // park reason either, and is not parked on a verdict.
+    const needsJob = await render(queueOf({
+        needsJob: [intake("j", { state: "NEEDS_JOB", stateReason: null })],
+    }), parseReceiptFilters({}));
+    assert.match(needsJob, /Pick the job/);
+    assert.ok(!needsJob.includes("No reason recorded."), "not noise on every row that has no reason");
 });
 
 test("the unknown pile offers no button, because nothing on this page answers it", async () => {
@@ -407,15 +430,18 @@ test("a page of already-handled rows never claims she is done while older ones a
     assert.doesNotMatch(html, /group=missing-receipts&amp;view=all/);
 });
 
-test("a group that came back full also stops the done state, and says why", async () => {
+test("a group that came back full also stops the done state, and says MAY", async () => {
     const html = await renderWithHrefs(queueOf({
         booking: Array.from({ length: RECEIPT_GROUP_TAKE }, (_unused, index) => intake(`bk-${index}`, { state: "BOOKING" })),
     }), parseReceiptFilters({}));
 
     assert.ok(!html.includes(escaped(TODO_COPY.doneTitle)),
         "the intake lists are capped at the same hundred, and nothing pages past them either");
-    assert.ok(html.includes("Some receipt groups have more rows than this page loads. Justin checks those."));
-    assert.ok(foldedStrip(html).includes("Some receipt groups have more rows"), "and it is said in the strip");
+    // "may". A group of exactly a hundred comes back full too, and the
+    // detector cannot tell the two apart.
+    assert.ok(html.includes("Some receipt groups may have more rows than this page loads. Justin checks those."));
+    assert.ok(!html.includes("groups have more rows"), "it never states what it cannot know");
+    assert.ok(foldedStrip(html).includes("Some receipt groups may have more rows"), "and it is said in the strip");
 });
 
 test("one unloaded request says so in the singular, and a whole queue says nothing at all", async () => {
@@ -445,23 +471,36 @@ test("a folded line keeps the project filter it was clicked from", async () => {
     assert.match(strip, /href="\/automation\?tab=receipts&amp;group=missing-receipts&amp;owner=office&amp;projectId=p1"/);
 });
 
-test("a hold this page has no words for is quoted where the strip sends you", async () => {
+/** The one rendered row that mentions `needle`, so an assertion can be scoped to it. */
+const rowContaining = (html: string, needle: string) =>
+    (html.match(/<div class="group px-4 py-3[\s\S]*?<\/div><\/div>/g) ?? []).find(row => row.includes(needle)) ?? "";
+
+test("a hold this page has no words for is named as such, not as an evidence hold", async () => {
     // The strip links an unknown hold to the missing-receipts group. Arriving
     // there to find it labelled "Existing document needs reconciliation" is a
-    // different claim, and loses the value the link was carrying.
+    // different claim about a different thing, and loses the value the link
+    // was carrying.
     const html = await render(queueOf({
         missingReceipts: [
-            request("odd", { outreachHold: "awaiting-vendor-portal" }),
-            request("known", { outreachHold: "existing-evidence-review" }),
-            request("answered", { resolution: "closed-by-vanessa" }),
+            request("odd", { outreachHold: "awaiting-vendor-portal", payee: "ODD ONE" }),
+            request("known", { outreachHold: "existing-evidence-review", payee: "KNOWN ONE" }),
+            request("office", { outreachHold: "office-invoice", payee: "OFFICE ONE" }),
+            request("answered", { resolution: "closed-by-vanessa", payee: "ANSWERED ONE" }),
         ],
     }), { ...PRE_VIEW, group: "missing-receipts" });
 
-    assert.match(html, /awaiting-vendor-portal<\/span>/);
-    assert.match(html, /Answered in a way this page has no words for\.[\s\S]{0,120}closed-by-vanessa<\/span>/);
-    // The known ones keep their existing wording, untouched.
-    assert.match(html, /Existing document needs reconciliation\. Crew request held\./);
-    assert.equal((html.match(/font-mono/g) ?? []).length, 2, "only the two it has no words for are quoted");
+    const odd = rowContaining(html, "ODD ONE");
+    assert.ok(odd.includes("Held for a reason this page has no words for: awaiting-vendor-portal. Crew request held."));
+    assert.ok(!odd.includes("Existing document needs reconciliation"),
+        "THIS row must not carry a sentence about a document nobody has seen");
+
+    // The two it does have words for keep their existing wording, untouched.
+    assert.match(rowContaining(html, "KNOWN ONE"), /Existing document needs reconciliation\. Crew request held\./);
+    assert.match(rowContaining(html, "OFFICE ONE"), /Office invoice/);
+    assert.match(
+        rowContaining(html, "ANSWERED ONE"),
+        /Answered in a way this page has no words for\.[\s\S]{0,120}closed-by-vanessa<\/span>/,
+    );
 });
 
 // ── What a render costs ───────────────────────────────────────────────────

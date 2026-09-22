@@ -161,7 +161,7 @@ export const TODO_PILE_COPY: Record<TodoPileKey, { title: string; note: string }
     },
     "tell-justin": {
         title: "Tell Justin about these",
-        note: "Something I do not know stopped these. Send Justin the code shown under each one.",
+        note: "Something I do not know stopped these. Send Justin the code under each one, or the vendor and amount if there is no code.",
     },
     "ask-for-these": {
         title: "Ask for these receipts",
@@ -195,11 +195,18 @@ export const TODO_COPY = {
     // full list" would be a button that cannot do what it says.
     notLoaded: "{n} older requests are not loaded here yet. They come up as newer ones clear.",
     notLoadedOne: "1 older request is not loaded here yet. It comes up as newer ones clear.",
-    cappedGroups: "Some receipt groups have more rows than this page loads. Justin checks those.",
+    // MAY. All this knows is that a list came back holding exactly the cap,
+    // which a group of exactly a hundred does too. Saying "have" would be a
+    // claim the detector cannot make.
+    cappedGroups: "Some receipt groups may have more rows than this page loads. Justin checks those.",
     noCard: "no card (office rail)",
     checkFacts: "check paid",
     checkSentence: "Needs the check photo and the bill it paid.",
     checkLink: "What to post ↗",
+    // A parked row with no reason at all is the one shape where "send the code"
+    // has no code to send. Saying so beats an empty space where a sentence
+    // should be.
+    noReason: "No reason recorded.",
 } as const;
 
 /**

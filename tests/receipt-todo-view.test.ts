@@ -275,6 +275,8 @@ test("a reason nobody has words for is its own pile, in front of the crew chases
 
     assert.deepEqual(rowIdsIn(plan, "tell-justin").sort(), ["blank", "mystery", "silent"],
         "a parked row with NO reason at all is unexplained too");
+    assert.ok(TODO_PILE_COPY["tell-justin"].note.includes("or the vendor and amount if there is no code"),
+        "because two of those three have no code to send");
     assert.equal(plan.handledCount, 0, "nothing here is folded away");
     assert.deepEqual(
         plan.piles.map(entry => entry.key),
@@ -707,6 +709,8 @@ test("a group that came back FULL is a window, and the plan says so", () => {
     const plan = planTodo(full, NOW);
     assert.deepEqual(plan.cappedGroups, ["booking"],
         "every list is read with take: RECEIPT_GROUP_TAKE and none of them pages");
+    // A group of exactly the cap comes back full too, so the copy hedges.
+    assert.ok(TODO_COPY.cappedGroups.startsWith("Some receipt groups may have more rows"));
     assert.equal(plan.needsYouCount, 0);
     // Which is the shape that must NOT say done: the piles are empty because
     // the page stopped reading, not because the queue did.

@@ -86,13 +86,6 @@ function pacificDay(iso: string): string {
     return at.toLocaleDateString("en-CA", { timeZone: PACIFIC });
 }
 
-/**
- * Holds this page has words for. Anything else is quoted verbatim rather than
- * labelled as one of these, and mirrors KNOWN_HOLDS in receipts-todo.ts, which
- * decides the same question for the folded strip.
- */
-const KNOWN_HOLD_VALUES: ReadonlySet<string> = new Set(["existing-evidence-review", "office-invoice"]);
-
 function amountLabel(cents: number | null): string {
     if (cents === null) return "—";
     return formatCurrency(Math.abs(cents) / 100);
@@ -752,14 +745,23 @@ function TodoIntakeRowView({ row, pile, jobs, links }: {
     jobs: Array<{ id: string; name: string }>;
     links: Map<string, string>;
 }) {
+    // A reason of null, "" or whitespace has nothing for StateReason to draw.
+    // In every other pile that is unremarkable (a NEEDS_JOB row is not parked
+    // on a verdict), but "Tell Justin about these" asks a reader to pass the
+    // code on, so a row with no code has to say so rather than leave a gap
+    // where the sentence should be.
+    const hasReason = (row.stateReason ?? "").trim() !== "";
     return (
         <RowShell>
             <div className="min-w-[16rem]">
                 <RowFacts row={row} />
-                {row.stateReason && (
+                {hasReason && (
                     <p className="text-xs text-amber-700 mt-1">
                         <StateReason reason={row.stateReason} row={row} />
                     </p>
+                )}
+                {!hasReason && pile === "tell-justin" && (
+                    <p className="text-xs text-hui-textMuted mt-1">{TODO_COPY.noReason}</p>
                 )}
             </div>
             <div className="flex items-center gap-3 flex-wrap">
@@ -966,16 +968,16 @@ function MissingReceiptRowView({ row }: { row: MissingReceiptRow }) {
                 </p>
                 {row.outreachHold && (
                     <p className="text-xs text-amber-700 mt-1">
+                        {/* THREE branches, not two. A hold this page has no
+                            words for used to fall into the evidence-reconciliation
+                            sentence, which is a different claim about a different
+                            thing. The To-do strip links here by that raw value, so
+                            it has to be findable, and true, once you arrive. */}
                         {row.outreachHold === "office-invoice"
                             ? "Office invoice — collect from billing email. Crew request held."
-                            : "Existing document needs reconciliation. Crew request held."}
-                        {/* A hold this page has no words for was being LABELLED
-                            as an evidence hold, which is a different claim. The
-                            To-do strip links here by that raw value, so it has to
-                            be findable once you arrive. */}
-                        {!KNOWN_HOLD_VALUES.has(row.outreachHold) && (
-                            <span className="ml-1.5 font-mono text-hui-textMuted">{row.outreachHold}</span>
-                        )}
+                            : row.outreachHold === "existing-evidence-review"
+                                ? "Existing document needs reconciliation. Crew request held."
+                                : `Held for a reason this page has no words for: ${row.outreachHold}. Crew request held.`}
                     </p>
                 )}
                 {row.resolution !== null && row.resolution !== "memo-signed" && (
