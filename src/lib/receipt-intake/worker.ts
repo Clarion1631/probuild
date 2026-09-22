@@ -38,6 +38,7 @@ import {
     type BookResult,
 } from "./book";
 import { isQBTimeoutError } from "@/lib/quickbooks";
+import { isComponentDeadlineExceeded } from "@/lib/receipt-requests";
 import {
     QboAccountConfigError,
     QboPurchaseFaultError,
@@ -1157,12 +1158,42 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
  * SAME predicate immediately before every apply, so once the timer has fired
  * no new apply can start, whatever the clock says.
  */
+
+/**
+ * A bounded classification for a failure from the injected close dependency
+ * — never its name or message, both of which are attacker- or
+ * dependency-controlled free text (Codex round 4, #3: an earlier version of
+ * this catch logged `error.name` on the claim that "a name is one of a
+ * small, fixed set" — it is not, since `name` is a plain mutable string
+ * property). This mirrors evidence-close-store.ts's own `errorCategory`, but
+ * is not imported from it — nothing in this module imports that one (see
+ * closeRequestsSatisfiedByBooking's own doc comment), so the same small
+ * check is repeated here rather than shared.
+ */
+function errorCategory(error: unknown): "timeout" | "db" | "other" {
+    if (isComponentDeadlineExceeded(error)) return "timeout";
+    if (
+        error instanceof Prisma.PrismaClientKnownRequestError ||
+        error instanceof Prisma.PrismaClientUnknownRequestError ||
+        error instanceof Prisma.PrismaClientRustPanicError ||
+        error instanceof Prisma.PrismaClientInitializationError ||
+        error instanceof Prisma.PrismaClientValidationError
+    ) return "db";
+    return "other";
+}
+
 async function closeRequestsSatisfiedByBooking(
     result: BookResult,
     deps: WorkerDependencies,
     remainingRunMs: () => number,
 ): Promise<void> {
     if (result.outcome !== "booked" || !deps.closeRequestsSatisfiedBy) return;
+    // Captured in a `const` rather than read again off `deps` below (round 4,
+    // #4 fix): the guard just above already proved it is present, and a
+    // `const` keeps that narrowing available inside the `.then` closure —
+    // reading `deps.closeRequestsSatisfiedBy` again there would widen back to
+    // `optional` from TypeScript's point of view.
+    const closeFn = deps.closeRequestsSatisfiedBy;
     const remaining = remainingRunMs();
     if (remaining < CLOSE_REQUESTS_MIN_BUDGET_MS) {
         console.warn("[cron/receipt-intake-worker] evidence close skipped: out of budget", result.expenseId);
@@ -1187,15 +1218,25 @@ async function closeRequestsSatisfiedByBooking(
     // always in place, whichever side of the race the call lands on — and
     // both branches resolve to `false`, so the race's own result can only
     // ever mean "the timer won".
-    const closePromise = deps.closeRequestsSatisfiedBy(result.expenseId, closeDeadlineExceeded)
+    //
+    // `closeFn` is called from INSIDE this first `.then`, not directly
+    // against `Promise.resolve()` (round 4, #4): a dependency that throws
+    // SYNCHRONOUSLY, before ever returning a promise, would otherwise throw
+    // straight out of `closeRequestsSatisfiedByBooking` instead of into the
+    // `.catch` below. This row's booking already committed — `applyBookResult`
+    // ran before this function was ever called — so letting that throw escape
+    // would reach the outer per-row `catch` (`handleRowError`) and retry or
+    // park a booking that already succeeded. Calling `closeFn` inside `.then`
+    // means a synchronous throw and an asynchronous rejection are handled
+    // identically, by the same `.catch`, and `closePromise` still only ever
+    // resolves to `false` — the timer race and the cancel latch above are
+    // otherwise unchanged.
+    const closePromise = Promise.resolve()
+        .then(() => closeFn(result.expenseId, closeDeadlineExceeded))
         .then(() => false as const)
         .catch(error => {
-            // Error NAME only, never the message (Codex round 3, should-fix
-            // 2) — a message can echo query parameters or other unbounded
-            // text; a name is one of a small, fixed set, so this line stays
-            // ids-only the same way evidence-close's own warns do.
             console.warn("[cron/receipt-intake-worker] evidence close failed", result.expenseId,
-                error instanceof Error ? error.name : "UnknownError");
+                errorCategory(error));
             return false as const;
         });
 

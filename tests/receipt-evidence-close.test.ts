@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Prisma } from "@prisma/client";
 
 process.env.DATABASE_URL = "postgresql://fiction:fiction@127.0.0.1:9/test?pgbouncer=true";
 
@@ -298,6 +299,66 @@ test("a throwing recompute is counted, swallowed, and leaves the issue untouched
     assert.equal(result.errors, 1);
     assert.deepEqual(result.cleared, ["line-b"], "one bad candidate does not abandon the rest");
     assert.equal(s.issues.get("line-a")!.clearedAt, null);
+});
+
+test("a caught error's own name or message never reaches the log — only a small fixed category (Codex round 4, #3)", async () => {
+    // `.name` is a plain mutable string property, not the "small, fixed set"
+    // an earlier version of errorCategory's own comment claimed — nothing
+    // stops a dependency from setting it to text that echoes a vendor or
+    // account reference, exactly as this one does on both `.name` and
+    // `.message`.
+    const s = store(["line-a"], ["line-a"]);
+    const vendorLikeError = new Error("Home Depot invoice 88213-4471 exceeded the lookback window");
+    vendorLikeError.name = "ARCO #82887 lookup failure";
+
+    const warns: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(" ")); };
+    let result;
+    try {
+        result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+            recompute: async () => { throw vendorLikeError; },
+        }));
+    } finally {
+        console.warn = realWarn;
+    }
+
+    assert.equal(result.errors, 1);
+    const output = warns.join("\n");
+    assert.doesNotMatch(output, /Home Depot/);
+    assert.doesNotMatch(output, /ARCO/);
+    assert.doesNotMatch(output, /88213/);
+    assert.doesNotMatch(output, /lookup failure/);
+    assert.match(output, /\bother\b/, "an unrecognized error still logs a fixed category, not its own name");
+});
+
+test("a ComponentDeadlineExceededError is categorized as timeout, and a Prisma error as db — never by name (Codex round 4, #3)", async () => {
+    const s1 = store(["line-a"], ["line-a"]);
+    const warns1: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warns1.push(args.map(String).join(" ")); };
+    try {
+        await closeRequestsSatisfiedBy(evidence(), depsFor(s1, {
+            recompute: async () => { throw new ComponentDeadlineExceededError(3); },
+        }));
+    } finally {
+        console.warn = realWarn;
+    }
+    assert.match(warns1.join("\n"), /\btimeout\b/);
+
+    const s2 = store(["line-a"], ["line-a"]);
+    const warns2: string[] = [];
+    console.warn = (...args: unknown[]) => { warns2.push(args.map(String).join(" ")); };
+    try {
+        await closeRequestsSatisfiedBy(evidence(), depsFor(s2, {
+            recompute: async () => {
+                throw new Prisma.PrismaClientKnownRequestError("pool exhausted", { code: "P2024", clientVersion: "test" });
+            },
+        }));
+    } finally {
+        console.warn = realWarn;
+    }
+    assert.match(warns2.join("\n"), /\bdb\b/);
 });
 
 test("a deadline thrown from inside a component walk stops the pass without failing it", async () => {
@@ -784,6 +845,61 @@ test("a throwing close does not fail the pass or the booking", async () => {
     assert.equal(summary.processed, 1);
     assert.equal(summary.byState.BOOKED, 1, "the booking still reports BOOKED");
     assert.equal(summary.byState.RETRY, undefined, "and it is NOT routed through the row error path");
+});
+
+test("the worker's own courtesy catch never logs the close error's name or message either — only a fixed category (Codex round 4, #3)", async () => {
+    const vendorLikeError = new Error("Lowe's PO#4471 receipt reconciliation failed");
+    vendorLikeError.name = "HomeDepotSyncError";
+    const h = workerHarness(BOOKED, {
+        closeRequestsSatisfiedBy: async () => { throw vendorLikeError; },
+    });
+
+    const warns: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(" ")); };
+    let summary;
+    try {
+        summary = await runIntakeWorker(h.deps);
+    } finally {
+        console.warn = realWarn;
+    }
+
+    assert.equal(summary.byState.BOOKED, 1, "the booking is unaffected by the close's own failure");
+    const output = warns.join("\n");
+    assert.doesNotMatch(output, /Lowe's/);
+    assert.doesNotMatch(output, /HomeDepotSyncError/);
+    assert.doesNotMatch(output, /4471/);
+    assert.match(output, /\bother\b/, "an unrecognized error still logs a fixed category, not its own name");
+});
+
+test("a SYNCHRONOUSLY throwing close does not fail an already-booked row — accounting still reports BOOKED, and the throw is logged as a category, never routed through handleRowError (Codex round 4, #4)", async () => {
+    const h = workerHarness(BOOKED, {
+        // Deliberately NOT `async`, and no `new Promise` either: this throws
+        // the instant it is called, before ever returning anything a
+        // `.then`/`.catch` chained onto the call's OWN return value could
+        // attach to. Distinct from the async-rejection tests above, which a
+        // plain `.then().catch()` already handled correctly before this fix.
+        closeRequestsSatisfiedBy: () => { throw new Error("Ferguson invoice 90142 lookup exploded synchronously"); },
+    });
+
+    const warns: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(" ")); };
+    let summary;
+    try {
+        summary = await runIntakeWorker(h.deps);
+    } finally {
+        console.warn = realWarn;
+    }
+
+    assert.equal(summary.processed, 1);
+    assert.equal(summary.byState.BOOKED, 1, "the booking still reports BOOKED — the sync throw never reached the outer per-row catch");
+    assert.equal(summary.byState.RETRY, undefined, "not routed through handleRowError as a booking failure");
+    assert.equal(summary.byState.NEEDS_REVIEW, undefined);
+    const output = warns.join("\n");
+    assert.doesNotMatch(output, /Ferguson/);
+    assert.doesNotMatch(output, /90142/);
+    assert.match(output, /\bother\b/, "the synchronous throw is still logged, as a fixed category");
 });
 
 test("the worker runs unchanged when the dependency is absent", async () => {

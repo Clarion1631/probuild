@@ -126,6 +126,7 @@
  * `receipt-request-cards/route.ts:390,415` uses, and it is what lets every test
  * run with no database and without `mock.module`, which CI's Node 20 cannot do.
  */
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
@@ -282,14 +283,25 @@ async function defaultOpenIssueKeys(ids: string[]): Promise<Map<string, string>>
 }
 
 /**
- * A bounded classification for a caught error — the error's own NAME (e.g.
- * "PrismaClientKnownRequestError", "ComponentDeadlineExceededError"), never
- * its message. A message can echo query parameters or other unbounded text;
- * a name is one of a small, fixed set, so every warn line in this module
- * stays ids-only, the same way `judged` does (Codex round 3, should-fix 2).
+ * A bounded classification for a caught error — mapped from a small fixed
+ * set of known error classes, never the error's own name or message (Codex
+ * round 4, #3). An earlier version of this function returned `error.name`
+ * verbatim, on the claim that "a name is one of a small, fixed set" — it is
+ * not: `name` is a plain mutable string property, and nothing stops a
+ * dependency from setting it to text that echoes a vendor or account
+ * reference. Every warn line in this module logs only this category, the
+ * same way `judged` stays ids-only.
  */
-function errorCategory(error: unknown): string {
-    return error instanceof Error ? error.name : "UnknownError";
+function errorCategory(error: unknown): "timeout" | "db" | "other" {
+    if (isComponentDeadlineExceeded(error)) return "timeout";
+    if (
+        error instanceof Prisma.PrismaClientKnownRequestError ||
+        error instanceof Prisma.PrismaClientUnknownRequestError ||
+        error instanceof Prisma.PrismaClientRustPanicError ||
+        error instanceof Prisma.PrismaClientInitializationError ||
+        error instanceof Prisma.PrismaClientValidationError
+    ) return "db";
+    return "other";
 }
 
 /**

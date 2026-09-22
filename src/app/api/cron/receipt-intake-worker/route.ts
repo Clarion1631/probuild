@@ -1363,15 +1363,19 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // already wrote it, per-candidate, ids only (Codex round 3,
             // should-fix 2). This line stays a COUNTS-only summary, with the
             // expenseId that line cannot carry, rather than a second copy of
-            // the same per-candidate detail.
-            const { judged, ...counts } = closed;
+            // the same per-candidate detail. `cleared` is pulled out
+            // alongside `judged`, not left inside `...counts`, and reduced to
+            // its length below — `cleared` is a target-key array, and
+            // spreading it into a "counts only" line would put ids right
+            // back in (Codex round 4, #2).
+            const { judged, cleared, ...counts } = closed;
             // `conflicts` (round 4) is contention, not a verdict — but it must
             // still trip this line, or a call that only lost lifecycle CASes
             // would log nothing at all despite the module header's promise
             // that conflicts "show in logs".
-            if (counts.cleared.length > 0 || counts.errors > 0 || counts.conflicts > 0 || counts.stale > 0 || judged.length > 0) {
+            if (cleared.length > 0 || counts.errors > 0 || counts.conflicts > 0 || counts.stale > 0 || judged.length > 0) {
                 console.log("[cron/receipt-intake-worker] evidence close",
-                    JSON.stringify({ expenseId, ...counts, judgedCount: judged.length }));
+                    JSON.stringify({ expenseId, ...counts, clearedCount: cleared.length, judgedCount: judged.length }));
             }
         },
 
