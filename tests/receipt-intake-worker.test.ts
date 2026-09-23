@@ -1337,6 +1337,43 @@ test("the REAL weak-net queries read the whole group, and log the verdict outsid
     );
 });
 
+test("the evidence-close summary log stays counts only — `cleared` is destructured out and counted, never spread as an id array (Codex round 4, #2)", () => {
+    // Same rationale as the weak-net test above: `closeRequestsSatisfiedBy`
+    // lives inside module-private `buildDeps`, with no runtime seam (every
+    // path inside it talks to real Prisma), so this asserts on the source.
+    const cron = readFileSync(
+        path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+        "utf8",
+    );
+    const closeBlock = cron.slice(
+        cron.indexOf("closeRequestsSatisfiedBy: async (expenseId, deadlineExceeded)"),
+        cron.indexOf("applyBookResult: async (rowId, result, claimToken)"),
+    );
+    assert.ok(closeBlock.length > 200, "sliced the right property");
+
+    // `cleared` really is a target-key array on the result this destructures
+    // — the property this test protects only matters because of that type.
+    const storeSrc = readFileSync(
+        path.join(__dirname, "..", "src/lib/receipt-intake/evidence-close-store.ts"),
+        "utf8",
+    );
+    assert.match(storeSrc, /cleared: string\[\];/, "EvidenceCloseResult.cleared is an id array, not a count");
+
+    // `cleared` must be pulled out of the destructure ALONGSIDE `judged`, not
+    // left inside `...counts` — an earlier version destructured only
+    // `judged` out, so `counts.cleared` was still the whole id array.
+    assert.match(closeBlock, /const \{ judged, cleared, \.\.\.counts \} = closed;/);
+    // And the logged object must carry that array's LENGTH, never the array
+    // itself — this is the exact literal logged, so a regression back to
+    // `...counts` (with `cleared` still inside it) or to spreading `cleared`
+    // bare would both fail this match.
+    assert.match(
+        closeBlock,
+        /JSON\.stringify\(\{ expenseId, \.\.\.counts, clearedCount: cleared\.length, judgedCount: judged\.length \}\)/,
+        "the logged payload is counts-only: clearedCount, not cleared",
+    );
+});
+
 test("a document-level gate short-circuits BOTH nets and claims no key", async () => {
     for (const [read, reason] of [
         [{ ...goodRead.read, docType: "multi" }, "multi-doc"],

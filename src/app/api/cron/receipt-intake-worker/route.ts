@@ -43,6 +43,10 @@ import {
     triageCutoverRows, resolveCutoverBoundary, type CutoverRow } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { bookReceipt, type BookPrismaClient } from "@/lib/receipt-intake/book";
+import {
+    closeRequestsSatisfiedBy as closeRequestsSatisfiedByEvidence,
+    loadBookedEvidence,
+} from "@/lib/receipt-intake/evidence-close-store";
 import { backoffMs } from "@/lib/receipt-intake/route-state";
 import {
     BATCH_SIZE,
@@ -1341,6 +1345,39 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             logEvent: logAutomationEvent,
             now: () => new Date(),
         }),
+
+        /**
+         * The evidence-driven close, built here like every other dependency so
+         * `worker.ts` never imports the receipt-requests route module.
+         *
+         * Two reads and no throw of its own: the Expense that just booked is
+         * turned into the evidence the candidate query needs, and a row that
+         * cannot produce usable evidence simply does nothing. The worker
+         * swallows anything this raises.
+         */
+        closeRequestsSatisfiedBy: async (expenseId, deadlineExceeded) => {
+            const evidence = await loadBookedEvidence(expenseId);
+            if (!evidence) return;
+            const closed = await closeRequestsSatisfiedByEvidence(evidence, { deadlineExceeded });
+            // ONE detailed log for `judged` — `closeRequestsSatisfiedBy`
+            // already wrote it, per-candidate, ids only (Codex round 3,
+            // should-fix 2). This line stays a COUNTS-only summary, with the
+            // expenseId that line cannot carry, rather than a second copy of
+            // the same per-candidate detail. `cleared` is pulled out
+            // alongside `judged`, not left inside `...counts`, and reduced to
+            // its length below — `cleared` is a target-key array, and
+            // spreading it into a "counts only" line would put ids right
+            // back in (Codex round 4, #2).
+            const { judged, cleared, ...counts } = closed;
+            // `conflicts` (round 4) is contention, not a verdict — but it must
+            // still trip this line, or a call that only lost lifecycle CASes
+            // would log nothing at all despite the module header's promise
+            // that conflicts "show in logs".
+            if (cleared.length > 0 || counts.errors > 0 || counts.conflicts > 0 || counts.stale > 0 || judged.length > 0) {
+                console.log("[cron/receipt-intake-worker] evidence close",
+                    JSON.stringify({ expenseId, ...counts, clearedCount: cleared.length, judgedCount: judged.length }));
+            }
+        },
 
         applyBookResult: async (rowId, result, claimToken) => {
             const now = new Date();

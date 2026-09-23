@@ -73,7 +73,8 @@ import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 // Enabling changes policy: start a fresh full sweep before any purchaser cards.
 const SOURCE_RECOGNITION_ENABLED = process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true";
 const RECOGNITION_POLICY = receiptRecognitionPolicy(SOURCE_RECOGNITION_ENABLED, reviewedReceiptFactsFingerprint, reviewedReceiptPairsFingerprint);
-const EVIDENCE_LOOKBACK_DAYS = Math.max(RECEIPT_REVIEW_WINDOW_DAYS, SOURCE_RECOGNITION_ENABLED ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS : RECEIPT_MATCH_DATE_SLOP_DAYS);
+/** EXPORTED so the evidence-driven close inverts THIS width, not a copy of it. */
+export const EVIDENCE_LOOKBACK_DAYS = Math.max(RECEIPT_REVIEW_WINDOW_DAYS, SOURCE_RECOGNITION_ENABLED ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS : RECEIPT_MATCH_DATE_SLOP_DAYS);
 const SOURCE_ADJACENCY_DAYS = SOURCE_RECOGNITION_ENABLED
     ? RECEIPT_AUTH_SETTLEMENT_MAX_DAYS + RECEIPT_MATCH_DATE_SLOP_DAYS
     : COMPETING_LINE_ADJACENCY_DAYS;
