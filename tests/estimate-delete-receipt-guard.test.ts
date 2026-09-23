@@ -19,6 +19,15 @@
  * delete (not just Expense) shows up in the op log, and the refusal tests
  * below prove none of them ran.
  *
+ * ROUND 3 (2026-09-23, Codex round 1): the Estimate row itself was the last
+ * holdout — a plain `prisma.estimate.delete()` ran AFTER this transaction
+ * committed and released the lock, so a receipt could book onto the estimate
+ * in that gap (book.ts re-validates against the still-live row and passes)
+ * and the unguarded delete would still go through behind it. It is
+ * `tx.estimate.delete` now, inside the same transaction as the other three —
+ * fakePrisma.estimate no longer exposes `delete` at all, so a regression that
+ * moves it back out fails loudly instead of silently passing.
+ *
  * Prisma, next-auth and the permission reader are patched at require() time —
  * same shape as tests/expense-delete-scope.test.ts and
  * tests/job-variance-db.test.ts. No mock.module: CI is Node 20.
@@ -74,12 +83,20 @@ const fakeTx: any = {
     estimatePaymentSchedule: {
         deleteMany: async () => { opLog.push("tx.estimatePaymentSchedule.deleteMany"); return { count: 0 }; },
     },
+    // Round 3: the Estimate row itself, now deleted on this same tx client
+    // instead of a separate post-commit `prisma.estimate.delete()`.
+    estimate: {
+        delete: async (args: unknown) => { estimateDeleteArgs = args; opLog.push("tx.estimate.delete"); return estimateRow; },
+    },
 };
 
 const fakePrisma: any = {
     estimate: {
         findUnique: async () => estimateRow,
-        delete: async (args: unknown) => { estimateDeleteArgs = args; opLog.push("estimate.delete"); return estimateRow; },
+        // Deliberately no `delete` here (Round 3): the fix moved the Estimate
+        // delete onto the transaction client. A regression that calls
+        // `prisma.estimate.delete` again throws "not a function" instead of
+        // quietly succeeding outside the lock.
     },
     expense: {
         // The EARLY, unlocked count at the top of deleteEstimate — unrelated
@@ -190,6 +207,7 @@ test("unchanged behavior: proceeds normally when no receipt-booked expense is li
     assert.ok(opLog.includes("tx.budget.delete"), `the Budget delete still ran: ${opLog.join(" ")}`);
     assert.ok(opLog.includes("tx.estimateItem.deleteMany"), `the EstimateItem delete still ran: ${opLog.join(" ")}`);
     assert.ok(opLog.includes("tx.estimatePaymentSchedule.deleteMany"), `the EstimatePaymentSchedule delete still ran: ${opLog.join(" ")}`);
+    assert.ok(opLog.includes("tx.estimate.delete"), `the Estimate row itself was deleted on the tx client: ${opLog.join(" ")}`);
     assert.deepEqual(estimateDeleteArgs, { where: { id: "est-1" } });
 });
 
@@ -222,10 +240,10 @@ test("the receipt check runs inside the lock, after it, and before any delete", 
             "tx.estimateItem.deleteMany",
             "tx.estimatePaymentSchedule.deleteMany",
             "tx.expense.deleteMany",
+            "tx.estimate.delete",
             "epoch-bump",
-            "estimate.delete",
         ],
-        "lock, then the guard's own check, then every delete inside that same transaction, then the epoch bump, then the Estimate row itself",
+        "lock, then the guard's own check, then every delete inside that same transaction including the Estimate row itself, then the epoch bump",
     );
 });
 

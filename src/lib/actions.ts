@@ -5528,6 +5528,12 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
     // EvidenceWriteClient type exposes expense/receiptIntake/reviewIssue, not
     // budget or estimateItem -- so every delete below runs only once the
     // guard has cleared.
+    //
+    // THE ESTIMATE ROW ALSO MOVES IN HERE (Codex round 1, 2026-09-23): it used
+    // to be a separate `prisma.estimate.delete()` call AFTER this transaction
+    // committed and released the lock, so a receipt could book onto this
+    // estimate in that gap and then the unguarded delete would still run.
+    // `tx.estimate.delete` makes the refusal and the delete one atomic commit.
     let receiptBookedCount = 0;
     await prisma.$transaction(async tx => {
         await lockReceiptEvidence(tx);
@@ -5542,6 +5548,7 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
             await tx.estimateItem.deleteMany({ where: { estimateId } });
             await tx.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
             await tx.expense.deleteMany({ where: { estimateId } });
+            await tx.estimate.delete({ where: { id: estimateId } });
         }
         await bumpReceiptEvidenceEpoch(tx);
     });
@@ -5551,7 +5558,6 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
             error: `This estimate has ${receiptBookedCount} expense(s) from receipts, so it can't be deleted. Archive it instead.`,
         };
     }
-    await prisma.estimate.delete({ where: { id: estimateId } });
 
     if (estimate.projectId) {
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
