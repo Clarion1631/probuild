@@ -402,8 +402,12 @@ test("the sweep holds a DURABLE lease, not a released advisory claim", () => {
     // The lease now lives in the shared src/lib/cron-lease.ts helper.
     assert.match(source, /takeLease\(LEASE_KEY, RUN_LEASE_MS, now, leaseToken\)/);
     // Taken before the work and released after it, not committed away first.
+    // (The call site awaits its own result to fire a heartbeat ping before
+    // returning — see src/lib/cron-heartbeat.ts — rather than a bare
+    // `return await runSweep(...)`; the ordering this test cares about is
+    // unchanged.)
     const takeAt = source.indexOf("await takeLease(LEASE_KEY");
-    const workAt = source.indexOf("return await runSweep(now");
+    const workAt = source.indexOf("const response = await runSweep(now");
     const releaseAt = source.indexOf("await releaseLease(LEASE_KEY");
     assert.ok(takeAt > 0 && workAt > takeAt && releaseAt > workAt);
     // And the retry path recomputes the SET.

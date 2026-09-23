@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import { pingCronHeartbeat } from "@/lib/cron-heartbeat";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
@@ -87,6 +88,8 @@ const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
+
+const HEARTBEAT_JOB_KEY = "RECEIPT_INTAKE_WORKER";
 
 /**
  * Receipt Pipeline v2 worker (docs/plans/PHASE-1-INTAKE-CORE-SPEC.md §5).
@@ -1559,10 +1562,17 @@ export async function GET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
+    await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "start");
 
-    const summary = await runIntakeWorker(buildDeps(createRouteDeadline(RUN_HARD_BUDGET_MS)));
-    if (summary.processed > 0 || summary.skipped) {
-        console.log("[cron/receipt-intake-worker]", JSON.stringify(summary));
+    try {
+        const summary = await runIntakeWorker(buildDeps(createRouteDeadline(RUN_HARD_BUDGET_MS)));
+        if (summary.processed > 0 || summary.skipped) {
+            console.log("[cron/receipt-intake-worker]", JSON.stringify(summary));
+        }
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
+        return NextResponse.json(summary);
+    } catch (error) {
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", error instanceof Error ? error.name : "UnknownError");
+        throw error;
     }
-    return NextResponse.json(summary);
 }

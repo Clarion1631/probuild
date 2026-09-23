@@ -1,9 +1,12 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { handleChangeOrderApproved } from "@/lib/billing-core";
+import { pingCronHeartbeat } from "@/lib/cron-heartbeat";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
+
+const HEARTBEAT_JOB_KEY = "CO_BILLING_SWEEP";
 
 /**
  * Hourly backstop for the change-order approval automation: after() gives no
@@ -22,37 +25,44 @@ export async function GET(request: Request) {
     if (process.env.VERCEL_ENV && (!process.env.CRON_SECRET || authHeader !== `Bearer ${process.env.CRON_SECRET}`)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
+    await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "start");
 
-    const now = Date.now();
-    const candidates = await prisma.changeOrder.findMany({
-        where: {
-            status: "Approved",
-            approvedAt: { lte: new Date(now - 15 * 60_000), gte: new Date(now - 2 * 60 * 60_000) },
-        },
-        select: { id: true, code: true, projectId: true },
-        take: 10,
-    });
-
-    const results: Array<{ code: string; action: string }> = [];
-    for (const co of candidates) {
-        const billedAlready = await prisma.paymentSchedule.findFirst({
+    try {
+        const now = Date.now();
+        const candidates = await prisma.changeOrder.findMany({
             where: {
-                name: { startsWith: `${co.code} — ` },
-                status: { not: "Canceled" },
-                invoice: { projectId: co.projectId },
+                status: "Approved",
+                approvedAt: { lte: new Date(now - 15 * 60_000), gte: new Date(now - 2 * 60 * 60_000) },
             },
-            select: { id: true },
+            select: { id: true, code: true, projectId: true },
+            take: 10,
         });
-        if (billedAlready) {
-            results.push({ code: co.code, action: "skipped (already billed)" });
-            continue;
-        }
-        const outcome = await handleChangeOrderApproved(co.id);
-        results.push({ code: co.code, action: outcome.sent ? "billed + sent" : `alerted: ${outcome.issues.join("; ")}` });
-    }
 
-    if (results.some(r => !r.action.startsWith("skipped"))) {
-        console.log("[cron/co-billing-sweep]", JSON.stringify(results));
+        const results: Array<{ code: string; action: string }> = [];
+        for (const co of candidates) {
+            const billedAlready = await prisma.paymentSchedule.findFirst({
+                where: {
+                    name: { startsWith: `${co.code} — ` },
+                    status: { not: "Canceled" },
+                    invoice: { projectId: co.projectId },
+                },
+                select: { id: true },
+            });
+            if (billedAlready) {
+                results.push({ code: co.code, action: "skipped (already billed)" });
+                continue;
+            }
+            const outcome = await handleChangeOrderApproved(co.id);
+            results.push({ code: co.code, action: outcome.sent ? "billed + sent" : `alerted: ${outcome.issues.join("; ")}` });
+        }
+
+        if (results.some(r => !r.action.startsWith("skipped"))) {
+            console.log("[cron/co-billing-sweep]", JSON.stringify(results));
+        }
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
+        return NextResponse.json({ checked: candidates.length, results });
+    } catch (error) {
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", error instanceof Error ? error.name : "UnknownError");
+        throw error;
     }
-    return NextResponse.json({ checked: candidates.length, results });
 }

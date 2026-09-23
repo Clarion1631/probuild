@@ -1,8 +1,11 @@
 import { NextResponse } from "next/server";
 import { sendPaymentReminders } from "@/lib/payment-reminders";
+import { pingCronHeartbeat } from "@/lib/cron-heartbeat";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
+
+const HEARTBEAT_JOB_KEY = "PAYMENT_REMINDERS";
 
 /**
  * Daily client payment-reminder sweep: emails clients about payment-schedule
@@ -25,12 +28,19 @@ export async function GET(request: Request) {
     if (process.env.VERCEL_ENV && (!process.env.CRON_SECRET || authHeader !== `Bearer ${process.env.CRON_SECRET}`)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
+    await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "start");
 
     const { searchParams } = new URL(request.url);
     const dryRunParam = searchParams.get("dryRun");
     const dryRun = dryRunParam === null ? undefined : dryRunParam === "1" || dryRunParam === "true";
 
-    const result = await sendPaymentReminders({ dryRun });
-    console.log("[cron/payment-reminders]", JSON.stringify(result));
-    return NextResponse.json(result);
+    try {
+        const result = await sendPaymentReminders({ dryRun });
+        console.log("[cron/payment-reminders]", JSON.stringify(result));
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
+        return NextResponse.json(result);
+    } catch (error) {
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", error instanceof Error ? error.name : "UnknownError");
+        throw error;
+    }
 }

@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import { pingCronHeartbeat } from "@/lib/cron-heartbeat";
 import { decodeReasonCodes, type ReasonCode } from "@/lib/review-alert-reasons";
 import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasBackedResolution, isComponentDeadlineExceeded, ComponentTooLargeError, ReceiptOutreachHeldError, type ReceiptOutreachHold } from "@/lib/receipt-requests";
 import {
@@ -34,6 +35,8 @@ import { recomputeCodesFor } from "@/app/api/cron/receipt-requests/route";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
+
+const HEARTBEAT_JOB_KEY = "RECEIPT_REQUEST_CARDS";
 
 /**
  * Per-owner missing-receipt Chat digest (Phase 2 §4). Weekday mornings, 14:30
@@ -535,21 +538,26 @@ export async function GET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
+    await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "start");
     if (process.env.RECEIPT_REQUEST_CARDS_ENABLED !== "true") {
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
         return NextResponse.json({ ok: true, skipped: "disabled" });
     }
     // The revalidation budget's own clock — see REVALIDATION_DEADLINE_MS.
     const runStartedAt = Date.now();
     const now = new Date();
     if (!isPacificWeekday(now)) {
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
         return NextResponse.json({ ok: true, skipped: "weekend" });
     }
     const webhookUrl = process.env.RECEIPTS_CHAT_WEBHOOK;
     if (!webhookUrl) {
         // Fail soft: the queue page still shows every one of these.
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
         return NextResponse.json({ ok: true, skipped: "no-webhook" });
     }
     if (!(await claim())) {
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
         return NextResponse.json({ ok: true, skipped: "locked" });
     }
 
@@ -609,12 +617,14 @@ export async function GET(request: Request) {
     const recognitionPolicy = receiptRecognitionPolicy(process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true", reviewedReceiptFactsFingerprint, reviewedReceiptPairsFingerprint);
     // A flag change invalidates selection AND retry certification until a fresh cycle finishes.
     if (!cycleRecognitionPolicyMatches(currentCycle, recognitionPolicy)) {
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
         return NextResponse.json({ ok: false, skipped: "chaser-policy-changed", date });
     }
     const selectionAllowed = chaserCompletedFor(marker, date, "America/Los_Angeles", currentCycleId);
     // Creating a cycle under the new policy is not completion: retries must
     // also wait for its certified finish, rather than replay an old pending card.
     if (currentCycle?.recognitionPolicy !== undefined && !selectionAllowed) {
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
         return NextResponse.json({ ok: false, skipped: "chaser-incomplete", date });
     }
     if (!retryOnly) {
@@ -629,6 +639,7 @@ export async function GET(request: Request) {
             console.error("[cron/receipt-request-cards] refusing to select — tonight's chase has not completed", JSON.stringify(summary));
             // 200: nothing failed here, and a retry of THIS invocation would
             // not help. The ok:false is what makes it visible.
+            await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
             return NextResponse.json(summary, { status: 200 });
         }
     }
@@ -1469,6 +1480,14 @@ export async function GET(request: Request) {
     } else if (toPost.length > 0) {
         console.log("[cron/receipt-request-cards]", JSON.stringify(summary));
     }
+    // Mirrors the response status just below: a refused delivery is the one
+    // outcome this heartbeat treats as a failed run. An unconfirmed delivery
+    // still answers 200 (it needs a human, not a retry), so it pings success too.
+    await pingCronHeartbeat(
+        HEARTBEAT_JOB_KEY,
+        failures.length > 0 ? "fail" : "success",
+        failures.length > 0 ? `${failures.length} owner(s) failed delivery` : undefined,
+    );
     // 500 ONLY for a refused delivery, which is worth retrying. An unconfirmed
     // one is 200: it needs a human, not another attempt.
     return NextResponse.json(summary, { status: failures.length > 0 ? 500 : 200 });

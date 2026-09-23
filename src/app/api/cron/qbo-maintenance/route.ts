@@ -4,9 +4,12 @@ import { isCronAuthorized } from "@/lib/cron-auth";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { PAYMENTS_SYNC_EVENT_KIND, QBO_MAINTENANCE_SOURCE } from "@/lib/pipeline-health";
 import { POST as runMaintenance } from "@/app/api/integrations/qbo-maintenance/route";
+import { pingCronHeartbeat } from "@/lib/cron-heartbeat";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
+
+const HEARTBEAT_JOB_KEY = "QBO_MAINTENANCE";
 
 /**
  * The automatic runner for the QuickBooks repair queues.
@@ -32,11 +35,13 @@ export async function GET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
     }
+    await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "start");
 
     const secret = process.env.RECEIPT_INGEST_SECRET;
     if (!secret) {
         // The delegate is gated on this. Say so rather than reporting a clean
         // run that did nothing.
+        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", "receipt-ingest-secret-missing");
         return NextResponse.json(
             { ok: false, reason: "receipt-ingest-secret-missing" },
             { status: 503 },
@@ -71,6 +76,11 @@ export async function GET(request: Request) {
         reason: ok ? undefined : String((body as { reason?: string } | null)?.reason ?? "maintenance-incomplete"),
         detail: (body ?? {}) as Record<string, unknown>,
     });
+    await pingCronHeartbeat(
+        HEARTBEAT_JOB_KEY,
+        ok ? "success" : "fail",
+        ok ? undefined : String((body as { reason?: string } | null)?.reason ?? "maintenance-incomplete"),
+    );
 
     // 503 whenever the run was not genuinely clean, whatever the delegate
     // answered. Returning the delegate's 200 for an `ok:false` body recorded a
