@@ -13,6 +13,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { Prisma } from "@prisma/client";
 
 process.env.DATABASE_URL ??= "postgresql://fiction:fiction@127.0.0.1:9/test?pgbouncer=true";
@@ -185,4 +186,22 @@ test("a non-P2002 error from the insert itself also refuses with tx-failed, not 
     const fake = fakeDb({ createError: new Error("connection reset") });
     const result = await claimOwnerDay(fake.db as never, baseInput());
     assert.deepEqual(result, { kind: "refused", reason: "tx-failed" });
+});
+
+// ownerEpochAtScan is the GET handler's OWN snapshot, taken before it ever
+// calls claimOwnerDay above — the fake $transaction harness in this file
+// cannot reach it, so this is a source pin, not a behavioral test. Moving the
+// read after `scan` (or all the way to claim time) would snapshot the owner
+// epoch after candidates are already gathered, so a reassignment landing in
+// that window would pass claimOwnerDay's own re-check and silently reopen
+// Codex round 2 blocker 1 while every test above still passes.
+test("source pin: ownerEpochAtScan is read before scanCandidates runs, not after", () => {
+    const cardsRoute = readFileSync(new URL("../src/app/api/cron/receipt-request-cards/route.ts", import.meta.url), "utf8");
+    const scanAllowedAt = cardsRoute.indexOf("const selectionAllowed = chaserCompletedFor(");
+    const ownerEpochAt = cardsRoute.indexOf(
+        'const ownerEpochAtScan = selectionAllowed ? await readReceiptOwnerEpoch(prisma) : "0";', scanAllowedAt);
+    const scanAt = cardsRoute.indexOf("const scan = selectionAllowed", ownerEpochAt);
+    assert.ok(scanAllowedAt > 0, "selectionAllowed is decided in the GET handler");
+    assert.ok(ownerEpochAt > scanAllowedAt, "ownerEpochAtScan is read after selectionAllowed is decided");
+    assert.ok(scanAt > ownerEpochAt, "ownerEpochAtScan is read before scanCandidates gathers this run's candidates");
 });

@@ -274,3 +274,24 @@ test("source pin: in the line pass, writeCycle( follows blockingUndecidedLines( 
     assert.ok(writeCycleAt > blockingAt, "writeCycle follows blockingUndecidedLines");
     assert.ok(checkpointAt > writeCycleAt, "writeCycle precedes the checkpoint callback, so the cursor never passes an unrecorded line");
 });
+
+// These two pin the path an undecided line's id travels from processBatch's
+// return through to pageUndecided, so it can reach blockingUndecidedLines
+// above. Neither is exercised by the equivalence/matrix tests above (which
+// call blockingUndecidedLines directly) or by the line-pass pin (which only
+// orders blockingUndecidedLines/writeCycle/the checkpoint) — dropping either
+// line leaves every one of those green while silently reopening blocker 2.
+
+test("source pin: processBatch's final return carries undecidedIds, not just a count", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    assert.match(sweep,
+        /return \{ summary, undecided: plan\.undecided\.length \+ unresolved\.length, undecidedIds: \[\.\.\.plan\.undecided, \.\.\.unresolved\], replan: false \};/,
+        "a line whose component would not load must still be nameable, not just counted");
+});
+
+test("source pin: the line pass collects every batch outcome's undecidedIds into pageUndecided", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    assert.match(sweep,
+        /pageUndecided\.push\(\.\.\.\(outcome\.undecidedIds \?\? \[\]\)\);/,
+        "an outcome's undecidedIds must reach pageUndecided, or blockingUndecidedLines never sees them");
+});
