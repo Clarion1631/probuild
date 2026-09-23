@@ -4,6 +4,9 @@ import { useMemo, useState, useCallback, useRef } from "react";
 import { toast } from "sonner";
 import { deleteExpense, deleteExpenses, getExpenses, tagExpensesToChangeOrder } from "@/lib/time-expense-actions";
 import TaxPhaseModal, { type PhaseOption, type TaxPhaseExpense } from "./TaxPhaseModal";
+import MoveToJobModal from "./MoveToJobModal";
+// Never import booked-expense.ts here — it is server-only.
+import { isReceiptBookedExpense } from "@/lib/receipt-intake/booked-expense-rules";
 
 interface Expense {
     id: string;
@@ -30,6 +33,8 @@ interface Expense {
     taxDeductibleBase?: unknown;
     needsTaxReview?: boolean;
     taxSource?: string | null;
+    /** Set for a native row the receipt pipeline booked — see isReceiptBookedExpense. */
+    receiptIntake?: { id: string } | null;
 }
 
 interface Props {
@@ -42,6 +47,8 @@ interface Props {
     phases?: PhaseOption[];
     /** `financialReports`. Without it the panel is not offered at all. */
     canEditTax?: boolean;
+    /** Open jobs, for Move to job on a receipt-booked expense. */
+    jobOptions: Array<{ id: string; name: string }>;
 }
 
 function num(v: unknown): number {
@@ -56,8 +63,9 @@ function fmtMoney(v: number): string {
     return "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export default function ExpensesTab({ projectId, expenses: initialExpenses, onAddNew, currentUser, changeOrders, phases = [], canEditTax = false }: Props) {
+export default function ExpensesTab({ projectId, expenses: initialExpenses, onAddNew, currentUser, changeOrders, phases = [], canEditTax = false, jobOptions }: Props) {
     const [taxTarget, setTaxTarget] = useState<TaxPhaseExpense | null>(null);
+    const [moveTarget, setMoveTarget] = useState<Expense | null>(null);
     const [expenses, setExpenses] = useState<Expense[]>(initialExpenses);
     const [filter, setFilter] = useState("");
     const [statusFilter, setStatusFilter] = useState<"all" | "Pending" | "Reviewed">("all");
@@ -125,11 +133,19 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
 
     async function handleBulkDelete() {
         if (selectedIds.size === 0) return;
-        const n = selectedIds.size;
-        if (!confirm(`Delete ${n} expense${n === 1 ? "" : "s"}?`)) return;
         try {
-            const res = await deleteExpenses(Array.from(selectedIds));
-            toast.success(`Deleted ${res.deleted} expense${res.deleted === 1 ? "" : "s"}`);
+            const selected = expenses.filter(e => selectedIds.has(e.id));
+            const receiptCount = selected.filter(isReceiptBookedExpense).length;
+            const deletable = selected.length - receiptCount;
+            const s = (n: number) => (n === 1 ? "" : "s");
+            if (deletable === 0) { toast.error("These came from receipts, so they can't be deleted. Use Move to job on each one. If one is a double, tell Justin."); return; }
+            if (!confirm(receiptCount === 0
+                ? `Delete ${deletable} expense${s(deletable)}?`
+                : `Delete ${deletable} expense${s(deletable)}? ${receiptCount} came from receipts and will not be deleted.`)) return;
+            const res = await deleteExpenses(Array.from(selectedIds)); // send all; the server is the authority
+            toast.success(res.skippedFromReceipts > 0
+                ? `Deleted ${res.deleted} expense${s(res.deleted)}. ${res.skippedFromReceipts} came from receipts and were not deleted.`
+                : `Deleted ${res.deleted} expense${s(res.deleted)}`);
             setSelectedIds(new Set());
             await refreshExpenses();
         } catch (err: any) {
@@ -369,6 +385,8 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                                         </svg>
                                                     </a>
                                                 )}
+                                                {!isReceiptBookedExpense(expense) && (
+                                                <>
                                                 <input
                                                     type="file"
                                                     accept="image/*,application/pdf"
@@ -396,6 +414,8 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                                         </svg>
                                                     )}
                                                 </button>
+                                                </>
+                                                )}
                                             </div>
                                         </td>
                                         <td className="px-4 py-3 text-right whitespace-nowrap">
@@ -431,12 +451,15 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                                     {expense.needsTaxReview ? "Tax needs review" : "Tax & phase"}
                                                 </button>
                                             )}
-                                            {!expense.qbPurchaseId && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
+                                            {!expense.qbPurchaseId && !isReceiptBookedExpense(expense) && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
                                                 <button onClick={() => handleDelete(expense.id)} className="text-slate-400 hover:text-red-500 transition" title="Delete">
                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
                                                         <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
                                                     </svg>
                                                 </button>
+                                            )}
+                                            {isReceiptBookedExpense(expense) && !expense.invoiceId && !expense.invoicedAt && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
+                                                <button onClick={() => setMoveTarget(expense)} className="text-xs underline text-slate-400 hover:text-hui-primary transition">Move to job</button>
                                             )}
                                         </td>
                                     </tr>
@@ -458,6 +481,28 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                         // may have refused part of the change, and a hopeful
                         // local update would show an edit that did not happen.
                         setExpenses(await getExpenses(projectId) as unknown as Expense[]);
+                    }}
+                />
+            )}
+
+            {moveTarget && (
+                <MoveToJobModal
+                    expenseId={moveTarget.id}
+                    vendor={moveTarget.vendor}
+                    amountLabel={fmtMoney(num(moveTarget.amount))}
+                    dateLabel={moveTarget.date
+                        ? new Date(moveTarget.date).toLocaleDateString(
+                            undefined,
+                            moveTarget.qbPurchaseId ? { timeZone: "UTC" } : undefined,
+                        )
+                        : "—"}
+                    changeOrderLabel={moveTarget.changeOrder?.code ?? null}
+                    projectId={projectId}
+                    jobOptions={jobOptions}
+                    onClose={() => setMoveTarget(null)}
+                    onMoved={async () => {
+                        setMoveTarget(null);
+                        await refreshExpenses();
                     }}
                 />
             )}
