@@ -33,10 +33,10 @@ function stripComments(source: string): string {
     .replace(/(^|[^:])\/\/[^\n]*/g, (m, lead) => lead + " ".repeat(m.length - lead.length));
 }
 
-function expectGuardBeforeDatabase(source: string, actionName: string, guard: string) {
+function expectGuardBeforeDatabase(source: string, actionName: string, guard: string, databaseMarker = "prisma.") {
   const action = exportSource(source, actionName);
   const guardIndex = action.indexOf(guard);
-  const databaseIndex = action.indexOf("prisma.");
+  const databaseIndex = action.indexOf(databaseMarker);
   expect(guardIndex, `${actionName} must call ${guard}`).toBeGreaterThanOrEqual(0);
   if (databaseIndex >= 0) {
     expect(guardIndex, `${actionName} must authorize before database access`).toBeLessThan(databaseIndex);
@@ -152,7 +152,17 @@ test("all staff financial actions authorize inside the exported action", () => {
     "getProjectInvoices", "getAllInvoices", "issueInvoice", "createRetainer",
     "updateRetainer", "deleteRetainer",
   ];
-  for (const name of invoices) expectGuardBeforeDatabase(source, name, "await assertInvoicePermission(");
+  for (const name of invoices) {
+    // deleteInvoice's transaction body was extracted into deleteInvoiceCore
+    // (billing-core.ts) so it could be unit-tested without a next-auth
+    // session. Without this, action.indexOf("prisma.") finds nothing in
+    // deleteInvoice's own body, databaseIndex stays -1, and
+    // expectGuardBeforeDatabase's `if (databaseIndex >= 0)` SKIPS the
+    // "authorize before database access" assertion entirely instead of
+    // checking it — a silent pass, not a real one.
+    const databaseMarker = name === "deleteInvoice" ? "deleteInvoiceCore(" : "prisma.";
+    expectGuardBeforeDatabase(source, name, "await assertInvoicePermission(", databaseMarker);
+  }
 
   const changeOrders = ["createChangeOrder", "getChangeOrders", "getChangeOrder", "deleteChangeOrder"];
   for (const name of changeOrders) expectGuardBeforeDatabase(source, name, "await assertChangeOrderPermission(");

@@ -2840,28 +2840,11 @@ export async function deleteInvoice(invoiceId: string) {
     // Guard failures return { error } instead of throwing: production masks
     // thrown server-action messages, so the client would never see the reason.
     try {
-    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        await lockMoneyParents(tx, { invoiceId });
-        const invoice = await tx.invoice.findUnique({
-            where: { id: invoiceId },
-            include: { payments: true },
-        });
-        if (!invoice) throw new Error("Invoice not found");
-
-        const hasPaidPayments = invoice.payments.some((p) => p.status === "Paid");
-        if (hasPaidPayments) throw new Error("Cannot delete an invoice with recorded payments");
-        if (invoice.status === "Paid" || invoice.status === "Partially Paid") {
-            throw new Error("Cannot delete a paid or partially paid invoice");
-        }
-        const { assertInvoiceHasNoChangeOrderBilling } = await import("./billing-core");
-        await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "delete");
-
-        await tx.invoice.delete({ where: { id: invoiceId } });
-        return invoice.projectId;
-    }));
-    revalidatePath("/projects/" + projectId + "/invoices");
-    revalidatePath("/invoices");
-    return { success: true as const, projectId };
+        const { deleteInvoiceCore } = await import("./billing-core");
+        const projectId = await deleteInvoiceCore(invoiceId);
+        revalidatePath("/projects/" + projectId + "/invoices");
+        revalidatePath("/invoices");
+        return { success: true as const, projectId };
     } catch (e: any) {
         return { success: false as const, error: e?.message || "Cannot delete this invoice" };
     }

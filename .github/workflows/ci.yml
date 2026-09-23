@@ -84,6 +84,15 @@ jobs:
         env:
           QBO_CLIENT_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # Same shape as the Client row lock proof above: stageProgressBillingToQuickBooksCore's
+      # real QuickBooks claim is a bare, lock-free prisma.progressBilling.updateMany, so only
+      # deleteInvoiceCore's own SELECT ... FOR UPDATE on that row can exclude it. A fake tx
+      # cannot prove Postgres actually blocks; this runs the real interleaving.
+      - name: Prove the delete-invoice QuickBooks guard's row locks actually block
+        run: npx tsx --test tests/delete-invoice-qbo-guard-db.test.ts
+        env:
+          DELETE_INVOICE_QBO_GUARD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Verify one-record bank image repair transaction
         run: npx tsx --test tests/bank-image-1027-repair-db.test.ts
         env:
