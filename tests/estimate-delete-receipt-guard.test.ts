@@ -28,6 +28,19 @@
  * fakePrisma.estimate no longer exposes `delete` at all, so a regression that
  * moves it back out fails loudly instead of silently passing.
  *
+ * ROUND 4 (2026-09-23, Codex round 2 nits): two fixes, no behavior change to
+ * the guard itself. (1) The refusal path used to bump the evidence epoch even
+ * though nothing was deleted — it now bumps only inside the `receiptBookedCount
+ * === 0` branch, alongside the deletes it actually describes. (2) The
+ * pre-existing early gate above (the unlocked expense/time-entry count) used
+ * to tell the user to "delete these entries first" even when the linked
+ * expense was receipt-booked — since PR #534 that row's own UI only offers
+ * "Move to job", so the instruction pointed nowhere. The early gate now runs
+ * the same receipt-booked predicate the locked check uses and returns the
+ * plain receipt message when it finds one; fakePrisma.expense.count
+ * distinguishes the two query shapes so both paths can be driven
+ * independently.
+ *
  * Prisma, next-auth and the permission reader are patched at require() time —
  * same shape as tests/expense-delete-scope.test.ts and
  * tests/job-variance-db.test.ts. No mock.module: CI is Node 20.
@@ -42,6 +55,8 @@ let opLog: string[] = [];
 let estimateRow: Record<string, unknown> | null;
 let earlyExpenseCount: number;
 let earlyTimeEntryCount: number;
+/** What the early gate's own receipt-booked-expense count (nit 2) returns. */
+let earlyReceiptBookedCount: number;
 let budgetRow: Record<string, unknown> | null;
 /** What the NEW guard's `tx.expense.count(...)` (inside the lock) returns. */
 let txReceiptBookedCount: number;
@@ -99,9 +114,13 @@ const fakePrisma: any = {
         // quietly succeeding outside the lock.
     },
     expense: {
-        // The EARLY, unlocked count at the top of deleteEstimate — unrelated
-        // to the tx-scoped guard this suite is about.
-        count: async () => earlyExpenseCount,
+        // The EARLY, unlocked counts at the top of deleteEstimate — unrelated
+        // to the tx-scoped guard this suite is about. Two different shapes
+        // hit this same fake: the plain linked-expense count, and (nit 2) the
+        // receipt-booked-only count the early gate now also runs. Route on
+        // the where clause the way the real Prisma call is distinguished.
+        count: async (args: { where?: { receiptIntake?: unknown } } = {}) =>
+            args.where?.receiptIntake ? earlyReceiptBookedCount : earlyExpenseCount,
     },
     timeEntry: {
         count: async () => earlyTimeEntryCount,
@@ -164,6 +183,7 @@ beforeEach(() => {
     estimateRow = { projectId: "job-1", leadId: null, status: "Draft" };
     earlyExpenseCount = 0;
     earlyTimeEntryCount = 0;
+    earlyReceiptBookedCount = 0;
     budgetRow = null;
     txReceiptBookedCount = 0;
     txCountArgs = null;
@@ -226,6 +246,41 @@ test("unchanged behavior: the pre-existing linked-expense count still refuses fi
     assert.deepEqual(opLog, [], "the guarded transaction never ran at all");
 });
 
+test("nit 2: the early gate is receipt-aware — returns the plain receipt message when a linked expense came from a receipt", async () => {
+    earlyExpenseCount = 1;
+    earlyReceiptBookedCount = 1;
+    const result = await deleteEstimate("est-1");
+
+    assert.deepEqual(result, {
+        success: false,
+        error: "This estimate has 1 expense(s) from receipts, so it can't be deleted. Archive it instead.",
+    });
+    assert.deepEqual(opLog, [], "the guarded transaction never ran at all — the early gate caught it first");
+});
+
+test("nit 2: the early gate's receipt message counts only receipt-booked expenses, not every linked expense", async () => {
+    earlyExpenseCount = 3;
+    earlyReceiptBookedCount = 2;
+    const result = await deleteEstimate("est-1");
+
+    assert.deepEqual(result, {
+        success: false,
+        error: "This estimate has 2 expense(s) from receipts, so it can't be deleted. Archive it instead.",
+    });
+});
+
+test("nit 2: a linked time entry with no receipt-booked expense still gets the old, plain message", async () => {
+    earlyTimeEntryCount = 1;
+    earlyReceiptBookedCount = 0;
+    const result = await deleteEstimate("est-1");
+
+    assert.deepEqual(result, {
+        success: false,
+        error: "Cannot delete estimate because it has linked 1 time entry/entries. Please delete these entries first.",
+    });
+    assert.deepEqual(opLog, [], "the guarded transaction never ran at all");
+});
+
 test("the receipt check runs inside the lock, after it, and before any delete", async () => {
     txReceiptBookedCount = 0;
     budgetRow = { id: "budget-1" };
@@ -247,13 +302,17 @@ test("the receipt check runs inside the lock, after it, and before any delete", 
     );
 });
 
-test("when refused, the transaction still closes out the lock and epoch bump normally, and no delete runs", async () => {
+test("when refused, the transaction still closes out the lock normally, no delete runs, and (nit 1) the epoch is not bumped", async () => {
     // A refusal is not a thrown transaction failure — it is a plain early
-    // return from inside the locked body, so the transaction commits.
+    // return from inside the locked body, so the transaction commits. But
+    // nothing was deleted, so nothing about receipt evidence changed either —
+    // bumping the epoch here would only restart the missing-receipt sweep for
+    // no reason (Codex round 2 nit).
     txReceiptBookedCount = 3;
     budgetRow = { id: "budget-1" };
     await deleteEstimate("est-1");
 
-    assert.deepEqual(opLog, ["lock", "tx.expense.count", "epoch-bump"]);
+    assert.deepEqual(opLog, ["lock", "tx.expense.count"]);
+    assert.ok(!opLog.includes("epoch-bump"), `a refusal must not bump the evidence epoch: ${opLog.join(" ")}`);
     assert.ok(!opLog.some(isDelete), `no delete of any kind ran: ${opLog.join(" ")}`);
 });

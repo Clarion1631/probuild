@@ -5493,6 +5493,21 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
     });
 
     if (expenseCount > 0 || timeEntryCount > 0) {
+        // Codex round 2 nit (2026-09-23): receipt-booked expenses only offer
+        // "Move to job" in their own UI since PR #534, not delete -- so
+        // "Please delete these entries first" sends the user somewhere that no
+        // longer exists for them. Same predicate the locked check below uses
+        // (qbPurchaseId null, a linked ReceiptIntake). This is a message fix
+        // only; the locked in-transaction check stays the real guard.
+        const earlyReceiptBookedCount = await prisma.expense.count({
+            where: { estimateId, qbPurchaseId: null, receiptIntake: { isNot: null } },
+        });
+        if (earlyReceiptBookedCount > 0) {
+            return {
+                success: false,
+                error: `This estimate has ${earlyReceiptBookedCount} expense(s) from receipts, so it can't be deleted. Archive it instead.`,
+            };
+        }
         const parts = [];
         if (expenseCount > 0) parts.push(`${expenseCount} expense(s)`);
         if (timeEntryCount > 0) parts.push(`${timeEntryCount} time entry/entries`);
@@ -5549,8 +5564,11 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
             await tx.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
             await tx.expense.deleteMany({ where: { estimateId } });
             await tx.estimate.delete({ where: { id: estimateId } });
+            // Codex round 2 nit (2026-09-23): only bump the epoch when a delete
+            // actually ran. A refusal changes no evidence, so bumping here was
+            // needlessly restarting the missing-receipt sweep on every retry.
+            await bumpReceiptEvidenceEpoch(tx);
         }
-        await bumpReceiptEvidenceEpoch(tx);
     });
     if (receiptBookedCount > 0) {
         return {
