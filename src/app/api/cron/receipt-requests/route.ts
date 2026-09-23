@@ -1974,6 +1974,39 @@ export async function transitionCompletedOpenPass(
     await clearOpenCheckpoint();
 }
 
+/**
+ * ONE PROGRESS LINE PER LEASED INVOCATION (cheap-sweep-restart-spec.md §14.7).
+ *
+ * Ids and counts only — never a bank-line id or an issue's details. `GET`
+ * creates this before its `try`, `runSweep` fills it in as the cycle starts
+ * and both passes and the fence run, and the `finally` logs it exactly once,
+ * whichever way the invocation exits, before the lease that made it the only
+ * writer is released.
+ */
+interface SweepProgress {
+    cycleId: string | null;
+    plannerDay: string | null;
+    phase: SweepPhase | null;
+    outcome: "ok" | "deferred" | "cursor-write-failed" | "error";
+    openBatches: number;
+    batches: number;
+    bankLines: number;
+    opened: number;
+    closed: number;
+    touched: number;
+    errors: number;
+    contended: number;
+    undecided: number;
+    undecidedLines: number;
+    replans: number;
+    setupMs: number;
+    openMs: number;
+    lineMs: number;
+    fenceMs: number;
+    certified: boolean;
+    reason: string | null;
+}
+
 export async function GET(request: Request) {
     const budget = createSweepBudget(Date.now(), Date.now, RUN_BUDGET_MS);
     if (!isCronAuthorized(request)) {
@@ -2031,6 +2064,29 @@ export async function GET(request: Request) {
     if (!(await takeLease(LEASE_KEY, RUN_LEASE_MS, now, leaseToken))) {
         return NextResponse.json({ ok: true, skipped: "already-running" });
     }
+    const progress: SweepProgress = {
+        cycleId: null,
+        plannerDay: null,
+        phase: null,
+        outcome: "ok",
+        openBatches: 0,
+        batches: 0,
+        bankLines: 0,
+        opened: 0,
+        closed: 0,
+        touched: 0,
+        errors: 0,
+        contended: 0,
+        undecided: 0,
+        undecidedLines: 0,
+        replans: 0,
+        setupMs: 0,
+        openMs: 0,
+        lineMs: 0,
+        fenceMs: 0,
+        certified: false,
+        reason: null,
+    };
     try {
         /**
          * A SCHEDULED FULL RUN STARTS A FRESH CYCLE, CURSORS AND ALL (round-42
@@ -2071,9 +2127,10 @@ export async function GET(request: Request) {
             // not a statement about the work in progress.
             await writePhase("open-issues", undefined, null, prisma, null);
         }
-        return await runSweep(now, startingFullRun ? "open-issues" : resumePhase, startingFullRun, budget);
+        return await runSweep(now, startingFullRun ? "open-issues" : resumePhase, startingFullRun, budget, progress);
     } catch (error) {
         if (isSweepDeferredError(error)) {
+            progress.outcome = "deferred";
             const phase = await preserveDeferredSweepPhase(readPhase, phase => writePhase(phase));
             return NextResponse.json({ ok: true, phase, deferred: true, moreToProcess: true });
         }
@@ -2083,11 +2140,14 @@ export async function GET(request: Request) {
         // rather than reporting ok:true while the sweep silently redoes the
         // same batch forever.
         if (error instanceof CursorWriteError) {
+            progress.outcome = "cursor-write-failed";
             console.error("[cron/receipt-requests]", error.message);
             return NextResponse.json({ ok: false, error: "cursor-write-failed", detail: error.message }, { status: 500 });
         }
+        progress.outcome = "error";
         throw error;
     } finally {
+        console.log("[cron/receipt-requests] progress", JSON.stringify({ ...progress, totalMs: Date.now() - now.getTime() }));
         await releaseLease(LEASE_KEY, leaseToken);
     }
 }
@@ -2102,6 +2162,8 @@ async function runSweep(
      */
     clearFullRunRequestOnStart = false,
     budget: SweepBudget = createSweepBudget(Date.now()),
+    /** Filled in as this invocation runs (cheap-sweep-restart §14.7); `GET` logs it. */
+    progress?: SweepProgress,
 ) {
     // The UTC day THIS invocation's planner actually used (cheap-sweep-restart
     // §14.5, Codex round 2 blocker 3): `now` is what every processBatch and
@@ -2110,6 +2172,9 @@ async function runSweep(
     const plannerDay = now.toISOString().slice(0, 10);
     const windowStart = registerWindowStartYmd(now, LOOKBACK_DAYS);
     const windowEnd = now.toISOString().slice(0, 10);
+    // SETUP, for the progress log (§14.7): from here through the issue
+    // snapshot that both passes read, before either pass does its own work.
+    const setupStart = Date.now();
 
     /**
      * THE CYCLE'S SNAPSHOT, TAKEN AT THE CYCLE'S START (Codex PR #443 gate
@@ -2195,6 +2260,20 @@ async function runSweep(
     if (cycle === null) {
         cycle = { id: randomUUID(), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY, plannerDay };
         await writeCycle(cycle);
+        // ONE LINE PER CYCLE (§14.7), not per invocation: `progress` below
+        // covers every leased invocation; this covers only the moment a
+        // cycle actually starts — fresh, restarted, or a scheduled full run.
+        console.log("[cron/receipt-requests] cycle-start", JSON.stringify({
+            cycleId: cycle.id,
+            plannerDay,
+            reason: clearFullRunRequestOnStart ? "full-run" : restarted ? "restart" : "none",
+            epoch: snapshotEpoch,
+            evidenceEpoch: snapshotEvidenceEpoch,
+        }));
+    }
+    if (progress) {
+        progress.cycleId = cycle.id;
+        progress.plannerDay = plannerDay;
     }
     /**
      * ONLY NOW is the full-run request discharged (round-46 gate, finding 3).
@@ -2214,6 +2293,9 @@ async function runSweep(
     // bulking is worth losing that.
     budget.check();
     const { openIssues, resolvedIssueKeys, detailsByKey } = await loadIssueSnapshot();
+    // Setup ends here, for the progress log (§14.7): everything below is one
+    // of the two passes or the fence.
+    const setupMs = Date.now() - setupStart;
 
     // OLDEST-FIRST, FROM A DURABLE CURSOR, IN TIME-BUDGETED BATCHES.
     //
@@ -2256,6 +2338,8 @@ async function runSweep(
     // How many components had to be replanned because a sibling moved while the
     // plan was being made. Reported: a run full of them is a run racing a human.
     let replans = 0;
+    // OPEN PASS timing, for the progress log (§14.7).
+    const openStart = Date.now();
 
     while (startPhase !== "lines" && !budget.expired()) {
         const page = await prisma.reviewIssue.findMany({
@@ -2370,6 +2454,7 @@ async function runSweep(
             () => writeOpenCursor(null),
         );
     }
+    const openMs = Date.now() - openStart;
 
     let cursor = await readCursor();
     const totals: ReceiptRequestApplySummary = {
@@ -2385,6 +2470,8 @@ async function runSweep(
     let undecided = openUndecided;
     let lineContended = 0;
     let exhausted = false;
+    // LINE PASS timing, for the progress log (§14.7).
+    const lineStart = Date.now();
 
     // COMPONENTS FIRST, THEN PAGES — never the other way round.
     //
@@ -2558,6 +2645,7 @@ async function runSweep(
         });
         if (unitResult.deferred) { deferred = true; break; }
     }
+    const lineMs = Date.now() - lineStart;
 
     // A finished sweep starts over from the oldest line next time — that pass
     // is what re-checks everything for CLOSES.
@@ -2635,12 +2723,17 @@ async function runSweep(
     // judged at all. Certifying over it is exactly the same false claim.
     const undecidedBlocking = (cycle.undecidedLines?.length ?? 0) > 0;
     const certifiable = computedPhase === "done" && !bankPullStale && !undecidedBlocking;
+    // FENCE timing, for the progress log (§14.7).
+    const fenceStart = Date.now();
     let decision: { phase: SweepPhase; complete: boolean; blockedReason: string | null; ledgerMoved: boolean };
     if (certifiable) {
         try {
             const fenceOptions = budget.transactionOptions();
+            // Captured once, so the completion instant the fence commits is
+            // exactly what a "certified" log line (§14.7) reports below.
+            const completedAt = new Date();
             decision = await fenceAndWritePhase(
-                { snapshotEpoch, snapshotEvidenceEpoch, computedPhase, bankPullStale, now: new Date() },
+                { snapshotEpoch, snapshotEvidenceEpoch, computedPhase, bankPullStale, now: completedAt },
                 fn => prisma.$transaction(async tx => fn({
                     lockEpoch: () => lockBankLedgerEpoch(tx),
                     // The evidence lock FIRST, then its counter — same order
@@ -2669,6 +2762,14 @@ async function runSweep(
                         writePhase(phase, completedAt, blockedReason, tx, cycle!.id),
                 }), { ...fenceOptions, timeout: Math.min(fenceOptions.timeout, FENCE_TX_TIMEOUT_MS) }),
             );
+            // cycle!: same reason as the writePhase callback above (§14.6).
+            if (decision.complete) {
+                console.log("[cron/receipt-requests] certified", JSON.stringify({
+                    cycleId: cycle!.id,
+                    plannerDay,
+                    completedAt: completedAt.toISOString(),
+                }));
+            }
         } catch (error) {
             /**
              * THE FENCE ITSELF FAILED — a lock wait that ran out, or the marker
@@ -2689,6 +2790,7 @@ async function runSweep(
         decision = { ...sweepCompletionDecision({ computedPhase, bankPullStale, undecidedBlocking }), ledgerMoved: false };
         await writePhase(decision.phase, undefined, decision.blockedReason);
     }
+    const fenceMs = Date.now() - fenceStart;
     await clearCertifiedSweepCheckpoint(decision.complete, () => writeCursor(null));
     const ledgerMoved = decision.ledgerMoved;
     const fenceFailed = decision.blockedReason === LEDGER_FENCE_FAILED_REASON;
@@ -2740,6 +2842,28 @@ async function runSweep(
         console.error("[cron/receipt-requests]", JSON.stringify(result));
     } else if (totals.opened > 0 || totals.closed > 0) {
         console.log("[cron/receipt-requests]", JSON.stringify(result));
+    }
+    // The counts from `result`, for the progress log (§14.7). Ids and counts
+    // only — never `result.failedTargets` or `result.cursor`.
+    if (progress) {
+        progress.phase = result.phase;
+        progress.openBatches = result.openBatches;
+        progress.batches = result.batches;
+        progress.bankLines = result.bankLines;
+        progress.opened = result.opened;
+        progress.closed = result.closed;
+        progress.touched = result.touched;
+        progress.errors = result.errors;
+        progress.contended = result.contended;
+        progress.undecided = result.undecided;
+        progress.undecidedLines = result.undecidedLines;
+        progress.replans = result.replans;
+        progress.setupMs = setupMs;
+        progress.openMs = openMs;
+        progress.lineMs = lineMs;
+        progress.fenceMs = fenceMs;
+        progress.certified = decision.complete;
+        progress.reason = result.reason ?? null;
     }
     // 500 when anything failed, so the platform surfaces it. Whatever committed
     // stays committed and the cursor did not move past the failure.
