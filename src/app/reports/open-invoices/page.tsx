@@ -91,48 +91,50 @@ export default async function OpenInvoicesPage({
                             <span className="text-sm font-semibold text-hui-textMain">{bucket.label} days</span>
                             <span className="ml-2 text-sm text-hui-textMuted">({bucket.rows.length} item{bucket.rows.length !== 1 ? "s" : ""} · {formatCurrency(bucket.cents / 100)})</span>
                         </div>
-                        <table className="w-full text-sm">
-                            <thead>
-                                <tr className="text-left text-xs text-hui-textMuted uppercase tracking-wide border-b border-hui-border">
-                                    <th className="px-4 py-2">Invoice #</th>
-                                    <th className="px-4 py-2">Project</th>
-                                    <th className="px-4 py-2">Client</th>
-                                    <th className="px-4 py-2">Milestone</th>
-                                    <th className="px-4 py-2">Billed</th>
-                                    <th className="px-4 py-2">Due</th>
-                                    <th className="px-4 py-2 text-right">Amount</th>
-                                    <th className="px-4 py-2">Status</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {bucket.rows.map((row, i) => (
-                                    <tr key={`${row.invoiceId}-${row.item.id ?? i}`} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
-                                        <td className="px-4 py-3 font-mono text-xs">
-                                            {row.project ? (
-                                                <Link href={`/projects/${row.project.id}/invoices/${row.invoiceId}`} className="text-hui-primary hover:underline">{row.code}</Link>
-                                            ) : row.code}
-                                        </td>
-                                        <td className="px-4 py-3 text-hui-textMain">
-                                            {row.project ? <Link href={`/projects/${row.project.id}`} className="hover:underline">{row.project.name}</Link> : "—"}
-                                        </td>
-                                        <td className="px-4 py-3 text-hui-textMuted">{row.client?.name ?? "—"}</td>
-                                        <td className="px-4 py-3 text-hui-textMain">
-                                            {row.item.label}
-                                            {!row.item.requested && <div className="text-xs text-hui-textMuted">No payment request on record</div>}
-                                            {row.item.progressBillingCode && <div className="text-xs text-hui-textMuted">Progress billing {row.item.progressBillingCode}</div>}
-                                        </td>
-                                        <td className="px-4 py-3 text-hui-textMuted">{fmtDate(row.item.billedAt, timeZone)}</td>
-                                        <td className="px-4 py-3 text-hui-textMuted">{row.item.dueDate ? fmtDate(row.item.dueDate, timeZone) : "Net 30"}</td>
-                                        <td className="px-4 py-3 text-right font-semibold text-hui-textMain">{formatCurrency(row.item.cents / 100)}</td>
-                                        <td className="px-4 py-3">
-                                            <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${row.item.overdue ? "bg-red-100 text-red-700" : "bg-yellow-100 text-yellow-700"}`}>
-                                                {row.item.overdue ? "Overdue" : "Current"}
-                                            </span>
-                                        </td>
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="text-left text-xs text-hui-textMuted uppercase tracking-wide border-b border-hui-border">
+                                        <th className="px-4 py-2">Invoice #</th>
+                                        <th className="px-4 py-2">Project</th>
+                                        <th className="px-4 py-2">Client</th>
+                                        <th className="px-4 py-2">Milestone</th>
+                                        <th className="px-4 py-2">Billed</th>
+                                        <th className="px-4 py-2">Due</th>
+                                        <th className="px-4 py-2 text-right">Amount</th>
+                                        <th className="px-4 py-2">Status</th>
                                     </tr>
-                                ))}
-                            </tbody>
-                        </table>
+                                </thead>
+                                <tbody>
+                                    {bucket.rows.map((row, i) => (
+                                        <tr key={`${row.invoiceId}-${row.item.id ?? i}`} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
+                                            <td className="px-4 py-3 font-mono text-xs">
+                                                {row.project ? (
+                                                    <Link href={`/projects/${row.project.id}/invoices/${row.invoiceId}`} className="text-hui-primary hover:underline">{row.code}</Link>
+                                                ) : row.code}
+                                            </td>
+                                            <td className="px-4 py-3 text-hui-textMain">
+                                                {row.project ? <Link href={`/projects/${row.project.id}`} className="hover:underline">{row.project.name}</Link> : "—"}
+                                            </td>
+                                            <td className="px-4 py-3 text-hui-textMuted">{row.client?.name ?? "—"}</td>
+                                            <td className="px-4 py-3 text-hui-textMain">
+                                                {row.item.label}
+                                                {!row.item.requested && <div className="text-xs text-hui-textMuted">No payment request on record</div>}
+                                                {row.item.progressBillingCode && <div className="text-xs text-hui-textMuted">Progress billing {row.item.progressBillingCode}</div>}
+                                            </td>
+                                            <td className="px-4 py-3 text-hui-textMuted">{fmtDate(row.item.billedAt, timeZone)}</td>
+                                            <td className="px-4 py-3 text-hui-textMuted">{row.item.dueDate ? fmtDate(row.item.dueDate, timeZone) : "Net 30"}</td>
+                                            <td className="px-4 py-3 text-right font-semibold text-hui-textMain">{formatCurrency(row.item.cents / 100)}</td>
+                                            <td className="px-4 py-3">
+                                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${row.item.overdue ? "bg-red-100 text-red-700" : "bg-yellow-100 text-yellow-700"}`}>
+                                                    {row.item.overdue ? "Overdue" : "Current"}
+                                                </span>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
                 ))
             )}

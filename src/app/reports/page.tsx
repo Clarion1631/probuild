@@ -36,7 +36,7 @@ const REPORT_SECTIONS = [
             },
             {
                 title: "Open Invoices",
-                description: "Billed milestones that haven't been paid yet, aged from when each was billed (0–30/31–60/61–90/90+ day buckets).",
+                description: "Billed milestones that haven't been paid yet, aged from when each was billed (0–30/31–60/61–90/91+ day buckets).",
                 href: "/reports/open-invoices",
             },
             {

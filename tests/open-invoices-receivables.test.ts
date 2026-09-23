@@ -298,7 +298,7 @@ test("bucket boundaries: 30/31, 60/61, 90/91, and a negative ageDays", () => {
     assert.equal(bucketLabelForAge(60), "31–60");
     assert.equal(bucketLabelForAge(61), "61–90");
     assert.equal(bucketLabelForAge(90), "61–90");
-    assert.equal(bucketLabelForAge(91), "90+");
+    assert.equal(bucketLabelForAge(91), "91+");
     assert.equal(bucketLabelForAge(-5), "0–30");
 });
 

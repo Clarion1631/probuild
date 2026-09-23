@@ -57,7 +57,7 @@ export default function OpenInvoicesFiltersForm({
             </div>
 
             <div>
-                <label className="block text-xs text-hui-textMuted mb-1">Status</label>
+                <label className="block text-xs text-hui-textMuted mb-1">Invoice status</label>
                 <div className="flex flex-wrap gap-2">
                     {STATUS_OPTIONS.map(s => {
                         const active = statuses.has(s);
@@ -69,7 +69,7 @@ export default function OpenInvoicesFiltersForm({
                         );
                     })}
                 </div>
-                <p className="text-[11px] text-hui-textMuted mt-1">Leave all off to show every status.</p>
+                <p className="text-[11px] text-hui-textMuted mt-1">Filters on the invoice&apos;s own status. Leave all off to show every status.</p>
             </div>
 
             <div className="flex justify-end gap-2 pt-2 border-t border-hui-border">

@@ -63,7 +63,7 @@ export interface OpenInvoiceItemRow {
     item: BilledItem;
 }
 
-const OPEN_INVOICE_BUCKETS = ["0–30", "31–60", "61–90", "90+"] as const;
+const OPEN_INVOICE_BUCKETS = ["0–30", "31–60", "61–90", "91+"] as const;
 export type OpenInvoiceBucketLabel = (typeof OPEN_INVOICE_BUCKETS)[number];
 
 export interface OpenInvoicesSummary {
@@ -79,7 +79,7 @@ function bucketForAge(ageDays: number): OpenInvoiceBucketLabel {
     if (ageDays <= 30) return "0–30"; // negative ages (billed "in the future") land here too
     if (ageDays <= 60) return "31–60";
     if (ageDays <= 90) return "61–90";
-    return "90+";
+    return "91+";
 }
 
 /**
