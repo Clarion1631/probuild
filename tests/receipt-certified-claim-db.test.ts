@@ -25,7 +25,7 @@ import { closeRequestsSatisfiedBy } from "../src/lib/receipt-intake/evidence-clo
 import { writeReceiptOwnerLocked } from "../src/lib/receipt-owner-assignment";
 import { readReceiptEvidenceEpoch, readReceiptOwnerEpoch } from "../src/lib/receipt-evidence-lock";
 import { readBankLedgerEpoch } from "../src/lib/bank-ledger-epoch";
-import { recordCardOnIssues, type RecordableCard } from "../src/lib/receipt-card-history";
+import { recordCardOnIssues, type RecordableCard, type CardHistoryClient } from "../src/lib/receipt-card-history";
 import { CYCLE_KEY, SWEEP_MARKER_KEY, formatSweepMarker } from "../src/lib/receipt-sweep-marker";
 import { RECEIPT_REQUEST_TARGET_TYPE } from "../src/lib/receipt-requests";
 import { hashReasonCodes, canonicalizeReasonCodes } from "../src/lib/review-alert-reasons";
@@ -253,7 +253,7 @@ test("(c) a concurrent writeReceiptOwnerLocked blocks while the claim's transact
     await cleanup();
 });
 
-test("(d) a courtesy clear and recordCardOnIssues over two issues in reverse order both finish without a deadlock error", { skip }, async () => {
+test("(d) a courtesy clear over two issues and recordCardOnIssues over the same two in reverse order both finish without a deadlock error", { skip }, async () => {
     await cleanup();
     const targetD1 = `${PREFIX}line-d1`;
     const targetD2 = `${PREFIX}line-d2`;
@@ -262,12 +262,18 @@ test("(d) a courtesy clear and recordCardOnIssues over two issues in reverse ord
 
     const card: RecordableCard = {
         items: [
-            // REVERSE of creation order: issue2 first, issue1 second — so
-            // card history's own transaction locks issue2's row, THEN reaches
-            // for issue1's, while the courtesy clear below reaches for
-            // issue1's row from the other side. Holding exactly one issue row
-            // (§14.0) is what keeps this from ever deadlocking, whichever
-            // order either side reaches for it in.
+            // REVERSE of the clear's own sorted target order below: card
+            // history's transaction locks issue2's row first, then reaches
+            // for issue1's, while the clear reaches for issue1's row first —
+            // in its OWN, separate transaction (§14.10) — then issue2's, in a
+            // second, separate transaction. Under the design §14.10
+            // superseded (one transaction holding every queued issue row),
+            // this is exactly the "holds 1, wants 2" / "holds 2, wants 1"
+            // cycle Postgres's deadlock detector aborts one side of. Holding
+            // exactly one issue row per clear transaction (§14.0) removes the
+            // cycle: by the time either side asks for a row it does not
+            // already hold, the other side either never wanted anything it
+            // is holding, or has already let go of it.
             { n: 1, fingerprint: "fp-2", date: "2026-09-01", vendor: "ARCO", cents: 1_000, amount: "10.00", cardTail: null, issueId: issue2.id, targetKey: targetD2 },
             { n: 2, fingerprint: "fp-1", date: "2026-09-01", vendor: "ARCO", cents: 1_000, amount: "10.00", cardTail: null, issueId: issue1.id, targetKey: targetD1 },
         ],
@@ -275,26 +281,85 @@ test("(d) a courtesy clear and recordCardOnIssues over two issues in reverse ord
         requestId: `${PREFIX}req-d`,
     };
 
+    // Forces the interleaving: pause card history's own transaction right
+    // after its updateMany has locked issue2's row, and right before it
+    // reads issue1's — a wrapped CLIENT, not an elapsed-time guess. Same
+    // idiom as holdOpenAfterBody above, except the hold point is mid-loop
+    // rather than after the whole body.
+    let releaseHistory: () => void = () => {};
+    const historyReleased = new Promise<void>(resolve => { releaseHistory = resolve; });
+    let signalHolding: () => void = () => {};
+    const historyHolding = new Promise<void>(resolve => { signalHolding = resolve; });
+
+    function pauseBeforeIssue1Read(real: CardHistoryClient): CardHistoryClient {
+        return {
+            reviewIssue: {
+                findUnique: async (args: any) => {
+                    if (args?.where?.id === issue1.id) {
+                        signalHolding();
+                        await historyReleased;
+                    }
+                    return real.reviewIssue.findUnique(args);
+                },
+                updateMany: (args: any) => real.reviewIssue.updateMany(args),
+            },
+        } as unknown as CardHistoryClient;
+    }
+
     const historyPromise = otherDb!.$transaction(
-        tx => recordCardOnIssues(card, "spaces/AAA/threads/BBB", "spaces/AAA/threads/BBB/messages/CCC", new Date(), tx, "report"),
+        tx => recordCardOnIssues(
+            card, "spaces/AAA/threads/BBB", "spaces/AAA/threads/BBB/messages/CCC", new Date(),
+            pauseBeforeIssue1Read(tx), "report",
+        ),
         { timeout: 20_000 },
     );
+
+    // Do not start the clear until history is actually parked holding
+    // issue2's lock — otherwise this proves nothing (same reasoning as (c)
+    // above).
+    await historyHolding;
+
     const clearPromise = closeRequestsSatisfiedBy(
         { totalCents: 1_000, txnDate: pacificToday(), bookedOn: pacificToday() },
         {
-            findLines: async () => [{ id: targetD1 }],
-            openIssueKeys: async () => new Map([[targetD1, issue1.id]]),
+            findLines: async () => [{ id: targetD1 }, { id: targetD2 }],
+            openIssueKeys: async () => new Map([[targetD1, issue1.id], [targetD2, issue2.id]]),
             recompute: async () => [],
         },
     );
 
-    // Neither promise may reject — a real Postgres deadlock (40P01) would
-    // throw from whichever side Postgres chose as the victim.
-    const [historyResult, clearResult] = await Promise.all([historyPromise, clearPromise]);
+    // Give the clear time to finish issue1 (uncontended — history has not
+    // reached it yet) and then block waiting on issue2, which history still
+    // holds. Comfortably under the clear's own 4s lock_timeout; Postgres's
+    // 1s deadlock_timeout would already have fired had the pre-§14.10 design
+    // (one transaction holding every queued issue row) been in play.
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+    releaseHistory();
 
-    assert.equal(historyResult.lostRaces, 0, "no lost CAS — the two transactions serialized on issue1's row rather than colliding");
-    assert.equal(historyResult.recorded, 2);
-    assert.deepEqual(clearResult.cleared, [targetD1]);
+    // Neither side may reject — a real Postgres deadlock (40P01) throws from
+    // whichever side Postgres chose as the victim.
+    const [historySettled, clearSettled] = await Promise.allSettled([historyPromise, clearPromise]);
+    if (historySettled.status === "rejected") {
+        assert.fail(`card history rejected — a deadlock must not happen: ${historySettled.reason}`);
+    }
+    if (clearSettled.status === "rejected") {
+        assert.fail(`the courtesy clear rejected — a deadlock must not happen: ${clearSettled.reason}`);
+    }
+    const historyResult = historySettled.value;
+    const clearResult = clearSettled.value;
+
+    assert.equal(clearResult.errors, 0, "a lock wait is not a genuine error");
+    // Not an exact split: whichever side loses the race to the row it reads
+    // stale — most likely the clear's own write to issue2, read before
+    // history's still-open update to it becomes visible, then re-checked
+    // against history's now-committed version once the row unblocks — is a
+    // legitimate lost CAS (§14.10), not a bug. Both sides still account for
+    // every item exactly once.
+    assert.equal(historyResult.recorded + historyResult.lostRaces, 2, "both items were attempted exactly once");
+    assert.ok(
+        clearResult.cleared.every(target => target === targetD1 || target === targetD2),
+        `cleared must be a subset of [${targetD1}, ${targetD2}], got ${JSON.stringify(clearResult.cleared)}`,
+    );
     await cleanup();
 });
 
