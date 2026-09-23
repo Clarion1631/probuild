@@ -28,7 +28,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import {
-    RECEIVABLE_INVOICE_WHERE, RECEIVABLE_INVOICE_SELECT, DUE_DATE_GRACE_MS,
+    RECEIVABLE_INVOICE_SELECT, DUE_DATE_GRACE_MS,
     type ReceivableInvoiceInput, type ReceivableMilestone,
 } from "../src/lib/receivables";
 import type { ArAgingBucket, CompanyFinancialsChartFilters } from "../src/lib/company-financials-charts";
@@ -348,8 +348,29 @@ test("getCompanyFinancialsChartData: AR query is invoice.findMany(AND:[RECEIVABL
     ]);
 
     assert.equal(invoiceCalls.length, 1, "exactly one invoice.findMany call — the AR aging query");
-    assert.deepEqual(invoiceCalls[0].where, { AND: [RECEIVABLE_INVOICE_WHERE, { projectId: { in: ["job-a", "job-b"] } }] });
-    assert.deepEqual(invoiceCalls[0].select, RECEIVABLE_INVOICE_SELECT);
+    // The FULL args object, not just .where/.select — so a stray take/skip/
+    // orderBy slipped onto this query still fails here. The first AND clause
+    // is an independent literal (not RECEIVABLE_INVOICE_WHERE itself): this
+    // test would otherwise still pass if the constant regressed, because
+    // both sides of the comparison would regress together. The contract test
+    // (tests/receivable-query-contract.test.ts) is what pins the constant's
+    // own shape; select may reference it here since that's already covered.
+    assert.deepStrictEqual(invoiceCalls[0], {
+        where: {
+            AND: [
+                {
+                    status: { not: "Canceled" },
+                    OR: [
+                        { balanceDue: { gt: 0 } },
+                        { payments: { some: { status: "Pending" } } },
+                        { progressBillings: { some: { status: { in: ["Staged", "Sent"] } } } },
+                    ],
+                },
+                { projectId: { in: ["job-a", "job-b"] } },
+            ],
+        },
+        select: RECEIVABLE_INVOICE_SELECT,
+    });
 
     for (const call of paymentScheduleCalls) {
         assert.notDeepEqual(call.where?.status, { notIn: ["Paid", "Canceled"] }, "the old AR paymentSchedule query must be gone");
@@ -433,11 +454,16 @@ test("net-30 item (no due date): ageDays 60 -> '1-30'; 61 -> '31-60'", () => {
 // ── 9: grace edge, to the millisecond ───────────────────────────────────────
 
 test("grace edge: now = dueDate + 24h exactly -> 'Not yet due'; +1ms -> '1-30'", () => {
+    // The boundary below is the literal 24h-in-ms, not the production
+    // constant, so a shrunk DUE_DATE_GRACE_MS can't quietly move "the edge"
+    // along with it. Pinned independently instead:
+    assert.equal(DUE_DATE_GRACE_MS, 86_400_000, "DUE_DATE_GRACE_MS changed — the 24h due-date grace computeInvoiceReceivable() applies is no longer 24h, and this test's boundary must be re-derived");
+
     const dueDate = new Date("2026-09-20T19:00:00.000Z"); // 2026-09-20T12:00 PDT (LA-local noon)
     const billedAt = new Date("2026-09-01T00:00:00.000Z"); // long billed; the due date governs
     const invoice = invoiceOf([milestone({ amount: "500.00", dueDate, qbInvoiceSentAt: billedAt })]);
 
-    const atGraceEdge = dueDate.getTime() + DUE_DATE_GRACE_MS;
+    const atGraceEdge = dueDate.getTime() + 86_400_000;
     assert.equal(onlyNonZeroBucket(buildArAging([invoice], [], atGraceEdge, TZ)), "Not yet due");
     assert.equal(onlyNonZeroBucket(buildArAging([invoice], [], atGraceEdge + 1, TZ)), "1-30"); // exactly 1 LA-calendar day past due
 });

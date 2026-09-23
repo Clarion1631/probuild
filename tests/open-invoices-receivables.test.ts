@@ -304,30 +304,46 @@ test("bucket boundaries: 30/31, 60/61, 90/91, and a negative ageDays", () => {
 
 // ── 6: queryOpenInvoicesData's where/select composition ─────────────────────
 
-test("queryOpenInvoicesData: no filters -> where.AND holds RECEIVABLE_INVOICE_WHERE and no status clause", async () => {
+// Full captured args, not just .where/.select — a stray take/skip, or a
+// wrong/missing orderBy, must fail here too. select spreads
+// RECEIVABLE_INVOICE_SELECT directly (fine to reference: the contract test,
+// tests/receivable-query-contract.test.ts, already pins its literal shape).
+
+test("queryOpenInvoicesData: no filters -> full args (where.AND holds RECEIVABLE_INVOICE_WHERE only, select, orderBy)", async () => {
     fixtureRows = [];
     await queryOpenInvoicesData({ clientId: null, projectId: null, statuses: [] });
     const args = findManyCalls[findManyCalls.length - 1];
-    assert.deepEqual(args.where, { AND: [RECEIVABLE_INVOICE_WHERE] });
-    for (const key of Object.keys(RECEIVABLE_INVOICE_SELECT)) {
-        assert.ok(key in args.select, `select must include RECEIVABLE_INVOICE_SELECT's "${key}"`);
-    }
-    assert.equal(args.select.id, true);
-    assert.equal(args.select.code, true);
-    assert.deepEqual(args.select.project, { select: { id: true, name: true } });
-    assert.deepEqual(args.select.client, { select: { id: true, name: true } });
+    assert.deepStrictEqual(args, {
+        where: { AND: [RECEIVABLE_INVOICE_WHERE] },
+        select: {
+            id: true, code: true,
+            project: { select: { id: true, name: true } },
+            client: { select: { id: true, name: true } },
+            ...RECEIVABLE_INVOICE_SELECT,
+        },
+        orderBy: { issueDate: "asc" },
+    });
 });
 
-test("queryOpenInvoicesData: status/client/project filters are AND-composed alongside RECEIVABLE_INVOICE_WHERE", async () => {
+test("queryOpenInvoicesData: status/client/project filters -> full args (AND-composed where, select, orderBy)", async () => {
     fixtureRows = [];
     await queryOpenInvoicesData({ clientId: "client-1", projectId: "project-1", statuses: ["Issued", "Overdue"] });
     const args = findManyCalls[findManyCalls.length - 1];
-    assert.deepEqual(args.where, {
-        AND: [
-            RECEIVABLE_INVOICE_WHERE,
-            { status: { in: ["Issued", "Overdue"] } },
-            { clientId: "client-1" },
-            { projectId: "project-1" },
-        ],
+    assert.deepStrictEqual(args, {
+        where: {
+            AND: [
+                RECEIVABLE_INVOICE_WHERE,
+                { status: { in: ["Issued", "Overdue"] } },
+                { clientId: "client-1" },
+                { projectId: "project-1" },
+            ],
+        },
+        select: {
+            id: true, code: true,
+            project: { select: { id: true, name: true } },
+            client: { select: { id: true, name: true } },
+            ...RECEIVABLE_INVOICE_SELECT,
+        },
+        orderBy: { issueDate: "asc" },
     });
 });
