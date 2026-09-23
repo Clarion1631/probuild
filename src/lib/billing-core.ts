@@ -2766,6 +2766,149 @@ export async function assertInvoiceHasNoChangeOrderBilling(
     }
 }
 
+/**
+ * Names every QuickBooks-linked-or-pending row blocking a whole-invoice
+ * delete and what to do about it. Shown verbatim to the user via
+ * `toast.error(res.error)` in InvoiceEditor.tsx.
+ *
+ * Confirmed (`qbInvoiceId` set) and pending (marker only — see
+ * `isQboInvoiceLinkedOrPending`) get different wording: a confirmed link IS a
+ * live QuickBooks invoice, so deleting here abandons it; a pending marker only
+ * MIGHT be one, because a previous send never came back with a confirmed
+ * result (same fact `QBResolveRequiredError` reports) — so the real next step
+ * differs between the two, not just the sentence describing the state.
+ */
+function qboDeleteBlockReason(
+    rows: Array<{ label: string; qbInvoiceId: string | null; qbSyncError: string | null }>,
+    nextStep: { confirmedOne: string; confirmedMany: string; pendingOne: string; pendingMany: string },
+): string {
+    const confirmed = rows.filter((r) => r.qbInvoiceId).map((r) => `"${r.label}"`);
+    const pending = rows.filter((r) => !r.qbInvoiceId).map((r) => `"${r.label}"`);
+    const sentences: string[] = [];
+    if (confirmed.length > 0) {
+        const many = confirmed.length > 1;
+        sentences.push(
+            `${confirmed.join(", ")} ${many ? "are" : "is"} already in QuickBooks — deleting this invoice would leave ${many ? "them" : "it"} open in QuickBooks. ${many ? nextStep.confirmedMany : nextStep.confirmedOne}`,
+        );
+    }
+    if (pending.length > 0) {
+        const many = pending.length > 1;
+        sentences.push(
+            `${pending.join(", ")} may already be in QuickBooks — a previous QuickBooks send ended without a confirmed result and must be resolved first. ${many ? nextStep.pendingMany : nextStep.pendingOne}`,
+        );
+    }
+    return sentences.join(" ");
+}
+
+/**
+ * Delete a whole invoice — the transaction body behind the `deleteInvoice`
+ * server action, split out (mirrors `deleteInvoiceMilestoneCore`) so it can be
+ * unit-tested without a next-auth session. `deleteInvoice` in actions.ts stays
+ * the thin wrapper: permission check, this call, revalidatePath.
+ *
+ * Refuses when the invoice itself, any milestone, or any progress billing is
+ * linked or pending in QuickBooks (`isQboInvoiceLinkedOrPending`). Both
+ * PaymentSchedule and ProgressBilling cascade-delete with their Invoice
+ * (schema.prisma `onDelete: Cascade`), so deleting past any of the three would
+ * silently abandon a real, collectible QuickBooks invoice with nothing left in
+ * ProBuild pointing at it — a real incident left three QuickBooks invoices
+ * open after their ProBuild invoice was deleted.
+ */
+export async function deleteInvoiceCore(invoiceId: string): Promise<string> {
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId });
+
+        // Lock the child rows BEFORE reading them (same shape as
+        // loadCostPlusActuals' lockRows path). The two QBO push claims that can
+        // land on these rows work differently: the milestone push
+        // (claimMilestonePreCreateUnderLock, quickbooks-payments.ts) takes its
+        // OWN short-lived Invoice lock and commits before ever calling
+        // QuickBooks; the progress-billing push
+        // (stageProgressBillingToQuickBooksCore, progress-billing.ts) takes no
+        // lock at all — a bare prisma.progressBilling.updateMany. Locking the
+        // rows directly here covers both: a concurrent claim has either already
+        // committed (its marker is visible in the read below, and this
+        // refuses) or is blocked on these locks and finds its row gone once it
+        // gets through — its own CAS then matches zero rows and it aborts
+        // before ever calling QuickBooks.
+        await tx.$queryRaw`SELECT "id" FROM "PaymentSchedule" WHERE "invoiceId" = ${invoiceId} ORDER BY "id" FOR UPDATE`;
+        await tx.$queryRaw`SELECT "id" FROM "ProgressBilling" WHERE "invoiceId" = ${invoiceId} ORDER BY "id" FOR UPDATE`;
+
+        const invoice = await tx.invoice.findUnique({
+            where: { id: invoiceId },
+            include: { payments: true, progressBillings: true },
+        });
+        if (!invoice) throw new Error("Invoice not found");
+
+        const hasPaidPayments = invoice.payments.some((p) => p.status === "Paid");
+        if (hasPaidPayments) throw new Error("Cannot delete an invoice with recorded payments");
+        if (invoice.status === "Paid" || invoice.status === "Partially Paid") {
+            throw new Error("Cannot delete a paid or partially paid invoice");
+        }
+        await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "delete");
+
+        // Every QuickBooks-linkable row this delete would cascade away. Checked
+        // under the locks taken above, against the row just read under them.
+        //
+        // A milestone queued for QuickBooks deletion (Break QB Link with "Also
+        // delete the staged invoice in QuickBooks" checked) is caught here too,
+        // but only as a SIDE EFFECT: claimQBInvoiceUnlink pins its CAS to the
+        // schedule's qbInvoiceId, so `breakQBInvoiceLink` (actions.ts) keeps
+        // qbInvoiceId SET on the row from the moment it writes
+        // PENDING_DELETION_MARKER (qbo-create-markers.ts) until the QuickBooks
+        // delete is confirmed and claimQBInvoiceUnlink clears both fields
+        // together — or, if that unlink CAS itself loses (a settle raced it),
+        // qbInvoiceId stays set forever and quickbooks-payments.ts's
+        // PAID_PENDING_DELETION_FLAG takes over. Neither marker is in
+        // PENDING_CREATE_MARKERS, so isQboInvoiceLinkedOrPending only refuses
+        // these rows because qbInvoiceId is still truthy — if that flow is ever
+        // changed to clear qbInvoiceId before the QuickBooks delete is
+        // confirmed, this guard must start checking those two markers by name,
+        // the same way it checks the create markers today.
+        const blockingMilestones = invoice.payments.filter((p) => isQboInvoiceLinkedOrPending(p));
+        if (blockingMilestones.length > 0) {
+            throw new Error(qboDeleteBlockReason(
+                blockingMilestones.map((m) => ({ label: m.name, qbInvoiceId: m.qbInvoiceId, qbSyncError: m.qbSyncError })),
+                {
+                    confirmedOne: `Use "Break QB Link" and check "Also delete the staged invoice in QuickBooks" — a local-only unlink would still leave it open in QuickBooks.`,
+                    confirmedMany: `Use "Break QB Link" on each one and check "Also delete the staged invoice in QuickBooks" — a local-only unlink would still leave them open in QuickBooks.`,
+                    pendingOne: `Use "Break QB Link" first — it asks QuickBooks whether an invoice exists and links it here if so. If it links one, break the link again and check "Also delete the staged invoice in QuickBooks" before this invoice can be deleted.`,
+                    pendingMany: `Use "Break QB Link" on each one first — it asks QuickBooks whether an invoice exists and links it here if so. If it links one, break the link again and check "Also delete the staged invoice in QuickBooks" before this invoice can be deleted.`,
+                },
+            ));
+        }
+        const blockingBillings = invoice.progressBillings.filter((b) => isQboInvoiceLinkedOrPending(b));
+        if (blockingBillings.length > 0) {
+            throw new Error(qboDeleteBlockReason(
+                blockingBillings.map((b) => ({ label: b.code, qbInvoiceId: b.qbInvoiceId, qbSyncError: b.qbSyncError })),
+                {
+                    // Fixing it in QuickBooks does not clear ProBuild's own link —
+                    // there is no in-app control that unlinks a progress billing —
+                    // so pointing the user at QuickBooks would be misleading. Same
+                    // text for confirmed and pending: neither can be cleared here.
+                    confirmedOne: `ProBuild has no way to unlink this yet, so this invoice can't be deleted here — ask an admin.`,
+                    confirmedMany: `ProBuild has no way to unlink these yet, so this invoice can't be deleted here — ask an admin.`,
+                    pendingOne: `ProBuild has no way to unlink this yet, so this invoice can't be deleted here — ask an admin.`,
+                    pendingMany: `ProBuild has no way to unlink these yet, so this invoice can't be deleted here — ask an admin.`,
+                },
+            ));
+        }
+        // The invoice's own document-sync link — same marker vocabulary as the
+        // milestone/progress-billing qbSyncError (see the qbSyncMarker doc
+        // comment on the Invoice model), so the same predicate reads it too.
+        if (isQboInvoiceLinkedOrPending({ qbInvoiceId: invoice.qbInvoiceId, qbSyncError: invoice.qbSyncMarker })) {
+            const noUnlink = `ProBuild has no way to unlink this yet, so it can't be deleted here — ask an admin.`;
+            throw new Error(qboDeleteBlockReason(
+                [{ label: invoice.code, qbInvoiceId: invoice.qbInvoiceId, qbSyncError: invoice.qbSyncMarker }],
+                { confirmedOne: noUnlink, confirmedMany: noUnlink, pendingOne: noUnlink, pendingMany: noUnlink },
+            ));
+        }
+
+        await tx.invoice.delete({ where: { id: invoiceId } });
+        return invoice.projectId;
+    }));
+}
+
 export async function splitInvoiceMilestonesCore(
     invoiceId: string,
     milestones: { name: string; amount: number; dueDate?: string | null }[],
