@@ -162,7 +162,11 @@ const sha = (value: string) => createHash("sha256").update(value, "utf8").digest
 
 test("a completed, unblocked, unchanged current cycle proves every named predicate", async () => {
     const calls: unknown[] = [];
-    const result = await load(certifiedValues(), { calls });
+    // plannerDay equal to NOW's own UTC day (cheap-sweep-restart §14.8), so
+    // plannerDayMatches and selectionCertified prove true alongside the rest.
+    const result = await load(certifiedValues({
+        [CYCLE_KEY]: JSON.stringify({ id: CYCLE_ID, epoch: "7", evidenceEpoch: "9", recognitionPolicy: RUNTIME_ON.policy, plannerDay: "2026-09-10" }),
+    }), { calls });
     assert.equal(result.status, "stable");
     assert.equal(result.reason, null);
     assert.equal(result.scope, "receipt-chaser-completion");
@@ -182,6 +186,7 @@ test("a completed, unblocked, unchanged current cycle proves every named predica
         phaseDone: true, unblocked: true, completionIsCurrentCycle: true, completionTimeValid: true,
         epochsUnchanged: true, cyclePolicyMatchesRuntime: true, cycleStillValid: true, cycleCertified: true,
         completedForPacificDay: true, fullRunOwed: false, continuationNeedsWork: false,
+        plannerDayMatches: true, selectionCertified: true,
     });
     assert.deepEqual(result.marker, {
         present: true, shape: "json", phase: "done", chaserCompletedAt: "2026-09-10T14:06:00.000Z", completedAtValid: true,
@@ -190,6 +195,8 @@ test("a completed, unblocked, unchanged current cycle proves every named predica
     assert.equal(result.cycle?.id, CYCLE_ID);
     assert.equal(result.cycle?.epoch, "7");
     assert.equal(result.cycle?.evidenceEpoch, "9");
+    assert.equal(result.cycle?.plannerDay, "2026-09-10");
+    assert.equal(result.cycle?.undecidedLineCount, 0);
     assert.deepEqual(result.currentEpochs, { bankLedger: { state: "measured", value: "7" }, receiptEvidence: { state: "measured", value: "9" } });
     assert.deepEqual(result.fullRun, { owed: false });
     assert.deepEqual(result.cursors, { linePresent: false, openIssuePresent: false });
@@ -197,6 +204,31 @@ test("a completed, unblocked, unchanged current cycle proves every named predica
     assert.deepEqual(result.keys, [...CHASER_COMPLETION_KEYS]);
     assert.deepEqual(result.limitations, [...CHASER_COMPLETION_LIMITATIONS]);
     assert.equal(calls.length, 2, "exactly two reads");
+});
+
+test("no plannerDay on the cycle (a legacy cycle) fails both plannerDayMatches and selectionCertified", async () => {
+    // certifiedValues()'s own default cycle carries no plannerDay at all —
+    // the shape every stored cycle has before this deploy, and the one every
+    // OTHER test in this file still exercises unmodified.
+    const result = await load(certifiedValues());
+    assert.equal(result.cycle?.plannerDay, null);
+    assert.equal(result.predicates?.plannerDayMatches, false);
+    assert.equal(result.predicates?.selectionCertified, false);
+    // Nothing else about certification regresses — only the two new predicates differ.
+    assert.equal(result.predicates?.cycleCertified, true);
+});
+
+test("undecidedLines on an otherwise-certified cycle fails only selectionCertified", async () => {
+    const result = await load(certifiedValues({
+        [CYCLE_KEY]: JSON.stringify({
+            id: CYCLE_ID, epoch: "7", evidenceEpoch: "9", recognitionPolicy: RUNTIME_ON.policy,
+            plannerDay: "2026-09-10", undecidedLines: ["bl-undecided-1"],
+        }),
+    }));
+    assert.equal(result.cycle?.undecidedLineCount, 1);
+    assert.equal(result.predicates?.plannerDayMatches, true, "undecidedLines does not affect plannerDayMatches");
+    assert.equal(result.predicates?.cycleCertified, true, "undecidedLines is not a term of cycleCertified");
+    assert.equal(result.predicates?.selectionCertified, false);
 });
 
 test("the eight fixed keys, in the sweep's own names, are the only thing ever queried", async () => {

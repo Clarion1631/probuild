@@ -6,9 +6,11 @@ import { BANK_PULL_CHASER_WINDOW_HOURS, BANK_PULL_LAST_SUCCESS_KEY } from "./pip
 import {
     CYCLE_KEY,
     SWEEP_MARKER_KEY,
+    cardSelectionCertified,
     chaserCompletedFor,
     continuationNeedsWork,
     cycleCertified,
+    cycleMatchesPlannerDay,
     cycleRecognitionPolicyMatches,
     cycleStillValid,
     isSweepPhase,
@@ -187,6 +189,10 @@ export interface ChaserCompletionPredicates {
     fullRunOwed: boolean;
     /** The exact continuation predicate. false = a continuation pass would answer nothing-in-progress. */
     continuationNeedsWork: boolean;
+    /** cycleMatchesPlannerDay(cycle, now) — this cycle planned entirely against today's UTC day. */
+    plannerDayMatches: boolean;
+    /** cardSelectionCertified({...}) — everything a card claim may trust before selecting (§14.4, §14.9). */
+    selectionCertified: boolean;
 }
 
 export interface ChaserCompletionDiagnostic {
@@ -245,6 +251,10 @@ export interface ChaserCompletionDiagnostic {
             reviewedFacts: FingerprintProof | null;
             reviewedPairs: FingerprintProof | null;
         } | null;
+        /** `YYYY-MM-DD`, echoed only when date-shaped. Null for a legacy cycle with no plannerDay. */
+        plannerDay: string | null;
+        /** Count only — never the ids (cheap-sweep-restart-spec.md §14.8). */
+        undecidedLineCount: number;
     } | null;
     currentEpochs: {
         bankLedger: { state: EpochState; value: string | null };
@@ -269,6 +279,7 @@ export const CHASER_COMPLETION_LIMITATIONS = [
     "bankPull freshness is a separate input-readiness signal; a completed cycle is a continuation no-op regardless of it.",
     "delivery booleans describe configuration presence and shape only; they do not mean any card was or will be delivered.",
     "Cursor contents, raw setting text, webhook URLs, user ids and any policy text outside the strict grammar are never echoed.",
+    "selectionCertified is computed from two unlocked reads at capturedAt. The cards cron re-checks it under the evidence and ledger locks at claim time, plus an owner-epoch check this diagnostic does not see.",
 ] as const;
 
 // ── Policy proof (strict grammar whitelist) ─────────────────────────────────
@@ -399,6 +410,7 @@ export function settingsEqual(a: SettingValues, b: SettingValues): boolean {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EPOCH_RE = /^(0|[1-9]\d*)$/;
+const PLANNER_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 export function markerShapeOf(value: string | null): MarkerShape {
     if (!value) return "absent";
@@ -470,7 +482,7 @@ function projectMarker(value: string | null, marker: SweepMarker, shape: MarkerS
 }
 
 function projectCycle(value: string | null, cycle: SweepCycle | null, shape: CycleShape): NonNullable<ChaserCompletionDiagnostic["cycle"]> {
-    if (!cycle) return { present: !!value, shape, id: null, epoch: null, evidenceEpoch: null, recognitionPolicy: null };
+    if (!cycle) return { present: !!value, shape, id: null, epoch: null, evidenceEpoch: null, recognitionPolicy: null, plannerDay: null, undecidedLineCount: 0 };
     return {
         present: true,
         shape,
@@ -478,6 +490,8 @@ function projectCycle(value: string | null, cycle: SweepCycle | null, shape: Cyc
         epoch: EPOCH_RE.test(cycle.epoch) ? cycle.epoch : null,
         evidenceEpoch: EPOCH_RE.test(cycle.evidenceEpoch) ? cycle.evidenceEpoch : null,
         recognitionPolicy: projectCyclePolicy(cycle),
+        plannerDay: cycle.plannerDay && PLANNER_DAY_RE.test(cycle.plannerDay) ? cycle.plannerDay : null,
+        undecidedLineCount: cycle.undecidedLines?.length ?? 0,
     };
 }
 
@@ -571,6 +585,8 @@ export function projectChaserCompletion(input: ProjectChaserCompletionInput): Ch
         completedForPacificDay: chaserCompletedFor(marker, pacificDay, CHASER_COMPLETION_TIME_ZONE, cycle?.id ?? null),
         fullRunOwed,
         continuationNeedsWork: continuationNeedsWork({ ...certification, fullRunOwed, lineCursor, openCursor }),
+        plannerDayMatches: cycleMatchesPlannerDay(cycle, now),
+        selectionCertified: cardSelectionCertified({ ...certification, pacificDate: pacificDay, timeZone: CHASER_COMPLETION_TIME_ZONE }),
     };
     return { ...base, status: "stable", reason: null, predicates };
 }
