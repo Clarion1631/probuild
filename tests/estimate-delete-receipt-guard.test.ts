@@ -11,6 +11,14 @@
  * stranding its ReceiptIntake at BOOKED with expenseId null: on no job,
  * unre-sendable, and its bank charge still looks covered.
  *
+ * ROUND 2 (2026-09-23, independent-checker follow-up): Budget, EstimateItem
+ * and EstimatePaymentSchedule were ALSO deleted as plain prisma.* calls ahead
+ * of the lock, so a refusal below still left the estimate stripped of all
+ * three even though the guard "worked". They now run only inside the same
+ * guarded transaction, after the check — fakeTx carries all of them so every
+ * delete (not just Expense) shows up in the op log, and the refusal tests
+ * below prove none of them ran.
+ *
  * Prisma, next-auth and the permission reader are patched at require() time —
  * same shape as tests/expense-delete-scope.test.ts and
  * tests/job-variance-db.test.ts. No mock.module: CI is Node 20.
@@ -31,11 +39,14 @@ let txReceiptBookedCount: number;
 let txCountArgs: unknown;
 let estimateDeleteArgs: unknown;
 
+/** True for any opLog entry that represents a destructive statement. */
+const isDelete = (op: string) => op.toLowerCase().includes("delete");
+
 const fakeTx: any = {
     // The receipt-evidence lock and its epoch bump (PR #443 gate rounds
-    // 42/45): the real withReceiptEvidenceLock/lockReceiptEvidence/
-    // bumpReceiptEvidenceEpoch run unmocked against this fake — nothing here
-    // depends on their result, only that they are answerable and ordered.
+    // 42/45): the real lockReceiptEvidence/bumpReceiptEvidenceEpoch run
+    // unmocked against this fake — nothing here depends on their result, only
+    // that they are answerable and ordered.
     $executeRaw: async (..._args: unknown[]) => { opLog.push("lock"); return 1; },
     $queryRaw: async (..._args: unknown[]) => { opLog.push("epoch-bump"); return [{ value: "1" }]; },
     expense: {
@@ -48,6 +59,20 @@ const fakeTx: any = {
             opLog.push("tx.expense.deleteMany");
             return { count: 1 };
         },
+    },
+    // Round 2: these three used to be plain prisma.* calls ahead of the lock
+    // (see the file header). They now live on the SAME tx the guard checks,
+    // so a regression that lets any of them run on the refusal path shows up
+    // in opLog exactly like the Expense delete does.
+    budget: {
+        findUnique: async () => budgetRow,
+        delete: async () => { opLog.push("tx.budget.delete"); return {}; },
+    },
+    estimateItem: {
+        deleteMany: async () => { opLog.push("tx.estimateItem.deleteMany"); return { count: 0 }; },
+    },
+    estimatePaymentSchedule: {
+        deleteMany: async () => { opLog.push("tx.estimatePaymentSchedule.deleteMany"); return { count: 0 }; },
     },
 };
 
@@ -63,16 +88,6 @@ const fakePrisma: any = {
     },
     timeEntry: {
         count: async () => earlyTimeEntryCount,
-    },
-    budget: {
-        findUnique: async () => budgetRow,
-        delete: async () => ({}),
-    },
-    estimateItem: {
-        deleteMany: async () => ({ count: 0 }),
-    },
-    estimatePaymentSchedule: {
-        deleteMany: async () => ({ count: 0 }),
     },
     $transaction: async (fn: any) => fn(fakeTx),
 };
@@ -142,13 +157,16 @@ test("refuses the whole delete when a receipt-booked Expense is linked", async (
     // The race: nothing showed up in the early, unlocked count, but a receipt
     // landed on this estimate by the time the locked transaction runs.
     txReceiptBookedCount = 1;
+    // A Budget row is present, so a regression that deletes it before the
+    // guard fires would show up in the op log below.
+    budgetRow = { id: "budget-1" };
     const result = await deleteEstimate("est-1");
 
     assert.deepEqual(result, {
         success: false,
         error: "This estimate has 1 expense(s) from receipts, so it can't be deleted. Archive it instead.",
     });
-    assert.ok(!opLog.includes("tx.expense.deleteMany"), `no Expense delete ran: ${opLog.join(" ")}`);
+    assert.ok(!opLog.some(isDelete), `no delete of any kind ran: ${opLog.join(" ")}`);
     assert.equal(estimateDeleteArgs, null, "the Estimate row itself was not deleted either");
 });
 
@@ -164,10 +182,14 @@ test("the guard's query asks for receipt-booked Expenses specifically", () => {
 
 test("unchanged behavior: proceeds normally when no receipt-booked expense is linked", async () => {
     txReceiptBookedCount = 0;
+    budgetRow = { id: "budget-1" };
     const result = await deleteEstimate("est-1");
 
     assert.deepEqual(result, { success: true });
     assert.ok(opLog.includes("tx.expense.deleteMany"), `the ordinary Expense delete still ran: ${opLog.join(" ")}`);
+    assert.ok(opLog.includes("tx.budget.delete"), `the Budget delete still ran: ${opLog.join(" ")}`);
+    assert.ok(opLog.includes("tx.estimateItem.deleteMany"), `the EstimateItem delete still ran: ${opLog.join(" ")}`);
+    assert.ok(opLog.includes("tx.estimatePaymentSchedule.deleteMany"), `the EstimatePaymentSchedule delete still ran: ${opLog.join(" ")}`);
     assert.deepEqual(estimateDeleteArgs, { where: { id: "est-1" } });
 });
 
@@ -186,22 +208,34 @@ test("unchanged behavior: the pre-existing linked-expense count still refuses fi
     assert.deepEqual(opLog, [], "the guarded transaction never ran at all");
 });
 
-test("the receipt check runs inside the lock, after it, and before the delete", async () => {
+test("the receipt check runs inside the lock, after it, and before any delete", async () => {
     txReceiptBookedCount = 0;
+    budgetRow = { id: "budget-1" };
     await deleteEstimate("est-1");
 
     assert.deepEqual(
         opLog,
-        ["lock", "tx.expense.count", "tx.expense.deleteMany", "epoch-bump", "estimate.delete"],
-        "lock, then the guard's own check, then the Expense delete, then the epoch bump, then the Estimate row itself",
+        [
+            "lock",
+            "tx.expense.count",
+            "tx.budget.delete",
+            "tx.estimateItem.deleteMany",
+            "tx.estimatePaymentSchedule.deleteMany",
+            "tx.expense.deleteMany",
+            "epoch-bump",
+            "estimate.delete",
+        ],
+        "lock, then the guard's own check, then every delete inside that same transaction, then the epoch bump, then the Estimate row itself",
     );
 });
 
-test("when refused, the transaction still closes out the lock and epoch bump normally", async () => {
+test("when refused, the transaction still closes out the lock and epoch bump normally, and no delete runs", async () => {
     // A refusal is not a thrown transaction failure — it is a plain early
     // return from inside the locked body, so the transaction commits.
     txReceiptBookedCount = 3;
+    budgetRow = { id: "budget-1" };
     await deleteEstimate("est-1");
 
     assert.deepEqual(opLog, ["lock", "tx.expense.count", "epoch-bump"]);
+    assert.ok(!opLog.some(isDelete), `no delete of any kind ran: ${opLog.join(" ")}`);
 });

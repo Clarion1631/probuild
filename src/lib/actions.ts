@@ -156,7 +156,7 @@ import {
     unreadThreadCommentCount,
 } from "./selection-item-thread-core";
 import { findThreadItem } from "./selection-item-thread-dependencies";
-import { lockReceiptEvidence, withReceiptEvidenceLock } from "./receipt-evidence-lock";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence, withReceiptEvidenceLock } from "./receipt-evidence-lock";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -5502,15 +5502,8 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
         };
     }
 
-    // Delete related Budget
-    const budget = await prisma.budget.findUnique({ where: { estimateId } });
-    if (budget) {
-        await prisma.budget.delete({ where: { id: budget.id } });
-    }
-
-    // Delete related items, schedules, expenses, and the estimate itself
-    await prisma.estimateItem.deleteMany({ where: { estimateId } });
-    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
+    // Delete related Budget, items, schedules, expenses, and the estimate
+    // itself.
     // EVIDENCE (round-45 gate, finding 3). Deleting an estimate cascades to its
     // Expenses, and every one of those is a row the missing-receipt sweep may
     // have read as "this charge has its receipt". Unfenced, a sweep mid-cycle
@@ -5526,13 +5519,31 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
     // charge still looks covered. The check has to run AFTER the lock and
     // INSIDE this same transaction, or the identical race just reopens one
     // level up.
+    //
+    // NOTHING DESTRUCTIVE RUNS BEFORE THAT CHECK EITHER (2026-09-23 follow-up).
+    // Budget/EstimateItem/EstimatePaymentSchedule used to be deleted as plain
+    // prisma.* calls ahead of the lock, so a refusal below still left the
+    // estimate stripped of all three. This now owns the transaction directly
+    // instead of going through withReceiptEvidenceLock -- its
+    // EvidenceWriteClient type exposes expense/receiptIntake/reviewIssue, not
+    // budget or estimateItem -- so every delete below runs only once the
+    // guard has cleared.
     let receiptBookedCount = 0;
-    await withReceiptEvidenceLock(fn => prisma.$transaction(fn), async tx => {
+    await prisma.$transaction(async tx => {
+        await lockReceiptEvidence(tx);
         receiptBookedCount = await tx.expense.count({
             where: { estimateId, qbPurchaseId: null, receiptIntake: { isNot: null } },
         });
-        if (receiptBookedCount > 0) return;
-        await tx.expense.deleteMany({ where: { estimateId } });
+        if (receiptBookedCount === 0) {
+            const budget = await tx.budget.findUnique({ where: { estimateId } });
+            if (budget) {
+                await tx.budget.delete({ where: { id: budget.id } });
+            }
+            await tx.estimateItem.deleteMany({ where: { estimateId } });
+            await tx.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
+            await tx.expense.deleteMany({ where: { estimateId } });
+        }
+        await bumpReceiptEvidenceEpoch(tx);
     });
     if (receiptBookedCount > 0) {
         return {
