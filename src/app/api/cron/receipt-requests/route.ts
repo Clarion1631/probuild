@@ -88,7 +88,7 @@ export const maxDuration = 60;
 /**
  * Nightly missing-receipt request sweep (Phase 2 §5).
  *
- * Runs at 13:00 UTC (6 AM Pacific), AFTER `/api/cron/bank-register-pull`
+ * Runs at 10:00 UTC (3 AM PDT / 2 AM PST), AFTER `/api/cron/bank-register-pull`
  * (02:00 UTC) has landed last night's QBO register observations — that
  * ordering is why the pull was built first. The external
  * `scripts/post-qbo-register.mjs` runner is now a manual backfill tool, not a
@@ -130,7 +130,7 @@ const BATCH_SIZE = 1; // pageComponents keeps an oversized component whole.
 /**
  * Wall-clock budget for one invocation. `maxDuration` is 60s; stopping at 45
  * leaves room to checkpoint the cursor and return a real answer instead of
- * being killed mid-write with nothing recorded. The cron runs every 15 minutes,
+ * being killed mid-write with nothing recorded. The continuation runs every minute,
  * so a backlog drains over several invocations rather than in one heroic run.
  */
 const RUN_BUDGET_MS = 45_000;
@@ -160,8 +160,8 @@ const PHASE_KEY = SWEEP_MARKER_KEY;
  * these four lines relate:
  *
  *   0 2 * * *        /api/cron/bank-register-pull      the register this reads
- *   0 13 * * *       /api/cron/receipt-requests        this sweep, full run
- *   0/15 * * * *     /api/cron/receipt-requests?continue=1   its resume passes
+ *   0 10 * * *       /api/cron/receipt-requests        this sweep, full run
+ *   1-28,31-58 * * * *     /api/cron/receipt-requests?continue=1   its resume passes
  *   30 14 * * 1-5    /api/cron/receipt-request-cards   the cards it releases
  *
  * The pull withholds its success marker when it failed, when a batch errored,
@@ -172,8 +172,8 @@ const PHASE_KEY = SWEEP_MARKER_KEY;
  * chased, and nothing anywhere says why.
  *
  * A cycle may only stamp when the last COMPLETE pull success is inside this
- * window. 24h at the 13:00 slot cleanly separates a healthy pull (~11h old)
- * from last night's (~35h old, meaning tonight's failed), while tolerating a
+ * window. 24h at the 10:00 slot cleanly separates a healthy pull (~8h old)
+ * from last night's (~32h old, meaning tonight's failed), while tolerating a
  * pull that ran late. It lives in pipeline-health beside BANK_PULL_STALE_HOURS
  * so the two thresholds are read together and cannot drift apart.
  */
@@ -690,7 +690,7 @@ async function writeCycle(cycle: SweepCycle | null): Promise<void> {
 /**
  * THE FULL RUN'S DURABLE INTENT (round-45 gate, finding 2).
  *
- * The 13:00 full run and a continuation could fire in the same minute, and the
+ * The 10:00 full run and a continuation could fire in the same minute, and the
  * continuation could win the lease — so the full run returned
  * `already-running`, having cleared nothing, and the day's cycle never
  * restarted. Offsetting the schedule to :05/:20/:35/:50 removes the collision;
@@ -2015,9 +2015,9 @@ export async function GET(request: Request) {
     const now = new Date();
     // A DURABLE lease, held for the whole reconciliation. The old advisory
     // claim released before any work began and excluded nothing.
-    // `?continue=1` is the every-15-minutes RESUME pass. It does no work of its
+    // `?continue=1` is the every-minute RESUME pass. It does no work of its
     // own: if no cursor is parked it exits immediately, so the full sweep keeps
-    // its one predictable 6 AM slot instead of re-deriving the world 96 times a
+    // its one predictable 10:00 UTC slot instead of re-deriving the world 96 times a
     // day. Checked BEFORE the lease so a resume pass with nothing to do cannot
     // even briefly block the real run.
     const continueOnly = new URL(request.url).searchParams.get("continue") === "1";
@@ -2099,7 +2099,7 @@ export async function GET(request: Request) {
          */
         /**
          * A CONTINUATION THAT FINDS A PENDING FULL RUN BECOMES ONE (round-45
-         * gate, finding 2). The 13:00 run records its intent before reaching
+         * gate, finding 2). The 10:00 run records its intent before reaching
          * for the lease, so losing that race costs one continuation slot
          * instead of the whole day's cycle.
          */
@@ -2537,7 +2537,7 @@ async function runSweep(
      * (every write here is idempotent) and skipping is not.
      *
      * A cursor left by an older build carries no epoch and restarts the same
-     * way. The FRESH 13:00 run is handled by `retryOnly` below: it clears the
+     * way. The FRESH 10:00 run is handled by `retryOnly` below: it clears the
      * cursor before this point rather than resuming into it.
      */
     const parsedCursor = parseSweepCursor(cursor);

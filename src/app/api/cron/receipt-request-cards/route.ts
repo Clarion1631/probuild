@@ -675,7 +675,7 @@ export async function GET(request: Request) {
      * `chaserCompletedFor` used to ask only whether the stamp's DATE was today.
      * A completion is deliberately carried forward by every later phase write —
      * it is a true statement about a cycle that really happened — so a NEW
-     * cycle that started at 13:00 and is still mid-flight, or blocked by a
+     * cycle that started at 10:00 and is still mid-flight, or blocked by a
      * stale bank pull, still looked "completed today" and released the cards
      * over a partially reconciled set.
      *

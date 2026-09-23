@@ -136,10 +136,10 @@ test("the continuation schedule never collides with a full run", () => {
         assert.ok(receiptMinutes.every(minute => (minute - protectedMinute + 60) % 60 >= 1),
             "first continuation starts at least one minute after full/card selection");
     }
-    assert.equal(at("/api/cron/receipt-requests"), "0 13 * * *");
+    assert.equal(at("/api/cron/receipt-requests"), "0 10 * * *");
     assert.equal(at("/api/cron/receipt-request-cards"), "30 14 * * 1-5");
     assert.equal(at("/api/cron/receipt-request-cards?retry=1"), "30 16 * * 1-5");
-    // Available starts, including the 13:00 full run; not a completion guarantee.
+    // Available starts, including the 10:00 full run; not a completion guarantee.
     const startsBeforeCards = (hour: number) => 1 + (hour - 13) * receiptMinutes.length
         + receiptMinutes.filter(minute => minute < 30).length;
     assert.equal(startsBeforeCards(14), 85);

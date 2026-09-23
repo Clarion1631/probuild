@@ -327,22 +327,22 @@ test("the freshness window is the one the cron schedule implies", () => {
     // The whole rule depends on these four staying in this order. A schedule
     // change that breaks the ordering should break this test, loudly.
     assert.equal(at("/api/cron/bank-register-pull"), "0 2 * * *");
-    assert.equal(at("/api/cron/receipt-requests"), "0 13 * * *");
+    assert.equal(at("/api/cron/receipt-requests"), "0 10 * * *");
     assert.equal(at("/api/cron/receipt-request-cards"), "30 14 * * 1-5");
     // A CONTINUATION SLOT must exist between the sweep and the cards, or a
     // cycle held open for a stale pull could never finish before delivery.
     const resume = at("/api/cron/receipt-requests?continue=1");
     assert.ok(resume, "the ?continue=1 resume pass must be scheduled");
     // Each minute with full/card gaps, so it never collides with the
-    // 13:00 full run (round-45 gate, finding 2).
+    // 10:00 full run (round-45 gate, finding 2).
     assert.equal(resume, "1-28,31-58 * * * *", "minute continuations with full/card gaps before 14:30");
 });
 
 test("bankPullFresh: a healthy pull is fresh at chaser time, last night's is not", () => {
-    const chaserTime = new Date("2026-09-02T13:00:00Z");
-    // Tonight's 02:00 pull — 11 hours old.
+    const chaserTime = new Date("2026-09-02T10:00:00Z");
+    // Tonight's 02:00 pull — 8 hours old.
     assert.equal(bankPullFresh("2026-09-02T02:05:00Z", chaserTime), true);
-    // Last night's, meaning tonight's failed — 35 hours old.
+    // Last night's, meaning tonight's failed — 32 hours old.
     assert.equal(bankPullFresh("2026-09-01T02:05:00Z", chaserTime), false);
     // Never succeeded, unreadable, and a clock from the future are all stale.
     assert.equal(bankPullFresh(null, chaserTime), false);
@@ -350,8 +350,8 @@ test("bankPullFresh: a healthy pull is fresh at chaser time, last night's is not
     assert.equal(bankPullFresh("whenever", chaserTime), false);
     assert.equal(bankPullFresh("2026-09-03T00:00:00Z", chaserTime), false, "a future mark is not evidence");
     // The boundary itself is inclusive.
-    assert.equal(bankPullFresh("2026-09-01T13:00:00Z", chaserTime), true, "exactly 24h");
-    assert.equal(bankPullFresh("2026-09-01T12:59:59Z", chaserTime), false, "one second past");
+    assert.equal(bankPullFresh("2026-09-01T10:00:00Z", chaserTime), true, "exactly 24h");
+    assert.equal(bankPullFresh("2026-09-01T09:59:59Z", chaserTime), false, "one second past");
 });
 
 test("a stale pull cannot stamp the cycle complete, and cannot close it either", () => {

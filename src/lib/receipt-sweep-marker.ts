@@ -54,7 +54,7 @@ export interface SweepMarker {
      * whether that date was today. A completion stamped by this morning's cycle
      * is carried forward by every later `writePhase` — that is deliberate, it
      * is a true statement about a cycle that really happened — so a NEW cycle
-     * that started at 13:00 and is still mid-flight, or blocked, still looked
+     * that started at 10:00 and is still mid-flight, or blocked, still looked
      * "completed today". The cards then went out on a partially reconciled set.
      *
      * So completion is a tuple, and the cards cron asks about the CURRENT
