@@ -113,6 +113,7 @@ const fakePrisma: any = {
     expense: {
         findUnique: async () => {
             expenseFindUniqueCall++;
+            opLog.push(`expense.findUnique:${expenseFindUniqueCall}`);
             if (expenseFindUniqueOverride) return expenseFindUniqueOverride(expenseFindUniqueCall, storedExpense);
             return storedExpense;
         },
@@ -287,6 +288,13 @@ function moverUser(overrides: Partial<FakeUser> = {}): FakeUser {
     };
 }
 
+/** Every refusal must roll back to no writes past its point (spec §7.2). */
+function assertNoMoveWrites(): void {
+    assert.equal(linksUpdateArgs, null, "no link write after this refusal");
+    assert.equal(intakeUpdateArgs, null, "no intake write after this refusal");
+    assert.equal(automationEventArgs, null, "no audit write after this refusal");
+}
+
 test("moveReceiptExpenseToJob: happy path, phase kept — opLog order, one transaction", async () => {
     storedExpense = receiptBookedExpense();
     currentUser = moverUser();
@@ -299,8 +307,8 @@ test("moveReceiptExpenseToJob: happy path, phase kept — opLog order, one trans
     const at = (needle: string) => opLog.findIndex(entry => entry.startsWith(needle));
     const evidenceLock = at("evidence-lock");
     const epochBump = at("epoch-bump");
-    const firstExpenseRead = 0; // findUnique itself isn't logged; inferred from call count below
-    void firstExpenseRead;
+    const firstRead = at("expense.findUnique:1");
+    const reRead = at("expense.findUnique:2");
     const firstLock = at("lock:Project");
     const estimateLock = at("lock:Estimate");
     const itemLock = at("lock:EstimateItem");
@@ -318,10 +326,12 @@ test("moveReceiptExpenseToJob: happy path, phase kept — opLog order, one trans
     assert.ok(evidenceLock === 0, `evidence lock is first: ${opLog.join(" ")}`);
     assert.ok(epochBump === 1, `epoch bump is second: ${opLog.join(" ")}`);
     assert.ok(evidenceLock < epochBump, opLog.join(" "));
-    assert.ok(epochBump < firstLock, `parents locked after the epoch bump: ${opLog.join(" ")}`);
+    assert.ok(epochBump < firstRead, `the first Expense read follows the epoch bump: ${opLog.join(" ")}`);
+    assert.ok(firstRead < firstLock, `parents locked after the first read: ${opLog.join(" ")}`);
     assert.ok(firstLock < estimateLock && estimateLock < itemLock && itemLock < costCodeLock,
         `Project, Estimate, EstimateItem, CostCode, in that order: ${opLog.join(" ")}`);
-    assert.ok(costCodeLock < projectRead, `the parents are held before the target job is read: ${opLog.join(" ")}`);
+    assert.ok(costCodeLock < reRead, `the re-read under lock follows the parent locks: ${opLog.join(" ")}`);
+    assert.ok(reRead < projectRead, `the re-read precedes the target job read: ${opLog.join(" ")}`);
     assert.ok(projectRead < phaseProjectStatus, opLog.join(" "));
     assert.ok(phaseProjectStatus < phaseCostCode && phaseCostCode < phaseMembership,
         `the phase check runs project, then cost code, then membership: ${opLog.join(" ")}`);
@@ -396,6 +406,7 @@ test("moveReceiptExpenseToJob: role check — a non-ADMIN/MANAGER user gets notA
 
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.notAllowed });
     assert.equal(transactionCalls, 0, "no transaction runs");
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: not receipt-booked", async () => {
@@ -403,6 +414,7 @@ test("moveReceiptExpenseToJob: not receipt-booked", async () => {
     currentUser = moverUser();
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.notFromReceipt });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: a QBO row is refused as not-from-receipt, even with an intake link", async () => {
@@ -412,6 +424,7 @@ test("moveReceiptExpenseToJob: a QBO row is refused as not-from-receipt, even wi
     currentUser = moverUser();
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.notFromReceipt });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: billed", async () => {
@@ -419,6 +432,7 @@ test("moveReceiptExpenseToJob: billed", async () => {
     currentUser = moverUser();
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.billed });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: invoicedAt alone also refuses billed", async () => {
@@ -426,6 +440,7 @@ test("moveReceiptExpenseToJob: invoicedAt alone also refuses billed", async () =
     currentUser = moverUser();
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.billed });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: ARCHIVED intake", async () => {
@@ -434,6 +449,7 @@ test("moveReceiptExpenseToJob: ARCHIVED intake", async () => {
     currentUser = moverUser();
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.archived });
+    assertNoMoveWrites();
 });
 
 for (const [label, patch] of [
@@ -449,6 +465,7 @@ for (const [label, patch] of [
         currentUser = moverUser();
         const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
         assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.askJustin });
+        assertNoMoveWrites();
     });
 }
 
@@ -457,6 +474,20 @@ test("moveReceiptExpenseToJob: stale fromProjectId refuses changed", async () =>
     currentUser = moverUser({ projectIds: [FROM_PROJECT, TO_PROJECT, "some-other-job"] });
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: the re-read under lock disagrees with the first read, refuses changed", async () => {
+    // Call 1 is the first, lock-free read; call 2 is the re-read taken after
+    // the parent locks (booked-expense.ts:157-163). A disagreement there means
+    // the row moved in the gap between the two reads — distinct from "stale
+    // fromProjectId" above, which catches a caller acting on a stale page.
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    expenseFindUniqueOverride = (call, base) => (call === 2 ? { ...(base as object), projectId: "some-other-job" } : base);
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: same job refuses sameJob", async () => {
@@ -464,6 +495,7 @@ test("moveReceiptExpenseToJob: same job refuses sameJob", async () => {
     currentUser = moverUser();
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, FROM_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.sameJob });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: a closed target job refuses jobNotOpen", async () => {
@@ -472,6 +504,7 @@ test("moveReceiptExpenseToJob: a closed target job refuses jobNotOpen", async ()
     projectRow = { name: "Closed Job", status: "Closed Complete" };
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.jobNotOpen });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: a missing target job also refuses jobNotOpen", async () => {
@@ -480,6 +513,7 @@ test("moveReceiptExpenseToJob: a missing target job also refuses jobNotOpen", as
     projectRow = null;
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.jobNotOpen });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: reattributeExpense no-such-expense refuses gone", async () => {
@@ -489,6 +523,7 @@ test("moveReceiptExpenseToJob: reattributeExpense no-such-expense refuses gone",
     expenseFindUniqueOverride = (call, base) => (call >= 3 ? null : base);
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.gone });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: reattributeExpense already-there refuses sameJob", async () => {
@@ -497,6 +532,7 @@ test("moveReceiptExpenseToJob: reattributeExpense already-there refuses sameJob"
     expenseFindUniqueOverride = (call, base) => (call >= 3 ? { ...base, projectId: TO_PROJECT } : base);
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.sameJob });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: reattributeExpense target-moved refuses changed", async () => {
@@ -506,6 +542,34 @@ test("moveReceiptExpenseToJob: reattributeExpense target-moved refuses changed",
     estimateFindFirstOverride = call => (call === 1 ? "est-peek" : "est-relocked");
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: reattributeExpense source-moved refuses changed", async () => {
+    // The job the expense is LEAVING changes under the same peek/re-read gap
+    // (expense-attribution.ts:1079-1084): reattributeExpense's own read
+    // (call 3) sees no projectId of its own, so it falls back to the
+    // estimate's projectId peek, and that peek disagrees with its own
+    // locked re-read.
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    expenseFindUniqueOverride = (call, base) => (call >= 3 ? { ...(base as object), projectId: null } : base);
+    let estimatePeekCall = 0;
+    const originalQueryRawUnsafe = fakePrisma.$queryRawUnsafe;
+    fakePrisma.$queryRawUnsafe = async (query: string, ...values: unknown[]) => {
+        if (/^SELECT "projectId" FROM "Estimate"/.test(query)) {
+            estimatePeekCall++;
+            return [{ projectId: estimatePeekCall === 1 ? FROM_PROJECT : "job-3" }];
+        }
+        return originalQueryRawUnsafe(query, ...values);
+    };
+    try {
+        const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+        assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+        assertNoMoveWrites();
+    } finally {
+        fakePrisma.$queryRawUnsafe = originalQueryRawUnsafe;
+    }
 });
 
 test("moveReceiptExpenseToJob: reattributeExpense lost-the-race refuses changed", async () => {
@@ -514,6 +578,7 @@ test("moveReceiptExpenseToJob: reattributeExpense lost-the-race refuses changed"
     reattributeUpdateCount = 0;
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: no estimate on the target job refuses noEstimate, after rolling back", async () => {
@@ -523,9 +588,7 @@ test("moveReceiptExpenseToJob: no estimate on the target job refuses noEstimate,
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.noEstimate });
     // The rollback point: nothing after the move's own estimate lookup runs.
-    assert.equal(linksUpdateArgs, null, "no link write after a refused move");
-    assert.equal(intakeUpdateArgs, null, "no intake write after a refused move");
-    assert.equal(automationEventArgs, null, "no audit write after a refused move");
+    assertNoMoveWrites();
 });
 
 test("moveReceiptExpenseToJob: an intake CAS count of 0 refuses changed, after the links already wrote", async () => {
@@ -534,6 +597,9 @@ test("moveReceiptExpenseToJob: an intake CAS count of 0 refuses changed, after t
     intakeUpdateCount = 0;
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    // The links write already committed in this transaction before the intake
+    // CAS failed, so only the audit row — written after both — stays unwritten.
+    assert.equal(automationEventArgs, null, "no audit write after a refused move");
 });
 
 test("moveReceiptExpenseToJob: a links CAS count of 0 refuses changed, before the intake row is touched", async () => {
@@ -543,6 +609,7 @@ test("moveReceiptExpenseToJob: a links CAS count of 0 refuses changed, before th
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
     assert.equal(intakeUpdateArgs, null, "the transaction rolled back before the intake write");
+    assert.equal(automationEventArgs, null, "no audit write after a refused move");
 });
 
 test("moveReceiptExpenseToJob: every refusal makes no write at all", async () => {
