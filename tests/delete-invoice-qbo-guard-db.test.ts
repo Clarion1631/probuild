@@ -14,10 +14,18 @@
  * construction. See tests/qbo-client-lock-db.test.ts for the same shape of
  * proof on the Client row lock.
  *
+ * The interleaving test below proves the block DETERMINISTICALLY rather than
+ * with a fixed sleep: it pins the delete's connection to a single, known
+ * Postgres backend pid (`connection_limit=1`) and polls `pg_locks` from a
+ * THIRD, independent connection until that exact pid is reported holding an
+ * un-granted lock request — with a hard deadline that FAILS the test if it
+ * never happens, instead of a sleep that could resolve before the wait even
+ * starts (a false pass) or never notice a guard that took no lock at all.
+ *
  * Opt-in by URL, like tests/qbo-client-lock-db.test.ts: a normal unit run
  * must never be able to write to a developer database. CI's `migrations` job
- * supplies the URL from its Postgres service container — see this file's
- * final comment block for what still needs wiring up before that happens.
+ * supplies the URL from its Postgres service container — a dedicated step,
+ * same shape as tests/qbo-client-lock-db.test.ts's.
  */
 
 import test from "node:test";
@@ -36,9 +44,6 @@ const ID = {
     schedule: "ps-delinvtest",
     billing: "pb-delinvtest",
 };
-
-/** How long the concurrent claim holds its row lock before committing. */
-const HOLD_MS = 400;
 
 async function seed(db: PrismaClient) {
     await teardown(db);
@@ -78,6 +83,44 @@ async function withPrisma<T>(db: PrismaClient, fn: () => Promise<T>): Promise<T>
     } finally {
         (globalThis as any).prisma = previous;
     }
+}
+
+/**
+ * Poll `check` until it resolves true, or REJECT once `deadlineMs` elapses (or
+ * `check` itself throws). A resolved promise here is proof the condition
+ * became true; there is no unbounded loop and no fixed sleep — either of
+ * those can hang forever or resolve without ever having proven anything.
+ */
+function waitFor(check: () => boolean | Promise<boolean>, deadlineMs: number, timeoutMessage: string): Promise<void> {
+    const startedAt = Date.now();
+    return new Promise((resolve, reject) => {
+        const poll = async () => {
+            let ok: boolean;
+            try {
+                ok = await check();
+            } catch (e) {
+                reject(e);
+                return;
+            }
+            if (ok) {
+                resolve();
+                return;
+            }
+            if (Date.now() - startedAt > deadlineMs) {
+                reject(new Error(timeoutMessage));
+                return;
+            }
+            setTimeout(poll, 10);
+        };
+        poll();
+    });
+}
+
+/** Set (or override) `connection_limit` on a Postgres connection URL. */
+function withConnectionLimit(url: string, limit: number): string {
+    const parsed = new URL(url);
+    parsed.searchParams.set("connection_limit", String(limit));
+    return parsed.toString();
 }
 
 test("an unlinked invoice deletes, and its milestones and progress billings cascade with it", { skip }, async () => {
@@ -121,11 +164,28 @@ test("a linked milestone refuses the delete, and nothing is deleted", { skip }, 
 });
 
 test("a concurrent, lock-free progress-billing claim blocks the delete, then the delete refuses once the claim lands", { skip }, async () => {
-    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    // Pinned to exactly ONE physical connection: with only one connection in
+    // the pool, pg_backend_pid() read on `db` below is GUARANTEED to be the
+    // same backend deleteInvoiceCore's own internal transaction runs on —
+    // there is nothing else for Prisma to hand that transaction.
+    const db = new PrismaClient({ datasources: { db: { url: withConnectionLimit(databaseUrl!, 1) } } });
     const other = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    // A THIRD, independent connection: the only thing that can prove Postgres
+    // itself queued deleteInvoiceCore's backend as a lock waiter.
+    const probe = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+
+    // `held` settles the claim transaction below: resolving lets its callback
+    // return normally (COMMIT); rejecting throws inside it (ROLLBACK). A
+    // promise settles once, so whichever of commitClaim/abortClaim runs first
+    // decides the outcome — the other is then a harmless no-op.
+    let commitClaim: () => void = () => {};
+    let abortClaim: (_reason: unknown) => void = () => {};
+    let claim: Promise<unknown> = Promise.resolve();
+    let deletion: Promise<unknown> = Promise.resolve();
     try {
         await seed(db);
         const { deleteInvoiceCore } = await import("../src/lib/billing-core");
+        const [{ pid }] = await db.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`;
 
         // stageProgressBillingToQuickBooksCore's real claim is a bare
         // prisma.progressBilling.updateMany — no transaction, no lock of its
@@ -138,66 +198,60 @@ test("a concurrent, lock-free progress-billing claim blocks the delete, then the
             privateNote: "ProBuild INV-DELINVTEST-P1",
         });
 
-        let release: () => void = () => {};
-        const held = new Promise<void>((r) => { release = r; });
+        const held = new Promise<void>((resolve, reject) => { commitClaim = resolve; abortClaim = reject; });
         let claimOpen = false;
-        const claim = other.$transaction(async (tx) => {
+        claim = other.$transaction(async (tx) => {
             await tx.progressBilling.update({ where: { id: ID.billing }, data: { qbSyncError: marker } });
             claimOpen = true;
             await held;
         }, { timeout: 20_000, maxWait: 20_000 });
-        while (!claimOpen) await new Promise((r) => setTimeout(r, 10));
+        // Bounded readiness signal — not the unbounded poll this used to be —
+        // so a claim whose UPDATE never lands fails the test instead of
+        // hanging it.
+        await waitFor(() => claimOpen, 10_000, "the claim's UPDATE never ran within 10s");
 
-        let settled = false;
-        const deletion = withPrisma(db, () => deleteInvoiceCore(ID.invoice))
-            .then((r) => { settled = true; return r; }, (e) => { settled = true; throw e; });
+        deletion = withPrisma(db, () => deleteInvoiceCore(ID.invoice));
 
-        await new Promise((r) => setTimeout(r, HOLD_MS));
-        assert.equal(
-            settled, false,
-            "deleteInvoiceCore must WAIT on the ProgressBilling row lock — finishing here means it took none",
+        // THE DETERMINISTIC BARRIER. Only once a THIRD connection confirms
+        // Postgres reports backend `pid` (deleteInvoiceCore's own connection,
+        // pinned above) holding an un-granted lock request do we know it is
+        // actually queued behind the claim's row lock — proof, not a guess
+        // from timing. Fails the test outright if that never happens.
+        await waitFor(
+            async () => {
+                const rows = await probe.$queryRaw<Array<{ count: number }>>`
+                    SELECT count(*)::int AS count FROM pg_locks WHERE pid = ${pid} AND granted = false
+                `;
+                return (rows[0]?.count ?? 0) > 0;
+            },
+            10_000,
+            "deleteInvoiceCore never showed up waiting on the ProgressBilling row lock within 10s",
         );
 
-        release();
-        await claim;
+        commitClaim();
+        const [claimOutcome, deletionOutcome] = await Promise.allSettled([claim, deletion]);
 
-        let err: unknown;
-        try {
-            await deletion;
-        } catch (e) {
-            err = e;
+        if (claimOutcome.status === "rejected") {
+            throw new Error(`the claim transaction itself failed: ${claimOutcome.reason}`);
         }
-        assert.ok(err, "expected a refusal, now that the claim's marker is visible");
-        assert.match((err as Error).message, /previous QuickBooks send ended without a confirmed result/);
+        assert.equal(deletionOutcome.status, "rejected", "expected the delete to be refused once the claim's marker is visible");
+        const deleteError = deletionOutcome.status === "rejected" ? deletionOutcome.reason : undefined;
+        assert.match((deleteError as Error).message, /previous QuickBooks send ended without a confirmed result/);
 
         assert.ok(await db.invoice.findUnique({ where: { id: ID.invoice } }), "the invoice must survive");
         assert.ok(await db.progressBilling.findUnique({ where: { id: ID.billing } }), "the progress billing must survive");
     } finally {
+        // A no-op if commitClaim already settled `held` above. What actually
+        // fires this is anything earlier in the try block throwing (the
+        // lock-wait barrier's deadline, a seed failure, ...): it rolls the
+        // claim transaction BACK instead of leaving it open, and draining
+        // both promises here — via allSettled, so neither rejection escapes
+        // unhandled — means nothing is left running behind this test.
+        abortClaim(new Error("delete-invoice-qbo-guard-db test cleanup: releasing the held claim transaction"));
+        await Promise.allSettled([claim, deletion]);
         await teardown(db);
         await db.$disconnect();
         await other.$disconnect();
+        await probe.$disconnect();
     }
 });
-
-/**
- * NOT YET WIRED TO RUN FOR REAL IN CI.
- *
- * This file is opt-in by DELETE_INVOICE_QBO_GUARD_TEST_URL, same shape as
- * tests/qbo-client-lock-db.test.ts — but that file gets its URL from a
- * DEDICATED `.github/workflows/ci.yml` step in the `migrations` job
- * (`npx tsx --test tests/qbo-client-lock-db.test.ts`, env
- * `QBO_CLIENT_LOCK_TEST_URL: ...`), which is the only job with a Postgres
- * service container. This file is listed in package.json's `test:unit`
- * instead (as asked), but `test:unit` only ever runs from the `build` job
- * (ci.yml: "Hermetic pure-logic suites — no DB, no network, so they belong in
- * this job rather than the Postgres one"), which has no Postgres service and
- * never sets DELETE_INVOICE_QBO_GUARD_TEST_URL. So as CI is wired today, this
- * file's `skip` guard is always true in CI and all three tests above report
- * "skipped", not "passed" — the same is already true of roughly a dozen other
- * *-db.test.ts files package.json lists inside test:unit (e.g.
- * tax-at-source-report-db.test.ts, the payroll-*-lock-db.test.ts cluster).
- * Making it actually run for real needs a step like qbo-client-lock-db's
- * added to the `migrations` job — not done here, since editing the shared CI
- * workflow is outside what this task asked for. Flagged rather than silently
- * left implicit, so the gap is a decision rather than a surprise.
- */
