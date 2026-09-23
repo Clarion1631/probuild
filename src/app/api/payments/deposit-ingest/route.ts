@@ -1332,10 +1332,12 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
  *
  *  - candidates must be REQUESTED (PaymentSchedule.qbInvoiceSentAt, the
  *    rail-neutral request marker billing-core.ts stamps only once the client
- *    email actually went out). A qbInvoiceId-only milestone was created in
- *    QuickBooks but never asked for, so it is not a candidate — that is what
- *    resolves the Hoppe case, where three Pending milestones sat at exactly
- *    $13,447.68 and only one had been requested;
+ *    email actually went out), and FIRST requested by the end of the credit's
+ *    post date (firstRequestedAt, falling back to qbInvoiceSentAt). A
+ *    qbInvoiceId-only milestone was created in QuickBooks but never asked for,
+ *    so it is not a candidate — that is what resolves the Hoppe case, where
+ *    three Pending milestones sat at exactly $13,447.68 and only one had been
+ *    requested;
  *  - uniqueness is taken over a UNION with anything at this amount settled in
  *    the last 14 days by ANY source, so money the photo path just booked still
  *    counts against uniqueness even though its milestone is now Paid;
@@ -1384,11 +1386,19 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
     // arrived. Money cannot pay a bill that had not been sent yet, and without
     // this bound, invoicing a new milestone for the same amount today would
     // retroactively make it a candidate for last week's deposit.
+    // "Requested" here means FIRST requested (firstRequestedAt, else
+    // qbInvoiceSentAt): a resend after the deposit must not disqualify it.
     const requestedBy = requestedByInstant(payload.postDate);
     const requested: BankCandidate[] = await prisma.paymentSchedule.findMany({
         where: {
             status: "Pending",
-            qbInvoiceSentAt: { not: null, lte: requestedBy },
+            // Judged by the FIRST request: a resend after the client paid moves
+            // only qbInvoiceSentAt. A row with no firstRequestedAt (requested
+            // before that column existed) falls back to qbInvoiceSentAt.
+            OR: [
+                { firstRequestedAt: { not: null, lte: requestedBy } },
+                { firstRequestedAt: null, qbInvoiceSentAt: { not: null, lte: requestedBy } },
+            ],
             invoice: { status: { in: OPEN_INVOICE_STATUSES } },
         },
         select: BANK_CANDIDATE_SELECT,
@@ -1574,7 +1584,10 @@ async function bankNoMatchReason(
         const late: BankCandidate[] = await prisma.paymentSchedule.findMany({
             where: {
                 status: "Pending",
-                qbInvoiceSentAt: { gt: requestedBy },
+                OR: [
+                    { firstRequestedAt: { gt: requestedBy } },
+                    { firstRequestedAt: null, qbInvoiceSentAt: { gt: requestedBy } },
+                ],
                 invoice: { status: { in: OPEN_INVOICE_STATUSES } },
             },
             select: BANK_CANDIDATE_SELECT,

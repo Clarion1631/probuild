@@ -68,6 +68,7 @@ import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { computeInvoiceReceivable, type ReceivableInvoiceInput, type ReceivableMilestone, type ReceivableProgressBilling } from "./receivables";
 import { computeInvoiceAmountDue, type InvoiceAmountDue } from "./invoice-amount-due";
+import { stampFirstRequested } from "./milestone-request-stamp";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
@@ -191,7 +192,7 @@ const RECEIVABLE_PAYMENTS_ARGS = {
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     select: {
         id: true, name: true, amount: true, status: true, dueDate: true, createdAt: true,
-        qbInvoiceId: true, qbInvoiceSentAt: true, qbSyncError: true, qbSyncedAt: true,
+        qbInvoiceId: true, qbInvoiceSentAt: true, firstRequestedAt: true, qbSyncError: true, qbSyncedAt: true,
     },
 } satisfies Prisma.Invoice$paymentsArgs;
 const RECEIVABLE_PROGRESS_BILLINGS_ARGS = {
@@ -745,17 +746,24 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
     // (PR #216/#289 history). qbInvoiceSentAt doubles as the rail-neutral
     // request marker: the portal only shows Pay buttons and due amounts for
     // requested milestones. Requested milestones get their last-sent time
-    // refreshed as before. Delivered-but-not-recorded must not read as a
+    // refreshed as before. The FIRST request is recorded once, in the same
+    // transaction and before the last-sent write, and never moves
+    // (milestone-request-stamp.ts), so a resend can no longer make an overdue
+    // milestone look newly billed. Delivered-but-not-recorded must not read as a
     // send failure — the email DID go out, and reporting failure here would
     // invite a duplicate send — so the stamp is fail-soft and loud, same
     // pattern as the milestone path. A legacy-only send has nothing to stamp.
     const billedMilestoneIds = milestoneItems.map(it => it.id as string);
     if (billedMilestoneIds.length > 0) {
         try {
-            await prisma.paymentSchedule.updateMany({
-                where: { invoiceId, status: "Pending", id: { in: billedMilestoneIds } },
-                data: { qbInvoiceSentAt: new Date() },
-            });
+            const stampedAt = new Date();
+            await prisma.$transaction([
+                stampFirstRequested(prisma, invoiceId, billedMilestoneIds, stampedAt),
+                prisma.paymentSchedule.updateMany({
+                    where: { invoiceId, status: "Pending", id: { in: billedMilestoneIds } },
+                    data: { qbInvoiceSentAt: stampedAt },
+                }),
+            ]);
         } catch (stampErr) {
             console.error(`[sendInvoiceToClientCore] Email sent but the request stamp failed for invoice ${invoice.code} — portal will show nothing due until a resend:`, stampErr);
         }
@@ -1415,11 +1423,15 @@ export async function sendMilestoneInvoicesCore(
                 const stampedAt = new Date();
                 let stampError: string | null = null;
                 try {
-                    await prisma.$transaction(
-                        sendable.map(({ schedule }) =>
+                    // First request once, then the last-sent time, atomically.
+                    // The first-request statement must come first: it reads the
+                    // pre-send qbInvoiceSentAt (milestone-request-stamp.ts).
+                    await prisma.$transaction([
+                        stampFirstRequested(prisma, invoiceId, sendable.map(({ schedule }) => schedule.id), stampedAt),
+                        ...sendable.map(({ schedule }) =>
                             prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceSentAt: stampedAt } })
-                        )
-                    );
+                        ),
+                    ]);
                 } catch (e: any) {
                     stampError = e?.message || "unknown error";
                     console.error("[sendMilestoneInvoices] email delivered but recording the send failed:", e);
