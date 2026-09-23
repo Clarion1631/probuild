@@ -51,7 +51,7 @@ let projectStatusRows: unknown[] = [{ id: "job-2", status: "In Progress" }];
 /** `assertPhaseOfProjectTx`'s plain CostCode read. */
 let costCodeRows: unknown[] = [{ id: "cc-1", code: "03-PLUMB", isActive: true }];
 /** `tx.project.findUnique` — the target job Move to job reads at step 7. */
-let projectRow: { name: string; status: string } | null = { name: "Mesplay Kitchen", status: "In Progress" };
+let projectRow: { name: string; status: string } | null = { name: "Sample Job B", status: "In Progress" };
 /** `tx.estimate.findFirst` — `reattributeExpense`'s target-estimate peek/re-read. */
 let targetEstimateId: string | null = "est-target-1";
 let estimateFindFirstOverride: ((call: number) => string | null) | null = null;
@@ -248,7 +248,7 @@ beforeEach(() => {
     membershipRows = [{ ok: 1 }];
     projectStatusRows = [{ id: "job-2", status: "In Progress" }];
     costCodeRows = [{ id: "cc-1", code: "03-PLUMB", isActive: true }];
-    projectRow = { name: "Mesplay Kitchen", status: "In Progress" };
+    projectRow = { name: "Sample Job B", status: "In Progress" };
     targetEstimateId = "est-target-1";
     estimateFindFirstOverride = null;
     estimateFindFirstCall = 0;
@@ -315,7 +315,7 @@ test("moveReceiptExpenseToJob: happy path, phase kept — opLog order, one trans
 
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
 
-    assert.deepEqual(res, { ok: true, toProjectName: "Mesplay Kitchen", phaseCleared: false });
+    assert.deepEqual(res, { ok: true, toProjectName: "Sample Job B", phaseCleared: false });
     assert.equal(transactionCalls, 1, "one transaction, no retry");
 
     const at = (needle: string) => opLog.findIndex(entry => entry.startsWith(needle));
@@ -365,7 +365,7 @@ test("moveReceiptExpenseToJob: happy path, phase cleared — links and intake da
 
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
 
-    assert.deepEqual(res, { ok: true, toProjectName: "Mesplay Kitchen", phaseCleared: true });
+    assert.deepEqual(res, { ok: true, toProjectName: "Sample Job B", phaseCleared: true });
 
     assert.deepEqual(linksUpdateArgs.data, {
         itemId: null, changeOrderId: null, isBillable: false, purchaseOrderId: null,
