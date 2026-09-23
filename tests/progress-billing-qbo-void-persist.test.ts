@@ -8,6 +8,15 @@
  * against a fake `progressBilling` table whose `updateMany` evaluates the
  * WHERE for real (mirrors the pattern in tests/progress-billing-stage.test.ts),
  * so the CAS's marker allowlist is actually exercised, not re-implemented.
+ *
+ * Round-2 fix: `findMany`/`count` used to ignore `where` and `select`
+ * entirely and hand the row handler every field on every row regardless of
+ * what the production query actually asked for — so removing `qbSyncError`
+ * from `billingSelect`, or narrowing `billingWhere`, would have passed here
+ * silently. Both now run through the same generic `matchWhere`/`project`
+ * used by `updateMany`, and new cases pin the CAS's two race protections
+ * (the link or status changing between the read and the write) and the
+ * per-row error path when the write itself fails.
  */
 
 import test from "node:test";
@@ -44,23 +53,35 @@ function billingRow(overrides: Row = {}): Row {
 }
 
 /**
- * Prisma WHERE semantics, as far as the persist CAS actually uses them (`in`,
- * `startsWith`, `OR`, plain equality — including `null`). Same shape as
- * tests/progress-billing-stage.test.ts's matcher, so a where clause this test
- * cannot evaluate is a signal the source drifted from what both were written
- * against, not a gap to silently paper over.
+ * Prisma WHERE semantics, as far as the poller's queries against
+ * `progressBilling` actually use them: equality (including `null`), `in`,
+ * `not`, `startsWith`, `OR`, `gt`/`lte` (the `id` cursor pagination
+ * `count`/`findMany` send), and one level of nested relation object (a
+ * project-scoped run's `invoice: { projectId: ... }`, matched against the
+ * row's `invoice`). Same shape as tests/progress-billing-stage.test.ts's
+ * matcher plus the cursor/relation forms this file's `count`/`findMany` also
+ * need. Throws on anything else, so a where clause this test cannot evaluate
+ * is a signal the source drifted from what both were written against, not a
+ * gap to silently paper over.
  */
 function matchWhere(row: any, where: any): boolean {
     const matchOne = (rowValue: any, cond: any): boolean => {
-        if (cond !== null && typeof cond === "object") {
-            if ("in" in cond) return (cond as any).in.includes(rowValue);
-            if ("not" in cond) return rowValue !== (cond as any).not;
-            if ("startsWith" in cond) {
-                return typeof rowValue === "string" && rowValue.startsWith((cond as any).startsWith);
-            }
-            throw new Error(`unsupported condition: ${JSON.stringify(cond)}`);
+        if (cond === null || typeof cond !== "object") return rowValue === cond;
+        if ("in" in cond) return (cond as any).in.includes(rowValue);
+        if ("not" in cond) return rowValue !== (cond as any).not;
+        if ("startsWith" in cond) {
+            return typeof rowValue === "string" && rowValue.startsWith((cond as any).startsWith);
         }
-        return rowValue === cond;
+        if ("gt" in cond || "lte" in cond) {
+            return (!("gt" in cond) || rowValue > (cond as any).gt)
+                && (!("lte" in cond) || rowValue <= (cond as any).lte);
+        }
+        if (rowValue !== null && typeof rowValue === "object" && !Array.isArray(rowValue)) {
+            // Nested relation predicate, e.g. `invoice: { projectId: "..." }` —
+            // recurse the same matcher against the related row.
+            return matchWhere(rowValue, cond);
+        }
+        throw new Error(`unsupported condition: ${JSON.stringify(cond)}`);
     };
     return Object.entries(where ?? {}).every(([k, v]) =>
         k === "OR"
@@ -68,20 +89,47 @@ function matchWhere(row: any, where: any): boolean {
             : matchOne(row[k], v));
 }
 
-/** In-memory ProgressBilling delegate: real WHERE matching, real count semantics. */
-function makeBillingTable(rows: Row[], updateCalls: any[]) {
+/** Applies a Prisma `select` (including one level of nested `{ select }`) to a row. */
+function project(row: any, select?: Record<string, any>): any {
+    if (!select) return { ...row };
+    const out: any = {};
+    for (const [key, spec] of Object.entries(select)) {
+        if (spec === true) {
+            out[key] = row[key];
+        } else if (spec && typeof spec === "object" && "select" in (spec as any)) {
+            const value = row[key];
+            const nestedSelect = (spec as any).select;
+            out[key] = Array.isArray(value)
+                ? value.map((v: any) => project(v, nestedSelect))
+                : (value == null ? value : project(value, nestedSelect));
+        }
+    }
+    return out;
+}
+
+/**
+ * In-memory ProgressBilling delegate: `count`/`findMany` evaluate the real
+ * `where` and honor `select` (round-2 fix — they used to hand back every
+ * field on every row regardless of what was asked for); `updateMany`
+ * evaluates `where` for real and applies real count semantics.
+ * `opts.failWhereIdIs` makes `updateMany` throw for the one billing whose
+ * `where.id` matches it (checked after the call is recorded, before any row
+ * is touched) — used to pin the per-row error path below.
+ */
+function makeBillingTable(rows: Row[], updateCalls: any[], opts?: { failWhereIdIs?: string }) {
     return {
         async count(args: any) {
-            const gt = args?.where?.id?.gt;
-            return (gt ? rows.filter((r) => r.id > gt) : rows).length;
+            return rows.filter((r) => matchWhere(r, args?.where)).length;
         },
         async findMany(args: any) {
-            const gt = args?.where?.id?.gt;
-            const list = gt ? rows.filter((r) => r.id > gt) : rows;
-            return list.slice(0, args?.take ?? list.length).map((r) => ({ ...r }));
+            const matched = rows.filter((r) => matchWhere(r, args?.where));
+            return matched.slice(0, args?.take ?? matched.length).map((r) => project(r, args?.select));
         },
         async updateMany(args: any) {
             updateCalls.push(args);
+            if (opts?.failWhereIdIs && args.where?.id === opts.failWhereIdIs) {
+                throw new Error("database unavailable");
+            }
             const matches = rows.filter((r) => matchWhere(r, args.where));
             for (const row of matches) Object.assign(row, args.data);
             return { count: matches.length };
@@ -98,6 +146,7 @@ function makeBillingTable(rows: Row[], updateCalls: any[]) {
 async function runPoller(
     billings: Row[],
     probeInvoice: (qbInvoiceId: string) => Promise<any>,
+    tableOpts?: { failWhereIdIs?: string },
 ): Promise<{ result: any; updateCalls: any[] }> {
     const previousNextauth = process.env.NEXTAUTH_SECRET;
     process.env.NEXTAUTH_SECRET = "test-nextauth-secret";
@@ -115,7 +164,7 @@ async function runPoller(
     const client = {
         integration: { async findUnique() { return { settings }; }, async upsert() { return {}; } },
         paymentSchedule: noMilestones,
-        progressBilling: makeBillingTable(billings, updateCalls),
+        progressBilling: makeBillingTable(billings, updateCalls, tableOpts),
         automationEvent: { async create() { return {}; } },
     };
 
@@ -230,6 +279,65 @@ test("probe ok never writes qbSyncError (regression)", async () => {
 
     assert.equal(updateCalls.length, 0);
     assert.equal(billings[0].qbSyncError, null);
+});
+
+// --- CAS protections ---------------------------------------------------------
+
+test("CAS protection: the link changing during the probe makes the write match zero rows", async () => {
+    const billings = [billingRow({ id: "pb-1", qbInvoiceId: "qb-1", qbSyncError: null, status: "Staged" })];
+    const { updateCalls } = await runPoller(billings, async () => {
+        // A concurrent writer re-links this billing to a different QBO invoice
+        // after the row was read (findMany already handed "qb-1" to the row
+        // handler) but before the CAS write below runs.
+        billings[0].qbInvoiceId = "qb-9-different";
+        return { state: "voided" };
+    });
+
+    assert.equal(updateCalls.length, 1, "the CAS is still attempted");
+    assert.equal(updateCalls[0].where.qbInvoiceId, "qb-1", "pinned to the link the probe actually checked");
+    assert.equal(billings[0].qbInvoiceId, "qb-9-different", "the row keeps its new link");
+    assert.equal(billings[0].qbSyncError, null, "the stale-link CAS matched zero rows and left qbSyncError alone");
+});
+
+test("CAS protection: the status changing to Paid during the probe makes the write match zero rows", async () => {
+    const billings = [billingRow({ id: "pb-1", qbInvoiceId: "qb-1", qbSyncError: null, status: "Staged" })];
+    const { updateCalls } = await runPoller(billings, async () => {
+        // A settlement landed on this billing while the probe was in flight.
+        billings[0].status = "Paid";
+        return { state: "voided" };
+    });
+
+    assert.equal(updateCalls.length, 1, "the CAS is still attempted");
+    assert.equal(billings[0].status, "Paid", "the row keeps its new status");
+    assert.equal(billings[0].qbSyncError, null, "the stale-status CAS matched zero rows and left qbSyncError alone");
+});
+
+test("one billing's updateMany failing still reports its error and lets another billing in the run persist", async () => {
+    const billings = [
+        billingRow({ id: "pb-1", qbInvoiceId: "qb-1", qbSyncError: null, status: "Staged", code: "INV-1-P1", invoice: { code: "INV-1", estimateId: null } }),
+        billingRow({ id: "pb-2", qbInvoiceId: "qb-2", qbSyncError: null, status: "Staged", code: "INV-2-P1", invoice: { code: "INV-2", estimateId: null } }),
+    ];
+    const { result, updateCalls } = await runPoller(
+        billings,
+        async () => ({ state: "voided" }),
+        { failWhereIdIs: "pb-1" },
+    );
+
+    assert.equal(updateCalls.length, 2, "both billings were attempted");
+    assert.equal(billings[0].qbSyncError, null, "pb-1's write failed — its row is untouched");
+    assert.equal(billings[1].qbSyncError, "voided", "pb-2 in the same run is still processed and persisted");
+    // runQboRowLoop's onRowError formats a thrown row error as "<invoice
+    // code>/<billing code>: <message>" — the normal "QBO invoice voided" push
+    // never runs for pb-1, since the throw unwinds out of the row handler
+    // before reaching it.
+    assert.ok(
+        result.errors.includes("INV-1/INV-1-P1: database unavailable"),
+        "the failed billing's row error is recorded",
+    );
+    assert.ok(
+        result.errors.includes("INV-2/INV-2-P1: QBO invoice voided"),
+        "the other billing's normal error is still recorded",
+    );
 });
 
 // --- Re-push safety --------------------------------------------------------

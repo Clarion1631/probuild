@@ -3532,17 +3532,15 @@ async function runPaymentsSync(
                 throw new Error(`QBO invoice probe failed (status ${probe.status})`);
             }
             if (probe.state === "voided" || probe.state === "notFound") {
-                // Persist so receivables.ts's isLiveQboLink (computeInvoiceReceivable)
-                // can exclude this billing from "live" QBO evidence — mirrors the
-                // milestone claim above (~3412). Unlike that claim, one CAS covers
-                // both the first flag and a later relabel (voided <-> notFound):
-                // progress billings have no notification to keep exactly-once, so
-                // there's no separate claim/relabel split to preserve.
-                // The OR only matches qbSyncError null, a pay-link marker, or the
-                // OTHER voided/notFound state — it must never overwrite
-                // create-in-flight, ambiguous-create, a `compensating:` claim, or a
-                // pending-deletion marker, each of which means a human or another
-                // writer is already mid-decision on this row.
+                // Persist it, like the milestone claim above, so anything that
+                // treats a voided/notFound link as dead (the AR digest's live-link
+                // rule) stops counting this billing as billed. One CAS covers both
+                // the first flag and a later voided <-> notFound relabel: progress
+                // billings have no notification to keep exactly-once. The OR only
+                // replaces no marker, a pay-link marker, or the other probe state —
+                // never create-in-flight, ambiguous-create, a `compensating:` claim
+                // or a pending-deletion marker, which mean another writer or a
+                // human is mid-decision on this row.
                 if (billing.qbSyncError !== probe.state) {
                     await prisma.progressBilling.updateMany({
                         where: {

@@ -13,6 +13,14 @@
  * tests/qbo-parked-row-guards.test.ts) against a fake `progressBillingLine`
  * table that evaluates the guard's actual `where` clause rather than
  * returning canned per-test answers.
+ *
+ * Round-2 fix: the fake's Void exclusion used to be hardcoded in JS instead
+ * of read from `args.where`, and the split tests fed `paymentSchedule`
+ * canned per-test answers instead of a real table — either gap could have
+ * let a changed production predicate, or a changed `deleteMany` scope, pass
+ * silently. Every fake here now runs the actual `where` (and, for the split
+ * table, `select`) through one generic matcher (`matchWhere`) shared by both
+ * `progressBillingLine` and `paymentSchedule`.
  */
 
 import test from "node:test";
@@ -42,14 +50,37 @@ function cleanSchedule(overrides: Record<string, unknown> = {}) {
 type FakeLine = { scheduleId: string; billing: { code: string; status: string } };
 
 /**
+ * Small generic where-matcher shared by every fake read/write in this file:
+ * equality (including null), `{ in: [...] }`, `{ not: X }` (X a value or
+ * null), and one level of nested relation object (e.g. `billing: { status:
+ * { not: "Void" } }`, matched against `row.billing`). Throws on anything
+ * else, so a changed production predicate this matcher can't evaluate fails
+ * the test loudly instead of silently passing.
+ */
+function matchWhere(row: any, where: Record<string, unknown> | undefined): boolean {
+    return Object.entries(where ?? {}).every(([key, cond]) => matchField((row ?? {})[key], cond));
+}
+
+function matchField(value: any, cond: any): boolean {
+    if (cond === null || typeof cond !== "object") return value === cond;
+    if ("in" in cond) return (cond as { in: unknown[] }).in.includes(value);
+    if ("not" in cond) return value !== (cond as { not: unknown }).not;
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+        // Nested relation predicate, e.g. `billing: { status: { not: "Void" } }`
+        // — recurse the same matcher against the related row.
+        return matchWhere(value, cond as Record<string, unknown>);
+    }
+    throw new Error(`unsupported where condition: ${JSON.stringify(cond)}`);
+}
+
+/**
  * The fake `tx.progressBillingLine.findFirst`: evaluates the guard's actual
- * where clause (scheduleId in the given list, billing status not Void)
- * against an in-memory lines table, instead of returning a fixed answer.
+ * `where` clause via `matchWhere` against an in-memory lines table, instead
+ * of hardcoding any part of the predicate (e.g. the Void exclusion) itself.
  */
 function fakeProgressBillingLineFindFirst(lines: FakeLine[]) {
     return async (args: any) => {
-        const ids: string[] = args.where.scheduleId.in;
-        const hit = lines.find((l) => ids.includes(l.scheduleId) && l.billing.status !== "Void");
+        const hit = lines.find((l) => matchWhere(l, args.where));
         if (!hit) return null;
         return { scheduleId: hit.scheduleId, billing: { code: hit.billing.code, status: hit.billing.status } };
     };
@@ -207,25 +238,69 @@ test("delete: a milestone not on any progress billing succeeds", async () => {
 
 // --- splitInvoiceMilestonesCore ---------------------------------------------
 
+type FakeScheduleRow = { id: string; invoiceId: string; name: string; status: string; amount: number };
+
+/** Applies a Prisma `select` (flat `{ field: true }` — all this core sends) to a row. */
+function project(row: FakeScheduleRow, select?: Record<string, boolean>): Partial<FakeScheduleRow> {
+    if (!select) return { ...row };
+    const out: Partial<FakeScheduleRow> = {};
+    for (const key of Object.keys(select) as (keyof FakeScheduleRow)[]) {
+        if (select[key]) (out as any)[key] = row[key];
+    }
+    return out;
+}
+
+/**
+ * One in-memory `paymentSchedule` table backing the split tests: `findMany`
+ * evaluates the real `where`/`select` the core sends, and `deleteMany`
+ * evaluates its `where` and actually removes matching rows from the SAME
+ * array `createMany` appends to — so a test can assert exactly which rows
+ * survived, not just that a method was called. `findFirst` (the core's
+ * separate in-flight-payment / change-order checks — a different guard with
+ * its own OR/startsWith predicate, not what this file is pinning) stays a
+ * plain "nothing in flight" stub, true of every row these fixtures create.
+ */
+function makeScheduleTable(rows: FakeScheduleRow[]) {
+    const deleteManyCalls: any[] = [];
+    const createManyCalls: any[] = [];
+    let nextId = 1;
+    return {
+        rows,
+        deleteManyCalls,
+        createManyCalls,
+        async findFirst() { return null; },
+        async findMany(args: any) {
+            return rows.filter((r) => matchWhere(r, args.where)).map((r) => project(r, args.select));
+        },
+        async deleteMany(args: any) {
+            deleteManyCalls.push(args);
+            const toDelete = rows.filter((r) => matchWhere(r, args.where));
+            for (const row of toDelete) rows.splice(rows.indexOf(row), 1);
+            return { count: toDelete.length };
+        },
+        async createMany(args: any) {
+            createManyCalls.push(args);
+            const added = args.data.map((d: any) => ({ status: "Pending", ...d, id: `new-${nextId++}` }));
+            rows.push(...added);
+            return { count: added.length };
+        },
+    };
+}
+
 test("split: a non-Paid milestone covered by a Staged progress billing is refused", async () => {
     const { splitInvoiceMilestonesCore } = await import("../src/lib/billing-core");
-    const currentRows = [
-        cleanSchedule({ id: "ps-1", name: "Rough-in" }),
-        cleanSchedule({ id: "ps-2", name: "Trim" }),
-    ];
-    let deleteManyCalled = false;
-    let createManyCalled = false;
+    const table = makeScheduleTable([
+        { id: "ps-1", invoiceId: "inv-1", name: "Rough-in", status: "Pending", amount: 1000 },
+        { id: "ps-2", invoiceId: "inv-1", name: "Trim", status: "Pending", amount: 1000 },
+        { id: "ps-paid", invoiceId: "inv-1", name: "Deposit", status: "Paid", amount: 500 },
+        { id: "ps-other", invoiceId: "inv-2", name: "Other job", status: "Pending", amount: 400 },
+    ]);
     const tx = {
         invoice: {
-            async findUnique() { return { id: "inv-1", projectId: "proj-1", totalAmount: 2000, balanceDue: 2000, status: "Sent" }; },
+            async findUnique() { return { id: "inv-1", projectId: "proj-1", totalAmount: 2500, balanceDue: 2000, status: "Sent" }; },
             async update() { throw new Error("must not recompute the invoice"); },
         },
-        paymentSchedule: {
-            async findFirst() { return null; }, // in-flight check + assertInvoiceHasNoChangeOrderBilling: neither applies here
-            async findMany() { return currentRows.map(({ id, name }) => ({ id, name })); },
-            async deleteMany() { deleteManyCalled = true; return { count: currentRows.length }; },
-            async createMany() { createManyCalled = true; return { count: 2 }; },
-        },
+        paymentSchedule: table,
         progressBillingLine: {
             findFirst: fakeProgressBillingLineFindFirst([
                 { scheduleId: "ps-1", billing: { code: "INV-1-P1", status: "Staged" } },
@@ -240,8 +315,9 @@ test("split: a non-Paid milestone covered by a Staged progress billing is refuse
             /"Rough-in" is on progress invoice INV-1-P1 \(Staged\)/,
         );
     });
-    assert.equal(deleteManyCalled, false);
-    assert.equal(createManyCalled, false);
+    assert.equal(table.deleteManyCalls.length, 0, "the CAS delete must not run");
+    assert.equal(table.createManyCalls.length, 0);
+    assert.deepEqual(table.rows.map((r) => r.id).sort(), ["ps-1", "ps-2", "ps-other", "ps-paid"], "no row touched");
 });
 
 test("split: a Paid milestone covered by a Paid progress billing does not block the split", async () => {
@@ -249,20 +325,17 @@ test("split: a Paid milestone covered by a Paid progress billing does not block 
     // ps-1 is Paid, so it's excluded from the non-Paid rows the deleteMany
     // below removes — the guard must never even consider it, even though a
     // (Paid, non-Void) billing references it.
-    const nonPaidRows = [cleanSchedule({ id: "ps-2", name: "Trim" })];
-    let deleteManyCalled = false;
-    let createManyCalled = false;
+    const table = makeScheduleTable([
+        { id: "ps-1", invoiceId: "inv-1", name: "Rough-in", status: "Paid", amount: 1000 },
+        { id: "ps-2", invoiceId: "inv-1", name: "Trim", status: "Pending", amount: 1000 },
+        { id: "ps-other", invoiceId: "inv-2", name: "Other job", status: "Pending", amount: 400 },
+    ]);
     const tx = {
         invoice: {
             async findUnique() { return { id: "inv-1", projectId: "proj-1", totalAmount: 2000, balanceDue: 1000, status: "Partially Paid" }; },
             async update() { return {}; },
         },
-        paymentSchedule: {
-            async findFirst() { return null; },
-            async findMany() { return nonPaidRows.map(({ id, name }) => ({ id, name })); },
-            async deleteMany() { deleteManyCalled = true; return { count: nonPaidRows.length }; },
-            async createMany() { createManyCalled = true; return { count: 1 }; },
-        },
+        paymentSchedule: table,
         progressBillingLine: {
             findFirst: fakeProgressBillingLineFindFirst([
                 { scheduleId: "ps-1", billing: { code: "INV-1-P1", status: "Paid" } },
@@ -275,26 +348,32 @@ test("split: a Paid milestone covered by a Paid progress billing does not block 
         splitInvoiceMilestonesCore("inv-1", [{ name: "New Trim", amount: 1000 }]),
     );
 
-    assert.equal(deleteManyCalled, true);
-    assert.equal(createManyCalled, true);
+    assert.equal(table.deleteManyCalls.length, 1);
+    assert.equal(table.createManyCalls.length, 1);
+    assert.equal(table.rows.find((r) => r.id === "ps-2"), undefined, "the Pending row was removed");
+    assert.deepEqual(
+        table.rows.map((r) => r.id).sort(),
+        ["new-1", "ps-1", "ps-other"],
+        "Paid row and the other invoice's row survive; the new row was added",
+    );
+    const paid = table.rows.find((r) => r.id === "ps-1")!;
+    assert.equal(paid.status, "Paid");
+    assert.equal(paid.amount, 1000, "the Paid row keeps its own amount");
 });
 
 test("split: an invoice with no progress billings at all succeeds", async () => {
     const { splitInvoiceMilestonesCore } = await import("../src/lib/billing-core");
-    const currentRows = [cleanSchedule({ id: "ps-1", name: "Rough-in" })];
-    let deleteManyCalled = false;
-    let createManyCalled = false;
+    const table = makeScheduleTable([
+        { id: "ps-1", invoiceId: "inv-1", name: "Rough-in", status: "Pending", amount: 1000 },
+        { id: "ps-paid", invoiceId: "inv-1", name: "Deposit", status: "Paid", amount: 300 },
+        { id: "ps-other", invoiceId: "inv-2", name: "Other job", status: "Pending", amount: 400 },
+    ]);
     const tx = {
         invoice: {
-            async findUnique() { return { id: "inv-1", projectId: "proj-1", totalAmount: 1000, balanceDue: 1000, status: "Sent" }; },
+            async findUnique() { return { id: "inv-1", projectId: "proj-1", totalAmount: 1300, balanceDue: 1000, status: "Sent" }; },
             async update() { return {}; },
         },
-        paymentSchedule: {
-            async findFirst() { return null; },
-            async findMany() { return currentRows.map(({ id, name }) => ({ id, name })); },
-            async deleteMany() { deleteManyCalled = true; return { count: 1 }; },
-            async createMany() { createManyCalled = true; return { count: 1 }; },
-        },
+        paymentSchedule: table,
         progressBillingLine: { findFirst: fakeProgressBillingLineFindFirst([]) },
         $queryRaw: async () => [],
     };
@@ -303,8 +382,43 @@ test("split: an invoice with no progress billings at all succeeds", async () => 
         splitInvoiceMilestonesCore("inv-1", [{ name: "New A", amount: 1000 }]),
     );
 
-    assert.equal(deleteManyCalled, true);
-    assert.equal(createManyCalled, true);
+    assert.equal(table.deleteManyCalls.length, 1);
+    assert.equal(table.createManyCalls.length, 1);
+    assert.deepEqual(table.rows.map((r) => r.id).sort(), ["new-1", "ps-other", "ps-paid"]);
+});
+
+test("split: a Pending milestone of a different invoice covered by a Staged billing does not block this invoice's split", async () => {
+    const { splitInvoiceMilestonesCore } = await import("../src/lib/billing-core");
+    const table = makeScheduleTable([
+        { id: "ps-1", invoiceId: "inv-1", name: "Rough-in", status: "Pending", amount: 1000 },
+        { id: "ps-2", invoiceId: "inv-2", name: "Other Rough-in", status: "Pending", amount: 500 },
+    ]);
+    const tx = {
+        invoice: {
+            async findUnique() { return { id: "inv-1", projectId: "proj-1", totalAmount: 1000, balanceDue: 1000, status: "Sent" }; },
+            async update() { return {}; },
+        },
+        paymentSchedule: table,
+        progressBillingLine: {
+            // ps-2 belongs to inv-2, not the invoice being split — the guard's
+            // row set must be scoped to this invoice's own toRemove rows.
+            findFirst: fakeProgressBillingLineFindFirst([
+                { scheduleId: "ps-2", billing: { code: "INV-2-P1", status: "Staged" } },
+            ]),
+        },
+        $queryRaw: async () => [],
+    };
+
+    await withFakePrisma({ $transaction: async (fn: any) => fn(tx) }, () =>
+        splitInvoiceMilestonesCore("inv-1", [{ name: "New A", amount: 1000 }]),
+    );
+
+    assert.equal(table.deleteManyCalls.length, 1, "inv-1's split must proceed despite inv-2's covered milestone");
+    assert.deepEqual(
+        table.rows.map((r) => r.id).sort(),
+        ["new-1", "ps-2"],
+        "ps-1 replaced; the other invoice's covered milestone is untouched",
+    );
 });
 
 // --- updatePendingMilestoneAmountsCore --------------------------------------
