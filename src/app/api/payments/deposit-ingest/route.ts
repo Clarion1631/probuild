@@ -1332,12 +1332,13 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
  *
  *  - candidates must be REQUESTED (PaymentSchedule.qbInvoiceSentAt, the
  *    rail-neutral request marker billing-core.ts stamps only once the client
- *    email actually went out), and FIRST requested by the end of the credit's
- *    post date (firstRequestedAt, falling back to qbInvoiceSentAt). A
- *    qbInvoiceId-only milestone was created in QuickBooks but never asked for,
- *    so it is not a candidate — that is what resolves the Hoppe case, where
- *    three Pending milestones sat at exactly $13,447.68 and only one had been
- *    requested;
+ *    email actually went out). A qbInvoiceId-only milestone was created in
+ *    QuickBooks but never asked for, so it is not a candidate — that is what
+ *    resolves the Hoppe case, where three Pending milestones sat at exactly
+ *    $13,447.68 and only one had been requested;
+ *  - candidates must also be FIRST requested by the end of the credit's post
+ *    date (firstRequestedAt, falling back to qbInvoiceSentAt on a row
+ *    requested before that column existed);
  *  - uniqueness is taken over a UNION with anything at this amount settled in
  *    the last 14 days by ANY source, so money the photo path just booked still
  *    counts against uniqueness even though its milestone is now Paid;
