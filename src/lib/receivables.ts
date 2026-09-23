@@ -86,6 +86,11 @@ export interface InvoiceReceivable {
     ageDays: number | null;
     overdue: boolean;
     items: BilledItem[];
+    /** Milestone ids claimed by a live progress billing — billed via the
+     *  billing's own item above, not their own. Exposed so a caller can mark
+     *  them "billed" on their own row (e.g. unpaidMilestones) without
+     *  re-deriving the coverage rule. */
+    coveredMilestoneIds: string[];
 }
 
 const EMPTY: InvoiceReceivable = {
@@ -96,6 +101,7 @@ const EMPTY: InvoiceReceivable = {
     ageDays: null,
     overdue: false,
     items: [],
+    coveredMilestoneIds: [],
 };
 
 function toCents(v: Money): number {
@@ -110,6 +116,16 @@ export function isLiveQboLink(qbInvoiceId: string | null, qbSyncError: string | 
     return !!qbInvoiceId && qbSyncError !== "voided" && qbSyncError !== "notFound" && !isPendingDeletion(qbSyncError);
 }
 
+/**
+ * The earliest RETAINED billing evidence among the given dates — not
+ * necessarily the true earliest event, only the earliest the row still
+ * holds. `qbSyncedAt` is written at link time but a drift reconcile can
+ * rewrite it; `qbInvoiceSentAt` holds only the LAST send, so a resend moves
+ * it forward; breaking a QuickBooks link clears `qbSyncedAt` entirely
+ * (`claimQBInvoiceUnlink` in quickbooks-payments.ts keeps `qbInvoiceSentAt`
+ * on purpose, which is why the milestone loop below still finds it). None of
+ * that is visible here — `billedAt` can only ever reflect what survives.
+ */
 function earliest(...dates: Array<Date | null | undefined>): Date | null {
     let min: Date | null = null;
     for (const d of dates) {
@@ -143,6 +159,30 @@ export function computeInvoiceReceivable(inv: ReceivableInvoiceInput, now: numbe
             if (line.scheduleId) covered.add(line.scheduleId);
         }
     }
+    // "covered" assumes single ownership: a milestone is never referenced by
+    // two live billings at once, and a covered milestone never separately
+    // holds its own live QBO link. Both are enforced in the app, not here —
+    // this module is pure and has no way to check them itself:
+    //   (a) one milestone, two active billings — createProgressBillingCore's
+    //       consumption guard (src/lib/progress-billing.ts, "Consumption
+    //       guard" section) sums every non-Void billing's claim on the
+    //       milestone before allowing a new one, and the claim itself is a
+    //       CAS write pinned to the amount read under the lock. Not
+    //       currently pinned by a behavioural test — see the source tripwire
+    //       in tests/progress-billing-stage.test.ts ("C4: the consumption
+    //       guard...").
+    //   (b) a covered milestone also getting its own QBO invoice — every
+    //       individual-milestone QBO push in the app funnels through the one
+    //       chokepoint pushMilestoneToQuickBooks (quickbooks-payments.ts),
+    //       which refuses via claimMilestonePreCreateUnderLock before the
+    //       push and re-checks immediately before the link write, both
+    //       querying ProgressBillingLine for a live (non-Void) claim on the
+    //       same scheduleId. Pinned by tests/qbo-payments-outage.test.ts
+    //       ("already covered by progress invoice ...").
+    // If either guard is ever weakened, this function would silently drop a
+    // milestone's money (covered here, but never actually billed anywhere)
+    // or double-count it (its own item here plus the billing's) — it has no
+    // way to detect that on its own.
 
     for (const pb of livePBs) {
         const cents = toCents(pb.total);
@@ -159,6 +199,15 @@ export function computeInvoiceReceivable(inv: ReceivableInvoiceInput, now: numbe
         });
     }
 
+    // Backlog: summed directly from Pending-but-unbilled milestones below,
+    // not from balanceDue minus receivable. A residual subtraction would
+    // silently absorb any drift between balanceDue and the milestones that
+    // make it up (rounding, a stale total) into "backlog", which is a
+    // different claim than "this scheduled work was never billed". Legacy
+    // zero-milestone invoices (below) add nothing here — their whole balance
+    // becomes one billed item instead, never backlog.
+    let unbilledCents = 0;
+
     for (const m of inv.payments) {
         if (m.status !== "Pending") continue; // Paid/Canceled never count
         if (covered.has(m.id)) continue; // its money is the progress billing's
@@ -166,7 +215,12 @@ export function computeInvoiceReceivable(inv: ReceivableInvoiceInput, now: numbe
         if (cents <= 0) continue; // legacy $0 placeholder rows
         const requested = m.qbInvoiceSentAt != null;
         const inQbo = isLiveQboLink(m.qbInvoiceId, m.qbSyncError);
-        if (!requested && !inQbo) continue; // scheduled, not billed: backlog
+        if (!requested && !inQbo) {
+            // Scheduled, not billed: backlog. A Draft invoice isn't final,
+            // so it contributes no backlog (matches the legacy branch below).
+            if (inv.status !== "Draft") unbilledCents += cents;
+            continue;
+        }
         items.push({
             kind: "milestone",
             id: m.id,
@@ -211,11 +265,13 @@ export function computeInvoiceReceivable(inv: ReceivableInvoiceInput, now: numbe
     const receivableCents = billedItems.reduce((s, it) => s + it.cents, 0);
     const overdueCents = billedItems.filter(it => it.overdue).reduce((s, it) => s + it.cents, 0);
     const notRequestedCents = billedItems.filter(it => !it.requested).reduce((s, it) => s + it.cents, 0);
-    // A Draft invoice's balance isn't final, so it contributes no backlog.
-    const unbilledCents = inv.status === "Draft" ? 0 : Math.max(0, toCents(inv.balanceDue) - receivableCents);
     // Oldest open billed item — standard AR aging, and how collections work.
     const ageDays = billedItems.length === 0 ? null : Math.max(...billedItems.map(it => it.ageDays));
     const overdue = billedItems.some(it => it.overdue);
 
-    return { receivableCents, overdueCents, unbilledCents, notRequestedCents, ageDays, overdue, items: billedItems };
+    return {
+        receivableCents, overdueCents, unbilledCents, notRequestedCents, ageDays, overdue,
+        items: billedItems,
+        coveredMilestoneIds: [...covered],
+    };
 }

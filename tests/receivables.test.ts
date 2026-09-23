@@ -439,3 +439,19 @@ test("E25: three requested milestones of 13447.68 sum to the exact cent total", 
     const r = computeInvoiceReceivable(invoiceOf(ms), NOW);
     assert.equal(r.receivableCents, 4_034_304);
 });
+
+test("E26 (design review C3): unbilled backlog is the sum of unbilled Pending milestones, not balanceDue minus receivable", () => {
+    // balanceDue is deliberately drifted from Σ Pending: the two milestones
+    // below total 800.00, but balanceDue claims 950.00 (a stale total, a
+    // rounding bug elsewhere — the cause doesn't matter). The old subtraction
+    // (950.00 - 300.00 receivable = 650.00) would have silently folded that
+    // 150.00 of drift into "backlog" too.
+    const unbilled = milestone({ amount: "500.00" }); // no billing evidence at all: backlog
+    const billed = milestone({ amount: "300.00", qbInvoiceSentAt: new Date(NOW - 5 * DAY) }); // requested: receivable
+    const inv = invoiceOf([unbilled, billed], { balanceDue: "950.00" });
+    const r = computeInvoiceReceivable(inv, NOW);
+    assert.equal(r.receivableCents, 30_000); // the requested milestone only
+    // Exactly the one truly-unbilled milestone's amount (500.00) — NOT
+    // 95000 - 30000 = 65000, which is what subtraction would have given.
+    assert.equal(r.unbilledCents, 50_000);
+});

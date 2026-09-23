@@ -164,19 +164,107 @@ test("L3: all 9 fixtures — totals, row order, and the email body", async () =>
     const html = sentEmails[0].html as string;
     assert.ok(html.includes("$17,414.18"), "email should show the new total");
     assert.ok(!html.includes("$189,800.00"), "email must not show the old unbilled figure");
-    const notEmailedCount = html.split("not emailed from ProBuild").length - 1;
-    assert.equal(notEmailedCount, 1, 'expected "not emailed from ProBuild" exactly once (INV-00172)');
+    // C6: INV-00172's item is requested:false — the row shows the amount and
+    // names the gap in ProBuild's own record, not a claim nobody was billed.
+    const notRequestedCount = html.split("has no payment request on record").length - 1;
+    assert.equal(notRequestedCount, 1, 'expected "has no payment request on record" exactly once (INV-00172)');
+    assert.ok(html.includes("$11,760.00 has no payment request on record"), "INV-00172's row should show its not-requested amount");
+    assert.ok(!html.includes("not emailed from ProBuild"), "the overclaiming label must be gone");
+    // C5: the net-30 wording says what it does.
+    assert.ok(html.includes("more than 30 days since billed, or past due date"), "aging wording should say 'more than 30 days'");
+    assert.ok(!html.includes("30+ days"), "the old '30+ days' wording must be gone");
+    // C1: the books-of-record caveat is in the footer.
+    assert.ok(html.includes("QuickBooks is the books of record"), "the books-of-record caveat should be in the email");
+    // None of these 4 rows has a partial overdue (each has exactly one
+    // billed item), so the "of which ... overdue" sub-line should not fire
+    // here — see L6 for the case where it should.
+    assert.ok(!html.includes("of which"), "no row in this fixture set is partially overdue");
 });
 
-test("L4: the recorded findMany args select enough columns to compute receivables and no longer exclude Draft (select tripwire)", async () => {
+test("L4: the recorded findMany args select enough columns to compute receivables and reach beyond balanceDue > 0 (select/where tripwire)", async () => {
     fixtureRows = ALL_FIXTURES;
     await listReceivables(NOW);
     const args = findManyCalls[findManyCalls.length - 1];
-    assert.deepEqual(args.where, { balanceDue: { gt: 0 }, status: { not: "Canceled" } });
+    // C2: balanceDue > 0 alone misses a drifted-to-0 invoice that still
+    // carries a billed, unpaid milestone or a live progress billing.
+    assert.deepEqual(args.where, {
+        status: { not: "Canceled" },
+        OR: [
+            { balanceDue: { gt: 0 } },
+            { payments: { some: { status: "Pending" } } },
+            { progressBillings: { some: { status: { in: ["Staged", "Sent"] } } } },
+        ],
+    });
     assert.equal(args.select?._count?.select?.payments, true);
     const paymentsSelect = args.select?.payments?.select ?? {};
     for (const field of ["qbInvoiceId", "qbInvoiceSentAt", "qbSyncError", "qbSyncedAt", "dueDate", "createdAt", "status"]) {
         assert.equal(paymentsSelect[field], true, `payments.select.${field} must be selected`);
     }
     assert.ok(args.select?.progressBillings?.select?.lines, "select.progressBillings.select.lines must be requested");
+});
+
+test("L5 (design review C2): an invoice with balanceDue drifted to 0 still counts a requested Pending milestone", async () => {
+    fixtureRows = [{
+        code: "INV-DRIFT",
+        status: "Partially Paid",
+        balanceDue: "0.00", // drifted — the milestone below is real, unbilled money
+        issueDate: null,
+        sentAt: null,
+        createdAt: "2026-08-01T00:00:00.000Z",
+        milestoneCount: 1,
+        project: "Drift Test",
+        progressBillings: [],
+        payments: [{
+            id: "ms-drift-1",
+            name: "Drift Milestone",
+            amount: "500.00",
+            status: "Pending",
+            dueDate: null,
+            createdAt: "2026-08-01T00:00:00.000Z",
+            qbInvoiceId: null,
+            qbInvoiceSentAt: "2026-08-02T00:00:00.000Z", // requested
+            qbSyncError: null,
+            qbSyncedAt: null,
+        }],
+    }];
+    const ar = await listReceivables(NOW);
+    assert.equal(ar.invoiceCount, 1, "an invoice with balanceDue 0 but a requested Pending milestone must still be counted");
+    assert.equal(ar.totalOutstanding, 500);
+    assert.equal(ar.invoices[0].code, "INV-DRIFT");
+});
+
+test("L6 (design review C7): the email shows a row's overdue amount separately when it differs from the receivable", async () => {
+    fixtureRows = [{
+        code: "INV-PARTIAL-OD",
+        status: "Partially Paid",
+        balanceDue: "1500.00",
+        issueDate: null,
+        sentAt: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        milestoneCount: 2,
+        project: "Partial Overdue Test",
+        progressBillings: [],
+        payments: [
+            {
+                id: "ms-old", name: "Old milestone", amount: "1000.00", status: "Pending", dueDate: null,
+                createdAt: "2026-01-01T00:00:00.000Z", qbInvoiceId: null,
+                qbInvoiceSentAt: "2026-06-01T00:00:00.000Z", // billed 45+ days before NOW: overdue
+                qbSyncError: null, qbSyncedAt: null,
+            },
+            {
+                id: "ms-recent", name: "Recent milestone", amount: "500.00", status: "Pending", dueDate: null,
+                createdAt: "2026-09-01T00:00:00.000Z", qbInvoiceId: null,
+                qbInvoiceSentAt: "2026-09-16T00:00:00.000Z", // billed 5 days before NOW: not overdue
+                qbSyncError: null, qbSyncedAt: null,
+            },
+        ],
+    }];
+    const ar = await listReceivables(NOW);
+    assert.equal(ar.invoices[0].receivable, 1500);
+    assert.equal(ar.invoices[0].overdueAmount, 1000, "only the old milestone is overdue");
+
+    const result = await sendArDigest();
+    assert.equal(result.sent, true);
+    const html = sentEmails[0].html as string;
+    assert.ok(html.includes("of which $1,000.00 overdue"), "the row should break out the overdue portion");
 });

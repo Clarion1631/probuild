@@ -179,7 +179,20 @@ export async function getProjectBilling(projectId: string) {
 
 export async function listReceivables(now: number = Date.now()) {
     const invoices = await prisma.invoice.findMany({
-        where: { balanceDue: { gt: 0 }, status: { not: "Canceled" } },
+        // balanceDue > 0 alone misses an invoice whose balance has drifted to
+        // 0 (or negative) while it still carries a billed, unpaid milestone —
+        // a Pending one that was requested or linked, or a live progress
+        // billing. The balanceDue branch stays so a legacy zero-milestone
+        // invoice (no Pending rows, no progress billings) with a genuine
+        // positive balance is still found.
+        where: {
+            status: { not: "Canceled" },
+            OR: [
+                { balanceDue: { gt: 0 } },
+                { payments: { some: { status: "Pending" } } },
+                { progressBillings: { some: { status: { in: ["Staged", "Sent"] } } } },
+            ],
+        },
         orderBy: { issueDate: "asc" },
         select: {
             id: true, code: true, status: true, totalAmount: true, balanceDue: true,
@@ -217,32 +230,37 @@ export async function listReceivables(now: number = Date.now()) {
     const billed = computed.filter(({ receivable }) => receivable.receivableCents > 0);
 
     const rows = billed
-        .map(({ inv, receivable }) => ({
-            invoiceId: inv.id,
-            code: inv.code,
-            status: inv.status,
-            project: inv.project?.name ?? null,
-            projectId: inv.project?.id ?? null,
-            client: inv.client?.name ?? null,
-            total: Number(inv.totalAmount),
-            balanceDue: Number(inv.balanceDue),
-            ageDays: receivable.ageDays,
-            overdue: receivable.overdue,
-            receivable: receivable.receivableCents / 100,
-            unbilled: receivable.unbilledCents / 100,
-            overdueAmount: receivable.overdueCents / 100,
-            notEmailedAmount: receivable.notRequestedCents / 100,
-            billedItems: receivable.items.map(it => ({
-                kind: it.kind, id: it.id, label: it.label, amount: it.cents / 100,
-                billedAt: it.billedAt, dueDate: it.dueDate, ageDays: it.ageDays, overdue: it.overdue,
-                requested: it.requested, inQuickBooks: it.inQuickBooks,
-            })),
-            unpaidMilestones: inv.payments.map(p => ({
-                id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
-                lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
-                billed: p.qbInvoiceSentAt != null || isLiveQboLink(p.qbInvoiceId, p.qbSyncError),
-            })),
-        }))
+        .map(({ inv, receivable }) => {
+            // Covered by a live progress billing: billed via the billing's
+            // own item, not this milestone's — still "billed" for display.
+            const coveredIds = new Set(receivable.coveredMilestoneIds);
+            return {
+                invoiceId: inv.id,
+                code: inv.code,
+                status: inv.status,
+                project: inv.project?.name ?? null,
+                projectId: inv.project?.id ?? null,
+                client: inv.client?.name ?? null,
+                total: Number(inv.totalAmount),
+                balanceDue: Number(inv.balanceDue),
+                ageDays: receivable.ageDays,
+                overdue: receivable.overdue,
+                receivable: receivable.receivableCents / 100,
+                unbilled: receivable.unbilledCents / 100,
+                overdueAmount: receivable.overdueCents / 100,
+                notRequestedAmount: receivable.notRequestedCents / 100,
+                billedItems: receivable.items.map(it => ({
+                    kind: it.kind, id: it.id, label: it.label, amount: it.cents / 100,
+                    billedAt: it.billedAt, dueDate: it.dueDate, ageDays: it.ageDays, overdue: it.overdue,
+                    requested: it.requested, inQuickBooks: it.inQuickBooks,
+                })),
+                unpaidMilestones: inv.payments.map(p => ({
+                    id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
+                    lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
+                    billed: p.qbInvoiceSentAt != null || isLiveQboLink(p.qbInvoiceId, p.qbSyncError) || coveredIds.has(p.id),
+                })),
+            };
+        })
         // Oldest open billed item first — standard AR aging; collections work oldest first.
         .sort((a, b) => (b.ageDays ?? -1) - (a.ageDays ?? -1));
 
@@ -275,26 +293,41 @@ export async function sendArDigest() {
     if (!to) return { sent: false, reason: "no notification email configured", ...ar };
 
     const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const row = (r: (typeof ar.invoices)[number]) => `
+    const row = (r: (typeof ar.invoices)[number]) => {
+        // Only when it's a genuine partial — if the whole receivable is
+        // overdue, the row's ⚠️ and background already say so; a sub-line
+        // repeating the same figure would just be noise.
+        const overdueLine = r.overdue && r.overdueAmount > 0 && r.overdueAmount !== r.receivable
+            ? `<div style="color:#b91c1c;font-size:11px;">of which ${formatCurrency(r.overdueAmount)} overdue</div>`
+            : "";
+        // A missing payment-request record doesn't prove the client was
+        // never asked (an approval email can carry a pay link without
+        // stamping qbInvoiceSentAt) — so this names the amount and the gap
+        // in ProBuild's own record, not a claim that nobody was billed.
+        const notRequestedLine = r.notRequestedAmount > 0
+            ? `<div style="color:#64748b;font-size:11px;font-weight:normal;">${formatCurrency(r.notRequestedAmount)} has no payment request on record</div>`
+            : "";
+        return `
         <tr style="${r.overdue ? "background:#fef2f2;" : ""}">
             <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.code)}${r.overdue ? " ⚠️" : ""}</td>
             <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.project ?? "—")}</td>
             <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.client ?? "—")}</td>
-            <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${formatCurrency(r.receivable)}${r.notEmailedAmount > 0 ? `<div style="color:#64748b;font-size:11px;font-weight:normal;">not emailed from ProBuild</div>` : ""}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${formatCurrency(r.receivable)}${overdueLine}${notRequestedLine}</td>
             <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${r.ageDays}d</td>
         </tr>`;
+    };
 
     const sendResult = await sendNotification(
         to,
         `AR digest — ${formatCurrency(ar.totalOutstanding)} outstanding across ${ar.invoiceCount} invoice${ar.invoiceCount === 1 ? "" : "s"}${ar.overdueOutstanding > 0 ? ` (${formatCurrency(ar.overdueOutstanding)} overdue)` : ""}`,
         `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 640px; margin: 0 auto; padding: 24px; color: #333;">
             <h2 style="font-size:18px;">Accounts receivable</h2>
-            <p><strong>${formatCurrency(ar.totalOutstanding)}</strong> billed and unpaid · <strong style="color:#b91c1c;">${formatCurrency(ar.overdueOutstanding)}</strong> overdue (30+ days since billed, or past due date)</p>
+            <p><strong>${formatCurrency(ar.totalOutstanding)}</strong> billed and unpaid · <strong style="color:#b91c1c;">${formatCurrency(ar.overdueOutstanding)}</strong> overdue (more than 30 days since billed, or past due date)</p>
             <table style="border-collapse:collapse;width:100%;font-size:13px;">
                 <tr style="text-align:left;color:#64748b;"><th style="padding:6px 10px;">Invoice</th><th style="padding:6px 10px;">Project</th><th style="padding:6px 10px;">Client</th><th style="padding:6px 10px;text-align:right;">Billed & unpaid</th><th style="padding:6px 10px;text-align:right;">Age</th></tr>
                 ${ar.invoices.map(row).join("")}
             </table>
-            <p style="color:#64748b;font-size:12px;margin-top:16px;">Ask ChatGPT "who owes us money?" for the live view, or "resend the payment request for [milestone] on [project]" to nudge. Not counted here: ${formatCurrency(ar.unbilledBacklog)} of scheduled milestones not yet billed (backlog, not receivables).</p>
+            <p style="color:#64748b;font-size:12px;margin-top:16px;">Ask ChatGPT "who owes us money?" for the live view, or "resend the payment request for [milestone] on [project]" to nudge. Not counted here: ${formatCurrency(ar.unbilledBacklog)} of scheduled milestones not yet billed (backlog, not receivables). QuickBooks is the books of record for accounts receivable — this covers only what ProBuild billed, and can't see partial or short payments, credits, or balances created outside ProBuild.</p>
         </div>`,
         undefined,
         { fromName: settings?.companyName || "ProBuild" },

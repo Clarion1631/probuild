@@ -13,6 +13,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { QBTimeoutError, createRouteDeadline, qboTxnDate, type QBTokens } from "../src/lib/quickbooks";
 import {
     stageProgressBillingToQuickBooksCore,
@@ -840,4 +841,43 @@ test("round 49 follow-up: the payload is dated from the identity, not from send 
     await stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent });
 
     assert.equal(calls.created[0]?.txnDate, qboTxnDate(), "the create carries the claim's date");
+});
+
+// --- Source tripwire: single ownership (AR digest design review, C4) -------
+
+/**
+ * src/lib/receivables.ts's `covered` set assumes a milestone is never
+ * claimed by two live progress billings at once — it is pure and has no
+ * database access to verify that itself, so the assumption is pinned here
+ * instead, against the actual guard that enforces it.
+ *
+ * createProgressBillingCore's "Consumption guard" sums every OTHER non-Void
+ * billing's claim on a scheduleId before allowing a new one, and the write
+ * that carves out (or fully claims) the milestone is a CAS pinned to the
+ * amount read under the lock — so a concurrent second billing can't win a
+ * race the sum check alone would miss. (The other half of C4 — a covered
+ * milestone also getting its own QBO invoice — is already pinned by
+ * tests/qbo-payments-outage.test.ts's "already covered by progress invoice"
+ * case, via claimMilestonePreCreateUnderLock.)
+ */
+test("C4: the consumption guard sums every non-Void billing's claim on a milestone before allowing a new one", () => {
+    const source = readFileSync("src/lib/progress-billing.ts", "utf8");
+    const start = source.indexOf("export async function createProgressBillingCore");
+    assert.ok(start >= 0, "createProgressBillingCore not found — rename it here too");
+    const nextExport = source.indexOf("\nexport ", start + 1);
+    const body = source.slice(start, nextExport === -1 ? undefined : nextExport);
+
+    assert.ok(
+        body.includes('scheduleId: line.scheduleId, billing: { status: { not: "Void" } } }'),
+        "no longer sums every non-Void billing's claim on the milestone before allowing a new one",
+    );
+    assert.ok(body.includes("exceeds what's left"), "the over-claim refusal is gone");
+    assert.ok(
+        body.includes("const claim = await tx.paymentSchedule.updateMany({"),
+        "the claim is no longer a conditional (CAS) write",
+    );
+    assert.ok(
+        body.includes("amount: schedule.amount,"),
+        "the claim's WHERE no longer pins the amount read under the lock",
+    );
 });

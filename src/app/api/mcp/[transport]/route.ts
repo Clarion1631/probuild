@@ -1195,8 +1195,10 @@ function createHandler(actor: RouteMcpActor) {
                 title: "Who owes us money (all projects)",
                 annotations: { readOnlyHint: true },
                 description:
-                    "Accounts receivable across ALL projects: money BILLED to clients and not yet paid (milestones emailed as a payment request or with a QuickBooks invoice), per invoice, with age since billing and overdue flags (past due date, or 30+ days since billed). " +
+                    "Accounts receivable across ALL projects: money BILLED to clients and not yet paid (milestones emailed as a payment request or with a QuickBooks invoice), per invoice, with age since billing and overdue flags (past due date, or more than 30 days since billed). " +
                     "`receivable` is what is owed now; `balanceDue` is the remaining contract and includes unbilled milestones (backlog, not receivables; see `unbilledBacklog`). " +
+                    "`requested` means ProBuild recorded a payment-request send — a missing record does not prove the client was never asked (an approval email can carry a deposit pay link without stamping one). " +
+                    "QuickBooks is the books of record for accounts receivable; this covers only what ProBuild billed and can't see partial or short payments, credits, or balances created outside ProBuild. " +
                     "Use for 'who owes us money?', 'what's overdue?', 'total outstanding?'.",
                 inputSchema: {},
             },
