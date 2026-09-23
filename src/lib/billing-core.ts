@@ -2515,6 +2515,15 @@ export async function updatePendingMilestoneAmountsCore(
             );
         }
 
+        // Only an amount change matters to a progress billing (it pays the row at
+        // its own amount) — a name/dueDate-only edit doesn't change what's settled.
+        const amountChanged = parsed.filter((r) => Math.abs(toNum(existingMap.get(r.scheduleId)!.amount) - r.amount) > 0.005);
+        await assertMilestonesNotOnProgressBilling(
+            tx,
+            amountChanged.map((r) => ({ id: r.scheduleId, name: existingMap.get(r.scheduleId)!.name })),
+            "changing this milestone's amount",
+        );
+
         const affected: QBAffected[] = [];
         for (const r of parsed) {
             const row = existingMap.get(r.scheduleId)!;
@@ -2677,6 +2686,8 @@ export async function deleteInvoiceMilestoneCore(
             throw new Error("A payment is in progress on this milestone — wait for it to finish or void it before deleting");
         }
 
+        await assertMilestonesNotOnProgressBilling(tx, [{ id: locked.id, name: locked.name }], "deleting this milestone");
+
         // Re-assert every deletable-state predicate checked above IN the delete
         // itself, not just at the read. The milestone-rail's in-flight claim
         // (pushMilestoneToQuickBooksCore in quickbooks-payments.ts) writes its
@@ -2766,6 +2777,33 @@ export async function assertInvoiceHasNoChangeOrderBilling(
     }
 }
 
+// A ProgressBillingLine points at its milestone by scheduleId (a plain column,
+// no FK), and settlement pays that milestone at its own amount — so deleting,
+// replacing or re-amounting the row here would either orphan the line or
+// change what the billing settles. "Covered" means referenced by any billing
+// whose status is not Void, the same rule as the milestone rail's
+// double-billing guard (pushMilestoneToQuickBooks); Draft counts too, since a
+// Draft is staged later with the lines it already has. Call inside the
+// writer's transaction after lockMoneyParents(invoiceId): createProgressBillingCore
+// takes the same Invoice lock, so no billing can claim a milestone between
+// this check and the write.
+async function assertMilestonesNotOnProgressBilling(
+    tx: Prisma.TransactionClient,
+    milestones: { id: string; name: string }[],
+    doing: string,
+): Promise<void> {
+    if (!milestones.length) return;
+    const hit = await tx.progressBillingLine.findFirst({
+        where: { scheduleId: { in: milestones.map((m) => m.id) }, billing: { status: { not: "Void" } } },
+        select: { scheduleId: true, billing: { select: { code: true, status: true } } },
+    });
+    if (!hit) return;
+    const milestone = milestones.find((m) => m.id === hit.scheduleId)!;
+    throw new Error(
+        `"${milestone.name}" is on progress invoice ${hit.billing.code} (${hit.billing.status}) — delete or void that progress invoice before ${doing}.`
+    );
+}
+
 export async function splitInvoiceMilestonesCore(
     invoiceId: string,
     milestones: { name: string; amount: number; dueDate?: string | null }[],
@@ -2820,6 +2858,16 @@ export async function splitInvoiceMilestonesCore(
         }
 
         await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "re-split");
+
+        // Load exactly the rows the deleteMany below will remove, so the
+        // progress-billing guard checks precisely what is about to disappear —
+        // the new rows it creates get fresh ids, so a covered row can't be
+        // preserved through this call the way a delete-by-id could skip it.
+        const toRemove = await tx.paymentSchedule.findMany({
+            where: { invoiceId, status: { not: "Paid" } },
+            select: { id: true, name: true },
+        });
+        await assertMilestonesNotOnProgressBilling(tx, toRemove, "re-splitting the milestones");
 
         // Recalculate: the paid portion survives untouched, and only the pending
         // portion is replaced. totalAmount must keep counting the surviving paid
