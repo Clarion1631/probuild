@@ -10,6 +10,11 @@ import { lockAttributionParents } from "@/lib/phase-invariant";
 import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 import { getCurrentUserWithPermissions, canAccessProject } from "@/lib/permissions";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
+import {
+    isReceiptBookedExpense,
+    RECEIPT_EXPENSE_CODE,
+    RECEIPT_EXPENSE_NO_RECEIPT_CHANGE,
+} from "@/lib/receipt-intake/booked-expense-rules";
 
 const MAX_RECEIPT_BYTES = 10 * 1024 * 1024; // 10 MB
 
@@ -69,7 +74,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
         const expense = await prisma.expense.findUnique({
             where: { id },
-            select: { id: true, projectId: true, estimateId: true, estimate: { select: { projectId: true } } },
+            select: {
+                id: true, projectId: true, estimateId: true, estimate: { select: { projectId: true } },
+                qbPurchaseId: true, receiptIntake: { select: { id: true } },
+            },
         });
         if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
         // Fail closed: an expense with no resolvable project cannot be
@@ -82,6 +90,12 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         const projectId = resolveExpenseProjectId(expense);
         if (!projectId || !canAccessProject(user, projectId)) {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+        if (isReceiptBookedExpense(expense)) {
+            return NextResponse.json(
+                { error: RECEIPT_EXPENSE_NO_RECEIPT_CHANGE, code: RECEIPT_EXPENSE_CODE },
+                { status: 409 },
+            );
         }
 
         const formData = await req.formData();
