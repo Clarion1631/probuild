@@ -24,8 +24,13 @@ import type { Prisma } from "@prisma/client";
  * UPDATE, never a value read into JS first (same reason as
  * setPercentCompleteOverride in actions.ts): under a concurrent send the
  * IS NULL guard and the SET are re-evaluated against the committed row, so two
- * sends can never both set it and a send by the previous build is never lost.
- * Pending only, matching the whole-invoice write.
+ * sends can never both set it. An old-build send that COMMITS before this
+ * statement runs is kept, exactly like any other prior send — but if the old
+ * build RESENDS the same still-unstamped row during the deploy window, the
+ * earlier date is lost the same as before this fix: AR age can be
+ * understated, while the deposit gate only ever stays conservative (it can
+ * wrongly exclude a real payment, never wrongly include one). Pending only,
+ * matching the whole-invoice write.
  */
 export function stampFirstRequested(
     db: Pick<Prisma.TransactionClient, "$executeRaw">,
