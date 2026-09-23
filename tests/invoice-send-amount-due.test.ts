@@ -99,7 +99,7 @@ function toSendShape(raw: RawInvoice): Row {
         createdAt: new Date(raw.createdAt),
         clientId: null,
         projectId: null,
-        client: { name: "Sandi", email: "sandi@example.test", additionalEmail: null },
+        client: { name: "Alex", email: "alex@example.test", additionalEmail: null },
         project: null,
         _count: { payments: raw.milestoneCount },
         payments: raw.payments
@@ -129,7 +129,7 @@ function syntheticInvoice(overrides: Partial<Row> & { id: string; code: string }
         createdAt: new Date("2026-01-01T00:00:00.000Z"),
         clientId: null,
         projectId: null,
-        client: { name: "Sandi", email: "sandi@example.test", additionalEmail: null },
+        client: { name: "Alex", email: "alex@example.test", additionalEmail: null },
         project: null,
         _count: { payments: payments.length },
         payments,
@@ -306,7 +306,7 @@ test("buildInvoiceDueEmail: INV-00246 shape - subject, amounts, escaping, singul
     const due = computeInvoiceAmountDue(toInput(rawFixture("INV-00246")), NOW);
     const { subject, html } = buildInvoiceDueEmail({
         companyName: "Golden Touch Remodeling",
-        clientName: "Sandi <VIP>",
+        clientName: "Alex <VIP>",
         projectName: "Commercial Siding",
         projectLocation: "123 Main St",
         invoiceCode: "INV-00246",
@@ -319,8 +319,8 @@ test("buildInvoiceDueEmail: INV-00246 shape - subject, amounts, escaping, singul
     assert.ok(html.includes("$4,651.20"));
     assert.ok(!html.includes("6,511.68"), "must not show the invoice's balanceDue");
     assert.ok(!html.includes("9,302.40"), "must not show the invoice's totalAmount");
-    assert.ok(html.includes("Sandi &lt;VIP&gt;"), "client name must be HTML-escaped");
-    assert.ok(!html.includes("Sandi <VIP>"), "unescaped client name must not appear");
+    assert.ok(html.includes("Alex &lt;VIP&gt;"), "client name must be HTML-escaped");
+    assert.ok(!html.includes("Alex <VIP>"), "unescaped client name must not appear");
     assert.ok(html.includes("Only the payment above is due now."), "singular wording for one item");
     assert.ok(!/[—–]/.test(subject), "subject must contain no em/en dashes");
     assert.ok(!/[—–]/.test(html), "html must contain no em/en dashes");
@@ -350,7 +350,7 @@ test("sendInvoiceToClientCore: INV-00246 sends only the billed amount and stamps
 
     const result = await sendInvoiceToClientCore(raw.code);
     assert.equal(result.success, true);
-    assert.equal(result.sentTo, "sandi@example.test");
+    assert.equal(result.sentTo, "alex@example.test");
     assert.equal(result.amountDue, 4651.2);
     assert.deepEqual(result.requested, [{ name: "Arrival / Mobilization Payment", amount: 4651.2 }]);
 
@@ -423,7 +423,7 @@ test("sendInvoiceToClientCore: portal link focuses on the billed milestone via t
         const { verifyClientPortalToken } = await import("../src/lib/client-portal-auth");
         const payload = await verifyClientPortalToken(url.searchParams.get("token")!);
         assert.equal(payload?.clientId, "client-246");
-        assert.equal(payload?.email, "sandi@example.test");
+        assert.equal(payload?.email, "alex@example.test");
     } finally {
         if (originalSecret === undefined) delete process.env.CLIENT_PORTAL_SECRET;
         else process.env.CLIENT_PORTAL_SECRET = originalSecret;
