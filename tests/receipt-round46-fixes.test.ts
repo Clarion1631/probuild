@@ -236,8 +236,11 @@ test("starting a cycle clears the previous completion", () => {
     assert.match(sweep, /const startingNewCycle = cycleId === null;/);
     assert.match(sweep, /chaserCompletedAt: startingNewCycle \? null : \(completedAt \?\? previous\.chaserCompletedAt\),/);
     assert.match(sweep, /await writePhase\("open-issues", undefined, null, prisma, null\);/);
-    // And a completion names the cycle it belongs to.
-    assert.match(sweep, /writePhase\(phase, completedAt, blockedReason, tx, cycle\.id\)/);
+    // And a completion names the cycle it belongs to. `cycle!.id`: §14.6's
+    // conditional reassignment of `cycle` inside the line pass's own closure
+    // is enough to make TS widen its type inside every closure that captures
+    // it, this one included.
+    assert.match(sweep, /writePhase\(phase, completedAt, blockedReason, tx, cycle!\.id\)/);
 
     const cards = read("src/app/api/cron/receipt-request-cards/route.ts");
     assert.match(cards, /const selectionAllowed = chaserCompletedFor\(marker, date, "America\/Los_Angeles", currentCycleId\);/);

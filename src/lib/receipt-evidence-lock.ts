@@ -133,6 +133,40 @@ export async function readReceiptEvidenceEpoch(client: EvidenceEpochClient): Pro
 }
 
 /**
+ * THE RECEIPT-OWNER EPOCH (cheap-sweep-restart §14.1, Codex round 2 blocker 1).
+ *
+ * The evidence epoch says nothing about who a card's items are assigned to.
+ * `setMissingReceiptOwner` can move an issue to a different owner without
+ * touching evidence at all, so a card claim that only compares evidence and
+ * ledger epochs can miss a reassignment that lands between the card scan and
+ * the claim. This counter is that reassignment's own epoch, bumped only while
+ * holding the evidence lock (`writeReceiptOwnerLocked`) so the bump is
+ * ordered with respect to a claim transaction that also holds it.
+ */
+export const RECEIPT_OWNER_EPOCH_KEY = "receiptOwnerEpoch";
+
+/**
+ * Record that an issue's owner changed. Call only while holding the evidence
+ * lock, alongside the write — the same discipline as `bumpReceiptEvidenceEpoch`.
+ */
+export async function bumpReceiptOwnerEpoch(tx: EvidenceEpochClient): Promise<void> {
+    await tx.$queryRaw<EpochRow[]>`
+        INSERT INTO "AutomationSetting" ("key", "value", "updatedAt")
+        VALUES (${RECEIPT_OWNER_EPOCH_KEY}, '1', NOW())
+        ON CONFLICT ("key") DO UPDATE
+            SET "value" = (COALESCE(NULLIF("AutomationSetting"."value", ''), '0')::bigint + 1)::text,
+                "updatedAt" = NOW()
+        RETURNING "value"`;
+}
+
+/** Read the owner epoch. A missing row reads as "0", same as the evidence epoch. */
+export async function readReceiptOwnerEpoch(client: EvidenceEpochClient): Promise<string> {
+    const rows = await client.$queryRaw<EpochRow[]>`
+        SELECT "value" FROM "AutomationSetting" WHERE "key" = ${RECEIPT_OWNER_EPOCH_KEY}`;
+    return rows[0]?.value ?? RECEIPT_EVIDENCE_EPOCH_ZERO;
+}
+
+/**
  * Run one short transaction that holds the evidence lock.
  *
  * The wrapper exists so a bare write — `prisma.receiptIntake.updateMany(...)`,

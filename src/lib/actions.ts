@@ -156,7 +156,7 @@ import {
     unreadThreadCommentCount,
 } from "./selection-item-thread-core";
 import { findThreadItem } from "./selection-item-thread-dependencies";
-import { lockReceiptEvidence, withReceiptEvidenceLock } from "./receipt-evidence-lock";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence, withReceiptEvidenceLock } from "./receipt-evidence-lock";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -5493,6 +5493,21 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
     });
 
     if (expenseCount > 0 || timeEntryCount > 0) {
+        // Codex round 2 nit (2026-09-23): receipt-booked expenses only offer
+        // "Move to job" in their own UI since PR #534, not delete -- so
+        // "Please delete these entries first" sends the user somewhere that no
+        // longer exists for them. Same predicate the locked check below uses
+        // (qbPurchaseId null, a linked ReceiptIntake). This is a message fix
+        // only; the locked in-transaction check stays the real guard.
+        const earlyReceiptBookedCount = await prisma.expense.count({
+            where: { estimateId, qbPurchaseId: null, receiptIntake: { isNot: null } },
+        });
+        if (earlyReceiptBookedCount > 0) {
+            return {
+                success: false,
+                error: `This estimate has ${earlyReceiptBookedCount} expense(s) from receipts, so it can't be deleted. Archive it instead.`,
+            };
+        }
         const parts = [];
         if (expenseCount > 0) parts.push(`${expenseCount} expense(s)`);
         if (timeEntryCount > 0) parts.push(`${timeEntryCount} time entry/entries`);
@@ -5502,23 +5517,65 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
         };
     }
 
-    // Delete related Budget
-    const budget = await prisma.budget.findUnique({ where: { estimateId } });
-    if (budget) {
-        await prisma.budget.delete({ where: { id: budget.id } });
-    }
-
-    // Delete related items, schedules, expenses, and the estimate itself
-    await prisma.estimateItem.deleteMany({ where: { estimateId } });
-    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
+    // Delete related Budget, items, schedules, expenses, and the estimate
+    // itself.
     // EVIDENCE (round-45 gate, finding 3). Deleting an estimate cascades to its
     // Expenses, and every one of those is a row the missing-receipt sweep may
     // have read as "this charge has its receipt". Unfenced, a sweep mid-cycle
     // could close a chase on evidence this statement was in the middle of
     // destroying — and certify it, because nothing moved the epoch.
-    await withReceiptEvidenceLock(fn => prisma.$transaction(fn),
-        tx => tx.expense.deleteMany({ where: { estimateId } }));
-    await prisma.estimate.delete({ where: { id: estimateId } });
+    //
+    // RECEIPT-BOOKED EXPENSES REFUSE THE WHOLE DELETE INSTEAD (2026-09-23).
+    // Native receipt booking (receipt-intake/book.ts) attaches its Expense to
+    // the project's newest estimate -- drafts included -- so this estimate can
+    // pick up a fresh one in the gap between the count check above and this
+    // transaction. Hard-deleting it here would strand its ReceiptIntake at
+    // BOOKED with expenseId null: on no job, unre-sendable, and its bank
+    // charge still looks covered. The check has to run AFTER the lock and
+    // INSIDE this same transaction, or the identical race just reopens one
+    // level up.
+    //
+    // NOTHING DESTRUCTIVE RUNS BEFORE THAT CHECK EITHER (2026-09-23 follow-up).
+    // Budget/EstimateItem/EstimatePaymentSchedule used to be deleted as plain
+    // prisma.* calls ahead of the lock, so a refusal below still left the
+    // estimate stripped of all three. This now owns the transaction directly
+    // instead of going through withReceiptEvidenceLock -- its
+    // EvidenceWriteClient type exposes expense/receiptIntake/reviewIssue, not
+    // budget or estimateItem -- so every delete below runs only once the
+    // guard has cleared.
+    //
+    // THE ESTIMATE ROW ALSO MOVES IN HERE (Codex round 1, 2026-09-23): it used
+    // to be a separate `prisma.estimate.delete()` call AFTER this transaction
+    // committed and released the lock, so a receipt could book onto this
+    // estimate in that gap and then the unguarded delete would still run.
+    // `tx.estimate.delete` makes the refusal and the delete one atomic commit.
+    let receiptBookedCount = 0;
+    await prisma.$transaction(async tx => {
+        await lockReceiptEvidence(tx);
+        receiptBookedCount = await tx.expense.count({
+            where: { estimateId, qbPurchaseId: null, receiptIntake: { isNot: null } },
+        });
+        if (receiptBookedCount === 0) {
+            const budget = await tx.budget.findUnique({ where: { estimateId } });
+            if (budget) {
+                await tx.budget.delete({ where: { id: budget.id } });
+            }
+            await tx.estimateItem.deleteMany({ where: { estimateId } });
+            await tx.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
+            await tx.expense.deleteMany({ where: { estimateId } });
+            await tx.estimate.delete({ where: { id: estimateId } });
+            // Codex round 2 nit (2026-09-23): only bump the epoch when a delete
+            // actually ran. A refusal changes no evidence, so bumping here was
+            // needlessly restarting the missing-receipt sweep on every retry.
+            await bumpReceiptEvidenceEpoch(tx);
+        }
+    });
+    if (receiptBookedCount > 0) {
+        return {
+            success: false,
+            error: `This estimate has ${receiptBookedCount} expense(s) from receipts, so it can't be deleted. Archive it instead.`,
+        };
+    }
 
     if (estimate.projectId) {
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
@@ -16533,6 +16590,15 @@ export async function resolveUncertainCard(
     return { success: true, stale: false as const };
 }
 
+// Imported here, next to its only call site, rather than with the imports at
+// the top of the file: this file's manifest tests (payroll-writer-manifest,
+// payroll-user-writer-manifest, time-entry-void-readers) pin several `.user`
+// and evidence writers by their exact line number, and every one of those
+// sits above this point. Adding a line up top would shift all of them for no
+// reason; adding it here shifts only the lines the cheap-sweep-restart §14.2
+// manifest re-pin already accounts for.
+import { writeReceiptOwnerLocked } from "./receipt-owner-assignment";
+
 /**
  * Assign the owner of an unattributed bank charge (Codex round-4 item 7).
  *
@@ -16574,14 +16640,23 @@ export async function setMissingReceiptOwner(issueId: string, owner: string, exp
     details.ownerOverride = owner;
 
     // Version-guarded: the nightly sweep writes this same column, and losing
-    // that race silently would drop the assignment on the floor.
-    const result = await prisma.reviewIssue.updateMany({
-        // The RENDERED version, so the write is refused atomically even if the
-        // row moved between the read above and this statement.
-        where: { id: issue.id, version: expectedVersion, clearedAt: null },
-        data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
-    });
-    if (result.count === 0) throw new Error("That item changed underneath you — refresh and try again.");
+    // that race silently would drop the assignment on the floor. Locked and
+    // owner-epoch-bumped (cheap-sweep-restart §14.2) so a card claim made
+    // under the same lock can never miss this reassignment.
+    let count: number;
+    try {
+        count = await writeReceiptOwnerLocked(prisma, {
+            issueId: issue.id,
+            // The RENDERED version, so the write is refused atomically even if the
+            // row moved between the read above and this statement.
+            expectedVersion,
+            displayDetailsJson: JSON.stringify(details),
+            now: new Date(),
+        });
+    } catch {
+        throw new Error("The list is busy — try again in a moment.");
+    }
+    if (count === 0) throw new Error("That item changed underneath you — refresh and try again.");
     revalidateReceiptQueue();
     return { success: true };
 }

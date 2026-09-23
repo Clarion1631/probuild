@@ -106,6 +106,22 @@ const cardsPrisma: Record<string, unknown> = {
     $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
         // The lease probe passes a Prisma.sql value, not a template array.
         const sql = Array.isArray(strings) ? strings.join("?") : "";
+        // Epoch reads/locks/bumps (§14.9's claimOwnerDay), through the SAME
+        // settings store `automationSetting` uses below — raw SQL and the
+        // model accessor are two doors onto the one real table, so this
+        // fake keeps them onto the one real Map too. Locking is a no-op
+        // here (this fake never runs two callers at once); a bump — the
+        // ONLY write shape with "+ 1" in it — actually increments.
+        if (sql.includes('"AutomationSetting"')) {
+            const key = String(values[0]);
+            if (/\+ 1/.test(sql)) {
+                const next = String(Number(settings.get(key) ?? "0") + 1);
+                settings.set(key, next);
+                return [{ value: next }];
+            }
+            if (!settings.has(key)) settings.set(key, "0");
+            return [{ value: settings.get(key) }];
+        }
         if (!/ReceiptRequestCard/.test(sql)) return [{ locked: true }];
         const before = String(values[0]);
         const limit = Number(values[1]);
@@ -127,6 +143,9 @@ const cardsPrisma: Record<string, unknown> = {
             .sort((a, c) => order(a, c) || String(a.owner).localeCompare(String(c.owner)))
             .slice(0, limit);
     },
+    // SET LOCAL and the evidence advisory lock (§14.9's claimOwnerDay): a
+    // no-op here for the same reason locking is — one caller at a time.
+    $executeRaw: async () => undefined,
     $transaction: async (arg: unknown) =>
         (typeof arg === "function" ? await (arg as (tx: unknown) => Promise<unknown>)(cardsPrisma) : arg),
     automationSetting: settingStore,
@@ -267,8 +286,17 @@ function reset() {
      * something finished today. A stale stamp carried forward by a later phase
      * write used to release cards over a partially reconciled set.
      */
+    // The RAW epoch reads (§14.9's claimOwnerDay, through $queryRaw above)
+    // have to agree with what the cycle below claims it was measured
+    // against, or certification could never pass regardless of plannerDay.
+    settings.set("bankLedgerEpoch", "1");
+    settings.set("receiptEvidenceEpoch", "1");
     settings.set("receiptRequestsCycle", JSON.stringify({
         id: "cycle-under-test", epoch: "1", evidenceEpoch: "1",
+        // §14.9's claim re-certifies under cardSelectionCertified, which
+        // also requires the cycle to have planned against TODAY's own UTC
+        // day — a legacy cycle with none can never certify.
+        plannerDay: new Date().toISOString().slice(0, 10),
     }));
     settings.set("receiptRequestsPhase", JSON.stringify({
         phase: "done",
