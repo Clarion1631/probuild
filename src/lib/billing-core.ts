@@ -66,6 +66,8 @@ export function outageNote(error: unknown): string {
 }
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
+import { computeInvoiceReceivable, type ReceivableInvoiceInput, type ReceivableMilestone, type ReceivableProgressBilling } from "./receivables";
+import { computeInvoiceAmountDue, type InvoiceAmountDue } from "./invoice-amount-due";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
@@ -176,52 +178,138 @@ export async function getProjectBilling(projectId: string) {
 // Accounts receivable: every invoice still owed money, across all projects.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function listReceivables() {
-    const now = Date.now();
+// Shared with sendInvoiceToClientCore/loadInvoiceAmountDue: exactly which
+// Pending milestones and live progress billings feed computeInvoiceReceivable/
+// computeInvoiceAmountDue, so the AR digest and the invoice-send path can
+// never see a different set of "billed" evidence for the same invoice.
+// Milestone order is PR #289's deterministic schedule order (createdAt, id
+// tiebreak — same-transaction inserts share a createdAt), the same orderBy
+// used for invoice payments in actions.ts and pdf.ts, so an amount-due
+// email's item order matches the invoice editor/portal schedule order.
+const RECEIVABLE_PAYMENTS_ARGS = {
+    where: { status: "Pending" },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: {
+        id: true, name: true, amount: true, status: true, dueDate: true, createdAt: true,
+        qbInvoiceId: true, qbInvoiceSentAt: true, qbSyncError: true, qbSyncedAt: true,
+    },
+} satisfies Prisma.Invoice$paymentsArgs;
+const RECEIVABLE_PROGRESS_BILLINGS_ARGS = {
+    where: { status: { in: ["Staged", "Sent"] } },
+    select: {
+        id: true, code: true, status: true,
+        qbInvoiceId: true, qbSyncError: true, qbSyncedAt: true, qbInvoiceSentAt: true, sentAt: true, createdAt: true,
+        lines: { select: { scheduleId: true } },
+    },
+} satisfies Prisma.Invoice$progressBillingsArgs;
+const RECEIVABLE_INVOICE_SELECT = {
+    status: true, balanceDue: true, issueDate: true, sentAt: true, createdAt: true,
+    _count: { select: { payments: true } },
+    payments: RECEIVABLE_PAYMENTS_ARGS,
+    progressBillings: RECEIVABLE_PROGRESS_BILLINGS_ARGS,
+};
+
+function toReceivableInput(row: {
+    status: string;
+    balanceDue: ReceivableInvoiceInput["balanceDue"];
+    issueDate: Date | null;
+    sentAt: Date | null;
+    createdAt: Date;
+    _count: { payments: number };
+    payments: ReceivableMilestone[];
+    progressBillings: ReceivableProgressBilling[];
+}): ReceivableInvoiceInput {
+    return { ...row, milestoneCount: row._count.payments };
+}
+
+export async function listReceivables(now: number = Date.now()) {
     const invoices = await prisma.invoice.findMany({
-        where: { balanceDue: { gt: 0 }, status: { notIn: ["Draft"] } },
+        // balanceDue > 0 alone misses an invoice whose balance has drifted to
+        // 0 (or negative) while it still carries a billed, unpaid milestone —
+        // a Pending one that was requested or linked, or a live progress
+        // billing. The balanceDue branch stays so a legacy zero-milestone
+        // invoice (no Pending rows, no progress billings) with a genuine
+        // positive balance is still found.
+        where: {
+            status: { not: "Canceled" },
+            OR: [
+                { balanceDue: { gt: 0 } },
+                { payments: { some: { status: "Pending" } } },
+                { progressBillings: { some: { status: { in: ["Staged", "Sent"] } } } },
+            ],
+        },
         orderBy: { issueDate: "asc" },
         select: {
-            id: true, code: true, status: true, totalAmount: true, balanceDue: true,
-            issueDate: true, sentAt: true, createdAt: true,
+            id: true, code: true, totalAmount: true,
             project: { select: { id: true, name: true } },
             client: { select: { name: true, email: true } },
-            payments: {
-                where: { status: "Pending" },
-                orderBy: { createdAt: "asc" },
-                select: { id: true, name: true, amount: true, dueDate: true, qbInvoiceSentAt: true, qbSyncError: true },
-            },
+            ...RECEIVABLE_INVOICE_SELECT,
         },
     });
 
-    const rows = invoices.map(inv => {
-        const anchor = inv.issueDate ?? inv.sentAt ?? inv.createdAt;
-        const ageDays = Math.floor((now - anchor.getTime()) / 86_400_000);
-        // Due dates are business dates: a milestone isn't "past due" until the
-        // whole due day has elapsed (24h grace covers timezone-of-storage skew).
-        const pastDue = inv.payments.some(p => p.dueDate && p.dueDate.getTime() + 86_400_000 < now);
-        return {
-            invoiceId: inv.id,
-            code: inv.code,
-            status: inv.status,
-            project: inv.project?.name ?? null,
-            projectId: inv.project?.id ?? null,
-            client: inv.client?.name ?? null,
-            balanceDue: Number(inv.balanceDue),
-            total: Number(inv.totalAmount),
-            ageDays,
-            overdue: pastDue || ageDays > 30,
-            unpaidMilestones: inv.payments.map(p => ({
-                id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
-                lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
-            })),
-        };
-    });
+    // Per invoice: which billed items are still open, aged from the earliest
+    // billing evidence (src/lib/receivables.ts) — not the whole balanceDue,
+    // which includes milestones that were only ever scheduled.
+    const computed = invoices.map(inv => ({
+        inv,
+        receivable: computeInvoiceReceivable(toReceivableInput(inv), now),
+    }));
+
+    const billed = computed.filter(({ receivable }) => receivable.receivableCents > 0);
+
+    const rows = billed
+        .map(({ inv, receivable }) => {
+            // Every Pending milestone that made it into a billed item — its
+            // own evidence or a covering live progress billing's, either way
+            // computeInvoiceReceivable already decided it counts. Reusing
+            // that set here (rather than re-deriving "billed" from the raw
+            // fields) means unpaidMilestones can never disagree with what
+            // was actually counted above.
+            const billedMilestoneIds = new Set(
+                receivable.items.filter(it => it.kind === "milestone").map(it => it.id as string),
+            );
+            return {
+                invoiceId: inv.id,
+                code: inv.code,
+                status: inv.status,
+                project: inv.project?.name ?? null,
+                projectId: inv.project?.id ?? null,
+                client: inv.client?.name ?? null,
+                total: Number(inv.totalAmount),
+                balanceDue: Number(inv.balanceDue),
+                ageDays: receivable.ageDays,
+                overdue: receivable.overdue,
+                receivable: receivable.receivableCents / 100,
+                unbilled: receivable.unbilledCents / 100,
+                overdueAmount: receivable.overdueCents / 100,
+                notRequestedAmount: receivable.notRequestedCents / 100,
+                billedItems: receivable.items.map(it => ({
+                    kind: it.kind, id: it.id, label: it.label, amount: it.cents / 100,
+                    billedAt: it.billedAt, dueDate: it.dueDate, ageDays: it.ageDays, overdue: it.overdue,
+                    requested: it.requested, inQuickBooks: it.inQuickBooks, progressBillingCode: it.progressBillingCode,
+                })),
+                unpaidMilestones: inv.payments.map(p => ({
+                    id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
+                    lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
+                    billed: billedMilestoneIds.has(p.id),
+                })),
+            };
+        })
+        // Oldest open billed item first — standard AR aging; collections work oldest first.
+        .sort((a, b) => (b.ageDays ?? -1) - (a.ageDays ?? -1));
+
+    const totalOutstandingCents = billed.reduce((s, { receivable }) => s + receivable.receivableCents, 0);
+    const overdueOutstandingCents = billed.reduce((s, { receivable }) => s + receivable.overdueCents, 0);
+    // Backlog is summed over every fetched invoice, not just the ones with a
+    // billed item — an invoice that is 100% unbilled still belongs in it.
+    const unbilledBacklogCents = computed.reduce((s, { receivable }) => s + receivable.unbilledCents, 0);
 
     return {
-        totalOutstanding: Math.round(rows.reduce((s, r) => s + r.balanceDue, 0) * 100) / 100,
-        overdueOutstanding: Math.round(rows.filter(r => r.overdue).reduce((s, r) => s + r.balanceDue, 0) * 100) / 100,
+        totalOutstanding: totalOutstandingCents / 100,
+        overdueOutstanding: overdueOutstandingCents / 100,
         invoiceCount: rows.length,
+        unbilledBacklog: unbilledBacklogCents / 100,
+        unbilledInvoiceCount: computed.filter(({ receivable }) => receivable.unbilledCents > 0).length,
         invoices: rows,
     };
 }
@@ -229,9 +317,12 @@ export async function listReceivables() {
 /**
  * Weekly AR digest to the team (System Notification Email). Returns the summary
  * so the cron response is inspectable; sends nothing when nothing is owed.
+ * `now` threads through to listReceivables()/computeInvoiceReceivable() —
+ * the cron route calls this with no argument, so it still defaults to the
+ * real clock in production.
  */
-export async function sendArDigest() {
-    const ar = await listReceivables();
+export async function sendArDigest(now: number = Date.now()) {
+    const ar = await listReceivables(now);
     if (ar.invoiceCount === 0) return { sent: false, reason: "nothing outstanding", ...ar };
 
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { notificationEmail: true, email: true, companyName: true } });
@@ -239,26 +330,41 @@ export async function sendArDigest() {
     if (!to) return { sent: false, reason: "no notification email configured", ...ar };
 
     const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const row = (r: (typeof ar.invoices)[number]) => `
+    const row = (r: (typeof ar.invoices)[number]) => {
+        // Only when it's a genuine partial — if the whole receivable is
+        // overdue, the row's ⚠️ and background already say so; a sub-line
+        // repeating the same figure would just be noise.
+        const overdueLine = r.overdue && r.overdueAmount > 0 && r.overdueAmount !== r.receivable
+            ? `<div style="color:#b91c1c;font-size:11px;">of which ${formatCurrency(r.overdueAmount)} overdue</div>`
+            : "";
+        // A missing payment-request record doesn't prove the client was
+        // never asked (an approval email can carry a pay link without
+        // stamping qbInvoiceSentAt) — so this names the amount and the gap
+        // in ProBuild's own record, not a claim that nobody was billed.
+        const notRequestedLine = r.notRequestedAmount > 0
+            ? `<div style="color:#64748b;font-size:11px;font-weight:normal;">${formatCurrency(r.notRequestedAmount)} has no payment request on record</div>`
+            : "";
+        return `
         <tr style="${r.overdue ? "background:#fef2f2;" : ""}">
             <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.code)}${r.overdue ? " ⚠️" : ""}</td>
             <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.project ?? "—")}</td>
             <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(r.client ?? "—")}</td>
-            <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${formatCurrency(r.balanceDue)}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${formatCurrency(r.receivable)}${overdueLine}${notRequestedLine}</td>
             <td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;">${r.ageDays}d</td>
         </tr>`;
+    };
 
     const sendResult = await sendNotification(
         to,
         `AR digest — ${formatCurrency(ar.totalOutstanding)} outstanding across ${ar.invoiceCount} invoice${ar.invoiceCount === 1 ? "" : "s"}${ar.overdueOutstanding > 0 ? ` (${formatCurrency(ar.overdueOutstanding)} overdue)` : ""}`,
         `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 640px; margin: 0 auto; padding: 24px; color: #333;">
             <h2 style="font-size:18px;">Accounts receivable</h2>
-            <p><strong>${formatCurrency(ar.totalOutstanding)}</strong> outstanding · <strong style="color:#b91c1c;">${formatCurrency(ar.overdueOutstanding)}</strong> overdue (30+ days or past due date)</p>
+            <p><strong>${formatCurrency(ar.totalOutstanding)}</strong> billed and unpaid · <strong style="color:#b91c1c;">${formatCurrency(ar.overdueOutstanding)}</strong> overdue (more than 30 days since billed, or past due date)</p>
             <table style="border-collapse:collapse;width:100%;font-size:13px;">
-                <tr style="text-align:left;color:#64748b;"><th style="padding:6px 10px;">Invoice</th><th style="padding:6px 10px;">Project</th><th style="padding:6px 10px;">Client</th><th style="padding:6px 10px;text-align:right;">Balance</th><th style="padding:6px 10px;text-align:right;">Age</th></tr>
+                <tr style="text-align:left;color:#64748b;"><th style="padding:6px 10px;">Invoice</th><th style="padding:6px 10px;">Project</th><th style="padding:6px 10px;">Client</th><th style="padding:6px 10px;text-align:right;">Billed & unpaid</th><th style="padding:6px 10px;text-align:right;">Age</th></tr>
                 ${ar.invoices.map(row).join("")}
             </table>
-            <p style="color:#64748b;font-size:12px;margin-top:16px;">Ask ChatGPT "who owes us money?" for the live view, or "resend the invoice on [project]" to nudge with a fresh payment link.</p>
+            <p style="color:#64748b;font-size:12px;margin-top:16px;">Ask ChatGPT "who owes us money?" for the live view, or "resend the payment request for [milestone] on [project]" to nudge. Not counted here: ${formatCurrency(ar.unbilledBacklog)} of scheduled milestones not yet billed (backlog, not receivables). QuickBooks is the books of record for accounts receivable — this covers only what ProBuild billed, and can't see partial or short payments, credits, or balances created outside ProBuild.</p>
         </div>`,
         undefined,
         { fromName: settings?.companyName || "ProBuild" },
@@ -508,18 +614,73 @@ export async function createInvoiceFromEstimateGuarded(estimateId: string) {
 // Invoice email (ProBuild-native portal link). Moved verbatim from actions.ts.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?: string) {
+// A canonical, order-independent fingerprint of what's billed and unpaid —
+// the exact set a preview showed the user, so a later send can refuse to go
+// out if that set drifted (a milestone got paid/canceled, a different one
+// got billed, a live QBO link changed) between the preview and the confirm.
+// A dollar total alone isn't enough: swapping milestone A ($500) for an
+// unrelated, equal-priced milestone B still passes a total-only check.
+export type DueSnapshot = Array<{ id: string | null; cents: number }>;
+
+export function dueSnapshot(due: InvoiceAmountDue): DueSnapshot {
+    return due.items
+        .map(it => ({ id: it.id, cents: it.cents }))
+        .sort((a, b) => {
+            if (a.id === b.id) return a.cents - b.cents;
+            if (a.id === null) return 1; // null (legacyInvoice) sorts last
+            if (b.id === null) return -1;
+            return a.id < b.id ? -1 : 1;
+        });
+}
+
+// Both snapshots are expected to come from dueSnapshot(), whose sort makes
+// the comparison order-independent without needing to re-sort here.
+export function sameDue(a: DueSnapshot, b: DueSnapshot): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i].id !== b[i].id || a[i].cents !== b[i].cents) return false;
+    }
+    return true;
+}
+
+// The MCP resend_invoice confirm-token payload: binds the recipient AND the
+// exact billed set (not just its total) so a token minted for one can't be
+// replayed for a different one.
+export function resendConfirmPayload(args: { invoiceId: string; recipient: string; due: InvoiceAmountDue }): string {
+    return JSON.stringify({ invoiceId: args.invoiceId, recipient: args.recipient, due: dueSnapshot(args.due) });
+}
+
+export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?: string, opts?: { expectedDue?: DueSnapshot }) {
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
         include: {
             project: { include: { client: true } },
             client: true,
+            _count: { select: { payments: true } },
+            payments: RECEIVABLE_PAYMENTS_ARGS,
+            progressBillings: RECEIVABLE_PROGRESS_BILLINGS_ARGS,
         },
     });
     if (!invoice) throw new Error("Invoice not found");
 
     const recipientEmail = overrideEmail || invoice.client?.email;
     if (!recipientEmail) throw new Error("No email address provided");
+
+    // What this email may actually ask for, computed BEFORE any write — a
+    // nothing-billed invoice must not flip Draft->Issued or touch sentAt for
+    // an email that names no real ask.
+    const due = computeInvoiceAmountDue(toReceivableInput(invoice), Date.now());
+    if (due.dueCents <= 0) {
+        return nothingDueResult(invoice.code);
+    }
+
+    // A caller that pinned an expected billed set (an MCP send confirmed
+    // against a verified preview token) gets it re-checked here, BEFORE any
+    // write or email — if the set drifted since the preview, refuse rather
+    // than send something nobody actually approved.
+    if (opts?.expectedDue && !sameDue(dueSnapshot(due), opts.expectedDue)) {
+        return changedDueResult(invoice.code);
+    }
 
     if (invoice.status === "Draft") {
         await prisma.invoice.update({
@@ -535,58 +696,39 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
 
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
     const clientId = invoice.clientId || invoice.project?.clientId;
+    const milestoneItems = due.items.filter(it => it.kind === "milestone");
+    // Focus the portal on exactly what's billed — same ?milestone= mechanism
+    // as sendMilestoneRequestEmail below. A legacy zero-milestone invoice has
+    // no milestone ids to focus on, so it keeps the plain invoice link.
+    const nextPath = milestoneItems.length > 0
+        ? `/portal/invoices/${invoiceId}?milestone=${milestoneItems.map(it => it.id).join(",")}`
+        : `/portal/invoices/${invoiceId}`;
     let portalUrl: string;
     if (clientId) {
         const { signClientPortalToken } = await import("./client-portal-auth");
         const token = await signClientPortalToken(clientId, recipientEmail.toLowerCase());
-        portalUrl = `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(`/portal/invoices/${invoiceId}`)}`;
+        portalUrl = `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(nextPath)}`;
     } else {
-        portalUrl = `${appUrl}/portal/invoices/${invoiceId}`;
+        portalUrl = `${appUrl}${nextPath}`;
     }
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
-    // Job site line: project.location only, trimmed — a blank location renders no line
-    // at all (never a bare "Job site:"). Same rule as buildMilestoneRequestEmail.
-    const jobSite = (invoice.project?.location || "").trim();
-
     const invoiceAdditionalEmail = invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null;
     const invoiceCc = buildCc(recipientEmail, invoiceAdditionalEmail);
+    const { subject, html } = buildInvoiceDueEmail({
+        companyName,
+        clientName: invoice.client?.name,
+        projectName: invoice.project?.name,
+        projectLocation: invoice.project?.location,
+        invoiceCode: invoice.code,
+        due,
+        portalUrl,
+    });
     const emailResult = await sendNotification(
         recipientEmail,
-        `${companyName} sent you an invoice — ${invoice.code}`,
-        `<!DOCTYPE html>
-        <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-            <div style="text-align: center; margin-bottom: 32px;">
-                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
-            </div>
-            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
-                <h2 style="font-size: 20px; margin: 0 0 8px;">Invoice ${invoice.code}</h2>
-                <p style="color: #666; margin: 0 0 24px;">Hi ${invoice.client?.name || 'there'},</p>
-                <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you an invoice for <strong>${formatCurrency(invoice.totalAmount)}</strong>.
-                    Please click the button below to view the details and make a payment.
-                </p>
-                ${jobSite ? `<p style="color: #666; font-size: 13px; margin: 8px 0 0;">Job site: ${escapeHtml(jobSite)}</p>` : ""}
-                <div style="text-align: center; margin: 32px 0;">
-                    <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                        View & Pay Invoice
-                    </a>
-                </div>
-                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center;">
-                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Amount Due</div>
-                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(invoice.balanceDue)}</div>
-                </div>
-                <p style="color: #999; font-size: 13px; text-align: center; margin-top: 16px;">
-                    Or copy this link: ${portalUrl}
-                </p>
-            </div>
-            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
-                Sent via ProBuild • ${companyName}
-            </p>
-        </body>
-        </html>`,
+        subject,
+        html,
         undefined,
         { fromName: companyName, replyTo: settings?.email || undefined, cc: invoiceCc, copyToInternal: true }
     );
@@ -597,21 +739,26 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
         return { success: false as const, error: "The invoice email could not be sent — please try again.", sentTo: undefined };
     }
 
-    // A whole-invoice email asks the client for everything unpaid, so every
-    // Pending milestone becomes "requested". qbInvoiceSentAt doubles as the
-    // rail-neutral request marker: the portal only shows Pay buttons and due
-    // amounts for requested milestones. (Covers resendInvoiceCore too — it
-    // delegates here after refreshing QBO links.) Delivered-but-not-recorded
-    // must not read as a send failure — the email DID go out, and reporting
-    // failure here would invite a duplicate send — so the stamp is fail-soft
-    // and loud, same pattern as the milestone path.
-    try {
-        await prisma.paymentSchedule.updateMany({
-            where: { invoiceId, status: "Pending" },
-            data: { qbInvoiceSentAt: new Date() },
-        });
-    } catch (stampErr) {
-        console.error(`[sendInvoiceToClientCore] Email sent but the request stamp failed for invoice ${invoice.code} — portal will show nothing due until a resend:`, stampErr);
+    // A whole-invoice email now asks only for milestones already billed and
+    // unpaid, so only THOSE become "requested" — a milestone that was never
+    // billed stays unrequested until someone sends it from its own row
+    // (PR #216/#289 history). qbInvoiceSentAt doubles as the rail-neutral
+    // request marker: the portal only shows Pay buttons and due amounts for
+    // requested milestones. Requested milestones get their last-sent time
+    // refreshed as before. Delivered-but-not-recorded must not read as a
+    // send failure — the email DID go out, and reporting failure here would
+    // invite a duplicate send — so the stamp is fail-soft and loud, same
+    // pattern as the milestone path. A legacy-only send has nothing to stamp.
+    const billedMilestoneIds = milestoneItems.map(it => it.id as string);
+    if (billedMilestoneIds.length > 0) {
+        try {
+            await prisma.paymentSchedule.updateMany({
+                where: { invoiceId, status: "Pending", id: { in: billedMilestoneIds } },
+                data: { qbInvoiceSentAt: new Date() },
+            });
+        } catch (stampErr) {
+            console.error(`[sendInvoiceToClientCore] Email sent but the request stamp failed for invoice ${invoice.code} — portal will show nothing due until a resend:`, stampErr);
+        }
     }
 
     // Log to activity feed (project-scoped only)
@@ -632,25 +779,108 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
         revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
     }
     revalidatePath(`/invoices`);
-    return { success: true as const, sentTo: recipientEmail };
+    return {
+        success: true as const,
+        sentTo: recipientEmail,
+        amountDue: due.dueCents / 100,
+        requested: due.items.map(it => ({ name: it.label, amount: it.cents / 100 })),
+    };
+}
+
+// Same "nothing to ask for" result for both sendInvoiceToClientCore and
+// resendInvoiceCore's own short-circuit below — factored out so the message
+// can never drift between the two paths.
+function nothingDueResult(invoiceCode: string) {
+    return {
+        success: false as const,
+        nothingDue: true as const,
+        error: `Nothing on ${invoiceCode} is billed and unpaid, so there is nothing to ask the client for. To ask for a payment, use Send on that milestone's row.`,
+        sentTo: undefined,
+    };
+}
+
+// Same "the approved set drifted" result for both sendInvoiceToClientCore's
+// and resendInvoiceCore's expectedDue re-checks below.
+function changedDueResult(invoiceCode: string) {
+    return {
+        success: false as const,
+        changed: true as const,
+        error: `What's due on ${invoiceCode} changed since the preview, so nothing was sent. Preview it again.`,
+        sentTo: undefined,
+    };
 }
 
 /**
- * Resend an invoice whose QuickBooks payment links may have gone stale: refresh
- * each milestone's QBO link (re-pushing clears "voided"/"notFound" flags where
- * possible), then send the ProBuild invoice email with its always-current portal
- * link. QuickBooks being disconnected downgrades to a plain resend, not a failure.
+ * What a whole-invoice send/resend may ask for right now, without sending
+ * anything — the same computeInvoiceAmountDue rule sendInvoiceToClientCore
+ * uses, so resendInvoiceCore's nothing-due short-circuit and the MCP
+ * resend_invoice preview can never disagree with what an actual send would do.
  */
-export async function resendInvoiceCore(invoiceId: string, overrideEmail?: string, deadline?: RouteDeadline) {
-    const qbDeadline = deadline ?? createRouteDeadline(BILLING_QBO_BUDGET_MS);
+export async function loadInvoiceAmountDue(invoiceId: string, now = Date.now()) {
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
-        include: { payments: { select: { id: true, name: true, qbInvoiceId: true, status: true } } },
+        select: {
+            id: true, code: true, totalAmount: true,
+            ...RECEIVABLE_INVOICE_SELECT,
+        },
     });
-    if (!invoice) return { success: false as const, error: "Invoice not found" };
+    if (!invoice) return null;
+    return { invoice, due: computeInvoiceAmountDue(toReceivableInput(invoice), now) };
+}
+
+/**
+ * Which of an invoice's milestones resendInvoiceCore should refresh in
+ * QuickBooks: only ones the email is actually about to ask for again
+ * (billed per `due`) AND that have a QuickBooks invoice to refresh.
+ * Re-pushing/refreshing a milestone nobody asked for would risk creating or
+ * reviving a live QBO invoice for it and then emailing it as due. A voided
+ * milestone that was never requested and has no live link isn't a billed
+ * item at all, so it's already excluded here; a voided milestone that WAS
+ * requested still counts (qbInvoiceSentAt is billing evidence on its own)
+ * and is refreshed like any other.
+ */
+export function selectMilestonesToRefresh(
+    due: InvoiceAmountDue,
+    payments: Array<{ id: string; name: string; qbInvoiceId: string | null }>,
+): Array<{ id: string; name: string; qbInvoiceId: string }> {
+    const billedMilestoneIds = new Set(due.items.filter(it => it.kind === "milestone").map(it => it.id as string));
+    const out: Array<{ id: string; name: string; qbInvoiceId: string }> = [];
+    for (const p of payments) {
+        if (p.qbInvoiceId && billedMilestoneIds.has(p.id)) out.push({ id: p.id, name: p.name, qbInvoiceId: p.qbInvoiceId });
+    }
+    return out;
+}
+
+/**
+ * Resend an invoice whose QuickBooks payment links may have gone stale:
+ * refresh the QBO link for each BILLED milestone the email is about to ask
+ * for again (re-pushing clears "voided"/"notFound" flags where possible),
+ * then send the ProBuild invoice email with its always-current portal link.
+ * Milestones that were never billed are left untouched — see
+ * selectMilestonesToRefresh. If nothing is billed and unpaid, this returns
+ * the same nothing-due result sendInvoiceToClientCore would, before ever
+ * touching QuickBooks. An `opts.expectedDue` (the set a preview approved) is
+ * re-checked here too, before ever touching QuickBooks, and again inside
+ * sendInvoiceToClientCore right before any write — the QBO refresh loop
+ * below takes real time, so the set is worth re-checking on both sides of
+ * it. QuickBooks being disconnected downgrades to a plain resend, not a
+ * failure.
+ */
+export async function resendInvoiceCore(invoiceId: string, overrideEmail?: string, deadline?: RouteDeadline, opts?: { expectedDue?: DueSnapshot }) {
+    const qbDeadline = deadline ?? createRouteDeadline(BILLING_QBO_BUDGET_MS);
+    const loaded = await loadInvoiceAmountDue(invoiceId);
+    if (!loaded) return { success: false as const, error: "Invoice not found" };
+    const { invoice, due } = loaded;
+
+    if (due.dueCents <= 0) {
+        return { ...nothingDueResult(invoice.code), linkRefresh: [] as Array<{ milestone: string; refreshed: boolean; payLink?: string; error?: string }> };
+    }
+    if (opts?.expectedDue && !sameDue(dueSnapshot(due), opts.expectedDue)) {
+        return { ...changedDueResult(invoice.code), linkRefresh: [] as Array<{ milestone: string; refreshed: boolean; payLink?: string; error?: string }> };
+    }
 
     const linkRefresh: Array<{ milestone: string; refreshed: boolean; payLink?: string; error?: string }> = [];
-    const qbMilestones = invoice.payments.filter(p => p.qbInvoiceId && p.status !== "Paid" && p.status !== "Canceled");
+    const qbMilestones = selectMilestonesToRefresh(due, invoice.payments);
     if (qbMilestones.length > 0) {
         try {
             const { getFreshQBTokens, pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
@@ -696,7 +926,7 @@ export async function resendInvoiceCore(invoiceId: string, overrideEmail?: strin
         }
     }
 
-    const sent = await sendInvoiceToClientCore(invoiceId, overrideEmail);
+    const sent = await sendInvoiceToClientCore(invoiceId, overrideEmail, { expectedDue: opts?.expectedDue });
     return { ...sent, linkRefresh };
 }
 
@@ -770,6 +1000,77 @@ export function buildMilestoneRequestEmail(input: {
                 </div>
                 <p style="color: #999; font-size: 13px; text-align: center; margin-top: 16px;">
                     Reference: Invoice ${escapeHtml(input.invoiceCode)}. Only the payment${single ? "" : "s"} above ${single ? "is" : "are"} due now — your full invoice is available at the same link for reference.
+                </p>
+                <p style="color: #999; font-size: 13px; text-align: center; margin-top: 8px;">
+                    Or copy this link: ${escapeHtml(input.portalUrl)}
+                </p>
+            </div>
+            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
+                Sent via ProBuild • ${company}
+            </p>
+        </body>
+        </html>`;
+
+    return { subject, html };
+}
+
+// Whole-invoice send email: lists only what's billed and unpaid right now
+// (computeInvoiceAmountDue), never invoice.totalAmount or invoice.balanceDue.
+// Same visual style as buildMilestoneRequestEmail above. PROVISIONAL COPY —
+// the owner may revise the wording; keep all of it inside this one function.
+export function buildInvoiceDueEmail(input: {
+    companyName: string;
+    clientName: string | null | undefined;
+    projectName: string | null | undefined;
+    // Job site address (Project.location). Blank renders no line at all —
+    // same rule as buildMilestoneRequestEmail.
+    projectLocation?: string | null | undefined;
+    invoiceCode: string;
+    due: InvoiceAmountDue;
+    portalUrl: string;
+}): { subject: string; html: string } {
+    const company = escapeHtml(input.companyName);
+    const total = input.due.dueCents / 100;
+    const single = input.due.items.length === 1;
+    const projectName = input.projectName || "project";
+    const jobSite = (input.projectLocation || "").trim();
+    const itemRows = input.due.items.map(it => `
+                    <tr>
+                        <td style="padding: 10px 0; color: #333; border-bottom: 1px solid #f0f0f0;">${escapeHtml(it.label)}</td>
+                        <td style="padding: 10px 0; color: #111; font-weight: 600; text-align: right; border-bottom: 1px solid #f0f0f0;">${formatCurrency(it.cents / 100)}</td>
+                    </tr>`).join("");
+
+    const subject = sanitizeHeaderValue(
+        `${input.companyName} sent you invoice ${input.invoiceCode}: ${formatCurrency(total)} due`
+    );
+
+    const html = `<!DOCTYPE html>
+        <html>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+            <div style="text-align: center; margin-bottom: 32px;">
+                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${company}</h1>
+            </div>
+            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                <h2 style="font-size: 20px; margin: 0 0 8px;">Invoice ${escapeHtml(input.invoiceCode)}</h2>
+                <p style="color: #666; margin: 0 0 24px;">Hi ${escapeHtml(input.clientName || 'there')},</p>
+                <p style="color: #666; line-height: 1.6;">
+                    Here is your invoice ${escapeHtml(input.invoiceCode)} for your ${escapeHtml(projectName)}. This is what's due now:
+                </p>
+                ${jobSite ? `<p style="color: #666; font-size: 13px; margin: 0;">Job site: ${escapeHtml(jobSite)}</p>` : ""}
+                <table style="width: 100%; border-collapse: collapse; margin: 8px 0 0;">
+                    ${itemRows}
+                </table>
+                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin-top: 24px;">
+                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Amount Due Now</div>
+                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(total)}</div>
+                </div>
+                <div style="text-align: center; margin: 32px 0;">
+                    <a href="${escapeHtml(input.portalUrl)}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                        View &amp; Pay ${formatCurrency(total)}
+                    </a>
+                </div>
+                <p style="color: #999; font-size: 13px; text-align: center; margin-top: 16px;">
+                    Only the payment${single ? "" : "s"} above ${single ? "is" : "are"} due now. Your full payment schedule is at the same link, for reference.
                 </p>
                 <p style="color: #999; font-size: 13px; text-align: center; margin-top: 8px;">
                     Or copy this link: ${escapeHtml(input.portalUrl)}
