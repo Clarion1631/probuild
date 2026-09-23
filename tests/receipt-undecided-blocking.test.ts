@@ -15,6 +15,12 @@ import {
     PULL_MOVED_REASON,
     UNDECIDED_LINES_REASON,
 } from "../src/app/api/cron/receipt-requests/route";
+import {
+    cardSelectionCertified,
+    mergeUndecidedLines,
+    type SweepMarker,
+    type SweepCycle,
+} from "../src/lib/receipt-sweep-marker";
 
 // cheap-sweep-restart-spec.md §14.3 and §14.6 (Codex round 2 blocker 2).
 
@@ -309,16 +315,39 @@ test("source pin: certifiable requires !undecidedBlocking", () => {
     assert.match(sweep, /const certifiable = computedPhase === "done" && !bankPullStale && !undecidedBlocking;/);
 });
 
-test("source pin: in the line pass, writeCycle( follows blockingUndecidedLines( and precedes the checkpoint callback", () => {
+// Both passes now call ONE shared helper (recordUndecidedBlocking) instead of
+// each having its own inline blockingUndecidedLines(...)/writeCycle(cycle)
+// block, so a plain `indexOf("blockingUndecidedLines(")` finds the helper's
+// own body — the only occurrence left in the file — no matter which pass (if
+// either) actually calls that helper. That pin would stay green even if a
+// pass's call to the helper were deleted entirely. Split in two: this one
+// pins the helper's own internals; the line-pass and open-issue-pass pins
+// below separately pin that each pass actually calls the helper before its
+// own checkpoint advances its own cursor.
+test("source pin: the recordUndecidedBlocking helper calls blockingUndecidedLines( and then writeCycle(cycle)", () => {
     const sweep = read("src/app/api/cron/receipt-requests/route.ts");
-    const blockingAt = sweep.indexOf("blockingUndecidedLines(");
+    const helperAt = sweep.indexOf("async function recordUndecidedBlocking(");
+    const blockingAt = sweep.indexOf("blockingUndecidedLines(", helperAt);
     const writeCycleAt = sweep.indexOf("await writeCycle(cycle);", blockingAt);
+    assert.ok(helperAt > 0, "recordUndecidedBlocking is defined");
+    assert.ok(blockingAt > helperAt, "the helper calls blockingUndecidedLines");
+    assert.ok(writeCycleAt > blockingAt, "the helper's writeCycle(cycle) follows blockingUndecidedLines, so a blocking result is always persisted");
+});
+
+// Anchored on `const windowLines`, which appears exactly once in the file,
+// immediately before the line pass's own setup — so this can only match the
+// line pass's own call to the helper, not the open-issue pass's earlier one
+// or the helper's own internal call.
+test("source pin: in the line pass, recordUndecidedBlocking( is called before the checkpoint callback advances the cursor", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    const windowLinesAt = sweep.indexOf("const windowLines = budget.expired()");
+    const recordAt = sweep.indexOf("await recordUndecidedBlocking(pageUndecided, batch);", windowLinesAt);
     // The checkpoint callback is runCheckpointedUnits' second argument, where
     // the line-pass cursor advances.
-    const checkpointAt = sweep.indexOf("cursor = page[page.length - 1].key;", blockingAt);
-    assert.ok(blockingAt > 0, "blockingUndecidedLines is called in the line pass");
-    assert.ok(writeCycleAt > blockingAt, "writeCycle follows blockingUndecidedLines");
-    assert.ok(checkpointAt > writeCycleAt, "writeCycle precedes the checkpoint callback, so the cursor never passes an unrecorded line");
+    const checkpointAt = sweep.indexOf("cursor = page[page.length - 1].key;", windowLinesAt);
+    assert.ok(windowLinesAt > 0, "the line pass's window-lines setup is present");
+    assert.ok(recordAt > windowLinesAt, "the line pass calls recordUndecidedBlocking(pageUndecided, batch)");
+    assert.ok(checkpointAt > recordAt, "recordUndecidedBlocking precedes the checkpoint callback, so the cursor never passes an unrecorded line");
 });
 
 // These two pin the path an undecided line's id travels from processBatch's
@@ -340,4 +369,111 @@ test("source pin: the line pass collects every batch outcome's undecidedIds into
     assert.match(sweep,
         /pageUndecided\.push\(\.\.\.\(outcome\.undecidedIds \?\? \[\]\)\);/,
         "an outcome's undecidedIds must reach pageUndecided, or blockingUndecidedLines never sees them");
+});
+
+// ═══ Codex round 2, B2 remaining gap: the OPEN-ISSUE pass's undecided outcomes
+// must gate certification too, not just the line pass's ═══════════════════
+//
+// The line pass only ever sees the ~60-day window (`windowLines`); an issue
+// that goes undecided ONLY through the open-issue pass — which walks every
+// open issue regardless of age — used to feed nothing but a counter
+// (`openUndecided`). These two model that exact case end to end: run
+// blockingUndecidedLines the way `recordUndecidedBlocking` does, merge the
+// result into a cycle exactly like it does, then ask cardSelectionCertified
+// the question a card scan actually asks.
+
+function certifiedFor(cycle: SweepCycle): boolean {
+    const marker: SweepMarker = {
+        phase: "done",
+        chaserCompletedAt: "2026-09-22T14:00:00Z", // 7am PDT on 9/22 — today, Pacific
+        blockedReason: null,
+        completedCycleId: cycle.id,
+    };
+    return cardSelectionCertified({
+        marker, cycle,
+        bankEpoch: cycle.epoch, evidenceEpoch: cycle.evidenceEpoch,
+        recognitionPolicy: cycle.recognitionPolicy,
+        now: new Date("2026-09-22T15:00:00Z"),
+        pacificDate: "2026-09-22",
+    });
+}
+
+test("an open-issue-pass line undecided with a stale owner blocks certification", () => {
+    // 70 days old: well outside the line pass's ~60-day window, so only the
+    // open-issue pass — which walks every open issue regardless of age —
+    // would ever reach a verdict (or fail to reach one) for this line.
+    const old = line({ id: "bl-open-issue-stale", postedDate: "2026-07-14" });
+    const blocking = blockingUndecidedLines({
+        lines: [old],
+        undecidedIds: [old.id],
+        openIssueKeys: new Set([old.id]),
+        // The stored details predate a ledger correction: "unassigned" no
+        // longer matches what today's descriptor (card tail C#8516) derives.
+        openIssueDerivedOwners: new Map([[old.id, "unassigned"]]),
+        resolvedKeys: new Set(),
+        now: NOW,
+    });
+    assert.deepEqual(blocking, [old.id], "a stale-owner undecided line is blocking");
+
+    // Exactly what recordUndecidedBlocking does with a non-empty result.
+    const cycle: SweepCycle = {
+        id: "cycle-open-stale", epoch: "5", evidenceEpoch: "11",
+        recognitionPolicy: "receipt-source-v1:off",
+        plannerDay: "2026-09-22",
+        undecidedLines: mergeUndecidedLines(undefined, blocking),
+    };
+    assert.equal(certifiedFor(cycle), false,
+        "a cycle carrying a stale-owner undecided line from the open-issue pass must not certify");
+});
+
+test("an open-issue-pass line undecided with a fresh owner does not block certification", () => {
+    const fresh = line({ id: "bl-open-issue-fresh", postedDate: "2026-07-14" });
+    const blocking = blockingUndecidedLines({
+        lines: [fresh],
+        undecidedIds: [fresh.id],
+        openIssueKeys: new Set([fresh.id]),
+        // "CJ" is exactly what card tail C#8516 derives today — the stored
+        // owner is current, so the open-issue exemption still holds.
+        openIssueDerivedOwners: new Map([[fresh.id, "CJ"]]),
+        resolvedKeys: new Set(),
+        now: NOW,
+    });
+    assert.deepEqual(blocking, [], "a fresh-owner undecided line is not blocking");
+
+    const cycle: SweepCycle = {
+        id: "cycle-open-fresh", epoch: "5", evidenceEpoch: "11",
+        recognitionPolicy: "receipt-source-v1:off",
+        plannerDay: "2026-09-22",
+        // recordUndecidedBlocking never merges when blocking is empty, but
+        // merging an empty array is a no-op either way — assert both to make
+        // that equivalence explicit.
+        undecidedLines: mergeUndecidedLines(undefined, blocking),
+    };
+    assert.deepEqual(cycle.undecidedLines, [], "an empty blocking result leaves undecidedLines empty");
+    assert.equal(certifiedFor(cycle), true,
+        "a fresh-owner undecided line from the open-issue pass must not block an otherwise-certified cycle");
+});
+
+// The two tests above prove blockingUndecidedLines -> mergeUndecidedLines ->
+// cardSelectionCertified behaves correctly for an open-issue-pass-only line.
+// They call those three functions directly, so they pass whether or not
+// route.ts's open-issue pass actually wires itself into that composition —
+// they would still be green even if the open-issue pass's own call to
+// recordUndecidedBlocking (the function that performs exactly that
+// composition) were deleted. This pin closes that gap. Anchored on the FIRST
+// `const pageUndecided: string[] = [];` in the file, which is the open-issue
+// pass's own declaration (the line pass declares a second one further down —
+// see the line-pass pin above, which is anchored past this point).
+test("source pin: in the open-issue pass, recordUndecidedBlocking( is called after the errors/contention gate and before the checkpoint advances openCursor", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    const pageUndecidedAt = sweep.indexOf("const pageUndecided: string[] = [];");
+    const pushAt = sweep.indexOf("pageUndecided.push(...(outcome.undecidedIds ?? []));", pageUndecidedAt);
+    const gateAt = sweep.indexOf('throw new SweepDeferredError("Unit remains unreconciled");', pushAt);
+    const recordAt = sweep.indexOf("await recordUndecidedBlocking(pageUndecided, lines);", gateAt);
+    const checkpointAt = sweep.indexOf("openCursor = page[page.length - 1].id;", recordAt);
+    assert.ok(pageUndecidedAt > 0, "the open-issue pass declares pageUndecided");
+    assert.ok(pushAt > pageUndecidedAt, "the open-issue pass collects each batch outcome's undecidedIds into pageUndecided");
+    assert.ok(gateAt > pushAt, "the errors/contention gate follows the collection");
+    assert.ok(recordAt > gateAt, "recordUndecidedBlocking(pageUndecided, lines) is called after the gate");
+    assert.ok(checkpointAt > recordAt, "recordUndecidedBlocking precedes the checkpoint callback, so openCursor never advances past an unrecorded undecided line");
 });
