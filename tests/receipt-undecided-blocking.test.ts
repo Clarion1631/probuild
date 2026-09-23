@@ -15,6 +15,12 @@ import {
     PULL_MOVED_REASON,
     UNDECIDED_LINES_REASON,
 } from "../src/app/api/cron/receipt-requests/route";
+import {
+    cardSelectionCertified,
+    mergeUndecidedLines,
+    type SweepMarker,
+    type SweepCycle,
+} from "../src/lib/receipt-sweep-marker";
 
 // cheap-sweep-restart-spec.md §14.3 and §14.6 (Codex round 2 blocker 2).
 
@@ -340,4 +346,87 @@ test("source pin: the line pass collects every batch outcome's undecidedIds into
     assert.match(sweep,
         /pageUndecided\.push\(\.\.\.\(outcome\.undecidedIds \?\? \[\]\)\);/,
         "an outcome's undecidedIds must reach pageUndecided, or blockingUndecidedLines never sees them");
+});
+
+// ═══ Codex round 2, B2 remaining gap: the OPEN-ISSUE pass's undecided outcomes
+// must gate certification too, not just the line pass's ═══════════════════
+//
+// The line pass only ever sees the ~60-day window (`windowLines`); an issue
+// that goes undecided ONLY through the open-issue pass — which walks every
+// open issue regardless of age — used to feed nothing but a counter
+// (`openUndecided`). These two model that exact case end to end: run
+// blockingUndecidedLines the way `recordUndecidedBlocking` does, merge the
+// result into a cycle exactly like it does, then ask cardSelectionCertified
+// the question a card scan actually asks.
+
+function certifiedFor(cycle: SweepCycle): boolean {
+    const marker: SweepMarker = {
+        phase: "done",
+        chaserCompletedAt: "2026-09-22T14:00:00Z", // 7am PDT on 9/22 — today, Pacific
+        blockedReason: null,
+        completedCycleId: cycle.id,
+    };
+    return cardSelectionCertified({
+        marker, cycle,
+        bankEpoch: cycle.epoch, evidenceEpoch: cycle.evidenceEpoch,
+        recognitionPolicy: cycle.recognitionPolicy,
+        now: new Date("2026-09-22T15:00:00Z"),
+        pacificDate: "2026-09-22",
+    });
+}
+
+test("an open-issue-pass line undecided with a stale owner blocks certification", () => {
+    // 70 days old: well outside the line pass's ~60-day window, so only the
+    // open-issue pass — which walks every open issue regardless of age —
+    // would ever reach a verdict (or fail to reach one) for this line.
+    const old = line({ id: "bl-open-issue-stale", postedDate: "2026-07-14" });
+    const blocking = blockingUndecidedLines({
+        lines: [old],
+        undecidedIds: [old.id],
+        openIssueKeys: new Set([old.id]),
+        // The stored details predate a ledger correction: "unassigned" no
+        // longer matches what today's descriptor (card tail C#8516) derives.
+        openIssueDerivedOwners: new Map([[old.id, "unassigned"]]),
+        resolvedKeys: new Set(),
+        now: NOW,
+    });
+    assert.deepEqual(blocking, [old.id], "a stale-owner undecided line is blocking");
+
+    // Exactly what recordUndecidedBlocking does with a non-empty result.
+    const cycle: SweepCycle = {
+        id: "cycle-open-stale", epoch: "5", evidenceEpoch: "11",
+        recognitionPolicy: "receipt-source-v1:off",
+        plannerDay: "2026-09-22",
+        undecidedLines: mergeUndecidedLines(undefined, blocking),
+    };
+    assert.equal(certifiedFor(cycle), false,
+        "a cycle carrying a stale-owner undecided line from the open-issue pass must not certify");
+});
+
+test("an open-issue-pass line undecided with a fresh owner does not block certification", () => {
+    const fresh = line({ id: "bl-open-issue-fresh", postedDate: "2026-07-14" });
+    const blocking = blockingUndecidedLines({
+        lines: [fresh],
+        undecidedIds: [fresh.id],
+        openIssueKeys: new Set([fresh.id]),
+        // "CJ" is exactly what card tail C#8516 derives today — the stored
+        // owner is current, so the open-issue exemption still holds.
+        openIssueDerivedOwners: new Map([[fresh.id, "CJ"]]),
+        resolvedKeys: new Set(),
+        now: NOW,
+    });
+    assert.deepEqual(blocking, [], "a fresh-owner undecided line is not blocking");
+
+    const cycle: SweepCycle = {
+        id: "cycle-open-fresh", epoch: "5", evidenceEpoch: "11",
+        recognitionPolicy: "receipt-source-v1:off",
+        plannerDay: "2026-09-22",
+        // recordUndecidedBlocking never merges when blocking is empty, but
+        // merging an empty array is a no-op either way — assert both to make
+        // that equivalence explicit.
+        undecidedLines: mergeUndecidedLines(undefined, blocking),
+    };
+    assert.deepEqual(cycle.undecidedLines, [], "an empty blocking result leaves undecidedLines empty");
+    assert.equal(certifiedFor(cycle), true,
+        "a fresh-owner undecided line from the open-issue pass must not block an otherwise-certified cycle");
 });

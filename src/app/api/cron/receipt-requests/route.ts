@@ -2298,6 +2298,52 @@ async function runSweep(
     // of the two passes or the fence.
     const setupMs = Date.now() - setupStart;
 
+    /**
+     * THE SAME BLOCKING TEST, WHICHEVER PASS FINDS THE UNDECIDED LINE (Codex
+     * round 2, B2 remaining gap). Before this, only the line pass — bounded to
+     * the ~60-day window — ever called `blockingUndecidedLines`. An issue that
+     * went undecided ONLY through the open-issue pass (its line sits outside
+     * that window, e.g. a `ComponentTooLargeError` on a too-large component,
+     * cheap-sweep-restart-spec.md §14.6) never got the owner-freshness check
+     * and could never block certification, even once a ledger correction had
+     * made it freshly owed to an asked owner. Shared so the two passes cannot
+     * silently diverge on what "blocking" means.
+     */
+    async function recordUndecidedBlocking(
+        pageUndecided: string[],
+        lines: ReadonlyArray<{ id: string; postedDate: Date; amountCents: number; rawDescriptor: string; checkNumber: string | null }>,
+    ): Promise<void> {
+        if (pageUndecided.length === 0) return;
+        const open = await prisma.reviewIssue.findMany({
+            where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: pageUndecided }, clearedAt: null },
+            select: { targetKey: true, displayDetails: true },
+        });
+        // THE STORED DERIVED OWNER, for blockingUndecidedLines' own staleness
+        // check (Codex round 1, B2) — never for an issue carrying a human
+        // ownerOverride, which is authoritative on its own already-current path
+        // (§14.2) and is never "stale" just because the descriptor-derived
+        // answer differs from it.
+        const openIssueDerivedOwners = new Map<string, string>();
+        for (const issue of open) {
+            const details = parseMissingReceiptDetails(issue.displayDetails);
+            const overridden = typeof details.ownerOverride === "string" && details.ownerOverride !== "";
+            if (!overridden) openIssueDerivedOwners.set(issue.targetKey, effectiveOwner({ owner: details.owner }));
+        }
+        const blocking = blockingUndecidedLines({
+            lines: lines.map(r => ({ ...r, postedDate: r.postedDate.toISOString().slice(0, 10) })),
+            undecidedIds: pageUndecided,
+            openIssueKeys: new Set(open.map(r => r.targetKey)),
+            openIssueDerivedOwners,
+            resolvedKeys: new Set(resolvedIssueKeys),
+            now,
+        });
+        if (blocking.length > 0) {
+            cycle = { ...cycle!, undecidedLines: mergeUndecidedLines(cycle!.undecidedLines, blocking) };
+            await writeCycle(cycle);
+            console.error("[cron/receipt-requests] undecided-blocking", JSON.stringify({ cycleId: cycle.id, lineIds: blocking }));
+        }
+    }
+
     // OLDEST-FIRST, FROM A DURABLE CURSOR, IN TIME-BUDGETED BATCHES.
     //
     // One 2,000-line pass could not finish inside maxDuration on a real
@@ -2372,6 +2418,7 @@ async function runSweep(
             // that issue permanently, nagging with a target nothing can answer.
             let pageErrors = 0;
             let pageContended = 0;
+            const pageUndecided: string[] = [];
             for (const issue of orphaned) {
                 try {
                     budget.transactionOptions();
@@ -2428,6 +2475,7 @@ async function runSweep(
                 openContended += outcome.contended;
                 pageErrors += outcome.summary.errors;
                 pageContended += outcome.contended;
+                pageUndecided.push(...(outcome.undecidedIds ?? []));
             }
 
             // Same rule as the line pass: never checkpoint past a failure — from
@@ -2435,18 +2483,18 @@ async function runSweep(
             // (see processBatchWithReplan) — advancing past it strands the page it
             // sat on just as surely as an error would.
             if (pageErrors > 0 || pageContended > 0) throw new SweepDeferredError("Unit remains unreconciled");
+            await recordUndecidedBlocking(pageUndecided, lines);
 
         }, async () => {
             openCursor = page[page.length - 1].id;
-            // The open-issue checkpoint carries the same pair as the line one — a
-            // resume into THIS pass has to prove the same thing (round-44 gate,
-            // finding 1).
-            await writeOpenCursor(formatSweepCursor({ key: openCursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
-            // Same reasoning as the line pass's own checkpoint (Codex round 1,
-            // real issue: "exceptional progress logs lose committed work") —
-            // this page's share of `openPass` is durable the instant this
-            // callback returns, so a later page's throw still leaves a real
-            // count behind rather than the zeros `progress` started with.
+            // COMMITTED WORK BEFORE THE CURSOR WRITE (Codex round 2: "exceptional
+            // progress logs lose committed work", partially fixed in round 2 —
+            // this page's share of `openPass` was already durable by the time
+            // this callback runs, but copying it into `progress` used to happen
+            // AFTER the awaited cursor write below, so a `CursorWriteError` there
+            // skipped the copy and GET's `finally` logged the PREVIOUS page's
+            // counts instead of this one's committed work). Copying first means a
+            // failed cursor write still leaves this page's real counts behind.
             if (progress) {
                 progress.openBatches = openBatches;
                 progress.opened = openPass.opened;
@@ -2459,6 +2507,10 @@ async function runSweep(
                 progress.setupMs = setupMs;
                 progress.openMs = Date.now() - openStart;
             }
+            // The open-issue checkpoint carries the same pair as the line one — a
+            // resume into THIS pass has to prove the same thing (round-44 gate,
+            // finding 1).
+            await writeOpenCursor(formatSweepCursor({ key: openCursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
         });
         if (unitResult.deferred) { deferred = true; break; }
         if (page.length < OPEN_ISSUE_BATCH_SIZE) { openExhausted = true; break; }
@@ -2656,49 +2708,23 @@ async function runSweep(
             // the stored open set could miss it. Recorded on the cycle and
             // checked again at certification (below) and at card-claim time
             // (§14.9) — a STABLE non-verdict with an open issue is not blocking,
-            // because that issue already keeps the chase alive.
-            if (pageUndecided.length > 0) {
-                const open = await prisma.reviewIssue.findMany({
-                    where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: pageUndecided }, clearedAt: null },
-                    select: { targetKey: true, displayDetails: true },
-                });
-                // THE STORED DERIVED OWNER, for blockingUndecidedLines' own
-                // staleness check (Codex round 1, B2) — never for an issue
-                // carrying a human ownerOverride, which is authoritative on
-                // its own already-current path (§14.2) and is never "stale"
-                // just because the descriptor-derived answer differs from it.
-                const openIssueDerivedOwners = new Map<string, string>();
-                for (const issue of open) {
-                    const details = parseMissingReceiptDetails(issue.displayDetails);
-                    const overridden = typeof details.ownerOverride === "string" && details.ownerOverride !== "";
-                    if (!overridden) openIssueDerivedOwners.set(issue.targetKey, effectiveOwner({ owner: details.owner }));
-                }
-                const blocking = blockingUndecidedLines({
-                    lines: batch.map(r => ({ ...r, postedDate: r.postedDate.toISOString().slice(0, 10) })),
-                    undecidedIds: pageUndecided,
-                    openIssueKeys: new Set(open.map(r => r.targetKey)),
-                    openIssueDerivedOwners,
-                    resolvedKeys: new Set(resolvedIssueKeys),
-                    now,
-                });
-                if (blocking.length > 0) {
-                    cycle = { ...cycle!, undecidedLines: mergeUndecidedLines(cycle!.undecidedLines, blocking) };
-                    await writeCycle(cycle);
-                    console.error("[cron/receipt-requests] undecided-blocking", JSON.stringify({ cycleId: cycle.id, lineIds: blocking }));
-                }
-            }
+            // because that issue already keeps the chase alive. Same test, same
+            // recording, as the open-issue pass — see recordUndecidedBlocking.
+            await recordUndecidedBlocking(pageUndecided, batch);
 
             // The checkpoint is the last COMPONENT this page finished, so a resume
             // can never land in the middle of a competition set.
         }, async () => {
             cursor = page[page.length - 1].key;
-            await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
-            if (pageIndex >= pages.length) exhausted = true;
-            // SAME REASONING AS THE OPEN-ISSUE PASS ABOVE (Codex round 1, real
-            // issue): this page is durably checkpointed the instant this
-            // callback returns, so its share of `totals` is copied into
-            // `progress` right here rather than only once the whole cycle
-            // finishes.
+            // COMMITTED WORK BEFORE THE CURSOR WRITE (Codex round 2: "exceptional
+            // progress logs lose committed work", partially fixed in round 2 —
+            // this page's share of `totals` was already durable by the time this
+            // callback runs, but copying it into `progress` used to happen AFTER
+            // the awaited cursor write below, so a `CursorWriteError` there
+            // skipped the copy and GET's `finally` logged the PREVIOUS page's
+            // counts instead of this one's committed work). Copying first means a
+            // failed cursor write still leaves this page's real counts behind.
+            // `exhausted` stays gated on the write actually succeeding.
             if (progress) {
                 progress.batches = batches;
                 progress.bankLines = linesSeen;
@@ -2711,6 +2737,8 @@ async function runSweep(
                 progress.replans = replans;
                 progress.lineMs = Date.now() - lineStart;
             }
+            await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
+            if (pageIndex >= pages.length) exhausted = true;
         });
         if (unitResult.deferred) { deferred = true; break; }
     }
