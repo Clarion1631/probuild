@@ -66,7 +66,7 @@ export function outageNote(error: unknown): string {
 }
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
-import { computeInvoiceReceivable } from "./receivables";
+import { computeInvoiceReceivable, RECEIVABLE_INVOICE_WHERE, RECEIVABLE_INVOICE_SELECT, toReceivableInput } from "./receivables";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
@@ -179,43 +179,13 @@ export async function getProjectBilling(projectId: string) {
 
 export async function listReceivables(now: number = Date.now()) {
     const invoices = await prisma.invoice.findMany({
-        // balanceDue > 0 alone misses an invoice whose balance has drifted to
-        // 0 (or negative) while it still carries a billed, unpaid milestone —
-        // a Pending one that was requested or linked, or a live progress
-        // billing. The balanceDue branch stays so a legacy zero-milestone
-        // invoice (no Pending rows, no progress billings) with a genuine
-        // positive balance is still found.
-        where: {
-            status: { not: "Canceled" },
-            OR: [
-                { balanceDue: { gt: 0 } },
-                { payments: { some: { status: "Pending" } } },
-                { progressBillings: { some: { status: { in: ["Staged", "Sent"] } } } },
-            ],
-        },
+        where: RECEIVABLE_INVOICE_WHERE,
         orderBy: { issueDate: "asc" },
         select: {
-            id: true, code: true, status: true, totalAmount: true, balanceDue: true,
-            issueDate: true, sentAt: true, createdAt: true,
+            id: true, code: true, totalAmount: true,
             project: { select: { id: true, name: true } },
             client: { select: { name: true, email: true } },
-            _count: { select: { payments: true } },
-            payments: {
-                where: { status: "Pending" },
-                orderBy: { createdAt: "asc" },
-                select: {
-                    id: true, name: true, amount: true, status: true, dueDate: true, createdAt: true,
-                    qbInvoiceId: true, qbInvoiceSentAt: true, qbSyncError: true, qbSyncedAt: true,
-                },
-            },
-            progressBillings: {
-                where: { status: { in: ["Staged", "Sent"] } },
-                select: {
-                    id: true, code: true, status: true,
-                    qbInvoiceId: true, qbSyncError: true, qbSyncedAt: true, qbInvoiceSentAt: true, sentAt: true, createdAt: true,
-                    lines: { select: { scheduleId: true } },
-                },
-            },
+            ...RECEIVABLE_INVOICE_SELECT,
         },
     });
 
@@ -224,7 +194,7 @@ export async function listReceivables(now: number = Date.now()) {
     // which includes milestones that were only ever scheduled.
     const computed = invoices.map(inv => ({
         inv,
-        receivable: computeInvoiceReceivable({ ...inv, milestoneCount: inv._count.payments }, now),
+        receivable: computeInvoiceReceivable(toReceivableInput(inv), now),
     }));
 
     const billed = computed.filter(({ receivable }) => receivable.receivableCents > 0);
