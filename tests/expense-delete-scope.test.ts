@@ -13,12 +13,17 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { QboManagedExpenseError } from "../src/lib/qbo-expense-guard";
+import { MOVE_MESSAGES } from "../src/lib/receipt-intake/booked-expense-rules";
 
 interface FakeUser {
     id: string;
     role: string;
     permissions: Record<string, boolean>;
     projectIds: string[];
+    email?: string;
 }
 
 let currentUser: FakeUser | null;
@@ -33,17 +38,71 @@ let deleteArgs: unknown;
 let opLog: string[] = [];
 let batchRows: Record<string, unknown>[] = [];
 let findManyArgs: any = null;
+/** Every `where` object a `deleteMany` call ever ran with, in call order. */
+let deleteManyWheres: any[] = [];
+/** How many times `$transaction` actually opened one. */
+let transactionCalls = 0;
+
+// ── Move to job (moveReceiptExpenseToJob) fixtures ─────────────────────────
+/** `assertPhaseOfProjectTx`'s membership-proof query — [] means "not a phase". */
+let membershipRows: unknown[] = [{ ok: 1 }];
+/** `assertPhaseOfProjectTx`'s plain Project status read. */
+let projectStatusRows: unknown[] = [{ id: "job-2", status: "In Progress" }];
+/** `assertPhaseOfProjectTx`'s plain CostCode read. */
+let costCodeRows: unknown[] = [{ id: "cc-1", code: "03-PLUMB", isActive: true }];
+/** `tx.project.findUnique` — the target job Move to job reads at step 7. */
+let projectRow: { name: string; status: string } | null = { name: "Mesplay Kitchen", status: "In Progress" };
+/** `tx.estimate.findFirst` — `reattributeExpense`'s target-estimate peek/re-read. */
+let targetEstimateId: string | null = "est-target-1";
+let estimateFindFirstOverride: ((call: number) => string | null) | null = null;
+let estimateFindFirstCall = 0;
+/** `tx.expense.findUnique` call count, and an optional per-call override. */
+let expenseFindUniqueCall = 0;
+let expenseFindUniqueOverride: ((call: number, base: Record<string, unknown> | null) => Record<string, unknown> | null) | null = null;
+/** The most recent `select` (and `where`) an `expense.findUnique` call ran
+ *  with — the fake ignores `select` entirely and returns the fixture as-is,
+ *  so this is the only way to catch a guarded field dropped from a caller's
+ *  read (checker round 4). */
+let expenseFindUniqueArgs: { where?: unknown; select?: Record<string, any> } | null = null;
+/** The `reattributeExpense` CAS write (`tx.expense.updateMany` with projectId/estimateId in `data`). */
+let reattributeUpdateArgs: any = null;
+let reattributeUpdateCount = 1;
+/** Move's own link-clearing write (`tx.expense.updateMany` with no projectId/estimateId in `data`). */
+let linksUpdateArgs: any = null;
+let linksUpdateCount = 1;
+let intakeUpdateArgs: any = null;
+let intakeUpdateCount = 1;
+let automationEventArgs: any = null;
 
 const fakePrisma: any = {
     // The receipt-evidence lock and its epoch bump (PR #443 gate rounds
     // 42/45): every Expense writer takes them, and nothing in this suite
     // depends on their result — only that they are answerable.
-    $executeRaw: async () => 1,
-    $queryRaw: async () => [{ value: "1" }],
+    $executeRaw: async () => { opLog.push("evidence-lock"); return 1; },
+    $queryRaw: async () => { opLog.push("epoch-bump"); return [{ value: "1" }]; },
     // The delete now runs in a transaction that re-resolves a fallback-
     // attributed row's job from the LOCKED estimate (round 20, item 4).
-    $transaction: async (fn: any) => fn(fakePrisma),
+    $transaction: async (fn: any) => { transactionCalls++; return fn(fakePrisma); },
     $queryRawUnsafe: async (query: string, ...values: unknown[]) => {
+        // `assertPhaseOfProjectTx`'s membership proof (`FOR SHARE OF ei, e` —
+        // distinct from lockAttributionParents' bare `FOR SHARE OF ei`).
+        if (/FOR SHARE OF ei, e/.test(query)) {
+            opLog.push("phase:membership");
+            return membershipRows;
+        }
+        // `lockExpense`'s per-expense advisory lock.
+        if (/pg_advisory_xact_lock\(hashtextextended/.test(query)) {
+            opLog.push(`advisory:${values[0]}`);
+            return [{}];
+        }
+        if (/^SELECT id, status FROM "Project" WHERE id = \$1$/.test(query)) {
+            opLog.push("phase:project-status");
+            return projectStatusRows;
+        }
+        if (/^SELECT id, code, "isActive" FROM "CostCode" WHERE id = \$1$/.test(query)) {
+            opLog.push("phase:costcode");
+            return costCodeRows;
+        }
         const table = query.match(/FROM "(\w+)"/)?.[1];
         if (/^SELECT "projectId" FROM "Estimate"/.test(query)) {
             opLog.push(`resolve:${values[0]}`);
@@ -59,21 +118,77 @@ const fakePrisma: any = {
         return [{}];
     },
     expense: {
-        findUnique: async () => storedExpense,
+        findUnique: async (args: { where?: unknown; select?: Record<string, any> }) => {
+            expenseFindUniqueCall++;
+            // Only the FIRST call per request/flow: moveReceiptExpenseToJob
+            // re-reads this same fake multiple times, and a later read must
+            // not clobber the guard-relevant one deleteExpense's test pins.
+            if (expenseFindUniqueArgs === null) expenseFindUniqueArgs = args;
+            opLog.push(`expense.findUnique:${expenseFindUniqueCall}`);
+            if (expenseFindUniqueOverride) return expenseFindUniqueOverride(expenseFindUniqueCall, storedExpense);
+            return storedExpense;
+        },
         findMany: async (args: unknown) => {
             findManyArgs = args;
             return batchRows;
         },
         deleteMany: async (args: unknown) => {
             deleteArgs = args;
+            deleteManyWheres.push((args as any)?.where);
             opLog.push(`delete:${(args as any)?.where?.id}`);
             return { count: 1 };
+        },
+        // Two different writers share this method: `reattributeExpense`'s CAS
+        // (its `data` names `projectId`/`estimateId`) and Move's own link-clear
+        // (its `data` never does — see MoveToJobModal/booked-expense.ts §11).
+        updateMany: async (args: unknown) => {
+            const data = (args as any)?.data ?? {};
+            if ("projectId" in data || "estimateId" in data) {
+                reattributeUpdateArgs = args;
+                opLog.push("reattribute:updateMany");
+                return { count: reattributeUpdateCount };
+            }
+            linksUpdateArgs = args;
+            opLog.push("links:updateMany");
+            return { count: linksUpdateCount };
+        },
+    },
+    estimate: {
+        findFirst: async () => {
+            estimateFindFirstCall++;
+            const id = estimateFindFirstOverride ? estimateFindFirstOverride(estimateFindFirstCall) : targetEstimateId;
+            opLog.push(`estimate.findFirst:${id ?? "null"}`);
+            return id ? { id } : null;
+        },
+    },
+    project: {
+        findUnique: async () => {
+            opLog.push("project:findUnique");
+            return projectRow;
+        },
+    },
+    receiptIntake: {
+        updateMany: async (args: unknown) => {
+            intakeUpdateArgs = args;
+            opLog.push("intake:updateMany");
+            return { count: intakeUpdateCount };
+        },
+    },
+    automationEvent: {
+        create: async (args: unknown) => {
+            automationEventArgs = args;
+            opLog.push("automationEvent:create");
+            return {};
         },
     },
 };
 
 let deleteExpense: (id: string, projectId: string) => Promise<void>;
-let deleteExpenses: (ids: string[]) => Promise<{ deleted: number }>;
+let deleteExpenses: (ids: string[]) => Promise<{ deleted: number; skippedFromReceipts: number }>;
+let getExpenses: (projectId: string) => Promise<unknown[]>;
+let moveReceiptExpenseToJob: (
+    expenseId: string, fromProjectId: string, toProjectId: string
+) => Promise<{ ok: true; toProjectName: string; phaseCleared: boolean } | { ok: false; message: string }>;
 
 before(async () => {
     const originalRequire = Module.prototype.require;
@@ -109,6 +224,8 @@ before(async () => {
     }
     deleteExpense = mod.deleteExpense;
     deleteExpenses = mod.deleteExpenses;
+    getExpenses = mod.getExpenses;
+    moveReceiptExpenseToJob = mod.moveReceiptExpenseToJob;
 });
 
 beforeEach(() => {
@@ -126,6 +243,401 @@ beforeEach(() => {
     opLog = [];
     findManyArgs = null;
     batchRows = [];
+    deleteManyWheres = [];
+    transactionCalls = 0;
+    membershipRows = [{ ok: 1 }];
+    projectStatusRows = [{ id: "job-2", status: "In Progress" }];
+    costCodeRows = [{ id: "cc-1", code: "03-PLUMB", isActive: true }];
+    projectRow = { name: "Mesplay Kitchen", status: "In Progress" };
+    targetEstimateId = "est-target-1";
+    estimateFindFirstOverride = null;
+    estimateFindFirstCall = 0;
+    expenseFindUniqueCall = 0;
+    expenseFindUniqueOverride = null;
+    expenseFindUniqueArgs = null;
+    reattributeUpdateArgs = null;
+    reattributeUpdateCount = 1;
+    linksUpdateArgs = null;
+    linksUpdateCount = 1;
+    intakeUpdateArgs = null;
+    intakeUpdateCount = 1;
+    automationEventArgs = null;
+});
+
+// ── Move to job (moveReceiptExpenseToJob) ───────────────────────────────────
+
+const FROM_PROJECT = "job-1";
+const TO_PROJECT = "job-2";
+
+/** A receipt-booked native Expense, ready to move from FROM_PROJECT to TO_PROJECT. */
+function receiptBookedExpense(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+        id: "e1",
+        projectId: FROM_PROJECT,
+        estimateId: "est-source-1",
+        costCodeId: "cc-1",
+        amount: "146.32",
+        vendor: "Lowe's",
+        qbPurchaseId: null,
+        invoiceId: null,
+        invoicedAt: null,
+        changeOrderId: null,
+        receiptIntake: {
+            id: "intake-1",
+            state: "BOOKED",
+            sendAttempted: false,
+            qbPurchaseId: null,
+            postVoidQbPurchaseId: null,
+            claimToken: null,
+        },
+        ...overrides,
+    };
+}
+
+function moverUser(overrides: Partial<FakeUser> = {}): FakeUser {
+    return {
+        id: "u-mover", role: "MANAGER", permissions: { timeClock: true },
+        projectIds: [FROM_PROJECT, TO_PROJECT], email: "mover@goldentouchremodeling.com",
+        ...overrides,
+    };
+}
+
+/** Every refusal must roll back to no writes past its point (spec §7.2). */
+function assertNoMoveWrites(): void {
+    assert.equal(linksUpdateArgs, null, "no link write after this refusal");
+    assert.equal(intakeUpdateArgs, null, "no intake write after this refusal");
+    assert.equal(automationEventArgs, null, "no audit write after this refusal");
+}
+
+test("moveReceiptExpenseToJob: happy path, phase kept — opLog order, one transaction", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+
+    assert.deepEqual(res, { ok: true, toProjectName: "Mesplay Kitchen", phaseCleared: false });
+    assert.equal(transactionCalls, 1, "one transaction, no retry");
+
+    const at = (needle: string) => opLog.findIndex(entry => entry.startsWith(needle));
+    const evidenceLock = at("evidence-lock");
+    const epochBump = at("epoch-bump");
+    const firstRead = at("expense.findUnique:1");
+    const reRead = at("expense.findUnique:2");
+    const firstLock = at("lock:Project");
+    const estimateLock = at("lock:Estimate");
+    const itemLock = at("lock:EstimateItem");
+    const costCodeLock = at("lock:CostCode");
+    const projectRead = at("project:findUnique");
+    const phaseProjectStatus = at("phase:project-status");
+    const phaseCostCode = at("phase:costcode");
+    const phaseMembership = at("phase:membership");
+    const advisory = at("advisory:expense:e1");
+    const reattribute = at("reattribute:updateMany");
+    const links = at("links:updateMany");
+    const intake = at("intake:updateMany");
+    const automationEvent = at("automationEvent:create");
+
+    assert.ok(evidenceLock === 0, `evidence lock is first: ${opLog.join(" ")}`);
+    assert.ok(epochBump === 1, `epoch bump is second: ${opLog.join(" ")}`);
+    assert.ok(evidenceLock < epochBump, opLog.join(" "));
+    assert.ok(epochBump < firstRead, `the first Expense read follows the epoch bump: ${opLog.join(" ")}`);
+    assert.ok(firstRead < firstLock, `parents locked after the first read: ${opLog.join(" ")}`);
+    assert.ok(firstLock < estimateLock && estimateLock < itemLock && itemLock < costCodeLock,
+        `Project, Estimate, EstimateItem, CostCode, in that order: ${opLog.join(" ")}`);
+    assert.ok(costCodeLock < reRead, `the re-read under lock follows the parent locks: ${opLog.join(" ")}`);
+    assert.ok(reRead < projectRead, `the re-read precedes the target job read: ${opLog.join(" ")}`);
+    assert.ok(projectRead < phaseProjectStatus, opLog.join(" "));
+    assert.ok(phaseProjectStatus < phaseCostCode && phaseCostCode < phaseMembership,
+        `the phase check runs project, then cost code, then membership: ${opLog.join(" ")}`);
+    assert.ok(phaseMembership < advisory, `the per-expense lock comes last of the locks: ${opLog.join(" ")}`);
+    assert.ok(advisory < reattribute, `reattributeExpense's CAS follows the advisory lock: ${opLog.join(" ")}`);
+    assert.ok(reattribute < links, `the links clear follows the move: ${opLog.join(" ")}`);
+    assert.ok(links < intake, `the intake row moves after the links clear: ${opLog.join(" ")}`);
+    assert.ok(intake < automationEvent, `the audit row is written last: ${opLog.join(" ")}`);
+
+    assert.equal(expenseFindUniqueCall, 3, "the initial read, the re-read, and reattributeExpense's own read");
+});
+
+test("moveReceiptExpenseToJob: happy path, phase cleared — links and intake data, result", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    membershipRows = []; // not a phase of the target job
+
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+
+    assert.deepEqual(res, { ok: true, toProjectName: "Mesplay Kitchen", phaseCleared: true });
+
+    assert.deepEqual(linksUpdateArgs.data, {
+        itemId: null, changeOrderId: null, isBillable: false, purchaseOrderId: null,
+        costCodeId: null, costCodeSource: null, costCodeConfidence: null,
+    });
+    assert.deepEqual(linksUpdateArgs.where, {
+        id: "e1", projectId: TO_PROJECT, estimateId: "est-target-1",
+        qbPurchaseId: null, invoiceId: null, invoicedAt: null,
+    });
+
+    assert.deepEqual(intakeUpdateArgs.data, {
+        projectId: TO_PROJECT, costCodeId: null, suggestedCostCodeId: null,
+        suggestedConfidence: null, costCodeSource: null,
+    });
+});
+
+test("moveReceiptExpenseToJob: phase kept — links data carries no phase clear, and no money/status keys", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+
+    await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+
+    assert.deepEqual(linksUpdateArgs.data, {
+        itemId: null, changeOrderId: null, isBillable: false, purchaseOrderId: null,
+    });
+    for (const forbidden of ["amount", "vendor", "date", "description", "receiptUrl", "status", "taxAmount", "taxDeductibleBase"]) {
+        assert.ok(!(forbidden in linksUpdateArgs.data), `links data must not touch ${forbidden}`);
+    }
+
+    assert.deepEqual(intakeUpdateArgs.where, {
+        id: "intake-1", expenseId: "e1", state: "BOOKED",
+        qbPurchaseId: null, postVoidQbPurchaseId: null, sendAttempted: false, claimToken: null,
+    });
+    for (const forbidden of ["state", "bookedAt", "expenseId", "dedupStrongKey", "dedupWeakKey"]) {
+        assert.ok(!(forbidden in intakeUpdateArgs.data), `intake data must not touch ${forbidden}`);
+    }
+
+    assert.equal(automationEventArgs.data.kind, "receipt-moved");
+    const detail = JSON.parse(automationEventArgs.data.detail);
+    assert.equal(detail.expenseId, "e1");
+    assert.equal(detail.intakeId, "intake-1");
+    assert.equal(detail.fromProjectId, FROM_PROJECT);
+    assert.equal(detail.toProjectId, TO_PROJECT);
+    assert.equal(detail.phaseKept, true);
+});
+
+test("moveReceiptExpenseToJob: role check — a non-ADMIN/MANAGER user gets notAllowed, no transaction", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser({ role: "FIELD_CREW" });
+
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.notAllowed });
+    assert.equal(transactionCalls, 0, "no transaction runs");
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: not receipt-booked", async () => {
+    storedExpense = receiptBookedExpense({ receiptIntake: null });
+    currentUser = moverUser();
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.notFromReceipt });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: a QBO row is refused as not-from-receipt, even with an intake link", async () => {
+    // QBO-backed wins (design spec §4.1): a qbPurchaseId disqualifies the row
+    // from isReceiptBookedExpense, whatever else is true of it.
+    storedExpense = receiptBookedExpense({ qbPurchaseId: "qbo-purchase-1" });
+    currentUser = moverUser();
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.notFromReceipt });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: billed", async () => {
+    storedExpense = receiptBookedExpense({ invoiceId: "inv-1" });
+    currentUser = moverUser();
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.billed });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: invoicedAt alone also refuses billed", async () => {
+    storedExpense = receiptBookedExpense({ invoicedAt: new Date().toISOString() });
+    currentUser = moverUser();
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.billed });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: ARCHIVED intake", async () => {
+    const base = receiptBookedExpense();
+    storedExpense = receiptBookedExpense({ receiptIntake: { ...(base.receiptIntake as object), state: "ARCHIVED" } });
+    currentUser = moverUser();
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.archived });
+    assertNoMoveWrites();
+});
+
+for (const [label, patch] of [
+    ["sendAttempted", { sendAttempted: true }],
+    ["qbPurchaseId on the intake", { qbPurchaseId: "qbo-1" }],
+    ["postVoidQbPurchaseId", { postVoidQbPurchaseId: "qbo-2" }],
+    ["claimToken", { claimToken: "claim-1" }],
+    ["a non-BOOKED state", { state: "NEEDS_REVIEW" }],
+] as const) {
+    test(`moveReceiptExpenseToJob: a busy intake (${label}) refuses askJustin`, async () => {
+        const base = receiptBookedExpense();
+        storedExpense = receiptBookedExpense({ receiptIntake: { ...(base.receiptIntake as object), ...patch } });
+        currentUser = moverUser();
+        const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+        assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.askJustin });
+        assertNoMoveWrites();
+    });
+}
+
+test("moveReceiptExpenseToJob: stale fromProjectId refuses changed", async () => {
+    storedExpense = receiptBookedExpense({ projectId: "some-other-job" });
+    currentUser = moverUser({ projectIds: [FROM_PROJECT, TO_PROJECT, "some-other-job"] });
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: the re-read under lock disagrees with the first read, refuses changed", async () => {
+    // Call 1 is the first, lock-free read; call 2 is the re-read taken after
+    // the parent locks (booked-expense.ts:157-163). A disagreement there means
+    // the row moved in the gap between the two reads — distinct from "stale
+    // fromProjectId" above, which catches a caller acting on a stale page.
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    expenseFindUniqueOverride = (call, base) => (call === 2 ? { ...(base as object), projectId: "some-other-job" } : base);
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: same job refuses sameJob", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, FROM_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.sameJob });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: a closed target job refuses jobNotOpen", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    projectRow = { name: "Closed Job", status: "Closed Complete" };
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.jobNotOpen });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: a missing target job also refuses jobNotOpen", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    projectRow = null;
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.jobNotOpen });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: reattributeExpense no-such-expense refuses gone", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    // Calls 1 and 2 are Move's own reads; call 3 is reattributeExpense's `before` read.
+    expenseFindUniqueOverride = (call, base) => (call >= 3 ? null : base);
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.gone });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: reattributeExpense already-there refuses sameJob", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    expenseFindUniqueOverride = (call, base) => (call >= 3 ? { ...base, projectId: TO_PROJECT } : base);
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.sameJob });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: reattributeExpense target-moved refuses changed", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    // The peek (call 1) and the locked re-read (call 2) disagree.
+    estimateFindFirstOverride = call => (call === 1 ? "est-peek" : "est-relocked");
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: reattributeExpense source-moved refuses changed", async () => {
+    // The job the expense is LEAVING changes under the same peek/re-read gap
+    // (expense-attribution.ts:1079-1084): reattributeExpense's own read
+    // (call 3) sees no projectId of its own, so it falls back to the
+    // estimate's projectId peek, and that peek disagrees with its own
+    // locked re-read.
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    expenseFindUniqueOverride = (call, base) => (call >= 3 ? { ...(base as object), projectId: null } : base);
+    let estimatePeekCall = 0;
+    const originalQueryRawUnsafe = fakePrisma.$queryRawUnsafe;
+    fakePrisma.$queryRawUnsafe = async (query: string, ...values: unknown[]) => {
+        if (/^SELECT "projectId" FROM "Estimate"/.test(query)) {
+            estimatePeekCall++;
+            return [{ projectId: estimatePeekCall === 1 ? FROM_PROJECT : "job-3" }];
+        }
+        return originalQueryRawUnsafe(query, ...values);
+    };
+    try {
+        const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+        assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+        assertNoMoveWrites();
+    } finally {
+        fakePrisma.$queryRawUnsafe = originalQueryRawUnsafe;
+    }
+});
+
+test("moveReceiptExpenseToJob: reattributeExpense lost-the-race refuses changed", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    reattributeUpdateCount = 0;
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: no estimate on the target job refuses noEstimate, after rolling back", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    targetEstimateId = null;
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.noEstimate });
+    // The rollback point: nothing after the move's own estimate lookup runs.
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: an intake CAS count of 0 refuses changed, after the links already wrote", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    intakeUpdateCount = 0;
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    // The links write ran, in this transaction, before the intake CAS failed —
+    // but this fake `$transaction` just invokes its callback, so it proves
+    // nothing about commit or rollback (that only a real Postgres can show;
+    // see tests/attribution-lock-order-db.test.ts). It stays UNCOMMITTED and
+    // rolls back with everything else the refusal touches; only the audit
+    // row — written after both — never even runs.
+    assert.notEqual(linksUpdateArgs, null, "the links write did run before the intake CAS was checked");
+    assert.equal(automationEventArgs, null, "no audit write after a refused move");
+});
+
+test("moveReceiptExpenseToJob: a links CAS count of 0 refuses changed, before the intake row is touched", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser();
+    linksUpdateCount = 0;
+    const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
+    assert.equal(intakeUpdateArgs, null, "the transaction rolled back before the intake write");
+    assert.equal(automationEventArgs, null, "no audit write after a refused move");
+});
+
+test("moveReceiptExpenseToJob: every refusal makes no write at all", async () => {
+    storedExpense = receiptBookedExpense({ invoiceId: "inv-1" }); // billed — refused before any lock
+    currentUser = moverUser();
+    await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    assert.equal(linksUpdateArgs, null);
+    assert.equal(intakeUpdateArgs, null);
+    assert.equal(automationEventArgs, null);
 });
 
 async function attempt(projectId: string): Promise<string | null> {
@@ -144,6 +656,7 @@ test("the job the expense is ON can delete it", async () => {
     assert.deepEqual(deleteArgs, {
         where: {
             id: "e1", qbPurchaseId: null, invoiceId: null, invoicedAt: null,
+            receiptIntake: { is: null },
             projectId: "job-1",
         },
     });
@@ -200,6 +713,69 @@ test("a row with no job at all cannot be deleted here", async () => {
 test("the timeClock permission is still required", async () => {
     currentUser = { id: "u6", role: "FIELD_CREW", permissions: {}, projectIds: ["job-1"] };
     assert.equal(await attempt("job-1"), "Forbidden");
+});
+
+// ── receipt-booked guards (design spec, native-expense-guards-spec.md §5) ───
+
+test("deleteExpense on a receipt row throws RECEIPT_EXPENSE_NO_DELETE and never opens a transaction", async () => {
+    storedExpense = { ...storedExpense, projectId: "job-1", receiptIntake: { id: "intake-1" } };
+    assert.equal(await attempt("job-1"), "This came from a receipt, so it can't be deleted. Use Move to job if it's on the wrong job. If it's a double, tell Justin.");
+    assert.equal(transactionCalls, 0, "the row is refused before the transaction that would lock and delete it");
+    assert.equal(deleteArgs, null);
+    // The refusal above is only as real as the read it's judged from — pin the
+    // `select` so dropping `receiptIntake` from deleteExpense's findUnique
+    // cannot slip this refusal back open with every other assertion here
+    // still green (checker round 4).
+    assert.deepEqual(expenseFindUniqueArgs?.select?.receiptIntake, { select: { id: true } });
+});
+
+test("a QBO row still throws QboManagedExpenseError, whether or not it also carries a receipt link", async () => {
+    storedExpense = { ...storedExpense, projectId: "job-1", qbPurchaseId: "qbo-1", receiptIntake: { id: "intake-1" } };
+    await assert.rejects(() => deleteExpense("e1", "job-1"), QboManagedExpenseError);
+    assert.equal(deleteArgs, null);
+
+    batchRows = [{ id: "e-qbo", qbPurchaseId: "qbo-1", projectId: "job-1", estimateId: null, invoiceId: null, invoicedAt: null, receiptIntake: null }];
+    currentUser = { id: "u-qbo", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    await assert.rejects(() => deleteExpenses(["e-qbo"]), QboManagedExpenseError);
+});
+
+test("deleteExpenses skips a receipt row, deletes a manual one, and pins receiptIntake: { is: null } on every write", async () => {
+    batchRows = [
+        {
+            id: "e-manual", qbPurchaseId: null, invoiceId: null, invoicedAt: null,
+            projectId: "job-1", estimateId: null, estimate: { projectId: null }, receiptIntake: null,
+        },
+        {
+            id: "e-receipt", qbPurchaseId: null, invoiceId: null, invoicedAt: null,
+            projectId: "job-1", estimateId: null, estimate: { projectId: null }, receiptIntake: { id: "intake-1" },
+        },
+    ];
+    currentUser = { id: "u-batch", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
+
+    const result = await deleteExpenses(["e-manual", "e-receipt"]);
+
+    assert.deepEqual(result, { deleted: 1, skippedFromReceipts: 1 });
+    assert.equal(deleteManyWheres.length, 1, "no deleteMany is ever issued for the receipt row");
+    assert.equal(deleteManyWheres[0].id, "e-manual");
+    for (const where of deleteManyWheres) {
+        assert.deepEqual(where.receiptIntake, { is: null });
+    }
+    // The skip above only proves anything if the batch read actually asked for
+    // receiptIntake — pin the select on the findMany this test already
+    // captures, so dropping it from deleteExpenses cannot silently make every
+    // row look manual (checker round 4).
+    assert.deepEqual(findManyArgs?.select?.receiptIntake, { select: { id: true } });
+});
+
+test("deleteExpenses: every row receipt-booked returns deleted: 0 with the right skipped count", async () => {
+    batchRows = [{
+        id: "e-receipt", qbPurchaseId: null, invoiceId: null, invoicedAt: null,
+        projectId: "job-1", estimateId: null, estimate: { projectId: null }, receiptIntake: { id: "intake-1" },
+    }];
+    currentUser = { id: "u-batch2", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    const result = await deleteExpenses(["e-receipt"]);
+    assert.deepEqual(result, { deleted: 0, skippedFromReceipts: 1 });
+    assert.equal(deleteManyWheres.length, 0);
 });
 
 // ── the BATCH (Codex round 46, item 3) ─────────────────────────────────────
@@ -284,4 +860,57 @@ test("the batch is read in ASCENDING id order, so two of them cannot invert", as
         ["delete:e-a", "delete:e-b"],
         "and the writes follow that order, not the caller's argument order",
     );
+});
+
+// ── getExpenses / getTimeExpenseData select receiptIntake ──────────────────
+//
+// The Move to job screen's WHOLE gate is `isReceiptBookedExpense(expense)`,
+// which reads `expense.receiptIntake`. Prisma returns that field only when a
+// query's `include` names it, so if either of these reads drops the include,
+// every row looks manual again on the real page: the trash can and the
+// upload/replace control come back, and Move to job never renders — even
+// though the row is still receipt-booked underneath. tsc cannot catch this
+// because `receiptIntake` is optional on ExpensesTab's Expense type, and the
+// UI test (tests/qbo-expense-sync-ui.test.tsx) passes `receiptIntake` straight
+// in as a prop rather than through this query.
+
+test("getExpenses selects receiptIntake, so the tab's refresh path can see a receipt-booked row", async () => {
+    // getExpenses IS that refresh path (see the comment above it in
+    // time-expense-actions.ts) — it runs after a tax save, a delete, a
+    // change-order tag, anything that re-reads the tab.
+    await getExpenses("job-1");
+    assert.deepEqual(
+        findManyArgs?.include?.receiptIntake,
+        { select: { id: true } },
+        "getExpenses must include receiptIntake or isReceiptBookedExpense is always false on refresh",
+    );
+});
+
+test("getTimeExpenseData selects receiptIntake too (source check — five more models here are unstubbed)", () => {
+    // getTimeExpenseData is the page's FIRST-render path and shares this exact
+    // include with getExpenses (see the comment in time-expense-actions.ts:
+    // "Shared with getExpenses, which is the same tab's refresh path"). It also
+    // reads timeEntry, costCode, costType, user, estimate and changeOrder,
+    // none of which this suite's fake Prisma stubs, so calling it the way
+    // getExpenses is called above would only be testing new mocks. Pinned as a
+    // source check instead, in the style of tests/time-expense-core-guards.test.ts.
+    const source = readFileSync(path.join(__dirname, "..", "src/lib/time-expense-actions.ts"), "utf8");
+    const start = source.indexOf("export async function getTimeExpenseData");
+    assert.ok(start > -1, "getTimeExpenseData moved — this assertion is about nothing");
+    const end = source.indexOf("export async function moveReceiptExpenseToJob", start);
+    assert.ok(end > start, "the slice terminator moved");
+    const body = source.slice(start, end);
+    assert.ok(body.length > 500, "the function body is empty — the parser is matching nothing");
+
+    const expenseQueryStart = body.indexOf("prisma.expense.findMany");
+    const expenseQueryEnd = body.indexOf("const costCodes");
+    assert.ok(expenseQueryStart > -1 && expenseQueryEnd > expenseQueryStart, "the expense query moved");
+    const expenseQuery = body.slice(expenseQueryStart, expenseQueryEnd);
+    assert.match(expenseQuery, /receiptIntake:\s*\{\s*select:\s*\{\s*id:\s*true\s*\}\s*\}/);
+
+    // The control: the SAME body's timeEntry query — which precedes the
+    // expense query and has no receipt to select — must not match, so the
+    // assertion above is not the regex matching everything in the slice.
+    const timeEntryQuery = body.slice(0, expenseQueryStart);
+    assert.doesNotMatch(timeEntryQuery, /receiptIntake/, "the control slice must not contain a real match");
 });

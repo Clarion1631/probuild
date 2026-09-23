@@ -38,7 +38,12 @@ export interface AutomationEventInput {
          * Both free things the system will not free on its own — a dedup key, a
          * quarantined re-send — so both record WHO said so and WHY.
          */
-        | "receipt-orphan-resolution";
+        | "receipt-orphan-resolution"
+        /**
+         * A person moved a receipt-booked Expense to another job with Move to
+         * job: who, from where, to where, and whether the phase survived.
+         */
+        | "receipt-moved";
     stage?: string;
     status: string;
     reason?: string;

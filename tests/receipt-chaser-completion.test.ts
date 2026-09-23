@@ -53,6 +53,7 @@ import {
     SWEEP_MARKER_KEY,
     continuationNeedsWork,
     cycleCertified,
+    cycleMatchesPlannerDay,
     cycleStillValid,
     formatSweepMarker,
     shouldResumeSweep,
@@ -162,7 +163,11 @@ const sha = (value: string) => createHash("sha256").update(value, "utf8").digest
 
 test("a completed, unblocked, unchanged current cycle proves every named predicate", async () => {
     const calls: unknown[] = [];
-    const result = await load(certifiedValues(), { calls });
+    // plannerDay equal to NOW's own UTC day (cheap-sweep-restart §14.8), so
+    // plannerDayMatches and selectionCertified prove true alongside the rest.
+    const result = await load(certifiedValues({
+        [CYCLE_KEY]: JSON.stringify({ id: CYCLE_ID, epoch: "7", evidenceEpoch: "9", recognitionPolicy: RUNTIME_ON.policy, plannerDay: "2026-09-10" }),
+    }), { calls });
     assert.equal(result.status, "stable");
     assert.equal(result.reason, null);
     assert.equal(result.scope, "receipt-chaser-completion");
@@ -182,6 +187,7 @@ test("a completed, unblocked, unchanged current cycle proves every named predica
         phaseDone: true, unblocked: true, completionIsCurrentCycle: true, completionTimeValid: true,
         epochsUnchanged: true, cyclePolicyMatchesRuntime: true, cycleStillValid: true, cycleCertified: true,
         completedForPacificDay: true, fullRunOwed: false, continuationNeedsWork: false,
+        plannerDayMatches: true, selectionCertified: true,
     });
     assert.deepEqual(result.marker, {
         present: true, shape: "json", phase: "done", chaserCompletedAt: "2026-09-10T14:06:00.000Z", completedAtValid: true,
@@ -190,6 +196,8 @@ test("a completed, unblocked, unchanged current cycle proves every named predica
     assert.equal(result.cycle?.id, CYCLE_ID);
     assert.equal(result.cycle?.epoch, "7");
     assert.equal(result.cycle?.evidenceEpoch, "9");
+    assert.equal(result.cycle?.plannerDay, "2026-09-10");
+    assert.equal(result.cycle?.undecidedLineCount, 0);
     assert.deepEqual(result.currentEpochs, { bankLedger: { state: "measured", value: "7" }, receiptEvidence: { state: "measured", value: "9" } });
     assert.deepEqual(result.fullRun, { owed: false });
     assert.deepEqual(result.cursors, { linePresent: false, openIssuePresent: false });
@@ -197,6 +205,41 @@ test("a completed, unblocked, unchanged current cycle proves every named predica
     assert.deepEqual(result.keys, [...CHASER_COMPLETION_KEYS]);
     assert.deepEqual(result.limitations, [...CHASER_COMPLETION_LIMITATIONS]);
     assert.equal(calls.length, 2, "exactly two reads");
+});
+
+test("no plannerDay on the cycle (a legacy cycle) fails plannerDayMatches, selectionCertified, AND continuationNeedsWork", async () => {
+    // certifiedValues()'s own default cycle carries no plannerDay at all —
+    // the shape every stored cycle has before this deploy. A few other tests
+    // in this file now override CYCLE_KEY to add a matching plannerDay,
+    // specifically so THIS scenario (the legacy shape) stays theirs alone to
+    // exercise.
+    const result = await load(certifiedValues());
+    assert.equal(result.cycle?.plannerDay, null);
+    assert.equal(result.predicates?.plannerDayMatches, false);
+    assert.equal(result.predicates?.selectionCertified, false);
+    // cycleCertified itself is not a function of plannerDay — that predicate
+    // does not regress.
+    assert.equal(result.predicates?.cycleCertified, true);
+    // continuationNeedsWork DOES now depend on plannerDay too (Codex round 1,
+    // real issue: "completed legacy cycles need not restart after
+    // deployment" — before this fix this asserted `false`, and a legacy
+    // cycle that was otherwise still certified went idle forever, since
+    // selectionCertified refusing it never itself made the sweep plan a
+    // fresh one).
+    assert.equal(result.predicates?.continuationNeedsWork, true);
+});
+
+test("undecidedLines on an otherwise-certified cycle fails only selectionCertified", async () => {
+    const result = await load(certifiedValues({
+        [CYCLE_KEY]: JSON.stringify({
+            id: CYCLE_ID, epoch: "7", evidenceEpoch: "9", recognitionPolicy: RUNTIME_ON.policy,
+            plannerDay: "2026-09-10", undecidedLines: ["bl-undecided-1"],
+        }),
+    }));
+    assert.equal(result.cycle?.undecidedLineCount, 1);
+    assert.equal(result.predicates?.plannerDayMatches, true, "undecidedLines does not affect plannerDayMatches");
+    assert.equal(result.predicates?.cycleCertified, true, "undecidedLines is not a term of cycleCertified");
+    assert.equal(result.predicates?.selectionCertified, false);
 });
 
 test("the eight fixed keys, in the sweep's own names, are the only thing ever queried", async () => {
@@ -290,6 +333,10 @@ test("an owed full run overrides even a certified completion", async () => {
 test("a prior-day completion is a continuation no-op but not today's card prerequisite", async () => {
     const result = await load(certifiedValues({
         [SWEEP_MARKER_KEY]: formatSweepMarker({ phase: "done", chaserCompletedAt: "2026-09-09T14:06:00Z", blockedReason: null, completedCycleId: CYCLE_ID }),
+        // plannerDay matches NOW's own day: this test is about the completion
+        // TIMESTAMP being stale, not the cycle's plannerDay (that has its own
+        // dedicated test below) — continuationNeedsWork now requires both.
+        [CYCLE_KEY]: JSON.stringify({ id: CYCLE_ID, epoch: "7", evidenceEpoch: "9", recognitionPolicy: RUNTIME_ON.policy, plannerDay: "2026-09-10" }),
     }));
     assert.equal(result.status, "stable");
     assert.equal(result.predicates?.cycleCertified, true);
@@ -347,7 +394,12 @@ test("a blocked marker reports the known reason; an unknown reason is 'other', n
 });
 
 test("cursor presence is reported, cursor contents are not", async () => {
-    const result = await load(certifiedValues({ [LINE_CURSOR_KEY]: "2026-09-10|bl-terminal-cleanup", [OPEN_CURSOR_KEY]: "" }));
+    const result = await load(certifiedValues({
+        [LINE_CURSOR_KEY]: "2026-09-10|bl-terminal-cleanup", [OPEN_CURSOR_KEY]: "",
+        // plannerDay matches NOW: this test is about cursors not forcing a
+        // resume, not about plannerDay (dedicated tests cover that).
+        [CYCLE_KEY]: JSON.stringify({ id: CYCLE_ID, epoch: "7", evidenceEpoch: "9", recognitionPolicy: RUNTIME_ON.policy, plannerDay: "2026-09-10" }),
+    }));
     assert.equal(result.status, "stable");
     assert.deepEqual(result.cursors, { linePresent: true, openIssuePresent: false });
     assert.equal(result.predicates?.cycleCertified, true);
@@ -689,7 +741,10 @@ test("the shared continuation predicate is the sweep's own function, and cycleCe
     assert.equal(sweepRoute.continuationNeedsWork, continuationNeedsWork, "the route re-exports the shared function");
     assert.equal(sweepRoute.shouldResumeSweep, shouldResumeSweep);
     const marker: SweepMarker = { phase: "done", chaserCompletedAt: COMPLETED_AT, blockedReason: null, completedCycleId: CYCLE_ID };
-    const cycle: SweepCycle = { id: CYCLE_ID, epoch: "7", evidenceEpoch: "9", recognitionPolicy: V1_OFF };
+    // plannerDay matches NOW's own UTC day, so the "certified" branch below is
+    // reachable at all (Codex round 1, real issue — continuationNeedsWork now
+    // requires cycleMatchesPlannerDay too, not only cycleCertified).
+    const cycle: SweepCycle = { id: CYCLE_ID, epoch: "7", evidenceEpoch: "9", recognitionPolicy: V1_OFF, plannerDay: "2026-09-10" };
     const variants = [
         { marker, cycle },
         { marker: { ...marker, phase: "lines" as const }, cycle },
@@ -699,6 +754,11 @@ test("the shared continuation predicate is the sweep's own function, and cycleCe
         { marker: { ...marker, chaserCompletedAt: "nope" }, cycle },
         { marker, cycle: { ...cycle, epoch: "8" } },
         { marker, cycle: { ...cycle, recognitionPolicy: RUNTIME_ON.policy } },
+        // A cycle otherwise fully certified but planned against a day that is
+        // no longer today (Codex round 1, real issue) — and a legacy cycle
+        // with no plannerDay at all, same as every stored cycle before it.
+        { marker, cycle: { ...cycle, plannerDay: "2026-09-09" } },
+        { marker, cycle: { id: CYCLE_ID, epoch: "7", evidenceEpoch: "9", recognitionPolicy: V1_OFF } },
         { marker, cycle: null },
         { marker: { phase: "done" as const, chaserCompletedAt: null }, cycle: null },
     ];
@@ -711,7 +771,8 @@ test("the shared continuation predicate is the sweep's own function, and cycleCe
                     && input.marker.completedCycleId === input.cycle.id && Number.isFinite(completedAt) && completedAt <= NOW.getTime()
                     && cycleStillValid(input.cycle, input.bankEpoch, input.evidenceEpoch, input.recognitionPolicy);
                 assert.equal(cycleCertified(input), certified);
-                const expected = fullRunOwed ? true : certified ? false : input.cycle !== null || shouldResumeSweep(input.marker.phase, lineCursor, openCursor);
+                const plannerMatches = cycleMatchesPlannerDay(input.cycle, input.now);
+                const expected = fullRunOwed ? true : (certified && plannerMatches) ? false : input.cycle !== null || shouldResumeSweep(input.marker.phase, lineCursor, openCursor);
                 assert.equal(continuationNeedsWork(input), expected);
             }
         }

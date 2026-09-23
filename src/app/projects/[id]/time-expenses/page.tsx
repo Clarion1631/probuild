@@ -7,6 +7,7 @@ import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { fetchJobOptions } from "@/app/automation/receipts-data";
 import TimeExpensesClient from "./TimeExpensesClient";
 
 export default async function TimeExpensesPage({
@@ -45,11 +46,12 @@ export default async function TimeExpensesPage({
     // so it is gated on `financialReports` — not on the `timeClock` permission
     // that merely gets you onto this page — and it may only offer THIS
     // project's phases.
-    const [data, companyTimeZone, permissionedUser, phases] = await Promise.all([
+    const [data, companyTimeZone, permissionedUser, phases, jobOptions] = await Promise.all([
         getTimeExpenseData(projectId),
         resolveCompanyTimeZone(),
         getCurrentUserWithPermissions(),
         resolveProjectPhaseCodes(prismaPhaseDataSource, projectId),
+        fetchJobOptions(),
     ]);
     const canEditTax = !!permissionedUser && hasPermission(permissionedUser, "financialReports");
 
@@ -64,6 +66,7 @@ export default async function TimeExpensesPage({
                         companyTimeZone={companyTimeZone}
                         phases={phases.map(p => ({ id: p.id, code: p.code, name: p.name }))}
                         canEditTax={canEditTax}
+                        jobOptions={jobOptions}
                     />
                 </div>
             </div>

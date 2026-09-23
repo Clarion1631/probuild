@@ -448,13 +448,13 @@ export interface PullWindowState {
      * ingest, and this run was not truncated, so it was CLEARED as a finished
      * window — and `pullContinuationPending` (the only thing the 15-minute
      * resume pass looks at) answered "nothing in progress" every time. The
-     * 02:00 failure sat until 02:00 the next night while the 13:00 chaser found
+     * 02:00 failure sat until 02:00 the next night while the 10:00 chaser found
      * an uncertified register and held every owner's cards.
      *
      * Carries the window's own BOUNDS because the high-water mark legitimately
      * advances over a fully-ingested window: re-planning from the mark would ask
      * QuickBooks about a NARROWER span than the one whose clearance is unknown.
-     * `attempts` is what stops a dead report endpoint spinning through all 44
+     * `attempts` is what stops a dead report endpoint spinning through all 32
      * continuation slots — see PROBE_RETRY_LIMIT.
      */
     retryPending?: PullRetryPending | null;
@@ -521,7 +521,7 @@ export interface PullWindowState {
      * endpoint also leaves `complete: false`, and it is the one incompleteness
      * that repeating cannot fix — `retryPending` gives it PROBE_RETRY_LIMIT
      * attempts and then stops on purpose, so that a dead endpoint cannot burn
-     * all 44 continuation slots every day. Recording it here as ordinary
+     * all 32 continuation slots every day. Recording it here as ordinary
      * unfinished work would undo that.
      */
     continuationPending?: boolean;

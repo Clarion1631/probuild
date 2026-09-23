@@ -1,0 +1,238 @@
+/**
+ * claimOwnerDay: the only place a card is ever SELECTED (cheap-sweep-restart-
+ * spec.md §14.9; Codex round 2 blocker 1, and the claim-time race).
+ *
+ * The gate above reads `selectionAllowed` and snapshots `ownerEpochAtScan`
+ * outside any lock, minutes before this runs. This transaction re-proves
+ * certification and owner stability, under the §14.0 lock order, right before
+ * the insert that actually claims the (owner, pacificDate) slot.
+ *
+ * A recording fake transaction, same style as tests/receipt-owner-assignment.
+ * test.ts: each call is tagged by what it does, so the assertions read the
+ * ORDER of operations, not any module's own SQL wording.
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { Prisma } from "@prisma/client";
+
+process.env.DATABASE_URL ??= "postgresql://fiction:fiction@127.0.0.1:9/test?pgbouncer=true";
+process.env.NEXTAUTH_SECRET ??= "fiction-not-a-real-secret";
+
+import { claimOwnerDay } from "../src/app/api/cron/receipt-request-cards/route";
+import { CYCLE_KEY, SWEEP_MARKER_KEY, formatSweepMarker, type SweepPhase } from "../src/lib/receipt-sweep-marker";
+import { RECEIPT_EVIDENCE_EPOCH_KEY, RECEIPT_OWNER_EPOCH_KEY } from "../src/lib/receipt-evidence-lock";
+import { BANK_LEDGER_EPOCH_KEY } from "../src/lib/bank-ledger-epoch";
+import type { CardItem } from "../src/lib/receipt-request-cards";
+
+// claimOwnerDay's own certification check captures `now: new Date()` fresh,
+// inside the transaction — deliberately not injectable (§14.9 step 6), so a
+// stale value from scan time can never pass as current. Fixtures are built
+// relative to the real clock so this test is correct on whatever day it runs,
+// rather than pinned to one fictional date.
+const NOW = new Date();
+const UTC_DAY = NOW.toISOString().slice(0, 10);
+const PACIFIC_DAY = NOW.toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+const CYCLE_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const RECOGNITION_POLICY = "receipt-source-v1:off";
+const BANK_EPOCH = "5";
+const EVIDENCE_EPOCH = "9";
+const OWNER_EPOCH = "3";
+// One calendar day behind NOW, both readings — for the "stamped/planned
+// against the wrong day" cases below. Same real-clock reasoning as NOW itself
+// (see the comment above it): this is yesterday relative to test-file load
+// time, moments before claimOwnerDay captures its own fresh `now`.
+const YESTERDAY = new Date(NOW.getTime() - 24 * 60 * 60 * 1000);
+const UTC_YESTERDAY = YESTERDAY.toISOString().slice(0, 10);
+
+const ITEMS: CardItem[] = [{
+    n: 1, fingerprint: "fp-1", date: "2026-09-01", vendor: "Lowes", cents: 1234, amount: "12.34",
+    cardTail: "1234", issueId: "issue-1", targetKey: "bl-1",
+}];
+
+function markerJson(over: {
+    phase?: SweepPhase; chaserCompletedAt?: string | null; blockedReason?: string | null; completedCycleId?: string | null;
+} = {}): string {
+    return formatSweepMarker({
+        phase: over.phase ?? "done",
+        chaserCompletedAt: over.chaserCompletedAt !== undefined ? over.chaserCompletedAt : NOW.toISOString(),
+        blockedReason: over.blockedReason ?? null,
+        completedCycleId: over.completedCycleId !== undefined ? over.completedCycleId : CYCLE_ID,
+    });
+}
+
+function cycleJson(over: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+        id: CYCLE_ID, epoch: BANK_EPOCH, evidenceEpoch: EVIDENCE_EPOCH,
+        recognitionPolicy: RECOGNITION_POLICY, plannerDay: UTC_DAY,
+        ...over,
+    });
+}
+
+interface FakeOptions {
+    markerValue?: string | null;
+    cycleValue?: string | null;
+    ownerEpoch?: string;
+    bankEpoch?: string;
+    evidenceEpoch?: string;
+    createError?: unknown;
+    createResult?: { id: string };
+}
+
+/** `db.$transaction` calls straight through to a recording `tx` double. */
+function fakeDb(options: FakeOptions = {}) {
+    const calls: string[] = [];
+    let transactionOptions: unknown;
+    const tx = {
+        $executeRaw: async (query: TemplateStringsArray, ..._values: unknown[]) => {
+            const text = query.join("");
+            if (text.includes("SET LOCAL")) calls.push("set-local");
+            else if (text.includes("pg_advisory_xact_lock")) calls.push("lock");
+            else calls.push(`executeRaw:${text}`);
+            return undefined;
+        },
+        $queryRaw: async (_query: TemplateStringsArray, ...values: unknown[]) => {
+            const key = values[0];
+            if (key === RECEIPT_EVIDENCE_EPOCH_KEY) { calls.push("evidence-read"); return [{ value: options.evidenceEpoch ?? EVIDENCE_EPOCH }]; }
+            if (key === BANK_LEDGER_EPOCH_KEY) { calls.push("ledger-lock"); return [{ value: options.bankEpoch ?? BANK_EPOCH }]; }
+            if (key === RECEIPT_OWNER_EPOCH_KEY) { calls.push("owner-epoch-read"); return [{ value: options.ownerEpoch ?? OWNER_EPOCH }]; }
+            throw new Error(`fakeDb: unexpected $queryRaw key ${String(key)}`);
+        },
+        automationSetting: {
+            findUnique: async (args: { where: { key: string } }) => {
+                if (args.where.key === SWEEP_MARKER_KEY) {
+                    calls.push("marker-read");
+                    return options.markerValue === null ? null : { value: options.markerValue ?? markerJson() };
+                }
+                if (args.where.key === CYCLE_KEY) {
+                    calls.push("cycle-read");
+                    return options.cycleValue === null ? null : { value: options.cycleValue ?? cycleJson() };
+                }
+                throw new Error(`fakeDb: unexpected automationSetting.findUnique key ${args.where.key}`);
+            },
+        },
+        receiptRequestCard: {
+            create: async (_args: unknown) => {
+                calls.push("create");
+                if (options.createError) throw options.createError;
+                return options.createResult ?? { id: "card-1" };
+            },
+        },
+    };
+    const db = {
+        $transaction: async (fn: (tx: unknown) => Promise<unknown>, txOptions?: unknown) => {
+            transactionOptions = txOptions;
+            return fn(tx);
+        },
+    };
+    return { db, calls, get transactionOptions() { return transactionOptions; } };
+}
+
+function baseInput(overrides: Partial<Parameters<typeof claimOwnerDay>[1]> = {}): Parameters<typeof claimOwnerDay>[1] {
+    return {
+        owner: "CJ", date: PACIFIC_DAY, items: ITEMS, overflow: 0, overflowExact: true,
+        claimedAt: NOW, claimToken: "token-1", ownerEpochAtScan: OWNER_EPOCH, recognitionPolicy: RECOGNITION_POLICY,
+        // The scan's own snapshot of the current cycle (Codex round 1, B1) —
+        // matches cycleJson()'s default id, same as fakeDb()'s default cycle.
+        cycleIdAtScan: CYCLE_ID,
+        ...overrides,
+    };
+}
+
+test("claimed: SET LOCAL, lock, evidence read, ledger lock, marker, cycle, owner epoch, then create — in order", async () => {
+    const fake = fakeDb();
+    const result = await claimOwnerDay(fake.db as never, baseInput());
+    assert.deepEqual(result, { kind: "claimed", id: "card-1" });
+    assert.deepEqual(fake.calls, [
+        "set-local", "lock", "evidence-read", "ledger-lock", "marker-read", "cycle-read", "owner-epoch-read", "create",
+    ]);
+    assert.deepEqual(fake.transactionOptions, { timeout: 8_000, maxWait: 1_000 });
+});
+
+test("each failed certification condition refuses with 'certification', and create is never reached", async () => {
+    const cases: Array<[string, FakeOptions, Partial<Parameters<typeof claimOwnerDay>[1]>?]> = [
+        ["marker phase is not done", { markerValue: markerJson({ phase: "lines" }) }],
+        ["marker is blocked", { markerValue: markerJson({ blockedReason: "bank-pull-stale" }) }],
+        ["the completion is for a different cycle", { markerValue: markerJson({ completedCycleId: "not-this-cycle" }) }],
+        ["the bank epoch moved under the cycle", { bankEpoch: "999" }],
+        ["the evidence epoch moved under the cycle", { evidenceEpoch: "999" }],
+        ["there is no cycle at all", { cycleValue: null }],
+        ["the cycle has undecided lines (blocker 2)", { cycleValue: cycleJson({ undecidedLines: ["bl-undecided-1"] }) }],
+        ["the cycle's plannerDay is missing (a legacy cycle)", { cycleValue: cycleJson({ plannerDay: undefined }) }],
+        // The claim's own input carries a policy the cycle was never measured
+        // against — cycleStillValid's recognitionPolicy branch (route.ts:588
+        // threads input.recognitionPolicy through, unguarded until now).
+        ["the recognition policy differs from the cycle's", {}, { recognitionPolicy: "receipt-source-v1:on" }],
+        // The stamp is real and unblocked, but for the WRONG Pacific day —
+        // chaserCompletedFor's own day comparison, not cycleCertified's
+        // not-in-the-future check (a stale-but-past stamp still passes that).
+        ["the chaser's stamp is from yesterday (Pacific)", { markerValue: markerJson({ chaserCompletedAt: YESTERDAY.toISOString() }) }],
+        // Present, but not today's UTC day — distinct from the "missing"
+        // case above, which cycleMatchesPlannerDay also refuses, for the
+        // opposite reason.
+        ["the cycle's plannerDay is yesterday (UTC)", { cycleValue: cycleJson({ plannerDay: UTC_YESTERDAY }) }],
+        // Codex round 1, B1: the cycle certified right now is not the one
+        // this claim's candidates were scanned against — even though it is a
+        // perfectly clean, internally-consistent certification on its own (a
+        // "successful recertification", not merely a bump). marker and cycle
+        // agree with EACH OTHER (so cardSelectionCertified alone would pass
+        // this), but disagree with baseInput()'s cycleIdAtScan.
+        ["the cycle recertified cleanly under a DIFFERENT id since the scan (Codex round 1, B1)", {
+            markerValue: markerJson({ completedCycleId: "a-later-cycle" }),
+            cycleValue: cycleJson({ id: "a-later-cycle" }),
+        }],
+    ];
+    for (const [label, options, inputOverrides] of cases) {
+        const fake = fakeDb(options);
+        const result = await claimOwnerDay(fake.db as never, baseInput(inputOverrides));
+        assert.deepEqual(result, { kind: "refused", reason: "certification" }, label);
+        assert.ok(!fake.calls.includes("create"), `${label}: create must not run`);
+        assert.ok(!fake.calls.includes("owner-epoch-read"), `${label}: the owner epoch is not even read once certification fails`);
+    }
+});
+
+test("the owner epoch moved since the scan: refused with 'owner-moved' (Codex round 2 blocker 1)", async () => {
+    const fake = fakeDb({ ownerEpoch: "a-different-epoch" });
+    const result = await claimOwnerDay(fake.db as never, baseInput({ ownerEpochAtScan: OWNER_EPOCH }));
+    assert.deepEqual(result, { kind: "refused", reason: "owner-moved" });
+    assert.deepEqual(fake.calls, [
+        "set-local", "lock", "evidence-read", "ledger-lock", "marker-read", "cycle-read", "owner-epoch-read",
+    ], "certification passed and the owner epoch WAS read, but no create followed");
+});
+
+test("a unique-constraint violation on the insert gives 'taken'", async () => {
+    const p2002 = new Prisma.PrismaClientKnownRequestError("unique constraint failed", { code: "P2002", clientVersion: "test" });
+    const fake = fakeDb({ createError: p2002 });
+    const result = await claimOwnerDay(fake.db as never, baseInput());
+    assert.deepEqual(result, { kind: "taken" });
+});
+
+test("a thrown lock timeout (or any other transaction failure) gives refused/tx-failed, never a throw", async () => {
+    const db = { $transaction: async () => { throw new Error("canceling statement due to lock timeout"); } };
+    const result = await claimOwnerDay(db as never, baseInput());
+    assert.deepEqual(result, { kind: "refused", reason: "tx-failed" });
+});
+
+test("a non-P2002 error from the insert itself also refuses with tx-failed, not taken", async () => {
+    const fake = fakeDb({ createError: new Error("connection reset") });
+    const result = await claimOwnerDay(fake.db as never, baseInput());
+    assert.deepEqual(result, { kind: "refused", reason: "tx-failed" });
+});
+
+// ownerEpochAtScan is the GET handler's OWN snapshot, taken before it ever
+// calls claimOwnerDay above — the fake $transaction harness in this file
+// cannot reach it, so this is a source pin, not a behavioral test. Moving the
+// read after `scan` (or all the way to claim time) would snapshot the owner
+// epoch after candidates are already gathered, so a reassignment landing in
+// that window would pass claimOwnerDay's own re-check and silently reopen
+// Codex round 2 blocker 1 while every test above still passes.
+test("source pin: ownerEpochAtScan is read before scanCandidates runs, not after", () => {
+    const cardsRoute = readFileSync(new URL("../src/app/api/cron/receipt-request-cards/route.ts", import.meta.url), "utf8");
+    const scanAllowedAt = cardsRoute.indexOf("const selectionAllowed = chaserCompletedFor(");
+    const ownerEpochAt = cardsRoute.indexOf(
+        'const ownerEpochAtScan = selectionAllowed ? await readReceiptOwnerEpoch(prisma) : "0";', scanAllowedAt);
+    const scanAt = cardsRoute.indexOf("const scan = selectionAllowed", ownerEpochAt);
+    assert.ok(scanAllowedAt > 0, "selectionAllowed is decided in the GET handler");
+    assert.ok(ownerEpochAt > scanAllowedAt, "ownerEpochAtScan is read after selectionAllowed is decided");
+    assert.ok(scanAt > ownerEpochAt, "ownerEpochAtScan is read before scanCandidates gathers this run's candidates");
+});

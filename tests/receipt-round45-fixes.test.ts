@@ -25,7 +25,11 @@ test("the cycle's epochs live in a record of their own, not on the cursors", () 
     // The bug, stated from the source: cursors are cleared the moment their
     // pass completes, so a continuation could find nothing to validate and take
     // a fresh snapshot of a world that had already moved.
-    assert.match(sweep, /transitionCompletedOpenPass\([\s\S]{0,180}writePhase\("lines", undefined, null, prisma, cycle\.id\)[\s\S]{0,80}writeOpenCursor\(null\)/,
+    // `cycle!.id`, not `cycle.id`: §14.6's conditional reassignment of `cycle`
+    // inside the line pass's own closure (for `undecidedLines`) is enough to
+    // make TS widen `cycle`'s type inside every closure that captures it,
+    // this one included, so the non-null assertion is required to compile.
+    assert.match(sweep, /transitionCompletedOpenPass\([\s\S]{0,180}writePhase\("lines", undefined, null, prisma, cycle!\.id\)[\s\S]{0,80}writeOpenCursor\(null\)/,
         "the open cursor clears after the durable phase handoff; the cycle must still validate epochs");
     assert.match(sweep, /clearCertifiedSweepCheckpoint\(decision.complete, \(\) => writeCursor\(null\)\)/);
 
@@ -34,7 +38,7 @@ test("the cycle's epochs live in a record of their own, not on the cursors", () 
     // cards cron needs it too, and a route importing another route pulls the
     // whole sweep into its bundle.
     assert.match(read("src/lib/receipt-sweep-marker.ts"), /export const CYCLE_KEY = "receiptRequestsCycle";/);
-    assert.match(sweep, /cycle = \{ id: randomUUID\(\), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY \};/);
+    assert.match(sweep, /cycle = \{ id: randomUUID\(\), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY, plannerDay \};/);
     assert.match(sweep, /await writeCycle\(cycle\);/);
     // A fresh full run clears it with the cursors, so the next cycle cannot
     // inherit the last one's snapshot.
@@ -132,14 +136,14 @@ test("the continuation schedule never collides with a full run", () => {
         assert.ok(receiptMinutes.every(minute => (minute - protectedMinute + 60) % 60 >= 1),
             "first continuation starts at least one minute after full/card selection");
     }
-    assert.equal(at("/api/cron/receipt-requests"), "0 13 * * *");
+    assert.equal(at("/api/cron/receipt-requests"), "0 10 * * *");
     assert.equal(at("/api/cron/receipt-request-cards"), "30 14 * * 1-5");
     assert.equal(at("/api/cron/receipt-request-cards?retry=1"), "30 16 * * 1-5");
-    // Available starts, including the 13:00 full run; not a completion guarantee.
-    const startsBeforeCards = (hour: number) => 1 + (hour - 13) * receiptMinutes.length
+    // Available starts, including the 10:00 full run; not a completion guarantee.
+    const startsBeforeCards = (hour: number) => 1 + (hour - 10) * receiptMinutes.length
         + receiptMinutes.filter(minute => minute < 30).length;
-    assert.equal(startsBeforeCards(14), 85);
-    assert.equal(startsBeforeCards(16), 197);
+    assert.equal(startsBeforeCards(14), 253);
+    assert.equal(startsBeforeCards(16), 365);
     assert.ok(!receiptMinutes.includes(30), "continuations avoid both card selection slots");
 
     // PRE-FIX CONTROL: the old field fired on the hour, which is exactly when
@@ -259,7 +263,7 @@ test("the Expense writes round 45 found are all fenced now", () => {
     // for a BARE single write; the fence is the same lock either way, and this
     // now checks the fence rather than the spelling.
     const sites: Array<[string, RegExp]> = [
-        ["src/lib/actions.ts", /tx => tx\.expense\.deleteMany\(\{ where: \{ estimateId \} \}\)\)/],
+        ["src/lib/actions.ts", /await tx\.expense\.deleteMany\(\{ where: \{ estimateId \} \}\);/],
         ["src/app/api/expenses/[id]/route.ts", /tx\.expense\.deleteMany\(\{[\s\S]{0,40}?where: \{/],
         ["src/app/api/expenses/[id]/route.ts", /await tx\.expense\.updateMany\(\{/],
         ["src/app/api/expenses/[id]/approve/route.ts", /const result = await tx\.expense\.updateMany\(\{/],
@@ -293,9 +297,15 @@ test("the estimate cascade is the sharpest case, and it is fenced", () => {
     // the sweep may have read as "this charge has its receipt", and unfenced it
     // could close a chase on evidence being destroyed underneath it — and
     // certify, because nothing moved the epoch.
+    //
+    // THE ESTIMATE ROW ITSELF WAS UNFENCED TOO (Codex round 1, 2026-09-23): a
+    // bare `prisma.estimate.delete()` ran AFTER this transaction committed and
+    // released the lock, so this check's old "textually after the cascade"
+    // bar was satisfied by code that had already let go of the fence. It is
+    // `tx.estimate.delete` now — pin the client, not just the ordering.
     const actions = read("src/lib/actions.ts");
-    const cascadeAt = actions.indexOf('tx => tx.expense.deleteMany({ where: { estimateId } })');
-    const estimateDeleteAt = actions.indexOf("await prisma.estimate.delete({ where: { id: estimateId } });", cascadeAt);
+    const cascadeAt = actions.indexOf('tx.expense.deleteMany({ where: { estimateId } })');
+    const estimateDeleteAt = actions.indexOf("await tx.estimate.delete({ where: { id: estimateId } });", cascadeAt);
     assert.ok(cascadeAt > 0 && estimateDeleteAt > cascadeAt,
-        "the expenses go under the fence before the estimate row is removed");
+        "the expenses go under the fence before the estimate row is removed, on the same tx client");
 });

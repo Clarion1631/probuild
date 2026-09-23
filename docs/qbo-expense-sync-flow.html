@@ -156,6 +156,7 @@
       <li>It usually takes about 5 to 10 minutes to show up on the Receipts tab. A row that is being read or booked sits under <i>Booking</i>, with its own "Retry now" button.</li>
       <li>If ProBuild is not sure which cost code to use, it still books the receipt to the job and adds a note asking for one. It never holds up the cost waiting on that.</li>
       <li>Duplicate-proof: keyed to the file, so retries can never book the same receipt twice.</li>
+      <li>Booked to the wrong job? Open that job's <b>Time &amp; Expenses</b> tab and click <b>Move to job</b> on the expense. Pick the right job, or <i>Shop</i> if it isn't a job cost. The receipt moves with it. An expense that came from a receipt can't be deleted. If one is a double, tell Justin.</li>
     </ul>
   </div>
   <div class="arrow">▼</div>
@@ -199,7 +200,7 @@
     <tr><td>Folder reconciler</td><td>Daily</td><td>Creates intake folders for new In-Progress projects; emails Justin when a folder matches no project</td></tr>
     <tr><td>QuickBooks → ProBuild sync</td><td>Every 4 hours <span class="pill">paused since September 18, 2026</span></td><td>Used to import finalized purchases into job costs. Paused on purpose now that receipts book directly</td></tr>
     <tr><td>Bank register pull</td><td>Nightly, 2:00&nbsp;AM&nbsp;UTC</td><td>Reads the QuickBooks register for the Washington Trust account and records the last 7 days as bank charges, so the missing-receipt check has fresh truth to work from instead of waiting for the monthly statement. When the statement does arrive it attaches to those same charges rather than creating duplicates. Read-only — it never writes to QuickBooks</td></tr>
-    <tr><td>Missing-receipt check</td><td>Daily, 6:00&nbsp;AM&nbsp;Pacific</td><td>Compares every bank charge older than 3 days against the receipts and expenses we hold. Anything with no match opens on the <b>Receipts</b> tab; anything that gets matched closes itself</td></tr>
+    <tr><td>Missing-receipt check</td><td>Daily, 3:00&nbsp;AM&nbsp;Pacific (2:00&nbsp;AM in winter). Runs again after receipts or bank charges change</td><td>Compares every bank charge older than 3 days against the receipts and expenses we hold. Anything with no match opens on the <b>Receipts</b> tab; anything that gets matched closes itself</td></tr>
     <tr><td>Receipt chase card</td><td>Weekday mornings <span class="pill">switched off since September 14, 2026</span></td><td>Posts ONE Chat message per person (CJ, Richard) listing their missing receipts. Reply in the thread with a photo, a job name, or "sign N" for a memo. Never emails anything</td></tr>
   </table>
   </div>
@@ -372,6 +373,7 @@
   <div class="callout">
     <h3>What changed recently</h3>
     <ul>
+      <li>September 22, 2026: expenses that came from a receipt can't be deleted any more. Use <b>Move to job</b> on the job's Time &amp; Expenses tab instead. If one is a double, tell Justin.</li>
       <li>Lists switched off since September 14, 2026, while old receipts get reconciled. Nobody is auto-asked until they are turned back on.</li>
       <li>The old affidavit processor was retired September 4, 2026. Requests wait for Justin.</li>
       <li>September 18, 2026: receipts now book into ProBuild job costing. Nothing is sent to QuickBooks. Vanessa books QuickBooks from the bank feed.</li>
