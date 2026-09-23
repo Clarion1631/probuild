@@ -57,6 +57,7 @@ import {
     AMBIGUOUS_CREATE_MARKER,
     CREATE_IN_FLIGHT_MARKER,
     PAYLINK_PENDING_MARKER,
+    PAYLINK_MISSING_MARKER,
     isPayLinkPending,
     nextPayLinkState,
     payLinkPendingWhere,
@@ -3482,7 +3483,7 @@ async function runPaymentsSync(
     // at billing-creation time — see createProgressBillingCore — so every line
     // has a scheduleId and settles like any other milestone; no special case).
     const billingSelect = {
-        id: true, invoiceId: true, qbInvoiceId: true, code: true,
+        id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, code: true,
         lines: { select: { scheduleId: true } },
         invoice: { select: { code: true, estimateId: true } },
     } as const;
@@ -3531,6 +3532,31 @@ async function runPaymentsSync(
                 throw new Error(`QBO invoice probe failed (status ${probe.status})`);
             }
             if (probe.state === "voided" || probe.state === "notFound") {
+                // Persist it, like the milestone claim above, so anything that
+                // treats a voided/notFound link as dead (the AR digest's live-link
+                // rule) stops counting this billing as billed. One CAS covers both
+                // the first flag and a later voided <-> notFound relabel: progress
+                // billings have no notification to keep exactly-once. The OR only
+                // replaces no marker, a pay-link marker, or the other probe state —
+                // never create-in-flight, ambiguous-create, a `compensating:` claim
+                // or a pending-deletion marker, which mean another writer or a
+                // human is mid-decision on this row.
+                if (billing.qbSyncError !== probe.state) {
+                    await prisma.progressBilling.updateMany({
+                        where: {
+                            id: billing.id,
+                            status: { in: ["Staged", "Sent"] },
+                            qbInvoiceId: billing.qbInvoiceId,
+                            OR: [
+                                { qbSyncError: null },
+                                ...payLinkPendingWhere(),
+                                { qbSyncError: PAYLINK_MISSING_MARKER },
+                                { qbSyncError: probe.state === "voided" ? "notFound" : "voided" },
+                            ],
+                        },
+                        data: { qbSyncError: probe.state },
+                    });
+                }
                 result.errors.push(`${billing.invoice.code}/${billing.code}: QBO invoice ${probe.state}`);
                 return;
             }

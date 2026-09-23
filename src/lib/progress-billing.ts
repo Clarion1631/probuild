@@ -1455,11 +1455,28 @@ export async function stageProgressBillingToQuickBooksCore(
     // the sweep uses, because `getPaymentLink` can answer null without
     // throwing. Writing `qbSyncError: null` on that answer is what used to
     // drop an invoice with no payable URL straight out of the repair queue.
+    //
+    // Also pinned to PAYLINK_PENDING_MARKER — exactly what the finalize write
+    // above just left on this row. While this call awaited QuickBooks for the
+    // link, the payments poller could have flagged the row voided/notFound, or
+    // the pay-link sweep could have already landed its own repair; either one
+    // is a fresher answer than this call's and must win, not be overwritten by
+    // a stale one here.
     const next = nextPayLinkState(PAYLINK_PENDING_MARKER, payLink);
-    await db.updateMany({
-        where: { id: billing.id, qbInvoiceId: qbId },
+    const persisted = await db.updateMany({
+        where: { id: billing.id, qbInvoiceId: qbId, qbSyncError: PAYLINK_PENDING_MARKER },
         data: { qbSyncError: next.marker, ...(next.link ? { qbInvoiceLink: next.link } : {}) },
     });
+    if (persisted.count !== 1) {
+        // Someone else moved the marker on. The billing is still correctly
+        // linked and staged — just report what is actually on the row now
+        // rather than claiming a link this call did not persist.
+        const current = await db.findUnique({
+            where: { id: billing.id },
+            select: { qbInvoiceId: true, qbInvoiceLink: true },
+        }).catch(() => null);
+        return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: current?.qbInvoiceLink ?? null };
+    }
 
     return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: next.link ?? null };
 }
