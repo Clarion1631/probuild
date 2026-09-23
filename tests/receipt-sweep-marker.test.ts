@@ -8,6 +8,12 @@ import {
     chaserCompletedFor,
     formatSweepMarker,
     parseSweepMarker,
+    parseSweepCycle,
+    cycleMatchesPlannerDay,
+    mergeUndecidedLines,
+    cardSelectionCertified,
+    type SweepCycle,
+    type SweepMarker,
 } from "../src/lib/receipt-sweep-marker";
 import {
     componentVersionOf,
@@ -295,4 +301,134 @@ test("completion fence takes receipt evidence before the bank epoch", async () =
     }));
     assert.deepEqual(calls, ["receipt-evidence", "bank-epoch", "count", "write"]);
     assert.equal(result.complete, true);
+});
+
+// ── §14.4: plannerDay and undecidedLines on the cycle record ───────────────
+// (cheap-sweep-restart-spec.md §14.4, Codex round 2 blockers 2 and 3)
+
+test("parseSweepCycle accepts and rejects plannerDay and undecidedLines", () => {
+    const base = { id: "c1", epoch: "5", evidenceEpoch: "11" };
+
+    // The legacy round-trip (no new fields at all) is byte-identical — no
+    // stray `plannerDay: undefined` sneaking into the parsed object.
+    assert.deepEqual(parseSweepCycle(JSON.stringify(base)), base);
+
+    // plannerDay: well-formed accepted, malformed rejected.
+    assert.deepEqual(parseSweepCycle(JSON.stringify({ ...base, plannerDay: "2026-09-22" })),
+        { ...base, plannerDay: "2026-09-22" });
+    for (const bad of ["2026-9-22", "2026-09-2", "09-22-2026", "2026/09/22", "", 20260922, null]) {
+        assert.equal(parseSweepCycle(JSON.stringify({ ...base, plannerDay: bad })), null, `plannerDay ${JSON.stringify(bad)} must reject the whole cycle`);
+    }
+
+    // undecidedLines: an array of at most 50 non-empty strings accepted;
+    // anything else rejects the whole cycle (the same "no partial trust"
+    // direction every other field here takes).
+    assert.deepEqual(parseSweepCycle(JSON.stringify({ ...base, undecidedLines: ["bl-1", "bl-2"] })),
+        { ...base, undecidedLines: ["bl-1", "bl-2"] });
+    assert.deepEqual(parseSweepCycle(JSON.stringify({ ...base, undecidedLines: [] })),
+        { ...base, undecidedLines: [] });
+    const fifty = Array.from({ length: 50 }, (_, i) => `bl-${i}`);
+    assert.deepEqual(parseSweepCycle(JSON.stringify({ ...base, undecidedLines: fifty })), { ...base, undecidedLines: fifty });
+    const fiftyOne = [...fifty, "bl-50"];
+    assert.equal(parseSweepCycle(JSON.stringify({ ...base, undecidedLines: fiftyOne })), null, "51 ids rejects");
+    for (const bad of ["bl-1", [""], [1], [null], "not-an-array"]) {
+        assert.equal(parseSweepCycle(JSON.stringify({ ...base, undecidedLines: bad })), null, `undecidedLines ${JSON.stringify(bad)} must reject`);
+    }
+
+    // Both together, and alongside the pre-existing recognitionPolicy field.
+    const full = { ...base, recognitionPolicy: "receipt-source-v1:off", plannerDay: "2026-09-22", undecidedLines: ["bl-1"] };
+    assert.deepEqual(parseSweepCycle(JSON.stringify(full)), full);
+});
+
+test("cycleMatchesPlannerDay compares the UTC day, not the instant", () => {
+    const cycle: SweepCycle = { id: "c1", epoch: "5", evidenceEpoch: "11", plannerDay: "2026-09-22" };
+    assert.equal(cycleMatchesPlannerDay(cycle, new Date("2026-09-22T00:00:00.000Z")), true);
+    assert.equal(cycleMatchesPlannerDay(cycle, new Date("2026-09-22T23:59:59.999Z")), true);
+    assert.equal(cycleMatchesPlannerDay(cycle, new Date("2026-09-23T00:00:00.000Z")), false, "a new UTC day");
+    assert.equal(cycleMatchesPlannerDay(cycle, new Date("2026-09-21T23:59:59.999Z")), false, "still the day before");
+    assert.equal(cycleMatchesPlannerDay(null, new Date("2026-09-22T12:00:00Z")), false, "no cycle is not a match");
+    assert.equal(cycleMatchesPlannerDay({ ...cycle, plannerDay: undefined }, new Date("2026-09-22T12:00:00Z")), false, "a legacy cycle has nothing to compare");
+});
+
+test("mergeUndecidedLines dedupes, sorts and caps at 50", () => {
+    assert.deepEqual(mergeUndecidedLines(undefined, ["bl-3", "bl-1"]), ["bl-1", "bl-3"]);
+    assert.deepEqual(mergeUndecidedLines(["bl-1", "bl-2"], ["bl-2", "bl-3"]), ["bl-1", "bl-2", "bl-3"], "dedupes the overlap");
+    assert.deepEqual(mergeUndecidedLines(["bl-5"], []), ["bl-5"], "an empty addition is a no-op");
+
+    const existing = Array.from({ length: 40 }, (_, i) => `bl-${String(i).padStart(3, "0")}`);
+    const add = Array.from({ length: 40 }, (_, i) => `bl-new-${String(i).padStart(3, "0")}`);
+    const merged = mergeUndecidedLines(existing, add);
+    assert.equal(merged.length, 50, "caps at 50 even when the union is larger");
+    assert.deepEqual(merged, [...merged].sort(), "stays sorted");
+    assert.deepEqual(new Set(merged).size, 50, "no duplicates");
+});
+
+test("cardSelectionCertified", async t => {
+    const pacificDate = "2026-09-22";
+    const baseMarker: SweepMarker = {
+        phase: "done",
+        chaserCompletedAt: "2026-09-22T14:00:00Z", // 7am PDT on 9/22 — today, Pacific
+        blockedReason: null,
+        completedCycleId: "cycle-1",
+    };
+    const baseCycle: SweepCycle = {
+        id: "cycle-1", epoch: "5", evidenceEpoch: "11",
+        recognitionPolicy: "receipt-source-v1:off",
+        plannerDay: "2026-09-22",
+        undecidedLines: [],
+    };
+    const baseInput = () => ({
+        marker: baseMarker, cycle: baseCycle,
+        bankEpoch: "5", evidenceEpoch: "11",
+        recognitionPolicy: "receipt-source-v1:off",
+        now: new Date("2026-09-22T15:00:00Z"),
+        pacificDate,
+    });
+
+    await t.test("true when everything holds", () => {
+        assert.equal(cardSelectionCertified(baseInput()), true);
+    });
+
+    await t.test("false: the stamp is from yesterday (Pacific)", () => {
+        assert.equal(cardSelectionCertified({
+            ...baseInput(),
+            marker: { ...baseMarker, chaserCompletedAt: "2026-09-21T14:00:00Z" },
+        }), false);
+    });
+
+    await t.test("false: the phase is lines", () => {
+        assert.equal(cardSelectionCertified({ ...baseInput(), marker: { ...baseMarker, phase: "lines" } }), false);
+    });
+
+    await t.test("false: the marker is blocked", () => {
+        assert.equal(cardSelectionCertified({ ...baseInput(), marker: { ...baseMarker, blockedReason: "bank-pull-stale" } }), false);
+    });
+
+    await t.test("false: completedCycleId does not match", () => {
+        assert.equal(cardSelectionCertified({ ...baseInput(), marker: { ...baseMarker, completedCycleId: "some-other-cycle" } }), false);
+    });
+
+    await t.test("false: the evidence epoch moved", () => {
+        assert.equal(cardSelectionCertified({ ...baseInput(), evidenceEpoch: "12" }), false);
+    });
+
+    await t.test("false: the ledger epoch moved", () => {
+        assert.equal(cardSelectionCertified({ ...baseInput(), bankEpoch: "6" }), false);
+    });
+
+    await t.test("false: the recognition policy differs", () => {
+        assert.equal(cardSelectionCertified({ ...baseInput(), recognitionPolicy: "receipt-source-v1:on" }), false);
+    });
+
+    await t.test("false: plannerDay is missing", () => {
+        assert.equal(cardSelectionCertified({ ...baseInput(), cycle: { ...baseCycle, plannerDay: undefined } }), false);
+    });
+
+    await t.test("false: plannerDay is yesterday", () => {
+        assert.equal(cardSelectionCertified({ ...baseInput(), cycle: { ...baseCycle, plannerDay: "2026-09-21" } }), false);
+    });
+
+    await t.test("false: undecidedLines is non-empty", () => {
+        assert.equal(cardSelectionCertified({ ...baseInput(), cycle: { ...baseCycle, undecidedLines: ["bl-1"] } }), false);
+    });
 });

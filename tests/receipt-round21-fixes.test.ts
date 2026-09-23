@@ -230,7 +230,11 @@ test("a STABLE non-verdict does not block the cycle for ever", () => {
     // too large to load, reproduces identically on every future run. Blocking
     // on those would stall the morning card permanently rather than for one
     // cycle, so `contended` is reported separately from `undecided` and only
-    // the contended half holds the phase open.
+    // the contended half holds the phase open — UNLESS the line has no open
+    // issue covering it (cheap-sweep-restart §14.6, Codex round 2 blocker 2):
+    // a stable non-verdict on a line WITH an open issue does not block, since
+    // that issue already keeps the chase alive; one with NO open issue does,
+    // because nothing else would ever surface it as owed.
     assert.match(sweepSource, /if \(!outcome\.replan\) return \{ \.\.\.outcome, contended: 0, replans \};/);
     assert.match(sweepSource, /return \{ summary: emptySummary\(\), undecided: batch\.length, contended: batch\.length, replans \};/);
 });

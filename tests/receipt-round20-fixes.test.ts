@@ -168,8 +168,15 @@ test("owner assignment is refused when the page was showing an older version", (
     // version this call discovered for itself.
     assert.match(actions, /if \(!Number\.isInteger\(expectedVersion\) \|\| expectedVersion < 1\)/);
     assert.match(actions, /if \(issue\.version !== expectedVersion\) \{/);
-    assert.match(actions, /where: \{ id: issue\.id, version: expectedVersion, clearedAt: null \}/);
-    assert.doesNotMatch(actions, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
+    // cheap-sweep-restart §14.2: the CAS write itself moved into
+    // writeReceiptOwnerLocked (src/lib/receipt-owner-assignment.ts), called
+    // with the RENDERED expectedVersion — never a version this call re-read
+    // for itself.
+    assert.match(actions, /issueId: issue\.id,/);
+    assert.match(actions, /expectedVersion,/);
+    const writer = readFileSync(join(repoRoot, "src/lib/receipt-owner-assignment.ts"), "utf8");
+    assert.match(writer, /where: \{ id: input\.issueId, version: input\.expectedVersion, clearedAt: null \}/);
+    assert.doesNotMatch(writer, /version: issue\.version/);
     // And the page hands its rendered version over.
     const tab = readFileSync(join(repoRoot, "src/app/automation/components/receipts/receipts-tab.tsx"), "utf8");
     assert.match(tab, /<AssignOwnerControl issueId=\{row\.id\} currentOwner=\{row\.owner\} expectedVersion=\{row\.version\} \/>/);

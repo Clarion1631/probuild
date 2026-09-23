@@ -26,7 +26,7 @@ import {
  *     schedule. The run was not TRUNCATED, so it parked no cursor — the window
  *     was cleared as finished, `pullContinuationPending()` answered
  *     "nothing-in-progress" for every one of the day's 44 resume slots, and the
- *     register stayed uncertified until the next night, hours after the 13:00
+ *     register stayed uncertified until the next night, hours after the 10:00
  *     chaser had already given up on it.
  *  3. The card cron's 45-second budget bounded only the DECISION to recompute,
  *     never the work: the component walk and the candidate scan each ran an
@@ -154,7 +154,7 @@ test("a failed probe at 02:00 is picked up by the 02:15 continuation and reaches
      * written by a BUDGET-TRUNCATED ingest, and this run was not truncated, so
      * the window was saved as finished. Every 15-minute continuation slot then
      * answered `nothing-in-progress`, and the register sat uncertified until
-     * 02:00 the next night — long past the 13:00 chaser, which held every
+     * 02:00 the next night — long past the 10:00 chaser, which held every
      * owner's cards for a failure that had cleared itself by 02:15.
      */
     resetPull();
@@ -180,7 +180,7 @@ test("a failed probe at 02:00 is picked up by the 02:15 continuation and reaches
     assert.deepEqual(leases, ["bank-register-pull", "bank-register-pull"], "the resume pass really ran");
     const resumedBody = await resumed.json() as { ok: boolean; complete: boolean; startDate: string; endDate: string };
     assert.equal(resumedBody.ok, true);
-    assert.equal(resumedBody.complete, true, "and reaches a complete pull — hours before the 13:00 chaser");
+    assert.equal(resumedBody.complete, true, "and reaches a complete pull — hours before the 10:00 chaser");
     assert.deepEqual(
         [resumedBody.startDate, resumedBody.endDate],
         [failedBody.startDate, failedBody.endDate],

@@ -427,8 +427,12 @@ test("the sweep resumes from a durable cursor, oldest-first", () => {
     assert.match(source, /const resumeFrom = cursorEpochMatches && isComponentKey\(/);
     assert.match(source, /components\.filter\(component => component\.key > resumeFrom\)/);
     assert.doesNotMatch(source, /cursor: \{ id: cursor \}, skip: 1/, "id paging is gone");
-    // Checkpointed after EVERY page, so a run that dies loses one page.
-    assert.match(source, /cursor = page\[page\.length - 1\]\.key;\s*\n\s*await writeCursor\(formatSweepCursor\(\{ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch \}\)\);/);
+    // Checkpointed after EVERY page, so a run that dies loses one page. The
+    // committed-work progress sync (Codex round 2: "exceptional progress logs
+    // lose committed work") now runs between these two lines, copying
+    // `progress` BEFORE the write rather than requiring them adjacent — see
+    // tests/receipt-sweep-progress-log.test.ts for that ordering.
+    assert.match(source, /cursor = page\[page\.length - 1\]\.key;[\s\S]*?await writeCursor\(formatSweepCursor\(\{ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch \}\)\);/);
 });
 
 // ── Allocation spans the whole cohort, not one page (round-5 item 3) ────────

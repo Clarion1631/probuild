@@ -14,8 +14,10 @@ import { taxIsAtSource } from "@/lib/expense-attribution";
  * defaulting it claimed a deduction nobody had looked at.
  *
  * It talks to `PATCH /api/expenses/[id]`, not the PUT — the PUT is guarded by
- * `assertExpenseMutableOutsideQbo` and every pipeline-booked expense carries a
- * `qbPurchaseId`, which is exactly the population this panel has to reach.
+ * `assertExpenseMutableOutsideQbo` for QBO-backed rows and by the receipt rule
+ * (`isReceiptBookedExpense`) for native pipeline rows, so every pipeline-booked
+ * expense is refused there whether or not it carries a `qbPurchaseId` — which
+ * is exactly the population this panel has to reach.
  */
 
 export interface TaxPhaseExpense {

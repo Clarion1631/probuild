@@ -25,6 +25,7 @@ import {
     decimalStringToCents,
     ComponentDeadlineExceededError,
     ComponentTooLargeError,
+    blockingUndecidedLines,
     competingLineFilter,
     componentTouchesBoundary,
     componentVersionOf,
@@ -35,6 +36,7 @@ import {
     pageComponents,
     MEMO_CONFLICT_RESOLUTION,
     MEMO_SIGNED_RESOLUTION,
+    effectiveOwner,
     hasBackedResolution,
     hasResolution,
     mergeReceiptRequestDetails,
@@ -59,8 +61,10 @@ import {
     CYCLE_KEY,
     SWEEP_MARKER_KEY,
     continuationNeedsWork,
+    cycleMatchesPlannerDay,
     cycleStillValid,
     formatSweepMarker,
+    mergeUndecidedLines,
     parseSweepCycle,
     parseSweepMarker,
     type SweepCycle,
@@ -85,7 +89,7 @@ export const maxDuration = 60;
 /**
  * Nightly missing-receipt request sweep (Phase 2 §5).
  *
- * Runs at 13:00 UTC (6 AM Pacific), AFTER `/api/cron/bank-register-pull`
+ * Runs at 10:00 UTC (3 AM PDT / 2 AM PST), AFTER `/api/cron/bank-register-pull`
  * (02:00 UTC) has landed last night's QBO register observations — that
  * ordering is why the pull was built first. The external
  * `scripts/post-qbo-register.mjs` runner is now a manual backfill tool, not a
@@ -127,7 +131,7 @@ const BATCH_SIZE = 1; // pageComponents keeps an oversized component whole.
 /**
  * Wall-clock budget for one invocation. `maxDuration` is 60s; stopping at 45
  * leaves room to checkpoint the cursor and return a real answer instead of
- * being killed mid-write with nothing recorded. The cron runs every 15 minutes,
+ * being killed mid-write with nothing recorded. The continuation runs every minute,
  * so a backlog drains over several invocations rather than in one heroic run.
  */
 const RUN_BUDGET_MS = 45_000;
@@ -157,8 +161,8 @@ const PHASE_KEY = SWEEP_MARKER_KEY;
  * these four lines relate:
  *
  *   0 2 * * *        /api/cron/bank-register-pull      the register this reads
- *   0 13 * * *       /api/cron/receipt-requests        this sweep, full run
- *   0/15 * * * *     /api/cron/receipt-requests?continue=1   its resume passes
+ *   0 10 * * *       /api/cron/receipt-requests        this sweep, full run
+ *   1-28,31-58 * * * *     /api/cron/receipt-requests?continue=1   its resume passes
  *   30 14 * * 1-5    /api/cron/receipt-request-cards   the cards it releases
  *
  * The pull withholds its success marker when it failed, when a batch errored,
@@ -169,8 +173,8 @@ const PHASE_KEY = SWEEP_MARKER_KEY;
  * chased, and nothing anywhere says why.
  *
  * A cycle may only stamp when the last COMPLETE pull success is inside this
- * window. 24h at the 13:00 slot cleanly separates a healthy pull (~11h old)
- * from last night's (~35h old, meaning tonight's failed), while tolerating a
+ * window. 24h at the 10:00 slot cleanly separates a healthy pull (~8h old)
+ * from last night's (~32h old, meaning tonight's failed), while tolerating a
  * pull that ran late. It lives in pipeline-health beside BANK_PULL_STALE_HOURS
  * so the two thresholds are read together and cannot drift apart.
  */
@@ -196,6 +200,17 @@ export const PULL_MOVED_REASON = "pull-moved";
  * not have moved at all — what failed is the proof that it did not.
  */
 export const LEDGER_FENCE_FAILED_REASON = "ledger-fence-failed";
+
+/**
+ * The `blockedReason` for a cycle that reached `done` with an eligible line
+ * left `undecided` and no open issue already covering it
+ * (cheap-sweep-restart-spec.md §14.6, Codex round 2 blocker 2). Distinct from
+ * the two above: nothing is stale or moving, the walk itself could not reach
+ * a verdict (an oversized competing component, most likely) — so stamping
+ * "done" over it could leave an owed charge off tomorrow's card with nothing
+ * to show it was ever missed.
+ */
+export const UNDECIDED_LINES_REASON = "undecided-lines";
 
 /** How long the fence transaction may wait for the ledger epoch's row lock. */
 const FENCE_TX_TIMEOUT_MS = 15_000;
@@ -336,8 +351,15 @@ export function sweepCompletionDecision(input: {
      * stamps then, hours before the cards.
      */
     ledgerMoved?: boolean;
+    /**
+     * An eligible line the walk reached "done" without ever judging, and with
+     * no open issue already covering it (cheap-sweep-restart §14.6, Codex
+     * round 2 blocker 2). Held open exactly like a stale pull: the next cycle
+     * re-judges it, and stamps once it can.
+     */
+    undecidedBlocking?: boolean;
 }): { phase: SweepPhase; complete: boolean; blockedReason: string | null } {
-    const held = input.bankPullStale || input.ledgerMoved === true;
+    const held = input.bankPullStale || input.ledgerMoved === true || input.undecidedBlocking === true;
     const phase: SweepPhase = held && input.computedPhase === "done" ? "lines" : input.computedPhase;
     return {
         phase,
@@ -345,10 +367,14 @@ export function sweepCompletionDecision(input: {
         // Restated every write, never carried forward, or `chaser-blocked`
         // would keep firing after the pull recovered. A register that never
         // arrived outranks one that arrived late: it is the bigger claim about
-        // the same input, and only one reason fits in the marker.
+        // the same input, and only one reason fits in the marker. An undecided
+        // line ranks last: both of the others are inputs the NEXT cycle would
+        // still have to re-read regardless, while an undecided line is this
+        // cycle's own unfinished business.
         blockedReason: input.bankPullStale
             ? BANK_PULL_STALE_REASON
-            : input.ledgerMoved === true ? PULL_MOVED_REASON : null,
+            : input.ledgerMoved === true ? PULL_MOVED_REASON
+                : input.undecidedBlocking === true ? UNDECIDED_LINES_REASON : null,
     };
 }
 
@@ -665,7 +691,7 @@ async function writeCycle(cycle: SweepCycle | null): Promise<void> {
 /**
  * THE FULL RUN'S DURABLE INTENT (round-45 gate, finding 2).
  *
- * The 13:00 full run and a continuation could fire in the same minute, and the
+ * The 10:00 full run and a continuation could fire in the same minute, and the
  * continuation could win the lease — so the full run returned
  * `already-running`, having cleared nothing, and the day's cycle never
  * restarted. Offsetting the schedule to :05/:20/:35/:50 removes the collision;
@@ -1192,7 +1218,7 @@ async function processBatchWithReplan(
     now: Date,
     cohortMode: "window" | "closure" = "window",
     budget: SweepBudget = createSweepBudget(Date.now()),
-): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; contended: number; replans: number }> {
+): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; undecidedIds?: string[]; contended: number; replans: number }> {
     let replans = 0;
     let issues = openIssues;
     let resolved = resolvedIssueKeys;
@@ -1297,7 +1323,7 @@ async function processBatch(
      */
     cohortMode: "window" | "closure" = "window",
     budget: SweepBudget = createSweepBudget(Date.now()),
-): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; replan: boolean }> {
+): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; undecidedIds?: string[]; replan: boolean }> {
     // THE LINES THIS BATCH IS ANSWERABLE FOR. The cohort query below drags in
     // neighbours so they can consume the evidence they are entitled to, but a
     // neighbour's OWN verdict belongs to the page that owns it — judging it here,
@@ -1866,7 +1892,7 @@ async function processBatch(
 
     // A line whose component would not load is undecided too — the caller
     // reports it, and the cursor does not step past it silently.
-    return { summary, undecided: plan.undecided.length + unresolved.length, replan: false };
+    return { summary, undecided: plan.undecided.length + unresolved.length, undecidedIds: [...plan.undecided, ...unresolved], replan: false };
 }
 
 
@@ -1949,6 +1975,39 @@ export async function transitionCompletedOpenPass(
     await clearOpenCheckpoint();
 }
 
+/**
+ * ONE PROGRESS LINE PER LEASED INVOCATION (cheap-sweep-restart-spec.md §14.7).
+ *
+ * Ids and counts only — never a bank-line id or an issue's details. `GET`
+ * creates this before its `try`, `runSweep` fills it in as the cycle starts
+ * and both passes and the fence run, and the `finally` logs it exactly once,
+ * whichever way the invocation exits, before the lease that made it the only
+ * writer is released.
+ */
+interface SweepProgress {
+    cycleId: string | null;
+    plannerDay: string | null;
+    phase: SweepPhase | null;
+    outcome: "ok" | "deferred" | "cursor-write-failed" | "error";
+    openBatches: number;
+    batches: number;
+    bankLines: number;
+    opened: number;
+    closed: number;
+    touched: number;
+    errors: number;
+    contended: number;
+    undecided: number;
+    undecidedLines: number;
+    replans: number;
+    setupMs: number;
+    openMs: number;
+    lineMs: number;
+    fenceMs: number;
+    certified: boolean;
+    reason: string | null;
+}
+
 export async function GET(request: Request) {
     const budget = createSweepBudget(Date.now(), Date.now, RUN_BUDGET_MS);
     if (!isCronAuthorized(request)) {
@@ -1957,9 +2016,9 @@ export async function GET(request: Request) {
     const now = new Date();
     // A DURABLE lease, held for the whole reconciliation. The old advisory
     // claim released before any work began and excluded nothing.
-    // `?continue=1` is the every-15-minutes RESUME pass. It does no work of its
+    // `?continue=1` is the every-minute RESUME pass. It does no work of its
     // own: if no cursor is parked it exits immediately, so the full sweep keeps
-    // its one predictable 6 AM slot instead of re-deriving the world 96 times a
+    // its one predictable 10:00 UTC slot instead of re-deriving the world 96 times a
     // day. Checked BEFORE the lease so a resume pass with nothing to do cannot
     // even briefly block the real run.
     const continueOnly = new URL(request.url).searchParams.get("continue") === "1";
@@ -2006,6 +2065,29 @@ export async function GET(request: Request) {
     if (!(await takeLease(LEASE_KEY, RUN_LEASE_MS, now, leaseToken))) {
         return NextResponse.json({ ok: true, skipped: "already-running" });
     }
+    const progress: SweepProgress = {
+        cycleId: null,
+        plannerDay: null,
+        phase: null,
+        outcome: "ok",
+        openBatches: 0,
+        batches: 0,
+        bankLines: 0,
+        opened: 0,
+        closed: 0,
+        touched: 0,
+        errors: 0,
+        contended: 0,
+        undecided: 0,
+        undecidedLines: 0,
+        replans: 0,
+        setupMs: 0,
+        openMs: 0,
+        lineMs: 0,
+        fenceMs: 0,
+        certified: false,
+        reason: null,
+    };
     try {
         /**
          * A SCHEDULED FULL RUN STARTS A FRESH CYCLE, CURSORS AND ALL (round-42
@@ -2018,7 +2100,7 @@ export async function GET(request: Request) {
          */
         /**
          * A CONTINUATION THAT FINDS A PENDING FULL RUN BECOMES ONE (round-45
-         * gate, finding 2). The 13:00 run records its intent before reaching
+         * gate, finding 2). The 10:00 run records its intent before reaching
          * for the lease, so losing that race costs one continuation slot
          * instead of the whole day's cycle.
          */
@@ -2046,9 +2128,10 @@ export async function GET(request: Request) {
             // not a statement about the work in progress.
             await writePhase("open-issues", undefined, null, prisma, null);
         }
-        return await runSweep(now, startingFullRun ? "open-issues" : resumePhase, startingFullRun, budget);
+        return await runSweep(now, startingFullRun ? "open-issues" : resumePhase, startingFullRun, budget, progress);
     } catch (error) {
         if (isSweepDeferredError(error)) {
+            progress.outcome = "deferred";
             const phase = await preserveDeferredSweepPhase(readPhase, phase => writePhase(phase));
             return NextResponse.json({ ok: true, phase, deferred: true, moreToProcess: true });
         }
@@ -2058,11 +2141,14 @@ export async function GET(request: Request) {
         // rather than reporting ok:true while the sweep silently redoes the
         // same batch forever.
         if (error instanceof CursorWriteError) {
+            progress.outcome = "cursor-write-failed";
             console.error("[cron/receipt-requests]", error.message);
             return NextResponse.json({ ok: false, error: "cursor-write-failed", detail: error.message }, { status: 500 });
         }
+        progress.outcome = "error";
         throw error;
     } finally {
+        console.log("[cron/receipt-requests] progress", JSON.stringify({ ...progress, totalMs: Date.now() - now.getTime() }));
         await releaseLease(LEASE_KEY, leaseToken);
     }
 }
@@ -2077,9 +2163,19 @@ async function runSweep(
      */
     clearFullRunRequestOnStart = false,
     budget: SweepBudget = createSweepBudget(Date.now()),
+    /** Filled in as this invocation runs (cheap-sweep-restart §14.7); `GET` logs it. */
+    progress?: SweepProgress,
 ) {
+    // The UTC day THIS invocation's planner actually used (cheap-sweep-restart
+    // §14.5, Codex round 2 blocker 3): `now` is what every processBatch and
+    // planner call in this invocation is judged against, so this is what the
+    // cycle record's `plannerDay` must record — not a later re-derivation.
+    const plannerDay = now.toISOString().slice(0, 10);
     const windowStart = registerWindowStartYmd(now, LOOKBACK_DAYS);
     const windowEnd = now.toISOString().slice(0, 10);
+    // SETUP, for the progress log (§14.7): from here through the issue
+    // snapshot that both passes read, before either pass does its own work.
+    const setupStart = Date.now();
 
     /**
      * THE CYCLE'S SNAPSHOT, TAKEN AT THE CYCLE'S START (Codex PR #443 gate
@@ -2116,6 +2212,9 @@ async function runSweep(
     let effectiveStartPhase = startPhase;
     budget.check();
     let cycle = await readCycle();
+    // Declared at this scope, not inside the block below, so the cycle-start
+    // log (§14.7) can still read it after that block ends.
+    let restarted = false;
     if (startPhase === "lines" || cycle !== null) {
         /**
          * THE CYCLE RECORD IS WHAT IS CHECKED, NOT THE CURSORS (round-45 gate,
@@ -2132,13 +2231,17 @@ async function runSweep(
         const storedCursors = [parseSweepCursor(await readCursor()), parseSweepCursor(await readOpenCursor())]
             .filter(cursor => cursor.key !== null);
         const stale = !cycleStillValid(cycle, snapshotEpoch, snapshotEvidenceEpoch, RECOGNITION_POLICY)
-            || storedCursors.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch));
+            || storedCursors.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch))
+            || !cycleMatchesPlannerDay(cycle, now);
         if (stale) {
+            restarted = true;
             console.log("[cron/receipt-requests] ledger or evidence moved under the cycle; restarting it", {
                 snapshotEpoch,
                 snapshotEvidenceEpoch,
                 cycle,
                 cursors: storedCursors.map(cursor => ({ epoch: cursor.epoch, evidenceEpoch: cursor.evidenceEpoch })),
+                plannerDay,
+                cyclePlannerDay: cycle?.plannerDay ?? null,
             });
             await Promise.all([writeCursor(null), writeOpenCursor(null)]);
             effectiveStartPhase = "open-issues";
@@ -2156,8 +2259,22 @@ async function runSweep(
     // being measured against, once, and nothing touches it again until the
     // next one starts.
     if (cycle === null) {
-        cycle = { id: randomUUID(), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY };
+        cycle = { id: randomUUID(), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY, plannerDay };
         await writeCycle(cycle);
+        // ONE LINE PER CYCLE (§14.7), not per invocation: `progress` below
+        // covers every leased invocation; this covers only the moment a
+        // cycle actually starts — fresh, restarted, or a scheduled full run.
+        console.log("[cron/receipt-requests] cycle-start", JSON.stringify({
+            cycleId: cycle.id,
+            plannerDay,
+            reason: clearFullRunRequestOnStart ? "full-run" : restarted ? "restart" : "none",
+            epoch: snapshotEpoch,
+            evidenceEpoch: snapshotEvidenceEpoch,
+        }));
+    }
+    if (progress) {
+        progress.cycleId = cycle.id;
+        progress.plannerDay = plannerDay;
     }
     /**
      * ONLY NOW is the full-run request discharged (round-46 gate, finding 3).
@@ -2177,6 +2294,61 @@ async function runSweep(
     // bulking is worth losing that.
     budget.check();
     const { openIssues, resolvedIssueKeys, detailsByKey } = await loadIssueSnapshot();
+    // Setup ends here, for the progress log (§14.7): everything below is one
+    // of the two passes or the fence.
+    const setupMs = Date.now() - setupStart;
+
+    /**
+     * THE SAME BLOCKING TEST, WHICHEVER PASS FINDS THE UNDECIDED LINE (Codex
+     * round 2, B2 remaining gap). Before this, only the line pass — bounded to
+     * the ~60-day window — ever called `blockingUndecidedLines`. An issue that
+     * went undecided ONLY through the open-issue pass (its line sits outside
+     * that window, e.g. a `ComponentTooLargeError` on a too-large component,
+     * cheap-sweep-restart-spec.md §14.6) never got the owner-freshness check
+     * and could never block certification, even once a ledger correction had
+     * made it freshly owed to an asked owner. Shared so the two passes cannot
+     * silently diverge on what "blocking" means.
+     */
+    async function recordUndecidedBlocking(
+        pageUndecided: string[],
+        lines: ReadonlyArray<{ id: string; postedDate: Date; amountCents: number; rawDescriptor: string; checkNumber: string | null }>,
+    ): Promise<void> {
+        if (pageUndecided.length === 0) return;
+        const open = await prisma.reviewIssue.findMany({
+            where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: pageUndecided }, clearedAt: null },
+            select: { targetKey: true, displayDetails: true },
+        });
+        // THE STORED DERIVED OWNER, for blockingUndecidedLines' own staleness
+        // check (Codex round 1, B2) — never for an issue carrying a human
+        // ownerOverride, which is authoritative on its own already-current path
+        // (§14.2) and is never "stale" just because the descriptor-derived
+        // answer differs from it. TRIMMED before the emptiness check (Codex
+        // cards-safety-followup round 1): effectiveOwner() trims ownerOverride
+        // before deciding whether it counts as set, so a whitespace-only value
+        // is NOT an override there and falls back to the derived owner.
+        // Comparing the untrimmed string here disagreed with that — it called
+        // a whitespace-only value "overridden" and skipped the very freshness
+        // check the card scan (which calls effectiveOwner) needed.
+        const openIssueDerivedOwners = new Map<string, string>();
+        for (const issue of open) {
+            const details = parseMissingReceiptDetails(issue.displayDetails);
+            const overridden = typeof details.ownerOverride === "string" && details.ownerOverride.trim() !== "";
+            if (!overridden) openIssueDerivedOwners.set(issue.targetKey, effectiveOwner({ owner: details.owner }));
+        }
+        const blocking = blockingUndecidedLines({
+            lines: lines.map(r => ({ ...r, postedDate: r.postedDate.toISOString().slice(0, 10) })),
+            undecidedIds: pageUndecided,
+            openIssueKeys: new Set(open.map(r => r.targetKey)),
+            openIssueDerivedOwners,
+            resolvedKeys: new Set(resolvedIssueKeys),
+            now,
+        });
+        if (blocking.length > 0) {
+            cycle = { ...cycle!, undecidedLines: mergeUndecidedLines(cycle!.undecidedLines, blocking) };
+            await writeCycle(cycle);
+            console.error("[cron/receipt-requests] undecided-blocking", JSON.stringify({ cycleId: cycle.id, lineIds: blocking }));
+        }
+    }
 
     // OLDEST-FIRST, FROM A DURABLE CURSOR, IN TIME-BUDGETED BATCHES.
     //
@@ -2219,6 +2391,8 @@ async function runSweep(
     // How many components had to be replanned because a sibling moved while the
     // plan was being made. Reported: a run full of them is a run racing a human.
     let replans = 0;
+    // OPEN PASS timing, for the progress log (§14.7).
+    const openStart = Date.now();
 
     while (startPhase !== "lines" && !budget.expired()) {
         const page = await prisma.reviewIssue.findMany({
@@ -2250,6 +2424,7 @@ async function runSweep(
             // that issue permanently, nagging with a target nothing can answer.
             let pageErrors = 0;
             let pageContended = 0;
+            const pageUndecided: string[] = [];
             for (const issue of orphaned) {
                 try {
                     budget.transactionOptions();
@@ -2306,6 +2481,7 @@ async function runSweep(
                 openContended += outcome.contended;
                 pageErrors += outcome.summary.errors;
                 pageContended += outcome.contended;
+                pageUndecided.push(...(outcome.undecidedIds ?? []));
             }
 
             // Same rule as the line pass: never checkpoint past a failure — from
@@ -2313,9 +2489,38 @@ async function runSweep(
             // (see processBatchWithReplan) — advancing past it strands the page it
             // sat on just as surely as an error would.
             if (pageErrors > 0 || pageContended > 0) throw new SweepDeferredError("Unit remains unreconciled");
+            await recordUndecidedBlocking(pageUndecided, lines);
 
         }, async () => {
             openCursor = page[page.length - 1].id;
+            // COMMITTED WORK BEFORE THE CURSOR WRITE (Codex round 2: "exceptional
+            // progress logs lose committed work", partially fixed in round 2 —
+            // this page's share of `openPass` was already durable by the time
+            // this callback runs, but copying it into `progress` used to happen
+            // AFTER the awaited cursor write below, so a `CursorWriteError` there
+            // skipped the copy and GET's `finally` logged the PREVIOUS page's
+            // counts instead of this one's committed work). Copying first means a
+            // failed cursor write still leaves this page's real counts behind.
+            if (progress) {
+                progress.openBatches = openBatches;
+                progress.opened = openPass.opened;
+                progress.closed = openPass.closed;
+                progress.touched = openPass.touched;
+                progress.errors = openPass.errors;
+                progress.undecided = openUndecided;
+                // SAME RULE, FOR undecidedLines (Codex cards-safety-followup
+                // round 1): recordUndecidedBlocking above already wrote
+                // cycle.undecidedLines durably, via writeCycle, before this
+                // callback ever runs — copying it here means a CursorWriteError
+                // from the writeOpenCursor call below still leaves the progress
+                // log showing the real, already-committed count instead of the
+                // stale default.
+                progress.undecidedLines = cycle!.undecidedLines?.length ?? 0;
+                progress.contended = openContended;
+                progress.replans = replans;
+                progress.setupMs = setupMs;
+                progress.openMs = Date.now() - openStart;
+            }
             // The open-issue checkpoint carries the same pair as the line one — a
             // resume into THIS pass has to prove the same thing (round-44 gate,
             // finding 1).
@@ -2328,10 +2533,12 @@ async function runSweep(
     // crash after it resumes lines. Neither window replays the open backlog.
     if (openExhausted && openPass.errors === 0 && openContended === 0 && !deferred) {
         await transitionCompletedOpenPass(
-            () => writePhase("lines", undefined, null, prisma, cycle.id),
+            // cycle!: reassigned inside the line pass's own closure (§14.6).
+            () => writePhase("lines", undefined, null, prisma, cycle!.id),
             () => writeOpenCursor(null),
         );
     }
+    const openMs = Date.now() - openStart;
 
     let cursor = await readCursor();
     const totals: ReceiptRequestApplySummary = {
@@ -2342,11 +2549,35 @@ async function runSweep(
         errors: openPass.errors,
         failedTargets: [...openPass.failedTargets],
     };
+    // WHAT THE OPEN-ISSUE PASS ALREADY COMMITTED, VISIBLE NOW (Codex round 1,
+    // real issue: "exceptional progress logs lose committed work"). The line
+    // pass below can still throw — a SweepDeferredError on unreconciled
+    // contention, or anything else uncaught — and until this invocation
+    // either returns or reaches its own catch, `progress` (see the interface
+    // comment: "filled in as the cycle starts and both passes ... run") is
+    // the only record `GET`'s `finally` block has to log. Filling it in here
+    // from this pass's own real totals, rather than waiting for `result` at
+    // the very end, means a failure partway through the line pass logs what
+    // actually committed instead of the zeros `progress` started with.
+    if (progress) {
+        progress.openBatches = openBatches;
+        progress.opened = totals.opened;
+        progress.closed = totals.closed;
+        progress.touched = totals.touched;
+        progress.errors = totals.errors;
+        progress.undecided = openUndecided;
+        progress.contended = openContended;
+        progress.replans = replans;
+        progress.setupMs = setupMs;
+        progress.openMs = openMs;
+    }
     let batches = 0;
     let linesSeen = 0;
     let undecided = openUndecided;
     let lineContended = 0;
     let exhausted = false;
+    // LINE PASS timing, for the progress log (§14.7).
+    const lineStart = Date.now();
 
     // COMPONENTS FIRST, THEN PAGES — never the other way round.
     //
@@ -2412,7 +2643,7 @@ async function runSweep(
      * (every write here is idempotent) and skipping is not.
      *
      * A cursor left by an older build carries no epoch and restarts the same
-     * way. The FRESH 13:00 run is handled by `retryOnly` below: it clears the
+     * way. The FRESH 10:00 run is handled by `retryOnly` below: it clears the
      * cursor before this point rather than resuming into it.
      */
     const parsedCursor = parseSweepCursor(cursor);
@@ -2450,6 +2681,7 @@ async function runSweep(
             const interiorBatch = batch.filter(row => !boundaryLineIds.has(row.id));
             let pageErrors = 0;
             let pageContended = 0;
+            const pageUndecided: string[] = [];
             for (const [rows, mode] of [
                 [interiorBatch, "window"],
                 [boundaryBatch, "closure"],
@@ -2467,6 +2699,7 @@ async function runSweep(
                 totals.failedTargets.push(...outcome.summary.failedTargets);
                 pageErrors += outcome.summary.errors;
                 pageContended += outcome.contended;
+                pageUndecided.push(...(outcome.undecidedIds ?? []));
             }
             batches++;
             linesSeen += batch.length;
@@ -2483,15 +2716,55 @@ async function runSweep(
             // free.
             if (pageErrors > 0 || pageContended > 0) throw new SweepDeferredError("Unit remains unreconciled");
 
+            // A NO-VERDICT LINE WITH NO OPEN ISSUE could be silently owed
+            // (cheap-sweep-restart-spec.md §14.6, Codex round 2 blocker 2): the
+            // walk reached "done" without ever judging it, so a card built from
+            // the stored open set could miss it. Recorded on the cycle and
+            // checked again at certification (below) and at card-claim time
+            // (§14.9) — a STABLE non-verdict with an open issue is not blocking,
+            // because that issue already keeps the chase alive. Same test, same
+            // recording, as the open-issue pass — see recordUndecidedBlocking.
+            await recordUndecidedBlocking(pageUndecided, batch);
+
             // The checkpoint is the last COMPONENT this page finished, so a resume
             // can never land in the middle of a competition set.
         }, async () => {
             cursor = page[page.length - 1].key;
+            // COMMITTED WORK BEFORE THE CURSOR WRITE (Codex round 2: "exceptional
+            // progress logs lose committed work", partially fixed in round 2 —
+            // this page's share of `totals` was already durable by the time this
+            // callback runs, but copying it into `progress` used to happen AFTER
+            // the awaited cursor write below, so a `CursorWriteError` there
+            // skipped the copy and GET's `finally` logged the PREVIOUS page's
+            // counts instead of this one's committed work). Copying first means a
+            // failed cursor write still leaves this page's real counts behind.
+            // `exhausted` stays gated on the write actually succeeding.
+            if (progress) {
+                progress.batches = batches;
+                progress.bankLines = linesSeen;
+                progress.opened = totals.opened;
+                progress.closed = totals.closed;
+                progress.touched = totals.touched;
+                progress.errors = totals.errors;
+                progress.undecided = undecided;
+                // SAME RULE, FOR undecidedLines (Codex cards-safety-followup
+                // round 1): recordUndecidedBlocking above already wrote
+                // cycle.undecidedLines durably, via writeCycle, before this
+                // callback ever runs — copying it here means a CursorWriteError
+                // from the writeCursor call below still leaves the progress log
+                // showing the real, already-committed count instead of the
+                // stale default.
+                progress.undecidedLines = cycle!.undecidedLines?.length ?? 0;
+                progress.contended = openContended + lineContended;
+                progress.replans = replans;
+                progress.lineMs = Date.now() - lineStart;
+            }
             await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
             if (pageIndex >= pages.length) exhausted = true;
         });
         if (unitResult.deferred) { deferred = true; break; }
     }
+    const lineMs = Date.now() - lineStart;
 
     // A finished sweep starts over from the oldest line next time — that pass
     // is what re-checks everything for CLOSES.
@@ -2561,13 +2834,25 @@ async function runSweep(
     // "Anything else" INCLUDES a run that left contended work behind. The stamp
     // is a claim that tonight's issue set is reconciled, and a component nobody
     // could reconcile makes that claim false.
-    const certifiable = computedPhase === "done" && !bankPullStale;
+    //
+    // AND A RUN THAT REACHED "done" WITH AN UNDECIDED, UNCOVERED LINE
+    // (cheap-sweep-restart §14.6, Codex round 2 blocker 2): "done" only means
+    // every batch finished without contention, and a STABLE non-verdict on a
+    // line with no open issue is not contention — it is a line the walk never
+    // judged at all. Certifying over it is exactly the same false claim.
+    const undecidedBlocking = (cycle.undecidedLines?.length ?? 0) > 0;
+    const certifiable = computedPhase === "done" && !bankPullStale && !undecidedBlocking;
+    // FENCE timing, for the progress log (§14.7).
+    const fenceStart = Date.now();
     let decision: { phase: SweepPhase; complete: boolean; blockedReason: string | null; ledgerMoved: boolean };
     if (certifiable) {
         try {
             const fenceOptions = budget.transactionOptions();
+            // Captured once, so the completion instant the fence commits is
+            // exactly what a "certified" log line (§14.7) reports below.
+            const completedAt = new Date();
             decision = await fenceAndWritePhase(
-                { snapshotEpoch, snapshotEvidenceEpoch, computedPhase, bankPullStale, now: new Date() },
+                { snapshotEpoch, snapshotEvidenceEpoch, computedPhase, bankPullStale, now: completedAt },
                 fn => prisma.$transaction(async tx => fn({
                     lockEpoch: () => lockBankLedgerEpoch(tx),
                     // The evidence lock FIRST, then its counter — same order
@@ -2586,11 +2871,24 @@ async function runSweep(
                     }),
                     // The completion names the cycle it is about (round-46
                     // gate, finding 4), so the cards cron can tell "a cycle
-                    // completed today" from "THIS cycle completed".
+                    // completed today" from "THIS cycle completed". Non-null
+                    // assertion for the same reason as the open-issue pass's
+                    // own `writePhase` call above: `cycle` is durable by this
+                    // point, but §14.6's conditional reassignment in the line
+                    // pass is enough to make TS widen its type inside any
+                    // closure that captures it.
                     writePhase: (phase, completedAt, blockedReason) =>
-                        writePhase(phase, completedAt, blockedReason, tx, cycle.id),
+                        writePhase(phase, completedAt, blockedReason, tx, cycle!.id),
                 }), { ...fenceOptions, timeout: Math.min(fenceOptions.timeout, FENCE_TX_TIMEOUT_MS) }),
             );
+            // cycle!: same reason as the writePhase callback above (§14.6).
+            if (decision.complete) {
+                console.log("[cron/receipt-requests] certified", JSON.stringify({
+                    cycleId: cycle!.id,
+                    plannerDay,
+                    completedAt: completedAt.toISOString(),
+                }));
+            }
         } catch (error) {
             /**
              * THE FENCE ITSELF FAILED — a lock wait that ran out, or the marker
@@ -2608,9 +2906,18 @@ async function runSweep(
     } else {
         // Not certifiable, so nothing to fence: this write can only ever carry
         // the previous stamp forward.
-        decision = { ...sweepCompletionDecision({ computedPhase, bankPullStale }), ledgerMoved: false };
+        decision = { ...sweepCompletionDecision({ computedPhase, bankPullStale, undecidedBlocking }), ledgerMoved: false };
         await writePhase(decision.phase, undefined, decision.blockedReason);
     }
+    const fenceMs = Date.now() - fenceStart;
+    // SAME RULE, FOR certified (Codex cards-safety-followup round 1): `decision`
+    // is already the real, durable outcome of the fence by this point — a
+    // completed fence has already committed the "done" phase in its own
+    // transaction above. Copying it here means a throwing terminal-cursor
+    // clear (clearCertifiedSweepCheckpoint's writeCursor(null) below) still
+    // leaves the progress log showing certified: true instead of the stale
+    // default.
+    if (progress) progress.certified = decision.complete;
     await clearCertifiedSweepCheckpoint(decision.complete, () => writeCursor(null));
     const ledgerMoved = decision.ledgerMoved;
     const fenceFailed = decision.blockedReason === LEDGER_FENCE_FAILED_REASON;
@@ -2627,7 +2934,8 @@ async function runSweep(
         ...(bankPullStale
             ? { reason: BANK_PULL_STALE_REASON }
             : ledgerMoved ? { reason: PULL_MOVED_REASON }
-                : fenceFailed ? { reason: LEDGER_FENCE_FAILED_REASON } : {}),
+                : fenceFailed ? { reason: LEDGER_FENCE_FAILED_REASON }
+                    : undecidedBlocking ? { reason: UNDECIDED_LINES_REASON } : {}),
         bankPull: { fresh: bankPull.fresh, lastSuccessAt: bankPull.lastSuccessAt },
         window: { start: windowStart, end: windowEnd },
         batches,
@@ -2638,6 +2946,11 @@ async function runSweep(
         replans,
         bankLines: linesSeen,
         undecided,
+        // At most 50 of `undecided`'s ids: chase candidates the walk left
+        // undecided with no open issue covering them. Non-zero is what holds
+        // "done" back (`undecidedBlocking` above) until a future cycle judges
+        // them.
+        undecidedLines: cycle.undecidedLines?.length ?? 0,
         // The share of `undecided` that was CONTENDED — no verdict because the
         // component kept moving. It is the part that blocks the completion
         // stamp and comes back on the next run.
@@ -2647,7 +2960,7 @@ async function runSweep(
         // exhausted its pages but left a component unreconciled, and including a
         // cycle held open because the register it read was not current.
         moreToProcess: !exhausted || !openExhausted || openContended > 0 || lineContended > 0
-            || bankPullStale || ledgerMoved || fenceFailed || deferredRun,
+            || bankPullStale || ledgerMoved || fenceFailed || deferredRun || undecidedBlocking,
         cursor,
         elapsedMs: Date.now() - startedAt,
         ...totals,
@@ -2656,6 +2969,28 @@ async function runSweep(
         console.error("[cron/receipt-requests]", JSON.stringify(result));
     } else if (totals.opened > 0 || totals.closed > 0) {
         console.log("[cron/receipt-requests]", JSON.stringify(result));
+    }
+    // The counts from `result`, for the progress log (§14.7). Ids and counts
+    // only — never `result.failedTargets` or `result.cursor`.
+    if (progress) {
+        progress.phase = result.phase;
+        progress.openBatches = result.openBatches;
+        progress.batches = result.batches;
+        progress.bankLines = result.bankLines;
+        progress.opened = result.opened;
+        progress.closed = result.closed;
+        progress.touched = result.touched;
+        progress.errors = result.errors;
+        progress.contended = result.contended;
+        progress.undecided = result.undecided;
+        progress.undecidedLines = result.undecidedLines;
+        progress.replans = result.replans;
+        progress.setupMs = setupMs;
+        progress.openMs = openMs;
+        progress.lineMs = lineMs;
+        progress.fenceMs = fenceMs;
+        progress.certified = decision.complete;
+        progress.reason = result.reason ?? null;
     }
     // 500 when anything failed, so the platform surfaces it. Whatever committed
     // stays committed and the cursor did not move past the failure.

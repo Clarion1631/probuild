@@ -63,7 +63,7 @@ function fence(input: { epochNow: string; appeared: number; evidenceEpochNow?: s
  *     on its own cap wrote nothing at all. Both report `complete: false`, and
  *     both left `pullContinuationPending` answering no — so every 15-minute
  *     slot exited with `nothing-in-progress` and a backlog drained one NIGHT
- *     per window while the 13:00 chaser waited on a stamp that could not come.
+ *     per window while the 10:00 chaser waited on a stamp that could not come.
  *  2. The chaser's line pass loads its window ONCE and reads the pull's
  *     freshness marker at the END. A pull landing in between satisfies both: a
  *     fresh marker over a stale snapshot, so the cycle stamped "complete" for a

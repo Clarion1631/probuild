@@ -54,7 +54,7 @@ export interface SweepMarker {
      * whether that date was today. A completion stamped by this morning's cycle
      * is carried forward by every later `writePhase` — that is deliberate, it
      * is a true statement about a cycle that really happened — so a NEW cycle
-     * that started at 13:00 and is still mid-flight, or blocked, still looked
+     * that started at 10:00 and is still mid-flight, or blocked, still looked
      * "completed today". The cards then went out on a partially reconciled set.
      *
      * So completion is a tuple, and the cards cron asks about the CURRENT
@@ -169,12 +169,34 @@ export function chaserCompletedFor(
 export const CYCLE_KEY = "receiptRequestsCycle";
 
 export interface SweepCycle {
-    /** Identifies the cycle in logs; never compared for correctness. */
+    /**
+     * Identifies the cycle in logs. Also compared for correctness, under
+     * lock, at card-claim time: `claimOwnerDay` requires it to equal the
+     * cycle its scan was certified against —
+     * `(cycle?.id ?? null) === input.cycleIdAtScan`
+     * (receipt-request-cards/route.ts) — Codex round 2 blocker 1, PR #530.
+     */
     id: string;
     epoch: string;
     evidenceEpoch: string;
     /** Absent legacy cycles used the default-off recognition policy. */
     recognitionPolicy?: string;
+    /**
+     * `YYYY-MM-DD`, the UTC day of the `now` the planner actually used
+     * (cheap-sweep-restart-spec.md §14.4/§14.5, Codex round 2 blocker 3).
+     * `startedAt` alone does not prove this: `now` is captured before the
+     * cycle record is written, so a continuation straddling UTC midnight
+     * could record a day it never actually planned against. A legacy cycle
+     * has none, so it restarts once after deploy (§14.5).
+     */
+    plannerDay?: string;
+    /**
+     * At most 50 bank-line ids the walk left `undecided` WITH NO open issue
+     * covering them (§14.3, §14.6, Codex round 2 blocker 2). Non-empty
+     * blocks certification: a stamp with an undecided, uncovered line could
+     * be silently missing something owed.
+     */
+    undecidedLines?: string[];
 }
 
 export function parseSweepCycle(value: string | null): SweepCycle | null {
@@ -185,8 +207,15 @@ export function parseSweepCycle(value: string | null): SweepCycle | null {
         if (typeof parsed.epoch !== "string" || !parsed.epoch) return null;
         if (typeof parsed.evidenceEpoch !== "string" || !parsed.evidenceEpoch) return null;
         if (parsed.recognitionPolicy !== undefined && (typeof parsed.recognitionPolicy !== "string" || !parsed.recognitionPolicy)) return null;
+        if (parsed.plannerDay !== undefined && (typeof parsed.plannerDay !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.plannerDay))) return null;
+        if (parsed.undecidedLines !== undefined) {
+            if (!Array.isArray(parsed.undecidedLines) || parsed.undecidedLines.length > 50
+                || !parsed.undecidedLines.every(id => typeof id === "string" && id.length > 0)) return null;
+        }
         return { id: parsed.id, epoch: parsed.epoch, evidenceEpoch: parsed.evidenceEpoch,
-            ...(parsed.recognitionPolicy === undefined ? {} : { recognitionPolicy: parsed.recognitionPolicy }) };
+            ...(parsed.recognitionPolicy === undefined ? {} : { recognitionPolicy: parsed.recognitionPolicy }),
+            ...(parsed.plannerDay === undefined ? {} : { plannerDay: parsed.plannerDay }),
+            ...(parsed.undecidedLines === undefined ? {} : { undecidedLines: parsed.undecidedLines }) };
     } catch {
         return null;
     }
@@ -206,6 +235,22 @@ export function cycleRecognitionPolicyMatches(cycle: SweepCycle | null, policy: 
 export function cycleStillValid(cycle: SweepCycle | null, epoch: string, evidenceEpoch: string, recognitionPolicy?: string): boolean {
     return cycle !== null && cycle.epoch === epoch && cycle.evidenceEpoch === evidenceEpoch
         && (recognitionPolicy === undefined || cycleRecognitionPolicyMatches(cycle, recognitionPolicy));
+}
+
+/**
+ * Did this cycle plan against TODAY'S UTC day (cheap-sweep-restart-spec.md
+ * §14.4/§14.5, Codex round 2 blocker 3)? A null cycle, or one with no
+ * `plannerDay` at all (a legacy cycle), is not usable — same direction as
+ * every other cycle predicate here: an absent guarantee is not a satisfied
+ * one.
+ */
+export function cycleMatchesPlannerDay(cycle: SweepCycle | null, now: Date): boolean {
+    return cycle !== null && cycle.plannerDay === now.toISOString().slice(0, 10);
+}
+
+/** The sorted, unique union of two undecided-line-id lists, keeping the first 50. */
+export function mergeUndecidedLines(existing: readonly string[] | undefined, add: readonly string[]): string[] {
+    return [...new Set([...(existing ?? []), ...add])].sort().slice(0, 50);
 }
 
 // ── The continuation predicate (moved verbatim from the sweep route) ─────────
@@ -252,12 +297,41 @@ export function cycleCertified(input: CycleCertificationInput): boolean {
         && cycleStillValid(input.cycle, input.bankEpoch, input.evidenceEpoch, input.recognitionPolicy);
 }
 
+/**
+ * Everything a CARD may trust before selecting from the stored open set
+ * (cheap-sweep-restart-spec.md §14.4, answering Codex round 2 blockers 2 and
+ * 3): `cycleCertified`'s epoch/identity/timing guarantee, PLUS the cycle
+ * planned entirely against today's UTC day, PLUS nothing the walk left
+ * undecided could still be silently owed. `claimOwnerDay` (§14.9) re-checks
+ * this itself, inside the claim transaction — this pure form is what lets the
+ * cards route and the health diagnostic ask the identical question.
+ */
+export function cardSelectionCertified(input: CycleCertificationInput & { pacificDate: string; timeZone?: string }): boolean {
+    return chaserCompletedFor(input.marker, input.pacificDate, input.timeZone ?? "America/Los_Angeles", input.cycle?.id ?? null)
+        && cycleCertified(input)
+        && cycleMatchesPlannerDay(input.cycle, input.now)
+        && (input.cycle?.undecidedLines?.length ?? 0) === 0;
+}
+
 /** Completed cycles remain stored because card selection verifies their identity. */
 export function continuationNeedsWork(input: CycleCertificationInput & {
     fullRunOwed: boolean; lineCursor: string | null; openCursor: string | null;
 }): boolean {
     if (input.fullRunOwed) return true;
-    if (cycleCertified(input)) return false;
+    // CERTIFIED FOR TODAY'S PLANNER DAY, not merely certified (Codex round 1,
+    // real issue — "completed legacy cycles need not restart after
+    // deployment"): `cycleCertified` alone proves the epochs, identity and
+    // timing are unchanged, but says nothing about which day the cycle was
+    // PLANNED against. A legacy cycle (no `plannerDay` — see that field's own
+    // doc comment: "it restarts once after deploy") or one left over across a
+    // UTC day rollover can pass every other check here forever, with no
+    // epoch change or full-run request ever forcing a resume.
+    // `cardSelectionCertified` already refuses to hand a card out from that
+    // cycle (`cycleMatchesPlannerDay`), so nothing wrong ships — but without
+    // the same check here, the sweep itself never learns it owes a fresh
+    // cycle, so the mismatch never heals on its own. Requiring both is what
+    // lets it resume like any other unfinished cycle.
+    if (cycleCertified(input) && cycleMatchesPlannerDay(input.cycle, input.now)) return false;
     // A crash between durable cycle creation and phase/checkpoint writes still resumes.
     return input.cycle !== null || shouldResumeSweep(input.marker.phase, input.lineCursor, input.openCursor);
 }

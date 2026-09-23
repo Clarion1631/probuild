@@ -211,6 +211,32 @@ test("tagging re-validates INSIDE the lock and pins projectId in the write", () 
     assert.match(guarded, /if \(updated\.count !== ids\.length\) throw new TimeEntryTagConflictError/);
 });
 
+// ── 3. receipt-booked expenses stay taggable (native-expense-guards-spec.md §5) ──
+
+test("tagging an expense to a change order carries no receipt-booked guard", () => {
+    // Design decision: receipts are cost-plus change-order actuals, so
+    // Move to job's guard must never reach here — "Tag selected" has to keep
+    // working on a receipt-booked row exactly as it does on a manual one.
+    // tagExpensesToChangeOrderCore is untouched by that design (it is on the
+    // spec's "do not touch" list); this pins that it stays that way. Only the
+    // QBO guard applies, same as before.
+    const source = read(CORE);
+    const start = source.indexOf("export async function tagExpensesToChangeOrderCore");
+    assert.ok(start > -1, "tagExpensesToChangeOrderCore moved");
+    const body = source.slice(start, source.indexOf("export async function", start + 1) === -1
+        ? source.length
+        : source.indexOf("export async function", start + 1));
+    assert.ok(body.length > 500, "the function body is empty — the parser is matching nothing");
+
+    assert.doesNotMatch(body, /isReceiptBookedExpense/, "no receipt-booked guard blocks tagging");
+    assert.doesNotMatch(body, /receiptIntake/, "the tag path reads nothing about receipt intake");
+    assert.doesNotMatch(body, /RECEIPT_EXPENSE_/);
+
+    // The control: the QBO guard IS still there, so an empty result above
+    // means "no receipt guard", not "the parser found nothing at all".
+    assert.match(body, /assertExpenseMutableOutsideQbo\(row\)/);
+});
+
 test("both project-changing writers REFUSE a change-order-tagged entry", () => {
     // Refuse, not clear: dropping somebody's cost-plus tag as a side effect of
     // a re-route is not a decision either of these gets to make. Nothing in the
