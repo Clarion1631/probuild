@@ -387,7 +387,9 @@ test("the block is reported where a human will see it, not only in the summary",
     // WHILE the pass was running leaves a list this cycle never judged.
     // A third reason since round 37, finding 3: the fence itself failing is not
     // proof the ledger moved, but it is the absence of proof that it did not.
-    assert.match(sweep, /\.\.\.\(bankPullStale[\s]*\? \{ reason: BANK_PULL_STALE_REASON \}[\s]*: ledgerMoved \? \{ reason: PULL_MOVED_REASON \}[\s]*: fenceFailed \? \{ reason: LEDGER_FENCE_FAILED_REASON \} : \{\}\)/);
+    // A fourth since cheap-sweep-restart §14.6 (Codex round 2 blocker 2): an
+    // eligible line the walk left undecided with no open issue covering it.
+    assert.match(sweep, /\.\.\.\(bankPullStale[\s]*\? \{ reason: BANK_PULL_STALE_REASON \}[\s]*: ledgerMoved \? \{ reason: PULL_MOVED_REASON \}[\s]*: fenceFailed \? \{ reason: LEDGER_FENCE_FAILED_REASON \}[\s]*: undecidedBlocking \? \{ reason: UNDECIDED_LINES_REASON \} : \{\}\)/);
     assert.match(sweep, /bankPull: \{ fresh: bankPull\.fresh, lastSuccessAt: bankPull\.lastSuccessAt \}/);
     // …and on the marker the health check already reads, so it does not need a
     // probe of its own.

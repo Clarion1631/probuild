@@ -25,7 +25,11 @@ test("the cycle's epochs live in a record of their own, not on the cursors", () 
     // The bug, stated from the source: cursors are cleared the moment their
     // pass completes, so a continuation could find nothing to validate and take
     // a fresh snapshot of a world that had already moved.
-    assert.match(sweep, /transitionCompletedOpenPass\([\s\S]{0,180}writePhase\("lines", undefined, null, prisma, cycle\.id\)[\s\S]{0,80}writeOpenCursor\(null\)/,
+    // `cycle!.id`, not `cycle.id`: §14.6's conditional reassignment of `cycle`
+    // inside the line pass's own closure (for `undecidedLines`) is enough to
+    // make TS widen `cycle`'s type inside every closure that captures it,
+    // this one included, so the non-null assertion is required to compile.
+    assert.match(sweep, /transitionCompletedOpenPass\([\s\S]{0,180}writePhase\("lines", undefined, null, prisma, cycle!\.id\)[\s\S]{0,80}writeOpenCursor\(null\)/,
         "the open cursor clears after the durable phase handoff; the cycle must still validate epochs");
     assert.match(sweep, /clearCertifiedSweepCheckpoint\(decision.complete, \(\) => writeCursor\(null\)\)/);
 

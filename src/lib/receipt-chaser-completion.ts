@@ -83,10 +83,10 @@ export type ChaserSettingKey = (typeof CHASER_COMPLETION_KEYS)[number];
 
 /**
  * Blocked reasons the sweep can write (`BANK_PULL_STALE_REASON`,
- * `PULL_MOVED_REASON`, `LEDGER_FENCE_FAILED_REASON` in the route). Anything
- * else is reported as "other" rather than echoed.
+ * `PULL_MOVED_REASON`, `LEDGER_FENCE_FAILED_REASON`, `UNDECIDED_LINES_REASON`
+ * in the route). Anything else is reported as "other" rather than echoed.
  */
-export const KNOWN_BLOCKED_REASONS = ["bank-pull-stale", "pull-moved", "ledger-fence-failed"] as const;
+export const KNOWN_BLOCKED_REASONS = ["bank-pull-stale", "pull-moved", "ledger-fence-failed", "undecided-lines"] as const;
 
 type FindManyOnly<M extends { findMany: unknown }> = Pick<M, "findMany">;
 /** Read-only surface: `findMany` only. A write method does not type-check. */

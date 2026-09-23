@@ -1,13 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
     isChaseCandidate,
     blockingUndecidedLines,
     RECEIPT_REQUEST_GRACE_DAYS,
 } from "../src/lib/receipt-requests";
 import { classifyReceiptRequirement } from "../src/lib/receipt-policy";
+import {
+    sweepCompletionDecision,
+    BANK_PULL_STALE_REASON,
+    PULL_MOVED_REASON,
+    UNDECIDED_LINES_REASON,
+} from "../src/app/api/cron/receipt-requests/route";
 
-// cheap-sweep-restart-spec.md §14.3 (Codex round 2 blocker 2).
+// cheap-sweep-restart-spec.md §14.3 and §14.6 (Codex round 2 blocker 2).
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const read = (rel: string) => readFileSync(join(repoRoot, rel), "utf8");
 
 const NOW = new Date("2026-09-22T09:00:00Z");
 
@@ -218,4 +230,47 @@ test("blockingUndecidedLines", async t => {
         });
         assert.deepEqual(result, ["bl-a", "bl-b"]);
     });
+});
+
+// ═══ §14.6: undecidedBlocking holds "done" back ═════════════════════════
+
+test("sweepCompletionDecision: undecidedBlocking holds a done phase at lines", () => {
+    assert.deepEqual(
+        sweepCompletionDecision({ computedPhase: "done", bankPullStale: false, undecidedBlocking: true }),
+        { phase: "lines", complete: false, blockedReason: UNDECIDED_LINES_REASON },
+    );
+});
+
+test("sweepCompletionDecision: a stale pull and a moved pull each outrank undecided lines", () => {
+    assert.deepEqual(
+        sweepCompletionDecision({ computedPhase: "done", bankPullStale: true, undecidedBlocking: true }).blockedReason,
+        BANK_PULL_STALE_REASON,
+    );
+    assert.deepEqual(
+        sweepCompletionDecision({ computedPhase: "done", bankPullStale: false, ledgerMoved: true, undecidedBlocking: true }).blockedReason,
+        PULL_MOVED_REASON,
+    );
+});
+
+test("sweepCompletionDecision: undecidedBlocking false or absent does not hold a done phase", () => {
+    assert.equal(sweepCompletionDecision({ computedPhase: "done", bankPullStale: false, undecidedBlocking: false }).phase, "done");
+    assert.equal(sweepCompletionDecision({ computedPhase: "done", bankPullStale: false }).phase, "done");
+});
+
+test("source pin: certifiable requires !undecidedBlocking", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    assert.match(sweep, /const undecidedBlocking = \(cycle\.undecidedLines\?\.length \?\? 0\) > 0;/);
+    assert.match(sweep, /const certifiable = computedPhase === "done" && !bankPullStale && !undecidedBlocking;/);
+});
+
+test("source pin: in the line pass, writeCycle( follows blockingUndecidedLines( and precedes the checkpoint callback", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    const blockingAt = sweep.indexOf("blockingUndecidedLines(");
+    const writeCycleAt = sweep.indexOf("await writeCycle(cycle);", blockingAt);
+    // The checkpoint callback is runCheckpointedUnits' second argument, where
+    // the line-pass cursor advances.
+    const checkpointAt = sweep.indexOf("cursor = page[page.length - 1].key;", blockingAt);
+    assert.ok(blockingAt > 0, "blockingUndecidedLines is called in the line pass");
+    assert.ok(writeCycleAt > blockingAt, "writeCycle follows blockingUndecidedLines");
+    assert.ok(checkpointAt > writeCycleAt, "writeCycle precedes the checkpoint callback, so the cursor never passes an unrecorded line");
 });
