@@ -5516,8 +5516,30 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
     // have read as "this charge has its receipt". Unfenced, a sweep mid-cycle
     // could close a chase on evidence this statement was in the middle of
     // destroying — and certify it, because nothing moved the epoch.
-    await withReceiptEvidenceLock(fn => prisma.$transaction(fn),
-        tx => tx.expense.deleteMany({ where: { estimateId } }));
+    //
+    // RECEIPT-BOOKED EXPENSES REFUSE THE WHOLE DELETE INSTEAD (2026-09-23).
+    // Native receipt booking (receipt-intake/book.ts) attaches its Expense to
+    // the project's newest estimate -- drafts included -- so this estimate can
+    // pick up a fresh one in the gap between the count check above and this
+    // transaction. Hard-deleting it here would strand its ReceiptIntake at
+    // BOOKED with expenseId null: on no job, unre-sendable, and its bank
+    // charge still looks covered. The check has to run AFTER the lock and
+    // INSIDE this same transaction, or the identical race just reopens one
+    // level up.
+    let receiptBookedCount = 0;
+    await withReceiptEvidenceLock(fn => prisma.$transaction(fn), async tx => {
+        receiptBookedCount = await tx.expense.count({
+            where: { estimateId, qbPurchaseId: null, receiptIntake: { isNot: null } },
+        });
+        if (receiptBookedCount > 0) return;
+        await tx.expense.deleteMany({ where: { estimateId } });
+    });
+    if (receiptBookedCount > 0) {
+        return {
+            success: false,
+            error: `This estimate has ${receiptBookedCount} expense(s) from receipts, so it can't be deleted. Archive it instead.`,
+        };
+    }
     await prisma.estimate.delete({ where: { id: estimateId } });
 
     if (estimate.projectId) {
