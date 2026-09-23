@@ -6,7 +6,8 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, loadInvoiceAmountDue, dueSnapshot, resendConfirmPayload, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
+import { getProjectBilling, sendMilestoneInvoicesCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
+import { handleResendInvoiceTool } from "@/lib/resend-invoice-tool";
 import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrewConflicts } from "@/lib/schedule-core";
 import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
@@ -792,63 +793,14 @@ function createHandler(actor: RouteMcpActor) {
                 },
             },
             async ({ invoiceId, overrideEmail, confirmToken }) => {
-                const invoice = await prisma.invoice.findUnique({
-                    where: { id: invoiceId },
-                    include: { client: true, payments: { select: { name: true, amount: true, status: true, qbSyncError: true } } },
-                });
-                if (!invoice) return { ...textResult({ error: "Invoice not found" }), isError: true };
-                const recipient = (overrideEmail || invoice.client?.email || "").trim();
-
-                const loaded = await loadInvoiceAmountDue(invoiceId);
-                if (!loaded) return { ...textResult({ error: "Invoice not found" }), isError: true };
-                const { due } = loaded;
-                const milestonesPreview = invoice.payments.map(p => ({ name: p.name, amount: Number(p.amount), status: p.status, staleLink: !!p.qbSyncError }));
-
-                if (due.dueCents <= 0) {
-                    // ALWAYS the nothing-due preview here, whatever confirmToken was
-                    // supplied — never fall through to resendInvoiceCore. A forged or
-                    // stale token must never reach the core: if a milestone got billed
-                    // in the race window between this read and the core's own fresh
-                    // read, the core would find something due and send it, with no
-                    // token ever actually verified.
-                    return textResult({
-                        preview: true,
-                        willSend: false,
-                        reason: `Nothing on ${invoice.code} is billed and unpaid, so there is nothing to ask the client for. To ask for a payment, use the send_milestone_invoice tool.`,
-                        invoice: { code: invoice.code, status: invoice.status, total: Number(invoice.totalAmount), balanceDue: Number(invoice.balanceDue) },
-                        milestones: milestonesPreview,
-                    });
-                }
-
-                // The token binds the recipient AND the exact billed set (not just
-                // its dollar total) — a milestone swapped for an equal-priced one
-                // between preview and confirm must not ride the old approval.
-                const payload = resendConfirmPayload({ invoiceId, recipient, due });
-                if (!verifyPreviewToken(confirmToken, payload)) {
-                    return textResult({
-                        preview: true,
-                        invoice: {
-                            code: invoice.code, status: invoice.status, total: Number(invoice.totalAmount), balanceDue: Number(invoice.balanceDue),
-                            note: "balanceDue is the whole remaining contract. The email asks only for amountDue: milestones already billed and unpaid.",
-                        },
-                        amountDue: due.dueCents / 100,
-                        dueNow: due.items.map(it => ({ name: it.label, amount: it.cents / 100 })),
-                        milestones: milestonesPreview,
-                        recipient: recipient || "(no client email on file — provide overrideEmail)",
-                        confirmToken: mintPreviewToken(payload),
-                        instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
-                    });
-                }
-                try {
-                    // recipient (not the raw overrideEmail) is what's bound into the
-                    // now-verified token, so the email goes to exactly the approved
-                    // address; expectedDue re-pins the approved billed set so the send
-                    // refuses if it drifted after this preview was shown.
-                    const result = await resendInvoiceCore(invoiceId, recipient || undefined, undefined, { expectedDue: dueSnapshot(due) });
-                    return textResult(result);
-                } catch (err: any) {
-                    return { ...textResult({ error: err?.message || "Resend failed" }), isError: true };
-                }
+                // Decision logic lives in resend-invoice-tool.ts (unit-tested there);
+                // this callback only wraps the result the same way every other tool
+                // does — textResult(), with isError merged in for the error cases.
+                const { isError, ...body } = await handleResendInvoiceTool(
+                    { invoiceId, overrideEmail, confirmToken },
+                    { mintPreviewToken, verifyPreviewToken },
+                );
+                return isError ? { ...textResult(body), isError: true } : textResult(body);
             },
         );
 
