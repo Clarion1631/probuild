@@ -315,16 +315,39 @@ test("source pin: certifiable requires !undecidedBlocking", () => {
     assert.match(sweep, /const certifiable = computedPhase === "done" && !bankPullStale && !undecidedBlocking;/);
 });
 
-test("source pin: in the line pass, writeCycle( follows blockingUndecidedLines( and precedes the checkpoint callback", () => {
+// Both passes now call ONE shared helper (recordUndecidedBlocking) instead of
+// each having its own inline blockingUndecidedLines(...)/writeCycle(cycle)
+// block, so a plain `indexOf("blockingUndecidedLines(")` finds the helper's
+// own body — the only occurrence left in the file — no matter which pass (if
+// either) actually calls that helper. That pin would stay green even if a
+// pass's call to the helper were deleted entirely. Split in two: this one
+// pins the helper's own internals; the line-pass and open-issue-pass pins
+// below separately pin that each pass actually calls the helper before its
+// own checkpoint advances its own cursor.
+test("source pin: the recordUndecidedBlocking helper calls blockingUndecidedLines( and then writeCycle(cycle)", () => {
     const sweep = read("src/app/api/cron/receipt-requests/route.ts");
-    const blockingAt = sweep.indexOf("blockingUndecidedLines(");
+    const helperAt = sweep.indexOf("async function recordUndecidedBlocking(");
+    const blockingAt = sweep.indexOf("blockingUndecidedLines(", helperAt);
     const writeCycleAt = sweep.indexOf("await writeCycle(cycle);", blockingAt);
+    assert.ok(helperAt > 0, "recordUndecidedBlocking is defined");
+    assert.ok(blockingAt > helperAt, "the helper calls blockingUndecidedLines");
+    assert.ok(writeCycleAt > blockingAt, "the helper's writeCycle(cycle) follows blockingUndecidedLines, so a blocking result is always persisted");
+});
+
+// Anchored on `const windowLines`, which appears exactly once in the file,
+// immediately before the line pass's own setup — so this can only match the
+// line pass's own call to the helper, not the open-issue pass's earlier one
+// or the helper's own internal call.
+test("source pin: in the line pass, recordUndecidedBlocking( is called before the checkpoint callback advances the cursor", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    const windowLinesAt = sweep.indexOf("const windowLines = budget.expired()");
+    const recordAt = sweep.indexOf("await recordUndecidedBlocking(pageUndecided, batch);", windowLinesAt);
     // The checkpoint callback is runCheckpointedUnits' second argument, where
     // the line-pass cursor advances.
-    const checkpointAt = sweep.indexOf("cursor = page[page.length - 1].key;", blockingAt);
-    assert.ok(blockingAt > 0, "blockingUndecidedLines is called in the line pass");
-    assert.ok(writeCycleAt > blockingAt, "writeCycle follows blockingUndecidedLines");
-    assert.ok(checkpointAt > writeCycleAt, "writeCycle precedes the checkpoint callback, so the cursor never passes an unrecorded line");
+    const checkpointAt = sweep.indexOf("cursor = page[page.length - 1].key;", windowLinesAt);
+    assert.ok(windowLinesAt > 0, "the line pass's window-lines setup is present");
+    assert.ok(recordAt > windowLinesAt, "the line pass calls recordUndecidedBlocking(pageUndecided, batch)");
+    assert.ok(checkpointAt > recordAt, "recordUndecidedBlocking precedes the checkpoint callback, so the cursor never passes an unrecorded line");
 });
 
 // These two pin the path an undecided line's id travels from processBatch's
@@ -429,4 +452,28 @@ test("an open-issue-pass line undecided with a fresh owner does not block certif
     assert.deepEqual(cycle.undecidedLines, [], "an empty blocking result leaves undecidedLines empty");
     assert.equal(certifiedFor(cycle), true,
         "a fresh-owner undecided line from the open-issue pass must not block an otherwise-certified cycle");
+});
+
+// The two tests above prove blockingUndecidedLines -> mergeUndecidedLines ->
+// cardSelectionCertified behaves correctly for an open-issue-pass-only line.
+// They call those three functions directly, so they pass whether or not
+// route.ts's open-issue pass actually wires itself into that composition —
+// they would still be green even if the open-issue pass's own call to
+// recordUndecidedBlocking (the function that performs exactly that
+// composition) were deleted. This pin closes that gap. Anchored on the FIRST
+// `const pageUndecided: string[] = [];` in the file, which is the open-issue
+// pass's own declaration (the line pass declares a second one further down —
+// see the line-pass pin above, which is anchored past this point).
+test("source pin: in the open-issue pass, recordUndecidedBlocking( is called after the errors/contention gate and before the checkpoint advances openCursor", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    const pageUndecidedAt = sweep.indexOf("const pageUndecided: string[] = [];");
+    const pushAt = sweep.indexOf("pageUndecided.push(...(outcome.undecidedIds ?? []));", pageUndecidedAt);
+    const gateAt = sweep.indexOf('throw new SweepDeferredError("Unit remains unreconciled");', pushAt);
+    const recordAt = sweep.indexOf("await recordUndecidedBlocking(pageUndecided, lines);", gateAt);
+    const checkpointAt = sweep.indexOf("openCursor = page[page.length - 1].id;", recordAt);
+    assert.ok(pageUndecidedAt > 0, "the open-issue pass declares pageUndecided");
+    assert.ok(pushAt > pageUndecidedAt, "the open-issue pass collects each batch outcome's undecidedIds into pageUndecided");
+    assert.ok(gateAt > pushAt, "the errors/contention gate follows the collection");
+    assert.ok(recordAt > gateAt, "recordUndecidedBlocking(pageUndecided, lines) is called after the gate");
+    assert.ok(checkpointAt > recordAt, "recordUndecidedBlocking precedes the checkpoint callback, so openCursor never advances past an unrecorded undecided line");
 });
