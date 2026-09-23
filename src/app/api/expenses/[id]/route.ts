@@ -33,6 +33,12 @@ import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { CALENDAR_DATE_NOT_REAL, classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
+import {
+    isReceiptBookedExpense,
+    RECEIPT_EXPENSE_CODE,
+    RECEIPT_EXPENSE_NO_DELETE,
+    RECEIPT_EXPENSE_NO_EDIT,
+} from "@/lib/receipt-intake/booked-expense-rules";
 
 export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
@@ -56,10 +62,17 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
                 projectId: true,
                 estimateId: true,
                 estimate: { select: { projectId: true } },
+                receiptIntake: { select: { id: true } },
             },
         });
         assertExpenseMutableOutsideQbo(expense);
         if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
+        if (isReceiptBookedExpense(expense)) {
+            return NextResponse.json(
+                { error: RECEIPT_EXPENSE_NO_DELETE, code: RECEIPT_EXPENSE_CODE },
+                { status: 409 },
+            );
+        }
 
         // Fail CLOSED: with no resolvable project there is no scope to
         // authorize against, so nobody may delete it here.
@@ -94,6 +107,7 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
                 where: {
                     id,
                     qbPurchaseId: null,
+                    receiptIntake: { is: null },
                     // The predicate carries the answer, so a row that moved in
                     // the gap matches nothing rather than being deleted.
                     ...expenseStillOnProjectWhere(expense, locked),
@@ -154,10 +168,17 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 estimateId: true,
                 projectId: true,
                 estimate: { select: { projectId: true } },
+                receiptIntake: { select: { id: true } },
             },
         });
         assertExpenseMutableOutsideQbo(expense);
         if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
+        if (isReceiptBookedExpense(expense)) {
+            return NextResponse.json(
+                { error: RECEIPT_EXPENSE_NO_EDIT, code: RECEIPT_EXPENSE_CODE },
+                { status: 409 },
+            );
+        }
 
         // Fail CLOSED on an unattributable row: with no project there is no
         // scope to authorize against, so nobody may edit it here.
@@ -705,6 +726,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             const written = await tx.expense.updateMany({
             where: {
                 id,
+                receiptIntake: { is: null },
                 // COMPARE-AND-SET on the tax figures these verdicts rested on,
                 // pinned to what was read UNDER the lock. The lock orders the
                 // writers that take it; the predicate is what still protects
@@ -843,10 +865,12 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
  * The TAX-CORRECTION path (Codex round 4, item 3).
  *
  * Split out from PUT because PUT cannot serve it. PUT is guarded by
- * `assertExpenseMutableOutsideQbo`, and every expense the receipt pipeline
- * creates carries a `qbPurchaseId` — which is precisely the population the tax
- * report reads. The correction path therefore could not reach a single row it
- * was built for.
+ * `assertExpenseMutableOutsideQbo` for QBO-backed rows and by the receipt rule
+ * (`isReceiptBookedExpense`, RECEIPT_EXPENSE_NO_EDIT) for receipt-booked
+ * rows — and together those two refuse every expense the receipt pipeline
+ * creates, whether or not it carries a `qbPurchaseId`, which is precisely the
+ * population the tax report reads. The correction path therefore could not
+ * reach a single row it was built for.
  *
  * The guard is right for PUT and wrong here, and the reason is what these
  * columns ARE: `installedAtCustomer`, `taxDeductibleBase`, `taxAmount`,

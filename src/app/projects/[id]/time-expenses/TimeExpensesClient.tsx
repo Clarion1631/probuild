@@ -23,11 +23,13 @@ interface Props {
     phases?: { id: string; code: string; name: string }[];
     /** `financialReports` — gates that panel. */
     canEditTax?: boolean;
+    /** Open jobs, for Move to job on a receipt-booked expense. */
+    jobOptions: Array<{ id: string; name: string }>;
 }
 
 type Tab = "time" | "expenses";
 
-export default function TimeExpensesClient({ project, data, currentUser, companyTimeZone, phases = [], canEditTax = false }: Props) {
+export default function TimeExpensesClient({ project, data, currentUser, companyTimeZone, phases = [], canEditTax = false, jobOptions }: Props) {
     const [activeTab, setActiveTab] = useState<Tab>("time");
     const [showTimeModal, setShowTimeModal] = useState(false);
     const [showExpenseModal, setShowExpenseModal] = useState(false);
@@ -94,6 +96,7 @@ export default function TimeExpensesClient({ project, data, currentUser, company
                     changeOrders={data.changeOrders}
                     phases={phases}
                     canEditTax={canEditTax}
+                    jobOptions={jobOptions}
                 />
             )}
 
