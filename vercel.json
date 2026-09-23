@@ -66,11 +66,11 @@
     },
     {
       "path": "/api/cron/bank-register-pull?continue=1",
-      "schedule": "5-59/15 2-12 * * *"
+      "schedule": "5-59/15 2-9 * * *"
     },
     {
       "path": "/api/cron/receipt-requests",
-      "schedule": "0 13 * * *"
+      "schedule": "0 10 * * *"
     },
     {
       "path": "/api/cron/receipt-requests?continue=1",

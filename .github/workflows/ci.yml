@@ -212,6 +212,16 @@ jobs:
         env:
           RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # The cards claim's own certification and owner-epoch check (§14.9),
+      # and the courtesy clear's lock order (§14.10) against card history —
+      # both need a real lock actually blocking, and a real absence of
+      # deadlock, which no fake transaction can prove.
+      - name: Certified claim, owner assignment and courtesy clear serialize against real Postgres
+        run: npx tsx --test tests/receipt-certified-claim-db.test.ts
+        env:
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+          RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # THE APPLY SCRIPT ITSELF, run end to end the way production will run it.
       # Its exported helpers are unit-tested and its statement list is replayed
       # by the DB-gated suite, but main() is executed by nothing else: not the
