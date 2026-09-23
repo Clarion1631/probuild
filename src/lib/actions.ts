@@ -16533,6 +16533,15 @@ export async function resolveUncertainCard(
     return { success: true, stale: false as const };
 }
 
+// Imported here, next to its only call site, rather than with the imports at
+// the top of the file: this file's manifest tests (payroll-writer-manifest,
+// payroll-user-writer-manifest, time-entry-void-readers) pin several `.user`
+// and evidence writers by their exact line number, and every one of those
+// sits above this point. Adding a line up top would shift all of them for no
+// reason; adding it here shifts only the lines the cheap-sweep-restart §14.2
+// manifest re-pin already accounts for.
+import { writeReceiptOwnerLocked } from "./receipt-owner-assignment";
+
 /**
  * Assign the owner of an unattributed bank charge (Codex round-4 item 7).
  *
@@ -16574,14 +16583,23 @@ export async function setMissingReceiptOwner(issueId: string, owner: string, exp
     details.ownerOverride = owner;
 
     // Version-guarded: the nightly sweep writes this same column, and losing
-    // that race silently would drop the assignment on the floor.
-    const result = await prisma.reviewIssue.updateMany({
-        // The RENDERED version, so the write is refused atomically even if the
-        // row moved between the read above and this statement.
-        where: { id: issue.id, version: expectedVersion, clearedAt: null },
-        data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
-    });
-    if (result.count === 0) throw new Error("That item changed underneath you — refresh and try again.");
+    // that race silently would drop the assignment on the floor. Locked and
+    // owner-epoch-bumped (cheap-sweep-restart §14.2) so a card claim made
+    // under the same lock can never miss this reassignment.
+    let count: number;
+    try {
+        count = await writeReceiptOwnerLocked(prisma, {
+            issueId: issue.id,
+            // The RENDERED version, so the write is refused atomically even if the
+            // row moved between the read above and this statement.
+            expectedVersion,
+            displayDetailsJson: JSON.stringify(details),
+            now: new Date(),
+        });
+    } catch {
+        throw new Error("The list is busy — try again in a moment.");
+    }
+    if (count === 0) throw new Error("That item changed underneath you — refresh and try again.");
     revalidateReceiptQueue();
     return { success: true };
 }
