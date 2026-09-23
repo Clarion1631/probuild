@@ -54,22 +54,40 @@
  *    instant on — not only once the elapsed-time arithmetic would separately
  *    agree.
  *
- *    THE EXACT RESIDUAL, stated honestly: the read and the write are still
- *    two separate round trips, not one atomic operation, and the deadline
- *    check is cooperative, not preemptive. An apply already IN FLIGHT — past
- *    its own epoch/deadline check, already inside `applyCodes` — when the
- *    epoch bumps or the worker's timer fires can still land after that. That
- *    is accepted, and safe: it is a single CAS'd `clear` (or a `noop`),
- *    never anything else (see SUBTRACTIVE), so the worst it can do is settle
- *    a moment later than the check would have liked — and the next
- *    certified sweep re-judges the line from current data regardless and
- *    reopens it if the clear no longer holds, so nothing is left uncaught.
- *    No NEW apply starts after that point; only the one already running can
- *    still finish. Closing this gap for real needs an atomic version taken
- *    under the SAME writer locks the sweep uses. That is a documented
- *    follow-up, not done here, because taking that lock from the booking
- *    path changes its lock order and deserves its own review rather than
- *    riding in on this one.
+ *    THE RESIDUAL ABOVE IS CLOSED (cheap-sweep-restart-spec.md §14.10, the
+ *    #525 follow-up). The read and the write used to be two separate round
+ *    trips — a fence read, then a write that could still land after the
+ *    epoch it checked against had moved. They are now ONE transaction:
+ *    `clearOneAtomically` takes the evidence lock, re-reads both epochs
+ *    UNDER it, and only then judges and (on a genuine `clear`) bumps the
+ *    evidence epoch — all inside the same commit. An apply that starts stale
+ *    sees that the instant it takes the lock, and returns `stale` having
+ *    written nothing; nothing can pass a freshness check and then land late
+ *    the way it could before.
+ *
+ *    THE LOCK ORDER (§14.0), so this cannot deadlock against any other
+ *    writer that takes these same locks: the evidence advisory lock, then
+ *    the ledger epoch's row lock, then exactly ONE ReviewIssue row (through
+ *    `evaluateReviewIssue`'s own write) and its episodes, then the evidence
+ *    epoch's own bump — E → L → one I → its P → EV. Every holder of the
+ *    evidence lock takes it FIRST, so any two holders — including two
+ *    concurrent calls into this module — are fully serialized before either
+ *    ever reaches an issue row. The one writer that can still interleave
+ *    with this one, because it never takes the evidence lock at all, is card
+ *    history (`receipt-card-history.ts:76-113`), which locks several issue
+ *    rows in card-item order. Holding exactly ONE issue row here, never two,
+ *    is what keeps that safe: this transaction can wait ON card history, but
+ *    it never holds something card history is waiting FOR while it is ALSO
+ *    waiting on card history itself, so no cycle is possible. `SET LOCAL
+ *    lock_timeout` still bounds an ordinary wait, and Postgres deadlock
+ *    detection remains the backstop. `SET LOCAL
+ *    idle_in_transaction_session_timeout` covers the one case a
+ *    `lock_timeout` cannot: #525's own close can outlive the race timer that
+ *    started it, so a client that has gone quiet still releases every lock
+ *    it holds rather than blocking every other writer until its connection
+ *    eventually times out on its own. Every abort remains a safe drop (see
+ *    BOUNDED): nothing here has written anything by the time any of these
+ *    can fire.
  *
  *    THE ROW-LEVEL CAS is a separate, narrower concern from the epoch fence
  *    above: it catches a concurrent write to THIS ONE issue row, between
@@ -137,14 +155,17 @@ import {
 } from "@/lib/receipt-requests";
 import { evaluateReviewIssue, type ReviewIssueLifecycleClient } from "@/lib/review-alert-lifecycle";
 import type { ReasonCode } from "@/lib/review-alert-reasons";
-// THE FRESHNESS FENCE'S two readers (see FENCED in the module header) — the
-// SAME functions the sweep's own completion fence and
-// receipt-on-demand-store.ts already read these settings through. Never a
-// second key, and never the LOCK or BUMP half of either module: this call
-// only ever observes the counters, it must not contend for the sweep's own
-// advisory lock or perturb the very thing it is fencing against.
-import { readReceiptEvidenceEpoch } from "@/lib/receipt-evidence-lock";
-import { readBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
+// THE FRESHNESS FENCE'S readers (see FENCED in the module header) — the SAME
+// functions the sweep's own completion fence and receipt-on-demand-store.ts
+// already read these settings through. Never a second key.
+//
+// `clearOneAtomically` (§14.10, the #525 follow-up) also takes the evidence
+// lock and bumps its epoch now: the read-only judge phase above still only
+// ever OBSERVES the counters, but the atomic apply phase below is itself one
+// of this module's writers, inside its own transaction, under the §14.0
+// lock order (see the module header).
+import { lockReceiptEvidence, readReceiptEvidenceEpoch, bumpReceiptEvidenceEpoch } from "@/lib/receipt-evidence-lock";
+import { lockBankLedgerEpoch, readBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 // The sweep's own judge and the sweep's own window width — imported rather than
 // re-derived, so there is exactly one of each. `receipt-on-demand-store.ts:16`
 // already imports from this route module, so a lib depending on it is an
@@ -165,6 +186,22 @@ export interface EpochSnapshot {
     ledger: string;
 }
 
+/**
+ * What `clearOneAtomically` (§14.10) hands its transaction: the raw SQL
+ * escape hatches the lock and epoch reads need, plus the two models
+ * `evaluateReviewIssue` writes through `flatten`. Narrow on purpose — the
+ * same discipline `EvidenceWriteClient` in receipt-evidence-lock.ts follows.
+ */
+export type CourtesyTx = Pick<Prisma.TransactionClient, "$executeRaw" | "$queryRaw" | "reviewIssue" | "reviewAlertEpisode">;
+
+/** One candidate's atomic clear attempt — see `clearOneAtomically`. */
+export type ClearOneOutcome =
+    | { kind: "cleared"; evidenceAfter: string }
+    | { kind: "noop" }
+    | { kind: "conflict" }
+    | { kind: "stale" }
+    | { kind: "error" };
+
 export interface EvidenceCloseDeps {
     findLines?: (query: CandidateBankLineQuery) => Promise<Array<{ id: string }>>;
     /** Which of those lines have an OPEN missing-receipt issue right now,
@@ -177,24 +214,20 @@ export interface EvidenceCloseDeps {
         deadlineExceeded?: () => boolean,
     ) => Promise<ReasonCode[]>;
     /**
-     * Resolves to whether the write was an actual CLEAR — never true for a
-     * noop (see IDEMPOTENT), and never invoked with a non-empty `codes` (see
-     * SUBTRACTIVE). No recompute callback is threaded through any more
-     * (round 4, blocker 1) — a lost lifecycle CAS is the caller's problem to
-     * notice via a thrown error, not something this hook can be handed a way
-     * to retry around.
+     * The transaction `clearOneAtomically` (§14.10) runs its lock, its
+     * freshness re-read and its one write inside. Injected so tests can
+     * exercise the real production `clearOneAtomically` — including
+     * `courtesyClient`'s CAS-conflict wrapper — against an in-memory fake
+     * transaction, rather than reimplementing the apply step themselves.
+     * Defaults to `prisma.$transaction` at the production timeout.
      */
-    applyCodes?: (targetKey: string, codes: ReasonCode[]) => Promise<boolean>;
+    transaction?: <T>(fn: (tx: CourtesyTx) => Promise<T>) => Promise<T>;
     /**
-     * The lifecycle client `defaultApplyCodes` hands to `evaluateReviewIssue`
-     * (wrapped in `courtesyClient` — see the module header's ROW-LEVEL CAS
-     * paragraph), used whenever `applyCodes` is NOT itself overridden.
-     * Injected so tests can exercise the real production `defaultApplyCodes`
-     * — including the CAS-conflict wrapper — against an in-memory fake,
-     * rather than reimplementing the apply step themselves. Defaults to the
-     * real prisma client.
+     * One candidate's atomic clear attempt. Defaults to `clearOneAtomically`
+     * bound to `transaction` above. Overridable directly so a caller can hand
+     * back canned outcomes without any transaction machinery at all.
      */
-    client?: ReviewIssueLifecycleClient;
+    clearOne?: (targetKey: string, expected: EpochSnapshot) => Promise<ClearOneOutcome>;
     /** The CALLER's absolute clock — the worker invocation's, not a fresh one. */
     deadlineExceeded?: () => boolean;
     /** Overridable only so the window is testable; production uses the sweep's. */
@@ -346,11 +379,43 @@ function courtesyClient(client: ReviewIssueLifecycleClient): ReviewIssueLifecycl
 }
 
 /**
- * THE ONLY WRITE THIS MODULE MAKES, and it refuses to be anything but a clear
- * — on its one and only attempt (see `courtesyClient` and the module
- * header's ROW-LEVEL CAS paragraph for why there is never a second one). See
- * SUBTRACTIVE and FENCED in the module header for why no recompute callback
- * is handed to `evaluateReviewIssue` any more (round 4).
+ * THE SWEEP'S OWN FLATTENING SHIM (route.ts's component transaction,
+ * `:1785-1796`), copied here for the same reason: `evaluateReviewIssue` asks
+ * its client for a transaction, and handing it `tx` itself would try to nest
+ * one, which Prisma's interactive client cannot do. This makes the
+ * lifecycle's own `$transaction` call return the SAME `tx`, so any writes it
+ * makes through that path join the one transaction `clearOneAtomically`
+ * already opened, rather than opening a nested one Prisma cannot give it.
+ */
+function flatten(tx: CourtesyTx): ReviewIssueLifecycleClient {
+    const flattened: {
+        reviewIssue: CourtesyTx["reviewIssue"];
+        reviewAlertEpisode: CourtesyTx["reviewAlertEpisode"];
+        $transaction: <T>(fn: (inner: unknown) => Promise<T>) => Promise<T>;
+    } = {
+        reviewIssue: tx.reviewIssue,
+        reviewAlertEpisode: tx.reviewAlertEpisode,
+        $transaction: async fn => fn(flattened),
+    };
+    return flattened as unknown as ReviewIssueLifecycleClient;
+}
+
+/** Production's `transaction` for `clearOneAtomically`: see `EvidenceCloseDeps.transaction`. */
+async function defaultTransaction<T>(fn: (tx: CourtesyTx) => Promise<T>): Promise<T> {
+    return prisma.$transaction(fn, { timeout: 6_000, maxWait: 1_000 });
+}
+
+/**
+ * ONE COURTESY CLEAR, FULLY ATOMIC (cheap-sweep-restart-spec.md §14.10, the
+ * #525 follow-up). See "THE RESIDUAL ABOVE IS CLOSED" and "THE LOCK ORDER"
+ * in the module header for the race this closes and why it cannot deadlock.
+ *
+ * It refuses to be anything but a clear — on its one and only lifecycle-write
+ * attempt (see `courtesyClient` and the module header's ROW-LEVEL CAS
+ * paragraph for why there is never a second one). See SUBTRACTIVE and FENCED
+ * in the module header for why no recompute callback is handed to
+ * `evaluateReviewIssue` (round 4) — unchanged by this transaction becoming
+ * atomic.
  *
  * `displayDetails` is null on purpose: the lifecycle's `clear` branch writes
  * `clearedAt`, the acknowledgement columns and the version, and never touches
@@ -358,29 +423,42 @@ function courtesyClient(client: ReviewIssueLifecycleClient): ReviewIssueLifecycl
  * (`applyReceiptRequestPlan`'s `evaluate(targetKey, [], null)`), so a
  * courtesy clear leaves the row identical to a sweep clear either way.
  *
- * Returns whether the lifecycle's OWN decision was `clear` — false for `noop`
- * (something else already cleared this issue since the open-issue read), so a
- * caller never counts a write that did not actually happen (see IDEMPOTENT in
- * the module header). Lets a lost CAS propagate as `CourtesyCasConflict`,
- * uncaught — the caller (`closeRequestsSatisfiedBy`) is what recognises and
- * counts it as a `conflict`.
+ * NEVER THROWS. A stale read returns `stale` having written nothing; a lost
+ * lifecycle CAS is caught as `CourtesyCasConflict` (the transaction has
+ * already rolled back) and returns `conflict`; anything else is caught,
+ * categorised and returned as `error` — never `errors` counted from a
+ * genuine `clear`, and never a `clear` counted from a `noop` (something else
+ * already cleared this issue since the open-issue read — see IDEMPOTENT in
+ * the module header).
  */
-async function defaultApplyCodes(
+async function clearOneAtomically(
     targetKey: string,
-    codes: ReasonCode[],
-    client: ReviewIssueLifecycleClient,
-): Promise<boolean> {
-    // Structural already (the caller only reaches here on an empty verdict);
-    // asserted anyway, because "subtractive" is the property that lets this
-    // path run without a certified cycle.
-    if (codes.length > 0) throw new Error("evidence-close may only clear an issue, never open one");
-    const { decision } = await evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, targetKey, codes, null, {
-        client: courtesyClient(client),
-        // Delivery is the per-owner digest, never the per-issue drainer — the
-        // same choice the sweep makes for every receipt-request write.
-        episodeStatus: "SUPPRESSED",
-    });
-    return decision.action === "clear";
+    expected: EpochSnapshot,
+    transaction: <T>(fn: (tx: CourtesyTx) => Promise<T>) => Promise<T>,
+): Promise<ClearOneOutcome> {
+    try {
+        return await transaction(async tx => {
+            await tx.$executeRaw`SET LOCAL lock_timeout = '4s'`;
+            await tx.$executeRaw`SET LOCAL idle_in_transaction_session_timeout = '10s'`;
+            await lockReceiptEvidence(tx);
+            const evidence = await readReceiptEvidenceEpoch(tx);
+            const ledger = await lockBankLedgerEpoch(tx);
+            if (evidence !== expected.evidence || ledger !== expected.ledger) return { kind: "stale" };
+            const { decision } = await evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, targetKey, [], null, {
+                client: courtesyClient(flatten(tx)),
+                // Delivery is the per-owner digest, never the per-issue drainer — the
+                // same choice the sweep makes for every receipt-request write.
+                episodeStatus: "SUPPRESSED",
+            });
+            if (decision.action !== "clear") return { kind: "noop" };
+            await bumpReceiptEvidenceEpoch(tx);
+            return { kind: "cleared", evidenceAfter: await readReceiptEvidenceEpoch(tx) };
+        });
+    } catch (error) {
+        if (error instanceof CourtesyCasConflict) return { kind: "conflict" };
+        console.warn("[receipt-intake/evidence-close] clear failed", targetKey, errorCategory(error));
+        return { kind: "error" };
+    }
 }
 
 /**
@@ -418,9 +496,9 @@ export async function closeRequestsSatisfiedBy(
     const openIssueKeys = deps.openIssueKeys ?? defaultOpenIssueKeys;
     const readEpochs = deps.readEpochs ?? defaultReadEpochs;
     const recompute = deps.recompute ?? recomputeCodesFor;
-    const lifecycleClient = deps.client ?? (prisma as unknown as ReviewIssueLifecycleClient);
-    const applyCodes = deps.applyCodes ??
-        ((targetKey: string, codes: ReasonCode[]) => defaultApplyCodes(targetKey, codes, lifecycleClient));
+    const transaction = deps.transaction ?? defaultTransaction;
+    const clearOne = deps.clearOne ??
+        ((targetKey: string, expected: EpochSnapshot) => clearOneAtomically(targetKey, expected, transaction));
 
     // SETUP: the candidate query, the open-issue lookup, and the freshness
     // snapshot every verdict below will be measured against (see FENCED). A
@@ -525,68 +603,55 @@ export async function closeRequestsSatisfiedBy(
         return result;
     }
 
-    // APPLY, one candidate at a time, each with its OWN fresh epoch read
-    // (Codex round 3 blocker: the batch-level read-then-apply was still
-    // read-read, not atomic — see FENCED for the exact residual that remains
-    // even with this). `epochBefore` stays the single reference point for
-    // every apply, not a rolling "since the last one": each is measured
-    // against what judging actually saw.
-    for (let i = 0; i < toClear.length; i++) {
+    // APPLY, one candidate at a time, each through its OWN ATOMIC transaction
+    // now (§14.10, the #525 follow-up — see "THE RESIDUAL ABOVE IS CLOSED" in
+    // the module header). Sorted so concurrent calls that share a target
+    // reach for issue rows in the same order. `expected` starts at
+    // `epochBefore`, the single reference point judging actually saw, and
+    // then tracks forward only the EVIDENCE half across a run of clears in
+    // the same call — each cleared target's own bump is the next target's own
+    // baseline, exactly like the epoch this module's own write just moved.
+    // The LEDGER half never moves under this module's write, so it stays
+    // pinned to `epochBefore` throughout.
+    const targets = [...toClear].sort();
+    let expected: EpochSnapshot = epochBefore;
+    for (let i = 0; i < targets.length; i++) {
         if (deadlineExceeded()) {
             console.warn("[receipt-intake/evidence-close] out of budget before an apply; leaving the rest to the sweep");
             break;
         }
 
-        let epochNow: EpochSnapshot;
-        try {
-            epochNow = await readEpochs();
-        } catch (error) {
-            result.errors++;
-            console.warn("[receipt-intake/evidence-close] freshness re-check failed", errorCategory(error));
-            break;
-        }
-        if (epochNow.evidence !== epochBefore.evidence || epochNow.ledger !== epochBefore.ledger) {
-            // THIS candidate and everything still queued behind it — none of
-            // it was judged against evidence that is still current.
-            result.stale += toClear.length - i;
-            console.warn("[receipt-intake/evidence-close] evidence or ledger moved before an apply; leaving the rest to the next certified sweep");
-            break;
-        }
-
-        // RIGHT AFTER THE EPOCH RE-READ, WITH NO AWAIT BEFORE THE APPLY BELOW
-        // (round 4, blocker 3): that re-read was itself an await, so a
-        // deadline or the worker's cancel latch (see FENCED in the module
-        // header) could have landed during it. Checking again here, with
-        // nothing but a synchronous array index between this check and
-        // `applyCodes` starting, is what makes "once cancelled, no new apply
-        // may start" true rather than aspirational.
-        if (deadlineExceeded()) {
-            console.warn("[receipt-intake/evidence-close] out of budget right after the epoch re-read; leaving the rest to the sweep");
-            break;
-        }
-
-        const targetKey = toClear[i];
-        try {
-            // A version conflict on the write itself — someone else committed
-            // to THIS row between the read just above and the write about to
-            // happen — is terminal on the first attempt (round 4, blocker 1):
-            // `courtesyClient` stops `evaluateReviewIssue`'s own retry loop
-            // from ever running a second one (see the module header's
-            // ROW-LEVEL CAS paragraph), and the resulting
-            // `CourtesyCasConflict` is recognised below and counted as a
-            // `conflict`, not an `error`.
-            const cleared = await applyCodes(targetKey, []);
+        const target = targets[i];
+        const outcome = await clearOne(target, expected);
+        if (outcome.kind === "cleared") {
             // Only a genuine `clear` is counted — a `noop` (something else
             // cleared it first) is not this call's doing (see IDEMPOTENT).
-            if (cleared) result.cleared.push(targetKey);
-        } catch (error) {
-            if (error instanceof CourtesyCasConflict) {
-                result.conflicts++;
-                console.warn("[receipt-intake/evidence-close] lost the lifecycle CAS; leaving it to the sweep", targetKey);
-            } else {
-                result.errors++;
-                console.warn("[receipt-intake/evidence-close] clear failed", targetKey, errorCategory(error));
-            }
+            result.cleared.push(target);
+            expected = { evidence: outcome.evidenceAfter, ledger: expected.ledger };
+        } else if (outcome.kind === "noop") {
+            // Nothing to count and nothing to log — see IDEMPOTENT.
+        } else if (outcome.kind === "conflict") {
+            // A version conflict on the write itself — someone else committed
+            // to THIS row between the transaction's own read and its write —
+            // is terminal on the first attempt (round 4, blocker 1):
+            // `courtesyClient` stops `evaluateReviewIssue`'s own retry loop
+            // from ever running a second one (see the module header's
+            // ROW-LEVEL CAS paragraph). Contention, not a bug: the next
+            // candidate is still tried.
+            result.conflicts++;
+            console.warn("[receipt-intake/evidence-close] lost the lifecycle CAS; leaving it to the sweep", target);
+        } else if (outcome.kind === "stale") {
+            // THIS candidate and everything still queued behind it — none of
+            // it was judged against evidence that is still current.
+            result.stale += targets.length - i;
+            console.warn("[receipt-intake/evidence-close] evidence or ledger moved before an apply; leaving the rest to the next certified sweep");
+            break;
+        } else {
+            // clearOneAtomically already logged the category — see its own
+            // header. A real failure, not contention, so this stops the
+            // batch exactly like the deadline and stale checks above do.
+            result.errors++;
+            break;
         }
     }
 
