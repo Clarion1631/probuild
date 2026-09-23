@@ -25,12 +25,16 @@ import {
 } from "../src/lib/receipt-intake/evidence-close";
 import {
     closeRequestsSatisfiedBy,
+    type ClearOneOutcome,
+    type CourtesyTx,
+    type EpochSnapshot,
     type EvidenceCloseDeps,
 } from "../src/lib/receipt-intake/evidence-close-store";
 import {
-    type ReviewIssueLifecycleClient,
     type ReviewIssueRow,
 } from "../src/lib/review-alert-lifecycle";
+import { RECEIPT_EVIDENCE_EPOCH_KEY } from "../src/lib/receipt-evidence-lock";
+import { BANK_LEDGER_EPOCH_KEY } from "../src/lib/bank-ledger-epoch";
 import { ComponentDeadlineExceededError, RECEIPT_REQUEST_TARGET_TYPE } from "../src/lib/receipt-requests";
 import { canonicalizeReasonCodes, hashReasonCodes, type ReasonCode } from "../src/lib/review-alert-reasons";
 import {
@@ -108,9 +112,22 @@ interface Store {
     /** Every write, in order: model, operation, and the data it carried. */
     writes: Array<{ model: string; op: string; data: unknown }>;
     recomputes: string[];
+    /**
+     * The transaction-layer state `clearOneAtomically` (§14.10) locks and
+     * reads — a mutable pair every fake transaction (below) shares with the
+     * store's OWN `readEpochs` default, so a fresh store's setup snapshot and
+     * its apply phase agree by construction. A test simulates drift by
+     * mutating this directly, or via `fakeTransaction`'s `beforeEach` hook.
+     */
+    epoch: EpochSnapshot;
 }
 
-function store(lineIds: string[], openKeys: string[], clearedKeys: string[] = []): Store {
+function store(
+    lineIds: string[],
+    openKeys: string[],
+    clearedKeys: string[] = [],
+    epoch: EpochSnapshot = { evidence: "1", ledger: "1" },
+): Store {
     const issues = new Map<string, ReviewIssueRow>();
     const add = (targetKey: string, clearedAt: Date | null) => issues.set(targetKey, {
         id: `issue-${targetKey}`,
@@ -134,79 +151,114 @@ function store(lineIds: string[], openKeys: string[], clearedKeys: string[] = []
     });
     for (const key of openKeys) add(key, null);
     for (const key of clearedKeys) add(key, new Date("2026-09-20T13:00:00.000Z"));
-    return { lines: lineIds, issues, writes: [], recomputes: [] };
+    return { lines: lineIds, issues, writes: [], recomputes: [], epoch };
 }
 
 /**
- * THE RECORDING CLIENT. It is the lifecycle's client, and it is also the
- * settings store: `automationSetting` is wired so a write to the cycle key or
- * either cursor would be RECORDED rather than merely impossible, which is what
- * makes the fence test below an assertion instead of a hope.
+ * THE RECORDING FAKE TRANSACTION (§14.10). It is `EvidenceCloseDeps.transaction`
+ * — a fake Postgres transaction, backed by the SAME store as the rest of this
+ * file, that answers both `SET LOCAL`s, the evidence lock, the evidence-epoch
+ * read, the ledger-epoch lock, the evidence-epoch bump, and the lifecycle's
+ * own `reviewIssue`/`reviewAlertEpisode` writes — all against `s.epoch`, so a
+ * test can move it mid-run to simulate a foreign writer. Every test below
+ * that does not override `transaction` or `clearOne` exercises the REAL
+ * `clearOneAtomically` — including `courtesyClient`'s CAS wrapper and the
+ * lock/epoch machinery — against this in-memory fake, not a reimplementation
+ * of the apply step.
  *
- * `conflictOnceFor`: the set of issue ids whose FIRST `updateMany` should
- * report a lost CAS — `{ count: 0 }` — regardless of whether the version
- * actually matches, exactly as a real concurrent writer committing between
- * the caller's read and its write would look from here. Consumed on the
- * first hit, so a retry's own write behaves normally (the transient-conflict
- * shape: contention clears and the SAME empty verdict lands a moment later).
+ * `conflictOnceFor`/`conflictAlwaysFor`: the set of issue ids whose
+ * `updateMany` should report a lost CAS — `{ count: 0 }` — once or forever,
+ * exactly as a real concurrent writer committing between the lifecycle's own
+ * read and its write would look from here (see the two CAS-conflict tests).
  *
- * `conflictAlwaysFor`: the set of issue ids whose `updateMany` NEVER
- * succeeds — every one of `evaluateReviewIssue`'s own retry attempts loses
- * the CAS, so it exhausts its budget and throws (the sustained-contention
- * shape, round 4: counted as a `conflict`, never applied).
+ * `beforeEach`: fires before every recorded operation, with the calls log SO
+ * FAR — the hook a test uses to land a "foreign" mutation to `s.epoch` at a
+ * precise point in a multi-target run (e.g. once the first target's own two
+ * evidence-reads have both happened, right as the second target's own
+ * transaction is starting).
  */
-function lifecycleClient(
+function fakeTransaction(
     s: Store,
-    opts: { conflictOnceFor?: Set<string>; conflictAlwaysFor?: Set<string> } = {},
-): ReviewIssueLifecycleClient {
-    const client = {
-        reviewIssue: {
-            findUnique: async (args: { where: { targetType_targetKey?: { targetKey: string }; id?: string } }) => {
-                const key = args.where.targetType_targetKey?.targetKey;
-                if (key) return s.issues.get(key) ?? null;
-                return [...s.issues.values()].find(row => row.id === args.where.id) ?? null;
+    opts: {
+        conflictOnceFor?: Set<string>;
+        conflictAlwaysFor?: Set<string>;
+        beforeEach?: (calls: readonly string[]) => void;
+    } = {},
+) {
+    const calls: string[] = [];
+    const note = (tag: string) => { opts.beforeEach?.(calls); calls.push(tag); };
+    const transaction = async <T>(fn: (tx: CourtesyTx) => Promise<T>): Promise<T> => {
+        const tx = {
+            $executeRaw: async (query: TemplateStringsArray, ..._values: unknown[]) => {
+                const text = query.join("");
+                if (text.includes("idle_in_transaction_session_timeout")) note("set-local-idle");
+                else if (text.includes("SET LOCAL")) note("set-local-lock-timeout");
+                else if (text.includes("pg_advisory_xact_lock")) note("lock");
+                else note(`executeRaw:${text}`);
+                return undefined;
             },
-            create: async (args: { data: Record<string, unknown> }) => {
-                s.writes.push({ model: "reviewIssue", op: "create", data: args.data });
-                throw new Error("evidence-close must never create an issue");
-            },
-            updateMany: async (args: { where: { id: string; version: number }; data: Record<string, unknown> }) => {
-                s.writes.push({ model: "reviewIssue", op: "updateMany", data: args.data });
-                const row = [...s.issues.values()].find(r => r.id === args.where.id);
-                if (!row) return { count: 0 };
-                if (opts.conflictAlwaysFor?.has(row.id)) return { count: 0 };
-                if (opts.conflictOnceFor?.has(row.id)) {
-                    opts.conflictOnceFor.delete(row.id);
-                    return { count: 0 };
+            $queryRaw: async (query: TemplateStringsArray, ...values: unknown[]) => {
+                const text = query.join("");
+                const key = values[0];
+                if (key === RECEIPT_EVIDENCE_EPOCH_KEY && text.includes("SELECT")) {
+                    note("evidence-read");
+                    return [{ value: s.epoch.evidence }];
                 }
-                if (row.version !== args.where.version) return { count: 0 };
-                Object.assign(row, {
-                    ...args.data,
-                    version: row.version + 1,
-                });
-                return { count: 1 };
+                if (key === RECEIPT_EVIDENCE_EPOCH_KEY && text.includes("INSERT")) {
+                    s.epoch = { ...s.epoch, evidence: String(Number(s.epoch.evidence) + 1) };
+                    note("bump");
+                    return [{ value: s.epoch.evidence }];
+                }
+                if (key === BANK_LEDGER_EPOCH_KEY && text.includes("INSERT")) {
+                    note("ledger-lock");
+                    return [{ value: s.epoch.ledger }];
+                }
+                throw new Error(`fakeTransaction: unexpected $queryRaw ${text} / ${String(key)}`);
             },
-        },
-        reviewAlertEpisode: {
-            create: async (args: { data: Record<string, unknown> }) => {
-                s.writes.push({ model: "reviewAlertEpisode", op: "create", data: args.data });
-                throw new Error("evidence-close must never open an episode");
+            reviewIssue: {
+                findUnique: async (args: { where: { targetType_targetKey?: { targetKey: string }; id?: string } }) => {
+                    note("reviewIssue.findUnique");
+                    const key = args.where.targetType_targetKey?.targetKey;
+                    if (key) return s.issues.get(key) ?? null;
+                    return [...s.issues.values()].find(row => row.id === args.where.id) ?? null;
+                },
+                create: async (args: { data: Record<string, unknown> }) => {
+                    s.writes.push({ model: "reviewIssue", op: "create", data: args.data });
+                    throw new Error("evidence-close must never create an issue");
+                },
+                updateMany: async (args: { where: { id: string; version: number }; data: Record<string, unknown> }) => {
+                    note("reviewIssue.updateMany");
+                    s.writes.push({ model: "reviewIssue", op: "updateMany", data: args.data });
+                    const row = [...s.issues.values()].find(r => r.id === args.where.id);
+                    if (!row) return { count: 0 };
+                    if (opts.conflictAlwaysFor?.has(row.id)) return { count: 0 };
+                    if (opts.conflictOnceFor?.has(row.id)) {
+                        opts.conflictOnceFor.delete(row.id);
+                        return { count: 0 };
+                    }
+                    if (row.version !== args.where.version) return { count: 0 };
+                    Object.assign(row, {
+                        ...args.data,
+                        version: row.version + 1,
+                    });
+                    return { count: 1 };
+                },
             },
-            updateMany: async (args: { where: unknown; data: Record<string, unknown> }) => {
-                s.writes.push({ model: "reviewAlertEpisode", op: "updateMany", data: args.data });
-                return { count: 0 };
+            reviewAlertEpisode: {
+                create: async (args: { data: Record<string, unknown> }) => {
+                    s.writes.push({ model: "reviewAlertEpisode", op: "create", data: args.data });
+                    throw new Error("evidence-close must never open an episode");
+                },
+                updateMany: async (args: { where: unknown; data: Record<string, unknown> }) => {
+                    note("reviewAlertEpisode.updateMany");
+                    s.writes.push({ model: "reviewAlertEpisode", op: "updateMany", data: args.data });
+                    return { count: 0 };
+                },
             },
-        },
-        automationSetting: {
-            upsert: async (args: unknown) => { s.writes.push({ model: "automationSetting", op: "upsert", data: args }); },
-            update: async (args: unknown) => { s.writes.push({ model: "automationSetting", op: "update", data: args }); },
-            create: async (args: unknown) => { s.writes.push({ model: "automationSetting", op: "create", data: args }); },
-            deleteMany: async (args: unknown) => { s.writes.push({ model: "automationSetting", op: "deleteMany", data: args }); },
-        },
-        $transaction: async <T>(fn: (tx: ReviewIssueLifecycleClient) => Promise<T>): Promise<T> =>
-            fn(client as unknown as ReviewIssueLifecycleClient),
+        };
+        return fn(tx as unknown as CourtesyTx);
     };
-    return client as unknown as ReviewIssueLifecycleClient;
+    return { transaction, calls };
 }
 
 function depsFor(s: Store, overrides: Partial<EvidenceCloseDeps> = {}): EvidenceCloseDeps {
@@ -222,16 +274,15 @@ function depsFor(s: Store, overrides: Partial<EvidenceCloseDeps> = {}): Evidence
                 .map(id => [id, s.issues.get(id)!.id]),
         ),
         recompute: async targetKey => { s.recomputes.push(targetKey); return []; },
-        // Production's OWN `defaultApplyCodes`, not a test reimplementation of
-        // it: every test below that does not override `applyCodes` exercises
-        // the real apply path — including the `courtesyClient` CAS wrapper
-        // (round 4, blocker 1) — against this in-memory fake. Before round 4
-        // no test ever ran production `defaultApplyCodes` at all, so blockers
-        // 1 and 2 had no regression guard.
-        client: lifecycleClient(s),
-        // Stable across both reads by default — no drift, no staleness. Tests
-        // that care about the freshness fence override this explicitly.
-        readEpochs: async () => ({ evidence: "1", ledger: "1" }),
+        // Production's OWN `clearOneAtomically`, not a test reimplementation
+        // of it — see `fakeTransaction` above.
+        transaction: fakeTransaction(s).transaction,
+        // The ONE setup read (§14.10 keeps the judge phase, including this,
+        // exactly as merged) — snapshots whatever `s.epoch` holds right now.
+        // Stable by default: no drift, no staleness. Tests that care about
+        // the freshness fence mutate `s.epoch` (directly, via this override,
+        // or via `fakeTransaction`'s `beforeEach`).
+        readEpochs: async () => ({ ...s.epoch }),
         ...overrides,
     };
 }
@@ -385,7 +436,8 @@ test("an exhausted caller deadline skips the whole step", async () => {
 
 test("THE FENCE: a close writes nothing to the cycle record, either cursor, or chaserCompletedAt", async () => {
     const s = store(["line-open"], ["line-open"]);
-    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s));
+    const fake = fakeTransaction(s);
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, { transaction: fake.transaction }));
     assert.deepEqual(result.cleared, ["line-open"]);
 
     // Every write this path made, through the client that also owns the
@@ -396,6 +448,16 @@ test("THE FENCE: a close writes nothing to the cycle record, either cursor, or c
         ["reviewIssue.updateMany", "reviewAlertEpisode.updateMany"],
     );
     assert.equal(s.writes.filter(write => write.model === "automationSetting").length, 0);
+
+    // THE WRITE LOG for one cleared target, exactly (§14.10): both SET
+    // LOCALs, the evidence lock, the freshness read, the ledger lock, the
+    // lifecycle's own issue read and its two writes, the bump, then the
+    // final read for `evidenceAfter`.
+    assert.deepEqual(fake.calls, [
+        "set-local-lock-timeout", "set-local-idle", "lock", "evidence-read", "ledger-lock",
+        "reviewIssue.findUnique", "reviewIssue.updateMany", "reviewAlertEpisode.updateMany",
+        "bump", "evidence-read",
+    ]);
 
     const written = JSON.stringify(s.writes);
     for (const forbidden of ["receiptRequestsCursor", "receiptRequestsOpenIssueCursor", "receiptRequestsPhase", "chaserCompletedAt", "receiptEvidenceEpoch", "bankLedgerEpoch"]) {
@@ -410,13 +472,18 @@ test("THE FENCE: a close writes nothing to the cycle record, either cursor, or c
             .replace(/\/\*[\s\S]*?\*\//g, "")
             .replace(/(^|[^:])\/\/.*$/gm, "$1");
         for (const forbidden of [
-            "automationSetting", "chaserCompletedAt", "receiptRequestsCursor", "receiptRequestsOpenIssueCursor",
-            "writeCycle", "writeCursor",
-            // The freshness fence (FENCED) is READ-ONLY: it may only ever
-            // OBSERVE the two epochs, never take the sweep's own advisory
-            // lock for them or bump either counter — either would be the
-            // fence perturbing the very thing it is comparing against.
-            "bumpReceiptEvidenceEpoch", "bumpBankLedgerEpoch", "lockReceiptEvidence", "lockBankLedgerEpoch",
+            // The judge-phase freshness fence (FENCED) is still READ-ONLY: it
+            // may only ever OBSERVE the two epochs. The APPLY phase now
+            // legitimately takes the evidence lock and bumps its epoch, in
+            // its own atomic transaction (§14.10) — `lockReceiptEvidence`,
+            // `readReceiptEvidenceEpoch`, `lockBankLedgerEpoch` and
+            // `bumpReceiptEvidenceEpoch` are no longer forbidden. Still
+            // forbidden: the LEDGER epoch is never bumped (this module never
+            // creates bank activity), and this module never touches the
+            // sweep's own phase, cycle or cursor state.
+            "automationSetting", "chaserCompletedAt", "receiptRequestsPhase", "receiptRequestsCycle",
+            "receiptRequestsCursor", "receiptRequestsOpenIssueCursor",
+            "writeCycle", "writeCursor", "bumpBankLedgerEpoch",
         ]) {
             assert.equal(code.includes(forbidden), false, `${file} references ${forbidden}`);
         }
@@ -499,48 +566,60 @@ test("a run of already-resolved candidates does not shadow a genuinely open one 
     assert.deepEqual(s.recomputes, ["line-open"], "no component walk was wasted on the already-resolved lines");
 });
 
-test("an epoch that moves between judging and applying withholds every clear, counted stale", async () => {
+test("stale under the lock writes nothing and does not bump (§14.10)", async () => {
     const s = store(["line-open"], ["line-open"]);
-    let reads = 0;
     const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
         readEpochs: async () => {
-            reads++;
-            // The FIRST read (before judging) sees one snapshot; the SECOND
-            // (right before applying) sees the ledger having moved under it —
-            // a bank line committed or changed between the two reads.
-            return reads === 1 ? { evidence: "1", ledger: "1" } : { evidence: "1", ledger: "2" };
+            // The ONE setup read sees the store's starting snapshot; a
+            // foreign writer then bumps the ledger before ANY apply's own
+            // transaction ever takes its lock — `clearOneAtomically` sees the
+            // move the instant it reads under that lock.
+            const before = { ...s.epoch };
+            s.epoch = { ...s.epoch, ledger: "2" };
+            return before;
         },
     }));
 
     assert.deepEqual(result, { examined: 1, cleared: [], errors: 0, conflicts: 0, stale: 1, judged: [] });
     assert.equal(s.issues.get("line-open")!.clearedAt, null, "no lifecycle write happened");
     assert.deepEqual(s.writes, [], "the fence caught it before the CAS ever ran");
+    assert.equal(s.epoch.evidence, "1", "not bumped — a stale read never reaches that step");
 });
 
 test("a stable epoch clears normally — the fence only withholds on an actual move", async () => {
-    const s = store(["line-open"], ["line-open"]);
-    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
-        readEpochs: async () => ({ evidence: "7", ledger: "3" }),
-    }));
+    // A non-default pair, so this cannot pass by coincidentally matching a
+    // hardcoded "1"/"1" somewhere — the fence compares VALUES, not literals.
+    const s = store(["line-open"], ["line-open"], [], { evidence: "7", ledger: "3" });
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s));
 
     assert.deepEqual(result, { examined: 1, cleared: ["line-open"], errors: 0, conflicts: 0, stale: 0, judged: [] });
 });
 
-test("an epoch that moves between two applies withholds the second one, counting only the first", async () => {
-    // Codex round 3: the freshness read now happens IMMEDIATELY before EACH
-    // apply, not once for the whole batch — this is the test that tells the
-    // two designs apart, since the single-candidate version above cannot.
+test("two targets clear in sorted order, and the second expects the first's post-bump epoch", async () => {
+    // Seeded deliberately out of order — line-b before line-a.
+    const s = store(["line-b", "line-a"], ["line-b", "line-a"]);
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s));
+
+    assert.deepEqual(result.cleared, ["line-a", "line-b"], "applied in SORTED order, not the store's own order");
+    assert.equal(result.stale, 0, "the second target's own transaction reads line-a's bump as current, not a foreign move");
+    assert.equal(s.epoch.evidence, "3", "bumped once per clear, from a starting value of 1");
+});
+
+test("a foreign bump between two targets makes the second stale, counting only the first as cleared", async () => {
+    // The write log for a full run (THE FENCE, above) shows each target's own
+    // two evidence-reads. Once the FIRST target's own pair has both
+    // happened, its transaction is done — this is exactly the moment a
+    // concurrent writer could land before the second target's own
+    // transaction takes its lock.
     const s = store(["line-a", "line-b"], ["line-a", "line-b"]);
-    let reads = 0;
-    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
-        readEpochs: async () => {
-            reads++;
-            // #1 = setup (before judging); #2 = right before applying
-            // line-a; #3 = right before applying line-b, where the ledger
-            // has now moved under it.
-            return reads <= 2 ? { evidence: "1", ledger: "1" } : { evidence: "1", ledger: "2" };
+    const fake = fakeTransaction(s, {
+        beforeEach: calls => {
+            if (calls.filter(c => c === "evidence-read").length >= 2) {
+                s.epoch = { ...s.epoch, ledger: "2" };
+            }
         },
-    }));
+    });
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, { transaction: fake.transaction }));
 
     assert.deepEqual(result.cleared, ["line-a"], "the first apply already committed under still-current evidence");
     assert.equal(result.stale, 1, "the second apply — and everything still queued behind it — is withheld");
@@ -553,7 +632,7 @@ test("a CAS conflict that would never resolve is still terminal on the very firs
     const conflictAlwaysFor = new Set([s.issues.get("line-open")!.id]);
     let recomputeCalls = 0;
     const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
-        client: lifecycleClient(s, { conflictAlwaysFor }),
+        transaction: fakeTransaction(s, { conflictAlwaysFor }).transaction,
         recompute: async targetKey => { recomputeCalls++; s.recomputes.push(targetKey); return []; },
     }));
 
@@ -566,6 +645,7 @@ test("a CAS conflict that would never resolve is still terminal on the very firs
     assert.deepEqual(s.writes.filter(w => w.model === "reviewAlertEpisode"), [], "nothing was ever actually applied");
     assert.equal(s.issues.get("line-open")!.version, 1, "the row's version never advanced — the one attempt lost the CAS");
     assert.equal(s.issues.get("line-open")!.clearedAt, null, "left exactly as it was, for the nightly sweep");
+    assert.equal(s.epoch.evidence, "1", "a conflict never bumps — the transaction rolled back before that step");
 });
 
 test("a lost lifecycle CAS is terminal on the first attempt even when the conflicting writer would have gotten out of the way a moment later — counted as a conflict, never cleared, never retried (round 4, blocker 1)", async () => {
@@ -573,7 +653,7 @@ test("a lost lifecycle CAS is terminal on the first attempt even when the confli
     const conflictOnceFor = new Set([s.issues.get("line-open")!.id]);
     let recomputeCalls = 0;
     const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
-        client: lifecycleClient(s, { conflictOnceFor }),
+        transaction: fakeTransaction(s, { conflictOnceFor }).transaction,
         recompute: async targetKey => { recomputeCalls++; s.recomputes.push(targetKey); return []; },
     }));
 
@@ -583,6 +663,17 @@ test("a lost lifecycle CAS is terminal on the first attempt even when the confli
     const updateManyAttempts = s.writes.filter(w => w.model === "reviewIssue" && w.op === "updateMany").length;
     assert.equal(updateManyAttempts, 1, "exactly one write attempt — courtesyClient stops evaluateReviewIssue's own retry loop from ever running a second one, so this transient conflict is never given the chance to resolve itself");
     assert.equal(s.issues.get("line-open")!.clearedAt, null, "left exactly as it was, for the nightly sweep");
+});
+
+test("a conflict on the first target still attempts the second", async () => {
+    const s = store(["line-a", "line-b"], ["line-a", "line-b"]);
+    const conflictAlwaysFor = new Set([s.issues.get("line-a")!.id]);
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        transaction: fakeTransaction(s, { conflictAlwaysFor }).transaction,
+    }));
+
+    assert.equal(result.conflicts, 1);
+    assert.deepEqual(result.cleared, ["line-b"], "the conflict on line-a did not stop line-b from being attempted and cleared");
 });
 
 test("a courtesy clear writes displayDetails exactly like the sweep's own clear: the column is not touched at all", async () => {
@@ -613,7 +704,7 @@ test("a deadline that fires exactly when judging finishes stops before any apply
             deadlineHit = true;
             return codes;
         },
-        applyCodes: async () => { applyCalls++; return false; },
+        clearOne: async () => { applyCalls++; return { kind: "noop" }; },
     }));
 
     assert.equal(applyCalls, 0, "the after-judging check stopped it before the apply phase began");
@@ -639,39 +730,72 @@ test("a late-settling judge does not start an apply — the store's own deadline
             await Promise.resolve();
             return [];
         },
-        applyCodes: async () => { applyCalls++; return false; },
+        clearOne: async () => { applyCalls++; return { kind: "noop" }; },
     }));
 
     assert.equal(applyCalls, 0, "no apply was ever started once the deadline had fired, however late the judge settled");
     assert.deepEqual(result.cleared, []);
 });
 
-test("a deadline that fires during the apply-phase epoch re-read stops that apply before it starts (round 4, blocker 3)", async () => {
-    // The pre-existing top-of-loop check cannot catch this: the deadline
-    // flips AFTER it has already passed, WHILE the epoch re-read itself is
-    // in flight — proving the check right after that re-read, with no await
-    // before the apply, is what actually stops it.
-    const s = store(["line-open"], ["line-open"]);
-    let deadlineHit = false;
-    let applyCalls = 0;
-    let reads = 0;
+test("an error on the first target stops the loop before the second is even attempted", async () => {
+    const s = store(["line-a", "line-b"], ["line-a", "line-b"]);
+    const attempted: string[] = [];
     const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
-        deadlineExceeded: () => deadlineHit,
-        readEpochs: async () => {
-            reads++;
-            // #1 = setup (before judging), still fresh. #2 = the apply
-            // phase's own re-read, right before the one candidate judging
-            // produced — flips the deadline DURING it, evidence staying
-            // fresh so this cannot be mistaken for a staleness stop.
-            if (reads === 2) deadlineHit = true;
-            return { evidence: "1", ledger: "1" };
-        },
-        applyCodes: async () => { applyCalls++; return true; },
+        clearOne: async targetKey => { attempted.push(targetKey); return { kind: "error" }; },
     }));
 
-    assert.equal(applyCalls, 0, "checked again right after the epoch re-read, before the apply started");
+    assert.deepEqual(attempted, ["line-a"], "the second target is never attempted once the first errors");
+    assert.equal(result.errors, 1);
     assert.deepEqual(result.cleared, []);
-    assert.equal(result.stale, 0, "evidence never moved — this is a deadline stop, not a freshness one");
+});
+
+test("a deadline right before the second target stops the loop there", async () => {
+    const s = store(["line-a", "line-b"], ["line-a", "line-b"]);
+    let deadlineHit = false;
+    const attempted: string[] = [];
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        deadlineExceeded: () => deadlineHit,
+        clearOne: async targetKey => {
+            attempted.push(targetKey);
+            // Flips AFTER the first target's own attempt, so the loop's own
+            // top-of-iteration check is what stops the second one — the
+            // exact "checked again, nothing but a synchronous index between
+            // the check and starting the apply" property round 4's blocker 3
+            // established, now with the epoch re-read folded into the
+            // atomic apply itself rather than a separate step to re-check
+            // after.
+            deadlineHit = true;
+            return { kind: "cleared", evidenceAfter: "2" };
+        },
+    }));
+
+    assert.deepEqual(attempted, ["line-a"], "only the first target's clearOne ran");
+    assert.deepEqual(result.cleared, ["line-a"]);
+});
+
+test("the function never rejects, even when the transaction wrapper itself throws", async () => {
+    const s = store(["line-open"], ["line-open"]);
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        transaction: async () => { throw new Error("connection pool exhausted"); },
+    }));
+
+    assert.equal(result.errors, 1);
+    assert.deepEqual(result.cleared, []);
+});
+
+test("the function never rejects even when an INJECTED clearOne itself rejects, not just the default's own catch (Codex round 1, real issue)", async () => {
+    // The test above proves the DEFAULT clearOneAtomically's own try/catch
+    // swallows a thrown transaction. This proves the apply loop's own guard:
+    // deps.clearOne is an exported seam a caller can override outright, and
+    // an override that rejects instead of resolving to {kind:"error"} used to
+    // escape past this function's own "never throws" contract uncaught.
+    const s = store(["line-open"], ["line-open"]);
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        clearOne: async () => { throw new Error("injected clearOne rejection"); },
+    }));
+
+    assert.equal(result.errors, 1);
+    assert.deepEqual(result.cleared, []);
 });
 
 test("a setup failure — the candidate query, the open-issue lookup, or the epoch read — is counted, never thrown", async () => {
@@ -691,21 +815,6 @@ test("a setup failure — the candidate query, the open-issue lookup, or the epo
         readEpochs: async () => { throw new Error("pool timeout"); },
     }));
     assert.deepEqual(readEpochsThrows, { examined: 0, cleared: [], errors: 1, conflicts: 0, stale: 0, judged: [] });
-});
-
-test("the freshness re-check failing (not just drifting) is also counted, not thrown", async () => {
-    const s = store(["line-open"], ["line-open"]);
-    let reads = 0;
-    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
-        readEpochs: async () => {
-            reads++;
-            if (reads === 1) return { evidence: "1", ledger: "1" };
-            throw new Error("pool timeout");
-        },
-    }));
-
-    assert.deepEqual(result, { examined: 1, cleared: [], errors: 1, conflicts: 0, stale: 0, judged: [] });
-    assert.deepEqual(s.writes, [], "no clear was attempted without a confirmed-fresh read");
 });
 
 // ---------------------------------------------------------------------------

@@ -227,8 +227,12 @@ test("both crons take the lease BEFORE any work and release it after", () => {
         assert.ok(releaseAt > takeAt, `${label} must release it after the work`);
         // The old shape said "locked"; the contract now names the condition.
         assert.match(source, /skipped: "already-running"/, label);
-        // And the release is in a finally, so a throw cannot strand it.
-        assert.match(source, /\} finally \{\s*\n\s*await releaseLease\(/, label);
+        // And the release is in a finally, so a throw cannot strand it. The
+        // receipt sweep's finally also logs its progress line (§14.7) BEFORE
+        // releasing — still inside the same finally, so this allows whatever
+        // sits between the block opening and the release rather than pinning
+        // it to be the very first statement.
+        assert.match(source, /\} finally \{[\s\S]*?await releaseLease\(/, label);
     }
 });
 

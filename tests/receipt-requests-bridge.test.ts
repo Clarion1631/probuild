@@ -502,9 +502,9 @@ test("?continue=1 only resumes; with no cursor it exits immediately", () => {
     const vercel = JSON.parse(readFileSync(join(repoRoot, "vercel.json"), "utf8")) as {
         crons: Array<{ path: string; schedule: string }>;
     };
-    assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests")?.schedule, "0 13 * * *");
+    assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests")?.schedule, "0 10 * * *");
     // Minute continuations leave gaps around full/card times (round-45 gate):
-    // the old unoffset schedule collided with the 13:00 full run — and the continuation
+    // the old unoffset schedule collided with the 10:00 full run — and the continuation
     // could win the lease, so the full run returned `already-running` having
     // cleared nothing and the day's cycle never restarted.
     assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests?continue=1")?.schedule, "1-28,31-58 * * * *");
@@ -679,7 +679,7 @@ test("?continue=1 and moreToProcess consult BOTH cursors", () => {
     // nothing in progress.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     // Widened in round 45 (finding 2): an OWED FULL RUN is work in progress
-    // too, even with no cursor parked — otherwise a 13:00 run that lost the
+    // too, even with no cursor parked — otherwise a 10:00 run that lost the
     // lease to a continuation would never be picked up.
     assert.match(source, /const \[marker, lineCursor, openCursor, fullRunOwed, persistedCycle, bankEpoch, evidenceEpoch\] = await Promise\.all\(\[/);
     assert.match(source, /readMarker\(\), readCursor\(\), readOpenCursor\(\), readFullRunRequested\(\), readCycle\(\),/);

@@ -25,7 +25,11 @@ test("the cycle's epochs live in a record of their own, not on the cursors", () 
     // The bug, stated from the source: cursors are cleared the moment their
     // pass completes, so a continuation could find nothing to validate and take
     // a fresh snapshot of a world that had already moved.
-    assert.match(sweep, /transitionCompletedOpenPass\([\s\S]{0,180}writePhase\("lines", undefined, null, prisma, cycle\.id\)[\s\S]{0,80}writeOpenCursor\(null\)/,
+    // `cycle!.id`, not `cycle.id`: §14.6's conditional reassignment of `cycle`
+    // inside the line pass's own closure (for `undecidedLines`) is enough to
+    // make TS widen `cycle`'s type inside every closure that captures it,
+    // this one included, so the non-null assertion is required to compile.
+    assert.match(sweep, /transitionCompletedOpenPass\([\s\S]{0,180}writePhase\("lines", undefined, null, prisma, cycle!\.id\)[\s\S]{0,80}writeOpenCursor\(null\)/,
         "the open cursor clears after the durable phase handoff; the cycle must still validate epochs");
     assert.match(sweep, /clearCertifiedSweepCheckpoint\(decision.complete, \(\) => writeCursor\(null\)\)/);
 
@@ -34,7 +38,7 @@ test("the cycle's epochs live in a record of their own, not on the cursors", () 
     // cards cron needs it too, and a route importing another route pulls the
     // whole sweep into its bundle.
     assert.match(read("src/lib/receipt-sweep-marker.ts"), /export const CYCLE_KEY = "receiptRequestsCycle";/);
-    assert.match(sweep, /cycle = \{ id: randomUUID\(\), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY \};/);
+    assert.match(sweep, /cycle = \{ id: randomUUID\(\), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY, plannerDay \};/);
     assert.match(sweep, /await writeCycle\(cycle\);/);
     // A fresh full run clears it with the cursors, so the next cycle cannot
     // inherit the last one's snapshot.
@@ -132,10 +136,10 @@ test("the continuation schedule never collides with a full run", () => {
         assert.ok(receiptMinutes.every(minute => (minute - protectedMinute + 60) % 60 >= 1),
             "first continuation starts at least one minute after full/card selection");
     }
-    assert.equal(at("/api/cron/receipt-requests"), "0 13 * * *");
+    assert.equal(at("/api/cron/receipt-requests"), "0 10 * * *");
     assert.equal(at("/api/cron/receipt-request-cards"), "30 14 * * 1-5");
     assert.equal(at("/api/cron/receipt-request-cards?retry=1"), "30 16 * * 1-5");
-    // Available starts, including the 13:00 full run; not a completion guarantee.
+    // Available starts, including the 10:00 full run; not a completion guarantee.
     const startsBeforeCards = (hour: number) => 1 + (hour - 13) * receiptMinutes.length
         + receiptMinutes.filter(minute => minute < 30).length;
     assert.equal(startsBeforeCards(14), 85);
