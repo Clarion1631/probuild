@@ -59,6 +59,7 @@ import {
     CYCLE_KEY,
     SWEEP_MARKER_KEY,
     continuationNeedsWork,
+    cycleMatchesPlannerDay,
     cycleStillValid,
     formatSweepMarker,
     parseSweepCycle,
@@ -2078,6 +2079,11 @@ async function runSweep(
     clearFullRunRequestOnStart = false,
     budget: SweepBudget = createSweepBudget(Date.now()),
 ) {
+    // The UTC day THIS invocation's planner actually used (cheap-sweep-restart
+    // §14.5, Codex round 2 blocker 3): `now` is what every processBatch and
+    // planner call in this invocation is judged against, so this is what the
+    // cycle record's `plannerDay` must record — not a later re-derivation.
+    const plannerDay = now.toISOString().slice(0, 10);
     const windowStart = registerWindowStartYmd(now, LOOKBACK_DAYS);
     const windowEnd = now.toISOString().slice(0, 10);
 
@@ -2116,6 +2122,9 @@ async function runSweep(
     let effectiveStartPhase = startPhase;
     budget.check();
     let cycle = await readCycle();
+    // Declared at this scope, not inside the block below, so the cycle-start
+    // log (§14.7) can still read it after that block ends.
+    let restarted = false;
     if (startPhase === "lines" || cycle !== null) {
         /**
          * THE CYCLE RECORD IS WHAT IS CHECKED, NOT THE CURSORS (round-45 gate,
@@ -2132,13 +2141,17 @@ async function runSweep(
         const storedCursors = [parseSweepCursor(await readCursor()), parseSweepCursor(await readOpenCursor())]
             .filter(cursor => cursor.key !== null);
         const stale = !cycleStillValid(cycle, snapshotEpoch, snapshotEvidenceEpoch, RECOGNITION_POLICY)
-            || storedCursors.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch));
+            || storedCursors.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch))
+            || !cycleMatchesPlannerDay(cycle, now);
         if (stale) {
+            restarted = true;
             console.log("[cron/receipt-requests] ledger or evidence moved under the cycle; restarting it", {
                 snapshotEpoch,
                 snapshotEvidenceEpoch,
                 cycle,
                 cursors: storedCursors.map(cursor => ({ epoch: cursor.epoch, evidenceEpoch: cursor.evidenceEpoch })),
+                plannerDay,
+                cyclePlannerDay: cycle?.plannerDay ?? null,
             });
             await Promise.all([writeCursor(null), writeOpenCursor(null)]);
             effectiveStartPhase = "open-issues";
@@ -2156,7 +2169,7 @@ async function runSweep(
     // being measured against, once, and nothing touches it again until the
     // next one starts.
     if (cycle === null) {
-        cycle = { id: randomUUID(), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY };
+        cycle = { id: randomUUID(), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch, recognitionPolicy: RECOGNITION_POLICY, plannerDay };
         await writeCycle(cycle);
     }
     /**
