@@ -93,20 +93,43 @@ function milestoneSend(db: any, invoiceId: string, ids: string[], at: Date) {
     ]);
 }
 
-/** Poll a separate connection until Postgres shows a backend blocked on a
- *  row lock in this database. Throws if that is never observed. */
-async function waitUntilBlocked(monitor: PrismaClient, timeoutMs = 10_000, intervalMs = 50): Promise<void> {
+/** Race `promise` against a bounded timer, rejecting with `message` if the
+ *  timer wins. Every wait in runWhileBlocking is bounded this way so a
+ *  failure reports a clear reason instead of hanging the suite. */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
+/** Poll a third connection until Postgres itself reports `blockerPid` as the
+ *  thing blocking the backend behind `getWaiterPid()` (pg_blocking_pids) —
+ *  not merely that some backend somewhere is waiting on some lock, which an
+ *  unrelated waiter could also satisfy. `getWaiterPid` is read live on every
+ *  poll because transaction B's pid is only known once its own first
+ *  statement (SELECT pg_backend_pid()) has resolved. */
+async function waitUntilBlocking(
+    monitor: PrismaClient,
+    blockerPid: number,
+    getWaiterPid: () => number,
+    timeoutMs = 10_000,
+    intervalMs = 50,
+): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-        const rows = await monitor.$queryRaw<Array<{ n: number }>>`
-            SELECT count(*)::int AS n
-            FROM pg_stat_activity
-            WHERE datname = current_database()
-              AND wait_event_type = 'Lock'
-        `;
-        if (Number(rows[0]?.n ?? 0) > 0) return;
+        const waiterPid = getWaiterPid();
+        if (waiterPid > 0) {
+            const rows = await monitor.$queryRaw<Array<{ blocked: boolean }>>`
+                SELECT ${blockerPid}::int = ANY(pg_blocking_pids(${waiterPid}::int)) AS blocked
+            `;
+            if (rows[0]?.blocked) return;
+        }
         if (Date.now() >= deadline) {
-            throw new Error("expected a second transaction to be waiting on a row lock, but none was observed within 10s");
+            throw new Error(
+                `expected backend ${blockerPid} (transaction A) to appear in pg_blocking_pids of transaction B within ${timeoutMs}ms, but it never did`,
+            );
         }
         await new Promise((r) => setTimeout(r, intervalMs));
     }
@@ -114,41 +137,98 @@ async function waitUntilBlocked(monitor: PrismaClient, timeoutMs = 10_000, inter
 
 /**
  * Hold `hold` open on a dedicated connection (dbA), start `attempt` on a
- * second dedicated connection (dbB) once dbA's write is in place, wait for
- * Postgres to actually show dbB blocked on the row lock (waitUntilBlocked),
- * THEN release dbA. Returns dbB's result.
+ * second dedicated connection (dbB) once dbA's write is in place, poll a
+ * THIRD connection until Postgres confirms A's backend is actually blocking
+ * B's (waitUntilBlocking), THEN release dbA. Returns dbB's result.
+ *
+ * `hold` and `attempt` each run as the body of an interactive transaction
+ * whose very first statement is `SELECT pg_backend_pid()`, so the pid each
+ * is checked against is really that transaction's own backend, not a
+ * separate connection that happened to be idle.
+ *
+ * Readiness and the lock-wait poll are each bounded (10s) with a clear
+ * failure message; the holder transaction failing before it signals ready
+ * rejects the readiness wait instead of hanging it. The holder is always
+ * released in `finally`, and both transaction promises are settled
+ * (Promise.allSettled) before either client disconnects.
  */
 async function runWhileBlocking<T>(
     monitor: PrismaClient,
     hold: (tx: any) => Promise<void>,
-    attempt: (dbB: PrismaClient) => Promise<T>,
+    attempt: (tx: any) => Promise<T>,
 ): Promise<T> {
     const dbA = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     const dbB = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => { release = r; });
+
+    let resolveReady!: (pid: number) => void;
+    let rejectReady!: (err: unknown) => void;
+    const ready = new Promise<number>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+
+    const holderPromise = dbA.$transaction(async (tx) => {
+        const [{ pid }] = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`;
+        await hold(tx);
+        resolveReady(pid);
+        await held;
+    }, { maxWait: 10_000, timeout: 20_000 });
+    // If the holder fails before signaling ready, propagate that failure to
+    // the readiness wait instead of leaving it to time out uninformatively.
+    holderPromise.catch((err) => rejectReady(err));
+
+    // dbB's transaction must not start until A is confirmed ready (its lock
+    // in place) — starting it any earlier would let B race ahead of A's
+    // write with no ordering guarantee at all.
+    let pidB = 0;
+    let runningPromise: Promise<T> | undefined;
+    let waitError: unknown;
     try {
-        let release: () => void = () => {};
-        const held = new Promise<void>((r) => { release = r; });
-        let opened = false;
-        const holder = dbA.$transaction(async (tx) => {
-            await hold(tx);
-            opened = true;
-            await held;
+        const pidA = await withTimeout(
+            ready,
+            10_000,
+            "transaction A never became ready within 10s (it may have failed before signaling — see the underlying error)",
+        );
+
+        runningPromise = dbB.$transaction(async (tx) => {
+            const [{ pid }] = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`;
+            pidB = pid;
+            return await attempt(tx);
         }, { maxWait: 10_000, timeout: 20_000 });
-        while (!opened) await new Promise((r) => setTimeout(r, 10));
 
-        let settled = false;
-        const running = attempt(dbB).then((r) => { settled = true; return r; });
-
-        await waitUntilBlocked(monitor);
-        assert.equal(settled, false, "the second transaction must WAIT on the lock — finishing here means it took none");
-
-        release();
-        await holder;
-        return await running;
+        await waitUntilBlocking(monitor, pidA, () => pidB);
+    } catch (err) {
+        waitError = err;
     } finally {
-        await dbA.$disconnect();
-        await dbB.$disconnect();
+        release();
     }
+
+    // A no-op placeholder so Promise.allSettled always has something to
+    // settle even if dbB's transaction was never started (readiness itself
+    // failed above).
+    const settleRunning = runningPromise ?? Promise.reject(waitError ?? new Error("transaction B never started"));
+    settleRunning.catch(() => {});
+
+    const [holderOutcome, runningOutcome] = await Promise.allSettled([holderPromise, settleRunning]);
+    await dbA.$disconnect();
+    await dbB.$disconnect();
+
+    if (waitError) throw waitError;
+    if (holderOutcome.status === "rejected") throw holderOutcome.reason;
+    if (runningOutcome.status === "rejected") throw runningOutcome.reason;
+    return runningOutcome.value;
+}
+
+/** Same write milestoneSend performs, but as statements inside an ALREADY
+ *  open interactive transaction — used by runWhileBlocking's attempt side,
+ *  whose harness runs its own SELECT pg_backend_pid() as this transaction's
+ *  first statement before any of these run. */
+async function milestoneSendTx(tx: any, invoiceId: string, ids: string[], at: Date) {
+    const stampCount = await stampFirstRequested(tx, invoiceId, ids, at);
+    for (const id of ids) {
+        await tx.paymentSchedule.update({ where: { id }, data: { qbInvoiceSentAt: at } });
+    }
+    return [stampCount] as [number];
 }
 
 test("D1: first send sets both; a resend moves only qbInvoiceSentAt", { skip }, async () => {
@@ -235,9 +315,9 @@ test("D4: two concurrent sends: only the first sets it", { skip }, async () => {
                 await stampFirstRequested(tx, ID.invoiceA, ["ps-frtest-d4"], tA);
                 await tx.paymentSchedule.update({ where: { id: "ps-frtest-d4" }, data: { qbInvoiceSentAt: tA } });
             },
-            (dbB) => milestoneSend(dbB, ID.invoiceA, ["ps-frtest-d4"], tB),
+            (tx) => milestoneSendTx(tx, ID.invoiceA, ["ps-frtest-d4"], tB),
         );
-        const [stampCount] = result as [number, unknown];
+        const [stampCount] = result as [number];
         assert.equal(stampCount, 0, "B's stamp must see the row already claimed and update nothing");
 
         const row = await readSchedule(db, "ps-frtest-d4");
@@ -265,9 +345,9 @@ test("D5: an old-build send landing mid-flight is not lost", { skip }, async () 
             async (tx) => {
                 await tx.paymentSchedule.update({ where: { id: "ps-frtest-d5" }, data: { qbInvoiceSentAt: tOld } });
             },
-            (dbB) => milestoneSend(dbB, ID.invoiceA, ["ps-frtest-d5"], tNew),
+            (tx) => milestoneSendTx(tx, ID.invoiceA, ["ps-frtest-d5"], tNew),
         );
-        const [stampCount] = result as [number, unknown];
+        const [stampCount] = result as [number];
         assert.equal(stampCount, 1, "B's stamp must run: the row was still unset when it re-read after A committed");
 
         const row = await readSchedule(db, "ps-frtest-d5");
