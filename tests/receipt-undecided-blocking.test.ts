@@ -230,6 +230,52 @@ test("blockingUndecidedLines", async t => {
         });
         assert.deepEqual(result, ["bl-a", "bl-b"]);
     });
+
+    // ═══ Codex round 1, B2: the open-issue exemption requires a CURRENT owner ═══
+
+    await t.test("an open issue whose stored owner no longer matches today's descriptor is blocking", () => {
+        // Default descriptor's card tail (C#8516) derives "CJ" today — see
+        // CARD_OWNERS in receipt-policy.ts. "unassigned" models the stored
+        // details from before a ledger correction changed the card tail.
+        const corrected = line({ id: "bl-stale" });
+        const result = blockingUndecidedLines({
+            lines: [corrected],
+            undecidedIds: [corrected.id],
+            openIssueKeys: new Set([corrected.id]),
+            openIssueDerivedOwners: new Map([[corrected.id, "unassigned"]]),
+            resolvedKeys: new Set(),
+            now: NOW,
+        });
+        assert.deepEqual(result, [corrected.id]);
+    });
+
+    await t.test("an open issue whose stored owner still matches today's descriptor stays exempt", () => {
+        const fresh = line({ id: "bl-fresh" }); // derives "CJ", same as stored below
+        const result = blockingUndecidedLines({
+            lines: [fresh],
+            undecidedIds: [fresh.id],
+            openIssueKeys: new Set([fresh.id]),
+            openIssueDerivedOwners: new Map([[fresh.id, "CJ"]]),
+            resolvedKeys: new Set(),
+            now: NOW,
+        });
+        assert.deepEqual(result, []);
+    });
+
+    await t.test("an open issue with no entry in openIssueDerivedOwners stays exempt (backward compatible: trust the exemption, as before B2)", () => {
+        const noEntry = line({ id: "bl-no-entry" });
+        const result = blockingUndecidedLines({
+            lines: [noEntry],
+            undecidedIds: [noEntry.id],
+            openIssueKeys: new Set([noEntry.id]),
+            // openIssueDerivedOwners omitted entirely — mirrors a caller that
+            // has not been updated, or an issue this run's caller chose not
+            // to look up (e.g. it carries an ownerOverride).
+            resolvedKeys: new Set(),
+            now: NOW,
+        });
+        assert.deepEqual(result, []);
+    });
 });
 
 // ═══ §14.6: undecidedBlocking holds "done" back ═════════════════════════

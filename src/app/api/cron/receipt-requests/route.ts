@@ -36,6 +36,7 @@ import {
     pageComponents,
     MEMO_CONFLICT_RESOLUTION,
     MEMO_SIGNED_RESOLUTION,
+    effectiveOwner,
     hasBackedResolution,
     hasResolution,
     mergeReceiptRequestDetails,
@@ -2441,6 +2442,23 @@ async function runSweep(
             // resume into THIS pass has to prove the same thing (round-44 gate,
             // finding 1).
             await writeOpenCursor(formatSweepCursor({ key: openCursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
+            // Same reasoning as the line pass's own checkpoint (Codex round 1,
+            // real issue: "exceptional progress logs lose committed work") —
+            // this page's share of `openPass` is durable the instant this
+            // callback returns, so a later page's throw still leaves a real
+            // count behind rather than the zeros `progress` started with.
+            if (progress) {
+                progress.openBatches = openBatches;
+                progress.opened = openPass.opened;
+                progress.closed = openPass.closed;
+                progress.touched = openPass.touched;
+                progress.errors = openPass.errors;
+                progress.undecided = openUndecided;
+                progress.contended = openContended;
+                progress.replans = replans;
+                progress.setupMs = setupMs;
+                progress.openMs = Date.now() - openStart;
+            }
         });
         if (unitResult.deferred) { deferred = true; break; }
         if (page.length < OPEN_ISSUE_BATCH_SIZE) { openExhausted = true; break; }
@@ -2465,6 +2483,28 @@ async function runSweep(
         errors: openPass.errors,
         failedTargets: [...openPass.failedTargets],
     };
+    // WHAT THE OPEN-ISSUE PASS ALREADY COMMITTED, VISIBLE NOW (Codex round 1,
+    // real issue: "exceptional progress logs lose committed work"). The line
+    // pass below can still throw — a SweepDeferredError on unreconciled
+    // contention, or anything else uncaught — and until this invocation
+    // either returns or reaches its own catch, `progress` (see the interface
+    // comment: "filled in as the cycle starts and both passes ... run") is
+    // the only record `GET`'s `finally` block has to log. Filling it in here
+    // from this pass's own real totals, rather than waiting for `result` at
+    // the very end, means a failure partway through the line pass logs what
+    // actually committed instead of the zeros `progress` started with.
+    if (progress) {
+        progress.openBatches = openBatches;
+        progress.opened = totals.opened;
+        progress.closed = totals.closed;
+        progress.touched = totals.touched;
+        progress.errors = totals.errors;
+        progress.undecided = openUndecided;
+        progress.contended = openContended;
+        progress.replans = replans;
+        progress.setupMs = setupMs;
+        progress.openMs = openMs;
+    }
     let batches = 0;
     let linesSeen = 0;
     let undecided = openUndecided;
@@ -2620,12 +2660,24 @@ async function runSweep(
             if (pageUndecided.length > 0) {
                 const open = await prisma.reviewIssue.findMany({
                     where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: pageUndecided }, clearedAt: null },
-                    select: { targetKey: true },
+                    select: { targetKey: true, displayDetails: true },
                 });
+                // THE STORED DERIVED OWNER, for blockingUndecidedLines' own
+                // staleness check (Codex round 1, B2) — never for an issue
+                // carrying a human ownerOverride, which is authoritative on
+                // its own already-current path (§14.2) and is never "stale"
+                // just because the descriptor-derived answer differs from it.
+                const openIssueDerivedOwners = new Map<string, string>();
+                for (const issue of open) {
+                    const details = parseMissingReceiptDetails(issue.displayDetails);
+                    const overridden = typeof details.ownerOverride === "string" && details.ownerOverride !== "";
+                    if (!overridden) openIssueDerivedOwners.set(issue.targetKey, effectiveOwner({ owner: details.owner }));
+                }
                 const blocking = blockingUndecidedLines({
                     lines: batch.map(r => ({ ...r, postedDate: r.postedDate.toISOString().slice(0, 10) })),
                     undecidedIds: pageUndecided,
                     openIssueKeys: new Set(open.map(r => r.targetKey)),
+                    openIssueDerivedOwners,
                     resolvedKeys: new Set(resolvedIssueKeys),
                     now,
                 });
@@ -2642,6 +2694,23 @@ async function runSweep(
             cursor = page[page.length - 1].key;
             await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
             if (pageIndex >= pages.length) exhausted = true;
+            // SAME REASONING AS THE OPEN-ISSUE PASS ABOVE (Codex round 1, real
+            // issue): this page is durably checkpointed the instant this
+            // callback returns, so its share of `totals` is copied into
+            // `progress` right here rather than only once the whole cycle
+            // finishes.
+            if (progress) {
+                progress.batches = batches;
+                progress.bankLines = linesSeen;
+                progress.opened = totals.opened;
+                progress.closed = totals.closed;
+                progress.touched = totals.touched;
+                progress.errors = totals.errors;
+                progress.undecided = undecided;
+                progress.contended = openContended + lineContended;
+                progress.replans = replans;
+                progress.lineMs = Date.now() - lineStart;
+            }
         });
         if (unitResult.deferred) { deferred = true; break; }
     }

@@ -143,6 +143,7 @@ test("(a) a certified cycle, then a committed courtesy clear (with its bump): th
     const claim = await claimOwnerDay(claimDb!, {
         owner, date: pacificToday(), items: [] as CardItem[], overflow: 0, overflowExact: true,
         claimedAt: new Date(), claimToken: "tok-a", ownerEpochAtScan, recognitionPolicy: RECOGNITION_POLICY,
+        cycleIdAtScan: `${PREFIX}cycle-a`,
     });
 
     assert.deepEqual(claim, { kind: "refused", reason: "certification" });
@@ -171,6 +172,7 @@ test("(b) writeReceiptOwnerLocked commits after the pre-scan owner-epoch read: t
     const claim = await claimOwnerDay(claimDb!, {
         owner, date: pacificToday(), items: [] as CardItem[], overflow: 0, overflowExact: true,
         claimedAt: new Date(), claimToken: "tok-b", ownerEpochAtScan, recognitionPolicy: RECOGNITION_POLICY,
+        cycleIdAtScan: `${PREFIX}cycle-b`,
     });
 
     assert.deepEqual(claim, { kind: "refused", reason: "owner-moved" });
@@ -217,6 +219,7 @@ test("(c) a concurrent writeReceiptOwnerLocked blocks while the claim's transact
             {
                 owner, date: pacificToday(), items: [] as CardItem[], overflow: 0, overflowExact: true,
                 claimedAt: new Date(), claimToken: "tok-c", ownerEpochAtScan, recognitionPolicy: RECOGNITION_POLICY,
+                cycleIdAtScan: `${PREFIX}cycle-c`,
             },
         );
         order.push("claim:committed");
@@ -360,6 +363,38 @@ test("(d) a courtesy clear over two issues and recordCardOnIssues over the same 
         clearResult.cleared.every(target => target === targetD1 || target === targetD2),
         `cleared must be a subset of [${targetD1}, ${targetD2}], got ${JSON.stringify(clearResult.cleared)}`,
     );
+    await cleanup();
+});
+
+test("(e) a claim refuses when the cycle changed since the scan, even though the new cycle recertified cleanly (Codex round 1, B1)", { skip }, async () => {
+    await cleanup();
+    const owner = `${PREFIX}owner-e`;
+    const targetE = `${PREFIX}line-e`;
+    await seedIssue(targetE);
+    await writeCertifiedMarkerAndCycle(`${PREFIX}cycle-e1`);
+    // The scan's own snapshot — exactly what the cards route reads as
+    // ownerEpochAtScan and currentCycleId (receipt-request-cards/route.ts:690,
+    // 733) before it ever builds a candidate array.
+    const ownerEpochAtScan = await readReceiptOwnerEpoch(claimDb!);
+    const cycleIdAtScan = `${PREFIX}cycle-e1`;
+
+    // An overlapping or delayed sweep completes and REPLACES the cycle with a
+    // new one that itself certifies cleanly against the world right now —
+    // Codex's own B1 scenario: a "successful recertification", not merely an
+    // epoch bump. Nothing here moves the owner epoch, so the owner-moved
+    // check alone cannot catch this; only comparing cycle identity can.
+    await writeCertifiedMarkerAndCycle(`${PREFIX}cycle-e2`);
+
+    const claim = await claimOwnerDay(claimDb!, {
+        owner, date: pacificToday(), items: [] as CardItem[], overflow: 0, overflowExact: true,
+        claimedAt: new Date(), claimToken: "tok-e", ownerEpochAtScan, recognitionPolicy: RECOGNITION_POLICY,
+        cycleIdAtScan,
+    });
+
+    assert.deepEqual(claim, { kind: "refused", reason: "certification" },
+        "a freshly, validly certified DIFFERENT cycle must not let a claim built from the old scan through");
+    const row = await claimDb!.receiptRequestCard.findUnique({ where: { owner_pacificDate: { owner, pacificDate: pacificToday() } } });
+    assert.equal(row, null, "no row was ever created");
     await cleanup();
 });
 

@@ -312,7 +312,20 @@ export function continuationNeedsWork(input: CycleCertificationInput & {
     fullRunOwed: boolean; lineCursor: string | null; openCursor: string | null;
 }): boolean {
     if (input.fullRunOwed) return true;
-    if (cycleCertified(input)) return false;
+    // CERTIFIED FOR TODAY'S PLANNER DAY, not merely certified (Codex round 1,
+    // real issue — "completed legacy cycles need not restart after
+    // deployment"): `cycleCertified` alone proves the epochs, identity and
+    // timing are unchanged, but says nothing about which day the cycle was
+    // PLANNED against. A legacy cycle (no `plannerDay` — see that field's own
+    // doc comment: "it restarts once after deploy") or one left over across a
+    // UTC day rollover can pass every other check here forever, with no
+    // epoch change or full-run request ever forcing a resume.
+    // `cardSelectionCertified` already refuses to hand a card out from that
+    // cycle (`cycleMatchesPlannerDay`), so nothing wrong ships — but without
+    // the same check here, the sweep itself never learns it owes a fresh
+    // cycle, so the mismatch never heals on its own. Requiring both is what
+    // lets it resume like any other unfinished cycle.
+    if (cycleCertified(input) && cycleMatchesPlannerDay(input.cycle, input.now)) return false;
     // A crash between durable cycle creation and phase/checkpoint writes still resumes.
     return input.cycle !== null || shouldResumeSweep(input.marker.phase, input.lineCursor, input.openCursor);
 }

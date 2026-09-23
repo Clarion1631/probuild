@@ -783,6 +783,21 @@ test("the function never rejects, even when the transaction wrapper itself throw
     assert.deepEqual(result.cleared, []);
 });
 
+test("the function never rejects even when an INJECTED clearOne itself rejects, not just the default's own catch (Codex round 1, real issue)", async () => {
+    // The test above proves the DEFAULT clearOneAtomically's own try/catch
+    // swallows a thrown transaction. This proves the apply loop's own guard:
+    // deps.clearOne is an exported seam a caller can override outright, and
+    // an override that rejects instead of resolving to {kind:"error"} used to
+    // escape past this function's own "never throws" contract uncaught.
+    const s = store(["line-open"], ["line-open"]);
+    const result = await closeRequestsSatisfiedBy(evidence(), depsFor(s, {
+        clearOne: async () => { throw new Error("injected clearOne rejection"); },
+    }));
+
+    assert.equal(result.errors, 1);
+    assert.deepEqual(result.cleared, []);
+});
+
 test("a setup failure — the candidate query, the open-issue lookup, or the epoch read — is counted, never thrown", async () => {
     const s = store(["line-open"], ["line-open"]);
 

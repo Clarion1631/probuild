@@ -132,6 +132,36 @@ test("source pin: runSweep fills in progress from result (ids and counts, never 
     assert.doesNotMatch(body, /result\.cursor\b/);
 });
 
+test("source pin: progress is also filled incrementally at each pass's own checkpoint, not only from the final result (Codex round 1, real issue: exceptional progress logs lose committed work)", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+
+    // The open-issue pass: synced right after its own loop, from openPass's
+    // real totals — reached even when the LINE pass below goes on to throw.
+    const openMsAt = sweep.indexOf("const openMs = Date.now() - openStart;");
+    const openSyncAt = sweep.indexOf("if (progress) {", openMsAt);
+    const openSyncCloseAt = sweep.indexOf("\n    }", openSyncAt);
+    assert.ok(openMsAt > 0 && openSyncAt > openMsAt,
+        "the open pass syncs progress after openMs is computed");
+    const openSyncBody = sweep.slice(openSyncAt, openSyncCloseAt);
+    assert.match(openSyncBody, /progress\.opened = totals\.opened;/);
+    assert.match(openSyncBody, /progress\.errors = totals\.errors;/);
+    assert.match(openSyncBody, /progress\.openMs = openMs;/);
+
+    // The line pass: synced inside its OWN per-page checkpoint callback, so a
+    // throw on a LATER page still leaves this page's real, committed counts
+    // behind instead of the zeros `progress` started with.
+    const lineCheckpointAt = sweep.indexOf("cursor = page[page.length - 1].key;");
+    const lineSyncAt = sweep.indexOf("if (progress) {", lineCheckpointAt);
+    const lineCheckpointCloseAt = sweep.indexOf("\n        });", lineCheckpointAt);
+    assert.ok(lineCheckpointAt > openSyncCloseAt, "the line-pass checkpoint comes after the open-pass sync");
+    assert.ok(lineSyncAt > lineCheckpointAt && lineSyncAt < lineCheckpointCloseAt,
+        "the line pass syncs progress inside its own checkpoint callback, before that callback closes");
+    const lineSyncBody = sweep.slice(lineSyncAt, lineCheckpointCloseAt);
+    assert.match(lineSyncBody, /progress\.opened = totals\.opened;/);
+    assert.match(lineSyncBody, /progress\.errors = totals\.errors;/);
+    assert.match(lineSyncBody, /progress\.lineMs = Date\.now\(\) - lineStart;/);
+});
+
 test("source pin: the SweepProgress shape names every field the brief lists", () => {
     const sweep = read("src/app/api/cron/receipt-requests/route.ts");
     const ifaceAt = sweep.indexOf("interface SweepProgress {");

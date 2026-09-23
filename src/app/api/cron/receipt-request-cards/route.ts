@@ -571,6 +571,21 @@ export async function claimOwnerDay(
         claimToken: string;
         /** Read at scan time, under no lock — this transaction re-checks it under one. */
         ownerEpochAtScan: string;
+        /**
+         * The cycle that was current when THIS scan built `items` (Codex round
+         * 1, B1 — "certification is not tied to the scan's cycle").
+         * `cardSelectionCertified` below only proves that the CURRENT cycle,
+         * whichever one that is, is fully certified right now — it says
+         * nothing about whether that is the SAME cycle the scan read. A later
+         * cycle can certify cleanly (a fresh, valid completion) while
+         * disagreeing with the one this candidate array was built from — e.g.
+         * evidence voided after the scan reopens a line for this owner in a
+         * new cycle that then finishes certifying without it. Comparing
+         * identity here, under the same lock, is what catches that: any
+         * cycle change between scan and claim refuses the claim exactly like
+         * an uncertified cycle would, and the next run rescans fresh.
+         */
+        cycleIdAtScan: string | null;
         recognitionPolicy: string;
     },
 ): Promise<{ kind: "claimed"; id: string } | { kind: "taken" } | { kind: "refused"; reason: "certification" | "owner-moved" | "tx-failed" }> {
@@ -584,10 +599,15 @@ export async function claimOwnerDay(
             const cycleRow = await tx.automationSetting.findUnique({ where: { key: CYCLE_KEY } });
             const marker = parseSweepMarker(markerRow?.value);
             const cycle = parseSweepCycle(cycleRow?.value ?? null);
-            if (!cardSelectionCertified({
+            // SAME CYCLE THE SCAN SAW, not merely A certified one (Codex round
+            // 1, B1): a cycle that replaced the scan's between then and now —
+            // even one that itself finished certifying cleanly — proves
+            // nothing about the candidate array THIS claim is about to write.
+            const certifiedForThisScan = cardSelectionCertified({
                 marker, cycle, bankEpoch, evidenceEpoch, recognitionPolicy: input.recognitionPolicy,
                 now: new Date(), pacificDate: input.date,
-            })) {
+            }) && (cycle?.id ?? null) === input.cycleIdAtScan;
+            if (!certifiedForThisScan) {
                 return { kind: "refused" as const, reason: "certification" as const };
             }
             if (await readReceiptOwnerEpoch(tx) !== input.ownerEpochAtScan) {
@@ -1017,6 +1037,9 @@ export async function GET(request: Request) {
             // whether its scan finished.
             overflowExact: scan.exhausted,
             claimedAt: now, claimToken: token, ownerEpochAtScan, recognitionPolicy,
+            // Same moment ownerEpochAtScan was decided (Codex round 1, B1):
+            // the cycle this run's candidates were built from.
+            cycleIdAtScan: currentCycleId,
         });
         if (claim.kind === "taken") continue; // the other run won the day
         if (claim.kind === "refused") {

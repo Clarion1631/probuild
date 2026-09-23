@@ -622,7 +622,22 @@ export async function closeRequestsSatisfiedBy(
         }
 
         const target = targets[i];
-        const outcome = await clearOne(target, expected);
+        let outcome: ClearOneOutcome;
+        try {
+            outcome = await clearOne(target, expected);
+        } catch (error) {
+            // THE INJECTED SEAM'S OWN CONTRACT (Codex round 1, real issue): the
+            // production clearOneAtomically never throws — it is documented
+            // and written that way — but `deps.clearOne` is an exported DI
+            // seam a caller or a test can override, and nothing upstream of
+            // this loop enforces the same promise on a substitute. A rejection
+            // here must still count as this module's own `error`, not escape
+            // past the "never throws" contract closeRequestsSatisfiedBy
+            // documents at its own top.
+            result.errors++;
+            console.warn("[receipt-intake/evidence-close] clearOne rejected", target, errorCategory(error));
+            break;
+        }
         if (outcome.kind === "cleared") {
             // Only a genuine `clear` is counted — a `noop` (something else
             // cleared it first) is not this call's doing (see IDEMPOTENT).

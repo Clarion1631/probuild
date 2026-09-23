@@ -132,6 +132,9 @@ function baseInput(overrides: Partial<Parameters<typeof claimOwnerDay>[1]> = {})
     return {
         owner: "CJ", date: PACIFIC_DAY, items: ITEMS, overflow: 0, overflowExact: true,
         claimedAt: NOW, claimToken: "token-1", ownerEpochAtScan: OWNER_EPOCH, recognitionPolicy: RECOGNITION_POLICY,
+        // The scan's own snapshot of the current cycle (Codex round 1, B1) —
+        // matches cycleJson()'s default id, same as fakeDb()'s default cycle.
+        cycleIdAtScan: CYCLE_ID,
         ...overrides,
     };
 }
@@ -168,6 +171,16 @@ test("each failed certification condition refuses with 'certification', and crea
         // case above, which cycleMatchesPlannerDay also refuses, for the
         // opposite reason.
         ["the cycle's plannerDay is yesterday (UTC)", { cycleValue: cycleJson({ plannerDay: UTC_YESTERDAY }) }],
+        // Codex round 1, B1: the cycle certified right now is not the one
+        // this claim's candidates were scanned against — even though it is a
+        // perfectly clean, internally-consistent certification on its own (a
+        // "successful recertification", not merely a bump). marker and cycle
+        // agree with EACH OTHER (so cardSelectionCertified alone would pass
+        // this), but disagree with baseInput()'s cycleIdAtScan.
+        ["the cycle recertified cleanly under a DIFFERENT id since the scan (Codex round 1, B1)", {
+            markerValue: markerJson({ completedCycleId: "a-later-cycle" }),
+            cycleValue: cycleJson({ id: "a-later-cycle" }),
+        }],
     ];
     for (const [label, options, inputOverrides] of cases) {
         const fake = fakeDb(options);
