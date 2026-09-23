@@ -60,16 +60,16 @@ export default async function OpenInvoicesPage({
             </div>
 
             <div className="hui-card p-4">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div>
                         <p className="text-sm text-hui-textMuted">Total Outstanding</p>
                         <p className="text-3xl font-bold text-hui-textMain">{formatCurrency(summary.totalOutstandingCents / 100)}</p>
                     </div>
-                    <div className="text-right">
+                    <div className="sm:text-right">
                         <p className="text-sm text-hui-textMuted">Open Invoices</p>
                         <p className="text-3xl font-bold text-hui-textMain">{summary.invoiceCount}</p>
                     </div>
-                    <div className="text-right">
+                    <div className="sm:text-right">
                         <p className="text-sm text-hui-textMuted">Overdue</p>
                         <p className="text-3xl font-bold text-red-500">{formatCurrency(summary.overdueCents / 100)}</p>
                         <p className="text-xs text-hui-textMuted mt-0.5">{summary.overdueInvoiceCount} invoice{summary.overdueInvoiceCount !== 1 ? "s" : ""}</p>
