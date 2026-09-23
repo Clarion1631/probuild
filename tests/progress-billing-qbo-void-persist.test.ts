@@ -64,17 +64,47 @@ function billingRow(overrides: Row = {}): Row {
  * is a signal the source drifted from what both were written against, not a
  * gap to silently paper over.
  */
+/** The only operator keys this matcher understands. */
+const SUPPORTED_OPERATORS = new Set(["in", "not", "startsWith", "gt", "lte"]);
+
 function matchWhere(row: any, where: any): boolean {
     const matchOne = (rowValue: any, cond: any): boolean => {
         if (cond === null || typeof cond !== "object") return rowValue === cond;
-        if ("in" in cond) return (cond as any).in.includes(rowValue);
-        if ("not" in cond) return rowValue !== (cond as any).not;
-        if ("startsWith" in cond) {
-            return typeof rowValue === "string" && rowValue.startsWith((cond as any).startsWith);
-        }
-        if ("gt" in cond || "lte" in cond) {
-            return (!("gt" in cond) || rowValue > (cond as any).gt)
-                && (!("lte" in cond) || rowValue <= (cond as any).lte);
+        const keys = Object.keys(cond);
+        const isOperatorObject = keys.some((key) => SUPPORTED_OPERATORS.has(key));
+        if (isOperatorObject) {
+            // Every key must be one this matcher understands — a condition
+            // mixing a supported operator with an unsupported one used to
+            // fall through whichever branch matched first and silently
+            // ignore the rest.
+            const unsupported = keys.filter((key) => !SUPPORTED_OPERATORS.has(key));
+            if (unsupported.length > 0) {
+                throw new Error(`unsupported condition: ${JSON.stringify(cond)}`);
+            }
+            // All present operators evaluated together (AND), not "whichever
+            // is checked first wins" — a condition combining e.g. `in` and
+            // `gt` used to have one silently ignored.
+            return keys.every((key) => {
+                if (key === "in") return (cond.in as unknown[]).includes(rowValue);
+                if (key === "not") {
+                    // Only a primitive or null is a real equality check; an
+                    // object here used to become `rowValue !== someObject`,
+                    // object-identity inequality, which is true for almost
+                    // any `rowValue` — silently passing a condition this
+                    // matcher cannot actually evaluate.
+                    const not = cond.not;
+                    if (not !== null && typeof not === "object") {
+                        throw new Error(`unsupported condition: ${JSON.stringify(cond)}`);
+                    }
+                    return rowValue !== not;
+                }
+                if (key === "startsWith") {
+                    return typeof rowValue === "string" && rowValue.startsWith(cond.startsWith);
+                }
+                if (key === "gt") return rowValue > cond.gt;
+                // key === "lte"
+                return rowValue <= cond.lte;
+            });
         }
         if (rowValue !== null && typeof rowValue === "object" && !Array.isArray(rowValue)) {
             // Nested relation predicate, e.g. `invoice: { projectId: "..." }` —
@@ -387,3 +417,142 @@ test("re-push safety: a Staged billing carrying a persisted voided marker still 
     );
     assert.equal(created.length, 0, "the QuickBooks create must never be reached");
 });
+
+// --- R3-1: the pay-link write pins the marker it read -----------------------
+
+/**
+ * A Draft billing about to be staged, in the same shape
+ * `tests/progress-billing-stage.test.ts`'s `draftRow` uses — the stage core
+ * reads `invoice.clientId` and `invoice.client.qbCustomerId` off it.
+ */
+function stageDraftRow(overrides: Row = {}): Row {
+    return {
+        id: "pb-1",
+        code: "INV-00171-P1",
+        description: "Rough-in complete",
+        status: "Draft",
+        subtotal: 1000,
+        taxAmount: 89,
+        total: 1089,
+        qbInvoiceId: null,
+        qbInvoiceLink: null,
+        qbSyncedAt: null,
+        qbSyncError: null,
+        invoice: {
+            id: "inv-1",
+            code: "INV-00171",
+            clientId: "client-1",
+            client: { id: "client-1", name: "Mesplay", email: "c@example.com", qbCustomerId: "42" },
+        },
+        ...overrides,
+    };
+}
+
+/**
+ * A `ProgressBillingStageDb` backed by ONE in-memory row. `updateMany`
+ * evaluates the real WHERE through `matchWhere` above — the same matcher the
+ * poller fakes in this file use — and mutates the row on a match, so these
+ * tests drive the stage core's actual CAS predicates (including the R3
+ * pay-link pin) rather than a simplified stand-in. Same idiom as
+ * `tests/progress-billing-stage.test.ts`'s `makeDb`.
+ */
+function makeStageDb(row: Row): ProgressBillingStageDb {
+    return {
+        async findUnique() { return { ...row }; },
+        async updateMany(args: any) {
+            if (!matchWhere(row, args.where)) return { count: 0 };
+            Object.assign(row, args.data);
+            return { count: 1 };
+        },
+    };
+}
+
+/**
+ * A `ProgressBillingStageQbo` whose create always succeeds (echoing back a
+ * matching document, so nothing here trips the create/tax/date mismatch
+ * refusal) and whose `getPaymentLink` is the one seam these tests drive.
+ */
+function makeStageQbo(getPaymentLink: ProgressBillingStageQbo["getPaymentLink"]): ProgressBillingStageQbo {
+    return {
+        async getTokens() { return { accessToken: "a", refreshToken: "r", realmId: "realm-1" }; },
+        async resolveCustomerAndItem() { return { customerId: "42", itemId: "7" }; },
+        async createInvoice(_t, input) {
+            return {
+                qbId: "qb-1",
+                total: input.amount,
+                document: {
+                    id: "qb-1",
+                    docNumber: input.docNumber,
+                    privateNote: input.privateNote,
+                    total: input.amount,
+                    customerId: input.customerId,
+                    txnDate: input.txnDate,
+                    itemIds: [input.itemId],
+                    totalTax: input.tax?.taxAmount ?? null,
+                },
+            };
+        },
+        getPaymentLink,
+        async deleteInvoice() { return true; },
+    };
+}
+
+const stageLogEvent = (async () => {}) as any;
+
+test("R3-1: the poller voids the row while getPaymentLink() is in flight — a returned URL must not resurrect it", async () => {
+    const row = stageDraftRow();
+    const db = makeStageDb(row);
+    const qbo = makeStageQbo(async () => {
+        // The payments poller persists 'voided' while this call is still
+        // awaiting QuickBooks for the pay link.
+        row.qbSyncError = "voided";
+        return "https://pay.example/x";
+    });
+
+    const res = await stageProgressBillingToQuickBooksCore("pb-1", createRouteDeadline(30_000), { db, qbo, logEvent: stageLogEvent });
+
+    assert.equal(res.success, true, "the billing is still correctly staged and linked");
+    assert.equal(res.qbInvoiceLink, null, "the stale link this call fetched is not reported as persisted");
+    assert.equal(row.qbSyncError, "voided", "the poller's flag wins over this call's stale pay-link answer");
+    assert.equal(row.qbInvoiceLink, null, "qbInvoiceLink was never written over the void");
+});
+
+test("R3-1: the poller voids the row while getPaymentLink() is in flight — a null answer must not downgrade it to a retry marker", async () => {
+    const row = stageDraftRow();
+    const db = makeStageDb(row);
+    const qbo = makeStageQbo(async () => {
+        row.qbSyncError = "voided";
+        return null;
+    });
+
+    const res = await stageProgressBillingToQuickBooksCore("pb-1", createRouteDeadline(30_000), { db, qbo, logEvent: stageLogEvent });
+
+    assert.equal(res.success, true);
+    assert.equal(res.qbInvoiceLink, null);
+    assert.equal(row.qbSyncError, "voided", "must not become paylink-pending:1");
+});
+
+test("R3-1: the pay-link sweep finishes first — its persisted link must not be overwritten by this call's own, different answer", async () => {
+    const row = stageDraftRow();
+    const db = makeStageDb(row);
+    const qbo = makeStageQbo(async () => {
+        // sweepPendingPayLinks reads its own answer and persists it while
+        // this call is still awaiting QuickBooks for a (different) one.
+        row.qbSyncError = null;
+        row.qbInvoiceLink = "https://sweep.example/y";
+        return "https://pay.example/different-answer";
+    });
+
+    const res = await stageProgressBillingToQuickBooksCore("pb-1", createRouteDeadline(30_000), { db, qbo, logEvent: stageLogEvent });
+
+    assert.equal(res.success, true);
+    assert.equal(res.qbInvoiceLink, "https://sweep.example/y", "reports the sweep's persisted link, not this call's stale answer");
+    assert.equal(row.qbSyncError, null, "the sweep's cleared marker is kept");
+    assert.equal(row.qbInvoiceLink, "https://sweep.example/y", "the sweep's link is kept, not overwritten");
+});
+
+// R3-1, nothing changed during the call (marker cleared, link written): already
+// covered by tests/progress-billing-stage.test.ts's "the happy path links the
+// invoice, writes the pay link, and clears the marker" — that test drives the
+// same CAS with the new `qbSyncError: PAYLINK_PENDING_MARKER` pin in its WHERE
+// and still passes, since nothing moves the marker mid-call there.

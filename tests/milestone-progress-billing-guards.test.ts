@@ -61,10 +61,38 @@ function matchWhere(row: any, where: Record<string, unknown> | undefined): boole
     return Object.entries(where ?? {}).every(([key, cond]) => matchField((row ?? {})[key], cond));
 }
 
+/** The only operator keys this matcher understands. */
+const SUPPORTED_OPERATORS = new Set(["in", "not"]);
+
 function matchField(value: any, cond: any): boolean {
     if (cond === null || typeof cond !== "object") return value === cond;
-    if ("in" in cond) return (cond as { in: unknown[] }).in.includes(value);
-    if ("not" in cond) return value !== (cond as { not: unknown }).not;
+    const keys = Object.keys(cond);
+    const isOperatorObject = keys.some((key) => SUPPORTED_OPERATORS.has(key));
+    if (isOperatorObject) {
+        // Every key must be one this matcher understands — a condition mixing
+        // a supported operator with an unsupported one used to fall through
+        // whichever branch matched first and silently ignore the rest.
+        const unsupported = keys.filter((key) => !SUPPORTED_OPERATORS.has(key));
+        if (unsupported.length > 0) {
+            throw new Error(`unsupported where condition: ${JSON.stringify(cond)}`);
+        }
+        // All present operators evaluated together (AND), not "whichever is
+        // checked first wins" — a condition could otherwise carry both `in`
+        // and `not` and have one of them silently ignored.
+        return keys.every((key) => {
+            if (key === "in") return (cond.in as unknown[]).includes(value);
+            // key === "not". Only a primitive or null is a real equality
+            // check; an object here used to become `value !== someObject`,
+            // which is object-identity inequality and true for almost any
+            // `value` — silently passing a condition this matcher cannot
+            // actually evaluate.
+            const not = cond.not;
+            if (not !== null && typeof not === "object") {
+                throw new Error(`unsupported where condition: ${JSON.stringify(cond)}`);
+            }
+            return value !== not;
+        });
+    }
     if (value !== null && typeof value === "object" && !Array.isArray(value)) {
         // Nested relation predicate, e.g. `billing: { status: { not: "Void" } }`
         // — recurse the same matcher against the related row.
