@@ -162,6 +162,44 @@ test("source pin: progress is also filled incrementally at each pass's own check
     assert.match(lineSyncBody, /progress\.lineMs = Date\.now\(\) - lineStart;/);
 });
 
+// ═══ Codex round 2: "exceptional progress logs lose committed work" was only
+// PARTIALLY fixed in round 2 — the sync above lands inside each checkpoint
+// callback, but it used to run AFTER the awaited cursor write, so a
+// `CursorWriteError` thrown by that write (a real, tested outcome — see
+// `progress.outcome = "cursor-write-failed"` below) skipped the copy and
+// GET's `finally` logged the PREVIOUS page's counts, not this one's already-
+// committed work. The fix moves the copy before the write. These two pin
+// that ORDER specifically; the "presence" test above still passes on the
+// unfixed code (Codex's own words: "its assertions are compatible with the
+// remaining bug") because it never checks what comes AFTER the sync. ═══════
+
+test("source pin: the line-pass checkpoint copies progress BEFORE the awaited cursor write, not after", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    const lineCheckpointAt = sweep.indexOf("cursor = page[page.length - 1].key;");
+    const lineSyncAt = sweep.indexOf("if (progress) {", lineCheckpointAt);
+    const writeCursorAt = sweep.indexOf("await writeCursor(formatSweepCursor(", lineCheckpointAt);
+    const exhaustedAt = sweep.indexOf("if (pageIndex >= pages.length) exhausted = true;", lineCheckpointAt);
+    assert.ok(lineCheckpointAt > 0 && lineSyncAt > lineCheckpointAt,
+        "the checkpoint syncs progress from the cursor it is about to persist");
+    assert.ok(writeCursorAt > lineSyncAt,
+        "progress must be copied BEFORE the awaited cursor write — a CursorWriteError there must not discard this page's already-committed counts");
+    // `exhausted` is a claim that the write itself succeeded, so it stays
+    // gated on the write, unlike `progress` (which describes committed DB
+    // work that happened before this checkpoint ran at all).
+    assert.ok(exhaustedAt > writeCursorAt, "exhausted is still set only after the cursor write succeeds");
+});
+
+test("source pin: the open-issue-pass checkpoint copies progress BEFORE the awaited cursor write, same as the line pass", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+    const openCheckpointAt = sweep.indexOf("openCursor = page[page.length - 1].id;");
+    const openSyncAt = sweep.indexOf("if (progress) {", openCheckpointAt);
+    const writeOpenCursorAt = sweep.indexOf("await writeOpenCursor(formatSweepCursor(", openCheckpointAt);
+    assert.ok(openCheckpointAt > 0 && openSyncAt > openCheckpointAt,
+        "the checkpoint syncs progress from the cursor it is about to persist");
+    assert.ok(writeOpenCursorAt > openSyncAt,
+        "progress must be copied BEFORE the awaited open-cursor write, not after");
+});
+
 test("source pin: the SweepProgress shape names every field the brief lists", () => {
     const sweep = read("src/app/api/cron/receipt-requests/route.ts");
     const ifaceAt = sweep.indexOf("interface SweepProgress {");

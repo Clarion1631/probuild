@@ -140,10 +140,10 @@ test("the continuation schedule never collides with a full run", () => {
     assert.equal(at("/api/cron/receipt-request-cards"), "30 14 * * 1-5");
     assert.equal(at("/api/cron/receipt-request-cards?retry=1"), "30 16 * * 1-5");
     // Available starts, including the 10:00 full run; not a completion guarantee.
-    const startsBeforeCards = (hour: number) => 1 + (hour - 13) * receiptMinutes.length
+    const startsBeforeCards = (hour: number) => 1 + (hour - 10) * receiptMinutes.length
         + receiptMinutes.filter(minute => minute < 30).length;
-    assert.equal(startsBeforeCards(14), 85);
-    assert.equal(startsBeforeCards(16), 197);
+    assert.equal(startsBeforeCards(14), 253);
+    assert.equal(startsBeforeCards(16), 365);
     assert.ok(!receiptMinutes.includes(30), "continuations avoid both card selection slots");
 
     // PRE-FIX CONTROL: the old field fired on the hour, which is exactly when

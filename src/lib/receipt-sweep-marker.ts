@@ -169,7 +169,13 @@ export function chaserCompletedFor(
 export const CYCLE_KEY = "receiptRequestsCycle";
 
 export interface SweepCycle {
-    /** Identifies the cycle in logs; never compared for correctness. */
+    /**
+     * Identifies the cycle in logs. Also compared for correctness, under
+     * lock, at card-claim time: `claimOwnerDay` requires it to equal the
+     * cycle its scan was certified against —
+     * `(cycle?.id ?? null) === input.cycleIdAtScan`
+     * (receipt-request-cards/route.ts) — Codex round 2 blocker 1, PR #530.
+     */
     id: string;
     epoch: string;
     evidenceEpoch: string;
