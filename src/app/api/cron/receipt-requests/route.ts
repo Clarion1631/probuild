@@ -2322,11 +2322,17 @@ async function runSweep(
         // check (Codex round 1, B2) — never for an issue carrying a human
         // ownerOverride, which is authoritative on its own already-current path
         // (§14.2) and is never "stale" just because the descriptor-derived
-        // answer differs from it.
+        // answer differs from it. TRIMMED before the emptiness check (Codex
+        // cards-safety-followup round 1): effectiveOwner() trims ownerOverride
+        // before deciding whether it counts as set, so a whitespace-only value
+        // is NOT an override there and falls back to the derived owner.
+        // Comparing the untrimmed string here disagreed with that — it called
+        // a whitespace-only value "overridden" and skipped the very freshness
+        // check the card scan (which calls effectiveOwner) needed.
         const openIssueDerivedOwners = new Map<string, string>();
         for (const issue of open) {
             const details = parseMissingReceiptDetails(issue.displayDetails);
-            const overridden = typeof details.ownerOverride === "string" && details.ownerOverride !== "";
+            const overridden = typeof details.ownerOverride === "string" && details.ownerOverride.trim() !== "";
             if (!overridden) openIssueDerivedOwners.set(issue.targetKey, effectiveOwner({ owner: details.owner }));
         }
         const blocking = blockingUndecidedLines({
@@ -2502,6 +2508,14 @@ async function runSweep(
                 progress.touched = openPass.touched;
                 progress.errors = openPass.errors;
                 progress.undecided = openUndecided;
+                // SAME RULE, FOR undecidedLines (Codex cards-safety-followup
+                // round 1): recordUndecidedBlocking above already wrote
+                // cycle.undecidedLines durably, via writeCycle, before this
+                // callback ever runs — copying it here means a CursorWriteError
+                // from the writeOpenCursor call below still leaves the progress
+                // log showing the real, already-committed count instead of the
+                // stale default.
+                progress.undecidedLines = cycle!.undecidedLines?.length ?? 0;
                 progress.contended = openContended;
                 progress.replans = replans;
                 progress.setupMs = setupMs;
@@ -2733,6 +2747,14 @@ async function runSweep(
                 progress.touched = totals.touched;
                 progress.errors = totals.errors;
                 progress.undecided = undecided;
+                // SAME RULE, FOR undecidedLines (Codex cards-safety-followup
+                // round 1): recordUndecidedBlocking above already wrote
+                // cycle.undecidedLines durably, via writeCycle, before this
+                // callback ever runs — copying it here means a CursorWriteError
+                // from the writeCursor call below still leaves the progress log
+                // showing the real, already-committed count instead of the
+                // stale default.
+                progress.undecidedLines = cycle!.undecidedLines?.length ?? 0;
                 progress.contended = openContended + lineContended;
                 progress.replans = replans;
                 progress.lineMs = Date.now() - lineStart;
@@ -2888,6 +2910,14 @@ async function runSweep(
         await writePhase(decision.phase, undefined, decision.blockedReason);
     }
     const fenceMs = Date.now() - fenceStart;
+    // SAME RULE, FOR certified (Codex cards-safety-followup round 1): `decision`
+    // is already the real, durable outcome of the fence by this point — a
+    // completed fence has already committed the "done" phase in its own
+    // transaction above. Copying it here means a throwing terminal-cursor
+    // clear (clearCertifiedSweepCheckpoint's writeCursor(null) below) still
+    // leaves the progress log showing certified: true instead of the stale
+    // default.
+    if (progress) progress.certified = decision.complete;
     await clearCertifiedSweepCheckpoint(decision.complete, () => writeCursor(null));
     const ledgerMoved = decision.ledgerMoved;
     const fenceFailed = decision.blockedReason === LEDGER_FENCE_FAILED_REASON;
