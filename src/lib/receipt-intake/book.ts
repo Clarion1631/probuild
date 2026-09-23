@@ -1681,8 +1681,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // that is the ONLY way in: the PUT on the same route is
                     // guarded by `assertExpenseMutableOutsideQbo`, which
                     // refuses anything carrying a `qbPurchaseId`. A NATIVE row
-                    // carries none, so the guard lets it through and the PUT is
-                    // open on it as well — see the `status` note below.
+                    // carries none, but it is receipt-booked, so the PUT
+                    // refuses it too — through the receipt rule
+                    // (`booked-expense-rules.ts`, RECEIPT_EXPENSE_NO_EDIT) —
+                    // see the `status` note below.
                     taxAmount: taxToStore,
                     taxAtSource: taxToStore !== null,
                     // An implausible read is a question, not an answer: the row
@@ -1727,13 +1729,16 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // "Reviewed" would look like human review that never
                     // happened.
                     //
-                    // ON THE NATIVE PATH none of that applies. There is no
-                    // Purchase, so `qbPurchaseId` is null, so the guard lets
-                    // every mutation through: a native Expense IS editable and
-                    // deletable in ProBuild, which is the point — ProBuild is
-                    // the system of record now. "Reviewed" is kept here because
-                    // it is what posts the job cost immediately; the row does
-                    // not wait on a queue nobody has been told to work.
+                    // ON THE NATIVE PATH none of that applies to QuickBooks —
+                    // there is no Purchase, so `qbPurchaseId` is null. But the
+                    // row is receipt-booked, so it is NOT editable or
+                    // deletable in ProBuild either (Justin's decision,
+                    // 2026-09-22): the only way its job changes is Move to job
+                    // (receipt-intake/booked-expense.ts), which moves this
+                    // same Expense row in place, with its receipt, in one
+                    // transaction. "Reviewed" is kept here because it is what
+                    // posts the job cost immediately; the row does not wait on
+                    // a queue nobody has been told to work.
                     //
                     // OPEN OWNER DECISION: whether a native row should instead
                     // land in `Pending` and enter the bookkeeper's review queue
