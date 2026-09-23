@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { isCronAuthorized } from "@/lib/cron-auth";
-import { pingCronHeartbeat } from "@/lib/cron-heartbeat";
+import { withCronHeartbeat, isRecord } from "@/lib/cron-heartbeat";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
@@ -88,8 +88,6 @@ const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
-
-const HEARTBEAT_JOB_KEY = "RECEIPT_INTAKE_WORKER";
 
 /**
  * Receipt Pipeline v2 worker (docs/plans/PHASE-1-INTAKE-CORE-SPEC.md §5).
@@ -1548,7 +1546,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
     };
 }
 
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     // isCronAuthorized: constant-time compare, and it fails CLOSED.
     //
     // The hand-rolled version this replaces had both problems the shared helper
@@ -1562,17 +1560,16 @@ export async function GET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
-    await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "start");
 
-    try {
-        const summary = await runIntakeWorker(buildDeps(createRouteDeadline(RUN_HARD_BUDGET_MS)));
-        if (summary.processed > 0 || summary.skipped) {
-            console.log("[cron/receipt-intake-worker]", JSON.stringify(summary));
-        }
-        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
-        return NextResponse.json(summary);
-    } catch (error) {
-        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", error instanceof Error ? error.name : "UnknownError");
-        throw error;
+    const summary = await runIntakeWorker(buildDeps(createRouteDeadline(RUN_HARD_BUDGET_MS)));
+    if (summary.processed > 0 || summary.skipped) {
+        console.log("[cron/receipt-intake-worker]", JSON.stringify(summary));
     }
+    return NextResponse.json(summary);
 }
+
+// Always answers 200; a row parked in RETRY state (byState.RETRY) is not
+// visible in the status code, so the heartbeat needs its own look at the body.
+export const GET = withCronHeartbeat("RECEIPT_INTAKE_WORKER", handleGET, {
+    isFailure: body => isRecord(body) && isRecord(body.byState) && typeof body.byState.RETRY === "number" && body.byState.RETRY > 0,
+});

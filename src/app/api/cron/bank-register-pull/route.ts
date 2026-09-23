@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
-import { pingCronHeartbeat } from "@/lib/cron-heartbeat";
+import { withCronHeartbeat } from "@/lib/cron-heartbeat";
 import {
     BANK_PULL_LAST_SUCCESS_KEY,
     BANK_PULL_AMBIGUOUS_KEY,
@@ -89,8 +89,6 @@ class SplitManifestUnreadableError extends Error {
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
-
-const HEARTBEAT_JOB_KEY = "BANK_REGISTER_PULL";
 
 /**
  * Nightly QBO POSTED-register pull (Phase 2 prerequisite / risk 1).
@@ -566,11 +564,10 @@ export function pullContinuationPending(state: PullWindowState): boolean {
         || state.stampPending === true;
 }
 
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
-    await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "start");
 
     /**
      * THE CONTINUATION PASS (Codex PR #443 gate round 33, finding 4).
@@ -590,7 +587,6 @@ export async function GET(request: Request) {
     if (new URL(request.url).searchParams.get("continue") === "1") {
         const parked = await readWindowState();
         if (!pullContinuationPending(parked)) {
-            await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
             return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
         }
     }
@@ -602,13 +598,10 @@ export async function GET(request: Request) {
     const now = new Date();
     const token = randomUUID();
     if (!(await takeLease(CLAIM_LOCK_KEY, RUN_LEASE_MS, now, token))) {
-        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
         return NextResponse.json({ ok: true, skipped: "already-running" });
     }
     try {
-        const response = await runPull();
-        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
-        return response;
+        return await runPull();
     } catch (error) {
         /**
          * AN UNREADABLE SPLIT MANIFEST STOPS THE RUN (round-48 gate, finding 1).
@@ -627,18 +620,22 @@ export async function GET(request: Request) {
                 continuationReason: MANIFEST_UNREADABLE_REASON,
             });
             await recordBlockedReason(MANIFEST_UNREADABLE_REASON);
-            await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", MANIFEST_UNREADABLE_REASON);
             return NextResponse.json(
                 { ok: false, error: MANIFEST_UNREADABLE_REASON, detail: error.message },
                 { status: 503 },
             );
         }
-        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", error instanceof Error ? error.name : "UnknownError");
         throw error;
     } finally {
         await releaseLease(CLAIM_LOCK_KEY, token);
     }
 }
+
+// runPull() and the skip branches above already set status from their own
+// ok/error state (see runPull's own `NextResponse.json(summary, { status })`
+// at its end) — the wrapper's default status-based rule classifies this
+// correctly with no predicate.
+export const GET = withCronHeartbeat("BANK_REGISTER_PULL", handleGET);
 
 /**
  * How far back a mint pass looks for still-unlinked QBO observations: THE SAME

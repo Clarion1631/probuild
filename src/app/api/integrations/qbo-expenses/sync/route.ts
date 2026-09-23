@@ -13,7 +13,7 @@ import {
 import { logAutomationEvent } from "@/lib/automation-events";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import { QBO_AUTH_EVENT_REASON } from "@/lib/pipeline-health";
-import { pingCronHeartbeat } from "@/lib/cron-heartbeat";
+import { withCronHeartbeat, isRecord } from "@/lib/cron-heartbeat";
 
 /**
  * Did QuickBooks reject who we are, rather than what this sync asked for?
@@ -56,7 +56,6 @@ export interface QboExpenseSyncHandlerDependencies {
 }
 
 const DEFAULT_INCREMENTAL_LOOKBACK_DAYS = 7;
-const HEARTBEAT_JOB_KEY = "QBO_EXPENSES_SYNC";
 
 function configuredLookbackDays(): number {
     const configured = Number(process.env.QBO_EXPENSE_SYNC_LOOKBACK_DAYS);
@@ -242,9 +241,7 @@ export function createQboExpenseSyncHandlers(
                     { status: 401 },
                 );
             }
-            await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "start");
             if (!dependencies.isCronEnabled()) {
-                await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", "sync-disabled");
                 return NextResponse.json(
                     { ok: false, reason: "sync-disabled" },
                     { status: 503 },
@@ -254,28 +251,13 @@ export function createQboExpenseSyncHandlers(
             // deliberately overrides a pause; pressing it IS the override).
             const isSyncPausedFn = dependencies.isSyncPaused ?? (() => isPaused(PAUSE_KEYS.qboSync));
             if (await isSyncPausedFn()) {
-                await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", "sync-paused");
                 return NextResponse.json({ ok: false, reason: "sync-paused" }, { status: 503 });
             }
             const since = incrementalSince(
                 dependencies.now(),
                 dependencies.incrementalLookbackDays,
             );
-            const response = await run("incremental", since, undefined, "cron");
-            // `run()` is shared with the manual/backfill POST path, so the ping
-            // lives here rather than inside it — this cron's heartbeat must only
-            // reflect the SCHEDULED invocation. `run()` never throws (it has its
-            // own catch-all), so the result is read from the response body
-            // (never a bare status: the incomplete-attachments case answers 200
-            // with ok:false — see the comment on `incomplete` above) via a clone,
-            // so the original response streams out unchanged.
-            const body = await response.clone().json().catch(() => null) as { ok?: boolean; reason?: string } | null;
-            await pingCronHeartbeat(
-                HEARTBEAT_JOB_KEY,
-                body?.ok === true ? "success" : "fail",
-                body?.ok === true ? undefined : String(body?.reason ?? "sync-failed"),
-            );
-            return response;
+            return run("incremental", since, undefined, "cron");
         },
     };
 }
@@ -311,7 +293,21 @@ export async function POST(request: Request) {
 /**
  * Vercel cron sends GET with Authorization: Bearer CRON_SECRET. It can only run
  * incremental mode; historical backfill stays behind the manual POST contract.
+ *
+ * `run()` (shared with the manual/backfill POST above) answers 503 for
+ * sync-disabled and sync-paused by design — those are intentional skips, not
+ * failures, so the predicate clears them without touching the status code
+ * POST callers and pipeline-health both still read. Everything else with an
+ * explicit `ok:false` in the body (including the one real 2xx case, an
+ * incomplete-attachments run — see `incomplete` in `run()` above) is a
+ * failure; the wrapper's default status-based rule already gets every other
+ * case right on its own.
  */
-export async function GET(request: Request) {
-    return handlers.GET(request);
-}
+export const GET = withCronHeartbeat("QBO_EXPENSES_SYNC", (request: Request) => handlers.GET(request), {
+    isFailure: body => {
+        if (!isRecord(body)) return undefined;
+        if (body.reason === "sync-disabled" || body.reason === "sync-paused") return false;
+        if (body.ok === false) return true;
+        return undefined;
+    },
+});

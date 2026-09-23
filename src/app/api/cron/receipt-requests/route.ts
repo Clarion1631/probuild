@@ -6,7 +6,7 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
-import { pingCronHeartbeat } from "@/lib/cron-heartbeat";
+import { withCronHeartbeat } from "@/lib/cron-heartbeat";
 import { resolveCompanyTimeZone, startOfDateInTimeZone } from "@/lib/company-timezone";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
@@ -82,8 +82,6 @@ const SOURCE_ADJACENCY_DAYS = SOURCE_RECOGNITION_ENABLED
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
-
-const HEARTBEAT_JOB_KEY = "RECEIPT_REQUESTS";
 
 /**
  * Nightly missing-receipt request sweep (Phase 2 §5).
@@ -1952,12 +1950,11 @@ export async function transitionCompletedOpenPass(
     await clearOpenCheckpoint();
 }
 
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     const budget = createSweepBudget(Date.now(), Date.now, RUN_BUDGET_MS);
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
-    await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "start");
     const now = new Date();
     // A DURABLE lease, held for the whole reconciliation. The old advisory
     // claim released before any work began and excluded nothing.
@@ -2001,7 +1998,6 @@ export async function GET(request: Request) {
          */
         if (!continuationNeedsWork({ marker, cycle: persistedCycle, bankEpoch, evidenceEpoch, recognitionPolicy: RECOGNITION_POLICY,
             fullRunOwed, lineCursor, openCursor, now: new Date() })) {
-            await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
             return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
         }
         resumePhase = phase === "done" ? "open-issues" : phase;
@@ -2009,7 +2005,6 @@ export async function GET(request: Request) {
 
     const leaseToken = randomUUID();
     if (!(await takeLease(LEASE_KEY, RUN_LEASE_MS, now, leaseToken))) {
-        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
         return NextResponse.json({ ok: true, skipped: "already-running" });
     }
     try {
@@ -2052,13 +2047,10 @@ export async function GET(request: Request) {
             // not a statement about the work in progress.
             await writePhase("open-issues", undefined, null, prisma, null);
         }
-        const response = await runSweep(now, startingFullRun ? "open-issues" : resumePhase, startingFullRun, budget);
-        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
-        return response;
+        return await runSweep(now, startingFullRun ? "open-issues" : resumePhase, startingFullRun, budget);
     } catch (error) {
         if (isSweepDeferredError(error)) {
             const phase = await preserveDeferredSweepPhase(readPhase, phase => writePhase(phase));
-            await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "success");
             return NextResponse.json({ ok: true, phase, deferred: true, moreToProcess: true });
         }
         // A cursor that will not persist is an INVOCATION ERROR, not a quiet
@@ -2068,15 +2060,19 @@ export async function GET(request: Request) {
         // same batch forever.
         if (error instanceof CursorWriteError) {
             console.error("[cron/receipt-requests]", error.message);
-            await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", "cursor-write-failed");
             return NextResponse.json({ ok: false, error: "cursor-write-failed", detail: error.message }, { status: 500 });
         }
-        await pingCronHeartbeat(HEARTBEAT_JOB_KEY, "fail", error instanceof Error ? error.name : "UnknownError");
         throw error;
     } finally {
         await releaseLease(LEASE_KEY, leaseToken);
     }
 }
+
+// runSweep()'s own final return sets status from `result.ok` (see its
+// `NextResponse.json(result, { status: result.ok ? 200 : 500 })`), and every
+// skip/deferred branch above answers 200 with ok:true — the wrapper's default
+// status-based rule classifies this correctly with no predicate.
+export const GET = withCronHeartbeat("RECEIPT_REQUESTS", handleGET);
 
 async function runSweep(
     now: Date,
