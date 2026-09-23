@@ -13,6 +13,8 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { QboManagedExpenseError } from "../src/lib/qbo-expense-guard";
 import { MOVE_MESSAGES } from "../src/lib/receipt-intake/booked-expense-rules";
 
@@ -174,6 +176,7 @@ const fakePrisma: any = {
 
 let deleteExpense: (id: string, projectId: string) => Promise<void>;
 let deleteExpenses: (ids: string[]) => Promise<{ deleted: number; skippedFromReceipts: number }>;
+let getExpenses: (projectId: string) => Promise<unknown[]>;
 let moveReceiptExpenseToJob: (
     expenseId: string, fromProjectId: string, toProjectId: string
 ) => Promise<{ ok: true; toProjectName: string; phaseCleared: boolean } | { ok: false; message: string }>;
@@ -212,6 +215,7 @@ before(async () => {
     }
     deleteExpense = mod.deleteExpense;
     deleteExpenses = mod.deleteExpenses;
+    getExpenses = mod.getExpenses;
     moveReceiptExpenseToJob = mod.moveReceiptExpenseToJob;
 });
 
@@ -831,4 +835,57 @@ test("the batch is read in ASCENDING id order, so two of them cannot invert", as
         ["delete:e-a", "delete:e-b"],
         "and the writes follow that order, not the caller's argument order",
     );
+});
+
+// ── getExpenses / getTimeExpenseData select receiptIntake ──────────────────
+//
+// The Move to job screen's WHOLE gate is `isReceiptBookedExpense(expense)`,
+// which reads `expense.receiptIntake`. Prisma returns that field only when a
+// query's `include` names it, so if either of these reads drops the include,
+// every row looks manual again on the real page: the trash can and the
+// upload/replace control come back, and Move to job never renders — even
+// though the row is still receipt-booked underneath. tsc cannot catch this
+// because `receiptIntake` is optional on ExpensesTab's Expense type, and the
+// UI test (tests/qbo-expense-sync-ui.test.tsx) passes `receiptIntake` straight
+// in as a prop rather than through this query.
+
+test("getExpenses selects receiptIntake, so the tab's refresh path can see a receipt-booked row", async () => {
+    // getExpenses IS that refresh path (see the comment above it in
+    // time-expense-actions.ts) — it runs after a tax save, a delete, a
+    // change-order tag, anything that re-reads the tab.
+    await getExpenses("job-1");
+    assert.deepEqual(
+        findManyArgs?.include?.receiptIntake,
+        { select: { id: true } },
+        "getExpenses must include receiptIntake or isReceiptBookedExpense is always false on refresh",
+    );
+});
+
+test("getTimeExpenseData selects receiptIntake too (source check — five more models here are unstubbed)", () => {
+    // getTimeExpenseData is the page's FIRST-render path and shares this exact
+    // include with getExpenses (see the comment in time-expense-actions.ts:
+    // "Shared with getExpenses, which is the same tab's refresh path"). It also
+    // reads timeEntry, costCode, costType, user, estimate and changeOrder,
+    // none of which this suite's fake Prisma stubs, so calling it the way
+    // getExpenses is called above would only be testing new mocks. Pinned as a
+    // source check instead, in the style of tests/time-expense-core-guards.test.ts.
+    const source = readFileSync(path.join(__dirname, "..", "src/lib/time-expense-actions.ts"), "utf8");
+    const start = source.indexOf("export async function getTimeExpenseData");
+    assert.ok(start > -1, "getTimeExpenseData moved — this assertion is about nothing");
+    const end = source.indexOf("export async function moveReceiptExpenseToJob", start);
+    assert.ok(end > start, "the slice terminator moved");
+    const body = source.slice(start, end);
+    assert.ok(body.length > 500, "the function body is empty — the parser is matching nothing");
+
+    const expenseQueryStart = body.indexOf("prisma.expense.findMany");
+    const expenseQueryEnd = body.indexOf("const costCodes");
+    assert.ok(expenseQueryStart > -1 && expenseQueryEnd > expenseQueryStart, "the expense query moved");
+    const expenseQuery = body.slice(expenseQueryStart, expenseQueryEnd);
+    assert.match(expenseQuery, /receiptIntake:\s*\{\s*select:\s*\{\s*id:\s*true\s*\}\s*\}/);
+
+    // The control: the SAME body's timeEntry query — which precedes the
+    // expense query and has no receipt to select — must not match, so the
+    // assertion above is not the regex matching everything in the slice.
+    const timeEntryQuery = body.slice(0, expenseQueryStart);
+    assert.doesNotMatch(timeEntryQuery, /receiptIntake/, "the control slice must not contain a real match");
 });

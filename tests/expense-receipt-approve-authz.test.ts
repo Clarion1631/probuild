@@ -303,6 +303,10 @@ test("approve authorizes on the job the expense is actually ON, not its estimate
     currentUser = { id: "u-new", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
     assert.equal((await callApprove()).status, 200);
     assert.equal(storedExpense?.status, "Reviewed");
+    // The write guard that keeps this route off receipt-booked rows (design
+    // spec native-expense-guards-spec.md §5) — this is a manual row, but the
+    // predicate is unconditional, so it is in the where clause here too.
+    assert.deepEqual(updateArgs?.where.receiptIntake, { is: null });
 });
 
 test("approve is refused when the row moves between the read and the write", async () => {

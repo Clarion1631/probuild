@@ -449,6 +449,11 @@ test("LOWERING the amount cannot strand an impossible base", async () => {
 test("lowering the amount is fine when the resulting row still holds", async () => {
     storedExpense = { ...storedExpense, taxDeductibleBase: 50 };
     assert.equal((await call({ amount: "100.00" })).status, 200);
+    // The write guard that keeps this route off receipt-booked rows (design
+    // spec native-expense-guards-spec.md §5) — this is a manual row, but the
+    // predicate is unconditional, so it is in the where clause here too.
+    const where = updateArgs?.where as Record<string, unknown>;
+    assert.deepEqual(where.receiptIntake, { is: null });
 });
 
 test("a PATCH base is judged against the row's real amount", async () => {
