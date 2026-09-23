@@ -1,9 +1,9 @@
 /**
  * The external heartbeat ping (Healthchecks.io-style dead man's switch) money
- * crons call via `withCronHeartbeat`. Round 2 (Codex review of the first
- * pass, which called `pingCronHeartbeat` inline in each route): these tests
- * cover the findings that round fixed —
+ * crons call via `withCronHeartbeat`.
  *
+ * Round 2 (Codex review of the first pass, which called `pingCronHeartbeat`
+ * inline in each route) fixed:
  *   1. latency/lease: the wrapper must add no latency on the request path
  *      when a real request scope is available (proven indirectly: every test
  *      below observes the finish ping synchronously after awaiting the
@@ -11,15 +11,27 @@
  *      the one this test file actually exercises, since it calls wrapped
  *      handlers directly rather than through a real Next.js request — awaits
  *      the ping rather than firing it detached).
- *   2. misclassification: non-2xx is a failure by default; a 2xx with an
- *      `isFailure` predicate can be escalated; a non-2xx with the predicate
- *      returning `false` can be cleared (an intentional skip).
+ *   2. misclassification, first pass: non-2xx is a failure by default, 2xx
+ *      is a success by default.
  *   3. a thrown handler error still pings fail (no gap before a route's own
  *      try/catch, because the wrapper's try/catch is OUTSIDE the handler).
  *   4. the timeout bounds a fetch call that never resolves at all, not just
  *      a slow one.
  *   5. detail sanitizing: only a short safe code (or "status-<code>") ever
  *      reaches the ping body; anything else becomes "error".
+ *
+ * Round 3 (Codex review of round 2) fixed two more, both covered below:
+ *   6. round 2's single `isFailure(body)` was consulted for every response
+ *      regardless of status, so a predicate written to clear an intentional
+ *      non-2xx skip could also clear an unrelated non-2xx it said nothing
+ *      about — including a bare 401 on every route that had a predicate at
+ *      all. Split into `isFailure` (2xx-only, escalate-only) and `isSkip`
+ *      (non-2xx-only, clear-only).
+ *   7. the start ping was fire-and-forget, so it could still be in flight
+ *      when the terminal ping's request landed — out-of-order delivery at
+ *      the heartbeat endpoint reads as a new run starting after the real one
+ *      already finished. The finish task now awaits the kept start-ping
+ *      promise before sending the terminal ping.
  */
 import test, { afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -196,26 +208,130 @@ test("a 2xx response with isFailure returning true pings fail", async () => {
     assert.equal(successCall, undefined, "success must not also fire");
 });
 
-test("a 2xx response with isFailure returning false (or undefined) pings success", async () => {
+test("a 2xx response with isFailure returning false, or undefined, or omitted, pings success", async () => {
     process.env.HC_PING_URL_TEST_JOB = "https://hc-ping.test/abc123";
     const handler = async () => NextResponse.json({ ok: true, skipped: "weekend" });
-    const wrapped = withCronHeartbeat("TEST_JOB", handler, { isFailure: () => undefined });
-    await wrapped(req());
-    assert.ok(calls.some(c => c.url === "https://hc-ping.test/abc123"), "success should have fired");
-    assert.equal(calls.find(c => c.url.endsWith("/fail")), undefined);
+    for (const isFailure of [() => false, () => undefined, undefined] as const) {
+        calls = [];
+        const wrapped = withCronHeartbeat("TEST_JOB", handler, isFailure ? { isFailure } : {});
+        await wrapped(req());
+        assert.ok(calls.some(c => c.url === "https://hc-ping.test/abc123"), "success should have fired");
+        assert.equal(calls.find(c => c.url.endsWith("/fail")), undefined);
+    }
 });
 
-test("isFailure returning false clears an intentional non-2xx skip to success (qbo-expenses sync-disabled shape)", async () => {
+// ── round 3: isFailure/isSkip are scoped to their own status class ─────────
+
+test("a 401 pings fail on a route that HAS an escalation predicate — isFailure must not be asked, and must not be able to clear it", async () => {
+    process.env.HC_PING_URL_TEST_JOB = "https://hc-ping.test/abc123";
+    const handler = async () => NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    const wrapped = withCronHeartbeat("TEST_JOB", handler, {
+        // A real route's escalation predicate: says nothing about `error`,
+        // so under round 2's bug (isFailure consulted for every status) this
+        // evaluated to `false` and CLEARED the 401 to success.
+        isFailure: body => isRecord(body) && Array.isArray(body.errors) && body.errors.length > 0,
+    });
+    const response = await wrapped(req());
+
+    assert.equal(response.status, 401);
+    assert.ok(calls.some(c => c.url.endsWith("/fail")), "401 must ping fail");
+    assert.equal(calls.find(c => c.url === "https://hc-ping.test/abc123"), undefined, "must not also ping success");
+});
+
+test("a 503 with no recognized fields pings fail on a route with a predicate, when isSkip is absent", async () => {
+    process.env.HC_PING_URL_TEST_JOB = "https://hc-ping.test/abc123";
+    const handler = async () => NextResponse.json({}, { status: 503 });
+    const wrapped = withCronHeartbeat("TEST_JOB", handler, {
+        isFailure: body => isRecord(body) && Array.isArray(body.errors) && body.errors.length > 0,
+    });
+    const response = await wrapped(req());
+
+    assert.equal(response.status, 503);
+    const failCall = calls.find(c => c.url.endsWith("/fail"));
+    assert.ok(failCall);
+    assert.equal(failCall!.init?.body, "status-503");
+});
+
+test("receipt-request-cards shape: a real 500 refusal (uncertainTransitions: []) still pings fail", async () => {
+    // The exact round-3 regression case named in review: an EMPTY array is
+    // still an array, so a naive `Array.isArray(x) && x.length > 0` guard
+    // guessed right here by luck of the length check — but the underlying
+    // bug (isFailure consulted for this 500 at all) meant any predicate that
+    // didn't specifically account for the failure shape could clear it.
+    process.env.HC_PING_URL_TEST_JOB = "https://hc-ping.test/abc123";
+    const handler = async () => NextResponse.json({ ok: false, uncertainTransitions: [], failedOwners: ["CJ"] }, { status: 500 });
+    const wrapped = withCronHeartbeat("TEST_JOB", handler, {
+        isFailure: body => isRecord(body) && Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0,
+    });
+    const response = await wrapped(req());
+
+    assert.equal(response.status, 500);
+    assert.ok(calls.some(c => c.url.endsWith("/fail")), "the 500 refusal must ping fail");
+    assert.equal(calls.find(c => c.url === "https://hc-ping.test/abc123"), undefined);
+});
+
+test("isSkip clears an intentional non-2xx skip to success (qbo-expenses sync-disabled shape), without touching the status code", async () => {
     process.env.HC_PING_URL_TEST_JOB = "https://hc-ping.test/abc123";
     const handler = async () => NextResponse.json({ ok: false, reason: "sync-disabled" }, { status: 503 });
     const wrapped = withCronHeartbeat("TEST_JOB", handler, {
-        isFailure: body => isRecord(body) && body.reason === "sync-disabled" ? false : undefined,
+        isSkip: body => isRecord(body) && body.reason === "sync-disabled",
+        isFailure: body => isRecord(body) && body.ok === false,
     });
     const response = await wrapped(req());
 
     assert.equal(response.status, 503, "the route's own status code must not change");
     assert.ok(calls.some(c => c.url === "https://hc-ping.test/abc123"), "success should have fired");
     assert.equal(calls.find(c => c.url.endsWith("/fail")), undefined, "fail must not fire for an intentional skip");
+});
+
+test("isSkip is never consulted for a 2xx, so it cannot accidentally clear a real isFailure escalation", async () => {
+    process.env.HC_PING_URL_TEST_JOB = "https://hc-ping.test/abc123";
+    const handler = async () => NextResponse.json({ ok: true, reason: "sync-disabled", errors: ["boom"] });
+    const wrapped = withCronHeartbeat("TEST_JOB", handler, {
+        isSkip: () => true, // would wrongly clear everything if it were ever asked about a 2xx
+        isFailure: body => isRecord(body) && Array.isArray(body.errors) && body.errors.length > 0,
+    });
+    await wrapped(req());
+    assert.ok(calls.some(c => c.url.endsWith("/fail")), "isFailure must still win on a 2xx");
+});
+
+test("isFailure is never consulted for a non-2xx, so it cannot accidentally clear a real failure", async () => {
+    process.env.HC_PING_URL_TEST_JOB = "https://hc-ping.test/abc123";
+    const handler = async () => NextResponse.json({ ok: false }, { status: 500 });
+    const wrapped = withCronHeartbeat("TEST_JOB", handler, {
+        isFailure: () => false, // would wrongly clear a real 500 if it were ever asked
+    });
+    const response = await wrapped(req());
+    assert.equal(response.status, 500);
+    assert.ok(calls.some(c => c.url.endsWith("/fail")), "the 500 must still ping fail");
+});
+
+// ── round 3: /start is ordered before the terminal ping ─────────────────────
+
+test("a slow /start still completes before the terminal ping is sent, even when the handler returns immediately", async () => {
+    process.env.HC_PING_URL_TEST_JOB = "https://hc-ping.test/abc123";
+    const order: string[] = [];
+    // /start takes ~200ms to resolve; the terminal ping's mock resolves
+    // instantly. Under round 2's fire-and-forget /start, the fast handler
+    // below would let the terminal ping's fetch fire (and could even
+    // complete) before /start's request ever reached the mock's push.
+    fetchImpl = async url => {
+        if (url.endsWith("/start")) {
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        order.push(url);
+        return new Response(null, { status: 200 });
+    };
+    const handler = async () => NextResponse.json({ ok: true }); // returns with no delay of its own
+
+    const wrapped = withCronHeartbeat("TEST_JOB", handler);
+    const startedAt = Date.now();
+    await wrapped(req());
+    const elapsed = Date.now() - startedAt;
+
+    assert.deepEqual(order, ["https://hc-ping.test/abc123/start", "https://hc-ping.test/abc123"],
+        "the terminal ping must be sent only after /start's own request has completed");
+    assert.ok(elapsed >= 190, `expected the wrapper to wait out /start's ~200ms delay, only took ${elapsed}ms`);
 });
 
 test("an unparseable body defers to the default status-based rule", async () => {

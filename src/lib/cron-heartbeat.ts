@@ -25,6 +25,24 @@ import { after } from "next/server";
  * response is sent, and so after the handler's own `finally`/lease-release —
  * which adds no latency at all on the request path. Every route's `finally`
  * now runs exactly where it always did.
+ *
+ * Round 3 (Codex review of round 2) fixed two more:
+ *  - Round 2's single `isFailure(body)` was consulted for every response
+ *    regardless of status, so returning `false` — the documented way to
+ *    clear an intentional non-2xx skip — also cleared any UNRELATED non-2xx
+ *    a route's predicate happened to say nothing about, including a bare
+ *    401 `{ error: "Unauthorized" }` on every route that had a predicate at
+ *    all. Split into `isFailure` (2xx-only, escalate-only) and `isSkip`
+ *    (non-2xx-only, clear-only) below — structurally impossible to cross
+ *    now, since each is never even called for the other status class.
+ *  - The start ping was fired-and-forgotten (`void`-discarded), so its
+ *    request could still be in flight when the terminal ping's request
+ *    landed — out-of-order delivery at Healthchecks reads as a new run
+ *    starting after the real one already finished, which then never closes.
+ *    The finish task now awaits the kept start-ping promise (itself already
+ *    bounded by PING_TIMEOUT_MS, failures already swallowed) before sending
+ *    the terminal ping — ordered at the source, not by hoping the network
+ *    preserves send order.
  */
 
 const PING_TIMEOUT_MS = 3_000;
@@ -119,19 +137,26 @@ async function finishAfterResponse(task: () => Promise<void>): Promise<void> {
 
 export interface WithCronHeartbeatOptions {
     /**
-     * Overrides the default status-based classification (non-2xx -> fail,
-     * 2xx -> success) when it returns a boolean:
-     *  - `true` flags a 2xx response that carries its own error signal in the
-     *    body that the status code alone doesn't show (e.g. per-row errors on
-     *    an otherwise-200 summary).
-     *  - `false` clears a non-2xx response that is an intentional skip, not a
-     *    failure (e.g. a disabled/paused sync answering 503 by design — the
-     *    status stays exactly what the route already returns; only this
-     *    heartbeat's classification changes).
-     * Returning `undefined` (or omitting the option, or the body failing to
-     * parse as JSON) defers to the default rule.
+     * Consulted ONLY for a 2xx response (round-3 fix — see module doc).
+     * Return `true` to flag a 2xx that carries its own error signal in the
+     * body that the status code alone doesn't show (e.g. per-row errors on
+     * an otherwise-200 summary). Anything else — `false`, `undefined`,
+     * omitting the option, or the body failing to parse as JSON — leaves a
+     * 2xx classified as a success. Never consulted for a non-2xx response,
+     * so it can only ESCALATE, never clear one.
      */
     isFailure?: (body: unknown, status: number) => boolean | undefined;
+    /**
+     * Consulted ONLY for a non-2xx response (round-3 fix — see module doc).
+     * Return `true` to clear it to a success, for an INTENTIONAL skip that
+     * answers a non-2xx status by design (e.g. a disabled/paused sync
+     * answering 503 — the status code stays exactly what the route already
+     * returns; only this heartbeat's classification changes). Anything else
+     * — `false`, `undefined`, omitting the option, or the body failing to
+     * parse as JSON — leaves a non-2xx classified as a failure. Never
+     * consulted for a 2xx response, so it can only CLEAR, never escalate.
+     */
+    isSkip?: (body: unknown, status: number) => boolean | undefined;
 }
 
 /**
@@ -145,16 +170,24 @@ export function withCronHeartbeat(
     opts: WithCronHeartbeatOptions = {},
 ): (request: Request) => Promise<Response> {
     return async function cronHeartbeatWrapped(request: Request): Promise<Response> {
-        // Fired without awaiting — runs concurrently with the handler.
-        // pingCronHeartbeat never throws, so there is nothing to catch here.
-        void pingCronHeartbeat(jobKey, "start");
+        // Fired without awaiting the WORK — runs concurrently with the
+        // handler. Kept (not `void`-discarded) so the finish task below can
+        // await it: round-3 fix — an un-awaited /start could still be
+        // in flight when the terminal ping lands, and Healthchecks reading
+        // them out of order opens a new "run in progress" window that the
+        // real run's own finish ping already closed, which never clears and
+        // eventually false-alarms as stuck. pingCronHeartbeat never throws,
+        // so there is nothing to catch here.
+        const startPing = pingCronHeartbeat(jobKey, "start");
 
         let response: Response;
         try {
             response = await handler(request);
         } catch (error) {
-            await finishAfterResponse(() =>
-                pingCronHeartbeat(jobKey, "fail", error instanceof Error ? error.name : undefined));
+            await finishAfterResponse(async () => {
+                await startPing;
+                await pingCronHeartbeat(jobKey, "fail", error instanceof Error ? error.name : undefined);
+            });
             throw error;
         }
 
@@ -162,23 +195,30 @@ export function withCronHeartbeat(
         // parsing the original here would consume it out from under them.
         const clone = response.clone();
         await finishAfterResponse(async () => {
+            await startPing;
+
             let failed = !response.ok;
             let detail = failed ? `status-${response.status}` : undefined;
-            if (opts.isFailure) {
-                try {
-                    const body = await clone.json();
-                    const override = opts.isFailure(body, response.status);
-                    if (override === true) {
+            try {
+                const body = await clone.json();
+                // isFailure/isSkip are mutually exclusive by construction
+                // (round-3 fix): a predicate written to ESCALATE a 2xx must
+                // never be given the chance to CLEAR an unrelated non-2xx —
+                // that is exactly how round 2's single isFailure predicate
+                // turned a misconfigured-CRON_SECRET 401 into a "success"
+                // ping on every route that had one.
+                if (response.ok) {
+                    if (opts.isFailure?.(body, response.status) === true) {
                         failed = true;
                         detail = "predicate";
-                    } else if (override === false) {
-                        failed = false;
-                        detail = undefined;
                     }
-                } catch {
-                    // Unparseable body decides nothing; the status-based
-                    // default above stands.
+                } else if (opts.isSkip?.(body, response.status) === true) {
+                    failed = false;
+                    detail = undefined;
                 }
+            } catch {
+                // Unparseable body decides nothing; the status-based
+                // default above stands.
             }
             await pingCronHeartbeat(jobKey, failed ? "fail" : "success", detail);
         });

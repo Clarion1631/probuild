@@ -296,18 +296,16 @@ export async function POST(request: Request) {
  *
  * `run()` (shared with the manual/backfill POST above) answers 503 for
  * sync-disabled and sync-paused by design — those are intentional skips, not
- * failures, so the predicate clears them without touching the status code
- * POST callers and pipeline-health both still read. Everything else with an
- * explicit `ok:false` in the body (including the one real 2xx case, an
- * incomplete-attachments run — see `incomplete` in `run()` above) is a
- * failure; the wrapper's default status-based rule already gets every other
- * case right on its own.
+ * failures, so isSkip clears them without touching the status code POST
+ * callers and pipeline-health both still read. isFailure separately catches
+ * the one real 2xx failure shape, an incomplete-attachments run (see
+ * `incomplete` in `run()` above), which answers 200 with ok:false. Each is
+ * only ever consulted for its own status class (isSkip: non-2xx, isFailure:
+ * 2xx — see withCronHeartbeat's round-3 fix), so this can't cross into
+ * clearing an unrelated non-2xx like a bare 401 the way a single combined
+ * predicate did.
  */
 export const GET = withCronHeartbeat("QBO_EXPENSES_SYNC", (request: Request) => handlers.GET(request), {
-    isFailure: body => {
-        if (!isRecord(body)) return undefined;
-        if (body.reason === "sync-disabled" || body.reason === "sync-paused") return false;
-        if (body.ok === false) return true;
-        return undefined;
-    },
+    isSkip: body => isRecord(body) && (body.reason === "sync-disabled" || body.reason === "sync-paused"),
+    isFailure: body => isRecord(body) && body.ok === false,
 });
