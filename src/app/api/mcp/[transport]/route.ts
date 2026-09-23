@@ -6,7 +6,7 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, loadInvoiceAmountDue, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
+import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, loadInvoiceAmountDue, dueSnapshot, resendConfirmPayload, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
 import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrewConflicts } from "@/lib/schedule-core";
 import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
@@ -805,26 +805,25 @@ function createHandler(actor: RouteMcpActor) {
                 const milestonesPreview = invoice.payments.map(p => ({ name: p.name, amount: Number(p.amount), status: p.status, staleLink: !!p.qbSyncError }));
 
                 if (due.dueCents <= 0) {
-                    if (!confirmToken) {
-                        return textResult({
-                            preview: true,
-                            willSend: false,
-                            reason: `Nothing on ${invoice.code} is billed and unpaid, so there is nothing to ask the client for. To ask for a payment, use the send_milestone_invoice tool.`,
-                            invoice: { code: invoice.code, status: invoice.status, total: Number(invoice.totalAmount), balanceDue: Number(invoice.balanceDue) },
-                            milestones: milestonesPreview,
-                        });
-                    }
-                    // A stale/forced confirmToken on a nothing-due invoice — fall
-                    // through to resendInvoiceCore, which independently re-checks
-                    // the amount due and returns the same nothing-due result
-                    // without ever emailing.
-                    const result = await resendInvoiceCore(invoiceId, overrideEmail);
-                    return textResult(result);
+                    // ALWAYS the nothing-due preview here, whatever confirmToken was
+                    // supplied — never fall through to resendInvoiceCore. A forged or
+                    // stale token must never reach the core: if a milestone got billed
+                    // in the race window between this read and the core's own fresh
+                    // read, the core would find something due and send it, with no
+                    // token ever actually verified.
+                    return textResult({
+                        preview: true,
+                        willSend: false,
+                        reason: `Nothing on ${invoice.code} is billed and unpaid, so there is nothing to ask the client for. To ask for a payment, use the send_milestone_invoice tool.`,
+                        invoice: { code: invoice.code, status: invoice.status, total: Number(invoice.totalAmount), balanceDue: Number(invoice.balanceDue) },
+                        milestones: milestonesPreview,
+                    });
                 }
 
-                // Bind the amount into the token: a token minted for one amount
-                // due can't be replayed to send a different one.
-                const payload = JSON.stringify({ invoiceId, recipient, amountDueCents: due.dueCents });
+                // The token binds the recipient AND the exact billed set (not just
+                // its dollar total) — a milestone swapped for an equal-priced one
+                // between preview and confirm must not ride the old approval.
+                const payload = resendConfirmPayload({ invoiceId, recipient, due });
                 if (!verifyPreviewToken(confirmToken, payload)) {
                     return textResult({
                         preview: true,
@@ -841,7 +840,11 @@ function createHandler(actor: RouteMcpActor) {
                     });
                 }
                 try {
-                    const result = await resendInvoiceCore(invoiceId, overrideEmail);
+                    // recipient (not the raw overrideEmail) is what's bound into the
+                    // now-verified token, so the email goes to exactly the approved
+                    // address; expectedDue re-pins the approved billed set so the send
+                    // refuses if it drifted after this preview was shown.
+                    const result = await resendInvoiceCore(invoiceId, recipient || undefined, undefined, { expectedDue: dueSnapshot(due) });
                     return textResult(result);
                 } catch (err: any) {
                     return { ...textResult({ error: err?.message || "Resend failed" }), isError: true };

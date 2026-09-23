@@ -614,7 +614,43 @@ export async function createInvoiceFromEstimateGuarded(estimateId: string) {
 // Invoice email (ProBuild-native portal link). Moved verbatim from actions.ts.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?: string) {
+// A canonical, order-independent fingerprint of what's billed and unpaid —
+// the exact set a preview showed the user, so a later send can refuse to go
+// out if that set drifted (a milestone got paid/canceled, a different one
+// got billed, a live QBO link changed) between the preview and the confirm.
+// A dollar total alone isn't enough: swapping milestone A ($500) for an
+// unrelated, equal-priced milestone B still passes a total-only check.
+export type DueSnapshot = Array<{ id: string | null; cents: number }>;
+
+export function dueSnapshot(due: InvoiceAmountDue): DueSnapshot {
+    return due.items
+        .map(it => ({ id: it.id, cents: it.cents }))
+        .sort((a, b) => {
+            if (a.id === b.id) return a.cents - b.cents;
+            if (a.id === null) return 1; // null (legacyInvoice) sorts last
+            if (b.id === null) return -1;
+            return a.id < b.id ? -1 : 1;
+        });
+}
+
+// Both snapshots are expected to come from dueSnapshot(), whose sort makes
+// the comparison order-independent without needing to re-sort here.
+export function sameDue(a: DueSnapshot, b: DueSnapshot): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i].id !== b[i].id || a[i].cents !== b[i].cents) return false;
+    }
+    return true;
+}
+
+// The MCP resend_invoice confirm-token payload: binds the recipient AND the
+// exact billed set (not just its total) so a token minted for one can't be
+// replayed for a different one.
+export function resendConfirmPayload(args: { invoiceId: string; recipient: string; due: InvoiceAmountDue }): string {
+    return JSON.stringify({ invoiceId: args.invoiceId, recipient: args.recipient, due: dueSnapshot(args.due) });
+}
+
+export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?: string, opts?: { expectedDue?: DueSnapshot }) {
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
         include: {
@@ -636,6 +672,14 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
     const due = computeInvoiceAmountDue(toReceivableInput(invoice), Date.now());
     if (due.dueCents <= 0) {
         return nothingDueResult(invoice.code);
+    }
+
+    // A caller that pinned an expected billed set (an MCP send confirmed
+    // against a verified preview token) gets it re-checked here, BEFORE any
+    // write or email — if the set drifted since the preview, refuse rather
+    // than send something nobody actually approved.
+    if (opts?.expectedDue && !sameDue(dueSnapshot(due), opts.expectedDue)) {
+        return changedDueResult(invoice.code);
     }
 
     if (invoice.status === "Draft") {
@@ -755,6 +799,17 @@ function nothingDueResult(invoiceCode: string) {
     };
 }
 
+// Same "the approved set drifted" result for both sendInvoiceToClientCore's
+// and resendInvoiceCore's expectedDue re-checks below.
+function changedDueResult(invoiceCode: string) {
+    return {
+        success: false as const,
+        changed: true as const,
+        error: `What's due on ${invoiceCode} changed since the preview, so nothing was sent. Preview it again.`,
+        sentTo: undefined,
+    };
+}
+
 /**
  * What a whole-invoice send/resend may ask for right now, without sending
  * anything — the same computeInvoiceAmountDue rule sendInvoiceToClientCore
@@ -804,10 +859,14 @@ export function selectMilestonesToRefresh(
  * Milestones that were never billed are left untouched — see
  * selectMilestonesToRefresh. If nothing is billed and unpaid, this returns
  * the same nothing-due result sendInvoiceToClientCore would, before ever
- * touching QuickBooks. QuickBooks being disconnected downgrades to a plain
- * resend, not a failure.
+ * touching QuickBooks. An `opts.expectedDue` (the set a preview approved) is
+ * re-checked here too, before ever touching QuickBooks, and again inside
+ * sendInvoiceToClientCore right before any write — the QBO refresh loop
+ * below takes real time, so the set is worth re-checking on both sides of
+ * it. QuickBooks being disconnected downgrades to a plain resend, not a
+ * failure.
  */
-export async function resendInvoiceCore(invoiceId: string, overrideEmail?: string, deadline?: RouteDeadline) {
+export async function resendInvoiceCore(invoiceId: string, overrideEmail?: string, deadline?: RouteDeadline, opts?: { expectedDue?: DueSnapshot }) {
     const qbDeadline = deadline ?? createRouteDeadline(BILLING_QBO_BUDGET_MS);
     const loaded = await loadInvoiceAmountDue(invoiceId);
     if (!loaded) return { success: false as const, error: "Invoice not found" };
@@ -815,6 +874,9 @@ export async function resendInvoiceCore(invoiceId: string, overrideEmail?: strin
 
     if (due.dueCents <= 0) {
         return { ...nothingDueResult(invoice.code), linkRefresh: [] as Array<{ milestone: string; refreshed: boolean; payLink?: string; error?: string }> };
+    }
+    if (opts?.expectedDue && !sameDue(dueSnapshot(due), opts.expectedDue)) {
+        return { ...changedDueResult(invoice.code), linkRefresh: [] as Array<{ milestone: string; refreshed: boolean; payLink?: string; error?: string }> };
     }
 
     const linkRefresh: Array<{ milestone: string; refreshed: boolean; payLink?: string; error?: string }> = [];
@@ -864,7 +926,7 @@ export async function resendInvoiceCore(invoiceId: string, overrideEmail?: strin
         }
     }
 
-    const sent = await sendInvoiceToClientCore(invoiceId, overrideEmail);
+    const sent = await sendInvoiceToClientCore(invoiceId, overrideEmail, { expectedDue: opts?.expectedDue });
     return { ...sent, linkRefresh };
 }
 

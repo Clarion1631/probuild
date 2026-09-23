@@ -22,18 +22,14 @@ export interface InvoiceAmountDue {
  * QuickBooks invoice, plus the legacy zero-milestone "legacyInvoice" item).
  * `dueCents` is `receivableCents`, which is always the sum of `items[].cents`.
  *
- * The invoice is being sent right now, so a Draft is evaluated as though
- * already issued: computeInvoiceReceivable only suppresses backlog and the
- * legacy zero-milestone item for a Draft invoice, both because a Draft isn't
- * final yet — but sending IS what finalizes it (sendInvoiceToClientCore flips
- * Draft to Issued as part of the same send), so what the email may ask for
- * must be computed as if that flip already happened.
+ * No Draft exception: owner-approved rule is "nothing billed means no
+ * email," full stop — including a Draft legacy zero-milestone invoice, whose
+ * whole balanceDue would otherwise become one billed item. This runs
+ * computeInvoiceReceivable on the invoice exactly as given, with no
+ * promotion to "as if issued."
  */
 export function computeInvoiceAmountDue(inv: ReceivableInvoiceInput, now: number): InvoiceAmountDue {
-    const evaluated: ReceivableInvoiceInput = inv.status === "Draft"
-        ? { ...inv, status: "Issued", issueDate: inv.issueDate ?? new Date(now), sentAt: inv.sentAt ?? new Date(now) }
-        : inv;
-    const receivable = computeInvoiceReceivable(evaluated, now);
+    const receivable = computeInvoiceReceivable(inv, now);
     return {
         dueCents: receivable.receivableCents,
         items: receivable.items.map(it => ({ kind: it.kind, id: it.id, label: it.label, cents: it.cents })),
