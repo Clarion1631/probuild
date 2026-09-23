@@ -195,8 +195,34 @@ async function runWhileBlocking<T>(
             pidB = pid;
             return await attempt(tx);
         }, { maxWait: 10_000, timeout: 20_000 });
+        // Attach a rejection handler right away: if acquiring the
+        // transaction, the pid query, or attempt(tx) itself fails, this
+        // promise must not be able to surface as an unhandled rejection
+        // while the lock-wait poll below is still running. The original
+        // promise (not a derived one) is preserved for the final
+        // Promise.allSettled further down.
+        runningPromise.catch(() => {});
 
-        await waitUntilBlocking(monitor, pidA, () => pidB);
+        // Race the lock-wait poll against B's own settlement, so a B that
+        // fails, or that finishes without ever blocking on A, stops the
+        // wait promptly instead of polling for the full 10s for something
+        // that will never happen.
+        const outcome = await Promise.race([
+            waitUntilBlocking(monitor, pidA, () => pidB).then(() => ({ kind: "blocking" as const })),
+            runningPromise.then(
+                () => ({ kind: "resolved" as const }),
+                (err) => ({ kind: "rejected" as const, err }),
+            ),
+        ]);
+        if (outcome.kind === "resolved") {
+            throw new Error("transaction B finished without ever blocking on transaction A's lock");
+        }
+        if (outcome.kind === "rejected") {
+            throw new Error(
+                "transaction B failed before it was ever observed blocking on transaction A's lock",
+                { cause: outcome.err },
+            );
+        }
     } catch (err) {
         waitError = err;
     } finally {
