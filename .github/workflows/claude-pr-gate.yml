@@ -64,6 +64,8 @@ jobs:
           # a `${{ }}` expansion inside `run:` is spliced in before Bash parses it.
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
+          echo "TEST ONLY, simulated login failure: 401 Unauthorized refresh_token_reused" | tee /tmp/codex-stderr.log >&2
+          exit 1
           git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
           # Prior rounds: earlier gate verdicts AND the author's replies (fixes,
           # disputes). Without this the reviewer is stateless — PR #453 (2026-09-03)
