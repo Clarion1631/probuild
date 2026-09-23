@@ -32,6 +32,11 @@ interface FakeUser {
 let currentUser: FakeUser | null;
 let storedExpense: Record<string, unknown> | null;
 let updateArgs: { where: unknown; data: Record<string, unknown> } | null;
+/** The `select` (and `where`) the route's own findUnique read was called with —
+ *  the fake below returns the whole stored row regardless of what `select`
+ *  asks for, so this is the only way to catch a guarded field silently
+ *  dropped from it (checker round 4). */
+let findUniqueArgs: { where?: unknown; select?: Record<string, any> } | null;
 let estimateItems: { id: string; estimateId: string; projectId: string | null }[];
 /**
  * What the LOCKED estimate read answers, when a test wants it to disagree with
@@ -77,7 +82,13 @@ const fakePrisma: any = {
         return [{ lock_result: null }];
     },
     expense: {
-        findUnique: async () => storedExpense,
+        findUnique: async (args: { where: unknown; select?: Record<string, any> }) => {
+            // Only the FIRST call per request: PUT re-reads under lock further
+            // down its handler, and that later read must not clobber the
+            // guard-relevant one this suite pins.
+            if (findUniqueArgs === null) findUniqueArgs = args;
+            return storedExpense;
+        },
         update: async (args: { where: unknown; data: Record<string, unknown> }) => {
             updateArgs = args;
             return { id: "e1", ...args.data };
@@ -217,6 +228,7 @@ beforeEach(() => {
     };
     updateArgs = null;
     deleteArgs = null;
+    findUniqueArgs = null;
     estimateItems = [
         { id: "item-own", estimateId: "est-job-1", projectId: "job-1" },
         { id: "item-elsewhere", estimateId: "est-job-2", projectId: "job-2" },
@@ -2197,6 +2209,10 @@ test("DELETE on a receipt row returns 409 with RECEIPT_BOOKED_EXPENSE and makes 
     assert.equal(json.code, "RECEIPT_BOOKED_EXPENSE");
     assert.match(json.error, /can't be deleted/);
     assert.equal(deleteArgs, null);
+    // The refusal above is only as real as the read it's judged from — pin the
+    // `select` so dropping `receiptIntake` from DELETE's findUnique cannot
+    // slip this refusal back open with every other assertion here still green.
+    assert.deepEqual(findUniqueArgs?.select?.receiptIntake, { select: { id: true } });
 });
 
 test("PUT on a receipt row returns 409 with RECEIPT_BOOKED_EXPENSE and makes no write", async () => {
@@ -2207,6 +2223,8 @@ test("PUT on a receipt row returns 409 with RECEIPT_BOOKED_EXPENSE and makes no 
     assert.equal(json.code, "RECEIPT_BOOKED_EXPENSE");
     assert.match(json.error, /can't be edited here/);
     assert.equal(updateArgs, null);
+    // Same reason as the DELETE test above, for PUT's own findUnique read.
+    assert.deepEqual(findUniqueArgs?.select?.receiptIntake, { select: { id: true } });
 });
 
 test("DELETE on a QBO row still returns today's 409 and QBO message, even with a receipt link", async () => {

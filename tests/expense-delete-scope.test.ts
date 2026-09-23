@@ -59,6 +59,11 @@ let estimateFindFirstCall = 0;
 /** `tx.expense.findUnique` call count, and an optional per-call override. */
 let expenseFindUniqueCall = 0;
 let expenseFindUniqueOverride: ((call: number, base: Record<string, unknown> | null) => Record<string, unknown> | null) | null = null;
+/** The most recent `select` (and `where`) an `expense.findUnique` call ran
+ *  with — the fake ignores `select` entirely and returns the fixture as-is,
+ *  so this is the only way to catch a guarded field dropped from a caller's
+ *  read (checker round 4). */
+let expenseFindUniqueArgs: { where?: unknown; select?: Record<string, any> } | null = null;
 /** The `reattributeExpense` CAS write (`tx.expense.updateMany` with projectId/estimateId in `data`). */
 let reattributeUpdateArgs: any = null;
 let reattributeUpdateCount = 1;
@@ -113,8 +118,12 @@ const fakePrisma: any = {
         return [{}];
     },
     expense: {
-        findUnique: async () => {
+        findUnique: async (args: { where?: unknown; select?: Record<string, any> }) => {
             expenseFindUniqueCall++;
+            // Only the FIRST call per request/flow: moveReceiptExpenseToJob
+            // re-reads this same fake multiple times, and a later read must
+            // not clobber the guard-relevant one deleteExpense's test pins.
+            if (expenseFindUniqueArgs === null) expenseFindUniqueArgs = args;
             opLog.push(`expense.findUnique:${expenseFindUniqueCall}`);
             if (expenseFindUniqueOverride) return expenseFindUniqueOverride(expenseFindUniqueCall, storedExpense);
             return storedExpense;
@@ -245,6 +254,7 @@ beforeEach(() => {
     estimateFindFirstCall = 0;
     expenseFindUniqueCall = 0;
     expenseFindUniqueOverride = null;
+    expenseFindUniqueArgs = null;
     reattributeUpdateArgs = null;
     reattributeUpdateCount = 1;
     linksUpdateArgs = null;
@@ -707,6 +717,11 @@ test("deleteExpense on a receipt row throws RECEIPT_EXPENSE_NO_DELETE and never 
     assert.equal(await attempt("job-1"), "This came from a receipt, so it can't be deleted. Use Move to job if it's on the wrong job. If it's a double, tell Justin.");
     assert.equal(transactionCalls, 0, "the row is refused before the transaction that would lock and delete it");
     assert.equal(deleteArgs, null);
+    // The refusal above is only as real as the read it's judged from — pin the
+    // `select` so dropping `receiptIntake` from deleteExpense's findUnique
+    // cannot slip this refusal back open with every other assertion here
+    // still green (checker round 4).
+    assert.deepEqual(expenseFindUniqueArgs?.select?.receiptIntake, { select: { id: true } });
 });
 
 test("a QBO row still throws QboManagedExpenseError, whether or not it also carries a receipt link", async () => {
@@ -740,6 +755,11 @@ test("deleteExpenses skips a receipt row, deletes a manual one, and pins receipt
     for (const where of deleteManyWheres) {
         assert.deepEqual(where.receiptIntake, { is: null });
     }
+    // The skip above only proves anything if the batch read actually asked for
+    // receiptIntake — pin the select on the findMany this test already
+    // captures, so dropping it from deleteExpenses cannot silently make every
+    // row look manual (checker round 4).
+    assert.deepEqual(findManyArgs?.select?.receiptIntake, { select: { id: true } });
 });
 
 test("deleteExpenses: every row receipt-booked returns deleted: 0 with the right skipped count", async () => {

@@ -36,6 +36,11 @@ const BUCKET = "project-files";
 let currentUser: FakeUser | null;
 let storedExpense: Record<string, any> | null;
 let updateArgs: { where: Record<string, any>; data: Record<string, unknown> } | null;
+/** The `select` (and `where`) the route's own findUnique read was called with —
+ *  the only way to catch a guarded field silently dropped from it (checker
+ *  round 4, PRIMARY): the fake below returns the whole stored row regardless
+ *  of what `select` asks for, so no other assertion can see the field go. */
+let findUniqueArgs: { where?: Record<string, any>; select?: Record<string, any> } | null;
 /**
  * What the LOCKED estimate read answers, when a test wants it to disagree with
  * the pre-transaction one. `undefined` means "the same fixture", which is every
@@ -63,7 +68,11 @@ const fakePrisma: any = {
         return [{ lock_result: null }];
     },
     expense: {
-        findUnique: async () => {
+        findUnique: async (args: { where: Record<string, any>; select?: Record<string, any> }) => {
+            // Only the FIRST call per request: receipt/route.ts re-reads under
+            // lock with a narrower select, and that second read must not
+            // clobber the guard-relevant one this suite pins.
+            if (findUniqueArgs === null) findUniqueArgs = args;
             const snapshot = storedExpense ? { ...storedExpense } : null;
             return snapshot;
         },
@@ -161,6 +170,7 @@ beforeEach(() => {
         estimate: { projectId: "job-1" },
     };
     updateArgs = null;
+    findUniqueArgs = null;
     lockedEstimateProject = undefined;
     objects = new Set();
     betweenReadAndWrite = null;
@@ -383,6 +393,10 @@ test("approve on a receipt row returns 409", async () => {
     assert.equal(json.code, "RECEIPT_BOOKED_EXPENSE");
     assert.equal(storedExpense?.status, "Pending", "the sign-off is not forged");
     assert.equal(updateArgs, null);
+    // The refusal above is only as real as the read it's judged from — pin the
+    // `select` so dropping `receiptIntake` from the route's findUnique cannot
+    // slip this refusal back open with every other assertion here still green.
+    assert.deepEqual(findUniqueArgs?.select?.receiptIntake, { select: { id: true } });
 });
 
 test("receipt upload on a receipt row returns 409 and makes no storage upload call", async () => {
@@ -393,6 +407,10 @@ test("receipt upload on a receipt row returns 409 and makes no storage upload ca
     assert.equal(json.code, "RECEIPT_BOOKED_EXPENSE");
     assert.equal(objects.size, 0, "nothing reached storage");
     assert.equal(updateArgs, null);
+    // Same reason as the approve test above: the fake returns the whole row
+    // whatever `select` asks for, so only pinning the argument itself catches
+    // `receiptIntake` being dropped from the route's read.
+    assert.deepEqual(findUniqueArgs?.select?.receiptIntake, { select: { id: true } });
 });
 
 test("upload on a QBO row with an intake still succeeds", async () => {
@@ -402,6 +420,10 @@ test("upload on a QBO row with an intake still succeeds", async () => {
     const res = await upload();
     assert.equal(res.status, 200);
     assert.equal(objects.size, 1);
+    // This is the case that would go quiet if `qbPurchaseId` fell out of the
+    // route's select: `isReceiptBookedExpense` would read `undefined` instead
+    // of the QBO id, and the QBO-wins branch would stop being tested at all.
+    assert.equal(findUniqueArgs?.select?.qbPurchaseId, true);
 });
 
 test("a fallback-attributed approve is refused when the estimate MOVES", async () => {
