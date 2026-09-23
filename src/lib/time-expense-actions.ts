@@ -339,6 +339,14 @@ export async function createExpense(data: {
     revalidatePath(`/projects/${data.projectId}/budget`);
 }
 
+// RECEIPT-BOOKED EXPENSE GUARDS (design spec, native-expense-guards-spec.md
+// §6.4). Imported here, next to the actions that need them, rather than with
+// the imports at the top — sweep-phase1 used the same pattern in actions.ts,
+// and this file is not on its list of touched files.
+import { isReceiptBookedExpense, RECEIPT_EXPENSE_NO_DELETE, MOVE_MESSAGES } from "./receipt-intake/booked-expense-rules";
+import { moveReceiptExpenseToJobCore, isReceiptMoveRefusedError, type MoveReceiptExpenseDbClient } from "./receipt-intake/booked-expense";
+import { ADMIN_ROLES } from "@/lib/access-rules";
+
 export async function deleteExpense(id: string, projectId: string) {
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Unauthorized");
@@ -352,6 +360,7 @@ export async function deleteExpense(id: string, projectId: string) {
             projectId: true,
             estimateId: true,
             estimate: { select: { projectId: true } },
+            receiptIntake: { select: { id: true } },
         },
     });
     // Resolved, not read off the estimate. For a RE-ATTRIBUTED expense the
@@ -364,6 +373,7 @@ export async function deleteExpense(id: string, projectId: string) {
         throw new Error("Forbidden");
     }
     assertExpenseMutableOutsideQbo(expense);
+    if (isReceiptBookedExpense(expense)) throw new Error(RECEIPT_EXPENSE_NO_DELETE);
     if (expense.invoiceId || expense.invoicedAt) throw new Error("Billed expenses cannot be deleted");
 
     // AND AGAIN, UNDER LOCK (round 20, item 4). Same rule as the API DELETE:
@@ -393,6 +403,7 @@ export async function deleteExpense(id: string, projectId: string) {
                 qbPurchaseId: null,
                 invoiceId: null,
                 invoicedAt: null,
+                receiptIntake: { is: null },
                 // The job the actor was authorized against, in the predicate.
                 ...expenseStillOnProjectWhere(expense, locked),
             },
@@ -406,11 +417,11 @@ export async function deleteExpense(id: string, projectId: string) {
 
 export async function deleteExpenses(
     ids: string[]
-): Promise<{ deleted: number }> {
+): Promise<{ deleted: number; skippedFromReceipts: number }> {
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
-    if (!ids.length) return { deleted: 0 };
+    if (!ids.length) return { deleted: 0, skippedFromReceipts: 0 };
 
     const expenses = await prisma.expense.findMany({
         where: { id: { in: ids } },
@@ -430,6 +441,7 @@ export async function deleteExpenses(
             invoiceId: true,
             invoicedAt: true,
             estimate: { select: { projectId: true } },
+            receiptIntake: { select: { id: true } },
         },
     });
     // Resolve each row's job the ONE way — the new column when it has one, the
@@ -440,8 +452,12 @@ export async function deleteExpenses(
         e => e.resolvedProjectId && canAccessProject(user, e.resolvedProjectId),
     );
     for (const expense of accessible) assertExpenseMutableOutsideQbo(expense);
-    const allowed = accessible.filter(e => !e.invoiceId && !e.invoicedAt);
-    if (!allowed.length) return { deleted: 0 };
+    // Receipt-booked rows are SKIPPED, not refused (design spec §5): they must
+    // stay selectable, because the same checkboxes drive "Tag selected" for
+    // T&M billing.
+    const skippedFromReceipts = accessible.filter(isReceiptBookedExpense).length;
+    const allowed = accessible.filter(e => !e.invoiceId && !e.invoicedAt && !isReceiptBookedExpense(e));
+    if (!allowed.length) return { deleted: 0, skippedFromReceipts };
 
     const allowedIds = allowed.map(e => e.id);
     const projectIds = new Set(
@@ -497,6 +513,7 @@ export async function deleteExpenses(
                     qbPurchaseId: null,
                     invoiceId: null,
                     invoicedAt: null,
+                    receiptIntake: { is: null },
                     ...expenseStillOnProjectWhere(expense, locked),
                 },
             });
@@ -509,7 +526,7 @@ export async function deleteExpenses(
         revalidatePath(`/projects/${projectId}/time-expenses`);
         revalidatePath(`/projects/${projectId}/budget`);
     }
-    return { deleted: result.count };
+    return { deleted: result.count, skippedFromReceipts };
 }
 
 export async function tagTimeEntriesToChangeOrder(projectId: string, ids: string[], changeOrderId: string) {
@@ -561,6 +578,7 @@ export async function getExpenses(projectId: string) {
             costType: { select: { id: true, name: true } },
             item: { select: { id: true, name: true } },
             changeOrder: { select: { id: true, code: true, title: true } },
+            receiptIntake: { select: { id: true } },
         },
         orderBy: { createdAt: "desc" },
     });
@@ -593,6 +611,7 @@ export async function getTimeExpenseData(projectId: string) {
             costType: { select: { id: true, name: true } },
             item: { select: { id: true, name: true } },
             changeOrder: { select: { id: true, code: true, title: true } },
+            receiptIntake: { select: { id: true } },
         },
         orderBy: { createdAt: "desc" },
     });
@@ -635,4 +654,36 @@ export async function getTimeExpenseData(projectId: string) {
     });
 
     return { timeEntries, expenses, costCodes, costTypes, teamMembers, estimates, changeOrders };
+}
+
+// ─── Move to job (receipt-booked expenses) ─────────────────────
+
+/**
+ * Move a receipt-booked Expense to another job, with its receipt, in one
+ * transaction (design spec §6.4). This is the ONLY way to change the job on
+ * one of these rows — they cannot be deleted or edited.
+ *
+ * Refusals come back as VALUES, not throws, so the plain message reaches the
+ * browser whether or not Next sanitizes thrown action errors in production
+ * (spec §11).
+ */
+export async function moveReceiptExpenseToJob(expenseId: string, fromProjectId: string, toProjectId: string):
+    Promise<{ ok: true; toProjectName: string; phaseCleared: boolean } | { ok: false; message: string }> {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!ADMIN_ROLES.includes(user.role)) return { ok: false, message: MOVE_MESSAGES.notAllowed };
+    if ([expenseId, fromProjectId, toProjectId].some(v => typeof v !== "string" || !v)) return { ok: false, message: MOVE_MESSAGES.changed };
+    if (!canAccessProject(user, fromProjectId) || !canAccessProject(user, toProjectId)) throw new Error("Forbidden");
+    try {
+        const moved = await moveReceiptExpenseToJobCore(prisma as unknown as MoveReceiptExpenseDbClient, { expenseId, fromProjectId, toProjectId, actor: user.email });
+        for (const id of [fromProjectId, toProjectId]) {
+            revalidatePath(`/projects/${id}/time-expenses`);
+            revalidatePath(`/projects/${id}/budget`);
+        }
+        revalidatePath("/automation");
+        return { ok: true, ...moved };
+    } catch (error) {
+        if (isReceiptMoveRefusedError(error)) return { ok: false, message: error.message };
+        throw error;
+    }
 }

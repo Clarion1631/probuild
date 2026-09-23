@@ -13,6 +13,11 @@ import {
 import { lockExpense } from "@/lib/expense-lock";
 import { lockAttributionParents } from "@/lib/phase-invariant";
 import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
+import {
+    isReceiptBookedExpense,
+    RECEIPT_EXPENSE_CODE,
+    RECEIPT_EXPENSE_NO_APPROVE,
+} from "@/lib/receipt-intake/booked-expense-rules";
 
 /**
  * APPROVING AN EXPENSE IS A MUTATION OF THE SAME ROW, SO IT TAKES THE SAME
@@ -53,10 +58,17 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
                 projectId: true,
                 estimateId: true,
                 estimate: { select: { projectId: true } },
+                receiptIntake: { select: { id: true } },
             },
         });
         assertExpenseMutableOutsideQbo(expense);
         if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
+        if (isReceiptBookedExpense(expense)) {
+            return NextResponse.json(
+                { error: RECEIPT_EXPENSE_NO_APPROVE, code: RECEIPT_EXPENSE_CODE },
+                { status: 409 },
+            );
+        }
 
         // Fail CLOSED: with no resolvable project there is no scope to
         // authorize against, so nobody may approve it here.
@@ -115,6 +127,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
                     // lands in the gap makes the row QuickBooks-owned, and the
                     // approval must not slip in behind it.
                     qbPurchaseId: null,
+                    receiptIntake: { is: null },
                     // The status this approval was decided FROM. A row somebody
                     // else already moved is not silently re-stamped, and the
                     // caller is told rather than shown a success for a decision
