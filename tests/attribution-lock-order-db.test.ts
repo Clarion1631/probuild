@@ -39,6 +39,8 @@ import {
     resolveExpenseProjectUnderLock,
 } from "../src/lib/expense-attribution";
 import { lockExpense } from "../src/lib/expense-lock";
+import { moveReceiptExpenseToJobCore, type MoveReceiptExpenseDbClient } from "../src/lib/receipt-intake/booked-expense";
+import { readReceiptEvidenceEpoch } from "../src/lib/receipt-evidence-lock";
 import {
     applyQboExpenseCostCodeSuggestion,
     upsertQboExpense,
@@ -991,6 +993,123 @@ for (const holdSource of [true, false]) {
             assert.deepEqual(after, { projectId: TARGET_PROJECT, estimateId: TARGET_ESTIMATE });
         } finally {
             await cleanupTwoJobs();
+        }
+    });
+}
+
+// ── Move to job (native-expense-guards-spec.md §7.9): the real core, against ─
+// ── the same two-job fixtures and the same held-lock harness ────
+
+const INTAKE = `${PFX}-move-intake`;
+
+/** EXPENSE, made native (no QBO purchase) and receipt-booked, with a BOOKED intake. */
+async function seedReceiptMove() {
+    await seedTwoJobs();
+    await writerDb!.expense.update({
+        where: { id: EXPENSE },
+        data: { qbPurchaseId: null, qbSyncToken: null },
+    });
+    await writerDb!.receiptIntake.create({
+        data: {
+            id: INTAKE,
+            source: "drive",
+            sourceRef: `${PFX}-move-source-ref`,
+            state: "BOOKED",
+            projectId: PROJECT,
+            expenseId: EXPENSE,
+            storagePath: `receipts/intake/${INTAKE}.pdf`,
+            mimeType: "application/pdf",
+            fileSize: 1024,
+            fileSha256: "0".repeat(64),
+            dedupStrongKey: `${PFX}-move-strong`,
+            bookedAt: new Date(),
+            totalCents: 25000,
+            vendor: "Summit Plumbing",
+        },
+    });
+}
+
+async function cleanupReceiptMove() {
+    await writerDb!.receiptIntake.deleteMany({ where: { id: INTAKE } });
+    await cleanupTwoJobs();
+}
+
+test("a receipt move moves the Expense in place and its receipt follows", { skip }, async () => {
+    await seedReceiptMove();
+    try {
+        const epochBefore = await readReceiptEvidenceEpoch(writerDb!);
+
+        const outcome = await moveReceiptExpenseToJobCore(writerDb! as unknown as MoveReceiptExpenseDbClient, {
+            expenseId: EXPENSE, fromProjectId: PROJECT, toProjectId: TARGET_PROJECT, actor: "test@example.com",
+        });
+        // The seeded Expense carries no costCodeId, so there is no phase to
+        // clear — keepPhase is trivially true and phaseCleared is false.
+        assert.deepEqual(outcome, { toProjectName: "Attribution Lock Order 2", phaseCleared: false });
+
+        const expense = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { id: true, projectId: true, estimateId: true },
+        });
+        assert.deepEqual(expense, { id: EXPENSE, projectId: TARGET_PROJECT, estimateId: TARGET_ESTIMATE }, "same id, moved in place");
+
+        const intake = await editorDb!.receiptIntake.findUnique({
+            where: { id: INTAKE },
+            select: { projectId: true, state: true, expenseId: true, dedupStrongKey: true },
+        });
+        assert.deepEqual(
+            intake,
+            { projectId: TARGET_PROJECT, state: "BOOKED", expenseId: EXPENSE, dedupStrongKey: `${PFX}-move-strong` },
+            "the intake follows the Expense, still BOOKED, same dedup key",
+        );
+
+        const epochAfter = await readReceiptEvidenceEpoch(writerDb!);
+        assert.equal(Number(epochAfter) - Number(epochBefore), 1, "receiptEvidenceEpoch rose by exactly 1");
+
+        const events = await writerDb!.automationEvent.findMany({
+            where: { kind: "receipt-moved", detail: { contains: EXPENSE } },
+        });
+        assert.equal(events.length, 1, "exactly one receipt-moved AutomationEvent for this move");
+    } finally {
+        await cleanupReceiptMove();
+    }
+});
+
+for (const holdSource of [true, false]) {
+    const label = holdSource ? "the SOURCE" : "the TARGET";
+    test(`the real Move to job waits out an editor holding ${label} job`, { skip }, async () => {
+        // The same held-lock harness as the bare reattributeExpense test above
+        // (":950-990"), with moveReceiptExpenseToJobCore in its place — Move
+        // takes the identical canonical lock pass before it ever reaches
+        // reattributeExpense, so it must wait the same way, not deadlock.
+        await seedReceiptMove();
+        try {
+            const held = gate();
+            const editor = crossJobEditor(
+                held,
+                holdSource ? PROJECT : TARGET_PROJECT,
+                holdSource ? TARGET_ESTIMATE : ESTIMATE,
+            );
+            await held.reached;
+
+            let writerError: unknown = null;
+            let outcome: unknown = null;
+            try {
+                outcome = await moveReceiptExpenseToJobCore(writerDb! as unknown as MoveReceiptExpenseDbClient, {
+                    expenseId: EXPENSE, fromProjectId: PROJECT, toProjectId: TARGET_PROJECT, actor: "test@example.com",
+                });
+            } catch (caught) {
+                writerError = caught;
+            }
+
+            await editor.done;
+
+            assert.equal(deadlocked(writerError), false, `the move was killed by a deadlock: ${writerError}`);
+            assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+            assert.equal(writerError, null, `the move failed: ${writerError}`);
+            assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+            assert.deepEqual(outcome, { toProjectName: "Attribution Lock Order 2", phaseCleared: false });
+        } finally {
+            await cleanupReceiptMove();
         }
     });
 }

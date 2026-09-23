@@ -369,6 +369,37 @@ test("approve takes the shared per-expense lock", async () => {
     }
 });
 
+// ── receipt-booked guards (design spec, native-expense-guards-spec.md §5) ──
+
+test("approve on a receipt row returns 409", async () => {
+    storedExpense = { ...(storedExpense as object), receiptIntake: { id: "intake-1" } };
+    const res = await callApprove();
+    assert.equal(res.status, 409);
+    const json = await res.json();
+    assert.equal(json.code, "RECEIPT_BOOKED_EXPENSE");
+    assert.equal(storedExpense?.status, "Pending", "the sign-off is not forged");
+    assert.equal(updateArgs, null);
+});
+
+test("receipt upload on a receipt row returns 409 and makes no storage upload call", async () => {
+    storedExpense = { ...(storedExpense as object), receiptIntake: { id: "intake-1" } };
+    const res = await upload();
+    assert.equal(res.status, 409);
+    const json = await res.json();
+    assert.equal(json.code, "RECEIPT_BOOKED_EXPENSE");
+    assert.equal(objects.size, 0, "nothing reached storage");
+    assert.equal(updateArgs, null);
+});
+
+test("upload on a QBO row with an intake still succeeds", async () => {
+    // QBO-backed wins (design spec §4.1): a Purchase-managed row keeps
+    // today's behaviour even when an intake links to it.
+    storedExpense = { ...(storedExpense as object), qbPurchaseId: "qb-1", receiptIntake: { id: "intake-1" } };
+    const res = await upload();
+    assert.equal(res.status, 200);
+    assert.equal(objects.size, 1);
+});
+
 test("a fallback-attributed approve is refused when the estimate MOVES", async () => {
     // The gate BEFORE the transaction and the gate INSIDE it are not the same
     // question, and only this shape tells them apart: the row has no

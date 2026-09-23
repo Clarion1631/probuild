@@ -411,7 +411,7 @@ test("DELETE still works for someone who may actually do it", async () => {
     // The predicate carries the job the actor was authorized against (round 19,
     // item 3), so a row that moved in the gap matches nothing.
     assert.deepEqual(deleteArgs, {
-        where: { id: "e1", qbPurchaseId: null, projectId: "job-1" },
+        where: { id: "e1", qbPurchaseId: null, receiptIntake: { is: null }, projectId: "job-1" },
     });
 });
 
@@ -426,6 +426,7 @@ test("DELETE of a FALLBACK-attributed row pins the estimate's job", async () => 
         where: {
             id: "e1",
             qbPurchaseId: null,
+            receiptIntake: { is: null },
             projectId: null,
             estimate: { is: { projectId: "job-1" } },
         },
@@ -2179,4 +2180,51 @@ test("clearing the date is still possible", async () => {
     const res = await call({ date: null });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.date, null);
+});
+
+// ── receipt-booked guards (design spec, native-expense-guards-spec.md §5) ──
+
+test("DELETE on a receipt row returns 409 with RECEIPT_BOOKED_EXPENSE and makes no write", async () => {
+    storedExpense = { ...storedExpense, receiptIntake: { id: "intake-1" } };
+    const res = await del();
+    assert.equal(res.status, 409);
+    const json = await res.json();
+    assert.equal(json.code, "RECEIPT_BOOKED_EXPENSE");
+    assert.match(json.error, /can't be deleted/);
+    assert.equal(deleteArgs, null);
+});
+
+test("PUT on a receipt row returns 409 with RECEIPT_BOOKED_EXPENSE and makes no write", async () => {
+    storedExpense = { ...storedExpense, receiptIntake: { id: "intake-1" } };
+    const res = await call({ vendor: "Someone Else" });
+    assert.equal(res.status, 409);
+    const json = await res.json();
+    assert.equal(json.code, "RECEIPT_BOOKED_EXPENSE");
+    assert.match(json.error, /can't be edited here/);
+    assert.equal(updateArgs, null);
+});
+
+test("DELETE on a QBO row still returns today's 409 and QBO message, even with a receipt link", async () => {
+    storedExpense = { ...storedExpense, qbPurchaseId: "qb-1", receiptIntake: { id: "intake-1" } };
+    const res = await del();
+    assert.equal(res.status, 409);
+    const json = await res.json();
+    assert.equal(json.error, "Finalized QuickBooks expenses are read-only in ProBuild; make the change in QuickBooks.");
+    assert.equal(json.code, undefined, "the QBO refusal keeps its own shape, not the receipt one");
+    assert.equal(deleteArgs, null);
+});
+
+test("PUT on a QBO row still returns today's 409 and QBO message, even with a receipt link", async () => {
+    storedExpense = { ...storedExpense, qbPurchaseId: "qb-1", receiptIntake: { id: "intake-1" } };
+    const res = await call({ vendor: "Someone Else" });
+    assert.equal(res.status, 409);
+    const json = await res.json();
+    assert.equal(json.error, "Finalized QuickBooks expenses are read-only in ProBuild; make the change in QuickBooks.");
+    assert.equal(updateArgs, null);
+});
+
+test("PATCH on a receipt row still returns 200 — Tax & phase stays open", async () => {
+    storedExpense = { ...storedExpense, receiptIntake: { id: "intake-1" } };
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200);
 });
