@@ -38,6 +38,12 @@ const RECOGNITION_POLICY = "receipt-source-v1:off";
 const BANK_EPOCH = "5";
 const EVIDENCE_EPOCH = "9";
 const OWNER_EPOCH = "3";
+// One calendar day behind NOW, both readings — for the "stamped/planned
+// against the wrong day" cases below. Same real-clock reasoning as NOW itself
+// (see the comment above it): this is yesterday relative to test-file load
+// time, moments before claimOwnerDay captures its own fresh `now`.
+const YESTERDAY = new Date(NOW.getTime() - 24 * 60 * 60 * 1000);
+const UTC_YESTERDAY = YESTERDAY.toISOString().slice(0, 10);
 
 const ITEMS: CardItem[] = [{
     n: 1, fingerprint: "fp-1", date: "2026-09-01", vendor: "Lowes", cents: 1234, amount: "12.34",
@@ -141,7 +147,7 @@ test("claimed: SET LOCAL, lock, evidence read, ledger lock, marker, cycle, owner
 });
 
 test("each failed certification condition refuses with 'certification', and create is never reached", async () => {
-    const cases: Array<[string, FakeOptions]> = [
+    const cases: Array<[string, FakeOptions, Partial<Parameters<typeof claimOwnerDay>[1]>?]> = [
         ["marker phase is not done", { markerValue: markerJson({ phase: "lines" }) }],
         ["marker is blocked", { markerValue: markerJson({ blockedReason: "bank-pull-stale" }) }],
         ["the completion is for a different cycle", { markerValue: markerJson({ completedCycleId: "not-this-cycle" }) }],
@@ -150,10 +156,22 @@ test("each failed certification condition refuses with 'certification', and crea
         ["there is no cycle at all", { cycleValue: null }],
         ["the cycle has undecided lines (blocker 2)", { cycleValue: cycleJson({ undecidedLines: ["bl-undecided-1"] }) }],
         ["the cycle's plannerDay is missing (a legacy cycle)", { cycleValue: cycleJson({ plannerDay: undefined }) }],
+        // The claim's own input carries a policy the cycle was never measured
+        // against — cycleStillValid's recognitionPolicy branch (route.ts:588
+        // threads input.recognitionPolicy through, unguarded until now).
+        ["the recognition policy differs from the cycle's", {}, { recognitionPolicy: "receipt-source-v1:on" }],
+        // The stamp is real and unblocked, but for the WRONG Pacific day —
+        // chaserCompletedFor's own day comparison, not cycleCertified's
+        // not-in-the-future check (a stale-but-past stamp still passes that).
+        ["the chaser's stamp is from yesterday (Pacific)", { markerValue: markerJson({ chaserCompletedAt: YESTERDAY.toISOString() }) }],
+        // Present, but not today's UTC day — distinct from the "missing"
+        // case above, which cycleMatchesPlannerDay also refuses, for the
+        // opposite reason.
+        ["the cycle's plannerDay is yesterday (UTC)", { cycleValue: cycleJson({ plannerDay: UTC_YESTERDAY }) }],
     ];
-    for (const [label, options] of cases) {
+    for (const [label, options, inputOverrides] of cases) {
         const fake = fakeDb(options);
-        const result = await claimOwnerDay(fake.db as never, baseInput());
+        const result = await claimOwnerDay(fake.db as never, baseInput(inputOverrides));
         assert.deepEqual(result, { kind: "refused", reason: "certification" }, label);
         assert.ok(!fake.calls.includes("create"), `${label}: create must not run`);
         assert.ok(!fake.calls.includes("owner-epoch-read"), `${label}: the owner epoch is not even read once certification fails`);
