@@ -6,8 +6,8 @@ export const maxDuration = 60;
 
 /**
  * Weekly accounts-receivable digest to the team (System Notification Email):
- * every invoice with a balance due, overdue ones flagged. Skips the email when
- * nothing is outstanding.
+ * every invoice with billed, unpaid milestones, overdue ones flagged. Skips
+ * the email when nothing is outstanding.
  */
 export async function GET(request: Request) {
     // Any deployed environment (production or preview) requires the cron secret,
@@ -18,6 +18,6 @@ export async function GET(request: Request) {
     }
 
     const result = await sendArDigest();
-    console.log("[cron/ar-digest]", JSON.stringify({ sent: result.sent, invoices: result.invoiceCount, outstanding: result.totalOutstanding }));
+    console.log("[cron/ar-digest]", JSON.stringify({ sent: result.sent, invoices: result.invoiceCount, outstanding: result.totalOutstanding, unbilled: result.unbilledBacklog }));
     return NextResponse.json(result);
 }

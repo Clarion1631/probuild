@@ -115,8 +115,8 @@ function renderExpensesTab(): string {
         currentUser: { id: "u1", role: "ADMIN", name: "Admin" },
         changeOrders: [],
         jobOptions: [
-            { id: "job-1", name: "Mueller Remodel" },
-            { id: "job-2", name: "Mesplay Kitchen" },
+            { id: "job-1", name: "Sample Job A" },
+            { id: "job-2", name: "Sample Job B" },
             { id: "shop-id", name: "Shop" },
         ],
         expenses: [
@@ -152,8 +152,8 @@ test("MoveToJobModal: title, double note, Shop help, current job absent, Move di
         changeOrderLabel: null,
         projectId: "job-1",
         jobOptions: [
-            { id: "job-1", name: "Mueller Remodel" },
-            { id: "job-2", name: "Mesplay Kitchen" },
+            { id: "job-1", name: "Sample Job A" },
+            { id: "job-2", name: "Sample Job B" },
             { id: "shop-id", name: "Shop" },
         ],
         onClose: () => {},
@@ -169,8 +169,8 @@ test("MoveToJobModal: title, double note, Shop help, current job absent, Move di
     assert.match(markup, /Pick Shop if it isn&#x27;t a job cost\./);
 
     // The current job (job-1) is absent from the options; Shop is present.
-    assert.doesNotMatch(markup, />Mueller Remodel</);
-    assert.match(markup, />Mesplay Kitchen</);
+    assert.doesNotMatch(markup, />Sample Job A</);
+    assert.match(markup, />Sample Job B</);
     assert.match(markup, />Shop</);
 
     // Move is disabled until a job is picked.
@@ -208,7 +208,7 @@ test("MoveToJobModal: dialog semantics, focus enters on open and returns to the 
             root.render(createElement(ImportedAwareMoveToJobModal, {
                 expenseId: "exp-receipt", vendor: "Lowe's", amountLabel: "$146.32", dateLabel: "9/2/2026",
                 changeOrderLabel: null, projectId: "job-1",
-                jobOptions: [{ id: "job-2", name: "Mesplay Kitchen" }],
+                jobOptions: [{ id: "job-2", name: "Sample Job B" }],
                 onClose: () => { closes++; },
                 onMoved: async () => {},
             }));
