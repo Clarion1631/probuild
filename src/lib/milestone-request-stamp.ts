@@ -35,7 +35,7 @@ export function stampFirstRequested(
 ) {
     return db.$executeRaw`
         UPDATE "PaymentSchedule"
-           SET "firstRequestedAt" = COALESCE("qbInvoiceSentAt", ${at}::timestamp(3))
+           SET "firstRequestedAt" = COALESCE("qbInvoiceSentAt", (${at}::timestamptz AT TIME ZONE 'UTC')::timestamp(3))
          WHERE "invoiceId" = ${invoiceId}
            AND "id" = ANY(${milestoneIds}::text[])
            AND "status" = 'Pending'

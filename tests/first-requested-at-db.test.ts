@@ -313,3 +313,58 @@ test("D6: the backfill copies qbInvoiceSentAt once and is a no-op on re-run", { 
         await db.$disconnect();
     }
 });
+
+test("D7: a non-UTC session time zone does not shift the stamped instant, and the deposit-matching bound reads it correctly", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await seed(db);
+        await seedMilestone(db, "ps-frtest-d7");
+
+        // A fixed instant with non-zero milliseconds, chosen so that shifting it
+        // by America/Los_Angeles's offset (UTC-7 in September) lands on a
+        // DIFFERENT calendar day than the true instant — the exact failure mode
+        // the cast bug produces.
+        const at = new Date("2026-09-20T02:00:00.123Z");
+
+        await db.$transaction(async (tx) => {
+            await tx.$executeRawUnsafe(`SET LOCAL TIME ZONE 'America/Los_Angeles'`);
+            await stampFirstRequested(tx as any, ID.invoiceA, ["ps-frtest-d7"], at);
+            await tx.paymentSchedule.update({ where: { id: "ps-frtest-d7" }, data: { qbInvoiceSentAt: at } });
+        });
+
+        const row = await readSchedule(db, "ps-frtest-d7");
+        assert.equal(
+            row.first!.toISOString(),
+            at.toISOString(),
+            "firstRequestedAt must be the true UTC instant regardless of the session's time zone",
+        );
+        assert.equal(row.last!.toISOString(), at.toISOString());
+
+        // The exact deposit-matching where-clause from
+        // src/app/api/payments/deposit-ingest/route.ts's matchAndApplyBank,
+        // scoped to this seeded row by id (the seeded invoice defaults to
+        // Draft, outside OPEN_INVOICE_STATUSES, so the invoice-status arm of
+        // the real where-clause is left out here rather than faked).
+        async function isCandidate(requestedBy: Date): Promise<boolean> {
+            const rows = await db.paymentSchedule.findMany({
+                where: {
+                    status: "Pending",
+                    id: "ps-frtest-d7",
+                    OR: [
+                        { firstRequestedAt: { not: null, lte: requestedBy } },
+                        { firstRequestedAt: null, qbInvoiceSentAt: { not: null, lte: requestedBy } },
+                    ],
+                },
+            });
+            return rows.length === 1;
+        }
+
+        const before = new Date(at.getTime() - 30 * 60_000);
+        const after = new Date(at.getTime() + 60_000);
+        assert.equal(await isCandidate(before), false, "a requestedBy 30 minutes before the true instant must NOT match");
+        assert.equal(await isCandidate(after), true, "a requestedBy 1 minute after the true instant must match");
+    } finally {
+        await teardown(db);
+        await db.$disconnect();
+    }
+});

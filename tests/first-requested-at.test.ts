@@ -20,7 +20,7 @@ test("T1: the stamp writes ONLY firstRequestedAt, from the pre-send qbInvoiceSen
 
     assert.equal(calls.length, 1);
     const sql = calls[0].sql.replace(/\s+/g, " ").trim();
-    assert.match(sql, /UPDATE "PaymentSchedule" SET "firstRequestedAt" = COALESCE\("qbInvoiceSentAt", \?::timestamp\(3\)\) WHERE/);
+    assert.match(sql, /UPDATE "PaymentSchedule" SET "firstRequestedAt" = COALESCE\("qbInvoiceSentAt", \(\?::timestamptz AT TIME ZONE 'UTC'\)::timestamp\(3\)\) WHERE/);
     assert.match(sql, /"invoiceId" = \?/);
     assert.match(sql, /"id" = ANY\(\?::text\[\]\)/);
     assert.match(sql, /"status" = 'Pending'/);
