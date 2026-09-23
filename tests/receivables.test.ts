@@ -200,7 +200,6 @@ function progressBilling(overrides: Partial<ReceivableProgressBilling> = {}): Re
         id: "pb-synthetic",
         code: "PB-001",
         status: "Staged",
-        total: "0.00",
         qbInvoiceId: "qb-pb-1",
         qbSyncError: null,
         qbSyncedAt: new Date("2026-08-01T00:00:00.000Z"),
@@ -340,45 +339,97 @@ test("E14: portal-only (no QBO link) re-send restarts age — documents the know
     assert.equal(r.items[0].ageDays, 2);
 });
 
-test("E15: a live Staged progress billing counts once at its total; line milestones are skipped", () => {
+test("E15 (design review F1): a live Staged billing is evidence, not a separate item — two milestone items totalling 25,000", () => {
     const msA = milestone({ id: "ms-A", amount: "15000.00", qbInvoiceSentAt: new Date(NOW - 10 * DAY) });
     const msB = milestone({ id: "ms-B", amount: "10000.00" });
-    const pb = progressBilling({ total: "25000.00", lines: [{ scheduleId: "ms-A" }, { scheduleId: "ms-B" }] });
+    const pb = progressBilling({ lines: [{ scheduleId: "ms-A" }, { scheduleId: "ms-B" }] });
     const inv = invoiceOf([msA, msB], { balanceDue: "25000.00", progressBillings: [pb] });
     const r = computeInvoiceReceivable(inv, NOW);
     assert.equal(r.receivableCents, 2_500_000);
-    assert.equal(r.items.length, 1);
-    assert.equal(r.items[0].kind, "progressBilling");
+    assert.equal(r.items.length, 2);
+    assert.ok(r.items.every(it => it.kind === "milestone"));
+    const a = r.items.find(it => it.id === "ms-A")!;
+    const b = r.items.find(it => it.id === "ms-B")!;
+    assert.equal(a.cents, 1_500_000);
+    assert.equal(a.requested, true); // its own evidence
+    assert.equal(b.cents, 1_000_000);
+    assert.equal(b.inQuickBooks, true); // via the billing, even with no evidence of its own
+    assert.equal(b.requested, false); // the billing itself was never sent/requested either
+    assert.equal(a.progressBillingCode, "PB-001");
+    assert.equal(b.progressBillingCode, "PB-001");
 });
 
 test("E16: the same billing in Draft does not cover its lines — each milestone stands alone", () => {
     const msA = milestone({ id: "ms-A", amount: "15000.00", qbInvoiceSentAt: new Date(NOW - 10 * DAY) });
     const msB = milestone({ id: "ms-B", amount: "10000.00" });
-    const pb = progressBilling({ status: "Draft", total: "25000.00", lines: [{ scheduleId: "ms-A" }, { scheduleId: "ms-B" }] });
+    const pb = progressBilling({ status: "Draft", lines: [{ scheduleId: "ms-A" }, { scheduleId: "ms-B" }] });
     const inv = invoiceOf([msA, msB], { balanceDue: "25000.00", progressBillings: [pb] });
     const r = computeInvoiceReceivable(inv, NOW);
     assert.equal(r.receivableCents, 1_500_000); // A only (requested); B is neither requested nor in QBO
-    assert.ok(r.items.every(it => it.kind !== "progressBilling"));
+    assert.equal(r.items.length, 1);
+    assert.equal(r.items[0].progressBillingCode, null); // a Draft billing is not live evidence
 });
 
-test("E17: a voided Staged billing is not a live link — its lines are evaluated alone", () => {
+test("E17 (design review F2 — latent: the hourly poller doesn't persist void/notFound onto ProgressBilling rows yet, so this pins the rule for when it does): a voided qbSyncError on a Staged billing is not a live link — its lines stand alone", () => {
     const msA = milestone({ id: "ms-A", amount: "15000.00", qbInvoiceSentAt: new Date(NOW - 10 * DAY) });
     const msB = milestone({ id: "ms-B", amount: "10000.00" });
-    const pb = progressBilling({ status: "Staged", qbSyncError: "voided", total: "25000.00", lines: [{ scheduleId: "ms-A" }, { scheduleId: "ms-B" }] });
+    const pb = progressBilling({ status: "Staged", qbSyncError: "voided", lines: [{ scheduleId: "ms-A" }, { scheduleId: "ms-B" }] });
     const inv = invoiceOf([msA, msB], { balanceDue: "25000.00", progressBillings: [pb] });
     const r = computeInvoiceReceivable(inv, NOW);
-    assert.equal(r.receivableCents, 1_500_000);
-    assert.ok(r.items.every(it => it.kind !== "progressBilling"));
+    assert.equal(r.receivableCents, 1_500_000); // A only, on its own evidence; B has none
+    assert.equal(r.items.length, 1);
+    assert.equal(r.items[0].id, "ms-A");
+    assert.equal(r.items[0].progressBillingCode, null);
 });
 
-test("E18: a materialized custom-line milestone is still covered — counted once via the billing", () => {
+test("E18: a materialized custom-line milestone is still covered by its billing — counted once, at its own amount", () => {
     const msCustom = milestone({ id: "ms-custom", amount: "5000.00" });
-    const pb = progressBilling({ total: "5000.00", lines: [{ scheduleId: "ms-custom" }] });
+    const pb = progressBilling({ lines: [{ scheduleId: "ms-custom" }] });
     const inv = invoiceOf([msCustom], { balanceDue: "5000.00", progressBillings: [pb] });
     const r = computeInvoiceReceivable(inv, NOW);
     assert.equal(r.items.length, 1);
-    assert.equal(r.items[0].kind, "progressBilling");
+    assert.equal(r.items[0].kind, "milestone");
+    assert.equal(r.items[0].id, "ms-custom");
+    assert.equal(r.items[0].inQuickBooks, true);
     assert.equal(r.receivableCents, 500_000);
+});
+
+test("F1 (design review, Codex's repro): a rebalanced covered milestone (A=$50) plus a requested one (B=$150) total 200, not 250", () => {
+    // Before any rebalance the billing claimed A at its own `total` (frozen
+    // at staging time). "Edit amounts" (updatePendingMilestoneAmountsCore)
+    // then re-split the invoice's Pending milestones to A=$50 / B=$150
+    // without knowing a progress billing exists — A's PaymentSchedule.amount
+    // moved; nothing about the billing did. The old code counted the
+    // billing's frozen total (100) PLUS B's new amount (150) = 250. This
+    // counts A and B each once, at what they currently say: 50 + 150 = 200.
+    const a = milestone({ id: "ms-A", amount: "50.00" }); // covered; already the rebalanced amount
+    const b = milestone({ id: "ms-B", amount: "150.00", qbInvoiceSentAt: new Date(NOW - 5 * DAY) });
+    const pb = progressBilling({ lines: [{ scheduleId: "ms-A" }] });
+    const inv = invoiceOf([a, b], { balanceDue: "200.00", progressBillings: [pb] });
+    const r = computeInvoiceReceivable(inv, NOW);
+    assert.equal(r.receivableCents, 20_000); // $200.00, not $250.00
+    assert.equal(r.items.length, 2);
+});
+
+test("F1 (design review): a milestone covered by two live billings still counts once", () => {
+    const m = milestone({ id: "ms-A", amount: "100.00" });
+    const pb1 = progressBilling({ id: "pb-1", code: "PB-001", lines: [{ scheduleId: "ms-A" }] });
+    const pb2 = progressBilling({ id: "pb-2", code: "PB-002", qbInvoiceSentAt: new Date(NOW - 3 * DAY), lines: [{ scheduleId: "ms-A" }] });
+    const inv = invoiceOf([m], { balanceDue: "100.00", progressBillings: [pb1, pb2] });
+    const r = computeInvoiceReceivable(inv, NOW);
+    assert.equal(r.items.length, 1);
+    assert.equal(r.receivableCents, 10_000);
+    assert.equal(r.items[0].requested, true); // OR'd in from pb2's evidence
+    assert.equal(r.items[0].progressBillingCode, "PB-001, PB-002");
+});
+
+test("F1 (design review): a covered milestone with its own live QBO link still counts once", () => {
+    const m = milestone({ id: "ms-A", amount: "100.00", qbInvoiceId: "qb-own", qbSyncedAt: new Date(NOW - 8 * DAY) });
+    const pb = progressBilling({ lines: [{ scheduleId: "ms-A" }] });
+    const inv = invoiceOf([m], { balanceDue: "100.00", progressBillings: [pb] });
+    const r = computeInvoiceReceivable(inv, NOW);
+    assert.equal(r.items.length, 1);
+    assert.equal(r.receivableCents, 10_000);
 });
 
 test("E19: a CO milestone counts only after it is sent, not merely when billed", () => {
@@ -391,14 +442,18 @@ test("E19: a CO milestone counts only after it is sent, not merely when billed",
     assert.equal(after.receivableCents, 100_000);
 });
 
-test("E20: a zero-milestone non-Draft invoice counts its whole balanceDue once, aged from issueDate", () => {
+test("E20 (design review F5): a zero-milestone non-Draft invoice counts its whole balanceDue once, requested only if it has evidence of being sent", () => {
     const issueDate = new Date(NOW - 10 * DAY);
-    const inv = invoiceOf([], { status: "Issued", balanceDue: "500.00", milestoneCount: 0, issueDate });
+    const inv = invoiceOf([], { status: "Issued", balanceDue: "500.00", milestoneCount: 0, issueDate, sentAt: null });
     const r = computeInvoiceReceivable(inv, NOW);
     assert.equal(r.items.length, 1);
     assert.equal(r.items[0].kind, "legacyInvoice");
     assert.equal(r.items[0].cents, 50_000);
     assert.equal(r.items[0].billedAt.getTime(), issueDate.getTime());
+    // No milestone to carry qbInvoiceSentAt, and sentAt is null here: there
+    // is no evidence this was ever emailed, so it can't claim requested:true.
+    assert.equal(r.items[0].requested, false);
+    assert.equal(r.notRequestedCents, 50_000);
 });
 
 test("E21: a zero-milestone Draft invoice reports zero — the legacy branch requires non-Draft (INV-00135 shape)", () => {
@@ -454,4 +509,22 @@ test("E26 (design review C3): unbilled backlog is the sum of unbilled Pending mi
     // Exactly the one truly-unbilled milestone's amount (500.00) — NOT
     // 95000 - 30000 = 65000, which is what subtraction would have given.
     assert.equal(r.unbilledCents, 50_000);
+});
+
+test("F3 (design review): half-cent amounts round the same way the currency formatter would", () => {
+    const sentAt = new Date(NOW - 1 * DAY);
+    const cases = [
+        { amount: 1.005, expectedCents: 101, label: "1.005 (number)" },
+        { amount: "1.005", expectedCents: 101, label: '"1.005" (string)' },
+        { amount: 2.675, expectedCents: 268, label: "2.675 (number)" },
+        { amount: "0.125", expectedCents: 13, label: '"0.125" (string)' },
+        { amount: { toString: () => "9.995" }, expectedCents: 1_000, label: "Decimal-like object (carries into the next dollar)" },
+        { amount: 42, expectedCents: 4_200, label: "whole number" },
+        { amount: "1234567.895", expectedCents: 123_456_790, label: "large value" },
+    ];
+    for (const { amount, expectedCents, label } of cases) {
+        const m = milestone({ amount, qbInvoiceSentAt: sentAt });
+        const r = computeInvoiceReceivable(invoiceOf([m]), NOW);
+        assert.equal(r.receivableCents, expectedCents, label);
+    }
 });

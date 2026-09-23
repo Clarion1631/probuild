@@ -66,7 +66,15 @@ function toSelectShape(raw: Row): Row {
                 qbInvoiceId: p.qbInvoiceId, qbInvoiceSentAt: parseDate(p.qbInvoiceSentAt),
                 qbSyncError: p.qbSyncError, qbSyncedAt: parseDate(p.qbSyncedAt),
             })),
-        progressBillings: (raw.progressBillings ?? []) as Row[],
+        progressBillings: ((raw.progressBillings ?? []) as Row[])
+            .filter(pb => pb.status === "Staged" || pb.status === "Sent")
+            .map(pb => ({
+                id: pb.id, code: pb.code, status: pb.status,
+                qbInvoiceId: pb.qbInvoiceId, qbSyncError: pb.qbSyncError,
+                qbSyncedAt: parseDate(pb.qbSyncedAt), qbInvoiceSentAt: parseDate(pb.qbInvoiceSentAt),
+                sentAt: parseDate(pb.sentAt), createdAt: new Date(pb.createdAt),
+                lines: pb.lines,
+            })),
     };
 }
 
@@ -102,7 +110,7 @@ beforeEach(() => {
 // ── Load billing-core under the patch ───────────────────────────────────────
 
 let listReceivables: (now?: number) => Promise<Row>;
-let sendArDigest: () => Promise<Row>;
+let sendArDigest: (now?: number) => Promise<Row>;
 
 before(async () => {
     const originalRequire = Module.prototype.require;
@@ -143,7 +151,7 @@ test("L1: never-billed milestones report zero outstanding, not their scheduled a
 
 test("L2: sendArDigest sends nothing when nothing is actually billed", async () => {
     fixtureRows = fixturesByCode("INV-00319", "INV-00171");
-    const result = await sendArDigest();
+    const result = await sendArDigest(NOW);
     assert.equal(result.sent, false);
     assert.equal(result.reason, "nothing outstanding");
     assert.equal(sentEmails.length, 0);
@@ -158,7 +166,10 @@ test("L3: all 9 fixtures — totals, row order, and the email body", async () =>
     assert.deepEqual(ar.invoices.map((r: Row) => r.code), ["INV-00172", "INV-00174", "INV-00169", "INV-00246"]);
     assert.equal(ar.unbilledBacklog, 283_450.60);
 
-    const result = await sendArDigest();
+    // F4: pass NOW explicitly — sendArDigest defaults to the real clock, and
+    // this test's dollar/age assertions must stay deterministic regardless
+    // of when the suite actually runs.
+    const result = await sendArDigest(NOW);
     assert.equal(result.sent, true);
     assert.equal(sentEmails.length, 1);
     const html = sentEmails[0].html as string;
@@ -201,6 +212,9 @@ test("L4: the recorded findMany args select enough columns to compute receivable
         assert.equal(paymentsSelect[field], true, `payments.select.${field} must be selected`);
     }
     assert.ok(args.select?.progressBillings?.select?.lines, "select.progressBillings.select.lines must be requested");
+    // F1: a live billing is evidence only now, never a separate item — its
+    // own `total` is never read, so it should not be selected either.
+    assert.equal(args.select?.progressBillings?.select?.total, undefined, "progressBillings.select.total should be dropped");
 });
 
 test("L5 (design review C2): an invoice with balanceDue drifted to 0 still counts a requested Pending milestone", async () => {
@@ -263,8 +277,79 @@ test("L6 (design review C7): the email shows a row's overdue amount separately w
     assert.equal(ar.invoices[0].receivable, 1500);
     assert.equal(ar.invoices[0].overdueAmount, 1000, "only the old milestone is overdue");
 
-    const result = await sendArDigest();
+    const result = await sendArDigest(NOW);
     assert.equal(result.sent, true);
     const html = sentEmails[0].html as string;
     assert.ok(html.includes("of which $1,000.00 overdue"), "the row should break out the overdue portion");
+});
+
+test("L7 (checker gap C7): unpaidMilestones[].billed reflects billing coverage, individual requests, and unbilled backlog", async () => {
+    fixtureRows = [{
+        code: "INV-BILLED-FLAG",
+        status: "Partially Paid",
+        balanceDue: "300.00",
+        issueDate: null,
+        sentAt: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        milestoneCount: 3,
+        project: "Billed Flag Test",
+        progressBillings: [{
+            id: "pb-1", code: "PB-001", status: "Staged",
+            qbInvoiceId: "qb-pb-1", qbSyncError: null,
+            qbSyncedAt: "2026-08-01T00:00:00.000Z", qbInvoiceSentAt: null, sentAt: null,
+            createdAt: "2026-07-01T00:00:00.000Z",
+            lines: [{ scheduleId: "ms-covered" }],
+        }],
+        payments: [
+            {
+                id: "ms-covered", name: "Covered by a live billing", amount: "100.00", status: "Pending", dueDate: null,
+                createdAt: "2026-01-01T00:00:00.000Z", qbInvoiceId: null, qbInvoiceSentAt: null,
+                qbSyncError: null, qbSyncedAt: null,
+            },
+            {
+                id: "ms-requested", name: "Individually requested", amount: "100.00", status: "Pending", dueDate: null,
+                createdAt: "2026-01-01T00:00:00.000Z", qbInvoiceId: null,
+                qbInvoiceSentAt: "2026-08-15T00:00:00.000Z",
+                qbSyncError: null, qbSyncedAt: null,
+            },
+            {
+                id: "ms-unbilled", name: "Never billed", amount: "100.00", status: "Pending", dueDate: null,
+                createdAt: "2026-01-01T00:00:00.000Z", qbInvoiceId: null, qbInvoiceSentAt: null,
+                qbSyncError: null, qbSyncedAt: null,
+            },
+        ],
+    }];
+    const ar = await listReceivables(NOW);
+    const row = ar.invoices[0];
+    const byId = (id: string) => row.unpaidMilestones.find((m: Row) => m.id === id);
+    assert.equal(byId("ms-covered").billed, true, "covered by a live progress billing");
+    assert.equal(byId("ms-requested").billed, true, "individually requested");
+    assert.equal(byId("ms-unbilled").billed, false, "never billed at all");
+});
+
+test("L8 (design review F3): a half-cent milestone amount sums and displays the same rounded value", async () => {
+    fixtureRows = [{
+        code: "INV-HALF-CENT",
+        status: "Partially Paid",
+        balanceDue: "1.005",
+        issueDate: null,
+        sentAt: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        milestoneCount: 1,
+        project: "Half Cent Test",
+        progressBillings: [],
+        payments: [{
+            id: "ms-half-cent", name: "Half cent milestone", amount: "1.005", status: "Pending", dueDate: null,
+            createdAt: "2026-01-01T00:00:00.000Z", qbInvoiceId: null,
+            qbInvoiceSentAt: "2026-08-01T00:00:00.000Z",
+            qbSyncError: null, qbSyncedAt: null,
+        }],
+    }];
+    const ar = await listReceivables(NOW);
+    assert.equal(ar.totalOutstanding, 1.01); // rounds up, matching formatCurrency's own rounding
+    const result = await sendArDigest(NOW);
+    assert.equal(result.sent, true);
+    const html = sentEmails[0].html as string;
+    assert.ok(html.includes("$1.01"), "the email should show the same rounded amount the total sums to");
+    assert.ok(!html.includes("$1.00"), "must not silently round the half-cent down");
 });

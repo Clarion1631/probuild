@@ -66,7 +66,7 @@ export function outageNote(error: unknown): string {
 }
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
-import { computeInvoiceReceivable, isLiveQboLink } from "./receivables";
+import { computeInvoiceReceivable } from "./receivables";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
@@ -211,7 +211,7 @@ export async function listReceivables(now: number = Date.now()) {
             progressBillings: {
                 where: { status: { in: ["Staged", "Sent"] } },
                 select: {
-                    id: true, code: true, status: true, total: true,
+                    id: true, code: true, status: true,
                     qbInvoiceId: true, qbSyncError: true, qbSyncedAt: true, qbInvoiceSentAt: true, sentAt: true, createdAt: true,
                     lines: { select: { scheduleId: true } },
                 },
@@ -231,9 +231,15 @@ export async function listReceivables(now: number = Date.now()) {
 
     const rows = billed
         .map(({ inv, receivable }) => {
-            // Covered by a live progress billing: billed via the billing's
-            // own item, not this milestone's — still "billed" for display.
-            const coveredIds = new Set(receivable.coveredMilestoneIds);
+            // Every Pending milestone that made it into a billed item — its
+            // own evidence or a covering live progress billing's, either way
+            // computeInvoiceReceivable already decided it counts. Reusing
+            // that set here (rather than re-deriving "billed" from the raw
+            // fields) means unpaidMilestones can never disagree with what
+            // was actually counted above.
+            const billedMilestoneIds = new Set(
+                receivable.items.filter(it => it.kind === "milestone").map(it => it.id as string),
+            );
             return {
                 invoiceId: inv.id,
                 code: inv.code,
@@ -252,12 +258,12 @@ export async function listReceivables(now: number = Date.now()) {
                 billedItems: receivable.items.map(it => ({
                     kind: it.kind, id: it.id, label: it.label, amount: it.cents / 100,
                     billedAt: it.billedAt, dueDate: it.dueDate, ageDays: it.ageDays, overdue: it.overdue,
-                    requested: it.requested, inQuickBooks: it.inQuickBooks,
+                    requested: it.requested, inQuickBooks: it.inQuickBooks, progressBillingCode: it.progressBillingCode,
                 })),
                 unpaidMilestones: inv.payments.map(p => ({
                     id: p.id, name: p.name, amount: Number(p.amount), dueDate: p.dueDate,
                     lastEmailedAt: p.qbInvoiceSentAt, paymentLinkStale: !!p.qbSyncError,
-                    billed: p.qbInvoiceSentAt != null || isLiveQboLink(p.qbInvoiceId, p.qbSyncError) || coveredIds.has(p.id),
+                    billed: billedMilestoneIds.has(p.id),
                 })),
             };
         })
@@ -283,9 +289,12 @@ export async function listReceivables(now: number = Date.now()) {
 /**
  * Weekly AR digest to the team (System Notification Email). Returns the summary
  * so the cron response is inspectable; sends nothing when nothing is owed.
+ * `now` threads through to listReceivables()/computeInvoiceReceivable() —
+ * the cron route calls this with no argument, so it still defaults to the
+ * real clock in production.
  */
-export async function sendArDigest() {
-    const ar = await listReceivables();
+export async function sendArDigest(now: number = Date.now()) {
+    const ar = await listReceivables(now);
     if (ar.invoiceCount === 0) return { sent: false, reason: "nothing outstanding", ...ar };
 
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { notificationEmail: true, email: true, companyName: true } });
