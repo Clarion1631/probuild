@@ -767,6 +767,64 @@ function satisfies(line: ReceiptRequestBankLine, payee: string, evidence: Eviden
 }
 
 /**
+ * Whether a line is a "chase candidate": policy says it owes a receipt, it
+ * has aged past the grace window, and nothing has already resolved it. This
+ * is exactly `planReceiptRequests`' own MATCHABLE test, minus the evidence
+ * completeness check (`evidenceIsComplete`) that only that function's caller
+ * can answer — the two together are what makes a line matchable there.
+ *
+ * Exported so `blockingUndecidedLines` below, and the sweep's line pass
+ * (cheap-sweep-restart-spec.md §14.3, §14.6), can ask the same question about
+ * a line the walk left undecided, with no risk of the two definitions
+ * drifting apart.
+ */
+export function isChaseCandidate(
+    line: { id: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber?: string | null },
+    now: Date,
+    resolvedKeys: ReadonlySet<string>,
+): boolean {
+    if (resolvedKeys.has(line.id)) return false;
+    if (line.amountCents >= 0) return false;
+    const verdict = classifyReceiptRequirement({
+        amountCents: line.amountCents,
+        rawDescriptor: line.rawDescriptor,
+        checkNumber: line.checkNumber ?? null,
+    });
+    if (verdict.requirement !== "receipt_expected") return false;
+    const day = dayNumber(line.postedDate);
+    const todayDay = dayNumber(toYmd(now));
+    if (day === null || todayDay === null) return false;
+    return todayDay - day >= RECEIPT_REQUEST_GRACE_DAYS;
+}
+
+/**
+ * The undecided lines that would silently drop an owed charge off a crew
+ * card if certification did not account for them (cheap-sweep-restart-spec.md
+ * §14.6, Codex round 2 blocker 2): a chase candidate with no open issue
+ * already covering it. An undecided line WITH an open issue is not blocking
+ * — the issue stays open until a future pass reaches a verdict, so nothing
+ * owed is silently dropped either way.
+ */
+export function blockingUndecidedLines(input: {
+    lines: ReadonlyArray<{ id: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber: string | null }>;
+    undecidedIds: readonly string[];
+    openIssueKeys: ReadonlySet<string>;
+    resolvedKeys: ReadonlySet<string>;
+    now: Date;
+}): string[] {
+    const byId = new Map(input.lines.map(line => [line.id, line]));
+    const blocking = new Set<string>();
+    for (const id of input.undecidedIds) {
+        const line = byId.get(id);
+        if (!line) continue;
+        if (input.openIssueKeys.has(id)) continue;
+        if (!isChaseCandidate(line, input.now, input.resolvedKeys)) continue;
+        blocking.add(id);
+    }
+    return [...blocking].sort();
+}
+
+/**
  * Plan the night's opens and closes.
  *
  * A candidate is a debit, at least `RECEIPT_REQUEST_GRACE_DAYS` calendar days
@@ -914,20 +972,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
     // per-line greedy pass cannot see that re-housing an earlier line frees the
     // only receipt a later one can reach.
     const matchable = orderedLines
-        .filter(line => {
-            if (resolvedKeys.has(line.id)) return false;
-            if (line.amountCents >= 0) return false;
-            const verdict = classifyReceiptRequirement({
-                amountCents: line.amountCents,
-                rawDescriptor: line.rawDescriptor,
-                checkNumber: line.checkNumber ?? null,
-            });
-            if (verdict.requirement !== "receipt_expected") return false;
-            const day = dayNumber(line.postedDate);
-            if (day === null || todayDay === null) return false;
-            if (todayDay - day < RECEIPT_REQUEST_GRACE_DAYS) return false;
-            return evidenceIsComplete(line);
-        })
+        .filter(line => isChaseCandidate(line, input.now, resolvedKeys) && evidenceIsComplete(line))
         .map(line => ({
             id: line.id,
             postedDate: line.postedDate,
