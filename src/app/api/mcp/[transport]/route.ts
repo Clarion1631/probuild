@@ -6,7 +6,7 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
+import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, loadInvoiceAmountDue, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
 import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrewConflicts } from "@/lib/schedule-core";
 import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
@@ -781,8 +781,9 @@ function createHandler(actor: RouteMcpActor) {
             {
                 title: "Resend an invoice (refreshes stale payment links)",
                 description:
-                    "Repairs stale QuickBooks payment links on an invoice's unpaid milestones, then re-emails the customer the invoice with its pay-online portal link " +
-                    "(the portal link is minted fresh on every send, so it never goes stale). Fresh QuickBooks pay links are also returned in the result if the user wants to share one directly. " +
+                    "Re-emails the customer what is billed and unpaid on the invoice — never milestones that were not billed yet (use send_milestone_invoice for those). " +
+                    "Repairs stale QuickBooks payment links on the milestones being asked for again, then sends with an always-current pay-online portal link. " +
+                    "Fresh QuickBooks pay links are also returned in the result if the user wants to share one directly. " +
                     "Use when a customer says the payment link doesn't work. TWO-STEP: call without confirmToken for a preview + token, then echo the confirmToken after the user approves.",
                 inputSchema: {
                     invoiceId: z.string().max(50).describe("Invoice id from list_project_billing"),
@@ -798,12 +799,42 @@ function createHandler(actor: RouteMcpActor) {
                 if (!invoice) return { ...textResult({ error: "Invoice not found" }), isError: true };
                 const recipient = (overrideEmail || invoice.client?.email || "").trim();
 
-                const payload = JSON.stringify({ invoiceId, recipient, balanceDue: Number(invoice.balanceDue) });
+                const loaded = await loadInvoiceAmountDue(invoiceId);
+                if (!loaded) return { ...textResult({ error: "Invoice not found" }), isError: true };
+                const { due } = loaded;
+                const milestonesPreview = invoice.payments.map(p => ({ name: p.name, amount: Number(p.amount), status: p.status, staleLink: !!p.qbSyncError }));
+
+                if (due.dueCents <= 0) {
+                    if (!confirmToken) {
+                        return textResult({
+                            preview: true,
+                            willSend: false,
+                            reason: `Nothing on ${invoice.code} is billed and unpaid, so there is nothing to ask the client for. To ask for a payment, use the send_milestone_invoice tool.`,
+                            invoice: { code: invoice.code, status: invoice.status, total: Number(invoice.totalAmount), balanceDue: Number(invoice.balanceDue) },
+                            milestones: milestonesPreview,
+                        });
+                    }
+                    // A stale/forced confirmToken on a nothing-due invoice — fall
+                    // through to resendInvoiceCore, which independently re-checks
+                    // the amount due and returns the same nothing-due result
+                    // without ever emailing.
+                    const result = await resendInvoiceCore(invoiceId, overrideEmail);
+                    return textResult(result);
+                }
+
+                // Bind the amount into the token: a token minted for one amount
+                // due can't be replayed to send a different one.
+                const payload = JSON.stringify({ invoiceId, recipient, amountDueCents: due.dueCents });
                 if (!verifyPreviewToken(confirmToken, payload)) {
                     return textResult({
                         preview: true,
-                        invoice: { code: invoice.code, status: invoice.status, total: Number(invoice.totalAmount), balanceDue: Number(invoice.balanceDue) },
-                        milestones: invoice.payments.map(p => ({ name: p.name, amount: Number(p.amount), status: p.status, staleLink: !!p.qbSyncError })),
+                        invoice: {
+                            code: invoice.code, status: invoice.status, total: Number(invoice.totalAmount), balanceDue: Number(invoice.balanceDue),
+                            note: "balanceDue is the whole remaining contract. The email asks only for amountDue: milestones already billed and unpaid.",
+                        },
+                        amountDue: due.dueCents / 100,
+                        dueNow: due.items.map(it => ({ name: it.label, amount: it.cents / 100 })),
+                        milestones: milestonesPreview,
                         recipient: recipient || "(no client email on file — provide overrideEmail)",
                         confirmToken: mintPreviewToken(payload),
                         instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
