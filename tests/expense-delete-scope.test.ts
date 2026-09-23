@@ -611,8 +611,13 @@ test("moveReceiptExpenseToJob: an intake CAS count of 0 refuses changed, after t
     intakeUpdateCount = 0;
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.changed });
-    // The links write already committed in this transaction before the intake
-    // CAS failed, so only the audit row — written after both — stays unwritten.
+    // The links write ran, in this transaction, before the intake CAS failed —
+    // but this fake `$transaction` just invokes its callback, so it proves
+    // nothing about commit or rollback (that only a real Postgres can show;
+    // see tests/attribution-lock-order-db.test.ts). It stays UNCOMMITTED and
+    // rolls back with everything else the refusal touches; only the audit
+    // row — written after both — never even runs.
+    assert.notEqual(linksUpdateArgs, null, "the links write did run before the intake CAS was checked");
     assert.equal(automationEventArgs, null, "no audit write after a refused move");
 });
 

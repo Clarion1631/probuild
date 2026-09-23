@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { toast } from "sonner";
 import { moveReceiptExpenseToJob } from "@/lib/time-expense-actions";
 import { RECEIPT_EXPENSE_DOUBLE_NOTE } from "@/lib/receipt-intake/booked-expense-rules";
@@ -35,6 +35,28 @@ export default function MoveToJobModal({
     const [jobId, setJobId] = useState("");
     const [moving, setMoving] = useState(false);
     const options = jobOptions.filter(job => job.id !== projectId);
+    const titleId = useId();
+    const dialogRef = useRef<HTMLDivElement>(null);
+    const movingRef = useRef(moving);
+    movingRef.current = moving;
+
+    // Focus moves into the dialog on open, and back to whatever triggered it
+    // (the row's "Move to job" button) once this unmounts.
+    useEffect(() => {
+        const trigger = document.activeElement as HTMLElement | null;
+        dialogRef.current?.focus();
+        return () => trigger?.focus?.();
+    }, []);
+
+    // Escape cancels, same as the Cancel button — including staying open
+    // while a move is in flight, which that button also respects.
+    useEffect(() => {
+        function onKeyDown(event: KeyboardEvent) {
+            if (event.key === "Escape" && !movingRef.current) onClose();
+        }
+        document.addEventListener("keydown", onKeyDown);
+        return () => document.removeEventListener("keydown", onKeyDown);
+    }, [onClose]);
 
     async function move() {
         if (!jobId) return;
@@ -58,9 +80,16 @@ export default function MoveToJobModal({
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-            <div className="hui-card w-full max-w-lg p-6 space-y-5 bg-white">
+            <div
+                ref={dialogRef}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby={titleId}
+                tabIndex={-1}
+                className="hui-card w-full max-w-lg p-6 space-y-5 bg-white"
+            >
                 <div>
-                    <h2 className="text-lg font-bold text-hui-textMain">Move to another job</h2>
+                    <h2 id={titleId} className="text-lg font-bold text-hui-textMain">Move to another job</h2>
                     <p className="text-sm text-hui-textMuted mt-1">
                         {vendor || "Unknown vendor"} · {amountLabel} · {dateLabel}
                     </p>

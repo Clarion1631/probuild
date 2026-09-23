@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import type { ComponentType } from "react";
-import { createElement } from "react";
+import { act, createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ReceiptQueueClient from "../src/app/manager/receipts/ReceiptQueueClient";
 import ExpensesTab from "../src/app/projects/[id]/time-expenses/ExpensesTab";
 import MoveToJobModal from "../src/app/projects/[id]/time-expenses/MoveToJobModal";
 import { RECEIPT_EXPENSE_DOUBLE_NOTE } from "../src/lib/receipt-intake/booked-expense-rules";
+// The repo ships jsdom without its optional declaration package (same adapter
+// as tests/time-entry-void-control.test.tsx).
+const { JSDOM } = require("jsdom") as { JSDOM: new (html: string, options: { url: string }) => { window: Window & typeof globalThis } };
 
 const ImportedAwareReceiptQueueClient =
     ReceiptQueueClient as unknown as ComponentType<Record<string, unknown>>;
@@ -83,6 +88,25 @@ test("ExpensesTab: the QBO row is unchanged — no Delete, no Move to job, uploa
     assert.match(row, /title="Upload receipt"/, "QBO rows keep their existing upload control");
 });
 
+// `moveReceiptExpenseToJob` and `getExpenses` are server actions ExpensesTab
+// imports directly (no DI seam), so a real click-through of Move cannot be
+// exercised here without either a live DB or Node's flagged module-mock API
+// (neither available to this suite's plain `tsx --test` invocation). Pin the
+// wiring by source instead — same approach as the costCodes-scoping test
+// below via TimeExpensesClient.tsx.
+test("ExpensesTab: onMoved drops the moved expense from selectedIds, so Tag selected can't reach it", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src/app/projects/[id]/time-expenses/ExpensesTab.tsx"),
+        "utf8",
+    );
+    const onMovedAt = source.indexOf("onMoved={");
+    assert.ok(onMovedAt > -1, "ExpensesTab must wire an onMoved handler to MoveToJobModal");
+    const onMovedBlock = source.slice(onMovedAt, source.indexOf("\n            )}", onMovedAt));
+    assert.match(onMovedBlock, /setSelectedIds/, "onMoved must update selectedIds, not just refresh");
+    assert.match(onMovedBlock, /moveTarget\.id/, "it must target the specific moved expense's id");
+    assert.match(onMovedBlock, /\.delete\(/, "it must remove the id (not clear or re-add it)");
+});
+
 function renderExpensesTab(): string {
     const ImportedAwareExpensesTab = ExpensesTab as unknown as ComponentType<Record<string, unknown>>;
     return renderToStaticMarkup(createElement(ImportedAwareExpensesTab, {
@@ -154,4 +178,64 @@ test("MoveToJobModal: title, double note, Shop help, current job absent, Move di
     assert.ok(moveAt > -1, "the Move button (not yet clicked, so not \"Moving…\") must render");
     const buttonStart = markup.lastIndexOf("<button", moveAt);
     assert.match(markup.slice(buttonStart, moveAt), /disabled/);
+});
+
+// Real interactivity, not renderToStaticMarkup — focus and keydown are runtime
+// behavior a static render cannot exercise. Safe to mount for real here: unlike
+// ExpensesTab/MoveToJobModal's "Move" button, nothing on this path reaches the
+// server actions imported from "@/lib/time-expense-actions" (Codex round 1 nit).
+test("MoveToJobModal: dialog semantics, focus enters on open and returns to the trigger on close, Escape cancels", async () => {
+    const dom = new JSDOM(
+        "<!doctype html><button id='trigger'>Move to job</button><div id='root'></div>",
+        { url: "https://example.test" },
+    );
+    const globals = ["window", "document", "navigator", "HTMLElement", "IS_REACT_ACT_ENVIRONMENT"];
+    const saved = new Map(globals.map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+    for (const key of globals) {
+        Object.defineProperty(globalThis, key, {
+            configurable: true, writable: true,
+            value: key === "IS_REACT_ACT_ENVIRONMENT" ? true : (dom.window as any)[key],
+        });
+    }
+    const { createRoot } = await import("react-dom/client");
+    const ImportedAwareMoveToJobModal = MoveToJobModal as unknown as ComponentType<Record<string, unknown>>;
+    const trigger = dom.window.document.getElementById("trigger") as HTMLButtonElement;
+    trigger.focus();
+    const root = createRoot(dom.window.document.getElementById("root")!);
+    let closes = 0;
+    try {
+        await act(async () => {
+            root.render(createElement(ImportedAwareMoveToJobModal, {
+                expenseId: "exp-receipt", vendor: "Lowe's", amountLabel: "$146.32", dateLabel: "9/2/2026",
+                changeOrderLabel: null, projectId: "job-1",
+                jobOptions: [{ id: "job-2", name: "Mesplay Kitchen" }],
+                onClose: () => { closes++; },
+                onMoved: async () => {},
+            }));
+        });
+
+        const dialog = dom.window.document.querySelector('[role="dialog"]');
+        assert.ok(dialog, "renders with role=dialog");
+        assert.equal(dialog!.getAttribute("aria-modal"), "true");
+        const labelledBy = dialog!.getAttribute("aria-labelledby");
+        assert.ok(labelledBy, "aria-labelledby is set");
+        assert.equal(dom.window.document.getElementById(labelledBy!)?.textContent, "Move to another job");
+        assert.equal(dom.window.document.activeElement, dialog, "focus moved into the dialog on open");
+
+        await act(async () => {
+            dialog!.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        });
+        assert.equal(closes, 1, "Escape triggers onClose, same as Cancel");
+
+        await act(async () => { root.unmount(); });
+        assert.equal(dom.window.document.activeElement, trigger, "focus returns to the trigger once closed");
+    } finally {
+        await act(async () => { try { root.unmount(); } catch { /* already unmounted */ } });
+        for (const key of globals) {
+            const descriptor = saved.get(key);
+            if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+            else Reflect.deleteProperty(globalThis, key);
+        }
+        dom.window.close();
+    }
 });

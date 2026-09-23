@@ -39,7 +39,13 @@ import {
     resolveExpenseProjectUnderLock,
 } from "../src/lib/expense-attribution";
 import { lockExpense } from "../src/lib/expense-lock";
-import { moveReceiptExpenseToJobCore, type MoveReceiptExpenseDbClient } from "../src/lib/receipt-intake/booked-expense";
+import {
+    moveReceiptExpenseToJobCore,
+    isReceiptMoveRefusedError,
+    type MoveReceiptExpenseDbClient,
+    type MoveReceiptExpenseTxClient,
+} from "../src/lib/receipt-intake/booked-expense";
+import { MOVE_MESSAGES } from "../src/lib/receipt-intake/booked-expense-rules";
 import { readReceiptEvidenceEpoch } from "../src/lib/receipt-evidence-lock";
 import {
     applyQboExpenseCostCodeSuggestion,
@@ -1001,6 +1007,7 @@ for (const holdSource of [true, false]) {
 // ── the same two-job fixtures and the same held-lock harness ────
 
 const INTAKE = `${PFX}-move-intake`;
+const EMPTY_TARGET_PROJECT = `${PFX}-project-empty`;
 
 /** EXPENSE, made native (no QBO purchase) and receipt-booked, with a BOOKED intake. */
 async function seedReceiptMove() {
@@ -1162,6 +1169,137 @@ test("an estimate created between the peek and the lock is REFUSED, not moved on
         assert.deepEqual(untouched, { projectId: PROJECT, estimateId: ESTIMATE }, "nothing moved");
     } finally {
         await cleanupTwoJobs();
+    }
+});
+
+// ── a LATE refusal rolls back the WHOLE Move transaction (Codex round 1) ────
+//
+// Both cases below throw AFTER reattributeExpense (booked-expense.ts step 10)
+// has already written the Expense's new projectId/estimateId inside the
+// transaction. Only a real rollback — not the application catching and
+// "undoing" the write itself — proves the caller's "nothing happened" is true:
+// the Expense stays on its old job/estimate, the ReceiptIntake row is
+// untouched, and the evidence epoch (bumped at step 2, same transaction) does
+// not move either.
+
+test("a refused Move (intake CAS loses a race) rolls back the WHOLE transaction", { skip }, async () => {
+    // The intake's own CAS update (step 12) is the LAST write in the
+    // transaction. A concurrent write lands on the SAME intake row, from a
+    // second connection, between the transaction's own read (step 3) and that
+    // CAS — the same shape a second in-flight send attempt would produce — so
+    // step 12 matches zero rows and refuses.
+    await seedReceiptMove();
+    try {
+        const epochBefore = await readReceiptEvidenceEpoch(writerDb!);
+
+        const racingDb: MoveReceiptExpenseDbClient = {
+            $transaction: fn => writerDb!.$transaction(async tx => {
+                const real = tx as unknown as Record<string, unknown>;
+                const proxied = new Proxy(real, {
+                    get(target, prop: string) {
+                        if (prop !== "receiptIntake") return target[prop];
+                        const receiptIntake = target.receiptIntake as {
+                            updateMany(args: unknown): Promise<{ count: number }>;
+                        };
+                        return {
+                            updateMany: async (args: unknown) => {
+                                await editorDb!.receiptIntake.update({
+                                    where: { id: INTAKE },
+                                    data: { sendAttempted: true },
+                                });
+                                return receiptIntake.updateMany(args);
+                            },
+                        };
+                    },
+                });
+                return fn(proxied as unknown as MoveReceiptExpenseTxClient);
+            }),
+        };
+
+        await assert.rejects(
+            () => moveReceiptExpenseToJobCore(racingDb, {
+                expenseId: EXPENSE, fromProjectId: PROJECT, toProjectId: TARGET_PROJECT, actor: "test@example.com",
+            }),
+            (error: unknown) => {
+                assert.ok(isReceiptMoveRefusedError(error), `expected ReceiptMoveRefusedError, got ${error}`);
+                assert.equal((error as Error).message, MOVE_MESSAGES.changed);
+                return true;
+            },
+        );
+
+        const expense = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true, estimateId: true },
+        });
+        assert.deepEqual(
+            expense,
+            { projectId: PROJECT, estimateId: ESTIMATE },
+            "reattributeExpense's write rolled back with everything else — still on the source job",
+        );
+
+        const intake = await editorDb!.receiptIntake.findUnique({
+            where: { id: INTAKE },
+            select: { projectId: true, state: true, expenseId: true },
+        });
+        assert.deepEqual(
+            intake,
+            { projectId: PROJECT, state: "BOOKED", expenseId: EXPENSE },
+            "the intake never moved — the transaction's own writes rolled back (sendAttempted is the racing write's own commit, not this transaction's)",
+        );
+
+        const epochAfter = await readReceiptEvidenceEpoch(writerDb!);
+        assert.equal(epochAfter, epochBefore, "the epoch bump rolled back too — a refused move changes nothing");
+    } finally {
+        await cleanupReceiptMove();
+    }
+});
+
+test("a refused Move (target job has no estimate) rolls back the WHOLE transaction", { skip }, async () => {
+    // reattributeExpense can return `moved: true, estimateId: null` when the
+    // target carries no eligible estimate — its own updateMany has already
+    // landed the Expense on the new project, uncommitted, before
+    // moveReceiptExpenseToJobCore reads that null estimateId (step 10) and
+    // refuses. Same rollback contract as the CAS case above, reached a
+    // different way — no second connection needed here.
+    await seedReceiptMove();
+    await writerDb!.project.create({
+        data: { id: EMPTY_TARGET_PROJECT, name: "Attribution Lock Order — no estimate", clientId: CLIENT, status: "In Progress" },
+    });
+    try {
+        const epochBefore = await readReceiptEvidenceEpoch(writerDb!);
+
+        await assert.rejects(
+            () => moveReceiptExpenseToJobCore(writerDb! as unknown as MoveReceiptExpenseDbClient, {
+                expenseId: EXPENSE, fromProjectId: PROJECT, toProjectId: EMPTY_TARGET_PROJECT, actor: "test@example.com",
+            }),
+            (error: unknown) => {
+                assert.ok(isReceiptMoveRefusedError(error), `expected ReceiptMoveRefusedError, got ${error}`);
+                assert.equal((error as Error).message, MOVE_MESSAGES.noEstimate);
+                return true;
+            },
+        );
+
+        const expense = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true, estimateId: true },
+        });
+        assert.deepEqual(
+            expense,
+            { projectId: PROJECT, estimateId: ESTIMATE },
+            "reattributeExpense's write rolled back with everything else — still on the source job",
+        );
+
+        const intake = await editorDb!.receiptIntake.findUnique({
+            where: { id: INTAKE },
+            select: { projectId: true, state: true, expenseId: true },
+        });
+        assert.deepEqual(intake, { projectId: PROJECT, state: "BOOKED", expenseId: EXPENSE }, "the intake never moved");
+
+        const epochAfter = await readReceiptEvidenceEpoch(writerDb!);
+        assert.equal(epochAfter, epochBefore, "the epoch bump rolled back too — a refused move changes nothing");
+    } finally {
+        await writerDb!.project.deleteMany({ where: { id: EMPTY_TARGET_PROJECT } });
+        await cleanupReceiptMove();
     }
 });
 

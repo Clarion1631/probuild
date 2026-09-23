@@ -502,6 +502,14 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                     onClose={() => setMoveTarget(null)}
                     onMoved={async () => {
                         setMoveTarget(null);
+                        // It just left this job — a "Tag selected" fired before the
+                        // refresh below resolves must never act on it.
+                        setSelectedIds(prev => {
+                            if (!prev.has(moveTarget.id)) return prev;
+                            const next = new Set(prev);
+                            next.delete(moveTarget.id);
+                            return next;
+                        });
                         await refreshExpenses();
                     }}
                 />
