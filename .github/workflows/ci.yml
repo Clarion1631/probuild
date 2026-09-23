@@ -216,7 +216,7 @@ jobs:
       # and the courtesy clear's lock order (§14.10) against card history —
       # both need a real lock actually blocking, and a real absence of
       # deadlock, which no fake transaction can prove.
-      - name: Card claim certification and lock order against real Postgres
+      - name: Certified claim, owner assignment and courtesy clear serialize against real Postgres
         run: npx tsx --test tests/receipt-certified-claim-db.test.ts
         env:
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
