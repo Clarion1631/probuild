@@ -155,10 +155,10 @@ async function seedFixture(opts: {
     const qbInvoiceSentAt = s.requested ? new Date(Date.now() - 30 * 86_400_000) : null;
     await prisma.paymentSchedule.upsert({
       where: { id: s.id },
-      update: { status, amount: s.amount, qbInvoiceId: s.qbInvoiceId ?? null, qbPaymentId: s.qbPaymentId ?? null, referenceNumber: null, qbInvoiceSentAt, ...paidFields },
+      update: { status, amount: s.amount, qbInvoiceId: s.qbInvoiceId ?? null, qbPaymentId: s.qbPaymentId ?? null, referenceNumber: null, qbInvoiceSentAt, firstRequestedAt: qbInvoiceSentAt, ...paidFields },
       create: {
         id: s.id, invoiceId: opts.invoiceId, name: s.name, amount: s.amount, status,
-        qbInvoiceId: s.qbInvoiceId ?? null, qbPaymentId: s.qbPaymentId ?? null, qbInvoiceSentAt, ...paidFields,
+        qbInvoiceId: s.qbInvoiceId ?? null, qbPaymentId: s.qbPaymentId ?? null, qbInvoiceSentAt, firstRequestedAt: qbInvoiceSentAt, ...paidFields,
       },
     });
   }

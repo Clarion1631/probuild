@@ -63,6 +63,7 @@ function toMilestone(m: RawMilestone): ReceivableMilestone {
         dueDate: parseDate(m.dueDate), createdAt: new Date(m.createdAt),
         qbInvoiceId: m.qbInvoiceId, qbInvoiceSentAt: parseDate(m.qbInvoiceSentAt),
         qbSyncError: m.qbSyncError, qbSyncedAt: parseDate(m.qbSyncedAt),
+        firstRequestedAt: null, // the 2026-09-21 snapshot predates the column; R1-R6 exercise the qbInvoiceSentAt fallback
     };
 }
 
@@ -176,6 +177,7 @@ function milestone(overrides: Partial<ReceivableMilestone> = {}): ReceivableMile
         qbInvoiceSentAt: null,
         qbSyncError: null,
         qbSyncedAt: null,
+        firstRequestedAt: null,
         ...overrides,
     };
 }
@@ -333,10 +335,36 @@ test("E13: linked then re-sent — billedAt stays the earlier link time", () => 
     assert.equal(r.items[0].ageDays, 40);
 });
 
-test("E14: portal-only (no QBO link) re-send restarts age — documents the known limitation", () => {
-    const m = milestone({ amount: "500.00", qbInvoiceId: null, qbInvoiceSentAt: new Date(NOW - 2 * DAY) });
+test("E14: a resend does not restart age: firstRequestedAt governs, qbInvoiceSentAt is only the last email", () => {
+    const m = milestone({
+        amount: "1000.00", qbInvoiceId: null,
+        firstRequestedAt: new Date(NOW - 40 * DAY),
+        qbInvoiceSentAt: new Date(NOW - 2 * DAY),
+    });
+    const r = computeInvoiceReceivable(invoiceOf([m]), NOW);
+    assert.equal(r.items[0].ageDays, 40);
+    assert.equal(r.items[0].requested, true);
+    assert.equal(r.items[0].overdue, true);
+    assert.equal(r.overdue, true);
+    assert.equal(r.overdueCents, 100_000);
+    assert.equal(r.ageDays, 40);
+});
+
+test("E14b: no firstRequestedAt (requested before the column, not backfilled) falls back to qbInvoiceSentAt", () => {
+    const m = milestone({ amount: "500.00", qbInvoiceId: null, firstRequestedAt: null, qbInvoiceSentAt: new Date(NOW - 2 * DAY) });
     const r = computeInvoiceReceivable(invoiceOf([m]), NOW);
     assert.equal(r.items[0].ageDays, 2);
+});
+
+test("E14c: an earlier live QBO link time still wins over the first request (earliest evidence)", () => {
+    const m = milestone({
+        amount: "500.00", qbInvoiceId: "qb-1",
+        qbSyncedAt: new Date(NOW - 50 * DAY),
+        firstRequestedAt: new Date(NOW - 40 * DAY),
+        qbInvoiceSentAt: new Date(NOW - 1 * DAY),
+    });
+    const r = computeInvoiceReceivable(invoiceOf([m]), NOW);
+    assert.equal(r.items[0].ageDays, 50);
 });
 
 test("E15 (design review F1): a live Staged billing is evidence, not a separate item — two milestone items totalling 25,000", () => {

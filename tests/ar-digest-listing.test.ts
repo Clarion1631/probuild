@@ -65,6 +65,7 @@ function toSelectShape(raw: Row): Row {
                 dueDate: parseDate(p.dueDate), createdAt: new Date(p.createdAt),
                 qbInvoiceId: p.qbInvoiceId, qbInvoiceSentAt: parseDate(p.qbInvoiceSentAt),
                 qbSyncError: p.qbSyncError, qbSyncedAt: parseDate(p.qbSyncedAt),
+                firstRequestedAt: parseDate(p.firstRequestedAt ?? null),
             })),
         progressBillings: ((raw.progressBillings ?? []) as Row[])
             .filter(pb => pb.status === "Staged" || pb.status === "Sent")
@@ -208,7 +209,7 @@ test("L4: the recorded findMany args select enough columns to compute receivable
     });
     assert.equal(args.select?._count?.select?.payments, true);
     const paymentsSelect = args.select?.payments?.select ?? {};
-    for (const field of ["qbInvoiceId", "qbInvoiceSentAt", "qbSyncError", "qbSyncedAt", "dueDate", "createdAt", "status"]) {
+    for (const field of ["qbInvoiceId", "qbInvoiceSentAt", "firstRequestedAt", "qbSyncError", "qbSyncedAt", "dueDate", "createdAt", "status"]) {
         assert.equal(paymentsSelect[field], true, `payments.select.${field} must be selected`);
     }
     assert.ok(args.select?.progressBillings?.select?.lines, "select.progressBillings.select.lines must be requested");
@@ -352,4 +353,31 @@ test("L8 (design review F3): a half-cent milestone amount sums and displays the 
     const html = sentEmails[0].html as string;
     assert.ok(html.includes("$1.01"), "the email should show the same rounded amount the total sums to");
     assert.ok(!html.includes("$1.00"), "must not silently round the half-cent down");
+});
+
+test("L9: a resent milestone stays overdue in the digest: billed from the first request, last emailed at the resend", async () => {
+    fixtureRows = [{
+        code: "INV-RESENT",
+        status: "Issued",
+        balanceDue: "1000.00",
+        issueDate: null,
+        sentAt: null,
+        createdAt: "2026-05-01T00:00:00.000Z",
+        milestoneCount: 1,
+        project: "Resend Test",
+        progressBillings: [],
+        payments: [{
+            id: "ms-resent", name: "Resent milestone", amount: "1000.00", status: "Pending", dueDate: null,
+            createdAt: "2026-05-01T00:00:00.000Z", qbInvoiceId: null,
+            firstRequestedAt: "2026-06-01T00:00:00.000Z",
+            qbInvoiceSentAt: "2026-09-20T00:00:00.000Z",
+            qbSyncError: null, qbSyncedAt: null,
+        }],
+    }];
+    const ar = await listReceivables(NOW);
+    assert.equal(ar.overdueOutstanding, 1000);
+    assert.equal(ar.invoices[0].overdueAmount, 1000);
+    assert.equal(ar.invoices[0].ageDays, 112);
+    assert.equal(ar.invoices[0].billedItems[0].billedAt.toISOString(), "2026-06-01T00:00:00.000Z");
+    assert.equal(ar.invoices[0].unpaidMilestones[0].lastEmailedAt.toISOString(), "2026-09-20T00:00:00.000Z");
 });
