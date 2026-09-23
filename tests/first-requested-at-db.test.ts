@@ -104,21 +104,38 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
 }
 
+/** Thrown by `waitUntilBlocking` when it is cancelled mid-poll because
+ *  transaction B has already settled. The race in `runWhileBlocking` has
+ *  always already resolved on B's own outcome by the time this can surface,
+ *  so callers discard it rather than treat it as a real failure. */
+class WaitCancelled extends Error {
+    constructor() {
+        super("waitUntilBlocking cancelled: transaction B already settled");
+        this.name = "WaitCancelled";
+    }
+}
+
 /** Poll a third connection until Postgres itself reports `blockerPid` as the
  *  thing blocking the backend behind `getWaiterPid()` (pg_blocking_pids) —
  *  not merely that some backend somewhere is waiting on some lock, which an
  *  unrelated waiter could also satisfy. `getWaiterPid` is read live on every
  *  poll because transaction B's pid is only known once its own first
- *  statement (SELECT pg_backend_pid()) has resolved. */
+ *  statement (SELECT pg_backend_pid()) has resolved.
+ *
+ *  `isCancelled` is checked before every poll and before every sleep, so a
+ *  caller that already knows B has settled (win or lose) can stop this loop
+ *  immediately instead of waiting out its own 10s deadline. */
 async function waitUntilBlocking(
     monitor: PrismaClient,
     blockerPid: number,
     getWaiterPid: () => number,
     timeoutMs = 10_000,
     intervalMs = 50,
+    isCancelled: () => boolean = () => false,
 ): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
+        if (isCancelled()) throw new WaitCancelled();
         const waiterPid = getWaiterPid();
         if (waiterPid > 0) {
             const rows = await monitor.$queryRaw<Array<{ blocked: boolean }>>`
@@ -126,6 +143,7 @@ async function waitUntilBlocking(
             `;
             if (rows[0]?.blocked) return;
         }
+        if (isCancelled()) throw new WaitCancelled();
         if (Date.now() >= deadline) {
             throw new Error(
                 `expected backend ${blockerPid} (transaction A) to appear in pg_blocking_pids of transaction B within ${timeoutMs}ms, but it never did`,
@@ -183,6 +201,12 @@ async function runWhileBlocking<T>(
     let pidB = 0;
     let runningPromise: Promise<T> | undefined;
     let waitError: unknown;
+    // Tells the lock-wait poll to stop as soon as transaction B has settled
+    // (won or lost the race), so a losing poll doesn't keep the event loop
+    // alive for its own 10s deadline. Set from B's own settlement below, and
+    // again in the outer `finally` as a last-resort safety net.
+    let cancelled = false;
+    const isCancelled = () => cancelled;
     try {
         const pidA = await withTimeout(
             ready,
@@ -202,13 +226,25 @@ async function runWhileBlocking<T>(
         // promise (not a derived one) is preserved for the final
         // Promise.allSettled further down.
         runningPromise.catch(() => {});
+        // Cancel the lock-wait poll the instant B settles, either way, so a
+        // losing poll doesn't keep querying every intervalMs until its own
+        // deadline. `.finally` adopts B's outcome, so this needs its own
+        // dead-code catch to stay safe from an unhandled rejection.
+        runningPromise.finally(() => { cancelled = true; }).catch(() => {});
 
         // Race the lock-wait poll against B's own settlement, so a B that
         // fails, or that finishes without ever blocking on A, stops the
         // wait promptly instead of polling for the full 10s for something
         // that will never happen.
+        const blockingPromise = waitUntilBlocking(monitor, pidA, () => pidB, undefined, undefined, isCancelled)
+            .then(() => ({ kind: "blocking" as const }));
+        // Same defensive catch as runningPromise above: once B settles and
+        // cancels this loop, its rejection (WaitCancelled, already
+        // superseded by the race below) must not surface as unhandled.
+        blockingPromise.catch(() => {});
+
         const outcome = await Promise.race([
-            waitUntilBlocking(monitor, pidA, () => pidB).then(() => ({ kind: "blocking" as const })),
+            blockingPromise,
             runningPromise.then(
                 () => ({ kind: "resolved" as const }),
                 (err) => ({ kind: "rejected" as const, err }),
@@ -226,6 +262,7 @@ async function runWhileBlocking<T>(
     } catch (err) {
         waitError = err;
     } finally {
+        cancelled = true;
         release();
     }
 
