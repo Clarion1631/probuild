@@ -46,7 +46,7 @@ test("RECEIVABLE_INVOICE_SELECT matches its literal shape", () => {
             _count: { select: { payments: true } },
             payments: {
                 where: { status: "Pending" },
-                orderBy: { createdAt: "asc" },
+                orderBy: [{ createdAt: "asc" }, { id: "asc" }],
                 select: {
                     id: true, name: true, amount: true, status: true, dueDate: true, createdAt: true,
                     qbInvoiceId: true, qbInvoiceSentAt: true, qbSyncError: true, qbSyncedAt: true,

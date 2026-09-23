@@ -6,7 +6,8 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
+import { getProjectBilling, sendMilestoneInvoicesCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
+import { handleResendInvoiceTool } from "@/lib/resend-invoice-tool";
 import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrewConflicts } from "@/lib/schedule-core";
 import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
@@ -781,8 +782,9 @@ function createHandler(actor: RouteMcpActor) {
             {
                 title: "Resend an invoice (refreshes stale payment links)",
                 description:
-                    "Repairs stale QuickBooks payment links on an invoice's unpaid milestones, then re-emails the customer the invoice with its pay-online portal link " +
-                    "(the portal link is minted fresh on every send, so it never goes stale). Fresh QuickBooks pay links are also returned in the result if the user wants to share one directly. " +
+                    "Re-emails the customer what is billed and unpaid on the invoice — never milestones that were not billed yet (use send_milestone_invoice for those). " +
+                    "Repairs stale QuickBooks payment links on the milestones being asked for again, then sends with an always-current pay-online portal link. " +
+                    "Fresh QuickBooks pay links are also returned in the result if the user wants to share one directly. " +
                     "Use when a customer says the payment link doesn't work. TWO-STEP: call without confirmToken for a preview + token, then echo the confirmToken after the user approves.",
                 inputSchema: {
                     invoiceId: z.string().max(50).describe("Invoice id from list_project_billing"),
@@ -791,30 +793,14 @@ function createHandler(actor: RouteMcpActor) {
                 },
             },
             async ({ invoiceId, overrideEmail, confirmToken }) => {
-                const invoice = await prisma.invoice.findUnique({
-                    where: { id: invoiceId },
-                    include: { client: true, payments: { select: { name: true, amount: true, status: true, qbSyncError: true } } },
-                });
-                if (!invoice) return { ...textResult({ error: "Invoice not found" }), isError: true };
-                const recipient = (overrideEmail || invoice.client?.email || "").trim();
-
-                const payload = JSON.stringify({ invoiceId, recipient, balanceDue: Number(invoice.balanceDue) });
-                if (!verifyPreviewToken(confirmToken, payload)) {
-                    return textResult({
-                        preview: true,
-                        invoice: { code: invoice.code, status: invoice.status, total: Number(invoice.totalAmount), balanceDue: Number(invoice.balanceDue) },
-                        milestones: invoice.payments.map(p => ({ name: p.name, amount: Number(p.amount), status: p.status, staleLink: !!p.qbSyncError })),
-                        recipient: recipient || "(no client email on file — provide overrideEmail)",
-                        confirmToken: mintPreviewToken(payload),
-                        instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
-                    });
-                }
-                try {
-                    const result = await resendInvoiceCore(invoiceId, overrideEmail);
-                    return textResult(result);
-                } catch (err: any) {
-                    return { ...textResult({ error: err?.message || "Resend failed" }), isError: true };
-                }
+                // Decision logic lives in resend-invoice-tool.ts (unit-tested there);
+                // this callback only wraps the result the same way every other tool
+                // does — textResult(), with isError merged in for the error cases.
+                const { isError, ...body } = await handleResendInvoiceTool(
+                    { invoiceId, overrideEmail, confirmToken },
+                    { mintPreviewToken, verifyPreviewToken },
+                );
+                return isError ? { ...textResult(body), isError: true } : textResult(body);
             },
         );
 
