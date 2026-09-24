@@ -57,12 +57,18 @@ export const maxDuration = 60;
  * ReviewIssue ids immutably. A second concurrent run loses that insert and
  * posts nothing.
  *
- * THE ONE FAILURE WINDOW, documented rather than engineered away: the post
- * happens AFTER the claim commits, and `postedAt` is written after the webhook
- * answers. A crash in between leaves a claimed-but-unposted row, and the next
- * run re-posts that exact row (same ids, same order). Worst case is ONE
- * duplicate card; the alternative — marking sent before posting — silently
- * drops the day's chase, which is worse.
+ * THE FAILURE WINDOW BEFORE POSTING, documented rather than engineered away:
+ * a crash between the claim commit and the POSTING write leaves a
+ * claimed-but-unposted PENDING row, and a SAME-DAY next run re-posts that
+ * exact row unchanged (same ids, same order) — the "existing card" lookup
+ * below is keyed on that run's own Pacific date. Worst case is ONE duplicate
+ * card; the alternative — marking sent before posting — silently drops the
+ * day's chase, which is worse. A crash with no same-day run left is not
+ * resent intact: the row stays as the record that the day failed, and its
+ * still-open items are replanned into a fresh card by a later day's run (see
+ * "Yesterday's unposted card" below). A SEPARATE, WORSE window exists once
+ * the POSTING write itself has committed — see "WHAT ENTERING `POSTING`
+ * COSTS, WORST CASE" below, where a crash leaves the row stuck, not resumed.
  *
  * NEVER emails anything. The whole point is a reply-in-thread chase.
  */
@@ -167,13 +173,24 @@ const SEND_COMPLETION_MARGIN_MS = 4_000;
  * phase then flipped a row to POSTING and called Chat, which starts a FRESH
  * 10-second timeout of its own, and the completion writes followed that. A run
  * that reached the send phase near its wall clock was killed between the
- * POSTING write and the response — and a row stranded in POSTING is converted
- * to UNCERTAIN by the next run, which is the one state that is never resent.
- * So a card nobody had ever sent became a card nobody would ever send.
+ * POSTING write and the response — and a row stranded that way stays stuck.
+ * The delivery-day reservation is written in the SAME transaction as the
+ * POSTING write, so `deliveredToday` already carries this owner by the time
+ * any later run looks: a same-day run skips the owner before it ever reaches
+ * the POSTING-to-UNCERTAIN check below, and a later day's run keys its lookup
+ * on a different (owner, date) and never finds this row at all. So a card
+ * nobody had ever sent stays stuck in POSTING — never converted, never
+ * resent, never surfaced for an operator to resolve (a known gap, tracked as
+ * a must-fix before cards go live).
  *
- * A run refuses to enter POSTING without this much budget left. The cost of
- * refusing is a card that goes out on the 16:30 retry pass instead of at 07:30;
- * the cost of not refusing is a chase that silently disappears.
+ * A run refuses to enter POSTING without this much budget left. The claim is
+ * released instead, so the row is picked up again rather than lost: a plain
+ * claimed row resumes unchanged on a same-day retry pass (the "existing card"
+ * lookup is keyed on today's date) or, failing that, is left as the record
+ * that the day failed while its items are reselected into a new card by a
+ * later day's run; a queued resend instead keeps its own date and
+ * `resendQueuedAt` marker and carries over regardless of when it runs. Either
+ * way, the cost of not refusing is a chase that silently disappears.
  */
 const SEND_HEADROOM_MS = CARD_POST_TIMEOUT_MS + SEND_COMPLETION_MARGIN_MS;
 
@@ -273,10 +290,10 @@ function toCandidate(issue: {
  * BOUNDED IN TIME AS WELL AS IN PAGES (Codex PR #443 gate round 34, finding 3).
  * `SCAN_MAX_PAGES` caps how many queries the scan may run; it says nothing about
  * how long they take, and this runs before the revalidation and the webhook
- * posts that still have to fit inside `maxDuration`. Stopping on the clock is
- * the same answer stopping on the page cap already gives — `exhausted: false`,
- * so `overflowExact` is false and the card prints no "and N more" it cannot
- * stand behind — rather than a killed invocation that claims nothing at all.
+ * posts that still have to fit inside `maxDuration`. Stopping on the clock
+ * gives the same answer the page cap gives, `exhausted: false`, and GET then
+ * selects nothing this run (see `scanIncomplete`): no owner's day is claimed
+ * from a partial read, and a later run reads again.
  *
  * AND IT RESUMES WHERE THE LAST RUN STOPPED (Codex PR #443 gate round 35,
  * finding 2). Both stops above — the page cap and the clock — used to leave
@@ -289,6 +306,11 @@ function toCandidate(issue: {
  * queue it WRAPS to the top and keeps going until it meets its own start again.
  * `exhausted` stays true only for a genuinely complete pass, so the card's "and
  * N more" is still only printed when it is a real total.
+ *
+ * Since selection requires `exhausted` (cards-complete-scan-spec.md), the
+ * cursor no longer decides what any card contains; it only moves where a
+ * pass starts. A pass must still cover the whole queue within one
+ * invocation to select.
  *
  * EXPORTED for the same reason `loadCardItemTruth` is: the run's own clock is a
  * 45-second budget with no injection seam at the route boundary, so the only way
@@ -375,8 +397,8 @@ export async function scanCandidates(
         // — so "and 4 more" was whatever the scan happened to have seen, which
         // is a number that looks authoritative and isn't. The queue is small
         // (page size 500) and this is one cheap indexed read per page; when the
-        // page cap does bite, `exhausted` stays false and the card drops the
-        // number rather than printing a guess.
+        // page cap does bite, `exhausted` stays false and GET selects nothing
+        // from this pass (scanIncomplete).
     }
 
     return { candidates, pages, exhausted, deadlineHit, nextCursor, wrapped };
@@ -657,9 +679,12 @@ async function handleGET(request: Request) {
     }
 
     const date = pacificDate(now);
-    // RETRY PASS (?retry=1, the 2-hours-later cron). It never SELECTS: it only
-    // re-posts rows an earlier run claimed and failed to deliver, so a webhook
-    // outage at 7:30 does not cost the crew their whole day.
+    // RETRY PASS (?retry=1, the 2-hours-later cron). Its job is to re-post
+    // rows an earlier run claimed and failed to deliver, so a webhook outage
+    // at 7:30 does not cost the crew their whole day — but it is not
+    // selection-blind: if the chase finishes late and `selectionAllowed`
+    // turns true during this pass, it scans and selects too (see "THE RETRY
+    // PASS SELECTS TOO" below).
     const retryOnly = new URL(request.url).searchParams.get("retry") === "1";
 
     /**
@@ -677,9 +702,11 @@ async function handleGET(request: Request) {
      * gets. So this refuses to select, says so, and consumes NOTHING — the
      * later `?retry=1` pass (or tomorrow) will find the slot free.
      *
-     * The retry pass never selects. Legacy cycles retain the earlier replay
-     * exemption; cycles recording a recognition policy must finish before
-     * replay too, so a pending snapshot cannot bypass current certification.
+     * A retry pass is not exempt from this gate — it selects too once the
+     * chase finishes during it (see "THE RETRY PASS SELECTS TOO" below).
+     * Legacy cycles retain the earlier replay exemption; cycles recording a
+     * recognition policy must finish before replay too, so a pending
+     * snapshot cannot bypass current certification.
      */
     const marker = parseSweepMarker(
         (await prisma.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } }))?.value,
@@ -761,6 +788,37 @@ async function handleGET(request: Request) {
     // next one further along; writing it after the send phase would lose it on
     // exactly the runs that needed it most.
     const scanCursorPersisted = selectionAllowed ? await writeScanCursor(scan.nextCursor) : true;
+    /**
+     * NO SELECTION FROM A PARTIAL READ (cards-complete-scan-spec.md; Codex on
+     * #530 r1/r2 and #541 r1/r2, "incomplete scans still claim").
+     *
+     * The owner has no column of its own (it lives in displayDetails), so a
+     * pass cut short by its page cap or the clock may have missed ANY owner's
+     * rows. Selecting from it would claim that owner's (owner, pacificDate)
+     * slot with an immutable list that can leave out a charge nobody was ever
+     * asked about while an already-asked one takes its place. So a partial
+     * pass selects nothing: no claim is written, the day stays free, and a
+     * later run (the 16:30Z retry, or the next weekday) reads again.
+     *
+     * Rows already claimed today resume unchanged on the same-day retry pass
+     * (the "existing card" lookup below is keyed on today's date). A row the
+     * day's last run defers is not carried forward the same way: it is left
+     * in place only as the record that the day failed, and its items are
+     * reselected into a new card by a later day's run. Explicitly queued
+     * resends carry over regardless of when they run.
+     */
+    const scanIncomplete = selectionAllowed && !scan.exhausted;
+    if (scanIncomplete) {
+        console.error("[cron/receipt-request-cards] scan-incomplete", JSON.stringify({
+            date,
+            retryOnly,
+            pages: scan.pages,
+            deadlineHit: scan.deadlineHit,
+            wrapped: scan.wrapped,
+            resumed: scanResumedFrom !== null,
+            candidates: scan.candidates.length,
+        }));
+    }
     const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
     // Refused by claimOwnerDay's own re-check (§14.9): nothing was written, so
     // the owner's day is still free for the retry pass or tomorrow.
@@ -1001,10 +1059,12 @@ async function handleGET(request: Request) {
                 invalidRows.push(owner);
                 continue;
             }
-            // THE ROW'S OWN overflowExact, not this run's scan flag. A retry
-            // pass does not scan at all, so `scan.exhausted` is trivially true
-            // there — and a card claimed by a run whose scan stopped early
-            // would come back claiming its "and N more" was a total.
+            // THE ROW'S OWN overflowExact, not this run's scan flag: this
+            // branch resumes a row an earlier pass already claimed, and
+            // `scan.exhausted` describes only THIS run's own scan — vacuously
+            // true when selection is not allowed this pass, and otherwise an
+            // unrelated result — never the state the resumed row was
+            // originally selected under.
             toPost.push({ card: buildCardFromItems(owner, date, items, existing.overflow, existing.overflowExact), rowId: existing.id, token, resumed: true });
             continue;
         }
@@ -1026,6 +1086,8 @@ async function handleGET(request: Request) {
          * no row to re-post. Nobody got a card, and nothing said so.
          */
         if (!selectionAllowed) continue;
+        // A partial read may be missing this owner's items (scanIncomplete).
+        if (scanIncomplete) continue;
         const { items, overflow } = selectOwnerItems(scan.candidates, owner);
         if (items.length === 0) continue;
         const token = randomUUID();
@@ -1034,8 +1096,8 @@ async function handleGET(request: Request) {
         // its immutable record, and this run's ownership of the post.
         const claim = await claimOwnerDay(prisma, {
             owner, date, items, overflow,
-            // Persisted WITH the selection, because only this run knows
-            // whether its scan finished.
+            // Always true here: a partial read never gets this far
+            // (scanIncomplete). Stored so "N of M" stays a real total.
             overflowExact: scan.exhausted,
             claimedAt: now, claimToken: token, ownerEpochAtScan, recognitionPolicy,
             // Same moment ownerEpochAtScan was decided (Codex round 1, B1):
@@ -1063,8 +1125,13 @@ async function handleGET(request: Request) {
     // did not go out.
     const failures: string[] = [];
     // Rows this run held back because it did not have the wall clock left to
-    // send them safely. NOT a failure and NOT uncertain: nothing was sent, the
-    // claim is released, and the next invocation picks the row up unchanged.
+    // send them safely. NOT a failure and NOT uncertain: nothing was sent and
+    // the claim is released. A plain claimed row is picked up unchanged by a
+    // SAME-DAY next invocation (the "existing card" lookup is keyed on
+    // today's date); if none runs today, the row is left as the record
+    // instead and its items are reselected into a new card by a later day's
+    // run. A queued resend keeps its own date and marker instead and carries
+    // over regardless of when it runs.
     const sendDeferred: string[] = [];
     /**
      * Cards held back because their pre-send validation ran out of budget
@@ -1107,18 +1174,29 @@ async function handleGET(request: Request) {
          * Everything below this point is unsafe to be killed part way: the
          * POSTING write, a webhook call that opens its own fresh timeout, and
          * the completion transaction that records the thread ids. A kill
-         * between the first and the last leaves the row in POSTING, which the
-         * NEXT run reads as `uncertain-delivery` and never resends — so a card
-         * that was never sent becomes a card nobody will ever send.
+         * between the first and the last leaves the row stuck in POSTING: the
+         * delivery-day reservation commits in the same transaction as the
+         * POSTING write, so a same-day run skips the owner via `deliveredToday`
+         * before it can reach the `uncertain-delivery` conversion, and a later
+         * day's run looks up a different (owner, date) and never finds the row
+         * at all — so a card that was never sent stays a card nobody will ever
+         * send or surface (a known gap, tracked as a must-fix before cards go
+         * live).
          *
          * Checked BEFORE the revalidation, not just before the POSTING write:
          * revalidation is itself several real queries, and spending them only
          * to refuse the send afterwards wastes the budget of the run that
          * WOULD have sent it.
          *
-         * Releasing the claim is what makes this recoverable rather than a
-         * lost day — the row keeps its selection and the 16:30 retry pass
-         * takes it as an ordinary resumed card.
+         * Releasing the claim here (before POSTING is ever entered) is what
+         * makes this recoverable rather than a lost day: a plain claimed row
+         * keeps its selection and a same-day retry pass — which can itself
+         * defer again under this same budget check — takes it as an ordinary
+         * resumed card; if none runs today, the row is left as the record
+         * instead and its items are reselected into a new card by a later
+         * day's run (see "Yesterday's unposted card" below). A queued resend
+         * keeps its own date and marker instead and carries over regardless
+         * of when it runs.
          */
         if (remainingRunBudgetMs(runStartedAt) <= SEND_HEADROOM_MS) {
             await prisma.receiptRequestCard.updateMany({
@@ -1169,9 +1247,12 @@ async function handleGET(request: Request) {
          *
          * So an incomplete validation defers the whole card instead: the row and
          * its `resendQueuedAt` are left exactly as they were, the claim is
-         * released so the next pass can take it, and the run reports
-         * `deferred:budget`. Nothing is deleted and nothing is rewritten on the
-         * strength of a check that did not finish.
+         * released so a SAME-DAY next pass can take it unchanged, and the run
+         * reports `deferred:budget`. Nothing is deleted and nothing is
+         * rewritten on the strength of a check that did not finish — if no
+         * same-day pass follows, a plain row is left as the record and its
+         * items are reselected into a new card by a later day's run, while a
+         * queued resend simply waits to be drained again under its own date.
          */
         const unverified = rebuilt.dropped.filter(drop => drop.reason === "revalidation-deadline");
         if (unverified.length > 0) {
@@ -1320,9 +1401,11 @@ async function handleGET(request: Request) {
              * `ReceiptRequestCardDelivery` — another invocation, or an EARLIER
              * ATTEMPT BY THIS CARD that Chat may already have taken. Either way
              * a message to this owner today is accounted for. This one sends
-             * nothing and releases its claim token so the row is free for the
-             * next delivery day; the card itself is untouched, so a queued
-             * resend keeps its marker.
+             * nothing and releases its claim token so the row is free to be
+             * taken again — by a same-day retry pass first, if one is still
+             * ahead, or otherwise carried to a later day's run; the card
+             * itself is untouched, so a queued resend keeps its own date and
+             * marker.
              *
              * P2002 only. Anything else is a real failure and is rethrown, so a
              * broken write cannot be silently read as "someone beat me to it".
@@ -1517,7 +1600,7 @@ async function handleGET(request: Request) {
         // card, which teaches people the list is noise. So the run is PARTIAL:
         // ok:false so it is visible, HTTP 200 so the platform does not treat it
         // as a crashed invocation and re-run it.
-        ok: failures.length === 0 && uncertainTransitions.length === 0,
+        ok: failures.length === 0 && uncertainTransitions.length === 0 && !scanIncomplete,
         partial: failures.length === 0 && uncertainTransitions.length > 0,
         failedOwners: failures,
         uncertainOwners: uncertain,
@@ -1556,6 +1639,8 @@ async function handleGET(request: Request) {
         scanned: scan.candidates.length,
         scanPages: scan.pages,
         scanExhausted: scan.exhausted,
+        // No new card was selected this run because the read was partial.
+        scanIncomplete,
         // The scan's durable position. A `scanResumedFrom` that never changes
         // across runs is a stuck cursor, which looks exactly like a quiet queue
         // without this; `scanWrapped` says the pass really did cover the prefix
@@ -1565,8 +1650,9 @@ async function handleGET(request: Request) {
         scanWrapped: scan.wrapped,
         scanCursorPersisted,
         // WHY the scan was not exhausted, when it was the clock rather than the
-        // page cap. Both produce the same honest `overflowExact: false`, and
-        // they need different fixes — one is a backlog, the other is a slow run.
+        // page cap. Both make the read partial (scanIncomplete: nothing new is
+        // selected), and they need different fixes: one is a backlog, the
+        // other is a slow run.
         scanDeadlineHit: scan.deadlineHit,
         claimed: toPost.length,
         // Refused by claimOwnerDay's own re-check (§14.9) — the certification
@@ -1596,6 +1682,9 @@ async function handleGET(request: Request) {
 // UNCONFIRMED delivery: still 200 (a retry would risk a duplicate chase
 // card), but uncertainTransitions is exactly the signal that a card went out
 // with no proof it arrived, which this heartbeat treats as a failed run.
+// scanIncomplete (cards-complete-scan-spec.md) is the same story: still 200,
+// but a run whose read was partial claimed no owner's day, and that is worth
+// the same escalation as an unconfirmed delivery.
 export const GET = withCronHeartbeat("RECEIPT_REQUEST_CARDS", handleGET, {
-    isFailure: body => isRecord(body) && Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0,
+    isFailure: body => isRecord(body) && ((Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0) || body.scanIncomplete === true),
 });
