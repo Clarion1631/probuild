@@ -24,6 +24,9 @@ test("rails with no merchant receipt are exempted, with a stated reason", async 
         ["insurance", "PREAUTHORIZED ACH DEBIT BILLPAY    RLI INSURANCE CO JUSTIN ADKINS RLI INSURANCE C PPD", "insurance"],
         ["bookkeeping", "PREAUTHORIZED ACH DEBIT SALE       BRYANT BOOKKEEPI JUSTIN ADKINS CCD", "professional-services"],
         ["owner transfer", "PREAUTHORIZED ACH DEBIT PAYMENT    VENMO JUSTIN ADKINS 1052320032752 WEB", "owner-transfer"],
+        ["Chase credit card autopay", "PREAUTHORIZED ACH DEBIT AUTOPAYBUS CHASE CREDIT CRD AUTOPAY REDACTED NAME", "card-payment"],
+        ["Synchrony store-card payment", "PREAUTHORIZED ACH DEBIT SYF PAYMNT LOWES REDACTED NAME", "card-payment"],
+        ["business loan servicer payment", "PREAUTHORIZED ACH DEBIT PAYMENT BANKERS HEALTHCA SER", "loan-payment"],
     ];
     for (const [name, descriptor, ruleKey] of cases) {
         await t.test(name, () => {
@@ -45,6 +48,7 @@ test("real job purchases still demand a receipt", async t => {
         "MISCELLANEOUS DEBIT THE HOME DEPOT #4718 THE HOME DEPOT  47 POS DEB 1348",
         "MISCELLANEOUS DEBIT PAYPAL *THERTASTORE 402-935-7733  NY C#6098 DBT CRD 0827",
         "MISCELLANEOUS DEBIT AMAZON MKTPL*5H4ZN43C2 Amzn.com/bill WA C#6098 DBT CRD 1942",
+        "PREAUTHORIZED ACH DEBIT HANG ZHOU SHEN DU QIU SUO REN PURCHASE 26.50 REDACTED NAME",
     ];
     for (const descriptor of purchases) {
         await t.test(descriptor.slice(21, 48).trim(), () => {
@@ -56,6 +60,13 @@ test("real job purchases still demand a receipt", async t => {
 test("an insurance-shaped word inside a merchant name does not exempt a purchase", () => {
     // Guard against the exemption patterns being too greedy.
     const v = classifyReceiptRequirement(line("MISCELLANEOUS DEBIT LOWES #01632* 360-260-2120  WA C#6098 DBT CRD 1409"));
+    assert.equal(v.requirement, "receipt_expected");
+});
+
+test("a Chase debit-card purchase is not caught by the Chase autopay rule", () => {
+    // Guard against the widened card-payment rule catching an ordinary
+    // purchase run through a Chase debit card, not the credit-card autopay.
+    const v = classifyReceiptRequirement(line("MISCELLANEOUS DEBIT CHASE DEBIT CARD PURCHASE CAFE VANCOUVER  WA C#6098 DBT CRD 1234"));
     assert.equal(v.requirement, "receipt_expected");
 });
 

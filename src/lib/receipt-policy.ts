@@ -59,12 +59,12 @@ export interface ReceiptPolicyLine {
 const NO_RECEIPT_RULES: Array<{ key: string; test: RegExp; reason: string }> = [
     {
         key: "loan-payment",
-        test: /\bINDIVIDUAL LOAN PAYMENTS\b|\bAUTOMATIC LOAN PAYMENT\b/i,
+        test: /\bINDIVIDUAL LOAN PAYMENTS\b|\bAUTOMATIC LOAN PAYMENT\b|\bBANKERS HEALTHCA/i,
         reason: "Loan payment — principal/interest, no merchant receipt exists",
     },
     {
         key: "card-payment",
-        test: /\bCAPITAL ONE\b|\bONLINE PMT\b.*\bCAPITAL ONE\b/i,
+        test: /\bCAPITAL ONE\b|\bONLINE PMT\b.*\bCAPITAL ONE\b|\bCHASE CREDIT CRD\b|\bCHASE CARD AUTOPAY\b|\bSYF PAYMNT\b|\bSYNCHRONY\b/i,
         reason: "Credit-card payment — a transfer; the receipts live on that card's statement",
     },
     {
