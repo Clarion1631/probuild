@@ -32,6 +32,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+// A REAL, un-mocked import: booked-expense-rules.ts has no prisma/next-auth
+// dependency chain, so nothing here needs the require-patch technique below.
+import { isReceiptBookedExpense } from "../src/lib/receipt-intake/booked-expense-rules";
 
 test("tagging a receipt-booked expense to a change order actually succeeds", async () => {
     const opLog: string[] = [];
@@ -51,7 +54,12 @@ test("tagging a receipt-booked expense to a change order actually succeeds", asy
         estimate: { projectId: "job-1" },
         invoiceId: null,
         invoicedAt: null,
+        receiptIntake: { id: "ri-1" },
     };
+    // Not a shape guess: the real predicate a receipt-booked guard would use,
+    // proving RECEIPT_ROW actually qualifies -- or this whole test proves
+    // nothing about receipt-booked rows at all.
+    assert.equal(isReceiptBookedExpense(RECEIPT_ROW), true, "RECEIPT_ROW must actually be receipt-booked");
     const CHANGE_ORDER = {
         id: "co-1",
         projectId: "job-1",

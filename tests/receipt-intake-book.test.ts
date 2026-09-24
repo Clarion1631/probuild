@@ -292,7 +292,7 @@ function recorder(
                     : all;
                 return {
                     id: "proj-1",
-                    name: "Berg ADU",
+                    name: "Sample Job A",
                     estimates: filtered.slice(0, 1),
                 };
             },

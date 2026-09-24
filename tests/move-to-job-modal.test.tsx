@@ -223,6 +223,10 @@ test("MoveToJobModal: dialog semantics, focus enters on open and returns to the 
                 assert.equal(closes, 1, "Escape triggers onClose, same as Cancel");
 
                 await act(async () => { root.unmount(); });
+                // Radix's FocusScope restores focus to the trigger inside a
+                // setTimeout(0), not synchronously on unmount -- flush that
+                // macrotask before asserting, or this is flaky under real timers.
+                await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
                 // Same reasoning as the dialog-containment check above: a boolean, not
                 // a raw-node `assert.equal`, so a future regression here fails fast
                 // instead of hanging on a fiber-graph diff.

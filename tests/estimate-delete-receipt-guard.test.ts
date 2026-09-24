@@ -83,8 +83,34 @@ let lockedReceiptCount: number;
 let lockedCountCalls: unknown[];
 let estimateDeleteArgs: unknown;
 
+/**
+ * Real modeled Expense rows for `tx.expense.count`, keyed the same way the
+ * real column is. When set (non-null), `tx.expense.count` filters THESE rows
+ * by the actual `where` clause it receives instead of returning the plain
+ * `lockedExpenseCount`/`lockedReceiptCount` numbers above — the only way a
+ * test can prove a query that (incorrectly) filters on `qbPurchaseId` would
+ * miss a QBO-backed row, rather than merely asserting a hand-picked number.
+ * `null` (the default, reset in beforeEach) keeps every other test in this
+ * file on the old, simpler numeric fakes.
+ */
+let expenseRows: Array<{ estimateId: string; qbPurchaseId: string | null; receiptIntake: unknown }> | null;
+
 /** True for any opLog entry that represents a destructive statement. */
 const isDelete = (op: string) => op.toLowerCase().includes("delete");
+
+/** Applies a real Prisma-shaped `where` clause to a modeled row, for `expenseRows` filtering. */
+function matchesExpenseWhere(
+    row: { estimateId: string; qbPurchaseId: string | null; receiptIntake: unknown },
+    where: { estimateId?: string; qbPurchaseId?: string | null; receiptIntake?: { isNot: null } } = {},
+): boolean {
+    if (where.estimateId !== undefined && row.estimateId !== where.estimateId) return false;
+    // "qbPurchaseId" in where, not a truthiness check: the real bug filtered
+    // on `qbPurchaseId: null`, and `null` is falsy, so `where.qbPurchaseId &&
+    // ...` would silently skip the very filter this test exists to catch.
+    if ("qbPurchaseId" in where && row.qbPurchaseId !== where.qbPurchaseId) return false;
+    if (where.receiptIntake?.isNot === null && row.receiptIntake == null) return false;
+    return true;
+}
 
 const fakeTx: any = {
     // The receipt-evidence lock and its epoch bump (PR #443 gate rounds
@@ -99,9 +125,10 @@ const fakeTx: any = {
         // one (only asked when the first count is nonzero) does. Routing on
         // shape rather than call order keeps this honest about which query
         // deleteEstimate actually sent.
-        count: async (args: { where?: { receiptIntake?: unknown } } = {}) => {
+        count: async (args: { where?: { estimateId?: string; qbPurchaseId?: string | null; receiptIntake?: { isNot: null } } } = {}) => {
             lockedCountCalls.push(args);
             opLog.push("tx.expense.count");
+            if (expenseRows) return expenseRows.filter(row => matchesExpenseWhere(row, args.where)).length;
             return args.where?.receiptIntake ? lockedReceiptCount : lockedExpenseCount;
         },
         deleteMany: async (_args: unknown) => {
@@ -220,6 +247,7 @@ beforeEach(() => {
     lockedReceiptCount = 0;
     lockedCountCalls = [];
     estimateDeleteArgs = null;
+    expenseRows = null;
 });
 
 test("refuses the whole delete when a NATIVE receipt-booked Expense is linked", async () => {
@@ -245,13 +273,15 @@ test("round 5 BLOCKER: refuses the whole delete for a QBO-backed receipt Expense
     // on `qbPurchaseId: null`, so a receipt Expense QuickBooks already owns
     // (qbPurchaseId SET, ReceiptIntake still linked) was invisible to the
     // count and got deleted along with everything else once that count read
-    // zero. The fake here cannot literally set qbPurchaseId (deleteEstimate's
-    // real query no longer filters on it at all — that IS the fix), so this
-    // asserts the observable behavior the old code got wrong: a receipt-
-    // linked Expense at lock time refuses the delete, full stop, regardless
-    // of who owns it downstream.
-    lockedExpenseCount = 1;
-    lockedReceiptCount = 1;
+    // zero. A real modeled row (not just hand-set count numbers) so the fake
+    // itself applies deleteEstimate's actual `where` clause: if that clause
+    // ever regresses back to filtering on `qbPurchaseId: null`, this row
+    // (qbPurchaseId SET) drops out of the count and the assertions below
+    // fail — proven by mutation against origin/main's actions.ts, which
+    // still carries that filter (see PR body).
+    expenseRows = [
+        { estimateId: "est-1", qbPurchaseId: "qb-1", receiptIntake: { id: "ri-1" } },
+    ];
     budgetRow = { id: "budget-1" };
     const result = await deleteEstimate("est-1");
 
