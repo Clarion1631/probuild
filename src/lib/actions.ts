@@ -16095,11 +16095,19 @@ export async function setReceiptIntakeJob(id: string, projectId: string, expecte
             && existing?.costCodeId
             && await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, existing.costCodeId);
 
-        // "not-applicable" for every state but NON_RECEIPT. "refuse" means the row
-        // WAS NON_RECEIPT but its readJson is missing or unparseable — nothing to
-        // audit the override against, so the whole action is refused rather than
-        // flipping docType with no record of why. See nonReceiptSetJobOverride.
-        const overrideResult = nonReceiptSetJobOverride(expected, existing?.readJson ?? null, user.id, now);
+        // "not-applicable" for every state but NON_RECEIPT, and also when the row
+        // itself is already gone: a MISSING row must fall through to the CAS
+        // below and come back as the ordinary not-found refusal
+        // (receiptIntakeWriteFailure), not as "can't be switched automatically"
+        // — that message is specifically about a PRESENT row's unreadable
+        // evidence, not a row that no longer exists at all. "refuse" means the
+        // row WAS NON_RECEIPT and IS present but its readJson is missing or
+        // unparseable — nothing to audit the override against, so the whole
+        // action is refused rather than flipping docType with no record of why.
+        // See nonReceiptSetJobOverride.
+        const overrideResult = existing
+            ? nonReceiptSetJobOverride(expected, existing.readJson, user.id, now)
+            : ({ kind: "not-applicable" } as const);
         if (overrideResult.kind === "refuse") {
             throw new ReceiptJobRefusedError("This item can't be switched to a receipt automatically. Ask Justin.");
         }

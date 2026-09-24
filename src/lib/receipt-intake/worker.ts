@@ -44,7 +44,7 @@ import {
     QboPurchaseFaultError,
     QboVendorDuplicateError,
 } from "@/lib/qbo-receipt-push";
-import { carryForwardDocTypeOverride, parseReadJson, READ_BUDGET_MS, type ProjectPhase, type ReadOutcome } from "./read";
+import { carryForwardDocTypeOverride, parseReadJson, READ_BUDGET_MS, stripDocTypeOverride, type ProjectPhase, type ReadOutcome } from "./read";
 import type { VerifiedBytes } from "./stored-object";
 import { STORAGE_TIMEOUT_MESSAGE } from "./bucket";
 
@@ -1530,6 +1530,13 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         return owned ? "RECEIVED" : "STALE";
     }
 
+    // The model's raw JSON is UNTRUSTED input: strip any doc_type_override key
+    // it might carry before anything else touches it. Only nonReceiptSetJobOverride
+    // (a human, via the Set-job action) may ever create that key — if the model
+    // echoed one back (coincidence, or a document engineered to) and it survived
+    // unstripped, a LATER read of this same row would find it and trust a forgery
+    // as if a human had written it.
+    const freshRead = { ...outcome.read, raw: stripDocTypeOverride(outcome.read.raw) };
     // `row.readJson` is the PRIOR read — from before this one — so this is the
     // one place that can tell "the AI says non_receipt" apart from "the AI
     // says non_receipt AGAIN, about a document a human already overruled it
@@ -1538,7 +1545,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     // says on any one pass — without this, a row that reaches RECEIVED again
     // (Retry on a weak-dup:, say) would silently re-classify itself right back
     // to NON_RECEIPT the instant the model repeats its first answer.
-    const read = carryForwardDocTypeOverride(outcome.read, row.readJson);
+    const read = carryForwardDocTypeOverride(freshRead, row.readJson);
     // Resolved BEFORE the keys: the fallback date is part of the dedup key, so
     // it has to be the company's calendar day from the start.
     const timeZone = await deps.companyTimeZone();
