@@ -273,10 +273,10 @@ function toCandidate(issue: {
  * BOUNDED IN TIME AS WELL AS IN PAGES (Codex PR #443 gate round 34, finding 3).
  * `SCAN_MAX_PAGES` caps how many queries the scan may run; it says nothing about
  * how long they take, and this runs before the revalidation and the webhook
- * posts that still have to fit inside `maxDuration`. Stopping on the clock is
- * the same answer stopping on the page cap already gives — `exhausted: false`,
- * so `overflowExact` is false and the card prints no "and N more" it cannot
- * stand behind — rather than a killed invocation that claims nothing at all.
+ * posts that still have to fit inside `maxDuration`. Stopping on the clock
+ * gives the same answer the page cap gives, `exhausted: false`, and GET then
+ * selects nothing this run (see `scanIncomplete`): no owner's day is claimed
+ * from a partial read, and a later run reads again.
  *
  * AND IT RESUMES WHERE THE LAST RUN STOPPED (Codex PR #443 gate round 35,
  * finding 2). Both stops above — the page cap and the clock — used to leave
@@ -289,6 +289,11 @@ function toCandidate(issue: {
  * queue it WRAPS to the top and keeps going until it meets its own start again.
  * `exhausted` stays true only for a genuinely complete pass, so the card's "and
  * N more" is still only printed when it is a real total.
+ *
+ * Since selection requires `exhausted` (cards-complete-scan-spec.md), the
+ * cursor no longer decides what any card contains; it only moves where a
+ * pass starts. A pass must still cover the whole queue within one
+ * invocation to select.
  *
  * EXPORTED for the same reason `loadCardItemTruth` is: the run's own clock is a
  * 45-second budget with no injection seam at the route boundary, so the only way
@@ -375,8 +380,8 @@ export async function scanCandidates(
         // — so "and 4 more" was whatever the scan happened to have seen, which
         // is a number that looks authoritative and isn't. The queue is small
         // (page size 500) and this is one cheap indexed read per page; when the
-        // page cap does bite, `exhausted` stays false and the card drops the
-        // number rather than printing a guess.
+        // page cap does bite, `exhausted` stays false and GET selects nothing
+        // from this pass (scanIncomplete).
     }
 
     return { candidates, pages, exhausted, deadlineHit, nextCursor, wrapped };
@@ -761,6 +766,34 @@ async function handleGET(request: Request) {
     // next one further along; writing it after the send phase would lose it on
     // exactly the runs that needed it most.
     const scanCursorPersisted = selectionAllowed ? await writeScanCursor(scan.nextCursor) : true;
+    /**
+     * NO SELECTION FROM A PARTIAL READ (cards-complete-scan-spec.md; Codex on
+     * #530 r1/r2 and #541 r1/r2, "incomplete scans still claim").
+     *
+     * The owner has no column of its own (it lives in displayDetails), so a
+     * pass cut short by its page cap or the clock may have missed ANY owner's
+     * rows. Selecting from it would claim that owner's (owner, pacificDate)
+     * slot with an immutable list that can leave out a charge nobody was ever
+     * asked about while an already-asked one takes its place. So a partial
+     * pass selects nothing: no claim is written, the day stays free, and a
+     * later run (the 16:30Z retry, or the next weekday) reads again.
+     *
+     * Queued resends and rows already claimed today are not blocked here. They
+     * still face the send-budget checks below, which defer them to the next
+     * run when this scan used up the clock.
+     */
+    const scanIncomplete = selectionAllowed && !scan.exhausted;
+    if (scanIncomplete) {
+        console.error("[cron/receipt-request-cards] scan-incomplete", JSON.stringify({
+            date,
+            retryOnly,
+            pages: scan.pages,
+            deadlineHit: scan.deadlineHit,
+            wrapped: scan.wrapped,
+            resumed: scanResumedFrom !== null,
+            candidates: scan.candidates.length,
+        }));
+    }
     const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
     // Refused by claimOwnerDay's own re-check (§14.9): nothing was written, so
     // the owner's day is still free for the retry pass or tomorrow.
@@ -1026,6 +1059,8 @@ async function handleGET(request: Request) {
          * no row to re-post. Nobody got a card, and nothing said so.
          */
         if (!selectionAllowed) continue;
+        // A partial read may be missing this owner's items (scanIncomplete).
+        if (scanIncomplete) continue;
         const { items, overflow } = selectOwnerItems(scan.candidates, owner);
         if (items.length === 0) continue;
         const token = randomUUID();
@@ -1034,8 +1069,8 @@ async function handleGET(request: Request) {
         // its immutable record, and this run's ownership of the post.
         const claim = await claimOwnerDay(prisma, {
             owner, date, items, overflow,
-            // Persisted WITH the selection, because only this run knows
-            // whether its scan finished.
+            // Always true here: a partial read never gets this far
+            // (scanIncomplete). Stored so "N of M" stays a real total.
             overflowExact: scan.exhausted,
             claimedAt: now, claimToken: token, ownerEpochAtScan, recognitionPolicy,
             // Same moment ownerEpochAtScan was decided (Codex round 1, B1):
@@ -1517,7 +1552,7 @@ async function handleGET(request: Request) {
         // card, which teaches people the list is noise. So the run is PARTIAL:
         // ok:false so it is visible, HTTP 200 so the platform does not treat it
         // as a crashed invocation and re-run it.
-        ok: failures.length === 0 && uncertainTransitions.length === 0,
+        ok: failures.length === 0 && uncertainTransitions.length === 0 && !scanIncomplete,
         partial: failures.length === 0 && uncertainTransitions.length > 0,
         failedOwners: failures,
         uncertainOwners: uncertain,
@@ -1556,6 +1591,8 @@ async function handleGET(request: Request) {
         scanned: scan.candidates.length,
         scanPages: scan.pages,
         scanExhausted: scan.exhausted,
+        // No new card was selected this run because the read was partial.
+        scanIncomplete,
         // The scan's durable position. A `scanResumedFrom` that never changes
         // across runs is a stuck cursor, which looks exactly like a quiet queue
         // without this; `scanWrapped` says the pass really did cover the prefix
@@ -1565,8 +1602,9 @@ async function handleGET(request: Request) {
         scanWrapped: scan.wrapped,
         scanCursorPersisted,
         // WHY the scan was not exhausted, when it was the clock rather than the
-        // page cap. Both produce the same honest `overflowExact: false`, and
-        // they need different fixes — one is a backlog, the other is a slow run.
+        // page cap. Both make the read partial (scanIncomplete: nothing new is
+        // selected), and they need different fixes: one is a backlog, the
+        // other is a slow run.
         scanDeadlineHit: scan.deadlineHit,
         claimed: toPost.length,
         // Refused by claimOwnerDay's own re-check (§14.9) — the certification
@@ -1596,6 +1634,9 @@ async function handleGET(request: Request) {
 // UNCONFIRMED delivery: still 200 (a retry would risk a duplicate chase
 // card), but uncertainTransitions is exactly the signal that a card went out
 // with no proof it arrived, which this heartbeat treats as a failed run.
+// scanIncomplete (cards-complete-scan-spec.md) is the same story: still 200,
+// but a run whose read was partial claimed no owner's day, and that is worth
+// the same escalation as an unconfirmed delivery.
 export const GET = withCronHeartbeat("RECEIPT_REQUEST_CARDS", handleGET, {
-    isFailure: body => isRecord(body) && Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0,
+    isFailure: body => isRecord(body) && ((Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0) || body.scanIncomplete === true),
 });
