@@ -59,10 +59,14 @@ export const maxDuration = 60;
  *
  * THE ONE FAILURE WINDOW, documented rather than engineered away: the post
  * happens AFTER the claim commits, and `postedAt` is written after the webhook
- * answers. A crash in between leaves a claimed-but-unposted row, and the next
- * run re-posts that exact row (same ids, same order). Worst case is ONE
- * duplicate card; the alternative — marking sent before posting — silently
- * drops the day's chase, which is worse.
+ * answers. A crash in between leaves a claimed-but-unposted row, and a
+ * SAME-DAY next run re-posts that exact row unchanged (same ids, same order)
+ * — the "existing card" lookup below is keyed on that run's own Pacific date.
+ * Worst case is ONE duplicate card; the alternative — marking sent before
+ * posting — silently drops the day's chase, which is worse. A crash with no
+ * same-day run left is not resent intact: the row stays as the record that
+ * the day failed, and its still-open items are replanned into a fresh card by
+ * the next day's run (see "Yesterday's unposted card" below).
  *
  * NEVER emails anything. The whole point is a reply-in-thread chase.
  */
@@ -171,9 +175,13 @@ const SEND_COMPLETION_MARGIN_MS = 4_000;
  * to UNCERTAIN by the next run, which is the one state that is never resent.
  * So a card nobody had ever sent became a card nobody would ever send.
  *
- * A run refuses to enter POSTING without this much budget left. The cost of
- * refusing is a card that goes out on the 16:30 retry pass instead of at 07:30;
- * the cost of not refusing is a chase that silently disappears.
+ * A run refuses to enter POSTING without this much budget left. If a same-day
+ * retry pass is still ahead, the cost of refusing is a card that goes out on
+ * the 16:30 retry pass instead of at 07:30, resumed unchanged (the "existing
+ * card" lookup is keyed on today's date). If this IS the day's last run, the
+ * deferred row is left as the record instead, and its items are replanned
+ * into a new card the next day. Either way, the cost of not refusing is a
+ * chase that silently disappears.
  */
 const SEND_HEADROOM_MS = CARD_POST_TIMEOUT_MS + SEND_COMPLETION_MARGIN_MS;
 
@@ -1101,8 +1109,11 @@ async function handleGET(request: Request) {
     // did not go out.
     const failures: string[] = [];
     // Rows this run held back because it did not have the wall clock left to
-    // send them safely. NOT a failure and NOT uncertain: nothing was sent, the
-    // claim is released, and the next invocation picks the row up unchanged.
+    // send them safely. NOT a failure and NOT uncertain: nothing was sent and
+    // the claim is released. A SAME-DAY next invocation picks the row up
+    // unchanged (the "existing card" lookup is keyed on today's date); if
+    // this was the day's last run, the row is left as the record instead and
+    // its items are replanned into a new card the next day.
     const sendDeferred: string[] = [];
     /**
      * Cards held back because their pre-send validation ran out of budget
@@ -1155,8 +1166,11 @@ async function handleGET(request: Request) {
          * WOULD have sent it.
          *
          * Releasing the claim is what makes this recoverable rather than a
-         * lost day — the row keeps its selection and the 16:30 retry pass
-         * takes it as an ordinary resumed card.
+         * lost day when a same-day retry pass is still ahead — the row keeps
+         * its selection and the 16:30 retry pass takes it as an ordinary
+         * resumed card. If this IS the day's last run, the row is left as the
+         * record instead and its items are replanned into a new card the next
+         * day (see "Yesterday's unposted card" below).
          */
         if (remainingRunBudgetMs(runStartedAt) <= SEND_HEADROOM_MS) {
             await prisma.receiptRequestCard.updateMany({
@@ -1207,9 +1221,11 @@ async function handleGET(request: Request) {
          *
          * So an incomplete validation defers the whole card instead: the row and
          * its `resendQueuedAt` are left exactly as they were, the claim is
-         * released so the next pass can take it, and the run reports
-         * `deferred:budget`. Nothing is deleted and nothing is rewritten on the
-         * strength of a check that did not finish.
+         * released so a SAME-DAY next pass can take it unchanged, and the run
+         * reports `deferred:budget`. Nothing is deleted and nothing is
+         * rewritten on the strength of a check that did not finish — if no
+         * same-day pass follows, the row is left as the record and its items
+         * are replanned into a new card the next day.
          */
         const unverified = rebuilt.dropped.filter(drop => drop.reason === "revalidation-deadline");
         if (unverified.length > 0) {
