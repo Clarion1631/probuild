@@ -34,6 +34,10 @@ test("rails with no merchant receipt are exempted, with a stated reason", async 
         ["Chase autopay after, CARD spelling", "CHASE CREDIT CARD AUTOPAY", "card-payment"],
         ["Chase autopay, repeated whitespace", "CHASE  CREDIT   CRD AUTOPAY", "card-payment"],
         ["loan servicer, full name, payment after", "BANKERS HEALTHCARE GROUP PAYMENT", "loan-payment"],
+        ["Chase card autopay, no CREDIT word", "CHASE CARD AUTOPAY", "card-payment"],
+        ["PMT trigger before Chase credit card", "PMT CHASE CREDIT CRD", "card-payment"],
+        ["PAYMENT trigger before Synchrony", "PAYMENT SYNCHRONY BANK", "card-payment"],
+        ["AUTOPAY trigger after Synchrony", "SYNCHRONY BANK AUTOPAY", "card-payment"],
     ];
     for (const [name, descriptor, ruleKey] of cases) {
         await t.test(name, () => {
@@ -106,6 +110,23 @@ test("paper checks are never exempted by the new card/loan patterns", async t =>
         const v = classifyReceiptRequirement(line("SYF PAYMNT LOWES REDACTED NAME", -1000, "1027"));
         assert.equal(v.requirement, "receipt_expected");
     });
+    await t.test("a CHECK NO. descriptor, which CHECK_DESCRIPTOR itself does not catch", () => {
+        // Codex round 3, P1: CHECK_DESCRIPTOR requires PAID/#/NO+digit/a bare
+        // digit right after CHECK, so the period in "CHECK NO. 1027" defeats
+        // it. Deliberately left as is (it also gates pre-existing rules'
+        // check precedence — out of scope) — the new rules get a second,
+        // looser "starts with CHECK" test of their own instead.
+        const v = classifyReceiptRequirement(line("CHECK NO. 1027 SYNCHRONY PAYMENT"));
+        assert.equal(v.requirement, "receipt_expected");
+    });
+});
+
+test("purchase/POS context on the line defeats the new card/loan patterns", () => {
+    // Codex round 3, P1: a bank's own "POS PAYMENT" jargon can sit right next
+    // to a real purchase on a Chase credit card, and the payment-context
+    // pattern alone would still match it — this must win regardless.
+    const v = classifyReceiptRequirement(line("CHASE CREDIT CRD PURCHASE POS PAYMENT"));
+    assert.equal(v.requirement, "receipt_expected");
 });
 
 test("person-to-person rails are NEVER blanket-exempted by card", async t => {
