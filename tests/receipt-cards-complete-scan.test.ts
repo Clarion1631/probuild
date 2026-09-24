@@ -480,7 +480,7 @@ test("source pin: selection waits for a complete read", () => {
     assert.ok(source.includes("ok: failures.length === 0 && uncertainTransitions.length === 0 && !scanIncomplete,"));
 });
 
-test("a read cut by the clock claims nothing, even for an owner it saw, and a card claimed earlier waits intact for the next run", async () => {
+test("a read cut by the clock claims nothing, even for an owner it saw, and a card claimed earlier waits intact for the same-day retry", async () => {
     reset();
     seedCertified();
     mode = "queue";

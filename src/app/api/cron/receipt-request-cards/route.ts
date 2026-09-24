@@ -778,9 +778,12 @@ async function handleGET(request: Request) {
      * pass selects nothing: no claim is written, the day stays free, and a
      * later run (the 16:30Z retry, or the next weekday) reads again.
      *
-     * Queued resends and rows already claimed today are not blocked here. They
-     * still face the send-budget checks below, which defer them to the next
-     * run when this scan used up the clock.
+     * Rows already claimed today resume unchanged on the same-day retry pass
+     * (the "existing card" lookup below is keyed on today's date). A row the
+     * day's last run defers is not carried forward the same way: it is left
+     * in place only as the record that the day failed, and its items are
+     * reselected into a new card by a later day's run. Explicitly queued
+     * resends carry over regardless of when they run.
      */
     const scanIncomplete = selectionAllowed && !scan.exhausted;
     if (scanIncomplete) {
