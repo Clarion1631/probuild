@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { handleChangeOrderApproved } from "@/lib/billing-core";
+import { withCronHeartbeat, isRecord } from "@/lib/cron-heartbeat";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -15,7 +16,7 @@ export const maxDuration = 120;
  * runs (bounded duplicate "needs a look" alerts) and never races the inline
  * after() automation, which fires within seconds of signing.
  */
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     // Any deployed environment (production or preview) requires the cron secret,
     // and fails closed if CRON_SECRET is unset. Only local dev skips the check.
     const authHeader = request.headers.get("authorization");
@@ -56,3 +57,10 @@ export async function GET(request: Request) {
     }
     return NextResponse.json({ checked: candidates.length, results });
 }
+
+// Always answers 200 whether a CO billed cleanly or hit an issue — "alerted:
+// ..." entries need a human, so the heartbeat treats them as a failed run.
+export const GET = withCronHeartbeat("CO_BILLING_SWEEP", handleGET, {
+    isFailure: body => isRecord(body) && Array.isArray(body.results)
+        && body.results.some(r => isRecord(r) && typeof r.action === "string" && r.action.startsWith("alerted")),
+});

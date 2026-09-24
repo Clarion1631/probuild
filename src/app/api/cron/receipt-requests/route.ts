@@ -6,6 +6,7 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import { withCronHeartbeat } from "@/lib/cron-heartbeat";
 import { resolveCompanyTimeZone, startOfDateInTimeZone } from "@/lib/company-timezone";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
@@ -2008,7 +2009,7 @@ interface SweepProgress {
     reason: string | null;
 }
 
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     const budget = createSweepBudget(Date.now(), Date.now, RUN_BUDGET_MS);
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -2152,6 +2153,12 @@ export async function GET(request: Request) {
         await releaseLease(LEASE_KEY, leaseToken);
     }
 }
+
+// runSweep()'s own final return sets status from `result.ok` (see its
+// `NextResponse.json(result, { status: result.ok ? 200 : 500 })`), and every
+// skip/deferred branch above answers 200 with ok:true — the wrapper's default
+// status-based rule classifies this correctly with no predicate.
+export const GET = withCronHeartbeat("RECEIPT_REQUESTS", handleGET);
 
 async function runSweep(
     now: Date,

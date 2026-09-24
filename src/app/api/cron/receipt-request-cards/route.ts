@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { Prisma, type PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import { withCronHeartbeat, isRecord } from "@/lib/cron-heartbeat";
 import { lockBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 import { lockReceiptEvidence, readReceiptEvidenceEpoch, readReceiptOwnerEpoch } from "@/lib/receipt-evidence-lock";
 import { decodeReasonCodes, type ReasonCode } from "@/lib/review-alert-reasons";
@@ -633,7 +634,7 @@ export async function claimOwnerDay(
     }
 }
 
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
@@ -1589,3 +1590,12 @@ export async function GET(request: Request) {
     // one is 200: it needs a human, not another attempt.
     return NextResponse.json(summary, { status: failures.length > 0 ? 500 : 200 });
 }
+
+// The 500 above already covers a refused delivery — the wrapper's default
+// status-based rule catches that with no help. What it can't see is an
+// UNCONFIRMED delivery: still 200 (a retry would risk a duplicate chase
+// card), but uncertainTransitions is exactly the signal that a card went out
+// with no proof it arrived, which this heartbeat treats as a failed run.
+export const GET = withCronHeartbeat("RECEIPT_REQUEST_CARDS", handleGET, {
+    isFailure: body => isRecord(body) && Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0,
+});
