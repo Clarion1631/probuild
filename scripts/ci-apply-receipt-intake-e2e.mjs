@@ -56,6 +56,7 @@ const PHASE1_DEPENDENT_MIGRATIONS = [
     "20260901120000_expense_attribution",
     "20260901120000_phase2_receipt_queue",
     "20260910233000_receipt_memo_content",
+    "20260925000000_receipt_intake_source_folder",
 ];
 
 /** Move a migration directory aside, and put it back however this process ends. */

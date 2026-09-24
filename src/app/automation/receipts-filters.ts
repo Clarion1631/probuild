@@ -17,6 +17,12 @@ import type { ReceiptOwner } from "@/lib/receipt-policy";
  */
 export const RECEIPT_GROUP_TAKE = 100;
 
+/**
+ * The Set job list's cap. Folder suggestions are off at the cap, because a
+ * cut list can fake a single match.
+ */
+export const JOB_OPTIONS_TAKE = 200;
+
 export const RECEIPT_GROUPS = [
     "needs-job",
     "needs-review",

@@ -213,6 +213,17 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
 
     return (
         <div>
+            {/* Move to job (PR #546 review) focuses this on close when its
+                trigger row is gone -- a real, visible landing spot instead of
+                nowhere. tabIndex={-1}: programmatically focusable, not in the
+                normal tab order. */}
+            <h2
+                id="expenses-table-heading"
+                tabIndex={-1}
+                className="text-lg font-semibold text-slate-800 mb-4 outline-none focus-visible:ring-2 focus-visible:ring-hui-primary rounded"
+            >
+                Expenses
+            </h2>
             {/* Summary Bar */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
                 <div className="bg-gradient-to-br from-blue-50 to-blue-100/50 border border-blue-200 rounded-xl p-4">
@@ -506,6 +517,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                     changeOrderLabel={moveTarget.changeOrder?.code ?? null}
                     projectId={projectId}
                     jobOptions={jobOptions}
+                    fallbackFocusId="expenses-table-heading"
                     onClose={() => setMoveTarget(null)}
                     onMoved={async () => {
                         setMoveTarget(null);
