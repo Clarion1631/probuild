@@ -624,12 +624,26 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     //    v1 receipt-ingest endpoint uses (route.ts:69). Expense.estimateId is
     //    required, so a project with no estimate cannot be job-costed at all;
     //    that is terminal and costs no attempt.
+    //
+    //    ARCHIVED ESTIMATES ARE EXCLUDED (Codex xhigh post-merge review of
+    //    #534, 2026-09-23), matching reattributeExpense's own target-estimate
+    //    pick (expense-attribution.ts): Move to job already refused to land a
+    //    receipt-booked Expense on an archived estimate, while this pick
+    //    still could, so the same receipt could book onto an estimate Move
+    //    would never choose. A job whose only estimate is archived falls
+    //    through to the `!estimateId` check below and parks "no-estimate",
+    //    the same as a job with none at all.
     const project = await deps.db.project.findUnique({
         where: { id: row.projectId },
         select: {
             id: true,
             name: true,
-            estimates: { orderBy: { createdAt: "desc" }, take: 1, select: { id: true } },
+            estimates: {
+                where: { archivedAt: null },
+                orderBy: { createdAt: "desc" },
+                take: 1,
+                select: { id: true },
+            },
         },
     });
     if (!project) return parkedBeforeSend(row, "no-estimate");

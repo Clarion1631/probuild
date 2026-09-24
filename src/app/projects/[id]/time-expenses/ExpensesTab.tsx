@@ -78,7 +78,14 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
         try {
             const fresh = await getExpenses(projectId);
             setExpenses(fresh as Expense[]);
-        } catch { /* server revalidation will handle it */ }
+            return true;
+        } catch {
+            // Local state may already reflect a move or delete that
+            // already succeeded server-side -- a failed re-sync is the
+            // caller's to report (a gentle notice), never reported here
+            // as that action's own failure.
+            return false;
+        }
     }, [projectId]);
 
     const summary = useMemo(() => {
@@ -502,6 +509,11 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                     onClose={() => setMoveTarget(null)}
                     onMoved={async () => {
                         setMoveTarget(null);
+                        // Drop the moved row locally right away -- it no longer
+                        // belongs on this job, and leaving it on screen until the
+                        // refresh below resolves is what let it be reselected and
+                        // acted on again while still mid-flight.
+                        setExpenses(prev => prev.filter(e => e.id !== moveTarget.id));
                         // It just left this job — a "Tag selected" fired before the
                         // refresh below resolves must never act on it.
                         setSelectedIds(prev => {
@@ -510,7 +522,11 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                             next.delete(moveTarget.id);
                             return next;
                         });
-                        await refreshExpenses();
+                        // The move already succeeded -- that's why we're here.
+                        // A failed re-sync afterward is not a move failure, just
+                        // a reason to say the list may be stale.
+                        const refreshed = await refreshExpenses();
+                        if (!refreshed) toast("Moved. Refresh the page if the list looks out of date.");
                     }}
                 />
             )}
