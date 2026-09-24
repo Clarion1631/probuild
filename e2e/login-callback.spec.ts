@@ -22,7 +22,10 @@ test("a signed-out visit to a deep link returns there after sign-in", async ({ p
     await expect
         .poll(async () => {
             const cookies = await page.context().cookies();
-            return cookies.find((c) => c.name === "next-auth.callback-url")?.value ?? null;
+            const value = cookies.find((c) => c.name === "next-auth.callback-url")?.value ?? null;
+            // next-auth writes this cookie through cookie.serialize, which
+            // percent-encodes the value -- decode it before comparing.
+            return value === null ? null : decodeURIComponent(value);
         })
         .toBe(`${baseURL}${deepLink}`);
 });
@@ -39,7 +42,10 @@ test("a signed-out visit with no callbackUrl still lands on the default page aft
     await expect
         .poll(async () => {
             const cookies = await page.context().cookies();
-            return cookies.find((c) => c.name === "next-auth.callback-url")?.value ?? null;
+            const value = cookies.find((c) => c.name === "next-auth.callback-url")?.value ?? null;
+            // next-auth writes this cookie through cookie.serialize, which
+            // percent-encodes the value -- decode it before comparing.
+            return value === null ? null : decodeURIComponent(value);
         })
         .toBe(`${baseURL}/`);
 });
