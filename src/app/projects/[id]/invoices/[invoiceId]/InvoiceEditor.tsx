@@ -395,6 +395,10 @@ export default function InvoiceEditor({
                 dueDate: r.dueDate || null,
             }));
             const res = await updatePendingMilestoneAmounts(initialInvoice.id, rows);
+            if (!res.success) {
+                toast.error(res.error || "Failed to update milestone amounts");
+                return;
+            }
             for (const warning of res.warnings || []) toast.warning(warning);
             if (!res.warnings || res.warnings.length === 0) toast.success("Payment schedule updated");
             handleCancelEditMode();
@@ -410,7 +414,11 @@ export default function InvoiceEditor({
         if (!deleteMilestoneTarget) return;
         setIsDeletingMilestone(true);
         try {
-            await deleteInvoiceMilestone(deleteMilestoneTarget.id);
+            const res = await deleteInvoiceMilestone(deleteMilestoneTarget.id);
+            if (!res.success) {
+                toast.error(res.error || "Failed to delete milestone");
+                return;
+            }
             toast.success("Milestone deleted");
             setDeleteMilestoneTarget(null);
             router.refresh();

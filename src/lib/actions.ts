@@ -5110,8 +5110,14 @@ export async function updatePendingMilestoneAmounts(
 ) {
     await assertInvoicePermission();
 
-    const { updatePendingMilestoneAmountsCore } = await import("./billing-core");
-    const result = await updatePendingMilestoneAmountsCore(invoiceId, rows);
+    // Refusals return { error } instead of throwing, same as splitInvoiceMilestones.
+    let result: { success: true; warnings: string[] };
+    try {
+        const { updatePendingMilestoneAmountsCore } = await import("./billing-core");
+        result = await updatePendingMilestoneAmountsCore(invoiceId, rows);
+    } catch (e: any) {
+        return { success: false as const, error: e?.message || "Failed to update milestone amounts" };
+    }
 
     // Same paths splitInvoiceMilestones revalidates.
     const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { projectId: true } });
@@ -5132,8 +5138,14 @@ export async function updatePendingMilestoneAmounts(
 export async function deleteInvoiceMilestone(scheduleId: string) {
     await assertInvoicePermission();
 
-    const { deleteInvoiceMilestoneCore } = await import("./billing-core");
-    const result = await deleteInvoiceMilestoneCore(scheduleId);
+    // Refusals return { error } instead of throwing, same as splitInvoiceMilestones.
+    let result: { projectId: string; invoiceId: string };
+    try {
+        const { deleteInvoiceMilestoneCore } = await import("./billing-core");
+        result = await deleteInvoiceMilestoneCore(scheduleId);
+    } catch (e: any) {
+        return { success: false as const, error: e?.message || "Failed to delete milestone" };
+    }
 
     revalidatePath(`/projects/${result.projectId}/invoices`);
     revalidatePath(`/projects/${result.projectId}/invoices/${result.invoiceId}`);
@@ -5141,7 +5153,7 @@ export async function deleteInvoiceMilestone(scheduleId: string) {
     revalidatePath(`/portal`);
     revalidatePath(`/reports/open-invoices`);
 
-    return { success: true };
+    return { success: true as const };
 }
 
 export async function unrecordPayment(paymentId: string, invoiceId: string) {

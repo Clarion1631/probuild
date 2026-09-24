@@ -10,7 +10,7 @@ const root = path.resolve(__dirname, "../src");
 // source for ownership, immutable-history replay and guarded mutation checks.
 const retained: Record<string, string> = {
     "lib/actions.ts:3271": "estimate-item deletion retains historical source evidence",
-    "lib/actions.ts:5487": "estimate deletion retains historical source evidence",
+    "lib/actions.ts:5499": "estimate deletion retains historical source evidence",
     "lib/payroll-parent-delete.ts:96": "parent deletion refuses any retained source row",
     "lib/actions.ts:3665": "structural deletion must see retained historical evidence",
     "lib/time-expense-actions.ts:254": "bulk deletion authorization reads original ownership",
