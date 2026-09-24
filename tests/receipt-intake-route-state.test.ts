@@ -41,6 +41,17 @@ test("a non-receipt is its own terminal state, not a review item", () => {
     assert.deepEqual(d, { state: "NON_RECEIPT", stateReason: null, duplicateOfId: null });
 });
 
+test("a Set-job override of a non-receipt reads as an ordinary receipt, not NON_RECEIPT again", () => {
+    // setReceiptIntakeJob's override (nonReceiptSetJobOverride, read.ts) rewrites
+    // the row's stored docType from "non_receipt" to "receipt" before handing the
+    // row back to READ. If routing ever saw this row again with the OLD docType,
+    // it would re-park it at NON_RECEIPT — silently undoing the human's decision
+    // on the very next pass. With the overridden docType, it must not.
+    const d = routeState(clean, NO_HITS, true);
+    assert.notEqual(d.state, "NON_RECEIPT");
+    assert.equal(d.state, "READ");
+});
+
 test("a $0.00 total is a misread and is parked BEFORE any dedup or job check", () => {
     // :531 — you don't get a $0 receipt or write a $0 check. Letting this reach
     // a key would poison it for the real document.

@@ -13,7 +13,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildReadPrompt, normalizeConfidence, parseReadJson, readReceipt, totalWasRead, amountNotRead } from "../src/lib/receipt-intake/read";
+import { buildReadPrompt, normalizeConfidence, nonReceiptSetJobOverride, parseReadJson, readReceipt, totalWasRead, amountNotRead } from "../src/lib/receipt-intake/read";
 import { cleanMoney } from "../src/lib/receipt-intake/keys";
 
 const PHASES = [
@@ -344,4 +344,45 @@ test("amountNotRead is true only for a stored zero the model never actually read
     assert.equal(amountNotRead(0, read), false);
     assert.equal(amountNotRead(1234, unread), false, "a later non-zero total always wins");
     assert.equal(amountNotRead(null, unread), false, "never-read totalCents keeps today's blank, not this flag");
+});
+
+// ── The Set-job override for a NON_RECEIPT row (actions.ts setReceiptIntakeJob) ──
+
+test("the override is only applied to a NON_RECEIPT row", () => {
+    const at = new Date("2026-09-24T12:00:00.000Z");
+    for (const state of ["NEEDS_JOB", "NEEDS_REVIEW", "READ", "BOOKED", "VOID"]) {
+        assert.equal(
+            nonReceiptSetJobOverride(state, JSON.stringify({ doc_type: "receipt" }), "user-1", at),
+            null,
+            state,
+        );
+    }
+});
+
+test("a NON_RECEIPT override rewrites the row's docType and stamps an audit entry into readJson", () => {
+    const at = new Date("2026-09-24T12:00:00.000Z");
+    const readJson = JSON.stringify({ doc_type: "non_receipt", vendor: "Cash App", total_amount: "42.00" });
+    const patch = nonReceiptSetJobOverride("NON_RECEIPT", readJson, "user-1", at);
+    assert.equal(patch?.docType, "receipt");
+    const parsed = JSON.parse(patch!.readJson!);
+    // The original read is preserved — only docType is overruled.
+    assert.equal(parsed.vendor, "Cash App");
+    assert.equal(parsed.total_amount, "42.00");
+    assert.equal(parsed.doc_type, "receipt");
+    assert.deepEqual(parsed.doc_type_override, { from: "non_receipt", by: "user-1", at: at.toISOString() });
+});
+
+test("a NON_RECEIPT override still rewrites docType when readJson is missing or unparseable", () => {
+    const at = new Date("2026-09-24T12:00:00.000Z");
+    // No readJson at all: nothing to patch, but the row must still book.
+    assert.deepEqual(nonReceiptSetJobOverride("NON_RECEIPT", null, "user-1", at), { docType: "receipt", readJson: null });
+    // A readJson that no longer parses (corrupted, or not an object) is left
+    // untouched rather than dropped or replaced — the row's own docType column
+    // is what book.ts's gate reads, so it alone is enough to make the row
+    // bookable even when the audit trail can't be safely rewritten.
+    const broken = "not json";
+    assert.deepEqual(
+        nonReceiptSetJobOverride("NON_RECEIPT", broken, "user-1", at),
+        { docType: "receipt", readJson: broken },
+    );
 });

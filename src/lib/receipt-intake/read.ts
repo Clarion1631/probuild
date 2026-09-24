@@ -258,6 +258,55 @@ export function parseReadJson(text: string, projectPhases: ProjectPhase[]): Read
     };
 }
 
+/** The docType/readJson patch `nonReceiptSetJobOverride` persists. */
+export interface NonReceiptOverride {
+    docType: string;
+    readJson: string | null;
+}
+
+/**
+ * The Set-job override for a NON_RECEIPT row: a human picking a job on it means
+ * "this IS a receipt, book it here" — not "trust the AI's non_receipt read after
+ * all". Returns the patch to persist, or `null` when the row wasn't NON_RECEIPT,
+ * so a job set on a NEEDS_JOB/NEEDS_REVIEW row (already docType receipt/check/
+ * multi) never gets re-stamped by this path.
+ *
+ * `docType` (the row's own column) is what book.ts's booking gate reads, so it
+ * is ALWAYS overridden to "receipt" — that alone is enough for the row to book.
+ * `readJson` is best-effort: recoverStrongKey (worker.ts) re-derives a dedup key
+ * from it and refuses when its embedded doc_type disagrees with the row's own,
+ * so patching it too — with an audit marker recording who overrode it and when
+ * — keeps that healing working instead of silently declining forever. A
+ * readJson that is missing or no longer parses is left as-is; the row still
+ * books (the row's docType column is what gates that), it just cannot heal a
+ * strong dedup key from an unreadable audit trail.
+ */
+export function nonReceiptSetJobOverride(
+    currentState: string,
+    readJson: string | null,
+    by: string,
+    at: Date,
+): NonReceiptOverride | null {
+    if (currentState !== "NON_RECEIPT") return null;
+    const docType = "receipt";
+    if (!readJson) return { docType, readJson };
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(readJson);
+    } catch {
+        return { docType, readJson };
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { docType, readJson };
+    return {
+        docType,
+        readJson: JSON.stringify({
+            ...(parsed as Record<string, unknown>),
+            doc_type: docType,
+            doc_type_override: { from: "non_receipt", by, at: at.toISOString() },
+        }),
+    };
+}
+
 /**
  * Read one document. `fileBytes` is the raw file; text/plain goes in as a text
  * part the way v1 does (:1093), everything else as inline_data.

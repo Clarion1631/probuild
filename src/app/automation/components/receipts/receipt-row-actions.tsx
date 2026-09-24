@@ -66,7 +66,26 @@ export function SetJobControl({
     suggestions?: FolderSuggestions;
 }) {
     const [projectId, setProjectId] = useState(currentProjectId ?? "");
-    const { pending, run } = useAction("Job set.");
+    const [pending, startTransition] = useTransition();
+    // NOT useAction: setReceiptIntakeJob returns `{ ok: false, message }` for a
+    // refusal it anticipated (wrong state, vanished job, bad cost code) instead
+    // of throwing — the same reason ResolveOrphanButton has its own run() — so
+    // a blanket "success on no throw" would toast success on a refusal too.
+    const run = () => startTransition(async () => {
+        try {
+            const result = await setReceiptIntakeJob(intakeId, projectId, expectedState, expectedUpdatedAt);
+            if (result.ok) toast.success("Job set — the pipeline will pick it up");
+            else toast.error(result.message);
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "That didn't work — try again");
+        }
+    });
+    // Folder-suggestion buttons go through setReceiptIntakeJobFromSuggestion
+    // (suggestion-actions.ts / suggestion-core.ts), which normalizes
+    // setReceiptIntakeJob's own `{ ok: false, message }` refusal into a thrown
+    // error — so, unlike the plain Set job button above, a generic "no throw
+    // means success" useAction is safe to reuse here.
+    const { pending: suggestionPending, run: runSuggestion } = useAction("Job set.");
 
     return (
         <div className="flex items-center gap-2 flex-wrap">
@@ -87,7 +106,7 @@ export function SetJobControl({
                 type="button"
                 className={BTN}
                 disabled={pending || !projectId}
-                onClick={() => run(() => setReceiptIntakeJob(intakeId, projectId, expectedState, expectedUpdatedAt))}
+                onClick={run}
             >
                 Set job
             </button>
@@ -99,9 +118,9 @@ export function SetJobControl({
                             key={job.id}
                             type="button"
                             className={BTN}
-                            disabled={pending}
+                            disabled={suggestionPending}
                             aria-label={`Set job to ${job.name}`}
-                            onClick={() => run(() => setReceiptIntakeJobFromSuggestion(intakeId, job.id, expectedState, expectedUpdatedAt))}
+                            onClick={() => runSuggestion(() => setReceiptIntakeJobFromSuggestion(intakeId, job.id, expectedState, expectedUpdatedAt))}
                         >
                             {job.name}
                         </button>
@@ -116,9 +135,9 @@ export function SetJobControl({
                             key={job.id}
                             type="button"
                             className={BTN}
-                            disabled={pending}
+                            disabled={suggestionPending}
                             aria-label={`Set job to ${job.name}`}
-                            onClick={() => run(() => setReceiptIntakeJobFromSuggestion(intakeId, job.id, expectedState, expectedUpdatedAt))}
+                            onClick={() => runSuggestion(() => setReceiptIntakeJobFromSuggestion(intakeId, job.id, expectedState, expectedUpdatedAt))}
                         >
                             {job.name}
                         </button>
