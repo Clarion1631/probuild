@@ -56,16 +56,39 @@ export interface ReceiptPolicyLine {
  *
  * Every one of these was observed in prod — nothing here is speculative.
  */
-const NO_RECEIPT_RULES: Array<{ key: string; test: RegExp; reason: string }> = [
+const NO_RECEIPT_RULES: Array<{ key: string; test: RegExp; reason: string; excludeChecks?: boolean }> = [
     {
         key: "loan-payment",
-        test: /\bINDIVIDUAL LOAN PAYMENTS\b|\bAUTOMATIC LOAN PAYMENT\b|\bBANKERS HEALTHCA/i,
+        test: /\bINDIVIDUAL LOAN PAYMENTS\b|\bAUTOMATIC LOAN PAYMENT\b/i,
         reason: "Loan payment — principal/interest, no merchant receipt exists",
     },
     {
         key: "card-payment",
-        test: /\bCAPITAL ONE\b|\bONLINE PMT\b.*\bCAPITAL ONE\b|\bCHASE CREDIT CRD\b|\bCHASE CARD AUTOPAY\b|\bSYF PAYMNT\b|\bSYNCHRONY\b/i,
+        test: /\bCAPITAL ONE\b|\bONLINE PMT\b.*\bCAPITAL ONE\b/i,
         reason: "Credit-card payment — a transfer; the receipts live on that card's statement",
+    },
+    {
+        // A separate entry, not folded into card-payment above, so its
+        // `excludeChecks` guard (see classifyReceiptRequirement) applies only
+        // to these newer, wider patterns — CAPITAL ONE above keeps its exact
+        // pre-existing behavior. Requires PAYMENT/AUTOPAY context alongside
+        // the issuer name, not just the name alone: a bare "SYNCHRONY" or
+        // "CHASE CREDIT CRD" also appears on ordinary retail purchases on
+        // those cards (e.g. "CHASE CREDIT CRD PURCHASE"), which must stay
+        // receipt_expected.
+        key: "card-payment",
+        test: /\bAUTOPAY\b.*\bCHASE\s+CREDIT\s+(?:CRD|CARD)\b|\bCHASE\s+CREDIT\s+(?:CRD|CARD)\b.*\b(?:AUTOPAY|PAYMENT|PMT)\b|\bSYF[\s*-]+PAYM(?:NT|ENT)\b|\bSYNCHRONY\b.*\bPAYM(?:NT|ENT)\b/i,
+        reason: "Credit-card payment — a transfer; the receipts live on that card's statement",
+        excludeChecks: true,
+    },
+    {
+        // Same reasoning as the card-payment split above: BANKERS HEALTHCA
+        // alone also appears without payment wording, so it needs its own
+        // guarded entry rather than widening the original phrase.
+        key: "loan-payment",
+        test: /\bPAYMENT\s+BANKERS\s+HEALTHCA\w*\b|\bBANKERS\s+HEALTHCA\w*\b.*\bPAYMENT\b/i,
+        reason: "Loan payment — principal/interest, no merchant receipt exists",
+        excludeChecks: true,
     },
     {
         key: "merchant-fee",
@@ -128,8 +151,16 @@ export function classifyReceiptRequirement(line: ReceiptPolicyLine): ReceiptPoli
     }
 
     const descriptor = line.rawDescriptor ?? "";
+    // A paper check is never a card autopay or loan-servicer payment, whatever
+    // words happen to sit in its memo line — `excludeChecks` rules (the newer,
+    // wider card/loan patterns above) do not apply to one, so a check still
+    // falls through to the checkNumber/CHECK_DESCRIPTOR branch below and
+    // returns receipt_expected. Scoped to those rules only: the pre-existing
+    // rules run unchanged, exactly as before this guard existed.
+    const isPaperCheck = looksLikeCheckOrSubBill(descriptor, line.checkNumber);
 
     for (const rule of NO_RECEIPT_RULES) {
+        if (rule.excludeChecks && isPaperCheck) continue;
         if (rule.test.test(descriptor)) {
             return { requirement: "no_receipt_expected", reason: rule.reason, ruleKey: rule.key };
         }

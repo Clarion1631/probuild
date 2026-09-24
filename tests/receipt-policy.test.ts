@@ -27,6 +27,13 @@ test("rails with no merchant receipt are exempted, with a stated reason", async 
         ["Chase credit card autopay", "PREAUTHORIZED ACH DEBIT AUTOPAYBUS CHASE CREDIT CRD AUTOPAY REDACTED NAME", "card-payment"],
         ["Synchrony store-card payment", "PREAUTHORIZED ACH DEBIT SYF PAYMNT LOWES REDACTED NAME", "card-payment"],
         ["business loan servicer payment", "PREAUTHORIZED ACH DEBIT PAYMENT BANKERS HEALTHCA SER", "loan-payment"],
+        ["Synchrony payment, * separator", "SYF*PAYMNT LOWES", "card-payment"],
+        ["Synchrony payment, - separator", "SYF-PAYMNT", "card-payment"],
+        ["Synchrony spelled out, payment context", "SYNCHRONY BANK PAYMENT", "card-payment"],
+        ["Chase autopay before the card words", "AUTOPAY CHASE CREDIT CRD", "card-payment"],
+        ["Chase autopay after, CARD spelling", "CHASE CREDIT CARD AUTOPAY", "card-payment"],
+        ["Chase autopay, repeated whitespace", "CHASE  CREDIT   CRD AUTOPAY", "card-payment"],
+        ["loan servicer, full name, payment after", "BANKERS HEALTHCARE GROUP PAYMENT", "loan-payment"],
     ];
     for (const [name, descriptor, ruleKey] of cases) {
         await t.test(name, () => {
@@ -68,6 +75,37 @@ test("a Chase debit-card purchase is not caught by the Chase autopay rule", () =
     // purchase run through a Chase debit card, not the credit-card autopay.
     const v = classifyReceiptRequirement(line("MISCELLANEOUS DEBIT CHASE DEBIT CARD PURCHASE CAFE VANCOUVER  WA C#6098 DBT CRD 1234"));
     assert.equal(v.requirement, "receipt_expected");
+});
+
+test("the issuer name alone, with no payment/autopay wording, is not enough to exempt", async t => {
+    // Codex round 2, P1: a bare issuer name also shows up on ordinary retail
+    // purchases made on those cards — the pattern must require explicit
+    // payment context, not just the name.
+    const cases: Array<[string, string]> = [
+        ["Synchrony retail purchase", "SYNCHRONY RETAIL PURCHASE"],
+        ["Chase credit card purchase, CRD spelling", "CHASE CREDIT CRD PURCHASE"],
+        ["Chase credit card purchase, CARD spelling", "CHASE CREDIT CARD PURCHASE"],
+        ["Bankers Healthcare with no payment wording", "BANKERS HEALTHCARE"],
+    ];
+    for (const [name, descriptor] of cases) {
+        await t.test(name, () => {
+            assert.equal(classifyReceiptRequirement(line(descriptor)).requirement, "receipt_expected");
+        });
+    }
+});
+
+test("paper checks are never exempted by the new card/loan patterns", async t => {
+    // Codex round 2, P1: exemptions ran before the checkNumber guard, so a
+    // check whose memo happens to contain payment wording, or any line
+    // carrying a real check number, could be wrongly exempted.
+    await t.test("a CHECK PAID descriptor carrying payment wording", () => {
+        const v = classifyReceiptRequirement(line("CHECK PAID SYNCHRONY PAYMENT"));
+        assert.equal(v.requirement, "receipt_expected");
+    });
+    await t.test("a Synchrony-shaped line with a populated check number", () => {
+        const v = classifyReceiptRequirement(line("SYF PAYMNT LOWES REDACTED NAME", -1000, "1027"));
+        assert.equal(v.requirement, "receipt_expected");
+    });
 });
 
 test("person-to-person rails are NEVER blanket-exempted by card", async t => {
