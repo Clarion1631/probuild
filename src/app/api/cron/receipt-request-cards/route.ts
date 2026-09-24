@@ -57,16 +57,18 @@ export const maxDuration = 60;
  * ReviewIssue ids immutably. A second concurrent run loses that insert and
  * posts nothing.
  *
- * THE ONE FAILURE WINDOW, documented rather than engineered away: the post
- * happens AFTER the claim commits, and `postedAt` is written after the webhook
- * answers. A crash in between leaves a claimed-but-unposted row, and a
- * SAME-DAY next run re-posts that exact row unchanged (same ids, same order)
- * — the "existing card" lookup below is keyed on that run's own Pacific date.
- * Worst case is ONE duplicate card; the alternative — marking sent before
- * posting — silently drops the day's chase, which is worse. A crash with no
- * same-day run left is not resent intact: the row stays as the record that
- * the day failed, and its still-open items are replanned into a fresh card by
- * the next day's run (see "Yesterday's unposted card" below).
+ * THE FAILURE WINDOW BEFORE POSTING, documented rather than engineered away:
+ * a crash between the claim commit and the POSTING write leaves a
+ * claimed-but-unposted PENDING row, and a SAME-DAY next run re-posts that
+ * exact row unchanged (same ids, same order) — the "existing card" lookup
+ * below is keyed on that run's own Pacific date. Worst case is ONE duplicate
+ * card; the alternative — marking sent before posting — silently drops the
+ * day's chase, which is worse. A crash with no same-day run left is not
+ * resent intact: the row stays as the record that the day failed, and its
+ * still-open items are replanned into a fresh card by a later day's run (see
+ * "Yesterday's unposted card" below). A SEPARATE, WORSE window exists once
+ * the POSTING write itself has committed — see "WHAT ENTERING `POSTING`
+ * COSTS, WORST CASE" below, where a crash leaves the row stuck, not resumed.
  *
  * NEVER emails anything. The whole point is a reply-in-thread chase.
  */
@@ -171,17 +173,24 @@ const SEND_COMPLETION_MARGIN_MS = 4_000;
  * phase then flipped a row to POSTING and called Chat, which starts a FRESH
  * 10-second timeout of its own, and the completion writes followed that. A run
  * that reached the send phase near its wall clock was killed between the
- * POSTING write and the response — and a row stranded in POSTING is converted
- * to UNCERTAIN by the next run, which is the one state that is never resent.
- * So a card nobody had ever sent became a card nobody would ever send.
+ * POSTING write and the response — and a row stranded that way stays stuck.
+ * The delivery-day reservation is written in the SAME transaction as the
+ * POSTING write, so `deliveredToday` already carries this owner by the time
+ * any later run looks: a same-day run skips the owner before it ever reaches
+ * the POSTING-to-UNCERTAIN check below, and a later day's run keys its lookup
+ * on a different (owner, date) and never finds this row at all. So a card
+ * nobody had ever sent stays stuck in POSTING — never converted, never
+ * resent, never surfaced for an operator to resolve (a known gap, tracked as
+ * a must-fix before cards go live).
  *
- * A run refuses to enter POSTING without this much budget left. If a same-day
- * retry pass is still ahead, the cost of refusing is a card that goes out on
- * the 16:30 retry pass instead of at 07:30, resumed unchanged (the "existing
- * card" lookup is keyed on today's date). If this IS the day's last run, the
- * deferred row is left as the record instead, and its items are replanned
- * into a new card the next day. Either way, the cost of not refusing is a
- * chase that silently disappears.
+ * A run refuses to enter POSTING without this much budget left. The claim is
+ * released instead, so the row is picked up again rather than lost: a plain
+ * claimed row resumes unchanged on a same-day retry pass (the "existing card"
+ * lookup is keyed on today's date) or, failing that, is left as the record
+ * that the day failed while its items are reselected into a new card by a
+ * later day's run; a queued resend instead keeps its own date and
+ * `resendQueuedAt` marker and carries over regardless of when it runs. Either
+ * way, the cost of not refusing is a chase that silently disappears.
  */
 const SEND_HEADROOM_MS = CARD_POST_TIMEOUT_MS + SEND_COMPLETION_MARGIN_MS;
 
@@ -670,9 +679,12 @@ async function handleGET(request: Request) {
     }
 
     const date = pacificDate(now);
-    // RETRY PASS (?retry=1, the 2-hours-later cron). It never SELECTS: it only
-    // re-posts rows an earlier run claimed and failed to deliver, so a webhook
-    // outage at 7:30 does not cost the crew their whole day.
+    // RETRY PASS (?retry=1, the 2-hours-later cron). Its job is to re-post
+    // rows an earlier run claimed and failed to deliver, so a webhook outage
+    // at 7:30 does not cost the crew their whole day — but it is not
+    // selection-blind: if the chase finishes late and `selectionAllowed`
+    // turns true during this pass, it scans and selects too (see "THE RETRY
+    // PASS SELECTS TOO" below).
     const retryOnly = new URL(request.url).searchParams.get("retry") === "1";
 
     /**
@@ -690,9 +702,11 @@ async function handleGET(request: Request) {
      * gets. So this refuses to select, says so, and consumes NOTHING — the
      * later `?retry=1` pass (or tomorrow) will find the slot free.
      *
-     * The retry pass never selects. Legacy cycles retain the earlier replay
-     * exemption; cycles recording a recognition policy must finish before
-     * replay too, so a pending snapshot cannot bypass current certification.
+     * A retry pass is not exempt from this gate — it selects too once the
+     * chase finishes during it (see "THE RETRY PASS SELECTS TOO" below).
+     * Legacy cycles retain the earlier replay exemption; cycles recording a
+     * recognition policy must finish before replay too, so a pending
+     * snapshot cannot bypass current certification.
      */
     const marker = parseSweepMarker(
         (await prisma.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } }))?.value,
@@ -1045,10 +1059,12 @@ async function handleGET(request: Request) {
                 invalidRows.push(owner);
                 continue;
             }
-            // THE ROW'S OWN overflowExact, not this run's scan flag. A retry
-            // pass does not scan at all, so `scan.exhausted` is trivially true
-            // there — and a card claimed by a run whose scan stopped early
-            // would come back claiming its "and N more" was a total.
+            // THE ROW'S OWN overflowExact, not this run's scan flag: this
+            // branch resumes a row an earlier pass already claimed, and
+            // `scan.exhausted` describes only THIS run's own scan — vacuously
+            // true when selection is not allowed this pass, and otherwise an
+            // unrelated result — never the state the resumed row was
+            // originally selected under.
             toPost.push({ card: buildCardFromItems(owner, date, items, existing.overflow, existing.overflowExact), rowId: existing.id, token, resumed: true });
             continue;
         }
@@ -1110,10 +1126,12 @@ async function handleGET(request: Request) {
     const failures: string[] = [];
     // Rows this run held back because it did not have the wall clock left to
     // send them safely. NOT a failure and NOT uncertain: nothing was sent and
-    // the claim is released. A SAME-DAY next invocation picks the row up
-    // unchanged (the "existing card" lookup is keyed on today's date); if
-    // this was the day's last run, the row is left as the record instead and
-    // its items are replanned into a new card the next day.
+    // the claim is released. A plain claimed row is picked up unchanged by a
+    // SAME-DAY next invocation (the "existing card" lookup is keyed on
+    // today's date); if none runs today, the row is left as the record
+    // instead and its items are reselected into a new card by a later day's
+    // run. A queued resend keeps its own date and marker instead and carries
+    // over regardless of when it runs.
     const sendDeferred: string[] = [];
     /**
      * Cards held back because their pre-send validation ran out of budget
@@ -1156,21 +1174,29 @@ async function handleGET(request: Request) {
          * Everything below this point is unsafe to be killed part way: the
          * POSTING write, a webhook call that opens its own fresh timeout, and
          * the completion transaction that records the thread ids. A kill
-         * between the first and the last leaves the row in POSTING, which the
-         * NEXT run reads as `uncertain-delivery` and never resends — so a card
-         * that was never sent becomes a card nobody will ever send.
+         * between the first and the last leaves the row stuck in POSTING: the
+         * delivery-day reservation commits in the same transaction as the
+         * POSTING write, so a same-day run skips the owner via `deliveredToday`
+         * before it can reach the `uncertain-delivery` conversion, and a later
+         * day's run looks up a different (owner, date) and never finds the row
+         * at all — so a card that was never sent stays a card nobody will ever
+         * send or surface (a known gap, tracked as a must-fix before cards go
+         * live).
          *
          * Checked BEFORE the revalidation, not just before the POSTING write:
          * revalidation is itself several real queries, and spending them only
          * to refuse the send afterwards wastes the budget of the run that
          * WOULD have sent it.
          *
-         * Releasing the claim is what makes this recoverable rather than a
-         * lost day when a same-day retry pass is still ahead — the row keeps
-         * its selection and the 16:30 retry pass takes it as an ordinary
-         * resumed card. If this IS the day's last run, the row is left as the
-         * record instead and its items are replanned into a new card the next
-         * day (see "Yesterday's unposted card" below).
+         * Releasing the claim here (before POSTING is ever entered) is what
+         * makes this recoverable rather than a lost day: a plain claimed row
+         * keeps its selection and a same-day retry pass — which can itself
+         * defer again under this same budget check — takes it as an ordinary
+         * resumed card; if none runs today, the row is left as the record
+         * instead and its items are reselected into a new card by a later
+         * day's run (see "Yesterday's unposted card" below). A queued resend
+         * keeps its own date and marker instead and carries over regardless
+         * of when it runs.
          */
         if (remainingRunBudgetMs(runStartedAt) <= SEND_HEADROOM_MS) {
             await prisma.receiptRequestCard.updateMany({
@@ -1224,8 +1250,9 @@ async function handleGET(request: Request) {
          * released so a SAME-DAY next pass can take it unchanged, and the run
          * reports `deferred:budget`. Nothing is deleted and nothing is
          * rewritten on the strength of a check that did not finish — if no
-         * same-day pass follows, the row is left as the record and its items
-         * are replanned into a new card the next day.
+         * same-day pass follows, a plain row is left as the record and its
+         * items are reselected into a new card by a later day's run, while a
+         * queued resend simply waits to be drained again under its own date.
          */
         const unverified = rebuilt.dropped.filter(drop => drop.reason === "revalidation-deadline");
         if (unverified.length > 0) {
@@ -1374,9 +1401,11 @@ async function handleGET(request: Request) {
              * `ReceiptRequestCardDelivery` — another invocation, or an EARLIER
              * ATTEMPT BY THIS CARD that Chat may already have taken. Either way
              * a message to this owner today is accounted for. This one sends
-             * nothing and releases its claim token so the row is free for the
-             * next delivery day; the card itself is untouched, so a queued
-             * resend keeps its marker.
+             * nothing and releases its claim token so the row is free to be
+             * taken again — by a same-day retry pass first, if one is still
+             * ahead, or otherwise carried to a later day's run; the card
+             * itself is untouched, so a queued resend keeps its own date and
+             * marker.
              *
              * P2002 only. Anything else is a real failure and is rethrown, so a
              * broken write cannot be silently read as "someone beat me to it".
