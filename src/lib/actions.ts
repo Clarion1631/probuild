@@ -16052,6 +16052,28 @@ export async function setReceiptIntakeJob(id: string, projectId: string, expecte
     if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
 
     try {
+        const now = new Date();
+        // BEFORE any DB read: a malformed/stale expectedState or expectedUpdatedAt
+        // is exactly the kind of anticipated refusal this action must not throw
+        // for, and there is no reason to spend two queries finding that out.
+        // assertExpectedState/assertExpectedUpdatedAt are shared by every queue
+        // action and keep their throwing behavior for those other callers — this
+        // catches it locally rather than changing what they do.
+        let expected: string;
+        let seenAt: Date;
+        try {
+            expected = assertExpectedState(expectedState);
+            seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+        } catch (error) {
+            return {
+                ok: false,
+                message: error instanceof Error ? error.message : "Refresh the page and try again — that view is out of date.",
+            };
+        }
+        if (!["NEEDS_JOB", "NEEDS_REVIEW", "NON_RECEIPT"].includes(expected)) {
+            throw new ReceiptJobRefusedError("A job can only be set on a receipt waiting for one");
+        }
+
         const project = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
         if (!project) throw new ReceiptJobRefusedError("That job no longer exists");
 
@@ -16073,14 +16095,18 @@ export async function setReceiptIntakeJob(id: string, projectId: string, expecte
             && existing?.costCodeId
             && await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, existing.costCodeId);
 
-        const now = new Date();
-        const expected = assertExpectedState(expectedState);
-        const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
-        if (!["NEEDS_JOB", "NEEDS_REVIEW", "NON_RECEIPT"].includes(expected)) {
-            throw new ReceiptJobRefusedError("A job can only be set on a receipt waiting for one");
+        // "not-applicable" for every state but NON_RECEIPT. "refuse" means the row
+        // WAS NON_RECEIPT but its readJson is missing or unparseable — nothing to
+        // audit the override against, so the whole action is refused rather than
+        // flipping docType with no record of why. See nonReceiptSetJobOverride.
+        const overrideResult = nonReceiptSetJobOverride(expected, existing?.readJson ?? null, user.id, now);
+        if (overrideResult.kind === "refuse") {
+            throw new ReceiptJobRefusedError("This item can't be switched to a receipt automatically. Ask Justin.");
         }
-        // `null` for every state but NON_RECEIPT — see nonReceiptSetJobOverride.
-        const override = nonReceiptSetJobOverride(expected, existing?.readJson ?? null, user.id, now);
+        const override = overrideResult.kind === "apply"
+            ? { docType: overrideResult.docType, readJson: overrideResult.readJson }
+            : {};
+
         const result = await evidenceIntakeUpdateMany({
             where: { id, state: expected, updatedAt: seenAt, ...notClaimedByWorker(now) },
             data: {

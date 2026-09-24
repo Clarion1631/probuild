@@ -106,7 +106,20 @@ export function SetJobControl({
                 type="button"
                 className={BTN}
                 disabled={pending || !projectId}
-                onClick={run}
+                onClick={() => {
+                    // NON_RECEIPT is the one starting state where this click means
+                    // something bigger than "assign a job": it overrules the AI's
+                    // reader, so unlike the ordinary NEEDS_JOB/NEEDS_REVIEW case it
+                    // is not one-click — same confirm-before-committing pattern as
+                    // VoidButton/ResolveOrphanButton above.
+                    if (expectedState === "NON_RECEIPT") {
+                        const jobName = jobs.find(job => job.id === projectId)?.name ?? "this job";
+                        if (!window.confirm(
+                            `ProBuild's reader thought this wasn't a receipt. Treat it as a receipt and book it to ${jobName} as an expense?`,
+                        )) return;
+                    }
+                    run();
+                }}
             >
                 Set job
             </button>

@@ -13,7 +13,17 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildReadPrompt, normalizeConfidence, nonReceiptSetJobOverride, parseReadJson, readReceipt, totalWasRead, amountNotRead } from "../src/lib/receipt-intake/read";
+import {
+    buildReadPrompt,
+    carryForwardDocTypeOverride,
+    normalizeConfidence,
+    nonReceiptSetJobOverride,
+    parseReadJson,
+    readReceipt,
+    totalWasRead,
+    amountNotRead,
+    type ReadResult,
+} from "../src/lib/receipt-intake/read";
 import { cleanMoney } from "../src/lib/receipt-intake/keys";
 
 const PHASES = [
@@ -351,9 +361,9 @@ test("amountNotRead is true only for a stored zero the model never actually read
 test("the override is only applied to a NON_RECEIPT row", () => {
     const at = new Date("2026-09-24T12:00:00.000Z");
     for (const state of ["NEEDS_JOB", "NEEDS_REVIEW", "READ", "BOOKED", "VOID"]) {
-        assert.equal(
+        assert.deepEqual(
             nonReceiptSetJobOverride(state, JSON.stringify({ doc_type: "receipt" }), "user-1", at),
-            null,
+            { kind: "not-applicable" },
             state,
         );
     }
@@ -363,8 +373,10 @@ test("a NON_RECEIPT override rewrites the row's docType and stamps an audit entr
     const at = new Date("2026-09-24T12:00:00.000Z");
     const readJson = JSON.stringify({ doc_type: "non_receipt", vendor: "Cash App", total_amount: "42.00" });
     const patch = nonReceiptSetJobOverride("NON_RECEIPT", readJson, "user-1", at);
-    assert.equal(patch?.docType, "receipt");
-    const parsed = JSON.parse(patch!.readJson!);
+    assert.equal(patch.kind, "apply");
+    if (patch.kind !== "apply") return;
+    assert.equal(patch.docType, "receipt");
+    const parsed = JSON.parse(patch.readJson);
     // The original read is preserved — only docType is overruled.
     assert.equal(parsed.vendor, "Cash App");
     assert.equal(parsed.total_amount, "42.00");
@@ -372,17 +384,71 @@ test("a NON_RECEIPT override rewrites the row's docType and stamps an audit entr
     assert.deepEqual(parsed.doc_type_override, { from: "non_receipt", by: "user-1", at: at.toISOString() });
 });
 
-test("a NON_RECEIPT override still rewrites docType when readJson is missing or unparseable", () => {
+test("a NON_RECEIPT override REFUSES rather than applying when readJson is missing or unparseable", () => {
+    // An override with no evidence behind it is exactly the silent
+    // reclassification this mechanism exists to prevent (checker round 2,
+    // item 3) — the caller must surface a refusal, not flip docType with
+    // nothing to audit it against.
     const at = new Date("2026-09-24T12:00:00.000Z");
-    // No readJson at all: nothing to patch, but the row must still book.
-    assert.deepEqual(nonReceiptSetJobOverride("NON_RECEIPT", null, "user-1", at), { docType: "receipt", readJson: null });
-    // A readJson that no longer parses (corrupted, or not an object) is left
-    // untouched rather than dropped or replaced — the row's own docType column
-    // is what book.ts's gate reads, so it alone is enough to make the row
-    // bookable even when the audit trail can't be safely rewritten.
-    const broken = "not json";
+    assert.deepEqual(nonReceiptSetJobOverride("NON_RECEIPT", null, "user-1", at), { kind: "refuse" });
+    assert.deepEqual(nonReceiptSetJobOverride("NON_RECEIPT", "not json", "user-1", at), { kind: "refuse" });
+    assert.deepEqual(nonReceiptSetJobOverride("NON_RECEIPT", JSON.stringify(["array", "not", "object"]), "user-1", at), { kind: "refuse" });
+});
+
+// ── A fresh re-read must not silently undo the override (checker round 2, item 3) ──
+
+test("carryForwardDocTypeOverride keeps docType=receipt and the marker when the AI re-reads non_receipt", () => {
+    // Simulates: a human overrode this row once (its OLD readJson already
+    // carries the marker), the row went back to RECEIVED (e.g. Retry on a
+    // weak-dup:), and Gemini read it again — repeating its ORIGINAL verdict.
+    const priorReadJson = JSON.stringify({
+        doc_type: "receipt",
+        vendor: "Cash App",
+        total_amount: "42.00",
+        doc_type_override: { from: "non_receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" },
+    });
+    const freshRead: ReadResult = {
+        docType: "non_receipt",
+        vendor: "Cash App",
+        date: "2026-09-20",
+        invoice: "",
+        checkNumber: "",
+        memo: "",
+        totalAmount: "42.00",
+        taxAmount: "",
+        suggestedPhaseCode: "",
+        suggestedConfidence: null,
+        raw: JSON.stringify({ doc_type: "non_receipt", vendor: "Cash App", total_amount: "42.00" }),
+    };
+    const kept = carryForwardDocTypeOverride(freshRead, priorReadJson);
+    assert.equal(kept.docType, "receipt");
+    const rawParsed = JSON.parse(kept.raw);
+    assert.equal(rawParsed.doc_type, "receipt");
+    assert.deepEqual(rawParsed.doc_type_override, { from: "non_receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" });
+    // Everything else the fresh read found still wins.
+    assert.equal(rawParsed.vendor, "Cash App");
+    assert.equal(rawParsed.total_amount, "42.00");
+});
+
+test("carryForwardDocTypeOverride is a no-op when there was no prior override", () => {
+    const freshRead: ReadResult = {
+        docType: "non_receipt",
+        vendor: "",
+        date: "",
+        invoice: "",
+        checkNumber: "",
+        memo: "",
+        totalAmount: "0.00",
+        taxAmount: "",
+        suggestedPhaseCode: "",
+        suggestedConfidence: null,
+        raw: JSON.stringify({ doc_type: "non_receipt" }),
+    };
+    // No prior readJson at all (first-ever read).
+    assert.deepEqual(carryForwardDocTypeOverride(freshRead, null), freshRead);
+    // A prior readJson that carries no override marker.
     assert.deepEqual(
-        nonReceiptSetJobOverride("NON_RECEIPT", broken, "user-1", at),
-        { docType: "receipt", readJson: broken },
+        carryForwardDocTypeOverride(freshRead, JSON.stringify({ doc_type: "non_receipt", vendor: "x" })),
+        freshRead,
     );
 });

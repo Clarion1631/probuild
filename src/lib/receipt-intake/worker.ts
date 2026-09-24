@@ -44,7 +44,7 @@ import {
     QboPurchaseFaultError,
     QboVendorDuplicateError,
 } from "@/lib/qbo-receipt-push";
-import { parseReadJson, READ_BUDGET_MS, type ProjectPhase, type ReadOutcome } from "./read";
+import { carryForwardDocTypeOverride, parseReadJson, READ_BUDGET_MS, type ProjectPhase, type ReadOutcome } from "./read";
 import type { VerifiedBytes } from "./stored-object";
 import { STORAGE_TIMEOUT_MESSAGE } from "./bucket";
 
@@ -1530,7 +1530,15 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         return owned ? "RECEIVED" : "STALE";
     }
 
-    const read = outcome.read;
+    // `row.readJson` is the PRIOR read — from before this one — so this is the
+    // one place that can tell "the AI says non_receipt" apart from "the AI
+    // says non_receipt AGAIN, about a document a human already overruled it
+    // on". A human's Set-job override (nonReceiptSetJobOverride, actions.ts)
+    // is a decision about the DOCUMENT, not about what any one Gemini call
+    // says on any one pass — without this, a row that reaches RECEIVED again
+    // (Retry on a weak-dup:, say) would silently re-classify itself right back
+    // to NON_RECEIPT the instant the model repeats its first answer.
+    const read = carryForwardDocTypeOverride(outcome.read, row.readJson);
     // Resolved BEFORE the keys: the fallback date is part of the dedup key, so
     // it has to be the company's calendar day from the start.
     const timeZone = await deps.companyTimeZone();

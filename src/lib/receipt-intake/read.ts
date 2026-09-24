@@ -258,52 +258,106 @@ export function parseReadJson(text: string, projectPhases: ProjectPhase[]): Read
     };
 }
 
-/** The docType/readJson patch `nonReceiptSetJobOverride` persists. */
-export interface NonReceiptOverride {
-    docType: string;
-    readJson: string | null;
-}
+/**
+ * What `nonReceiptSetJobOverride` decided:
+ *  - "not-applicable": the row wasn't NON_RECEIPT, so this path touches nothing
+ *    — a job set on a NEEDS_JOB/NEEDS_REVIEW row (already docType receipt/
+ *    check/multi) must never be re-stamped by it.
+ *  - "apply": the docType/readJson patch to persist.
+ *  - "refuse": the row WAS NON_RECEIPT, but its readJson is missing or no
+ *    longer parses, so there is nothing to audit the override against. The
+ *    caller must refuse the whole action rather than flip docType with no
+ *    record of why — an override with no evidence behind it is exactly the
+ *    kind of silent reclassification this mechanism exists to prevent.
+ */
+export type NonReceiptOverrideResult =
+    | { kind: "not-applicable" }
+    | { kind: "apply"; docType: string; readJson: string }
+    | { kind: "refuse" };
 
 /**
  * The Set-job override for a NON_RECEIPT row: a human picking a job on it means
- * "this IS a receipt, book it here" — not "trust the AI's non_receipt read after
- * all". Returns the patch to persist, or `null` when the row wasn't NON_RECEIPT,
- * so a job set on a NEEDS_JOB/NEEDS_REVIEW row (already docType receipt/check/
- * multi) never gets re-stamped by this path.
+ * "this IS a receipt, book it here" — not "trust the AI's non_receipt read
+ * after all".
  *
  * `docType` (the row's own column) is what book.ts's booking gate reads, so it
- * is ALWAYS overridden to "receipt" — that alone is enough for the row to book.
- * `readJson` is best-effort: recoverStrongKey (worker.ts) re-derives a dedup key
- * from it and refuses when its embedded doc_type disagrees with the row's own,
- * so patching it too — with an audit marker recording who overrode it and when
- * — keeps that healing working instead of silently declining forever. A
- * readJson that is missing or no longer parses is left as-is; the row still
- * books (the row's docType column is what gates that), it just cannot heal a
- * strong dedup key from an unreadable audit trail.
+ * is overridden to "receipt" whenever this applies — that alone is enough for
+ * the row to book. `readJson` is patched alongside it, with an audit marker
+ * recording who overrode it and when, because recoverStrongKey (worker.ts)
+ * re-derives a dedup key from readJson and refuses to heal one when its
+ * embedded doc_type disagrees with the row's own column — and because a fresh
+ * re-read (carryForwardDocTypeOverride) needs this marker to keep the override
+ * from being silently undone the next time the AI reads the same document.
  */
 export function nonReceiptSetJobOverride(
     currentState: string,
     readJson: string | null,
     by: string,
     at: Date,
-): NonReceiptOverride | null {
-    if (currentState !== "NON_RECEIPT") return null;
-    const docType = "receipt";
-    if (!readJson) return { docType, readJson };
+): NonReceiptOverrideResult {
+    if (currentState !== "NON_RECEIPT") return { kind: "not-applicable" };
+    if (!readJson) return { kind: "refuse" };
     let parsed: unknown;
     try {
         parsed = JSON.parse(readJson);
     } catch {
-        return { docType, readJson };
+        return { kind: "refuse" };
     }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { docType, readJson };
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "refuse" };
+    const docType = "receipt";
     return {
+        kind: "apply",
         docType,
         readJson: JSON.stringify({
             ...(parsed as Record<string, unknown>),
             doc_type: docType,
             doc_type_override: { from: "non_receipt", by, at: at.toISOString() },
         }),
+    };
+}
+
+/**
+ * The audit marker a prior `nonReceiptSetJobOverride` left in a row's readJson,
+ * or `null` when there isn't one (never overridden, or that JSON no longer
+ * parses — nothing to carry forward either way).
+ */
+function docTypeOverrideMarker(priorReadJson: string | null): unknown | null {
+    if (!priorReadJson) return null;
+    try {
+        const parsed: unknown = JSON.parse(priorReadJson);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "doc_type_override" in parsed) {
+            return (parsed as Record<string, unknown>).doc_type_override ?? null;
+        }
+    } catch { /* not parseable: nothing to carry forward */ }
+    return null;
+}
+
+/**
+ * A fresh read must never silently undo a human's earlier Set-job override.
+ * "This IS a receipt" was a decision about the DOCUMENT, not about what any
+ * one Gemini call says on any one pass — so when the row's PRIOR readJson
+ * carries the override marker, this read's own docType is replaced with
+ * "receipt" and the marker is carried forward into the NEW readJson, no matter
+ * what this read says. Everything else the fresh read found (vendor, total,
+ * date, memo) still wins; only the classification is pinned. Returns `read`
+ * unchanged when there is no prior override to protect.
+ */
+export function carryForwardDocTypeOverride(read: ReadResult, priorReadJson: string | null): ReadResult {
+    const marker = docTypeOverrideMarker(priorReadJson);
+    if (!marker) return read;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(read.raw);
+    } catch {
+        parsed = null;
+    }
+    const base = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : {};
+    return {
+        ...read,
+        docType: "receipt",
+        raw: JSON.stringify({ ...base, doc_type: "receipt", doc_type_override: marker }),
     };
 }
 
