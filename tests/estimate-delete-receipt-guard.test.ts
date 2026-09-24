@@ -30,16 +30,31 @@
  *
  * ROUND 4 (2026-09-23, Codex round 2 nits): two fixes, no behavior change to
  * the guard itself. (1) The refusal path used to bump the evidence epoch even
- * though nothing was deleted — it now bumps only inside the `receiptBookedCount
- * === 0` branch, alongside the deletes it actually describes. (2) The
- * pre-existing early gate above (the unlocked expense/time-entry count) used
- * to tell the user to "delete these entries first" even when the linked
- * expense was receipt-booked — since PR #534 that row's own UI only offers
- * "Move to job", so the instruction pointed nowhere. The early gate now runs
- * the same receipt-booked predicate the locked check uses and returns the
- * plain receipt message when it finds one; fakePrisma.expense.count
- * distinguishes the two query shapes so both paths can be driven
- * independently.
+ * though nothing was deleted — it now bumps only inside the success branch,
+ * alongside the deletes it actually describes. (2) The pre-existing early
+ * gate above (the unlocked expense/time-entry count) used to tell the user to
+ * "delete these entries first" even when the linked expense was
+ * receipt-booked — since PR #534 that row's own UI only offers "Move to
+ * job", so the instruction pointed nowhere. The early gate now runs the same
+ * receipt-booked predicate the locked check uses and returns the plain
+ * receipt message when it finds one; fakePrisma.expense.count distinguishes
+ * the two query shapes so both paths can be driven independently.
+ *
+ * ROUND 5 (2026-09-23, Codex xhigh post-merge re-review of #542, BLOCKER):
+ * the locked guard itself was still wrong. It counted only NATIVE receipt
+ * expenses (qbPurchaseId null with a linked ReceiptIntake) and then, once
+ * that count read zero, deleted EVERY Expense on the estimate regardless of
+ * kind — so a QBO-backed receipt expense (qbPurchaseId SET, still carrying
+ * its ReceiptIntake) was never counted but was destroyed anyway, and the
+ * same was true of a plain ordinary Expense some other writer committed in
+ * the gap between the early unlocked count and this lock (the R1 race,
+ * flagged in the same review). The guard now counts ALL Expenses on the
+ * estimate under the lock first; if any exist it refuses the whole delete
+ * and only THEN asks whether any of them carry a ReceiptIntake (whatever
+ * their qbPurchaseId) to choose which message to show. fakeTx.expense.count
+ * now answers two distinct query shapes and `lockedCountCalls` records every
+ * call, in order, so the tests below can assert both which query ran and how
+ * many times.
  *
  * Prisma, next-auth and the permission reader are patched at require() time —
  * same shape as tests/expense-delete-scope.test.ts and
@@ -57,10 +72,15 @@ let earlyExpenseCount: number;
 let earlyTimeEntryCount: number;
 /** What the early gate's own receipt-booked-expense count (nit 2) returns. */
 let earlyReceiptBookedCount: number;
+/** The args of the early gate's receipt-specific count, captured for the shape assertion below. */
+let earlyReceiptCountArgs: unknown;
 let budgetRow: Record<string, unknown> | null;
-/** What the NEW guard's `tx.expense.count(...)` (inside the lock) returns. */
-let txReceiptBookedCount: number;
-let txCountArgs: unknown;
+/** What the locked guard's ALL-Expenses count (round 5) returns. */
+let lockedExpenseCount: number;
+/** What the locked guard's receipt-specific count (round 5, only run when lockedExpenseCount > 0) returns. */
+let lockedReceiptCount: number;
+/** Every `tx.expense.count` call this run made, in order, for shape and call-count assertions. */
+let lockedCountCalls: unknown[];
 let estimateDeleteArgs: unknown;
 
 /** True for any opLog entry that represents a destructive statement. */
@@ -74,10 +94,15 @@ const fakeTx: any = {
     $executeRaw: async (..._args: unknown[]) => { opLog.push("lock"); return 1; },
     $queryRaw: async (..._args: unknown[]) => { opLog.push("epoch-bump"); return [{ value: "1" }]; },
     expense: {
-        count: async (args: unknown) => {
-            txCountArgs = args;
+        // ROUND 5: up to two distinct queries land here now. The ALL-Expenses
+        // count has no `receiptIntake` key in its where; the receipt-specific
+        // one (only asked when the first count is nonzero) does. Routing on
+        // shape rather than call order keeps this honest about which query
+        // deleteEstimate actually sent.
+        count: async (args: { where?: { receiptIntake?: unknown } } = {}) => {
+            lockedCountCalls.push(args);
             opLog.push("tx.expense.count");
-            return txReceiptBookedCount;
+            return args.where?.receiptIntake ? lockedReceiptCount : lockedExpenseCount;
         },
         deleteMany: async (_args: unknown) => {
             opLog.push("tx.expense.deleteMany");
@@ -119,8 +144,13 @@ const fakePrisma: any = {
         // hit this same fake: the plain linked-expense count, and (nit 2) the
         // receipt-booked-only count the early gate now also runs. Route on
         // the where clause the way the real Prisma call is distinguished.
-        count: async (args: { where?: { receiptIntake?: unknown } } = {}) =>
-            args.where?.receiptIntake ? earlyReceiptBookedCount : earlyExpenseCount,
+        count: async (args: { where?: { receiptIntake?: unknown } } = {}) => {
+            if (args.where?.receiptIntake) {
+                earlyReceiptCountArgs = args;
+                return earlyReceiptBookedCount;
+            }
+            return earlyExpenseCount;
+        },
     },
     timeEntry: {
         count: async () => earlyTimeEntryCount,
@@ -184,16 +214,19 @@ beforeEach(() => {
     earlyExpenseCount = 0;
     earlyTimeEntryCount = 0;
     earlyReceiptBookedCount = 0;
+    earlyReceiptCountArgs = null;
     budgetRow = null;
-    txReceiptBookedCount = 0;
-    txCountArgs = null;
+    lockedExpenseCount = 0;
+    lockedReceiptCount = 0;
+    lockedCountCalls = [];
     estimateDeleteArgs = null;
 });
 
-test("refuses the whole delete when a receipt-booked Expense is linked", async () => {
+test("refuses the whole delete when a NATIVE receipt-booked Expense is linked", async () => {
     // The race: nothing showed up in the early, unlocked count, but a receipt
     // landed on this estimate by the time the locked transaction runs.
-    txReceiptBookedCount = 1;
+    lockedExpenseCount = 1;
+    lockedReceiptCount = 1;
     // A Budget row is present, so a regression that deletes it before the
     // guard fires would show up in the op log below.
     budgetRow = { id: "budget-1" };
@@ -207,18 +240,82 @@ test("refuses the whole delete when a receipt-booked Expense is linked", async (
     assert.equal(estimateDeleteArgs, null, "the Estimate row itself was not deleted either");
 });
 
-test("the guard's query asks for receipt-booked Expenses specifically", () => {
-    // Not exercised by the assertion above directly (the fake ignores its
-    // args), so pin the WHERE shape once, behaviorally, via a dedicated run.
-    return deleteEstimate("est-1").then(() => {
-        assert.deepEqual(txCountArgs, {
-            where: { estimateId: "est-1", qbPurchaseId: null, receiptIntake: { isNot: null } },
-        });
+test("round 5 BLOCKER: refuses the whole delete for a QBO-backed receipt Expense too", async () => {
+    // Codex xhigh post-merge review of #542. The OLD guard's count filtered
+    // on `qbPurchaseId: null`, so a receipt Expense QuickBooks already owns
+    // (qbPurchaseId SET, ReceiptIntake still linked) was invisible to the
+    // count and got deleted along with everything else once that count read
+    // zero. The fake here cannot literally set qbPurchaseId (deleteEstimate's
+    // real query no longer filters on it at all — that IS the fix), so this
+    // asserts the observable behavior the old code got wrong: a receipt-
+    // linked Expense at lock time refuses the delete, full stop, regardless
+    // of who owns it downstream.
+    lockedExpenseCount = 1;
+    lockedReceiptCount = 1;
+    budgetRow = { id: "budget-1" };
+    const result = await deleteEstimate("est-1");
+
+    assert.deepEqual(result, {
+        success: false,
+        error: "This estimate has 1 expense(s) from receipts, so it can't be deleted. Archive it instead.",
+    });
+    assert.ok(!opLog.some(isDelete), `no delete of any kind ran: ${opLog.join(" ")}`);
+    assert.equal(estimateDeleteArgs, null);
+});
+
+test("round 5 (R1 race): refuses the whole delete for an ORDINARY Expense appearing at lock time too", async () => {
+    // The other half of the same blocker: an Expense with no ReceiptIntake at
+    // all, committed by some other writer in the gap between the early
+    // unlocked count and this lock. The OLD guard's count was receipt-only,
+    // so this case sailed straight through and the ordinary Expense (and the
+    // rest of the estimate) was deleted under it. It now refuses with the
+    // ordinary message instead, same as if it had been visible from the
+    // start.
+    lockedExpenseCount = 1;
+    lockedReceiptCount = 0;
+    budgetRow = { id: "budget-1" };
+    const result = await deleteEstimate("est-1");
+
+    assert.deepEqual(result, {
+        success: false,
+        error: "Cannot delete estimate because it has linked 1 expense(s). Please delete these entries first.",
+    });
+    assert.ok(!opLog.some(isDelete), `no delete of any kind ran: ${opLog.join(" ")}`);
+    assert.equal(estimateDeleteArgs, null);
+});
+
+test("the locked guard's first query counts EVERY Expense on the estimate, not just receipt ones", async () => {
+    await deleteEstimate("est-1");
+    assert.deepEqual(lockedCountCalls[0], { where: { estimateId: "est-1" } });
+});
+
+test("the locked guard's second query — only run when Expenses exist — asks for receipt-booked ones specifically", async () => {
+    lockedExpenseCount = 1;
+    lockedReceiptCount = 1;
+    await deleteEstimate("est-1");
+    assert.deepEqual(lockedCountCalls, [
+        { where: { estimateId: "est-1" } },
+        { where: { estimateId: "est-1", receiptIntake: { isNot: null } } },
+    ]);
+});
+
+test("the locked guard never runs its second query when the estimate is already clear of Expenses", async () => {
+    lockedExpenseCount = 0;
+    await deleteEstimate("est-1");
+    assert.equal(lockedCountCalls.length, 1, `only the ALL-Expenses count should run: ${JSON.stringify(lockedCountCalls)}`);
+});
+
+test("the early gate's receipt test no longer filters on qbPurchaseId (matches the locked guard)", async () => {
+    earlyExpenseCount = 1;
+    earlyReceiptBookedCount = 1;
+    await deleteEstimate("est-1");
+    assert.deepEqual(earlyReceiptCountArgs, {
+        where: { estimateId: "est-1", receiptIntake: { isNot: null } },
     });
 });
 
-test("unchanged behavior: proceeds normally when no receipt-booked expense is linked", async () => {
-    txReceiptBookedCount = 0;
+test("unchanged behavior: proceeds normally when no Expense is linked at lock time", async () => {
+    lockedExpenseCount = 0;
     budgetRow = { id: "budget-1" };
     const result = await deleteEstimate("est-1");
 
@@ -281,8 +378,8 @@ test("nit 2: a linked time entry with no receipt-booked expense still gets the o
     assert.deepEqual(opLog, [], "the guarded transaction never ran at all");
 });
 
-test("the receipt check runs inside the lock, after it, and before any delete", async () => {
-    txReceiptBookedCount = 0;
+test("the Expense check runs inside the lock, after it, and before any delete", async () => {
+    lockedExpenseCount = 0;
     budgetRow = { id: "budget-1" };
     await deleteEstimate("est-1");
 
@@ -308,11 +405,12 @@ test("when refused, the transaction still closes out the lock normally, no delet
     // nothing was deleted, so nothing about receipt evidence changed either —
     // bumping the epoch here would only restart the missing-receipt sweep for
     // no reason (Codex round 2 nit).
-    txReceiptBookedCount = 3;
+    lockedExpenseCount = 3;
+    lockedReceiptCount = 0;
     budgetRow = { id: "budget-1" };
     await deleteEstimate("est-1");
 
-    assert.deepEqual(opLog, ["lock", "tx.expense.count"]);
+    assert.deepEqual(opLog, ["lock", "tx.expense.count", "tx.expense.count"]);
     assert.ok(!opLog.includes("epoch-bump"), `a refusal must not bump the evidence epoch: ${opLog.join(" ")}`);
     assert.ok(!opLog.some(isDelete), `no delete of any kind ran: ${opLog.join(" ")}`);
 });

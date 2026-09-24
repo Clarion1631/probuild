@@ -996,13 +996,15 @@ export interface ReattributeTxClient extends ExpenseTxClient {
  *   * the write is a compare-and-set on the attribution it was decided from, so
  *     a concurrent move loses rather than interleaving.
  *
- * NO CALLER TODAY. Stated plainly because it matters: no handler currently
- * offers re-attribution — the PUT and PATCH allowlists do not accept
- * `projectId`, and the QBO suggester, the receipt approve and the backfill all
- * write a phase or a first attribution rather than moving one. This exists so
- * the path that gets built next is the correct one rather than the obvious one,
- * and `tests/attribution-lock-order.test.ts` fails any write that moves
- * `projectId` on an already-attributed row without moving `estimateId` with it.
+ * ITS CALLER (2026-09-23): `moveReceiptExpenseToJobCore`
+ * (receipt-intake/booked-expense.ts), the "Move to job" action for a
+ * receipt-booked Expense (design spec §6.2/§6.4). The PUT and PATCH
+ * allowlists still do not accept `projectId` — the QBO suggester, the receipt
+ * approve and the backfill still write a phase or a first attribution rather
+ * than moving one — so this remains the one sanctioned path for changing an
+ * already-attributed row's job, and `tests/attribution-lock-order.test.ts`
+ * fails any write that moves `projectId` on one without moving `estimateId`
+ * with it.
  */
 export async function reattributeExpense(
     tx: ReattributeTxClient,

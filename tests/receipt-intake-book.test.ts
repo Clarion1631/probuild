@@ -207,7 +207,15 @@ function restoreInPlace(target: Record<string, any>, snapshot: Record<string, an
 function recorder(
     overrides: Partial<BookDependencies> = {},
     opts: {
-        estimates?: { id: string }[];
+        /**
+         * `archivedAt` models the column of the same name — set on an
+         * archived estimate, `undefined`/absent on a live one. The fake
+         * below applies the SAME `where: { archivedAt: null }` filter
+         * `bookReceipt` actually sends, so a test can hand it an unfiltered,
+         * newest-first list and prove the pick, not just assert on a
+         * pre-filtered fixture.
+         */
+        estimates?: { id: string; archivedAt?: string | null }[];
         intakeStillBooking?: boolean;
         existingExpense?: Record<string, unknown> | null;
         /**
@@ -271,11 +279,23 @@ function recorder(
 
     const tx = {
         project: {
-            findUnique: async () => ({
-                id: "proj-1",
-                name: "Berg ADU",
-                estimates: opts.estimates ?? [{ id: "est-1" }],
-            }),
+            // Filters on the REAL query bookReceipt sends, not on what the
+            // test hands in -- so a regression that drops the
+            // `where: { archivedAt: null }` clause off the estimates
+            // selection makes this fake start returning the archived row
+            // again, and the archived-estimate tests below catch it.
+            findUnique: async (args: any) => {
+                const all = opts.estimates ?? [{ id: "est-1" }];
+                const where = args?.select?.estimates?.where;
+                const filtered = where && "archivedAt" in where && where.archivedAt === null
+                    ? all.filter((e: any) => !e.archivedAt)
+                    : all;
+                return {
+                    id: "proj-1",
+                    name: "Berg ADU",
+                    estimates: filtered.slice(0, 1),
+                };
+            },
         },
         expense: {
             // The pre-existing row a test planted wins, whichever key was
@@ -635,6 +655,31 @@ test("a project with no estimate is terminal, spends NO attempt, and KEEPS the s
     // same document re-sent with a differently read total would then miss both
     // nets and book, and this row would book as well.
     const r = recorder({}, { estimates: [] });
+    const result = await bookReceipt(row(), r.deps);
+    assert.deepEqual(result, { outcome: "needs-review", reason: "no-estimate", releaseStrongKey: false });
+    assert.equal(r.purchaseCalls.length, 0, "QuickBooks is never touched");
+    assert.equal(r.expenses.length, 0);
+});
+
+test("a newer ARCHIVED estimate is skipped in favor of an older active one", async () => {
+    // Codex xhigh post-merge review of #534: booking used to pick the
+    // project's newest estimate with no archived exclusion, disagreeing with
+    // Move to job's reattributeExpense (which already excludes archived).
+    // The fake filters on the real query args (see recorder() above), so
+    // this only passes if bookReceipt actually asks for archivedAt: null.
+    const r = recorder({}, {
+        estimates: [
+            { id: "est-new-archived", archivedAt: "2026-08-20T00:00:00.000Z" },
+            { id: "est-old-active" },
+        ],
+    });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.expenses[0].estimateId, "est-old-active");
+});
+
+test("a job whose only estimate is archived takes the no-estimate park path", async () => {
+    const r = recorder({}, { estimates: [{ id: "est-archived-only", archivedAt: "2026-08-20T00:00:00.000Z" }] });
     const result = await bookReceipt(row(), r.deps);
     assert.deepEqual(result, { outcome: "needs-review", reason: "no-estimate", releaseStrongKey: false });
     assert.equal(r.purchaseCalls.length, 0, "QuickBooks is never touched");
