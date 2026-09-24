@@ -97,7 +97,7 @@ export const maxDuration = 60;
  * import and QBO register rows only arrived when a human ran
  * `scripts/post-qbo-register.mjs` from a laptop. The missing-receipt matcher's
  * whole input is the bank ledger, so a chase request could be weeks late. This
- * runs at 02:00 UTC — BEFORE `/api/cron/receipt-requests` (13:00 UTC) — so the
+ * runs at 02:00 UTC — BEFORE `/api/cron/receipt-requests` (10:00 UTC) — so the
  * matcher always sees last night's posted register.
  *
  * WHAT IT DOES NOT SEE (Codex PR #443 gate round 37, finding 1). The source is
@@ -535,7 +535,7 @@ async function commitFreshnessStamp(at: string): Promise<void> {
  * is not a TRUNCATION, so it wrote neither of the first two — the window was
  * cleared as finished and every 15-minute resume slot answered
  * `nothing-in-progress` while the register stayed uncertified until the next
- * night, long after the 13:00 chaser had given up on it.
+ * night, long after the 10:00 chaser had given up on it.
  *
  * THE FOURTH AND FIFTH ARE THE SAME SHAPE AGAIN (round-36 gate, finding 1).
  *
@@ -575,7 +575,7 @@ async function handleGET(request: Request) {
      * The pull is resumable — a run that hits its wall clock parks
      * `continueAfter` and reports `complete: false` — but it was invoked exactly
      * once a night, at 02:00. So a truncated pull sat parked for eleven hours
-     * and the 13:00 chaser found a register that had never been certified
+     * and the 10:00 chaser found a register that had never been certified
      * current, held its cycle open, and the 14:30 cards did not go out. The
      * backlog needed another invocation and nothing was scheduled to give it
      * one.

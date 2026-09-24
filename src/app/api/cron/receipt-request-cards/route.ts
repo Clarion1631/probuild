@@ -2,10 +2,12 @@ import { reviewedReceiptFactsFingerprint } from "@/server/receipt-reviewed-sourc
 import { reviewedReceiptPairsFingerprint } from "@/server/receipt-reviewed-pair-facts";
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { Prisma } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { withCronHeartbeat, isRecord } from "@/lib/cron-heartbeat";
+import { lockBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
+import { lockReceiptEvidence, readReceiptEvidenceEpoch, readReceiptOwnerEpoch } from "@/lib/receipt-evidence-lock";
 import { decodeReasonCodes, type ReasonCode } from "@/lib/review-alert-reasons";
 import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasBackedResolution, isComponentDeadlineExceeded, ComponentTooLargeError, ReceiptOutreachHeldError, type ReceiptOutreachHold } from "@/lib/receipt-requests";
 import {
@@ -25,7 +27,7 @@ import {
     type CardItemTruth,
     type OwnerCard,
 } from "@/lib/receipt-request-cards";
-import { CYCLE_KEY, SWEEP_MARKER_KEY, chaserCompletedFor, parseSweepCycle, parseSweepMarker, cycleRecognitionPolicyMatches } from "@/lib/receipt-sweep-marker";
+import { CYCLE_KEY, SWEEP_MARKER_KEY, cardSelectionCertified, chaserCompletedFor, parseSweepCycle, parseSweepMarker, cycleRecognitionPolicyMatches } from "@/lib/receipt-sweep-marker";
 import { receiptRecognitionPolicy } from "@/lib/receipt-source-recognition";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 import { itemsMissingCardRecord, recordCardOnIssues } from "@/lib/receipt-card-history";
@@ -532,6 +534,106 @@ function isUniqueConstraintError(error: unknown): boolean {
     return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
 }
 
+/**
+ * ONE LOCKED, CURRENT, OWNER-STABLE CLAIM (cheap-sweep-restart-spec.md §14.9;
+ * Codex round 2 blocker 1, and the claim-time race).
+ *
+ * `selectionAllowed` below is read outside any lock, minutes before this runs
+ * — plenty of time for a courtesy clear (§14.10) or an owner reassignment
+ * (§14.2, `writeReceiptOwnerLocked`) to land. This is the only place a card is
+ * ever SELECTED, so it is also the only place that has to re-prove, under the
+ * §14.0 lock order (E → L → C), that the world the scan priced in is still the
+ * world right now.
+ *
+ * `cardSelectionCertified` is re-checked here rather than trusted from the
+ * scan, for the same reason a stamp alone was not enough for the gate below: a
+ * stamp is a claim about the PAST, and only a lock taken now proves nothing
+ * moved between then and this transaction.
+ *
+ * The owner epoch is the one check `cardSelectionCertified` cannot make: it
+ * says nothing about WHICH owner an item belongs to, only that the sweep's own
+ * cycle certified. `ownerEpochAtScan` — read at the same moment
+ * `selectionAllowed` was decided — is compared here under the same lock
+ * `writeReceiptOwnerLocked` bumps it under, so a reassignment the scan already
+ * priced in and one that lands after it can never be confused for each other.
+ *
+ * Every abort is a safe drop (§14.0): nothing is written, the owner's day is
+ * not used up, and the 16:30Z retry (or a future run) gets another try.
+ */
+export async function claimOwnerDay(
+    db: Pick<PrismaClient, "$transaction">,
+    input: {
+        owner: string;
+        date: string;
+        items: CardItem[];
+        overflow: number;
+        overflowExact: boolean;
+        claimedAt: Date;
+        claimToken: string;
+        /** Read at scan time, under no lock — this transaction re-checks it under one. */
+        ownerEpochAtScan: string;
+        /**
+         * The cycle that was current when THIS scan built `items` (Codex round
+         * 1, B1 — "certification is not tied to the scan's cycle").
+         * `cardSelectionCertified` below only proves that the CURRENT cycle,
+         * whichever one that is, is fully certified right now — it says
+         * nothing about whether that is the SAME cycle the scan read. A later
+         * cycle can certify cleanly (a fresh, valid completion) while
+         * disagreeing with the one this candidate array was built from — e.g.
+         * evidence voided after the scan reopens a line for this owner in a
+         * new cycle that then finishes certifying without it. Comparing
+         * identity here, under the same lock, is what catches that: any
+         * cycle change between scan and claim refuses the claim exactly like
+         * an uncertified cycle would, and the next run rescans fresh.
+         */
+        cycleIdAtScan: string | null;
+        recognitionPolicy: string;
+    },
+): Promise<{ kind: "claimed"; id: string } | { kind: "taken" } | { kind: "refused"; reason: "certification" | "owner-moved" | "tx-failed" }> {
+    try {
+        return await db.$transaction(async (tx: Prisma.TransactionClient) => {
+            await tx.$executeRaw`SET LOCAL lock_timeout = '4s'`;
+            await lockReceiptEvidence(tx);
+            const evidenceEpoch = await readReceiptEvidenceEpoch(tx);
+            const bankEpoch = await lockBankLedgerEpoch(tx);
+            const markerRow = await tx.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } });
+            const cycleRow = await tx.automationSetting.findUnique({ where: { key: CYCLE_KEY } });
+            const marker = parseSweepMarker(markerRow?.value);
+            const cycle = parseSweepCycle(cycleRow?.value ?? null);
+            // SAME CYCLE THE SCAN SAW, not merely A certified one (Codex round
+            // 1, B1): a cycle that replaced the scan's between then and now —
+            // even one that itself finished certifying cleanly — proves
+            // nothing about the candidate array THIS claim is about to write.
+            const certifiedForThisScan = cardSelectionCertified({
+                marker, cycle, bankEpoch, evidenceEpoch, recognitionPolicy: input.recognitionPolicy,
+                now: new Date(), pacificDate: input.date,
+            }) && (cycle?.id ?? null) === input.cycleIdAtScan;
+            if (!certifiedForThisScan) {
+                return { kind: "refused" as const, reason: "certification" as const };
+            }
+            if (await readReceiptOwnerEpoch(tx) !== input.ownerEpochAtScan) {
+                return { kind: "refused" as const, reason: "owner-moved" as const };
+            }
+            const row = await tx.receiptRequestCard.create({
+                data: {
+                    owner: input.owner,
+                    pacificDate: input.date,
+                    itemsJson: JSON.stringify(input.items),
+                    overflow: input.overflow,
+                    overflowExact: input.overflowExact,
+                    claimedAt: input.claimedAt,
+                    claimToken: input.claimToken,
+                },
+                select: { id: true },
+            });
+            return { kind: "claimed" as const, id: row.id };
+        }, { timeout: 8_000, maxWait: 1_000 });
+    } catch (error) {
+        if (isUniqueConstraintError(error)) return { kind: "taken" };
+        return { kind: "refused", reason: "tx-failed" };
+    }
+}
+
 async function handleGET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -594,7 +696,7 @@ async function handleGET(request: Request) {
      * `chaserCompletedFor` used to ask only whether the stamp's DATE was today.
      * A completion is deliberately carried forward by every later phase write —
      * it is a true statement about a cycle that really happened — so a NEW
-     * cycle that started at 13:00 and is still mid-flight, or blocked by a
+     * cycle that started at 10:00 and is still mid-flight, or blocked by a
      * stale bank pull, still looked "completed today" and released the cards
      * over a partially reconciled set.
      *
@@ -613,6 +715,10 @@ async function handleGET(request: Request) {
         return NextResponse.json({ ok: false, skipped: "chaser-policy-changed", date });
     }
     const selectionAllowed = chaserCompletedFor(marker, date, "America/Los_Angeles", currentCycleId);
+    // ONCE PER RUN, before any of the early returns below — so a run that then
+    // refuses to select still leaves one line saying why (§14.7's sibling for
+    // this cron).
+    console.log("[cron/receipt-request-cards] gate", JSON.stringify({ date, retryOnly, selectionAllowed }));
     // Creating a cycle under the new policy is not completion: retries must
     // also wait for its certified finish, rather than replay an old pending card.
     if (currentCycle?.recognitionPolicy !== undefined && !selectionAllowed) {
@@ -640,6 +746,12 @@ async function handleGET(request: Request) {
     // below and find an empty list, which is the same lost day wearing a
     // different hat. A retry that may not select still needs no scan: it only
     // re-posts what an earlier run claimed.
+    // SNAPSHOT the owner epoch at the same moment selectionAllowed was decided
+    // (cheap-sweep-restart §14.9, Codex round 2 blocker 1). `claimOwnerDay`
+    // re-reads it under the evidence lock and refuses `owner-moved` if a
+    // reassignment landed since — the check `cardSelectionCertified` alone
+    // cannot make.
+    const ownerEpochAtScan = selectionAllowed ? await readReceiptOwnerEpoch(prisma) : "0";
     const scanResumedFrom = selectionAllowed ? await readScanCursor() : null;
     const scan = selectionAllowed
         ? await scanCandidates(() => remainingRevalidationBudgetMs(runStartedAt) <= 0, scanResumedFrom)
@@ -650,6 +762,9 @@ async function handleGET(request: Request) {
     // exactly the runs that needed it most.
     const scanCursorPersisted = selectionAllowed ? await writeScanCursor(scan.nextCursor) : true;
     const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
+    // Refused by claimOwnerDay's own re-check (§14.9): nothing was written, so
+    // the owner's day is still free for the retry pass or tomorrow.
+    const claimRefused: Array<{ owner: string; reason: "certification" | "owner-moved" | "tx-failed" }> = [];
     // Sent, but we never confirmed it. Reported, never reposted.
     const uncertain: string[] = [];
     // The subset THIS RUN moved into UNCERTAIN. Distinct from `uncertain`,
@@ -914,28 +1029,26 @@ async function handleGET(request: Request) {
         const { items, overflow } = selectOwnerItems(scan.candidates, owner);
         if (items.length === 0) continue;
         const token = randomUUID();
-        try {
-            // THE DAY-CLAIM and the POST-CLAIM in one insert: selection, its
-            // immutable record, and this run's ownership of the post.
-            const row = await prisma.receiptRequestCard.create({
-                data: {
-                    owner,
-                    pacificDate: date,
-                    itemsJson: JSON.stringify(items),
-                    overflow,
-                    // Persisted WITH the selection, because only this run knows
-                    // whether its scan finished.
-                    overflowExact: scan.exhausted,
-                    claimedAt: now,
-                    claimToken: token,
-                },
-                select: { id: true },
-            });
-            toPost.push({ card: buildCardFromItems(owner, date, items, overflow, scan.exhausted), rowId: row.id, token, resumed: false });
-        } catch (error) {
-            if (isUniqueConstraintError(error)) continue; // the other run won the day
-            throw error;
+        // THE DAY-CLAIM and the POST-CLAIM in one insert, under a lock that
+        // re-proves certification and owner stability first (§14.9): selection,
+        // its immutable record, and this run's ownership of the post.
+        const claim = await claimOwnerDay(prisma, {
+            owner, date, items, overflow,
+            // Persisted WITH the selection, because only this run knows
+            // whether its scan finished.
+            overflowExact: scan.exhausted,
+            claimedAt: now, claimToken: token, ownerEpochAtScan, recognitionPolicy,
+            // Same moment ownerEpochAtScan was decided (Codex round 1, B1):
+            // the cycle this run's candidates were built from.
+            cycleIdAtScan: currentCycleId,
+        });
+        if (claim.kind === "taken") continue; // the other run won the day
+        if (claim.kind === "refused") {
+            claimRefused.push({ owner, reason: claim.reason });
+            console.error("[cron/receipt-request-cards] claim-refused", JSON.stringify({ owner, reason: claim.reason }));
+            continue;
         }
+        toPost.push({ card: buildCardFromItems(owner, date, items, overflow, scan.exhausted), rowId: claim.id, token, resumed: false });
     }
 
     const posted: Array<{ owner: string; items: number; threadName: string | null; resumed: boolean }> = [];
@@ -1456,6 +1569,9 @@ async function handleGET(request: Request) {
         // they need different fixes — one is a backlog, the other is a slow run.
         scanDeadlineHit: scan.deadlineHit,
         claimed: toPost.length,
+        // Refused by claimOwnerDay's own re-check (§14.9) — the certification
+        // or the owner epoch moved between the scan and the locked claim.
+        claimRefused,
         // Rows whose whole snapshot was answered between selection and the
         // send. Not a failure — the opposite — but worth seeing.
         cancelledOwners: cancelled,

@@ -961,16 +961,16 @@ export const BANK_PULL_STALE_HOURS = 36;
  * and must not be slack at all.
  *
  * From vercel.json: `/api/cron/bank-register-pull` runs at 02:00 UTC daily and
- * `/api/cron/receipt-requests` at 13:00 UTC, with `?continue=1` resumes every
- * 15 minutes and the cards going out at 14:30 UTC on weekdays. So at chaser
- * time a healthy pull is ~11h old, and last night's pull — the one that means
- * tonight's failed — is ~35h old. 24h separates those two cleanly while still
+ * `/api/cron/receipt-requests` at 10:00 UTC, with `?continue=1` resumes every
+ * minute and the cards going out at 14:30 UTC on weekdays. So at chaser
+ * time a healthy pull is ~8h old, and last night's pull — the one that means
+ * tonight's failed — is ~32h old. 24h separates those two cleanly while still
  * tolerating a pull that ran late.
  */
 export const BANK_PULL_CHASER_WINDOW_HOURS = 24;
 
 /**
- * The chaser runs a full sweep daily (plus 15-minute resume passes), so 26h is
+ * The chaser runs a full sweep daily (plus minute-by-minute resume passes), so 26h is
  * one missed night with room for a slow morning — short enough that the alarm
  * lands BEFORE the next day's cards are due, which is the whole point of
  * watching it.

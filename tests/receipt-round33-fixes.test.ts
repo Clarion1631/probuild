@@ -383,7 +383,7 @@ test("a truncated pull reaches a COMPLETE state through its continuation", async
     // THE STORY (finding 4). The pull is resumable and reports `complete:false`
     // when it truncates, but only one invocation a night existed — so the
     // parked cursor sat until 02:00 the NEXT night, eleven hours after the
-    // 13:00 chaser had already found an uncertified register and held its cycle
+    // 10:00 chaser had already found an uncertified register and held its cycle
     // open. The cards were lost to a backlog that was draining fine.
     const stored = new Map<string, string>();
     let saved: PullWindowState = { highWater: "2026-08-11", lastFullSweep: "2026-08-11", continueAfter: null };
@@ -434,7 +434,7 @@ test("a truncated pull reaches a COMPLETE state through its continuation", async
     const second = await runBankRegisterPull(deps(Number.POSITIVE_INFINITY));
     assert.deepEqual(second.resumedAfter, parkedAt, "it resumes past what the first run posted");
     assert.equal(second.ok, true);
-    assert.equal(second.complete, true, "and reaches a complete pull — hours before the 13:00 chaser");
+    assert.equal(second.complete, true, "and reaches a complete pull — hours before the 10:00 chaser");
     assert.equal(saved.continueAfter, null, "the resume point is cleared");
     assert.equal(stored.size, 600, "every row landed exactly once across the two invocations");
 });
@@ -449,10 +449,10 @@ test("the continuation is scheduled, bounded, and stops before the chaser", () =
     assert.ok(resume, "the pull needs a continuation slot, exactly as the chaser has one");
     // OFFSET off the hour (round-45 gate, finding 2): `*/15` fired at 02:00,
     // the same minute as the full pull it was meant to continue.
-    assert.equal(resume, "5-59/15 2-12 * * *");
+    assert.equal(resume, "5-59/15 2-9 * * *");
 
     // The ordering the whole design rests on, asserted rather than assumed: the
-    // last continuation lands before the 13:00 sweep, and there are enough of
+    // last continuation lands before the 10:00 sweep, and there are enough of
     // them for a real backlog to drain.
     const [minutes, hours] = (resume as string).split(" ");
     assert.equal(minutes, "5-59/15");
@@ -465,6 +465,6 @@ test("the continuation is scheduled, bounded, and stops before the chaser", () =
     );
     const [firstHour, lastHour] = hours.split("-").map(Number);
     assert.equal(firstHour, 2, "it starts with the nightly pull");
-    assert.ok(lastHour < 13, "and every slot lands before the 13:00 chaser");
-    assert.equal((lastHour - firstHour + 1) * 4, 44, "44 chances to drain a backlog, where there used to be none");
+    assert.ok(lastHour < 10, "and every slot lands before the 10:00 chaser");
+    assert.equal((lastHour - firstHour + 1) * 4, 32, "32 chances to drain a backlog, where there used to be none");
 });
