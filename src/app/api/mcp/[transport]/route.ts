@@ -61,6 +61,11 @@ import { listInspections, recordInspectionWithConfirmation } from "@/lib/mcp-ins
 // machine-to-machine pattern as /api/integrations. ChatGPT custom connectors
 // offer only OAuth or no-auth, so the secret rides in the connector URL.
 // /api/mcp is excluded from the session-redirect matcher in src/proxy.ts.
+//
+// A key matching MCP_READONLY_SECRET instead authenticates as "readonly-ai":
+// same endpoint, but only the READONLY_TOOLS allowlist below ever gets
+// registered on the server, so every write tool is entirely absent (not just
+// hidden) for that key. See wrapReadOnlyMode. Unset by default.
 
 export const maxDuration = 60;
 
@@ -185,6 +190,25 @@ const WRITE_TOOLS = new Set([
 // bill_change_order is deliberately NOT here: fixed-price orders bill without
 // emailing anyone, so "mcp_send_bill_change_order" would misreport a plain
 // billing action as a customer send. It stays in WRITE_TOOLS for auditing.
+
+// ── Read-only mode (MCP_READONLY_SECRET) ────────────────────────────────────
+// Explicit ALLOWLIST, not a denylist: a tool only reaches a read-only caller
+// if its name is listed here, so a new tool defaults to HIDDEN until someone
+// deliberately adds it. This is exactly the set of tools registered below
+// with `annotations: { readOnlyHint: true }` — no create/update/delete/send/
+// email/QuickBooks-push/other side effect. read_file and get_file_link are
+// read-only in this sense too (they only ever fetch content, never write
+// anything) even though WRITE_TOOLS above also audits them for content access.
+const READONLY_TOOLS = new Set([
+    "list_projects", "list_leads", "find_job", "get_estimating_codes",
+    "list_templates", "get_template", "get_estimate",
+    "list_project_billing", "list_receivables", "list_change_orders",
+    "list_project_files", "read_file", "get_file_link",
+    "list_daily_logs", "list_inspections", "list_punch_items", "get_project_contacts",
+    "list_contract_templates", "list_contracts", "get_contract",
+    "get_company_schedule", "get_project_schedule", "list_crew_availability",
+    "get_activity_log",
+]);
 const SEND_TOOLS = new Set([
     "send_estimate", "send_contract", "send_change_order",
     "send_milestone_invoice", "resend_invoice",
@@ -450,9 +474,28 @@ function wrapWriteTools(server: { registerTool: (...args: any[]) => unknown }, a
     };
 }
 
+// Monkeypatches registerTool so a read-only actor never gets a non-allowlisted
+// tool registered on its server instance at all — not filtered out of
+// tools/list after the fact, and not rejected inside a handler that still
+// ran. It is simply never added to this request's McpServer, so tools/list
+// can't return it and tools/call has nothing to find (mcp-handler's own
+// "unknown tool" error rejects it) — checked fresh on every request, since
+// createHandler(actor) reruns this whole registration for each call. A no-op
+// for justin-ai/richard-ai: MCP_SECRET/MCP_SECRET_RICHARD behavior is
+// untouched.
+function wrapReadOnlyMode(server: { registerTool: (...args: any[]) => unknown }, actor: RouteMcpActor) {
+    if (actor.actorLabel !== "readonly-ai") return;
+    const originalRegisterTool = server.registerTool.bind(server);
+    server.registerTool = (name: string, config: unknown, cb: (...cbArgs: any[]) => unknown) => {
+        if (!READONLY_TOOLS.has(name)) return undefined;
+        return originalRegisterTool(name, config, cb);
+    };
+}
+
 function createHandler(actor: RouteMcpActor) {
     return createMcpHandler(
     server => {
+        wrapReadOnlyMode(server, actor);
         wrapWriteTools(server, actor);
 
         server.registerTool(
@@ -2775,6 +2818,10 @@ export function resolveMcpActorLabel(req: Request): McpActorLabel | null {
     const candidates: Array<[McpActorLabel, string | undefined]> = [
         ["justin-ai", process.env.MCP_SECRET],
         ["richard-ai", process.env.MCP_SECRET_RICHARD],
+        // Unset by default — MCP_READONLY_SECRET only exists once an operator
+        // opts in. `secret` is then undefined, so this candidate can never
+        // match regardless of what key is supplied (same guard as above).
+        ["readonly-ai", process.env.MCP_READONLY_SECRET],
     ];
     for (const [actorLabel, secret] of candidates) {
         const configuredHash = createHash("sha256").update(secret ?? "").digest();
@@ -2785,7 +2832,7 @@ export function resolveMcpActorLabel(req: Request): McpActorLabel | null {
 }
 
 function guarded(req: Request) {
-    if (!process.env.MCP_SECRET && !process.env.MCP_SECRET_RICHARD) {
+    if (!process.env.MCP_SECRET && !process.env.MCP_SECRET_RICHARD && !process.env.MCP_READONLY_SECRET) {
         return Response.json({ error: "MCP connector not configured" }, { status: 503 });
     }
     const actorLabel = resolveMcpActorLabel(req);
