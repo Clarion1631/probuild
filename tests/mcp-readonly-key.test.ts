@@ -139,6 +139,45 @@ test("MCP_READONLY_SECRET colliding with MCP_SECRET_RICHARD resolves to NO actor
     });
 });
 
+test("MCP_READONLY_SECRET equal to BOTH MCP_SECRET and MCP_SECRET_RICHARD (all three the same): the readonly key resolves to null", () => {
+    withEnv({ MCP_SECRET: "shared-secret", MCP_SECRET_RICHARD: "shared-secret", MCP_READONLY_SECRET: "shared-secret" }, () => {
+        assert.equal(resolveMcpActorLabel(reqWithKey("shared-secret")), null);
+    });
+});
+
+test("MCP_READONLY_SECRET equal to BOTH MCP_SECRET and MCP_SECRET_RICHARD (all three the same): the shared value resolves to null for every actor, not just the first collision found", () => {
+    withEnv({ MCP_SECRET: "shared-secret", MCP_SECRET_RICHARD: "shared-secret", MCP_READONLY_SECRET: "shared-secret" }, () => {
+        // Round-2 regression: readonlySecretCollision() used to return only the FIRST colliding
+        // variable name ("MCP_SECRET"), leaving richard-ai's candidate secret intact — so the
+        // readonly key silently authenticated as richard-ai, which has full write access. It must
+        // now disable every colliding full-access candidate, not just the first one found.
+        assert.notEqual(resolveMcpActorLabel(reqWithKey("shared-secret")), "justin-ai");
+        assert.notEqual(resolveMcpActorLabel(reqWithKey("shared-secret")), "richard-ai");
+        assert.notEqual(resolveMcpActorLabel(reqWithKey("shared-secret")), "readonly-ai");
+        assert.equal(resolveMcpActorLabel(reqWithKey("shared-secret")), null);
+    });
+});
+
+test("MCP_SECRET colliding with MCP_SECRET_RICHARD alone (MCP_READONLY_SECRET distinct) is unaffected by the readonly-collision guard — existing pairwise behavior, unchanged from main", () => {
+    withEnv({ MCP_SECRET: "shared-secret", MCP_SECRET_RICHARD: "shared-secret", MCP_READONLY_SECRET: "readonly-secret" }, () => {
+        // readonlySecretCollision() only compares MCP_READONLY_SECRET against the other two, so a
+        // collision between MCP_SECRET and MCP_SECRET_RICHARD alone is outside its scope — this
+        // fix does not touch that case. The candidate loop's pre-existing, unchanged behavior is
+        // first-match-in-list-order wins, and justin-ai is listed before richard-ai.
+        assert.equal(resolveMcpActorLabel(reqWithKey("shared-secret")), "justin-ai");
+        // The genuinely distinct readonly secret is unaffected.
+        assert.equal(resolveMcpActorLabel(reqWithKey("readonly-secret")), "readonly-ai");
+    });
+});
+
+test("all three secrets distinct: readonly-ai, justin-ai and richard-ai each resolve normally", () => {
+    withEnv({ MCP_SECRET: "full-secret", MCP_SECRET_RICHARD: "richard-secret", MCP_READONLY_SECRET: "readonly-secret" }, () => {
+        assert.equal(resolveMcpActorLabel(reqWithKey("full-secret")), "justin-ai");
+        assert.equal(resolveMcpActorLabel(reqWithKey("richard-secret")), "richard-ai");
+        assert.equal(resolveMcpActorLabel(reqWithKey("readonly-secret")), "readonly-ai");
+    });
+});
+
 // ── secretForActor ───────────────────────────────────────────────────────────
 
 test('secretForActor("readonly-ai") never falls through to MCP_SECRET', () => {

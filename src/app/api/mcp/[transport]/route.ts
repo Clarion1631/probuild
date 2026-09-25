@@ -2831,19 +2831,24 @@ function createHandler(actor: RouteMcpActor) {
 }
 
 // Detects an operator misconfiguration: MCP_READONLY_SECRET set to the exact
-// same value as one of the full-access secrets. Compared the same way as the
-// candidates below — fixed-length sha256 digests, timingSafeEqual.
-function readonlySecretCollision(): "MCP_SECRET" | "MCP_SECRET_RICHARD" | null {
+// same value as one or both full-access secrets. Compared the same way as the
+// candidates below — fixed-length sha256 digests, timingSafeEqual. Returns
+// every colliding full-access variable name, not just the first one found —
+// MCP_SECRET and MCP_SECRET_RICHARD can both equal MCP_READONLY_SECRET at the
+// same time (e.g. an operator sets all three to one value), and both must be
+// disabled, not just whichever was checked first.
+function readonlySecretCollision(): Set<"MCP_SECRET" | "MCP_SECRET_RICHARD"> {
+    const colliding = new Set<"MCP_SECRET" | "MCP_SECRET_RICHARD">();
     const readonlySecret = process.env.MCP_READONLY_SECRET;
-    if (!readonlySecret) return null;
+    if (!readonlySecret) return colliding;
     const readonlyHash = createHash("sha256").update(readonlySecret).digest();
     const sameAs = (other: string | undefined): boolean => {
         if (!other) return false;
         return timingSafeEqual(readonlyHash, createHash("sha256").update(other).digest());
     };
-    if (sameAs(process.env.MCP_SECRET)) return "MCP_SECRET";
-    if (sameAs(process.env.MCP_SECRET_RICHARD)) return "MCP_SECRET_RICHARD";
-    return null;
+    if (sameAs(process.env.MCP_SECRET)) colliding.add("MCP_SECRET");
+    if (sameAs(process.env.MCP_SECRET_RICHARD)) colliding.add("MCP_SECRET_RICHARD");
+    return colliding;
 }
 
 // Shared-secret gate: every candidate secret is hashed to a fixed-length
@@ -2860,26 +2865,26 @@ export function resolveMcpActorLabel(req: Request): McpActorLabel | null {
     // full-access actor — an operator who hands this key to an AI agent
     // believes it can only read. Detected from the env vars themselves, not
     // from the supplied key, so it fails closed regardless of which value
-    // comes in: BOTH the readonly-ai candidate and whichever full-access
-    // candidate shares its value are voided below, so that shared secret
-    // matches no actor at all until MCP_READONLY_SECRET is set to its own
-    // distinct value. The other, non-colliding full-access secret (if any)
-    // is unaffected.
+    // comes in: BOTH the readonly-ai candidate and EVERY full-access
+    // candidate that shares its value are voided below, so that shared
+    // secret matches no actor at all until MCP_READONLY_SECRET is set to its
+    // own distinct value. The other, non-colliding full-access secret (if
+    // any) is unaffected.
     const collision = readonlySecretCollision();
-    if (collision) {
+    if (collision.size > 0) {
         console.error(
-            `[MCP AUTH] MCP_READONLY_SECRET is set to the same value as ${collision} — refusing to authenticate with either until MCP_READONLY_SECRET is changed to its own distinct value.`,
+            `[MCP AUTH] MCP_READONLY_SECRET is set to the same value as ${[...collision].join(" and ")} — refusing to authenticate with either until MCP_READONLY_SECRET is changed to its own distinct value.`,
         );
     }
 
     let matched: McpActorLabel | null = null;
     const candidates: Array<[McpActorLabel, string | undefined]> = [
-        ["justin-ai", collision === "MCP_SECRET" ? undefined : process.env.MCP_SECRET],
-        ["richard-ai", collision === "MCP_SECRET_RICHARD" ? undefined : process.env.MCP_SECRET_RICHARD],
+        ["justin-ai", collision.has("MCP_SECRET") ? undefined : process.env.MCP_SECRET],
+        ["richard-ai", collision.has("MCP_SECRET_RICHARD") ? undefined : process.env.MCP_SECRET_RICHARD],
         // Unset by default — MCP_READONLY_SECRET only exists once an operator
         // opts in. `secret` is then undefined, so this candidate can never
         // match regardless of what key is supplied (same guard as above).
-        ["readonly-ai", collision ? undefined : process.env.MCP_READONLY_SECRET],
+        ["readonly-ai", collision.size > 0 ? undefined : process.env.MCP_READONLY_SECRET],
     ];
     for (const [actorLabel, secret] of candidates) {
         const configuredHash = createHash("sha256").update(secret ?? "").digest();
