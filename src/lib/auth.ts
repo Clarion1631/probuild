@@ -127,19 +127,12 @@ export const authOptions: NextAuthOptions = {
         // Second, server-side fence behind safeCallbackPath (src/lib/login-callback.ts):
         // whatever reaches here -- the login page's callbackUrl, or a call next-auth
         // makes internally -- must resolve to a safe path on this origin before the
-        // browser is sent there. Same shape as next-auth's own default redirect
-        // callback, but every path it would allow is re-checked by the shared helper.
+        // browser is sent there. `baseUrl` is passed through as the trusted origin so
+        // this is the single call safeCallbackPath makes its own decision from,
+        // handling both a relative `url` and a same-origin absolute one the same way
+        // the login page does -- no separate origin check duplicated here.
         async redirect({ url, baseUrl }) {
-            if (url.startsWith("/")) return baseUrl + safeCallbackPath(url);
-            try {
-                const parsed = new URL(url);
-                if (parsed.origin === baseUrl) {
-                    return baseUrl + safeCallbackPath(parsed.pathname + parsed.search + parsed.hash);
-                }
-            } catch {
-                // Malformed url: fall through to baseUrl.
-            }
-            return baseUrl;
+            return baseUrl + safeCallbackPath(url, baseUrl);
         },
     },
     secret: process.env.NEXTAUTH_SECRET,

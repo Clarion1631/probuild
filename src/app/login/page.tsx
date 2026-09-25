@@ -9,7 +9,16 @@ import { safeCallbackPath } from "@/lib/login-callback";
 function LoginForm() {
     const searchParams = useSearchParams();
     const error = searchParams.get('error');
-    const callbackUrl = safeCallbackPath(searchParams.get('callbackUrl'));
+    // Same-origin absolute callback URLs are handled identically to the
+    // NextAuth redirect callback (src/lib/auth.ts), which passes its own
+    // trusted `baseUrl` the same way -- see safeCallbackPath's doc comment.
+    // `window` is undefined during server rendering; a relative callbackUrl
+    // still works then, and this component is only interactive (the button
+    // is only clickable) once hydrated, when `window` exists.
+    const callbackUrl = safeCallbackPath(
+        searchParams.get('callbackUrl'),
+        typeof window !== "undefined" ? window.location.origin : undefined
+    );
 
     return (
         <div className="relative min-h-screen flex items-center justify-center overflow-hidden bg-slate-900 w-full">
