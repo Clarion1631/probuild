@@ -90,3 +90,15 @@ test("refuses when the intake row itself no longer exists -- setter never called
     );
     assert.deepEqual(setCalls, []);
 });
+
+test("a setJob refusal ({ ok: false, message }) is thrown, not returned -- the caller's plain useAction wrapper treats any non-throwing resolution as success", async () => {
+    const { deps } = makeDeps({
+        sourceFolder: "Oak Street",
+        openJobs: jobs(["Oak Street"]),
+        setJob: async () => ({ ok: false, message: "This receipt changed underneath you — refresh." }),
+    });
+    await assert.rejects(
+        () => decideReceiptIntakeJobFromSuggestion("intake-1", "job-0", "NEEDS_JOB", "2026-09-24T00:00:00.000Z", deps),
+        /This receipt changed underneath you — refresh\./,
+    );
+});
