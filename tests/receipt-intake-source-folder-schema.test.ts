@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import path from 'node:path';
 import { validateMigrationTarget, statements } from '../scripts/apply-receipt-intake-source-folder.mjs';
 import { assertCiDatabaseTarget, EXPECTED_CI_DATABASE } from '../scripts/ci-receipt-intake-source-folder-column.mjs';
+
+const ROOT = path.join(__dirname, '..');
 
 test('schema migration requires explicit expected URL host/db and yes', () => {
     const url = 'postgresql://test:test@db.example.test:6543/example?pgbouncer=true';
@@ -107,6 +111,38 @@ test('ci-receipt-intake-source-folder-column.mjs refuses a missing or unparseabl
     assert.throws(() => assertCiDatabaseTarget(undefined));
     assert.throws(() => assertCiDatabaseTarget(''));
     assert.throws(() => assertCiDatabaseTarget('not a url'));
+});
+
+test('ci-receipt-intake-source-folder-column.mjs the real drop command refuses a bad DATABASE_URL before touching @prisma/client (checker, PR #555 round 3, mutation proof)', () => {
+    // tests/receipt-intake-source-folder-schema.test.ts only ever exercised
+    // assertCiDatabaseTarget as a pure function, imported straight from the
+    // module -- so a mutation deleting its call site inside main() (the real
+    // guard on the raw DROP COLUMN) still left every test in this file
+    // passing 9/9. This spawns the actual script the way CI does, so the
+    // guard has to run for real. It is safe: the refusal happens before
+    // `@prisma/client` is ever imported, so nothing dials a database, even
+    // for the unreachable 127.0.0.1:1 case below (proven by hand first).
+    const run = (databaseUrl: string) => {
+        try {
+            const stdout = execFileSync(
+                process.execPath,
+                ['scripts/ci-receipt-intake-source-folder-column.mjs', 'drop'],
+                { cwd: ROOT, env: { ...process.env, DATABASE_URL: databaseUrl }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000 },
+            );
+            return { code: 0, stdout, stderr: '' };
+        } catch (error) {
+            const failure = error as { status?: number; stdout?: string; stderr?: string };
+            return { code: failure.status ?? -1, stdout: failure.stdout ?? '', stderr: failure.stderr ?? '' };
+        }
+    };
+
+    const supabaseHost = run('postgresql://u:p@fake.supabase.co.invalid:5432/probuild_migrations');
+    assert.equal(supabaseHost.code, 1, 'a Supabase-looking host must exit 1, not run the drop');
+    assert.match(supabaseHost.stderr, /REFUSING/);
+
+    const wrongDb = run('postgresql://u:p@127.0.0.1:1/postgres');
+    assert.equal(wrongDb.code, 1, 'the wrong database name must exit 1, not attempt to connect to port 1');
+    assert.match(wrongDb.stderr, /REFUSING/);
 });
 
 test('schema.prisma declares the nullable column on ReceiptIntake', async () => {
