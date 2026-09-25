@@ -1,29 +1,37 @@
 "use server";
 
 /**
- * A thin, SEPARATE wrapper for the folder-suggestion buttons only.
+ * A thin, SEPARATE, AUTHORIZED wrapper for the folder-suggestion buttons
+ * only. `setReceiptIntakeJob` (src/lib/actions.ts) is reused UNCHANGED for
+ * the normal Set job control, and this file never edits it — its tests pin
+ * exact line numbers (build brief). The write-time re-check itself lives in
+ * suggestion-core.ts (no "use server", injected loaders), so it is
+ * unit-testable without a database; this file's only job is to authorize the
+ * caller and then hand off to that core with the real, Prisma-backed
+ * loaders.
  *
- * `setReceiptIntakeJob` (src/lib/actions.ts) is reused UNCHANGED for the
- * normal Set job control, and this file never edits it — its tests pin exact
- * line numbers (build brief). A suggestion button is different: it was
- * rendered from a SNAPSHOT of the open-job list, taken when the page loaded.
- * By the time someone taps it, the tapped job may have closed, or the
- * folder-to-job rule may no longer consider it a match (a namesake opened, a
- * job was renamed). Neither of those is a fact `setReceiptIntakeJob`'s own
- * checks can see — it only knows the job still EXISTS and that the RECEIPT
- * row is still in the state and version rendered.
- *
- * So this re-derives both facts, "still open" and "still a candidate", from
- * the database at write time, and refuses with a plain message before ever
- * reaching setReceiptIntakeJob if either has changed. It does not check the
- * receipt's row again itself — setReceiptIntakeJob's own compare-and-set
- * still owns that, unchanged.
+ * AUTHORIZATION (checker, PR #555 round 3): the moment a file starts with
+ * "use server", every export becomes a Server Action with a GLOBAL, PUBLIC
+ * id — dispatchable by anyone who can name it, whether or not any UI button
+ * ever calls it (tests/server-action-gates.test.ts). This export used to
+ * read the receipt row and the open-job list before checking who was asking.
+ * The check now runs FIRST, before any database read, and is the same one
+ * setReceiptIntakeJob itself is gated by (assertReceiptQueueAccess in
+ * src/lib/actions.ts: getCurrentUserWithPermissions + hasPermission
+ * "financialReports"), plus canAccessProject for the chosen project. It is
+ * duplicated inline rather than imported, because assertReceiptQueueAccess is
+ * not exported — exporting it from actions.ts, itself a "use server" module,
+ * would add a second dispatchable action id, which is exactly the class of
+ * hole this fix closes (see tests/server-action-gates.test.ts: "the gate
+ * helper is not itself a dispatchable action"). Every rejection returns the
+ * same generic message, so an unauthorized caller learns nothing about which
+ * check failed.
  */
 import { prisma } from "@/lib/prisma";
 import { setReceiptIntakeJob } from "@/lib/actions";
-import { isFolderCandidate } from "@/lib/receipt-intake/folder";
+import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
 import { fetchJobOptions } from "@/app/automation/receipts-data";
-import { JOB_OPTIONS_TAKE } from "@/app/automation/receipts-filters";
+import { decideReceiptIntakeJobFromSuggestion } from "@/lib/receipt-intake/suggestion-core";
 
 export async function setReceiptIntakeJobFromSuggestion(
     id: string,
@@ -31,17 +39,20 @@ export async function setReceiptIntakeJobFromSuggestion(
     expectedState: string,
     expectedUpdatedAt: string,
 ) {
-    const row = await prisma.receiptIntake.findUnique({ where: { id }, select: { sourceFolder: true } });
-    if (!row?.sourceFolder) {
-        throw new Error("This receipt no longer has a folder to suggest from. Refresh and use Set job.");
+    const user = await getCurrentUserWithPermissions();
+    if (
+        !user
+        || !hasPermission(user, "financialReports")
+        || typeof projectId !== "string"
+        || !projectId
+        || !canAccessProject(user, projectId)
+    ) {
+        throw new Error("Forbidden");
     }
-    // fetchJobOptions is already scoped to OPEN_PROJECT_STATUSES, so a job
-    // that closed since the page loaded simply will not be in this list —
-    // that IS the "still open" check.
-    const jobs = await fetchJobOptions();
-    const stillACandidate = isFolderCandidate(row.sourceFolder, jobs, JOB_OPTIONS_TAKE, projectId);
-    if (!stillACandidate) {
-        throw new Error("That job is no longer open or no longer matches this receipt's folder. Refresh and use Set job.");
-    }
-    return setReceiptIntakeJob(id, projectId, expectedState, expectedUpdatedAt);
+
+    return decideReceiptIntakeJobFromSuggestion(id, projectId, expectedState, expectedUpdatedAt, {
+        loadIntake: (intakeId) => prisma.receiptIntake.findUnique({ where: { id: intakeId }, select: { sourceFolder: true } }),
+        loadOpenJobs: fetchJobOptions,
+        setJob: setReceiptIntakeJob,
+    });
 }

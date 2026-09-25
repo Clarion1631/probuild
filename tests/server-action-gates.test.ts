@@ -30,6 +30,7 @@ const ACTION_MODULES = [
     "src/lib/subcontractor-actions.ts",
     "src/lib/budget-actions.ts",
     "src/lib/time-expense-actions.ts",
+    "src/lib/receipt-intake/suggestion-actions.ts",
 ];
 
 /**

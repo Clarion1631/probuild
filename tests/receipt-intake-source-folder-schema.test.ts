@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateMigrationTarget, statements } from '../scripts/apply-receipt-intake-source-folder.mjs';
+import { assertCiDatabaseTarget, EXPECTED_CI_DATABASE } from '../scripts/ci-receipt-intake-source-folder-column.mjs';
 
 test('schema migration requires explicit expected URL host/db and yes', () => {
     const url = 'postgresql://test:test@db.example.test:6543/example?pgbouncer=true';
@@ -69,6 +70,43 @@ test('CI applies the schema, proves it against an ABSENT column, and pins the ho
     const firstApplyIndex = step.indexOf('apply-receipt-intake-source-folder.mjs');
     assert.ok(dropIndex >= 0 && firstApplyIndex >= 0);
     assert.ok(dropIndex < firstApplyIndex, 'the drop must run before the first apply call');
+});
+
+test('ci-receipt-intake-source-folder-column.mjs refuses a Supabase-looking host (DANGER: it runs a raw DROP COLUMN)', () => {
+    assert.equal(EXPECTED_CI_DATABASE, 'probuild_migrations');
+    assert.throws(
+        () => assertCiDatabaseTarget('postgresql://postgres.abc123:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true'),
+        /REFUSING/,
+        'a pooler.supabase.com host must be refused',
+    );
+    assert.throws(
+        () => assertCiDatabaseTarget('postgresql://test:test@db.example.supabase.co:5432/probuild_migrations'),
+        /REFUSING/,
+        'a supabase.co host must be refused',
+    );
+});
+
+test('ci-receipt-intake-source-folder-column.mjs refuses any database name other than the CI one', () => {
+    assert.throws(
+        () => assertCiDatabaseTarget('postgresql://probuild:probuild@localhost:5432/postgres'),
+        /REFUSING/,
+        'the CI harness never touches the bare "postgres" database',
+    );
+    assert.throws(
+        () => assertCiDatabaseTarget('postgresql://probuild:probuild@localhost:5432/probuild_apply_fresh'),
+        /REFUSING/,
+        'a different throwaway db name must still be refused -- only the exact CI db name is accepted',
+    );
+    assert.doesNotThrow(
+        () => assertCiDatabaseTarget('postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true'),
+        'the real CI DATABASE_URL from ci.yml must be accepted',
+    );
+});
+
+test('ci-receipt-intake-source-folder-column.mjs refuses a missing or unparseable DATABASE_URL', () => {
+    assert.throws(() => assertCiDatabaseTarget(undefined));
+    assert.throws(() => assertCiDatabaseTarget(''));
+    assert.throws(() => assertCiDatabaseTarget('not a url'));
 });
 
 test('schema.prisma declares the nullable column on ReceiptIntake', async () => {
