@@ -24,6 +24,7 @@ import {
 // Imported ONLY to pin the deliberate divergence documented below — the
 // predicate no longer uses it.
 import { isValidDate } from "../src/lib/receipt-intake/keys";
+import { nonReceiptSetJobOverride, parseReadJson } from "../src/lib/receipt-intake/read";
 
 const NO_HITS = { strong: null, weak: null };
 const clean = { docType: "receipt", amount: "364.98", totalCents: 36498, canonicalVendor: "lowes" };
@@ -39,6 +40,45 @@ test("multi outranks everything, including a missing project", () => {
 test("a non-receipt is its own terminal state, not a review item", () => {
     const d = routeState({ docType: "non_receipt", amount: "0.00", totalCents: null, canonicalVendor: "" }, NO_HITS, true);
     assert.deepEqual(d, { state: "NON_RECEIPT", stateReason: null, duplicateOfId: null });
+});
+
+test("a Set-job override survives the worker's own heal/recover reconstruction, not just a clean fixture", () => {
+    // recoverStrongKey (worker.ts) never trusts the row's docType column on its
+    // own — it re-derives its routeInput by re-PARSING the row's persisted
+    // readJson (`parseReadJson(row.readJson, [])`). So the override has to patch
+    // readJson's OWN embedded doc_type, not just the row's column: a fix that
+    // only touched the column would pass a test built from a clean `{docType:
+    // "receipt", ...}` fixture while this exact reconstruction still read
+    // "non_receipt" back out of the persisted JSON and routed to NON_RECEIPT
+    // again. This test builds the input the same way that heal path does.
+    const priorReadJson = JSON.stringify({
+        doc_type: "non_receipt",
+        vendor: "Cash App",
+        total_amount: "42.00",
+        date: "2026-09-20",
+    });
+    const overridden = nonReceiptSetJobOverride(
+        "NON_RECEIPT",
+        priorReadJson,
+        "user-1",
+        new Date("2026-09-24T12:00:00.000Z"),
+    );
+    assert.equal(overridden.kind, "apply");
+    if (overridden.kind !== "apply") return;
+
+    const read = parseReadJson(overridden.readJson, []);
+    assert.ok(read, "the patched readJson must still parse");
+    const routeInput = {
+        docType: read!.docType,
+        amount: read!.totalAmount,
+        totalCents: 4200,
+        canonicalVendor: "cashapp",
+        dateStr: read!.date,
+        referenceDay: read!.date,
+    };
+    const d = routeState(routeInput, NO_HITS, true);
+    assert.notEqual(d.state, "NON_RECEIPT");
+    assert.equal(d.state, "READ");
 });
 
 test("a $0.00 total is a misread and is parked BEFORE any dedup or job check", () => {

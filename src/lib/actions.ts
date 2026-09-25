@@ -24,6 +24,7 @@ import { rowFingerprint, type RowFingerprintInput } from "./rate-import";
 import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
+import { nonReceiptSetJobOverride } from "./receipt-intake/read";
 import { POSSIBLE_ORPHAN_REASON, UNKNOWN_ORPHAN_STATES, planParkWrites, type ParkPlan } from "./receipt-intake/park";
 import { duplicateChainRefusal, withEvidenceAndChainLocks } from "./receipt-intake/duplicate-guard";
 import { driveFileIdOf } from "./receipt-intake/book";
@@ -16013,62 +16014,132 @@ function revalidateReceiptQueue() {
 }
 
 /**
+ * A refusal `setReceiptIntakeJob` can ANTICIPATE — wrong state, a vanished
+ * project, a cost code that isn't this job's — reaches the caller as a return
+ * value, never a thrown error (Next sanitizes thrown server-action messages in
+ * production, which is what turned this refusal into a generic crash). Same
+ * shape as `ReceiptMoveRefusedError`/`moveReceiptExpenseToJob` in
+ * booked-expense.ts. Genuinely unexpected failures (bad auth, malformed ids)
+ * still throw.
+ */
+class ReceiptJobRefusedError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "ReceiptJobRefusedError";
+    }
+}
+
+/**
  * Assign a job (and optionally a cost code) and hand the row back to the
  * worker at `READ`. Deliberately NOT `BOOKING`: routing owns dedup, and
  * jumping the row straight to booking would skip the weak/strong duplicate
  * checks that stand between a re-uploaded receipt and a double purchase.
+ *
+ * NON_RECEIPT is a legal starting state too, and it means something different
+ * from the other two: picking a job there is the human override for "the AI
+ * called this a non-receipt and it's wrong — this IS a receipt, book it here."
+ * `nonReceiptSetJobOverride` re-stamps the row's docType (and, best-effort, its
+ * stored read JSON) in the SAME atomic update, so the worker's booking gate
+ * (book.ts) sees a receipt, not the classification this click is overruling.
+ * Without it the row would reach READ, get reclaimed by the cron, and bounce
+ * straight back to review the instant book.ts read its docType column back —
+ * a silent failure behind a toast that already said "done".
  */
-export async function setReceiptIntakeJob(id: string, projectId: string, expectedState: string, expectedUpdatedAt: string, costCodeId?: string | null) {
+export async function setReceiptIntakeJob(id: string, projectId: string, expectedState: string, expectedUpdatedAt: string, costCodeId?: string | null): Promise<{ ok: true } | { ok: false; message: string }> {
     const user = await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
     if (typeof projectId !== "string" || !projectId) throw new Error("projectId is required");
     if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
 
-    const project = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
-    if (!project) throw new Error("That job no longer exists");
+    try {
+        const now = new Date();
+        // BEFORE any DB read: a malformed/stale expectedState or expectedUpdatedAt
+        // is exactly the kind of anticipated refusal this action must not throw
+        // for, and there is no reason to spend two queries finding that out.
+        // assertExpectedState/assertExpectedUpdatedAt are shared by every queue
+        // action and keep their throwing behavior for those other callers — this
+        // catches it locally rather than changing what they do.
+        let expected: string;
+        let seenAt: Date;
+        try {
+            expected = assertExpectedState(expectedState);
+            seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+        } catch (error) {
+            return {
+                ok: false,
+                message: error instanceof Error ? error.message : "Refresh the page and try again — that view is out of date.",
+            };
+        }
+        if (!["NEEDS_JOB", "NEEDS_REVIEW", "NON_RECEIPT"].includes(expected)) {
+            throw new ReceiptJobRefusedError("A job can only be set on a receipt waiting for one");
+        }
 
-    // "The cost code exists" is not a permission — it has to be a phase of THIS
-    // job. The same rule the clock-in validator applies.
-    if (costCodeId && !(await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId))) {
-        throw new Error("That cost code isn't a phase on this job");
+        const project = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
+        if (!project) throw new ReceiptJobRefusedError("That job no longer exists");
+
+        // "The cost code exists" is not a permission — it has to be a phase of THIS
+        // job. The same rule the clock-in validator applies.
+        if (costCodeId && !(await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId))) {
+            throw new ReceiptJobRefusedError("That cost code isn't a phase on this job");
+        }
+
+        // MOVING A RECEIPT MOVES ITS JOB, so a code carried over from the old job is
+        // almost certainly wrong for the new one — and a wrong code is a wrong job
+        // cost, which is worse than no code at all. Clear it and let the worker
+        // re-suggest against the new project's phases.
+        const existing = await prisma.receiptIntake.findUnique({
+            where: { id },
+            select: { costCodeId: true, readJson: true },
+        });
+        const keepExisting = !costCodeId
+            && existing?.costCodeId
+            && await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, existing.costCodeId);
+
+        // "not-applicable" for every state but NON_RECEIPT, and also when the row
+        // itself is already gone: a MISSING row must fall through to the CAS
+        // below and come back as the ordinary not-found refusal
+        // (receiptIntakeWriteFailure), not as "can't be switched automatically"
+        // — that message is specifically about a PRESENT row's unreadable
+        // evidence, not a row that no longer exists at all. "refuse" means the
+        // row WAS NON_RECEIPT and IS present but its readJson is missing or
+        // unparseable — nothing to audit the override against, so the whole
+        // action is refused rather than flipping docType with no record of why.
+        // See nonReceiptSetJobOverride.
+        const overrideResult = existing
+            ? nonReceiptSetJobOverride(expected, existing.readJson, user.id, now)
+            : ({ kind: "not-applicable" } as const);
+        if (overrideResult.kind === "refuse") {
+            throw new ReceiptJobRefusedError("This item can't be switched to a receipt automatically. Ask Justin.");
+        }
+        const override = overrideResult.kind === "apply"
+            ? { docType: overrideResult.docType, readJson: overrideResult.readJson }
+            : {};
+
+        const result = await evidenceIntakeUpdateMany({
+            where: { id, state: expected, updatedAt: seenAt, ...notClaimedByWorker(now) },
+            data: {
+                projectId,
+                // Explicit code wins; otherwise keep one still valid here, else null.
+                costCodeId: costCodeId ?? (keepExisting ? existing!.costCodeId : null),
+                // A stale suggestion is re-derived against the new job's phases.
+                suggestedCostCodeId: null,
+                suggestedConfidence: null,
+                state: "READ",
+                stateReason: null,
+                lastError: null,
+                nextRetryAt: null,
+                ...override,
+            },
+        });
+        if (result.count === 0) await receiptIntakeWriteFailure(id, [expected], now);
+        revalidateReceiptQueue();
+        return { ok: true };
+    } catch (error) {
+        if (error instanceof ReceiptJobRefusedError || error instanceof StaleReceiptIntakeError) {
+            return { ok: false, message: error.message };
+        }
+        throw error;
     }
-
-    // MOVING A RECEIPT MOVES ITS JOB, so a code carried over from the old job is
-    // almost certainly wrong for the new one — and a wrong code is a wrong job
-    // cost, which is worse than no code at all. Clear it and let the worker
-    // re-suggest against the new project's phases.
-    const existing = await prisma.receiptIntake.findUnique({
-        where: { id },
-        select: { costCodeId: true },
-    });
-    const keepExisting = !costCodeId
-        && existing?.costCodeId
-        && await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, existing.costCodeId);
-
-    const now = new Date();
-    const expected = assertExpectedState(expectedState);
-    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
-    if (!["NEEDS_JOB", "NEEDS_REVIEW"].includes(expected)) {
-        throw new Error("A job can only be set on a receipt waiting for one");
-    }
-    const result = await evidenceIntakeUpdateMany({
-        where: { id, state: expected, updatedAt: seenAt, ...notClaimedByWorker(now) },
-        data: {
-            projectId,
-            // Explicit code wins; otherwise keep one still valid here, else null.
-            costCodeId: costCodeId ?? (keepExisting ? existing!.costCodeId : null),
-            // A stale suggestion is re-derived against the new job's phases.
-            suggestedCostCodeId: null,
-            suggestedConfidence: null,
-            state: "READ",
-            stateReason: null,
-            lastError: null,
-            nextRetryAt: null,
-        },
-    });
-    if (result.count === 0) await receiptIntakeWriteFailure(id, [expected], now);
-    revalidateReceiptQueue();
-    return { success: true };
 }
 
 /** Park a row as a duplicate of another. `duplicateOfId` must be a real, different row. */

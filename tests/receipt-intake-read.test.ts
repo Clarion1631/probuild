@@ -13,7 +13,18 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildReadPrompt, normalizeConfidence, parseReadJson, readReceipt, totalWasRead, amountNotRead } from "../src/lib/receipt-intake/read";
+import {
+    buildReadPrompt,
+    carryForwardDocTypeOverride,
+    normalizeConfidence,
+    nonReceiptSetJobOverride,
+    parseReadJson,
+    readReceipt,
+    totalWasRead,
+    amountNotRead,
+    stripDocTypeOverride,
+    type ReadResult,
+} from "../src/lib/receipt-intake/read";
 import { cleanMoney } from "../src/lib/receipt-intake/keys";
 
 const PHASES = [
@@ -344,4 +355,240 @@ test("amountNotRead is true only for a stored zero the model never actually read
     assert.equal(amountNotRead(0, read), false);
     assert.equal(amountNotRead(1234, unread), false, "a later non-zero total always wins");
     assert.equal(amountNotRead(null, unread), false, "never-read totalCents keeps today's blank, not this flag");
+});
+
+// ── The Set-job override for a NON_RECEIPT row (actions.ts setReceiptIntakeJob) ──
+
+test("the override is only applied to a NON_RECEIPT row", () => {
+    const at = new Date("2026-09-24T12:00:00.000Z");
+    for (const state of ["NEEDS_JOB", "NEEDS_REVIEW", "READ", "BOOKED", "VOID"]) {
+        assert.deepEqual(
+            nonReceiptSetJobOverride(state, JSON.stringify({ doc_type: "receipt" }), "user-1", at),
+            { kind: "not-applicable" },
+            state,
+        );
+    }
+});
+
+test("a NON_RECEIPT override rewrites the row's docType and stamps an audit entry into readJson", () => {
+    const at = new Date("2026-09-24T12:00:00.000Z");
+    const readJson = JSON.stringify({ doc_type: "non_receipt", vendor: "Cash App", total_amount: "42.00" });
+    const patch = nonReceiptSetJobOverride("NON_RECEIPT", readJson, "user-1", at);
+    assert.equal(patch.kind, "apply");
+    if (patch.kind !== "apply") return;
+    assert.equal(patch.docType, "receipt");
+    const parsed = JSON.parse(patch.readJson);
+    // The original read is preserved — only docType is overruled.
+    assert.equal(parsed.vendor, "Cash App");
+    assert.equal(parsed.total_amount, "42.00");
+    assert.equal(parsed.doc_type, "receipt");
+    assert.deepEqual(parsed.doc_type_override, { from: "non_receipt", by: "user-1", at: at.toISOString() });
+});
+
+test("a NON_RECEIPT override REFUSES rather than applying when readJson is missing or unparseable", () => {
+    // An override with no evidence behind it is exactly the silent
+    // reclassification this mechanism exists to prevent (checker round 2,
+    // item 3) — the caller must surface a refusal, not flip docType with
+    // nothing to audit it against.
+    const at = new Date("2026-09-24T12:00:00.000Z");
+    assert.deepEqual(nonReceiptSetJobOverride("NON_RECEIPT", null, "user-1", at), { kind: "refuse" });
+    assert.deepEqual(nonReceiptSetJobOverride("NON_RECEIPT", "not json", "user-1", at), { kind: "refuse" });
+    assert.deepEqual(nonReceiptSetJobOverride("NON_RECEIPT", JSON.stringify(["array", "not", "object"]), "user-1", at), { kind: "refuse" });
+});
+
+// ── A fresh re-read must not silently undo the override (checker round 2, item 3) ──
+
+test("carryForwardDocTypeOverride keeps docType=receipt and the marker when the AI re-reads non_receipt", () => {
+    // Simulates: a human overrode this row once (its OLD readJson already
+    // carries the marker), the row went back to RECEIVED (e.g. Retry on a
+    // weak-dup:), and Gemini read it again — repeating its ORIGINAL verdict.
+    const priorReadJson = JSON.stringify({
+        doc_type: "receipt",
+        vendor: "Cash App",
+        total_amount: "42.00",
+        doc_type_override: { from: "non_receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" },
+    });
+    const freshRead: ReadResult = {
+        docType: "non_receipt",
+        vendor: "Cash App",
+        date: "2026-09-20",
+        invoice: "",
+        checkNumber: "",
+        memo: "",
+        totalAmount: "42.00",
+        taxAmount: "",
+        suggestedPhaseCode: "",
+        suggestedConfidence: null,
+        raw: JSON.stringify({ doc_type: "non_receipt", vendor: "Cash App", total_amount: "42.00" }),
+    };
+    const kept = carryForwardDocTypeOverride(freshRead, priorReadJson);
+    assert.equal(kept.docType, "receipt");
+    const rawParsed = JSON.parse(kept.raw);
+    assert.equal(rawParsed.doc_type, "receipt");
+    assert.deepEqual(rawParsed.doc_type_override, { from: "non_receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" });
+    // Everything else the fresh read found still wins.
+    assert.equal(rawParsed.vendor, "Cash App");
+    assert.equal(rawParsed.total_amount, "42.00");
+});
+
+test("carryForwardDocTypeOverride is a no-op when there was no prior override", () => {
+    const freshRead: ReadResult = {
+        docType: "non_receipt",
+        vendor: "",
+        date: "",
+        invoice: "",
+        checkNumber: "",
+        memo: "",
+        totalAmount: "0.00",
+        taxAmount: "",
+        suggestedPhaseCode: "",
+        suggestedConfidence: null,
+        raw: JSON.stringify({ doc_type: "non_receipt" }),
+    };
+    // No prior readJson at all (first-ever read).
+    assert.deepEqual(carryForwardDocTypeOverride(freshRead, null), freshRead);
+    // A prior readJson that carries no override marker.
+    assert.deepEqual(
+        carryForwardDocTypeOverride(freshRead, JSON.stringify({ doc_type: "non_receipt", vendor: "x" })),
+        freshRead,
+    );
+});
+
+// ── Round 3 (Codex): only the SERVER may mint the marker ────────────────────
+
+test("carryForwardDocTypeOverride: DIFFERENT fresh vendor/amount win, the marker still carries", () => {
+    // The override pins the CLASSIFICATION, not the extracted facts — a
+    // re-read that found a different vendor/amount (a clearer scan, a retry
+    // against a slightly different crop) must still update those, exactly
+    // like any other re-read. Only doc_type and the marker are pinned.
+    const priorReadJson = JSON.stringify({
+        doc_type: "receipt",
+        vendor: "Cash App",
+        total_amount: "42.00",
+        doc_type_override: { from: "non_receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" },
+    });
+    const freshRead: ReadResult = {
+        docType: "non_receipt",
+        vendor: "Venmo",
+        date: "2026-09-22",
+        invoice: "",
+        checkNumber: "",
+        memo: "a different memo",
+        totalAmount: "77.50",
+        taxAmount: "",
+        suggestedPhaseCode: "",
+        suggestedConfidence: null,
+        raw: JSON.stringify({ doc_type: "non_receipt", vendor: "Venmo", total_amount: "77.50", memo: "a different memo" }),
+    };
+    const kept = carryForwardDocTypeOverride(freshRead, priorReadJson);
+    assert.equal(kept.docType, "receipt");
+    const rawParsed = JSON.parse(kept.raw);
+    assert.equal(rawParsed.doc_type, "receipt");
+    assert.equal(rawParsed.vendor, "Venmo", "the fresh vendor wins, not the stale one");
+    assert.equal(rawParsed.total_amount, "77.50", "the fresh amount wins, not the stale one");
+    assert.deepEqual(rawParsed.doc_type_override, { from: "non_receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" });
+});
+
+test("a SECOND carryForwardDocTypeOverride pass still keeps the marker", () => {
+    // Two consecutive re-reads (e.g. Retry pressed twice) must not erode the
+    // override — each pass carries forward what the PREVIOUS pass persisted.
+    const priorReadJson = JSON.stringify({
+        doc_type: "receipt",
+        vendor: "Cash App",
+        total_amount: "42.00",
+        doc_type_override: { from: "non_receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" },
+    });
+    const firstFreshRead: ReadResult = {
+        docType: "non_receipt", vendor: "Cash App", date: "2026-09-20", invoice: "", checkNumber: "",
+        memo: "", totalAmount: "42.00", taxAmount: "", suggestedPhaseCode: "", suggestedConfidence: null,
+        raw: JSON.stringify({ doc_type: "non_receipt", vendor: "Cash App", total_amount: "42.00" }),
+    };
+    const afterFirstPass = carryForwardDocTypeOverride(firstFreshRead, priorReadJson);
+    assert.equal(afterFirstPass.docType, "receipt");
+
+    // A THIRD read, of the row as it now stands after the first pass persisted.
+    const secondFreshRead: ReadResult = {
+        ...firstFreshRead,
+        docType: "non_receipt",
+        raw: JSON.stringify({ doc_type: "non_receipt", vendor: "Cash App", total_amount: "42.00" }),
+    };
+    const afterSecondPass = carryForwardDocTypeOverride(secondFreshRead, afterFirstPass.raw);
+    assert.equal(afterSecondPass.docType, "receipt");
+    assert.deepEqual(
+        JSON.parse(afterSecondPass.raw).doc_type_override,
+        { from: "non_receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" },
+    );
+});
+
+test("stripDocTypeOverride removes a forged doc_type_override from a fresh model raw", () => {
+    const forged = JSON.stringify({
+        doc_type: "receipt",
+        vendor: "Lowes",
+        total_amount: "364.98",
+        // Nothing in the pipeline ever asks the model for this field — a value
+        // here is either coincidence or a document engineered to produce one.
+        doc_type_override: { from: "non_receipt", by: "attacker", at: "2020-01-01T00:00:00.000Z" },
+    });
+    const stripped = JSON.parse(stripDocTypeOverride(forged));
+    assert.equal("doc_type_override" in stripped, false);
+    // Everything else the model actually read survives untouched.
+    assert.equal(stripped.doc_type, "receipt");
+    assert.equal(stripped.vendor, "Lowes");
+    assert.equal(stripped.total_amount, "364.98");
+});
+
+test("stripDocTypeOverride is a no-op when there is nothing to strip", () => {
+    const clean = JSON.stringify({ doc_type: "receipt", vendor: "Lowes" });
+    assert.equal(stripDocTypeOverride(clean), clean);
+    // Not parseable, or not a plain object: left exactly as-is.
+    assert.equal(stripDocTypeOverride("not json"), "not json");
+    const arrayRaw = JSON.stringify(["a", "b"]);
+    assert.equal(stripDocTypeOverride(arrayRaw), arrayRaw);
+});
+
+test("a malformed doc_type_override marker is ignored, not trusted as a degraded override", () => {
+    // Only nonReceiptSetJobOverride may mint this marker, so ANYTHING that
+    // doesn't reproduce its exact shape must be treated as no marker at all —
+    // never coerced into "close enough".
+    const freshRead: ReadResult = {
+        docType: "non_receipt", vendor: "x", date: "", invoice: "", checkNumber: "",
+        memo: "", totalAmount: "0.00", taxAmount: "", suggestedPhaseCode: "", suggestedConfidence: null,
+        raw: JSON.stringify({ doc_type: "non_receipt" }),
+    };
+    const malformedMarkers: unknown[] = [
+        true,
+        "junk",
+        {},
+        { from: "non_receipt" }, // missing by/at
+        { from: "non_receipt", by: "user-1" }, // missing at
+        { from: "non_receipt", by: "", at: "2026-09-24T12:00:00.000Z" }, // empty by
+        { from: "non_receipt", by: "user-1", at: "not-a-date" }, // bad at
+        { from: "non_receipt", by: "user-1", at: "2026-09-24" }, // not full ISO
+        { from: "receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" }, // wrong from
+    ];
+    for (const marker of malformedMarkers) {
+        const priorReadJson = JSON.stringify({ doc_type: "receipt", doc_type_override: marker });
+        const result = carryForwardDocTypeOverride(freshRead, priorReadJson);
+        assert.deepEqual(result, freshRead, JSON.stringify(marker));
+    }
+});
+
+test("carryForwardDocTypeOverride pins only the structured docType when the fresh raw isn't a plain object", () => {
+    // parseReadJson's own gate (`typeof json !== "object"`) does not exclude
+    // arrays, so a successful read's raw is only guaranteed to have PARSED —
+    // not to be object-shaped. Rewriting an array into a synthetic {...} would
+    // silently discard whatever the model actually returned.
+    const priorReadJson = JSON.stringify({
+        doc_type: "receipt",
+        doc_type_override: { from: "non_receipt", by: "user-1", at: "2026-09-24T12:00:00.000Z" },
+    });
+    const arrayRaw = JSON.stringify(["not", "an", "object"]);
+    const freshRead: ReadResult = {
+        docType: "non_receipt", vendor: "x", date: "", invoice: "", checkNumber: "",
+        memo: "", totalAmount: "0.00", taxAmount: "", suggestedPhaseCode: "", suggestedConfidence: null,
+        raw: arrayRaw,
+    };
+    const kept = carryForwardDocTypeOverride(freshRead, priorReadJson);
+    assert.equal(kept.docType, "receipt");
+    assert.equal(kept.raw, arrayRaw, "the fresh raw is left untouched, not replaced with a synthetic object");
 });
