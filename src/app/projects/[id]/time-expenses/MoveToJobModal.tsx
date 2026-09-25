@@ -31,6 +31,7 @@ export default function MoveToJobModal({
     jobOptions,
     onClose,
     onMoved,
+    fallbackFocusId,
 }: {
     expenseId: string;
     vendor: string | null;
@@ -41,6 +42,14 @@ export default function MoveToJobModal({
     jobOptions: Array<{ id: string; name: string }>;
     onClose: () => void;
     onMoved: () => Promise<void>;
+    /**
+     * Element id to focus on close when the trigger is gone (PR #546 review).
+     * A successful move removes the row -- and its "Move to job" button --
+     * from the list this modal opened from, so `triggerElement` below is a
+     * detached node by the time Radix would restore focus to it, and
+     * focusing a detached node is a silent no-op: focus landed nowhere.
+     */
+    fallbackFocusId?: string;
 }) {
     const [jobId, setJobId] = useState("");
     const [moving, setMoving] = useState(false);
@@ -88,7 +97,18 @@ export default function MoveToJobModal({
                     aria-modal="true"
                     onEscapeKeyDown={event => { if (moving) event.preventDefault(); }}
                     onPointerDownOutside={event => { if (moving) event.preventDefault(); }}
-                    onCloseAutoFocus={event => { event.preventDefault(); triggerElement?.focus(); }}
+                    onCloseAutoFocus={event => {
+                        event.preventDefault();
+                        // Still there (Cancel, Escape, or a move that failed and left
+                        // the row in place): return focus to it, same as before.
+                        if (triggerElement && triggerElement.isConnected) {
+                            triggerElement.focus();
+                            return;
+                        }
+                        // Gone (the move succeeded and the row was dropped): land on
+                        // a connected element instead of leaving focus nowhere.
+                        if (fallbackFocusId) document.getElementById(fallbackFocusId)?.focus();
+                    }}
                 >
                     <div>
                         <Dialog.Title className="text-lg font-bold text-hui-textMain">Move to another job</Dialog.Title>

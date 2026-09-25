@@ -13,7 +13,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildReadPrompt, normalizeConfidence, parseReadJson, readReceipt } from "../src/lib/receipt-intake/read";
+import { buildReadPrompt, normalizeConfidence, parseReadJson, readReceipt, totalWasRead, amountNotRead } from "../src/lib/receipt-intake/read";
+import { cleanMoney } from "../src/lib/receipt-intake/keys";
 
 const PHASES = [
     { code: "01-DEMO", name: "Demolition" },
@@ -301,4 +302,46 @@ test("an absent confidence is NULL, never 0", () => {
     assert.equal(normalizeConfidence(1.2), 1);
     assert.equal(normalizeConfidence(-3), 0);
     assert.equal(normalizeConfidence(" 0.5 "), 0.5, "whitespace around a real number is fine");
+});
+
+const UNREAD_VALUES = ["", "N/A", "unknown", "-", ".", null];
+const READ_VALUES: unknown[] = ["0", "0.00", "$0.00", 0, "(12.50)", "12.50"];
+
+test("totalWasRead: a blank or unrecognized raw total is NOT read", () => {
+    for (const value of UNREAD_VALUES) {
+        assert.equal(totalWasRead(JSON.stringify({ total_amount: value })), false, JSON.stringify(value));
+    }
+    assert.equal(totalWasRead(JSON.stringify({})), false, "a missing key is not read");
+});
+
+test("totalWasRead: a real number, including a literal zero, IS read", () => {
+    for (const value of READ_VALUES) {
+        assert.equal(totalWasRead(JSON.stringify({ total_amount: value })), true, JSON.stringify(value));
+    }
+});
+
+test("totalWasRead: no readJson, or readJson that will not parse (including a bare JSON null), is unknown", () => {
+    assert.equal(totalWasRead(null), null);
+    assert.equal(totalWasRead(undefined), null);
+    assert.equal(totalWasRead(""), null);
+    assert.equal(totalWasRead("{not json"), null);
+    // A successful JSON.parse alone does not make property access safe --
+    // "null" and a bare JSON string both parse but are not an object.
+    assert.equal(totalWasRead("null"), null);
+    assert.equal(totalWasRead('"just a string"'), null);
+});
+
+test("totalWasRead agrees with cleanMoney: every value it calls unread, cleanMoney reduces to 0.00", () => {
+    for (const value of UNREAD_VALUES) {
+        assert.equal(cleanMoney(value), "0.00", JSON.stringify(value));
+    }
+});
+
+test("amountNotRead is true only for a stored zero the model never actually read", () => {
+    const unread = JSON.stringify({ total_amount: "" });
+    const read = JSON.stringify({ total_amount: "0.00" });
+    assert.equal(amountNotRead(0, unread), true);
+    assert.equal(amountNotRead(0, read), false);
+    assert.equal(amountNotRead(1234, unread), false, "a later non-zero total always wins");
+    assert.equal(amountNotRead(null, unread), false, "never-read totalCents keeps today's blank, not this flag");
 });

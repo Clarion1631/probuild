@@ -34,7 +34,18 @@ export interface ReasonTextRow {
     totalCents: number | null;
     /** ISO, as the queue carries it. */
     createdAt: string;
+    /**
+     * Optional: whether the stored zero was never actually read (read.ts's
+     * `amountNotRead`). Absent on every caller that predates this field, so
+     * every existing sentence is unchanged.
+     */
+    amountUnread?: boolean;
 }
+
+/** The Receipts tab's "amount not read" label — never "$0.00" for this row. */
+export const AMOUNT_NOT_READ_TEXT = "amount not read";
+/** `refund-or-zero`'s sentence when the total genuinely was not read. */
+export const UNREAD_TOTAL_SENTENCE = "I could not read a total on this one, so a person has to check it.";
 
 export interface StateReasonText {
     /** One plain sentence. Falls back to the raw code when there are no words for it. */
@@ -137,7 +148,9 @@ const REASON_TEXTS: Array<{ test: RegExp; text: (row: ReasonTextRow) => string }
     { test: /^multi-doc$/, text: () => "This file has more than one receipt in it." },
     {
         test: /^refund-or-zero$/,
-        text: row => `The total reads as ${money(row.totalCents)}. A refund or a zero needs a person to place it.`,
+        text: row => (row.amountUnread && row.totalCents === 0
+            ? UNREAD_TOTAL_SENTENCE
+            : `The total reads as ${money(row.totalCents)}. A refund or a zero needs a person to place it.`),
     },
     { test: /^no-estimate$/, text: () => "No job on this one yet." },
     { test: /^unreadable$/, text: () => "I could not read this file. It is usually a blurry photo or a bad scan. A clearer photo of the same receipt can be sent in." },

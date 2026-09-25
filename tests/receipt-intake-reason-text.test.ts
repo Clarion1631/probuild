@@ -201,3 +201,24 @@ test("the refund sentence quotes the amount the row actually carries", () => {
         /The total reads as nothing\./,
     );
 });
+
+test("an unread zero says so instead of quoting the amount", () => {
+    assert.equal(
+        describeStateReason("refund-or-zero", { ...ROW, totalCents: 0, amountUnread: true })!.headline,
+        "I could not read a total on this one, so a person has to check it.",
+    );
+});
+
+test("a real zero the model actually read still gets the usual sentence", () => {
+    assert.equal(
+        describeStateReason("refund-or-zero", { ...ROW, totalCents: 0, amountUnread: false })!.headline,
+        "The total reads as $0.00. A refund or a zero needs a person to place it.",
+    );
+});
+
+test("amountUnread only changes the sentence for a stored zero — a refund keeps its own", () => {
+    assert.match(
+        describeStateReason("refund-or-zero", { ...ROW, totalCents: -2257, amountUnread: true })!.headline,
+        /The total reads as -\$22\.57\./,
+    );
+});

@@ -239,3 +239,51 @@ test("MoveToJobModal: dialog semantics, focus enters on open and returns to the 
         dom.window.close();
     }
 });
+
+test("MoveToJobModal: focus falls back to a connected element when the trigger row is gone after a move (PR #546 review)", async () => {
+    const dom = new JSDOM(
+        "<!doctype html><button id='trigger'>Move to job</button>" +
+            "<h2 id='expenses-table-heading' tabindex='-1'>Expenses</h2><div id='root'></div>",
+        { url: "https://example.test" },
+    );
+    try {
+        await withJsdomGlobals(dom, async () => {
+            const trigger = dom.window.document.getElementById("trigger") as HTMLButtonElement;
+            const fallback = dom.window.document.getElementById("expenses-table-heading") as HTMLElement;
+            trigger.focus();
+            const root = createRoot(dom.window.document.getElementById("root")!);
+            try {
+                await act(async () => {
+                    root.render(createElement(ImportedAwareMoveToJobModal, {
+                        expenseId: "exp-receipt", vendor: "Lowe's", amountLabel: "$146.32", dateLabel: "9/2/2026",
+                        changeOrderLabel: null, projectId: "job-1",
+                        jobOptions: [{ id: "job-2", name: "Sample Job B" }],
+                        fallbackFocusId: "expenses-table-heading",
+                        onClose: () => {},
+                        onMoved: async () => {},
+                    }));
+                });
+
+                // The same thing a successful move does for real: onMoved drops the
+                // row (and its trigger button) from the list BEFORE the modal
+                // closes, so by the time Radix would restore focus, the node this
+                // captured is detached.
+                trigger.remove();
+
+                await act(async () => { root.unmount(); });
+                // Radix restores focus inside a setTimeout(0) -- see the note above.
+                await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+
+                assert.equal(
+                    dom.window.document.activeElement,
+                    fallback,
+                    "focus lands on the fallback heading, not nowhere",
+                );
+            } finally {
+                await act(async () => { try { root.unmount(); } catch { /* already unmounted */ } });
+            }
+        });
+    } finally {
+        dom.window.close();
+    }
+});
