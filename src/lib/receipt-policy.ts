@@ -56,7 +56,7 @@ export interface ReceiptPolicyLine {
  *
  * Every one of these was observed in prod — nothing here is speculative.
  */
-const NO_RECEIPT_RULES: Array<{ key: string; test: RegExp; reason: string }> = [
+const NO_RECEIPT_RULES: Array<{ key: string; test: RegExp; reason: string; excludeChecks?: boolean }> = [
     {
         key: "loan-payment",
         test: /\bINDIVIDUAL LOAN PAYMENTS\b|\bAUTOMATIC LOAN PAYMENT\b/i,
@@ -66,6 +66,30 @@ const NO_RECEIPT_RULES: Array<{ key: string; test: RegExp; reason: string }> = [
         key: "card-payment",
         test: /\bCAPITAL ONE\b|\bONLINE PMT\b.*\bCAPITAL ONE\b/i,
         reason: "Credit-card payment — a transfer; the receipts live on that card's statement",
+    },
+    {
+        // A separate entry, not folded into card-payment above, so its
+        // `excludeChecks` guard (see classifyReceiptRequirement) applies only
+        // to these newer, wider patterns — CAPITAL ONE above keeps its exact
+        // pre-existing behavior. Requires PAYMENT/AUTOPAY/PMT/PAYMNT context
+        // alongside the issuer name, on either side of it, not just the name
+        // alone: a bare "SYNCHRONY" or "CHASE CREDIT CRD" also appears on
+        // ordinary retail purchases on those cards (e.g. "CHASE CREDIT CRD
+        // PURCHASE"), which must stay receipt_expected — the PURCHASE/POS
+        // guard below additionally covers a line that carries both.
+        key: "card-payment",
+        test: /\b(?:AUTOPAY|PAYMENT|PMT|PAYMNT)\b.*\bCHASE\s+(?:CREDIT\s+(?:CRD|CARD)|CARD)\b|\bCHASE\s+(?:CREDIT\s+(?:CRD|CARD)|CARD)\b.*\b(?:AUTOPAY|PAYMENT|PMT|PAYMNT)\b|\bSYF[\s*-]+(?:PAYMNT|PAYMENT)\b|\b(?:AUTOPAY|PAYMENT|PMT|PAYMNT)\b.*\bSYNCHRONY\b|\bSYNCHRONY\b.*\b(?:AUTOPAY|PAYMENT|PMT|PAYMNT)\b/i,
+        reason: "Credit-card payment — a transfer; the receipts live on that card's statement",
+        excludeChecks: true,
+    },
+    {
+        // Same reasoning as the card-payment split above: BANKERS HEALTHCA
+        // alone also appears without payment wording, so it needs its own
+        // guarded entry rather than widening the original phrase.
+        key: "loan-payment",
+        test: /\bPAYMENT\s+BANKERS\s+HEALTHCA\w*\b|\bBANKERS\s+HEALTHCA\w*\b.*\bPAYMENT\b/i,
+        reason: "Loan payment — principal/interest, no merchant receipt exists",
+        excludeChecks: true,
     },
     {
         key: "merchant-fee",
@@ -128,8 +152,28 @@ export function classifyReceiptRequirement(line: ReceiptPolicyLine): ReceiptPoli
     }
 
     const descriptor = line.rawDescriptor ?? "";
+    // A paper check is never a card autopay or loan-servicer payment, whatever
+    // words happen to sit in its memo line — `excludeChecks` rules (the newer,
+    // wider card/loan patterns above) do not apply to one, so a check still
+    // falls through to the checkNumber/CHECK_DESCRIPTOR branch below and
+    // returns receipt_expected. Scoped to those rules only: the pre-existing
+    // rules run unchanged, exactly as before this guard existed.
+    //
+    // `looksLikeCheckOrSubBill`'s CHECK_DESCRIPTOR requires PAID/#/NO+digit/a
+    // bare digit right after CHECK, so "CHECK NO. 1027 …" (a period before the
+    // number) does not match it — deliberately left as is, since it also
+    // gates the pre-existing rules' check precedence and that is out of
+    // scope here. A second, local, looser test — merely "starts with CHECK" —
+    // catches that shape too, but ONLY for these `excludeChecks` rules.
+    const isPaperCheck = looksLikeCheckOrSubBill(descriptor, line.checkNumber) || /^\s*CHECK\b/i.test(descriptor);
+    // A purchase/point-of-sale line is never a card autopay or loan-servicer
+    // payment either, even when payment wording also appears on it (e.g. a
+    // bank's own "POS PAYMENT" jargon on a real purchase line) — again scoped
+    // to the `excludeChecks` rules only.
+    const isPurchaseContext = /\bPURCHASE\b|\bPOS\b/i.test(descriptor);
 
     for (const rule of NO_RECEIPT_RULES) {
+        if (rule.excludeChecks && (isPaperCheck || isPurchaseContext)) continue;
         if (rule.test.test(descriptor)) {
             return { requirement: "no_receipt_expected", reason: rule.reason, ruleKey: rule.key };
         }
