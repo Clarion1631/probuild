@@ -12,12 +12,16 @@
  * already uses to decide what counts as "due" (src/app/portal/projects/[id]/
  * page.tsx, src/app/portal/page.tsx, PortalInvoiceClient.tsx).
  *
- * Pure — no Prisma, no fetch, no session — so the Open Invoices report and the
- * company-charts AR aging can reuse it later, and so this can be unit tested
- * without a database. The only import is `isPendingDeletion`, itself pure by
- * its own header.
+ * Pure at runtime — no Prisma, no fetch, no session — so the Open Invoices
+ * report and the company-charts AR aging can reuse it (RECEIVABLE_INVOICE_WHERE
+ * / RECEIVABLE_INVOICE_SELECT / toReceivableInput below are the shared query
+ * shape both of them and the AR digest select their rows with), and so this
+ * can be unit tested without a database. The only VALUE import is
+ * `isPendingDeletion`, itself pure by its own header; `Prisma` is type-only
+ * and erased at compile time.
  */
 
+import type { Prisma } from "@prisma/client";
 import { isPendingDeletion } from "./qbo-create-markers";
 
 export const RECEIVABLE_NET_TERMS_DAYS = 30;
@@ -25,7 +29,7 @@ export const DUE_DATE_GRACE_MS = 86_400_000;
 
 const DAY_MS = 86_400_000;
 
-type Money = number | string | { toString(): string };
+export type Money = number | string | { toString(): string };
 
 export interface ReceivableMilestone {
     id: string;
@@ -90,6 +94,71 @@ export interface InvoiceReceivable {
     items: BilledItem[];
 }
 
+// balanceDue > 0 alone misses an invoice whose balance has drifted to
+// 0 (or negative) while it still carries a billed, unpaid milestone —
+// a Pending one that was requested or linked, or a live progress
+// billing. The balanceDue branch stays so a legacy zero-milestone
+// invoice (no Pending rows, no progress billings) with a genuine
+// positive balance is still found.
+export const RECEIVABLE_INVOICE_WHERE = {
+    status: { not: "Canceled" },
+    OR: [
+        { balanceDue: { gt: 0 } },
+        { payments: { some: { status: "Pending" } } },
+        { progressBillings: { some: { status: { in: ["Staged", "Sent"] } } } },
+    ],
+} satisfies Prisma.InvoiceWhereInput;
+
+// Exactly which Pending milestones and live progress billings feed
+// computeInvoiceReceivable/computeInvoiceAmountDue, shared by the AR digest,
+// the invoice-send path (billing-core.ts), the Open Invoices report and the
+// company-charts AR aging, so none of them can see a different set of
+// "billed" evidence for the same invoice. Milestone order is PR #289's
+// deterministic schedule order (createdAt, id tiebreak — same-transaction
+// inserts share a createdAt), the same orderBy used for invoice payments in
+// actions.ts and pdf.ts, so an amount-due email's item order matches the
+// invoice editor/portal schedule order.
+export const RECEIVABLE_PAYMENTS_ARGS = {
+    where: { status: "Pending" },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: {
+        id: true, name: true, amount: true, status: true, dueDate: true, createdAt: true,
+        qbInvoiceId: true, qbInvoiceSentAt: true, qbSyncError: true, qbSyncedAt: true,
+    },
+} satisfies Prisma.Invoice$paymentsArgs;
+export const RECEIVABLE_PROGRESS_BILLINGS_ARGS = {
+    where: { status: { in: ["Staged", "Sent"] } },
+    select: {
+        id: true, code: true, status: true,
+        qbInvoiceId: true, qbSyncError: true, qbSyncedAt: true, qbInvoiceSentAt: true, sentAt: true, createdAt: true,
+        lines: { select: { scheduleId: true } },
+    },
+} satisfies Prisma.Invoice$progressBillingsArgs;
+// Exactly the fields computeInvoiceReceivable() reads. Every caller spreads
+// this into its own `select` alongside whatever else it needs (id, code,
+// project, client, ...) instead of hand-copying it.
+export const RECEIVABLE_INVOICE_SELECT = {
+    status: true, balanceDue: true, issueDate: true, sentAt: true, createdAt: true,
+    _count: { select: { payments: true } },
+    payments: RECEIVABLE_PAYMENTS_ARGS,
+    progressBillings: RECEIVABLE_PROGRESS_BILLINGS_ARGS,
+} satisfies Prisma.InvoiceSelect;
+
+/** Turns a RECEIVABLE_INVOICE_SELECT row into computeInvoiceReceivable()'s
+ *  input — the one place `_count.payments` becomes `milestoneCount`. */
+export function toReceivableInput(row: {
+    status: string;
+    balanceDue: ReceivableInvoiceInput["balanceDue"];
+    issueDate: Date | null;
+    sentAt: Date | null;
+    createdAt: Date;
+    _count: { payments: number };
+    payments: ReceivableMilestone[];
+    progressBillings: ReceivableProgressBilling[];
+}): ReceivableInvoiceInput {
+    return { ...row, milestoneCount: row._count.payments };
+}
+
 const EMPTY: InvoiceReceivable = {
     receivableCents: 0,
     overdueCents: 0,
@@ -122,7 +191,7 @@ const DECIMAL_PATTERN = /^(-?)(\d+)(?:\.(\d+))?$/;
  * the value's string form isn't plain decimal (exponent notation) — a real
  * money amount never legitimately needs it.
  */
-function toCents(v: Money): number {
+export function toCents(v: Money): number {
     const str = typeof v === "string" ? v.trim() : String(v);
     const match = DECIMAL_PATTERN.exec(str);
     if (!match) return Math.round(Number(v) * 100); // e.g. exponent notation
