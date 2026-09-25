@@ -152,19 +152,22 @@ function sortJobs<T extends { id: string; name: string }>(jobs: T[]): T[] {
  * Step 0 — an empty folder, or a job list at or over `listCap` (which may be
  * cut short and could fake a single match), gives `none`.
  *
- * THE OVERHEAD GUARD RUNS BEFORE EXACT MATCHING (Codex round 2, finding 1).
- * Matching two NORMALIZED names alone cannot tell "the overhead folder" from
- * "a customer project whose name happens to normalize the same way" —
+ * THE OVERHEAD GUARD RUNS BEFORE EXACT MATCHING (Codex round 2, finding 1;
+ * tightened after the checker found the literal-only split let a punctuation
+ * variant like "Shop." exact-match a same-spelled job). Matching two
+ * NORMALIZED names alone cannot tell "the overhead folder" from "a customer
+ * project whose name happens to normalize the same way" —
  * `normalizeJobName("Shop.")` is `"shop"`, same as `normalizeJobName("Shop")`
- * — so the reserved name is decided FIRST, by the bot's own literal rule
- * (`isOverheadName`, no punctuation stripped), and only jobs on the SAME side
- * of that line are ever considered:
- *   - folder IS the overhead folder ("Shop", exactly) -> only a job that IS
- *     the overhead job ("Shop", exactly) is eligible. A customer project
- *     merely named "Shop." is never offered for it.
- *   - folder is NOT the overhead folder (including "Shop." — a project
- *     folder by the bot's own classifier) -> the overhead job is never
- *     eligible for it, even though the two normalize the same way.
+ * — so the split is decided on the NORMALIZED folder name first:
+ *   - folder NORMALIZES to the overhead name ("shop") -> a customer job is
+ *     NEVER offered, whatever its own spelling. Only when the folder is ALSO,
+ *     literally, "Shop" (no punctuation) is the literal overhead job itself
+ *     eligible; any other spelling of "shop" on the folder side ("Shop.",
+ *     "Shop-", "shop!") gives `none` outright, even if an open job shares
+ *     that exact spelling.
+ *   - folder does NOT normalize to the overhead name -> a normal project
+ *     folder; the overhead job is never eligible for it, even though the two
+ *     may normalize the same way.
  * Only after that split does normalized EXACT matching run, and the overhead
  * folder never reaches the PREFIX step at all (no second name is ever offered
  * for "Shop", matching the bot's own rule).
@@ -183,19 +186,31 @@ export function suggestJobsForFolder(
     const f = normalizeJobName(folder);
     if (!f) return { kind: "none" };
 
-    const folderIsOverhead = isOverheadName(folder);
-    const eligible = jobs.filter(job => isOverheadName(job.name) === folderIsOverhead);
+    if (f === OVERHEAD_FOLDER) {
+        // The folder NORMALIZES to the overhead name. Only a folder that IS,
+        // literally, "Shop" can ever draw a suggestion, and only the literal
+        // overhead job is eligible for it — a punctuation variant like
+        // "Shop." is a project folder by the bot's own classifier and must
+        // never offer a customer job just because it normalizes the same
+        // way, nor the overhead job itself.
+        if (!isOverheadName(folder)) return { kind: "none" };
+        const exact = jobs.filter(job => isOverheadName(job.name) && normalizeJobName(job.name) === f);
+        if (exact.length === 1) return { kind: "exact", jobs: [{ id: exact[0].id, name: exact[0].name }] };
+        if (exact.length >= 2) return { kind: "same-name" };
+        // No prefix step for the overhead folder: it only ever offers its
+        // own exact name (above), never a second, different one — a real
+        // "Shop Shed" project must never be offered just because "Shop" is
+        // on the folder side.
+        return { kind: "none" };
+    }
+
+    // A normal project folder never offers the overhead job.
+    const eligible = jobs.filter(job => !isOverheadName(job.name));
 
     const exact = eligible.filter(job => normalizeJobName(job.name) === f);
     if (exact.length === 1) return { kind: "exact", jobs: [{ id: exact[0].id, name: exact[0].name }] };
     if (exact.length >= 2) return { kind: "same-name" };
 
-    // No prefix step for a folder that READS as the overhead folder once
-    // normalized — literally "Shop" or a punctuation variant like "Shop.",
-    // either way. It only ever offers its own exact name (above), never a
-    // second, different one: a real "Shop Shed" project must never be
-    // offered just because some spelling of "shop" is on the folder side.
-    if (f === OVERHEAD_FOLDER) return { kind: "none" };
     if (f.length < PREFIX_MIN_CHARS) return { kind: "none" };
 
     const prefixed = eligible.filter(job => normalizeJobName(job.name).startsWith(`${f} `));
@@ -205,6 +220,26 @@ export function suggestJobsForFolder(
     if (prefixed.length > MAX_FOLDER_BUTTONS) return { kind: "too-many" };
 
     return { kind: "prefix", jobs: sortJobs(prefixed).map(job => ({ id: job.id, name: job.name })) };
+}
+
+/**
+ * Whether `projectId` is still one of `folder`'s suggested candidates against
+ * a FRESH job list — the write-time re-check a suggestion tap runs
+ * (`setReceiptIntakeJobFromSuggestion`, suggestion-actions.ts) before ever
+ * reaching `setReceiptIntakeJob`, since the button was rendered from a
+ * snapshot of the open-job list that may be stale by the time it is tapped
+ * (the job closed, was renamed, or a namesake opened). Kept here, pure and
+ * import-free, so the refusal path is unit-testable without a database.
+ */
+export function isFolderCandidate(
+    folder: string | null | undefined,
+    jobs: ReadonlyArray<{ id: string; name: string }>,
+    listCap: number,
+    projectId: string,
+): boolean {
+    const suggestions = suggestJobsForFolder(folder, jobs, listCap);
+    return (suggestions.kind === "exact" || suggestions.kind === "prefix")
+        && suggestions.jobs.some(job => job.id === projectId);
 }
 
 export const FOLDER_COPY = {

@@ -21,7 +21,7 @@
  */
 import { prisma } from "@/lib/prisma";
 import { setReceiptIntakeJob } from "@/lib/actions";
-import { suggestJobsForFolder } from "@/lib/receipt-intake/folder";
+import { isFolderCandidate } from "@/lib/receipt-intake/folder";
 import { fetchJobOptions } from "@/app/automation/receipts-data";
 import { JOB_OPTIONS_TAKE } from "@/app/automation/receipts-filters";
 
@@ -39,9 +39,7 @@ export async function setReceiptIntakeJobFromSuggestion(
     // that closed since the page loaded simply will not be in this list —
     // that IS the "still open" check.
     const jobs = await fetchJobOptions();
-    const suggestions = suggestJobsForFolder(row.sourceFolder, jobs, JOB_OPTIONS_TAKE);
-    const stillACandidate = (suggestions.kind === "exact" || suggestions.kind === "prefix")
-        && suggestions.jobs.some(job => job.id === projectId);
+    const stillACandidate = isFolderCandidate(row.sourceFolder, jobs, JOB_OPTIONS_TAKE, projectId);
     if (!stillACandidate) {
         throw new Error("That job is no longer open or no longer matches this receipt's folder. Refresh and use Set job.");
     }

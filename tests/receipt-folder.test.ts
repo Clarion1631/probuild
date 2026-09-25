@@ -5,6 +5,7 @@ import {
     intakeFolderOf,
     normalizeJobName,
     suggestJobsForFolder,
+    isFolderCandidate,
     folderFact,
     FOLDER_COPY,
 } from "../src/lib/receipt-intake/folder";
@@ -124,11 +125,14 @@ test("overhead guard runs BEFORE exact matching, both directions (Codex round 2,
     // "Shop." as a project folder, punctuation and all) never suggests the
     // overhead job "Shop", even though the two normalize identically.
     assert.deepEqual(suggestJobsForFolder("Shop.", jobs(["Shop"]), 200), { kind: "none" });
-    // And the project folder still matches ITSELF normally.
-    assert.deepEqual(
-        suggestJobsForFolder("Shop.", jobs(["Shop.", "Shop"]), 200),
-        { kind: "exact", jobs: [{ id: "job-0", name: "Shop." }] },
-    );
+    // A folder that NORMALIZES to the overhead name but is not literally
+    // "Shop" never offers a customer job either, even one spelled exactly
+    // the same way ("Shop." folder vs a "Shop." job) — the whole point of
+    // the guard is that nothing customer-facing is ever suggested once a
+    // folder reads as the overhead name (checker, PR #555 round 2).
+    assert.deepEqual(suggestJobsForFolder("Shop.", jobs(["Shop.", "Shop"]), 200), { kind: "none" });
+    assert.deepEqual(suggestJobsForFolder("Shop-", jobs(["Shop -"]), 200), { kind: "none" });
+    assert.deepEqual(suggestJobsForFolder("shop!", jobs(["SHOP?"]), 200), { kind: "none" });
 });
 
 test("Codex's cleaning case: a tab inside a folder name never merges two different jobs", () => {
@@ -206,6 +210,59 @@ test("an empty or emoji-only folder gives none", () => {
     assert.deepEqual(suggestJobsForFolder("\u{1F600}", jobs(["Oak Street"]), 200), { kind: "none" });
     assert.deepEqual(suggestJobsForFolder(null, jobs(["Oak Street"]), 200), { kind: "none" });
     assert.deepEqual(suggestJobsForFolder(undefined, jobs(["Oak Street"]), 200), { kind: "none" });
+});
+
+// ---- isFolderCandidate (setReceiptIntakeJobFromSuggestion's write-time re-check) ----
+
+test("isFolderCandidate: true when the job is still an exact or prefix candidate", () => {
+    assert.equal(isFolderCandidate("Oak Street", jobs(["Oak Street"]), 200, "job-0"), true);
+    assert.equal(
+        isFolderCandidate("Oak Street", jobs(["Oak Street Remodel", "Pine Avenue"]), 200, "job-0"),
+        true,
+    );
+});
+
+test("isFolderCandidate: refuses a job that closed since the page loaded (no longer in the list)", () => {
+    // fetchJobOptions is scoped to open projects, so a closed job simply is
+    // not in `jobs` any more -- the tapped id can never appear as a candidate.
+    assert.equal(isFolderCandidate("Oak Street", jobs(["Pine Avenue"]), 200, "job-0"), false);
+    assert.equal(isFolderCandidate("Oak Street", jobs([]), 200, "some-other-job-id"), false);
+});
+
+test("isFolderCandidate: refuses a job that is no longer a candidate for this folder (renamed, or a namesake opened)", () => {
+    // The job was renamed away from matching the folder since the page loaded.
+    assert.equal(isFolderCandidate("Oak Street", jobs(["Birch Lane"]), 200, "job-0"), false);
+    // A namesake opened, turning what was a unique exact match into same-name.
+    assert.equal(
+        isFolderCandidate("Oak Street", jobs(["Oak Street", "oak street"]), 200, "job-0"),
+        false,
+    );
+    // The suggested project id itself is stale even though something still matches.
+    assert.equal(
+        isFolderCandidate("Oak Street", jobs(["Oak Street"]), 200, "not-the-real-job-id"),
+        false,
+    );
+});
+
+// ---- source scan of receipt-row-actions.tsx (pins: suggestion taps use the wrapper) ----
+
+test("receipt-row-actions.tsx: Set job calls setReceiptIntakeJob directly, suggestion buttons call the wrapper", async () => {
+    const { readFileSync } = await import("node:fs");
+    const source = readFileSync(
+        new URL("../src/app/automation/components/receipts/receipt-row-actions.tsx", import.meta.url),
+        "utf8",
+    );
+    assert.match(
+        source,
+        /onClick=\{\(\) => run\(\(\) => setReceiptIntakeJob\(intakeId, projectId, expectedState, expectedUpdatedAt\)\)\}/,
+        "the plain Set job button must keep calling setReceiptIntakeJob directly, unchanged",
+    );
+    const suggestionCalls = source.match(
+        /onClick=\{\(\) => run\(\(\) => setReceiptIntakeJobFromSuggestion\(intakeId, job\.id, expectedState, expectedUpdatedAt\)\)\}/g,
+    );
+    assert.ok(suggestionCalls, "suggestion buttons must call setReceiptIntakeJobFromSuggestion");
+    // Both the "exact" and "prefix" suggestion button groups must use the wrapper.
+    assert.equal(suggestionCalls!.length, 2);
 });
 
 // ---- folderFact + copy lint -------------------------------------------------

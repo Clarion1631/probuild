@@ -6,6 +6,17 @@ test('schema migration requires explicit expected URL host/db and yes', () => {
     const url = 'postgresql://test:test@db.example.test:6543/example?pgbouncer=true';
     assert.throws(() => validateMigrationTarget(url, []));
     assert.throws(() => validateMigrationTarget(url, ['--target', 'ci', '--yes', '--expect-db', 'example', '--expect-host', 'wrong.example.test']));
+    assert.throws(
+        () => validateMigrationTarget(url, ['--target', 'ci', '--yes', '--expect-db', 'wrong-db', '--expect-host', 'db.example.test']),
+        'a database name that does not match --expect-db must refuse',
+    );
+    assert.throws(
+        () => validateMigrationTarget(
+            'postgresql://test:test@db.example.test:6543/example',
+            ['--target', 'ci', '--yes', '--expect-db', 'example', '--expect-host', 'db.example.test'],
+        ),
+        'a URL without ?pgbouncer=true must refuse (CLAUDE.md: without it, 42P05 and the site goes down)',
+    );
     assert.doesNotThrow(() => validateMigrationTarget(url, ['--target', 'ci', '--yes', '--expect-db', 'example', '--expect-host', 'db.example.test']));
 });
 
@@ -50,6 +61,14 @@ test('CI applies the schema, proves it against an ABSENT column, and pins the ho
     assert.ok(callCount >= 2, 'the apply script must run at least twice (add, then no-op)');
     assert.ok(step.includes('--expect-host "$FOLDER_DB_HOST"'));
     assert.match(step, /DROP COLUMN IF EXISTS "sourceFolder"|ci-receipt-intake-source-folder-column\.mjs drop/);
+    // The drop has to run BEFORE the first apply, not just exist somewhere in
+    // the step -- otherwise it proves nothing about the ADD COLUMN branch
+    // against a database that never had the column (a migrate-deploy'd one
+    // always already has it, which would hide the branch behind a no-op).
+    const dropIndex = step.search(/DROP COLUMN IF EXISTS "sourceFolder"|ci-receipt-intake-source-folder-column\.mjs drop/);
+    const firstApplyIndex = step.indexOf('apply-receipt-intake-source-folder.mjs');
+    assert.ok(dropIndex >= 0 && firstApplyIndex >= 0);
+    assert.ok(dropIndex < firstApplyIndex, 'the drop must run before the first apply call');
 });
 
 test('schema.prisma declares the nullable column on ReceiptIntake', async () => {

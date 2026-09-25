@@ -2083,6 +2083,11 @@ test.describe("Drive folder name", () => {
         await expect(page.getByText("I could not read a total on this one")).toBeVisible();
 
         await expect(page.getByText(`E2E Zero ${r}`)).toBeVisible();
-        await expect(page.getByText("$0.00")).toBeVisible();
+        // {exact: true} because "$0.00" also appears as a substring of the
+        // reason sentence below ("The total reads as $0.00. …") -- without it
+        // this locator matches both elements and Playwright's strict mode
+        // refuses to resolve it.
+        await expect(page.getByText("$0.00", { exact: true })).toBeVisible();
+        await expect(page.getByText("The total reads as $0.00.", { exact: false })).toBeVisible();
     });
 });
