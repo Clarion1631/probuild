@@ -185,8 +185,9 @@ async function main() {
     // flow; schedule writers must not call that stateless helper.
     assert.match(routeSource, /function mintPreviewToken/);
     assert.match(routeSource, /function verifyPreviewToken/);
-    const scheduleStart = routeSource.indexOf('"get_company_schedule"');
-    const scheduleRegistry = routeSource.slice(scheduleStart);
+    const scheduleRegistrationMatch = routeSource.match(/registerTool\(\s*"get_company_schedule"/);
+    assert.ok(scheduleRegistrationMatch, "get_company_schedule registerTool call not found");
+    const scheduleRegistry = routeSource.slice(scheduleRegistrationMatch.index);
     assert.doesNotMatch(scheduleRegistry, /mintPreviewToken|verifyPreviewToken/);
     console.log("PASS static confirmation schema, RLS, registry, and delegation contracts");
 
