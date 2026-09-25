@@ -3,6 +3,7 @@ import GoogleProvider from "next-auth/providers/google";
 import CredentialsProvider from "next-auth/providers/credentials";
 import type { JWT } from "next-auth/jwt";
 import { prisma } from "@/lib/prisma";
+import { safeCallbackPath } from "@/lib/login-callback";
 
 type StaffJWT = JWT & {
     userId?: string;
@@ -122,6 +123,16 @@ export const authOptions: NextAuthOptions = {
                 (session.user as any).role = token.role;
             }
             return session;
+        },
+        // Second, server-side fence behind safeCallbackPath (src/lib/login-callback.ts):
+        // whatever reaches here -- the login page's callbackUrl, or a call next-auth
+        // makes internally -- must resolve to a safe path on this origin before the
+        // browser is sent there. `baseUrl` is passed through as the trusted origin so
+        // this is the single call safeCallbackPath makes its own decision from,
+        // handling both a relative `url` and a same-origin absolute one the same way
+        // the login page does -- no separate origin check duplicated here.
+        async redirect({ url, baseUrl }) {
+            return baseUrl + safeCallbackPath(url, baseUrl);
         },
     },
     secret: process.env.NEXTAUTH_SECRET,

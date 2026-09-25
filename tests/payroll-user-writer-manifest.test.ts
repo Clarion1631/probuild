@@ -100,7 +100,7 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "wrapped",
         why: "first mobile Google sign-in performs the same activation",
     },
-    "lib/auth.ts:78::update": {
+    "lib/auth.ts:79::update": {
         kind: "wrapped",
         why: "the NextAuth signIn callback performs the same activation on first web sign-in",
     },
