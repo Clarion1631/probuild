@@ -549,6 +549,23 @@ jobs:
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
           RECEIPT_MEMO_TEST_DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # `migrate deploy`, earlier in this job, already added sourceFolder, so
+      # running the apply script alone would only ever prove its idempotent
+      # no-op branch. Drop the column first, so this step proves the script
+      # adds it when ABSENT -- the shape production will actually be in --
+      # then run it again to prove the second run really is a no-op.
+      - name: Apply receipt intake source folder schema
+        run: |
+          FOLDER_DB_HOST=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')
+          test -n "$FOLDER_DB_HOST"
+          export DATABASE_URL="postgresql://probuild:probuild@${FOLDER_DB_HOST}:5432/probuild_migrations?pgbouncer=true"
+          node scripts/ci-receipt-intake-source-folder-column.mjs drop
+          node scripts/apply-receipt-intake-source-folder.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$FOLDER_DB_HOST"
+          node scripts/ci-receipt-intake-source-folder-column.mjs assert-present
+          node scripts/apply-receipt-intake-source-folder.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$FOLDER_DB_HOST"
+        env:
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest

@@ -78,7 +78,14 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
         try {
             const fresh = await getExpenses(projectId);
             setExpenses(fresh as Expense[]);
-        } catch { /* server revalidation will handle it */ }
+            return true;
+        } catch {
+            // Local state may already reflect a move or delete that
+            // already succeeded server-side -- a failed re-sync is the
+            // caller's to report (a gentle notice), never reported here
+            // as that action's own failure.
+            return false;
+        }
     }, [projectId]);
 
     const summary = useMemo(() => {
@@ -206,6 +213,17 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
 
     return (
         <div>
+            {/* Move to job (PR #546 review) focuses this on close when its
+                trigger row is gone -- a real, visible landing spot instead of
+                nowhere. tabIndex={-1}: programmatically focusable, not in the
+                normal tab order. */}
+            <h2
+                id="expenses-table-heading"
+                tabIndex={-1}
+                className="text-lg font-semibold text-slate-800 mb-4 outline-none focus-visible:ring-2 focus-visible:ring-hui-primary rounded"
+            >
+                Expenses
+            </h2>
             {/* Summary Bar */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
                 <div className="bg-gradient-to-br from-blue-50 to-blue-100/50 border border-blue-200 rounded-xl p-4">
@@ -499,9 +517,15 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                     changeOrderLabel={moveTarget.changeOrder?.code ?? null}
                     projectId={projectId}
                     jobOptions={jobOptions}
+                    fallbackFocusId="expenses-table-heading"
                     onClose={() => setMoveTarget(null)}
                     onMoved={async () => {
                         setMoveTarget(null);
+                        // Drop the moved row locally right away -- it no longer
+                        // belongs on this job, and leaving it on screen until the
+                        // refresh below resolves is what let it be reselected and
+                        // acted on again while still mid-flight.
+                        setExpenses(prev => prev.filter(e => e.id !== moveTarget.id));
                         // It just left this job — a "Tag selected" fired before the
                         // refresh below resolves must never act on it.
                         setSelectedIds(prev => {
@@ -510,7 +534,11 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                             next.delete(moveTarget.id);
                             return next;
                         });
-                        await refreshExpenses();
+                        // The move already succeeded -- that's why we're here.
+                        // A failed re-sync afterward is not a move failure, just
+                        // a reason to say the list may be stale.
+                        const refreshed = await refreshExpenses();
+                        if (!refreshed) toast("Moved. Refresh the page if the list looks out of date.");
                     }}
                 />
             )}

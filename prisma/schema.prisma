@@ -3589,6 +3589,10 @@ model ReceiptIntake {
   /// "drive:<fileId>" | "email:<gmailMsgId>:<sha16>" | "mobile:<uploadId>" |
   /// "chat:<messageName>:<n>" | "web:<uuid>" — the caller's idempotency key.
   sourceRef   String  @unique
+  /// The Drive folder the forwarder filed this under, as it saw it (cleaned, at most
+  /// 200 characters). Written once at intake, only for the shared-secret drive
+  /// forwarder. A display and suggestion hint, never a job by itself.
+  sourceFolder String?
   /// STAGING is the state a row is BORN in: the object is not in the bucket
   /// yet, so the worker's claim predicate excludes it. The intake route flips
   /// it to RECEIVED in one UPDATE after the upload lands. A row that never gets

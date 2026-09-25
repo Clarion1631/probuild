@@ -51,7 +51,7 @@ let projectStatusRows: unknown[] = [{ id: "job-2", status: "In Progress" }];
 /** `assertPhaseOfProjectTx`'s plain CostCode read. */
 let costCodeRows: unknown[] = [{ id: "cc-1", code: "03-PLUMB", isActive: true }];
 /** `tx.project.findUnique` — the target job Move to job reads at step 7. */
-let projectRow: { name: string; status: string } | null = { name: "Mesplay Kitchen", status: "In Progress" };
+let projectRow: { name: string; status: string } | null = { name: "Sample Job B", status: "In Progress" };
 /** `tx.estimate.findFirst` — `reattributeExpense`'s target-estimate peek/re-read. */
 let targetEstimateId: string | null = "est-target-1";
 let estimateFindFirstOverride: ((call: number) => string | null) | null = null;
@@ -248,7 +248,7 @@ beforeEach(() => {
     membershipRows = [{ ok: 1 }];
     projectStatusRows = [{ id: "job-2", status: "In Progress" }];
     costCodeRows = [{ id: "cc-1", code: "03-PLUMB", isActive: true }];
-    projectRow = { name: "Mesplay Kitchen", status: "In Progress" };
+    projectRow = { name: "Sample Job B", status: "In Progress" };
     targetEstimateId = "est-target-1";
     estimateFindFirstOverride = null;
     estimateFindFirstCall = 0;
@@ -315,7 +315,7 @@ test("moveReceiptExpenseToJob: happy path, phase kept — opLog order, one trans
 
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
 
-    assert.deepEqual(res, { ok: true, toProjectName: "Mesplay Kitchen", phaseCleared: false });
+    assert.deepEqual(res, { ok: true, toProjectName: "Sample Job B", phaseCleared: false });
     assert.equal(transactionCalls, 1, "one transaction, no retry");
 
     const at = (needle: string) => opLog.findIndex(entry => entry.startsWith(needle));
@@ -365,7 +365,7 @@ test("moveReceiptExpenseToJob: happy path, phase cleared — links and intake da
 
     const res = await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
 
-    assert.deepEqual(res, { ok: true, toProjectName: "Mesplay Kitchen", phaseCleared: true });
+    assert.deepEqual(res, { ok: true, toProjectName: "Sample Job B", phaseCleared: true });
 
     assert.deepEqual(linksUpdateArgs.data, {
         itemId: null, changeOrderId: null, isBillable: false, purchaseOrderId: null,
@@ -420,6 +420,40 @@ test("moveReceiptExpenseToJob: role check — a non-ADMIN/MANAGER user gets notA
 
     assert.deepEqual(res, { ok: false, message: MOVE_MESSAGES.notAllowed });
     assert.equal(transactionCalls, 0, "no transaction runs");
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: a manager who can see only the SOURCE project is refused before any transaction starts", async () => {
+    // Codex xhigh post-merge review of #534, §7.5. canAccessProject already
+    // gates both ends before moveReceiptExpenseToJobCore is ever called
+    // (time-expense-actions.ts) -- this is the missing test proving it, not
+    // a code fix. The check throws a plain Error("Forbidden"), the same
+    // shape deleteExpense's own scope checks use elsewhere in this file, not
+    // a { ok: false, message } refusal.
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser({ projectIds: [FROM_PROJECT] }); // no access to TO_PROJECT
+    let message: string | null = null;
+    try {
+        await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    } catch (error) {
+        message = (error as Error).message;
+    }
+    assert.equal(message, "Forbidden");
+    assert.equal(transactionCalls, 0, "no transaction runs when the destination job is out of scope");
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: a manager who can see only the DESTINATION project is refused before any transaction starts", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser({ projectIds: [TO_PROJECT] }); // no access to FROM_PROJECT
+    let message: string | null = null;
+    try {
+        await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    } catch (error) {
+        message = (error as Error).message;
+    }
+    assert.equal(message, "Forbidden");
+    assert.equal(transactionCalls, 0, "no transaction runs when the source job is out of scope");
     assertNoMoveWrites();
 });
 
@@ -561,7 +595,7 @@ test("moveReceiptExpenseToJob: reattributeExpense target-moved refuses changed",
 
 test("moveReceiptExpenseToJob: reattributeExpense source-moved refuses changed", async () => {
     // The job the expense is LEAVING changes under the same peek/re-read gap
-    // (expense-attribution.ts:1079-1084): reattributeExpense's own read
+    // (expense-attribution.ts:1081-1086): reattributeExpense's own read
     // (call 3) sees no projectId of its own, so it falls back to the
     // estimate's projectId peek, and that peek disagrees with its own
     // locked re-read.

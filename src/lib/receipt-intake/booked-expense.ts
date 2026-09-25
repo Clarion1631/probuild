@@ -92,7 +92,7 @@ export async function moveReceiptExpenseToJobCore(
 
     return db.$transaction(async tx => {
         // 1-2. THE OUTERMOST LOCK, then the epoch bump — the same first two
-        // steps as booking (book.ts:1154) and every other Expense writer.
+        // steps as booking (book.ts:1168) and every other Expense writer.
         await lockReceiptEvidence(tx);
         await bumpReceiptEvidenceEpoch(tx);
 
@@ -181,8 +181,8 @@ export async function moveReceiptExpenseToJobCore(
 
         // 10. The move itself — the one sanctioned way to change an Expense's
         // job. No `eligibleEstimateStatuses`: it then picks the target job's
-        // newest non-archived estimate, matching booking's newest-estimate
-        // rule (book.ts:622-637).
+        // newest non-archived estimate, matching booking's own newest-estimate
+        // pick (book.ts:623-651), which also excludes archived estimates.
         const moved = await reattributeExpense(tx as never, { expenseId, toProjectId });
         if (!moved.moved) {
             if (moved.reason === "no-such-expense") throw new ReceiptMoveRefusedError(MOVE_MESSAGES.gone);

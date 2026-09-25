@@ -3,15 +3,10 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import type { ComponentType } from "react";
-import { act, createElement } from "react";
+import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ReceiptQueueClient from "../src/app/manager/receipts/ReceiptQueueClient";
 import ExpensesTab from "../src/app/projects/[id]/time-expenses/ExpensesTab";
-import MoveToJobModal from "../src/app/projects/[id]/time-expenses/MoveToJobModal";
-import { RECEIPT_EXPENSE_DOUBLE_NOTE } from "../src/lib/receipt-intake/booked-expense-rules";
-// The repo ships jsdom without its optional declaration package (same adapter
-// as tests/time-entry-void-control.test.tsx).
-const { JSDOM } = require("jsdom") as { JSDOM: new (html: string, options: { url: string }) => { window: Window & typeof globalThis } };
 
 const ImportedAwareReceiptQueueClient =
     ReceiptQueueClient as unknown as ComponentType<Record<string, unknown>>;
@@ -115,8 +110,8 @@ function renderExpensesTab(): string {
         currentUser: { id: "u1", role: "ADMIN", name: "Admin" },
         changeOrders: [],
         jobOptions: [
-            { id: "job-1", name: "Mueller Remodel" },
-            { id: "job-2", name: "Mesplay Kitchen" },
+            { id: "job-1", name: "Sample Job A" },
+            { id: "job-2", name: "Sample Job B" },
             { id: "shop-id", name: "Shop" },
         ],
         expenses: [
@@ -142,100 +137,15 @@ function renderExpensesTab(): string {
     }));
 }
 
-test("MoveToJobModal: title, double note, Shop help, current job absent, Move disabled", () => {
-    const ImportedAwareMoveToJobModal = MoveToJobModal as unknown as ComponentType<Record<string, unknown>>;
-    const markup = renderToStaticMarkup(createElement(ImportedAwareMoveToJobModal, {
-        expenseId: "exp-receipt",
-        vendor: "Lowe's",
-        amountLabel: "$146.32",
-        dateLabel: "9/2/2026",
-        changeOrderLabel: null,
-        projectId: "job-1",
-        jobOptions: [
-            { id: "job-1", name: "Mueller Remodel" },
-            { id: "job-2", name: "Mesplay Kitchen" },
-            { id: "shop-id", name: "Shop" },
-        ],
-        onClose: () => {},
-        onMoved: async () => {},
-    }));
-
-    assert.match(markup, />Move to another job</);
-    // React escapes apostrophes as &#x27; when it serializes text content.
-    const escapedNote = RECEIPT_EXPENSE_DOUBLE_NOTE
-        .replace(/'/g, "&#x27;")
-        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    assert.match(markup, new RegExp(escapedNote));
-    assert.match(markup, /Pick Shop if it isn&#x27;t a job cost\./);
-
-    // The current job (job-1) is absent from the options; Shop is present.
-    assert.doesNotMatch(markup, />Mueller Remodel</);
-    assert.match(markup, />Mesplay Kitchen</);
-    assert.match(markup, />Shop</);
-
-    // Move is disabled until a job is picked.
-    const moveAt = markup.indexOf(">Move<");
-    assert.ok(moveAt > -1, "the Move button (not yet clicked, so not \"Moving…\") must render");
-    const buttonStart = markup.lastIndexOf("<button", moveAt);
-    assert.match(markup.slice(buttonStart, moveAt), /disabled/);
-});
-
-// Real interactivity, not renderToStaticMarkup — focus and keydown are runtime
-// behavior a static render cannot exercise. Safe to mount for real here: unlike
-// ExpensesTab/MoveToJobModal's "Move" button, nothing on this path reaches the
-// server actions imported from "@/lib/time-expense-actions" (Codex round 1 nit).
-test("MoveToJobModal: dialog semantics, focus enters on open and returns to the trigger on close, Escape cancels", async () => {
-    const dom = new JSDOM(
-        "<!doctype html><button id='trigger'>Move to job</button><div id='root'></div>",
-        { url: "https://example.test" },
-    );
-    const globals = ["window", "document", "navigator", "HTMLElement", "IS_REACT_ACT_ENVIRONMENT"];
-    const saved = new Map(globals.map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
-    for (const key of globals) {
-        Object.defineProperty(globalThis, key, {
-            configurable: true, writable: true,
-            value: key === "IS_REACT_ACT_ENVIRONMENT" ? true : (dom.window as any)[key],
-        });
-    }
-    const { createRoot } = await import("react-dom/client");
-    const ImportedAwareMoveToJobModal = MoveToJobModal as unknown as ComponentType<Record<string, unknown>>;
-    const trigger = dom.window.document.getElementById("trigger") as HTMLButtonElement;
-    trigger.focus();
-    const root = createRoot(dom.window.document.getElementById("root")!);
-    let closes = 0;
-    try {
-        await act(async () => {
-            root.render(createElement(ImportedAwareMoveToJobModal, {
-                expenseId: "exp-receipt", vendor: "Lowe's", amountLabel: "$146.32", dateLabel: "9/2/2026",
-                changeOrderLabel: null, projectId: "job-1",
-                jobOptions: [{ id: "job-2", name: "Mesplay Kitchen" }],
-                onClose: () => { closes++; },
-                onMoved: async () => {},
-            }));
-        });
-
-        const dialog = dom.window.document.querySelector('[role="dialog"]');
-        assert.ok(dialog, "renders with role=dialog");
-        assert.equal(dialog!.getAttribute("aria-modal"), "true");
-        const labelledBy = dialog!.getAttribute("aria-labelledby");
-        assert.ok(labelledBy, "aria-labelledby is set");
-        assert.equal(dom.window.document.getElementById(labelledBy!)?.textContent, "Move to another job");
-        assert.equal(dom.window.document.activeElement, dialog, "focus moved into the dialog on open");
-
-        await act(async () => {
-            dialog!.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-        });
-        assert.equal(closes, 1, "Escape triggers onClose, same as Cancel");
-
-        await act(async () => { root.unmount(); });
-        assert.equal(dom.window.document.activeElement, trigger, "focus returns to the trigger once closed");
-    } finally {
-        await act(async () => { try { root.unmount(); } catch { /* already unmounted */ } });
-        for (const key of globals) {
-            const descriptor = saved.get(key);
-            if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-            else Reflect.deleteProperty(globalThis, key);
-        }
-        dom.window.close();
-    }
-});
+// MoveToJobModal's own rendering tests moved to tests/move-to-job-modal.test.tsx
+// (Codex xhigh post-merge review of #534, R2/R3: it moved onto Radix Dialog for
+// a real focus trap and inert background). That file exists ONLY because of a
+// hard ordering constraint: @radix-ui/react-use-layout-effect decides, once,
+// at module-IMPORT time, whether `globalThis.document` exists yet -- if not,
+// it permanently falls back to a no-op for the rest of this process, and no
+// jsdom global swapped in afterward can undo that. This file's own top-level
+// `import ExpensesTab` pulls in MoveToJobModal (and so Radix) before any test
+// here runs, in the plain Node environment with no document at all, so a
+// dialog test placed here would silently render nothing forever. The dedicated
+// file establishes a real jsdom `document` before MoveToJobModal is ever
+// imported (dynamically, specifically so nothing else can load it first).

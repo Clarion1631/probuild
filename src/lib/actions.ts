@@ -5497,10 +5497,12 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
         // "Move to job" in their own UI since PR #534, not delete -- so
         // "Please delete these entries first" sends the user somewhere that no
         // longer exists for them. Same predicate the locked check below uses
-        // (qbPurchaseId null, a linked ReceiptIntake). This is a message fix
-        // only; the locked in-transaction check stays the real guard.
+        // (a linked ReceiptIntake, whatever its qbPurchaseId -- a QBO-managed
+        // receipt expense still can't be deleted here either). This is a
+        // message fix only; the locked in-transaction check stays the real
+        // guard.
         const earlyReceiptBookedCount = await prisma.expense.count({
-            where: { estimateId, qbPurchaseId: null, receiptIntake: { isNot: null } },
+            where: { estimateId, receiptIntake: { isNot: null } },
         });
         if (earlyReceiptBookedCount > 0) {
             return {
@@ -5549,13 +5551,25 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
     // committed and released the lock, so a receipt could book onto this
     // estimate in that gap and then the unguarded delete would still run.
     // `tx.estimate.delete` makes the refusal and the delete one atomic commit.
-    let receiptBookedCount = 0;
+    //
+    // THE LOCKED GUARD COUNTS EVERY EXPENSE, NOT JUST RECEIPT ONES (Codex
+    // xhigh post-merge re-review of #542, BLOCKER, 2026-09-23). It used to
+    // count only native receipt expenses (qbPurchaseId null with a linked
+    // ReceiptIntake) and then delete EVERY Expense on the estimate once that
+    // count read zero -- so a QBO-backed receipt expense (qbPurchaseId set,
+    // still carrying its ReceiptIntake) was never counted but was deleted
+    // anyway, and the same was true of a plain ordinary Expense some other
+    // writer committed in the gap between the unlocked count above and this
+    // lock (the R1 race, also flagged in the same review). Counting ALL
+    // Expenses here, and refusing the whole delete whenever any exist at
+    // lock time, closes both at once: nothing destructive runs unless the
+    // estimate is genuinely clear of Expenses right now, of any kind.
+    let lockedExpenseCount = 0;
+    let lockedReceiptCount = 0;
     await prisma.$transaction(async tx => {
         await lockReceiptEvidence(tx);
-        receiptBookedCount = await tx.expense.count({
-            where: { estimateId, qbPurchaseId: null, receiptIntake: { isNot: null } },
-        });
-        if (receiptBookedCount === 0) {
+        lockedExpenseCount = await tx.expense.count({ where: { estimateId } });
+        if (lockedExpenseCount === 0) {
             const budget = await tx.budget.findUnique({ where: { estimateId } });
             if (budget) {
                 await tx.budget.delete({ where: { id: budget.id } });
@@ -5568,12 +5582,30 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
             // actually ran. A refusal changes no evidence, so bumping here was
             // needlessly restarting the missing-receipt sweep on every retry.
             await bumpReceiptEvidenceEpoch(tx);
+        } else {
+            // Which refusal message applies -- read under the same lock as the
+            // count above, never separately, or this could name a number that
+            // does not match what the count just refused on.
+            lockedReceiptCount = await tx.expense.count({
+                where: { estimateId, receiptIntake: { isNot: null } },
+            });
         }
     });
-    if (receiptBookedCount > 0) {
+    if (lockedExpenseCount > 0) {
+        if (lockedReceiptCount > 0) {
+            return {
+                success: false,
+                error: `This estimate has ${lockedReceiptCount} expense(s) from receipts, so it can't be deleted. Archive it instead.`,
+            };
+        }
+        // The ordinary message, unchanged -- same wording and shape as the
+        // early gate above, just built from what the lock actually found.
+        const parts = [];
+        if (lockedExpenseCount > 0) parts.push(`${lockedExpenseCount} expense(s)`);
+        if (timeEntryCount > 0) parts.push(`${timeEntryCount} time entry/entries`);
         return {
             success: false,
-            error: `This estimate has ${receiptBookedCount} expense(s) from receipts, so it can't be deleted. Archive it instead.`,
+            error: `Cannot delete estimate because it has linked ${parts.join(" and ")}. Please delete these entries first.`
         };
     }
 

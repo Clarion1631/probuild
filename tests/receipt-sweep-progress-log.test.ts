@@ -66,7 +66,11 @@ test("source pin: certified logs cycleId, plannerDay and the fence's own complet
 test("source pin: progress is declared before GET's try, and logged inside finally before releaseLease", () => {
     const sweep = read("src/app/api/cron/receipt-requests/route.ts");
 
-    const getAt = sweep.indexOf("export async function GET(request: Request) {");
+    // Exported via withCronHeartbeat's wrapper rather than a bare
+    // `export async function GET` (see src/lib/cron-heartbeat.ts); "getAt" is
+    // just the start-of-handler anchor the rest of this test searches after,
+    // so the rename is all that needs to change here.
+    const getAt = sweep.indexOf("async function handleGET(request: Request) {");
     const leaseAt = sweep.indexOf("await takeLease(LEASE_KEY, RUN_LEASE_MS, now, leaseToken)", getAt);
     const progressDeclAt = sweep.indexOf("const progress: SweepProgress = {", getAt);
     const tryAt = sweep.indexOf("\n    try {", progressDeclAt);
@@ -89,7 +93,7 @@ test("source pin: progress is declared before GET's try, and logged inside final
 
 test("source pin: the catch sets outcome to deferred, cursor-write-failed or error", () => {
     const sweep = read("src/app/api/cron/receipt-requests/route.ts");
-    const getAt = sweep.indexOf("export async function GET(request: Request) {");
+    const getAt = sweep.indexOf("async function handleGET(request: Request) {");
     const catchAt = sweep.indexOf("} catch (error) {", getAt);
     const finallyAt = sweep.indexOf("} finally {", catchAt);
     const body = sweep.slice(catchAt, finallyAt);
