@@ -4,10 +4,21 @@ import { signIn } from "next-auth/react";
 import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 import Image from "next/image";
+import { safeCallbackPath } from "@/lib/login-callback";
 
 function LoginForm() {
     const searchParams = useSearchParams();
     const error = searchParams.get('error');
+    // Same-origin absolute callback URLs are handled identically to the
+    // NextAuth redirect callback (src/lib/auth.ts), which passes its own
+    // trusted `baseUrl` the same way -- see safeCallbackPath's doc comment.
+    // `window` is undefined during server rendering; a relative callbackUrl
+    // still works then, and this component is only interactive (the button
+    // is only clickable) once hydrated, when `window` exists.
+    const callbackUrl = safeCallbackPath(
+        searchParams.get('callbackUrl'),
+        typeof window !== "undefined" ? window.location.origin : undefined
+    );
 
     return (
         <div className="relative min-h-screen flex items-center justify-center overflow-hidden bg-slate-900 w-full">
@@ -38,7 +49,7 @@ function LoginForm() {
                 )}
 
                 <button
-                    onClick={() => signIn("google", { callbackUrl: "/" })}
+                    onClick={() => signIn("google", { callbackUrl })}
                     className="w-full relative flex items-center justify-center gap-3 bg-white text-slate-900 px-6 py-3.5 rounded-xl font-medium shadow-[0_0_40px_rgba(255,255,255,0.15)] hover:shadow-[0_0_60px_rgba(255,255,255,0.3)] hover:-translate-y-0.5 transition-all duration-300 group"
                 >
                     <svg className="w-5 h-5 flex-shrink-0" viewBox="0 0 24 24">
