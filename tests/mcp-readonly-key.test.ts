@@ -295,7 +295,7 @@ test("wrapReadOnlyMode composed with wrapWriteTools, same order, registers every
 
 // ── Allowlist composition (real Sets, not regex) ────────────────────────────
 
-test("READONLY_TOOLS is exactly the expected 20-tool allowlist (snapshot — a new tool needs a deliberate change here)", () => {
+test("READONLY_TOOLS is exactly the expected 21-tool allowlist (snapshot — a new tool needs a deliberate change here)", () => {
     const expected = new Set([
         "list_projects", "list_leads", "find_job", "get_estimating_codes",
         "list_templates", "get_template", "get_estimate",
@@ -304,6 +304,8 @@ test("READONLY_TOOLS is exactly the expected 20-tool allowlist (snapshot — a n
         "list_contract_templates", "list_contracts",
         "get_company_schedule", "get_project_schedule", "list_crew_availability",
         "get_activity_log",
+        // PB-leads-001: counts-only, SELECT-only (src/lib/speed-to-lead/funnel.ts).
+        "get_lead_funnel_summary",
     ]);
     assert.deepStrictEqual(READONLY_TOOLS, expected);
 });

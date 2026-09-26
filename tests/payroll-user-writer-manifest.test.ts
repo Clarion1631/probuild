@@ -110,11 +110,11 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "guarded",
         why: "THE rate/payType writer — takes acquirePayrollWriteLock and then the owner row lock, in the global order",
     },
-    "lib/actions.ts:16964::updateMany": {
+    "lib/actions.ts:17123::updateMany": {
         kind: "guarded",
         why: "applyGustoRateImport, inside a transaction that takes acquirePayrollWriteLock before any row lock",
     },
-    "lib/actions.ts:17058::updateMany": {
+    "lib/actions.ts:17217::updateMany": {
         kind: "guarded",
         why: "setUserPayType, taking the same lock in the same order",
     },
