@@ -56,16 +56,7 @@ jobs:
       # shape) and Booked/Called/the 09:00 digest/promoteLeadToReal's
       # no-new-alert guarantee had zero coverage before this round. Same
       # ordering reason as the two steps below (must run before the
-      # known-red migration-match assertion, see its own comment) — placed
-      # BEFORE, not after, "Speed-to-Lead v1a intake and alert races": that
-      # step has a pre-existing, unrelated test-isolation flake of its own
-      # (intake-db.test.ts's tests never clean up their created rows, and
-      # Node's test runner runs the files it's given concurrently against
-      # the shared Postgres service, so alerts-db.test.ts's "sink hit
-      # exactly once" assertion can pick up leftover PENDING alerts from
-      # whichever intake-db.test.ts tests happen to have run by then) —
-      # every row this round's own tests create is cleaned up in a
-      # `finally` block, so running first does not add to that problem.
+      # known-red migration-match assertion, see its own comment).
       - name: Speed-to-Lead v1a round-2 fixes (intake route, tracking, digest) against real Postgres
         run: npx tsx --test tests/speed-to-lead-intake-route.test.ts tests/speed-to-lead-tracking-db.test.ts
         env:
@@ -92,8 +83,26 @@ jobs:
       # otherwise never execute in CI. This ordering is scoped to just this
       # PR's own new tests; the pre-existing steps below the assertion are
       # left exactly where they were.
-      - name: Speed-to-Lead v1a intake and alert races against real Postgres
-        run: npx tsx --test tests/speed-to-lead-intake-db.test.ts tests/speed-to-lead-alerts-db.test.ts
+      #
+      # Round-3 fix: these two files run in SEPARATE `tsx --test` invocations,
+      # sequentially — not the single combined invocation round 1 used. Node's
+      # test runner runs the files it's given as concurrent OS processes
+      # against the SAME shared Postgres service; intake-db.test.ts's rows are
+      # now cleaned up in a `finally` block (round 3), but cleanup alone does
+      # not stop alerts-db.test.ts's own "sink hit exactly once" assertion
+      # from picking up an intake-db row that is briefly PENDING and due
+      # DURING the overlap between the two files' concurrent runs, before
+      # intake-db's cleanup for that row has run — reproduced in CI even after
+      # the cleanup fix landed. Running intake-db.test.ts to completion
+      # (including every one of its `finally` blocks) before alerts-db.test.ts
+      # even starts removes the overlap entirely, rather than narrowing it.
+      - name: Speed-to-Lead v1a intake races against real Postgres
+        run: npx tsx --test tests/speed-to-lead-intake-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      - name: Speed-to-Lead v1a alert races against real Postgres
+        run: npx tsx --test tests/speed-to-lead-alerts-db.test.ts
         env:
           SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
