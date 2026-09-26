@@ -4,6 +4,7 @@ import type { PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { encryptObject, decryptObject } from "@/lib/crypto";
 import { LEAD_INBOX_ADDRESS, GMAIL_REQUEST_TIMEOUT_MS } from "./constants";
+import { safeErrorCategory } from "./error-category";
 
 /**
  * The gtrsupport@ lead-inbox Gmail identity — a SECOND, independent OAuth
@@ -188,7 +189,7 @@ export async function ensureLeadInboxAuth(db: PrismaClient = prisma): Promise<Le
         await withTimeout(client.getAccessToken(), GMAIL_REQUEST_TIMEOUT_MS, "lead-inbox token refresh");
         return { ok: true, client };
     } catch (error) {
-        console.error("[speed-to-lead] could not load or refresh the stored lead-inbox credential", error instanceof Error ? error.message : "UnknownError");
+        console.error("[speed-to-lead] could not load or refresh the stored lead-inbox credential", safeErrorCategory(error));
         return { ok: false };
     }
 }

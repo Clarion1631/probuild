@@ -6,6 +6,7 @@ import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { logLeadEvent } from "./audit";
 import { sendPlainNtfy } from "./alerts";
 import { speedToLeadMode, DIGEST_HOUR_LOCAL, DIGEST_LOOKBACK_MS } from "./constants";
+import { safeErrorCategory } from "./error-category";
 
 /**
  * Booked/Called (the funnel's tracking half) and the 09:00 digest — v1a has
@@ -43,8 +44,14 @@ function hourInTimeZone(date: Date, timeZone: string): number {
  * Goal: unanswered/unbooked leads plus DEAD alerts and poll health, once a
  * day at the business's own local morning (never 09:00 UTC — Golden Touch
  * Remodeling is in Vancouver, WA / America/Los_Angeles).
+ *
+ * Returns whether the digest is fully handled: true when there was nothing
+ * to send, or the push actually succeeded; false when there WAS content but
+ * the push failed. `sendPlainNtfy` never throws on a failed push (it
+ * resolves `false`), so the caller cannot tell success from failure via
+ * try/catch alone — it must check this return value.
  */
-export async function send0900Digest(db: PrismaClient = prisma, now: Date = new Date()): Promise<void> {
+export async function send0900Digest(db: PrismaClient = prisma, now: Date = new Date()): Promise<boolean> {
     const since = new Date(now.getTime() - DIGEST_LOOKBACK_MS);
     const leads = await db.lead.findMany({
         where: { ...OWNED_LEAD_WHERE, createdAt: { gte: since } },
@@ -58,7 +65,7 @@ export async function send0900Digest(db: PrismaClient = prisma, now: Date = new 
         ? `Inbox poll unhealthy (${settings.leadInboxFailureCount} consecutive failure(s)).`
         : "Inbox poll healthy.";
 
-    if (leads.length === 0 && deadAlerts === 0) return;
+    if (leads.length === 0 && deadAlerts === 0) return true;
 
     const lines = [
         pollHealthLine,
@@ -67,7 +74,7 @@ export async function send0900Digest(db: PrismaClient = prisma, now: Date = new 
         ...leads.map(l => `- ${l.name} (received ${l.createdAt.toISOString().slice(0, 10)})`),
     ].filter((l): l is string => l !== null);
 
-    await sendPlainNtfy(`Speed-to-Lead: ${leads.length} unanswered/unbooked lead(s)`, lines.join("\n"));
+    return sendPlainNtfy(`Speed-to-Lead: ${leads.length} unanswered/unbooked lead(s)`, lines.join("\n"));
 }
 
 /**
@@ -98,11 +105,21 @@ export async function maybeSend0900Digest(now: Date = new Date(), db: PrismaClie
     }
 
     try {
-        await send0900Digest(db, now);
+        const sent = await send0900Digest(db, now);
+        if (!sent) {
+            // sendPlainNtfy resolved false (a real push failure) rather than
+            // throwing — this branch is what actually catches that; the
+            // catch block below alone never would (v1a's #557 write-before-
+            // send bug, reproduced: the "sent" marker must not be written on
+            // a failed push).
+            console.error("[speed-to-lead] 09:00 digest push failed; releasing claim for retry");
+            await db.automationSetting.delete({ where: { key: claimKey } }).catch(() => undefined);
+            return false;
+        }
         await db.automationSetting.upsert({ where: { key: sentKey }, create: { key: sentKey, value: today }, update: { value: today } });
         return true;
     } catch (error) {
-        console.error("[speed-to-lead] 09:00 digest failed; releasing claim for retry", error instanceof Error ? error.message : "UnknownError");
+        console.error("[speed-to-lead] 09:00 digest failed; releasing claim for retry", safeErrorCategory(error));
         await db.automationSetting.delete({ where: { key: claimKey } }).catch(() => undefined);
         return false;
     }

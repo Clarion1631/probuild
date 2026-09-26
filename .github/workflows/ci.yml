@@ -87,6 +87,18 @@ jobs:
         env:
           SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # Round-2 gap fixes (acceptance tests 4, 9, 21, 22): the intake route
+      # handler itself (mode-gate ordering, 32KB cap, generic 401, response
+      # shape) and Booked/Called/the 09:00 digest/promoteLeadToReal's
+      # no-new-alert guarantee had zero coverage before this round. Same
+      # ordering reason as the two steps above — both files have DB-gated
+      # cases that must run somewhere, and this is the only job with a real
+      # Postgres.
+      - name: Speed-to-Lead v1a round-2 fixes (intake route, tracking, digest) against real Postgres
+        run: npx tsx --test tests/speed-to-lead-intake-route.test.ts tests/speed-to-lead-tracking-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # The schema gap the baseline recorded is now closed by
       # 20260814120000_missing_fk_indexes, so `migrate deploy` above already
       # produces the final shape and there is no separate gap file to apply.

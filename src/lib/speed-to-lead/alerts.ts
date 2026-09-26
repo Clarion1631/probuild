@@ -354,8 +354,15 @@ export async function deliverDueAlerts(db: PrismaClient = prisma, now: Date = ne
             continue;
         }
 
+        // nextAttemptAt is re-checked here, not just in the `due` SELECT above:
+        // a concurrent invocation's `due` list is a snapshot — if THIS row's
+        // backoff got reset to PENDING (by another invocation's failed send,
+        // between that snapshot and this claim) with nextAttemptAt pushed into
+        // the future, matching on {id, status} alone would let a stale
+        // in-memory "due" reference re-claim and resend it immediately,
+        // ignoring the backoff it was just given.
         const claim = await db.leadAlert.updateMany({
-            where: { id: row.id, status: "PENDING" },
+            where: { id: row.id, status: "PENDING", nextAttemptAt: { lte: now } },
             data: { status: "SENDING", claimedAt: now, attempts: { increment: 1 } },
         });
         if (claim.count === 0) continue; // lost the claim race to another invocation

@@ -64,6 +64,33 @@ test("Bearer bypass is refused for Server Action dispatches on an allowlisted pa
     }
 });
 
+// PB-leads-001a spec (SPEED-TO-LEAD-V1A.md) acceptance test 4: the signed
+// webhook must be reachable with no session at all, its sibling sub-routes
+// must NOT inherit that bypass, and a Server Action header must still be
+// refused through it (the same isMachineOnlyBypass rule as every other
+// machine-to-machine endpoint — see PUBLIC_PROXY_BYPASS_PATTERN's own
+// comment on api/speed-to-lead/intake).
+test("api/speed-to-lead/intake is reachable unauthenticated, api/speed-to-lead/other still redirects to login, and a Server Action header is refused", async () => {
+    const { default: proxy } = await loadProxy();
+    const { NextRequest } = await import("next/server");
+    const event = { waitUntil() {} } as any;
+
+    const intake = await proxy(new NextRequest("https://probuild.test/api/speed-to-lead/intake", { method: "POST" }), event);
+    assert.ok(intake instanceof Response, "proxy returns a response for the unauthenticated webhook POST");
+    assert.equal(intake.headers.get("x-middleware-next"), "1", "the signed webhook must reach its own handler, not a /login redirect");
+
+    const other = await proxy(new NextRequest("https://probuild.test/api/speed-to-lead/other", { method: "GET" }), event);
+    assert.ok(other instanceof Response, "proxy returns a response for the unrelated sub-route");
+    assert.notEqual(other.headers.get("x-middleware-next"), "1", "only the exact /intake path is bypassed");
+    assert.ok([302, 303, 307, 308].includes(other.status), `expected a redirect to /login, got ${other.status}`);
+    assert.match(other.headers.get("location") ?? "", /\/login/, "redirect target is the login page");
+
+    const action = await proxy(new NextRequest("https://probuild.test/api/speed-to-lead/intake", { method: "POST", headers: { "next-action": "deadbeef" } }), event);
+    assert.ok(action instanceof Response, "proxy must return a response, not fall through");
+    assert.notEqual(action.headers.get("x-middleware-next"), "1", "a Server Action header must never bypass the webhook route");
+    assert.equal(action.status, 403, "isMachineOnlyBypass refuses a Server Action dispatch through this route with a plain 403");
+});
+
 test("the allowlist does not widen to other time-entry descendants", async () => {
     const { isMobileAuthenticatedRoute } = await loadProxy();
     for (const path of [

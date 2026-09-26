@@ -1,4 +1,5 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
+import { safeErrorCategory } from "./error-category";
 
 type Db = PrismaClient | Prisma.TransactionClient;
 
@@ -23,6 +24,6 @@ export async function logLeadEvent(db: Db, params: { leadId?: string | null; kin
             },
         });
     } catch (error) {
-        console.error("[speed-to-lead] failed to log SpeedToLeadEvent", error instanceof Error ? error.message : "UnknownError");
+        console.error("[speed-to-lead] failed to log SpeedToLeadEvent", safeErrorCategory(error));
     }
 }

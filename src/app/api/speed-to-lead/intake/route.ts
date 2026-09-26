@@ -5,6 +5,7 @@ import { intakeWebhookLead } from "@/lib/speed-to-lead/intake";
 import { deliverDueAlerts } from "@/lib/speed-to-lead/alerts";
 import { isRetryableTxError } from "@/lib/tx-retry";
 import { speedToLeadMode, INTAKE_MAX_BODY_BYTES } from "@/lib/speed-to-lead/constants";
+import { safeErrorCategory } from "@/lib/speed-to-lead/error-category";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -80,7 +81,7 @@ export async function POST(request: Request) {
         try {
             await deliverDueAlerts();
         } catch (error) {
-            console.error("[speed-to-lead] post-intake alert delivery failed", error instanceof Error ? error.message : "UnknownError");
+            console.error("[speed-to-lead] post-intake alert delivery failed", safeErrorCategory(error));
         }
     });
 

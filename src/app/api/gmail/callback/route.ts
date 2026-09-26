@@ -9,6 +9,7 @@ import {
     leadInboxStateNonce, LEAD_INBOX_STATE_COOKIE, LEAD_INBOX_SCOPES, encryptLeadInboxRefreshToken,
 } from "@/lib/speed-to-lead/gmail-inbox-client";
 import { isApprover, LEAD_INBOX_ADDRESS } from "@/lib/speed-to-lead/constants";
+import { safeErrorCategory as safeOAuthErrorCategory } from "@/lib/speed-to-lead/error-category";
 
 // Google OAuth capture for the company integrations (Gmail + Drive scopes).
 // Visit /api/gmail/callback signed in as an ADMIN: no code -> redirect to the
@@ -23,17 +24,6 @@ async function callerIsAdmin(): Promise<boolean> {
         select: { role: true },
     });
     return user?.role === "ADMIN" || user?.role === "MANAGER";
-}
-
-/** The only error.name values this route ever logs — a genuinely finite allowlist, not "whatever the thrower named their error". */
-const OAUTH_ERROR_CATEGORIES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "GaxiosError", "AggregateError"]);
-
-/** Never logs the raw OAuth error (it can carry the authorization code or request/response bodies) — only an allowlisted category and status code. `error.name` is copied through ONLY when it is one of the finite categories above; anything else falls back to "UnknownError". */
-function safeOAuthErrorCategory(error: unknown): { category: string; status: number | null } {
-    const status = (error as { code?: number })?.code ?? (error as { response?: { status?: number } })?.response?.status ?? null;
-    const name = error instanceof Error ? error.name : null;
-    const category = name && OAUTH_ERROR_CATEGORIES.has(name) ? name : "UnknownError";
-    return { category, status: typeof status === "number" ? status : null };
 }
 
 export async function GET(req: NextRequest) {

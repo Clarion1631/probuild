@@ -7,6 +7,7 @@ import { parseFallbackEmail } from "./fallback-email";
 import { recordPendingFallback, intakeVoiceEvent } from "./intake";
 import { sendPlainNtfy } from "./alerts";
 import { GMAIL_REQUEST_TIMEOUT_MS } from "./constants";
+import { safeErrorCategory } from "./error-category";
 
 /**
  * Read-only inbox poll (v1a: gmail.readonly only, no send scope). Runs every
@@ -100,8 +101,15 @@ class RunBudget {
  * relays cost exactly one `get` each. `full` (body) is fetched ONLY once
  * `authenticateMessage` has already trusted the sender from metadata alone.
  */
-async function processMessage(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, id: string, budget: RunBudget, now: Date): Promise<void> {
-    if (budget.exhausted) return;
+/**
+ * Returns false only when the budget ran out mid-message, AFTER the metadata
+ * fetch already found a TRUSTED sender but BEFORE the full fetch/record could
+ * run — i.e. this specific message was never actually recorded and must not
+ * be treated as handled (finding: "silent, permanent lead loss"). Every other
+ * outcome (untrusted, deleted/404, or fully recorded) returns true.
+ */
+async function processMessage(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, id: string, budget: RunBudget, now: Date): Promise<boolean> {
+    if (budget.exhausted) return false;
     budget.spendGet();
     let metaRes;
     try {
@@ -112,7 +120,7 @@ async function processMessage(db: PrismaClient, gmail: ReturnType<typeof gmailCl
     } catch (error) {
         // A message the history feed listed can be deleted/expunged before we
         // fetch it — skip THIS message only; never abort the whole poll.
-        if (isGoogleApiError(error, 404)) return;
+        if (isGoogleApiError(error, 404)) return true;
         throw error;
     }
     const headers = headerList(metaRes.data.payload);
@@ -121,15 +129,15 @@ async function processMessage(db: PrismaClient, gmail: ReturnType<typeof gmailCl
     const fromEmail = from.trim().toLowerCase();
 
     const auth = authenticateMessage(headers, fromEmail);
-    if (!auth.trusted) return;
+    if (!auth.trusted) return true;
 
-    if (budget.exhausted) return;
+    if (budget.exhausted) return false;
     budget.spendGet();
     let fullRes;
     try {
         fullRes = await gmail.users.messages.get({ userId: "me", id, format: "full" }, { timeout: GMAIL_REQUEST_TIMEOUT_MS });
     } catch (error) {
-        if (isGoogleApiError(error, 404)) return;
+        if (isGoogleApiError(error, 404)) return true;
         throw error;
     }
     const bodyText = extractPlainText(fullRes.data.payload);
@@ -139,12 +147,13 @@ async function processMessage(db: PrismaClient, gmail: ReturnType<typeof gmailCl
         const submissionId = submissionIdFromHeaders(headers);
         const payload = parseFallbackEmail({ headers, bodyText, submissionId });
         await db.$transaction(tx => recordPendingFallback(tx, { gmailMessageId: id, receivedAt: new Date(internalDateMs), payload }));
-        return;
+        return true;
     }
     if (auth.rule === "voice-direct") {
         await intakeVoiceEvent({ gmailMessageId: id, receivedAt: new Date(internalDateMs), callerPhoneRaw: bodyText, summary: bodyText.slice(0, 2000) }, db);
-        return;
+        return true;
     }
+    return true;
 }
 
 async function recordPollHealth(db: PrismaClient, startedAt: Date, finishedAt: Date | null, ok: boolean, extra: Record<string, unknown> = {}) {
@@ -215,7 +224,13 @@ async function runResyncSlice(db: PrismaClient, gmail: ReturnType<typeof gmailCl
         for (const m of page.data.messages ?? []) {
             if (!m.id) continue;
             if (budget.exhausted) return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null } };
-            await processMessage(db, gmail, m.id, budget, now);
+            // A false return means THIS message's budget cutoff landed after
+            // it was found trusted but before it could be recorded — must be
+            // reported as incomplete immediately, not just relying on the
+            // budget.exhausted check above catching it on the NEXT message
+            // (there may be no next message in this page/batch).
+            const completed = await processMessage(db, gmail, m.id, budget, now);
+            if (!completed) return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null } };
             processed++;
         }
         pageToken = page.data.nextPageToken ?? undefined;
@@ -285,8 +300,15 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
         let pageToken: string | undefined;
         let newHistoryId: string | null = settingsRow.leadInboxHistoryId;
         let historyExpired = false;
+        // Set when the page cap cuts pagination short. `page.data.historyId`
+        // is the MAILBOX'S CURRENT historyId (the same value on every page of
+        // one history.list series), not "historyId as of the pages fetched so
+        // far" — committing it as the new cursor after only a partial scan
+        // would permanently skip every history record on the pages never
+        // reached (finding: "permanently skipping unread history").
+        let pagesCappedOut = false;
         do {
-            if (budget.pagesExhausted) break;
+            if (budget.pagesExhausted) { pagesCappedOut = true; break; }
             budget.spendPage();
             let page;
             try {
@@ -343,25 +365,32 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
         }
 
         let processed = 0;
+        let allComplete = true;
         for (const id of messageIds) {
-            if (budget.exhausted) break;
-            await processMessage(db, gmail, id, budget, now);
+            if (budget.exhausted) { allComplete = false; break; }
+            // A false return means budget ran out mid-message, after this one
+            // was already found trusted but before it could be recorded — it
+            // must count as NOT durably processed, or the cursor gate below
+            // would advance past it (see processMessage's own doc comment).
+            const completed = await processMessage(db, gmail, id, budget, now);
+            if (!completed) { allComplete = false; break; }
             processed++;
         }
 
         // Cursor advances only after every listed message was durably
-        // processed (or the budget stopped us — in which case the NEXT run's
+        // processed AND every history page that exists was actually fetched
+        // (or the budget stopped us — in which case the NEXT run's
         // history.list, starting from the SAME cursor, simply re-lists the
         // same page; a message already processed is a no-op via its
         // externalId's ON CONFLICT DO NOTHING).
-        if (processed === messageIds.size) {
+        if (!pagesCappedOut && allComplete && processed === messageIds.size) {
             await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: newHistoryId } });
         }
         await recordPollHealth(db, startedAt, new Date(), true);
         await recordSuccessAndClearBackoff(db);
         return { ran: true, processed };
     } catch (error) {
-        console.error("[speed-to-lead] inbox poll failed", error instanceof Error ? error.message : "UnknownError");
+        console.error("[speed-to-lead] inbox poll failed", safeErrorCategory(error));
         await recordFailureAndBackoff(db, startedAt, now, error);
         return { ran: false, reason: "error" };
     } finally {
