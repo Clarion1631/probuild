@@ -228,20 +228,30 @@ model Lead {
   deletedById   String?   @ignore
   deleteBatchId String?   @ignore
 
+  // Speed-to-Lead (PB-leads-001): per-lead outreach timing row (received =
+  // createdAt above). Nullable — set once, never overwritten, by the code
+  // paths documented on each lib function that writes them.
+  firstTouchAt    DateTime?
+  personalReplyAt DateTime?
+  bookedAt        DateTime?
+  calledAt        DateTime?
+
   // Relations
-  estimates      Estimate[]
-  roomDesigns    RoomDesign[]
-  contracts      Contract[]
-  files          ProjectFile[]
-  folders        FileFolder[]
-  tasks          LeadTask[]
-  notes          LeadNote[]
-  meetings       LeadMeeting[]
-  takeoffs       Takeoff[]
-  clientMessages ClientMessage[]
-  scheduleTasks  ScheduleTask[]
-  message        String? // Initial inquiry message from the client
-  project        Project? // reverse relation: the project created from this lead
+  estimates        Estimate[]
+  roomDesigns      RoomDesign[]
+  contracts        Contract[]
+  files            ProjectFile[]
+  folders          FileFolder[]
+  tasks            LeadTask[]
+  notes            LeadNote[]
+  meetings         LeadMeeting[]
+  takeoffs         Takeoff[]
+  clientMessages   ClientMessage[]
+  scheduleTasks    ScheduleTask[]
+  message          String? // Initial inquiry message from the client
+  project          Project? // reverse relation: the project created from this lead
+  leadIntakeEvents LeadIntakeEvent[]
+  outreachMessages OutreachMessage[]
 
   @@index([createdAt])
   @@index([clientId])
@@ -1383,6 +1393,18 @@ model CompanySettings {
 
   // Contract signing
   requireContractCountersign Boolean @default(false) // default for a new contract's requiresCountersign
+
+  // Speed-to-Lead (PB-leads-001): the gtrsupport@ lead-inbox poll. A SECOND,
+  // independent Gmail OAuth identity from googleDriveRefreshToken above — see
+  // src/lib/speed-to-lead/gmail-inbox-client.ts for why it must not share the
+  // Drive client's module-level mutable credentials.
+  leadInboxRefreshToken     String?
+  leadInboxEmail            String?
+  leadInboxHistoryId        String?
+  leadInboxCutoffAt         DateTime?
+  leadInboxLastPollStartedAt DateTime?
+  leadInboxLastPollAt       DateTime?
+  leadInboxLastPollOk       Boolean?
 
   updatedAt DateTime @updatedAt
 }
@@ -3740,4 +3762,223 @@ model ReceiptIntake {
   @@index([createdById])
   @@index([dedupWeakKey])
   @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Speed-to-Lead v1 (PB-leads-001). Additive only — see docs/plans/SPEED-TO-LEAD-SPEC.md.
+// Shares no tables, flags or imports with payment-reminders.ts (see spec's
+// "Verified code facts").
+// ─────────────────────────────────────────────────────────────────────────
+
+enum LeadIntakeSource {
+  WEB
+  WEB_EMAIL_FALLBACK
+  VOICE
+}
+
+/// PENDING_FALLBACK: a WEB_EMAIL_FALLBACK row waiting out its dueAt (email
+/// time + 10 min) for a same-submission webhook to "take it over" before the
+/// cron promotes it. PROCESSED: a Lead has been created and linked (every WEB
+/// and VOICE row starts here; a WEB_EMAIL_FALLBACK row ends here, however it
+/// got there).
+enum LeadIntakeState {
+  PENDING_FALLBACK
+  PROCESSED
+}
+
+enum LeadVerdict {
+  REAL
+  REVIEW
+  JUNK
+}
+
+enum OutreachKind {
+  TEMPLATE_A
+  PERSONAL
+  FOLLOWUP
+}
+
+/// Lifecycle (spec "Dispatch"): DRAFT -> PENDING_APPROVAL -> APPROVED ->
+/// DISPATCHING -> {SENT, FAILED, UNKNOWN_DELIVERY} for PERSONAL/FOLLOWUP;
+/// READY -> DISPATCHING -> same outcomes for TEMPLATE_A. CANCELLED,
+/// SUPERSEDED, EXPIRED and BLOCKED are reachable only from states before
+/// DISPATCHING.
+enum OutreachStatus {
+  DRAFT
+  READY
+  PENDING_APPROVAL
+  APPROVED
+  DISPATCHING
+  SENT
+  FAILED
+  UNKNOWN_DELIVERY
+  CANCELLED
+  SUPERSEDED
+  EXPIRED
+  BLOCKED
+}
+
+enum OutreachAttemptOutcome {
+  SENT
+  FAILED
+  UNKNOWN_DELIVERY
+}
+
+/// One row per lead intake attempt. `externalId` is always set and unique —
+/// for WEB/WEB_EMAIL_FALLBACK it is deterministically derived from
+/// `submissionId` (see intakeExternalId in src/lib/speed-to-lead/intake.ts),
+/// so both channels compute the identical value independently and an
+/// `INSERT ... ON CONFLICT ("externalId") DO NOTHING` is what makes "one
+/// submission becomes one lead" true without either channel coordinating.
+/// `submissionId` is nullable because VOICE intake has none.
+model LeadIntakeEvent {
+  id           String           @id @default(cuid())
+  externalId   String           @unique
+  submissionId String?          @unique
+  source       LeadIntakeSource
+  state        LeadIntakeState  @default(PROCESSED)
+  dueAt        DateTime?
+  receivedAt   DateTime
+  leadId       String?
+  lead         Lead?            @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  verdict      LeadVerdict?
+  reasons      Json?
+  payload      Json
+  isTest       Boolean          @default(false)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([state, dueAt])
+  @@index([leadId])
+}
+
+/// Every email endpoint Speed-to-Lead has contacted or been told to stop
+/// contacting, normalized once across all clients and leads (spec
+/// "Suppression and cancellation"). Suppression is permanent unless Justin
+/// clears it with a reason (clearedBy/clearedAt).
+model ContactEndpoint {
+  id           String    @id @default(cuid())
+  endpoint     String    @unique
+  suppressedAt DateTime?
+  reason       String?
+  source       String?
+  bouncedAt    DateTime?
+  junkAt       DateTime?
+  clearedBy    String?
+  clearedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+model OutreachMessage {
+  id                String         @id @default(cuid())
+  leadId            String
+  lead              Lead           @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  kind              OutreachKind
+  status            OutreachStatus
+  generation        Int            @default(1)
+  approvedVersionId String?
+  approvalHash      String?
+  approvedBy        String?
+  approvedAt        DateTime?
+  dedupeKey         String         @unique
+  isTest            Boolean        @default(false)
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  versions OutreachVersion[]
+  attempts OutreachAttempt[]
+
+  @@index([leadId])
+  @@index([status])
+}
+
+/// Immutable: every draft, edit or regenerate is a NEW row with a new
+/// generation, never an update to an existing one (spec "Approval — Versions").
+model OutreachVersion {
+  id                String          @id @default(cuid())
+  messageId         String
+  message           OutreachMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  generation        Int
+  to                String
+  subject           String
+  body              String
+  footer            String
+  threading         Json
+  templateVersionId String?
+  renderInputs      Json?
+  createdAt         DateTime        @default(now())
+
+  @@unique([messageId, generation])
+}
+
+model OutreachAttempt {
+  id                String                  @id @default(cuid())
+  messageId         String
+  message           OutreachMessage         @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  versionId         String
+  rfcMessageId      String                  @unique
+  committedAt       DateTime
+  outcome           OutreachAttemptOutcome?
+  providerMessageId String?
+  threadId          String?
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+
+  @@index([messageId])
+}
+
+/// What Justin approves as Template A's standing approval (spec "Template A").
+/// `contentHash` covers subject/body/footer/fixedPhone/bookingBaseUrl/
+/// fromAddress and the substitution rules. `testOnly` rows are the R3 test
+/// fixture — enabled for readiness runs regardless of SPEED_TO_LEAD_TEMPLATE_A.
+model OutreachTemplate {
+  id             String    @id @default(cuid())
+  subject        String
+  body           String
+  footer         String
+  fixedPhone     String
+  bookingBaseUrl String
+  fromAddress    String
+  contentHash    String
+  testOnly       Boolean   @default(false)
+  approvedAt     DateTime?
+  approvedBy     String?
+  revokedAt      DateTime?
+  generation     Int       @default(1)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+/// Append-only audit trail. Never updated or deleted.
+model OutreachEvent {
+  id        String   @id @default(cuid())
+  leadId    String?
+  messageId String?
+  kind      String
+  detail    Json?
+  createdAt DateTime @default(now())
+
+  @@index([leadId])
+  @@index([messageId])
+  @@index([createdAt])
+}
+
+/// One row per UTC day; the dispatch commit transaction conditionally
+/// increments it as the daily send cap.
+model OutreachDailyCounter {
+  day   String @id
+  count Int    @default(0)
+}
+
+/// Append-only. There is no edit path (spec "Release — Readiness runner").
+model ReadinessRecord {
+  id          String   @id @default(cuid())
+  fingerprint String
+  deploySha   String?
+  passed      Boolean
+  results     Json
+  createdAt   DateTime @default(now())
+
+  @@index([fingerprint])
 }

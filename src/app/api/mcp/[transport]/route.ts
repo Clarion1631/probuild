@@ -50,6 +50,7 @@ import {
     moveFileWithConfirmation,
 } from "@/lib/mcp-pm-tools";
 import { listInspections, recordInspectionWithConfirmation } from "@/lib/mcp-inspection-tools";
+import { getLeadFunnelSummary } from "@/lib/speed-to-lead/funnel";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
 //
@@ -226,7 +227,7 @@ export const READONLY_TOOLS = new Set([
     "list_daily_logs", "list_inspections", "list_punch_items", "get_project_contacts",
     "list_contract_templates", "list_contracts",
     "get_company_schedule", "get_project_schedule", "list_crew_availability",
-    "get_activity_log",
+    "get_activity_log", "get_lead_funnel_summary",
 ]);
 const SEND_TOOLS = new Set([
     "send_estimate", "send_contract", "send_change_order",
@@ -559,6 +560,19 @@ function createHandler(actor: RouteMcpActor) {
                     id: l.id, name: l.name, client: l.client?.name ?? null, stage: l.stage, projectType: l.projectType, location: l.location,
                 })));
             },
+        );
+
+        server.registerTool(
+            "get_lead_funnel_summary",
+            {
+                title: "Speed-to-Lead funnel summary (counts only)",
+                annotations: { readOnlyHint: true },
+                description: "Counts only, SELECT only (PB-leads-001): new-lead intake by source and verdict, outreach by kind and status, and booked/called counts, over a trailing window of days.",
+                inputSchema: {
+                    windowDays: z.number().int().min(1).max(90).optional().describe("Trailing window in days. Defaults to 7."),
+                },
+            },
+            async ({ windowDays }) => textResult(await getLeadFunnelSummary(windowDays ?? 7)),
         );
 
         server.registerTool(

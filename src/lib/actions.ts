@@ -12,6 +12,7 @@ import { cache } from "react";
 import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
+import { CLOSED_LEAD_STAGES } from "./gpt-estimate";
 import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
@@ -373,10 +374,35 @@ export const getLead = cache(async function getLead(id: string) {
 
 export async function updateLeadStage(id: string, stage: string) {
     await assertActiveStaff();
-    await prisma.lead.update({
-        where: { id },
-        data: { stage }
-    });
+    if (CLOSED_LEAD_STAGES.includes(stage)) {
+        // Speed-to-Lead v1 (PB-leads-001) — BEGIN lead-close cancellation hook.
+        // "any ... lead close cancels every message for that lead that is
+        // still before commitment" (spec Suppression and cancellation). This
+        // is the general lead pipeline's own closing action — the hook lives
+        // here rather than duplicated at every caller that might close a
+        // lead. scripts/speed-to-lead-fingerprint.mjs hashes exactly this
+        // marked slice too, the same reasoning as the BEGIN/END block further
+        // down this file: a change here must lapse LIVE activation. (Marker
+        // text deliberately reads "Speed-to-Lead v1 (PB-leads-001) — BEGIN/END
+        // ...", not "BEGIN Speed-to-Lead v1 (PB-leads-001)...", so it can
+        // never collide with that other marker's own substring match.)
+        //
+        // Cancellation FIRST, the stage write after (see markLeadBooked in
+        // followups.ts for the full lock-order reasoning) — a `tx.lead.update`
+        // before cancelMessagesForLeadInTx would lock Lead ahead of
+        // AutomationSetting, the reverse of dispatch.ts's fixed order, and a
+        // concrete deadlock with a concurrent commit.
+        await prisma.$transaction(async tx => {
+            await stlCancelMessagesForLeadInTx(tx, id, "lead closed");
+            await tx.lead.update({ where: { id }, data: { stage } });
+        });
+        // Speed-to-Lead v1 (PB-leads-001) — END lead-close cancellation hook.
+    } else {
+        await prisma.lead.update({
+            where: { id },
+            data: { stage }
+        });
+    }
     revalidatePath(`/leads/${id}`);
     revalidatePath(`/leads`);
 }
@@ -16693,6 +16719,226 @@ export async function setMissingReceiptOwner(issueId: string, owner: string, exp
     return { success: true };
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// BEGIN Speed-to-Lead v1 (PB-leads-001). Thin wrappers only — every one of
+// these delegates its real work to src/lib/speed-to-lead/**
+// (tests/speed-to-lead-actions-delegate.test.ts statically checks that shape).
+// See docs/plans/SPEED-TO-LEAD-SPEC.md "Approval (Justin only, email only)".
+//
+// scripts/speed-to-lead-fingerprint.mjs hashes exactly this BEGIN..END slice
+// of actions.ts — not the whole file — as one of SPEED_TO_LEAD_FINGERPRINT's
+// inputs: the authorization/CSRF/origin gates for every action below live
+// here, not in src/lib/speed-to-lead/**, so a change to them must lapse LIVE
+// activation the same way a change under speed-to-lead/** does. Hashing the
+// WHOLE file instead would lapse LIVE on every unrelated action anyone adds
+// to this file (spec Release: "Unrelated deploys don't [lapse LIVE]") — the
+// same reasoning that keeps the fingerprint off all of schema.prisma. Keep
+// this comment and the END marker below intact; the script matches them by
+// exact text.
+// ─────────────────────────────────────────────────────────────────────────
+import { headers as speedToLeadHeaders } from "next/headers";
+import { isApprover, UNKNOWN_DELIVERY_SEND_AGAIN_MS } from "./speed-to-lead/constants";
+import { isSameOriginRequest, verifyOutreachCsrfToken } from "./speed-to-lead/csrf";
+import { submitForApproval as stlSubmitForApproval, approveOutreachVersion as stlApproveOutreachVersion, createNewGeneration as stlCreateNewGeneration } from "./speed-to-lead/approval";
+import { dispatchOutreach as stlDispatchOutreach } from "./speed-to-lead/dispatch";
+import { markLeadBooked as stlMarkLeadBooked, markLeadCalled as stlMarkLeadCalled } from "./speed-to-lead/followups";
+import { markEndpointJunk as stlMarkEndpointJunk, clearEndpointSuppression as stlClearEndpointSuppression } from "./speed-to-lead/contact-endpoint";
+import { promoteLeadToReal as stlPromoteLeadToReal, markLeadIntakeJunk as stlMarkLeadIntakeJunk } from "./speed-to-lead/intake";
+import { cancelMessagesForLeadInTx as stlCancelMessagesForLeadInTx } from "./speed-to-lead/cancellation";
+import { createOutreachTemplate as stlCreateOutreachTemplate, approveTemplate as stlApproveTemplate, revokeTemplate as stlRevokeTemplate } from "./speed-to-lead/template";
+import { setSpeedToLeadPaused as stlSetSpeedToLeadPaused } from "./speed-to-lead/settings";
+import { activateLive as stlActivateLive } from "./speed-to-lead/fingerprint";
+import { runReadinessCheck as stlRunReadinessCheck } from "./speed-to-lead/readiness";
+
+async function speedToLeadApproverSession(): Promise<string> {
+    const session = await getServerSession(authOptions);
+    const email = session?.user?.email ?? null;
+    if (!isApprover(email)) throw new Error("Unauthorized");
+    return email as string;
+}
+
+async function assertSpeedToLeadOrigin(): Promise<void> {
+    const h = await speedToLeadHeaders();
+    if (!isSameOriginRequest(h.get("origin"))) throw new Error("Unauthorized: origin mismatch");
+}
+
+/** The CURRENT generation's threading (inReplyTo/references/threadId) — save/send-again must carry this forward, never hardcode it to null, or every edit breaks the email thread the recipient sees. */
+async function stlCurrentThreading(messageId: string): Promise<{ inReplyTo: string | null; references: string | null; threadId: string | null }> {
+    const message = await prisma.outreachMessage.findUniqueOrThrow({ where: { id: messageId } });
+    const version = await prisma.outreachVersion.findFirst({ where: { messageId, generation: message.generation } });
+    const threading = version?.threading as { inReplyTo?: string | null; references?: string | null; threadId?: string | null } | null;
+    return { inReplyTo: threading?.inReplyTo ?? null, references: threading?.references ?? null, threadId: threading?.threadId ?? null };
+}
+
+export async function approveOutreachMessageAction(input: { messageId: string; versionId: string; leadId: string; approvalHash: string; csrfToken: string }) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    if (!verifyOutreachCsrfToken(input.csrfToken, approverEmail, input.messageId, input.versionId)) throw new Error("Unauthorized: bad CSRF token");
+    await stlSubmitForApproval(input.messageId, input.versionId);
+    const result = await stlApproveOutreachVersion({ messageId: input.messageId, versionId: input.versionId, approvalHash: input.approvalHash, approvedBy: approverEmail, leadId: input.leadId });
+    await stlDispatchOutreach(input.messageId);
+    revalidatePath(`/leads/outreach/${input.messageId}`);
+    return result;
+}
+
+export async function saveOutreachDraftAction(input: { messageId: string; to: string; subject: string; body: string; footer: string; csrfToken: string }) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    if (!verifyOutreachCsrfToken(input.csrfToken, approverEmail, input.messageId, "draft")) throw new Error("Unauthorized: bad CSRF token");
+    const result = await stlCreateNewGeneration(input.messageId, {
+        to: input.to, subject: input.subject, body: input.body, footer: input.footer,
+        threading: await stlCurrentThreading(input.messageId),
+    });
+    revalidatePath(`/leads/outreach/${input.messageId}`);
+    return result;
+}
+
+export async function sendAgainOutreachMessageAction(input: { messageId: string; to: string; subject: string; body: string; footer: string; confirmedNotInSent: boolean; csrfToken: string }) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    if (!verifyOutreachCsrfToken(input.csrfToken, approverEmail, input.messageId, "send-again")) throw new Error("Unauthorized: bad CSRF token");
+    const message = await prisma.outreachMessage.findUniqueOrThrow({ where: { id: input.messageId } });
+    if (message.status !== "FAILED" && message.status !== "UNKNOWN_DELIVERY") {
+        throw new Error("send-again is only available from FAILED or UNKNOWN_DELIVERY");
+    }
+    if (message.status === "UNKNOWN_DELIVERY") {
+        if (!input.confirmedNotInSent) {
+            throw new Error("send-again from UNKNOWN_DELIVERY requires confirming the message is not in Sent");
+        }
+        // Spec Dispatch: "send-again is offered once an UNKNOWN_DELIVERY
+        // attempt has aged past 30 minutes" — reconciliation's own 1/5/30-minute
+        // checkpoints (dispatch.ts) need that long to resolve it either way,
+        // so send-again must not race ahead of them.
+        const latestAttempt = await prisma.outreachAttempt.findFirst({ where: { messageId: input.messageId }, orderBy: { committedAt: "desc" } });
+        if (!latestAttempt || Date.now() - latestAttempt.committedAt.getTime() < UNKNOWN_DELIVERY_SEND_AGAIN_MS) {
+            throw new Error("send-again from UNKNOWN_DELIVERY is only available 30 minutes after the attempt");
+        }
+    }
+    // Template A is machine-rendered from a standing-approved template and
+    // never goes through the manual approval flow at all — dispatch.ts's
+    // commit only ever accepts a TEMPLATE_A message from READY (never
+    // DRAFT/APPROVED, and it requires the version to carry a
+    // templateVersionId). Without carrying both forward here, a resent A
+    // message loses its template reference and lands at the generic DRAFT
+    // "needs a fresh approval" state, which a TEMPLATE_A message can never
+    // pass through — permanently unsendable.
+    const isTemplateA = message.kind === "TEMPLATE_A";
+    const currentVersion = isTemplateA
+        ? await prisma.outreachVersion.findFirst({ where: { messageId: input.messageId, generation: message.generation } })
+        : null;
+    const result = await stlCreateNewGeneration(input.messageId, {
+        to: input.to, subject: input.subject, body: input.body, footer: input.footer,
+        threading: await stlCurrentThreading(input.messageId),
+        templateVersionId: isTemplateA ? currentVersion?.templateVersionId ?? null : undefined,
+        renderInputs: isTemplateA ? currentVersion?.renderInputs : undefined,
+    }, prisma, { allowedStatuses: ["FAILED", "UNKNOWN_DELIVERY"], targetStatus: isTemplateA ? "READY" : "DRAFT" });
+    revalidatePath(`/leads/outreach/${input.messageId}`);
+    return result;
+}
+
+export async function markOutreachLeadBookedAction(leadId: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Unauthorized");
+    await stlMarkLeadBooked(leadId);
+    revalidatePath(`/leads/${leadId}`);
+}
+
+export async function markOutreachLeadCalledAction(leadId: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Unauthorized");
+    await stlMarkLeadCalled(leadId);
+    revalidatePath(`/leads/${leadId}`);
+}
+
+export async function promoteLeadToRealAction(leadId: string) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    await stlPromoteLeadToReal(leadId);
+    revalidatePath(`/leads/${leadId}`);
+}
+
+export async function markLeadJunkAction(leadId: string) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    // One transaction: the junk mark, the endpoint junk mark, and the
+    // cancellation of every pending message all commit together — as
+    // separate calls, a dispatch racing the gap between them could still
+    // commit against a lead that reads as junk everywhere else already.
+    //
+    // Cancellation FIRST — it locks ContactEndpoint (among other rows) in
+    // dispatch.ts's own fixed order (AutomationSetting, then template, then
+    // ContactEndpoint, then Lead). `stlMarkEndpointJunk`'s upsert taking that
+    // SAME ContactEndpoint row ahead of it (the previous shape) locks it
+    // before AutomationSetting — the reverse of dispatch.ts's order, and a
+    // concrete deadlock with a concurrent commit. Running it after reuses the
+    // lock cancelMessagesForLeadInTx already holds on that row.
+    await prisma.$transaction(async tx => {
+        await stlCancelMessagesForLeadInTx(tx, leadId, "junk");
+        const lead = await tx.lead.findUnique({ where: { id: leadId }, select: { client: { select: { email: true } } } });
+        await stlMarkLeadIntakeJunk(leadId, tx);
+        if (lead?.client?.email) await stlMarkEndpointJunk(lead.client.email, tx);
+    });
+    revalidatePath(`/leads/${leadId}`);
+}
+
+export async function clearOutreachSuppressionAction(input: { endpoint: string; reason: string }) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    await stlClearEndpointSuppression(input.endpoint, { clearedBy: approverEmail, reason: input.reason });
+    revalidatePath("/settings/speed-to-lead");
+}
+
+export async function saveOutreachTemplateAction(input: { subject: string; body: string; footer: string; fixedPhone: string; bookingBaseUrl: string; fromAddress: string; testOnly: boolean }) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const created = await stlCreateOutreachTemplate(input, prisma);
+    revalidatePath("/settings/speed-to-lead");
+    return created;
+}
+
+export async function approveOutreachTemplateAction(templateId: string) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const updated = await stlApproveTemplate(templateId, approverEmail, prisma);
+    revalidatePath("/settings/speed-to-lead");
+    return updated;
+}
+
+export async function revokeOutreachTemplateAction(templateId: string) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const updated = await stlRevokeTemplate(templateId, prisma);
+    revalidatePath("/settings/speed-to-lead");
+    return updated;
+}
+
+export async function setSpeedToLeadPausedAction(paused: boolean) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    await stlSetSpeedToLeadPaused(paused);
+    revalidatePath("/settings/speed-to-lead");
+}
+
+export async function runSpeedToLeadReadinessAction() {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const result = await stlRunReadinessCheck({ deploySha: process.env.VERCEL_GIT_COMMIT_SHA ?? null });
+    revalidatePath("/settings/speed-to-lead");
+    return result;
+}
+
+export async function activateSpeedToLeadLiveAction() {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const result = await stlActivateLive({ activatedBy: approverEmail });
+    revalidatePath("/settings/speed-to-lead");
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// END Speed-to-Lead v1 (PB-leads-001) — see the BEGIN marker above.
+// ─────────────────────────────────────────────────────────────────────────
+
 // ============ Payroll (Phase 5 — docs/plans/PHASE-5-GUSTO-AND-MOBILE-RELEASE-SPEC.md) ============
 
 /**
@@ -17692,3 +17938,4 @@ export async function unlockPayrollPeriod(
     revalidatePath("/manager/time-entries");
     return { success: true as const };
 }
+

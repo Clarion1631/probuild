@@ -69,6 +69,14 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // wildcard, so a future /api/receipts/intake/<id>/anything route does not
 // inherit the bypass before anyone has reviewed its gates. Everything else
 // under /api/receipts (notably /api/receipts/parse) keeps the proxy boundary.
+// api/speed-to-lead/intake is a machine-to-machine webhook (the site's signed
+// lead-intake payload, verified by HMAC inside the route itself, per
+// src/lib/speed-to-lead/hmac.ts) and must return a clean signature-verification
+// failure rather than a redirect to /login. Exact-match only — nothing else
+// under /api/speed-to-lead/ inherits the bypass, and it is deliberately NOT
+// added to ANONYMOUS_ACTION_PATTERN, so isMachineOnlyBypass still refuses any
+// Server Action dispatch through it (same Server Action prohibition as every
+// other machine endpoint here).
 // api/automation/receipt-requests/threads and .../answers are the qbo-clasp
 // bridge for the missing-receipt Chat digest (Phase 2 §4). Same shape again:
 // the Apps Script mirror/forwarder self-authenticates with
@@ -81,7 +89,7 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // privacy / terms / account-deletion are static legal pages with no data access.
 // The app stores require them to be reachable by a logged-out reviewer, and Google
 // Play specifically requires a public account-deletion URL.
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|api\/receipts\/intake\/?$|api\/receipts\/intake\/start\/?$|api\/receipts\/intake\/[^/]+\/(?:archived|finalize)\/?$|api\/automation\/receipt-requests\/(?:threads|answers|on-demand)\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|api\/speed-to-lead\/intake\/?$|api\/receipts\/intake\/?$|api\/receipts\/intake\/start\/?$|api\/receipts\/intake\/[^/]+\/(?:archived|finalize)\/?$|api\/automation\/receipt-requests\/(?:threads|answers|on-demand)\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
 /**
  * The cookie that has to be present before a bypassed tree may dispatch a
