@@ -154,7 +154,12 @@ async function cleanupRouteTestRow(externalId: string): Promise<void> {
         await db.leadIntakeEvent.deleteMany({ where: { externalId } }).catch(() => undefined);
         if (row?.leadId) {
             await db.leadAlert.deleteMany({ where: { leadId: row.leadId } }).catch(() => undefined);
+            // clientId looked up BEFORE the Lead is deleted (the FK points the
+            // other way) so the Client findOrCreateClientForContact created
+            // for it gets removed too, not just the Lead/LeadAlert rows.
+            const lead = await db.lead.findUnique({ where: { id: row.leadId }, select: { clientId: true } }).catch(() => null);
             await db.lead.delete({ where: { id: row.leadId } }).catch(() => undefined);
+            if (lead?.clientId) await db.client.delete({ where: { id: lead.clientId } }).catch(() => undefined);
         }
     } finally {
         await db.$disconnect();

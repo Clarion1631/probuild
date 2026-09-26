@@ -23,10 +23,19 @@ const skip = !databaseUrl && "set SPEED_TO_LEAD_TEST_URL to a disposable Postgre
  * connection under some network stacks, which a `fetch()` caller (undici)
  * then reports as a generic network failure rather than the real response.
  */
-async function startSink(handler: (req: http.IncomingMessage, res: http.ServerResponse) => void): Promise<{ url: string; close: () => Promise<void>; hits: () => number }> {
+async function startSink(handler: (req: http.IncomingMessage, res: http.ServerResponse) => void): Promise<{ url: string; close: () => Promise<void>; hits: () => number; hitsForLead: (leadId: string) => number }> {
     let hitCount = 0;
+    // Click header value per hit, captured synchronously off `req.headers`
+    // (available immediately, no need to wait on the body) — `sendNtfyAlert`
+    // always sets `Click: leadUrl(ctx.leadId)`, so this is what lets a test
+    // count only ITS OWN alert's deliveries. `deliverDueAlerts` scans the
+    // WHOLE table with no per-test scope, so a leftover row from another
+    // test (or another file, on the shared CI Postgres) can land on this
+    // same sink and inflate a plain hit count.
+    const clickHeaders: string[] = [];
     const server = http.createServer((req, res) => {
         hitCount++;
+        clickHeaders.push(String(req.headers.click ?? ""));
         req.resume();
         res.setHeader("Connection", "close");
         handler(req, res);
@@ -41,6 +50,7 @@ async function startSink(handler: (req: http.IncomingMessage, res: http.ServerRe
         url: `http://127.0.0.1:${port}`,
         close: () => new Promise(resolve => server.close(() => resolve())),
         hits: () => hitCount,
+        hitsForLead: (leadId: string) => clickHeaders.filter(click => click.includes(`/leads/${leadId}`)).length,
     };
 }
 
@@ -75,7 +85,7 @@ test("delivered ntfy 2xx-with-id marks the row DELIVERED, sets providerRef, and 
         const row = await db.leadAlert.findUnique({ where: { leadId_channel: { leadId: lead.id, channel: "NTFY" } } });
         assert.equal(row?.status, "DELIVERED", `got status=${row?.status} attempts=${row?.attempts} lastErrorCategory=${row?.lastErrorCategory}`);
         assert.equal(row?.providerRef, "ntfy-msg-1");
-        assert.equal(sink.hits(), 1, "the sink must be hit exactly once across both concurrent runs");
+        assert.equal(sink.hitsForLead(lead.id), 1, "this test's own alert must be hit exactly once across both concurrent runs");
     } finally {
         process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
         process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;
@@ -174,7 +184,7 @@ test("a lead older than 6h with an alert never attempted goes SKIPPED, never DEA
         const row = await db.leadAlert.findUnique({ where: { leadId_channel: { leadId: lead.id, channel: "NTFY" } } });
         assert.equal(row?.status, "SKIPPED");
         assert.equal(row?.attempts, 0);
-        assert.equal(sink.hits(), 0, "a never-attempted stale alert must never be sent");
+        assert.equal(sink.hitsForLead(lead.id), 0, "a never-attempted stale alert must never be sent");
     } finally {
         process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
         process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;
@@ -205,21 +215,26 @@ test("an alert that already had attempts, now stale, goes DEAD (not SKIPPED)", {
 test("ntfy content never carries email, full phone or message text — Click header carries the lead link", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     const captured: { headers: http.IncomingHttpHeaders | null; body: string } = { headers: null, body: "" };
+    const originalTopic = process.env.SPEED_TO_LEAD_NTFY_TOPIC;
+    const originalBase = process.env.SPEED_TO_LEAD_NTFY_BASE_URL;
+    const email = "secret-address@example.test";
+    const client = await db.client.create({ data: { name: "Content Test", initials: "CT", email, primaryPhone: "3605551234" } });
+    const lead = await db.lead.create({ data: { clientId: client.id, name: "Content Test Lead", message: "very secret message body that must never leak into a push" } });
+    // Only capture the hit that is OUR lead's own alert — deliverDueAlerts
+    // scans the whole table with no per-test scope, so a foreign due row's
+    // send could otherwise land on this sink too and overwrite `captured`
+    // with content that has nothing to do with this test.
     const sink = await startSink((req, res) => {
-        captured.headers = req.headers;
-        req.on("data", chunk => { captured.body += chunk; });
+        const isOurs = String(req.headers.click ?? "").includes(`/leads/${lead.id}`);
+        if (isOurs) captured.headers = req.headers;
+        req.on("data", chunk => { if (isOurs) captured.body += chunk; });
         req.on("end", () => {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ id: "ntfy-content" }));
         });
     });
-    const originalTopic = process.env.SPEED_TO_LEAD_NTFY_TOPIC;
-    const originalBase = process.env.SPEED_TO_LEAD_NTFY_BASE_URL;
     process.env.SPEED_TO_LEAD_NTFY_TOPIC = "test-topic";
     process.env.SPEED_TO_LEAD_NTFY_BASE_URL = sink.url;
-    const email = "secret-address@example.test";
-    const client = await db.client.create({ data: { name: "Content Test", initials: "CT", email, primaryPhone: "3605551234" } });
-    const lead = await db.lead.create({ data: { clientId: client.id, name: "Content Test Lead", message: "very secret message body that must never leak into a push" } });
     try {
         await db.$transaction(tx => createLeadAlertsInTx(tx, { leadId: lead.id, verdict: "REAL", reasons: [], isTest: false }));
         await deliverDueAlerts(db);
@@ -274,7 +289,8 @@ test("a row whose failed-send backoff already pushed nextAttemptAt into the futu
         assert.equal(row?.status, "PENDING");
         assert.equal(row?.attempts, 1, "the row must have been sent exactly once, never re-claimed after its own backoff");
         assert.ok(row!.nextAttemptAt.getTime() > now.getTime(), "backoff must have pushed nextAttemptAt into the future");
-        assert.equal(sink.hits(), 2, "exactly one send for the decoy and one for the real row — never a third, re-claimed send");
+        assert.equal(sink.hitsForLead(decoyLead.id), 1, "the decoy must be sent exactly once");
+        assert.equal(sink.hitsForLead(lead.id), 1, "the real row must have been sent exactly once — never a third, re-claimed send");
     } finally {
         process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
         process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;

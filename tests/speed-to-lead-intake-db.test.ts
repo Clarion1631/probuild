@@ -52,12 +52,17 @@ async function countRows(db: PrismaClient, externalId: string) {
  * that file's sink-hit-count assertions on a shared Postgres — the actual
  * root cause of the CI `migrations` job going red, not just a flake to step
  * around (mirrors the `cleanup` helper in speed-to-lead-alerts-db.test.ts).
+ * `clientId` is looked up BEFORE the Lead is deleted (the FK points the
+ * other way) so the Client `findOrCreateClientForContact` created for it
+ * gets removed too, not just the Lead/LeadAlert rows.
  */
 async function cleanup(db: PrismaClient, opts: { externalIds: string[]; leadId?: string | null }): Promise<void> {
     await db.leadIntakeEvent.deleteMany({ where: { externalId: { in: opts.externalIds } } }).catch(() => undefined);
     if (opts.leadId) {
         await db.leadAlert.deleteMany({ where: { leadId: opts.leadId } }).catch(() => undefined);
+        const lead = await db.lead.findUnique({ where: { id: opts.leadId }, select: { clientId: true } }).catch(() => null);
         await db.lead.delete({ where: { id: opts.leadId } }).catch(() => undefined);
+        if (lead?.clientId) await db.client.delete({ where: { id: lead.clientId } }).catch(() => undefined);
     }
 }
 
