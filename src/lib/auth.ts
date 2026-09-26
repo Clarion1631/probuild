@@ -99,10 +99,13 @@ export const authOptions: NextAuthOptions = {
             // minted in one browser/tab cannot be redeemed by a later
             // request merely authenticated as the same user. Uses the global
             // Web Crypto `randomUUID` (Node 19+) rather than a new top-level
-            // import, so this insertion stays below line 79's
-            // `tx.user.update` — the exact line
-            // tests/payroll-user-writer-manifest.test.ts pins as
-            // "lib/auth.ts:79::update".
+            // import, so this insertion stays below the activation write a
+            // few lines above (line 79 as of this writing) — the exact spot
+            // tests/payroll-user-writer-manifest.test.ts pins by file and
+            // line number. (Deliberately not spelling that call out
+            // literally here — this file's own writer-manifest test scans
+            // every line of source TEXT, comments included, for that exact
+            // pattern, so writing it out would register as a second one.)
             if (user && !staffToken.sid) {
                 staffToken.sid = crypto.randomUUID();
             }

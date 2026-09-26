@@ -51,14 +51,6 @@ jobs:
       - name: Apply committed migrations to the throwaway database
         run: npx prisma migrate deploy
 
-      # The schema gap the baseline recorded is now closed by
-      # 20260814120000_missing_fk_indexes, so `migrate deploy` above already
-      # produces the final shape and there is no separate gap file to apply.
-      # prisma/EXPECTED_SCHEMA_GAP.sql was deleted with that migration; an
-      # absent gap file means the only remaining diff is PRISMA_PHANTOM_DIFF.sql.
-      - name: Assert the result matches production's shape
-        run: node scripts/check-migrations-match.mjs
-
       # Speed-to-Lead (PB-leads-001) v1a real-Postgres races: intake
       # (fallback-first, webhook-first, concurrent webhook delivery for one
       # submissionId, cross-channel dedupe) and alert claim/deliver
@@ -69,6 +61,17 @@ jobs:
       # actually run. `migrate deploy` above already applied this feature's
       # migration to probuild_migrations, so no separate apply step is
       # needed here.
+      #
+      # Placed BEFORE "Assert the result matches production's shape" (not
+      # after, unlike most DB-gated steps in this job): that assertion is
+      # EXPECTED to fail on this PR until R1 (Justin applies this migration
+      # to prod and refreshes prisma/prisma-blind-spots.json — see the PR
+      # description) — its blind-spots check can't yet know about tables
+      # that don't exist in prod. A step ordered after a failing step never
+      # runs at all (this job has no continue-on-error), so these two would
+      # otherwise never execute in CI. This ordering is scoped to just this
+      # PR's own new tests; the pre-existing steps below the assertion are
+      # left exactly where they were.
       - name: Speed-to-Lead v1a intake and alert races against real Postgres
         run: npx tsx --test tests/speed-to-lead-intake-db.test.ts tests/speed-to-lead-alerts-db.test.ts
         env:
@@ -78,11 +81,27 @@ jobs:
       # Postgres for CompanySettings/LeadIntakeEvent, with a fake Gmail
       # client (require()-patched, same technique as
       # tests/takeoff-convert-tax.test.ts) standing in for the Google API —
-      # no real Gmail account is ever touched.
+      # no real Gmail account is ever touched. Same ordering reason as above.
       - name: Speed-to-Lead v1a inbox poll (fake Gmail) against real Postgres
         run: npx tsx --test tests/speed-to-lead-gmail-poll.test.ts
         env:
           SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # The schema gap the baseline recorded is now closed by
+      # 20260814120000_missing_fk_indexes, so `migrate deploy` above already
+      # produces the final shape and there is no separate gap file to apply.
+      # prisma/EXPECTED_SCHEMA_GAP.sql was deleted with that migration; an
+      # absent gap file means the only remaining diff is PRISMA_PHANTOM_DIFF.sql.
+      #
+      # KNOWN RED ON THIS PR (see description): the blind-spots half of this
+      # assertion will report RLS enabled on the 4 new Speed-to-Lead tables
+      # "but not in production's snapshot" until Justin's R1 step. Every step
+      # below this one is consequently skipped on this PR's CI run (no
+      # continue-on-error in this job) — a pre-existing structural property
+      # of this job (any migration needing the same R1 ordering would hit
+      # it), not something this PR's diff changes about the job itself.
+      - name: Assert the result matches production's shape
+        run: node scripts/check-migrations-match.mjs
 
       # The APPLY SCRIPT itself, run the way a human runs it before a deploy.
       #
@@ -626,6 +645,14 @@ jobs:
       - name: Build
         run: npm run build 2>&1 | tee /tmp/build-output.txt
         env:
+          # Speed-to-Lead v1a's 4 new Prisma models are enough to push next
+          # build's internal TypeScript phase over this runner's default
+          # heap limit ("Ineffective mark-compacts near heap limit ...
+          # JavaScript heap out of memory") — the same regression class the
+          # full-build v1 (#557) hit with its larger ~9-model schema addition
+          # and fixed the same way. ubuntu-latest runners carry 7GB; 6GB
+          # leaves headroom for the OS and the rest of the toolchain.
+          NODE_OPTIONS: --max-old-space-size=6144
           NEXT_TELEMETRY_DISABLED: 1
           NEXT_PUBLIC_SUPABASE_URL: https://ghzdbzdnwjxazvmcefbh.supabase.co
           NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
@@ -810,6 +837,11 @@ jobs:
       - name: Build application
         run: npm run build
         env:
+          # See the "Build" step's comment in the "build" job above — this is
+          # the step that was actually observed FAILING with a JavaScript
+          # heap OOM during next build's TypeScript phase; the fix is
+          # identical.
+          NODE_OPTIONS: --max-old-space-size=6144
           NEXT_TELEMETRY_DISABLED: 1
 
       # These assert invariants nothing else does: money lock ordering, portal
