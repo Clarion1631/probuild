@@ -119,7 +119,12 @@ async function main() {
     // semicolons) into invalid fragments. Same convention as
     // scripts/apply-time-entry-void.mjs.
     const sql = readFileSync(new URL('../prisma/migrations/20260925120000_speed_to_lead/migration.sql', import.meta.url), 'utf8');
-    const statements = sql.split('-- statement-break').map(s => s.trim()).filter(Boolean);
+    // Split on STANDALONE "-- statement-break" delimiter LINES only, never a
+    // bare substring match: this migration's own header comment quotes the
+    // marker inside a sentence ("-- statement-break" markers ...), and a
+    // plain sql.split('-- statement-break') cuts that quoted text in half,
+    // producing an invalid fragment.
+    const statements = sql.split(/^-- statement-break[ \t]*$/m).map(s => s.trim()).filter(Boolean);
     await prisma.$transaction(
       async (tx) => {
         const current = await tx.$queryRaw`SELECT current_database() AS db`;

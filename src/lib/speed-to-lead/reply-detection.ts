@@ -46,9 +46,13 @@ export function stripQuotedText(body: string): string {
         .trim();
 }
 
+/** Word-boundary match, never a bare substring — "stop" as plain `.includes()` also matches inside an ordinary word like "nonstop" or "doorstop", turning a reply that never opted out into a false one. */
 export function containsOptOutPhrase(strippedText: string): boolean {
     const lower = strippedText.toLowerCase();
-    return OPT_OUT_PHRASES.some(phrase => lower.includes(phrase));
+    return OPT_OUT_PHRASES.some(phrase => {
+        const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`\\b${escaped}\\b`).test(lower);
+    });
 }
 
 export type ReplyClassification = "auto-reply" | "bounce" | "opt-out" | "reply";

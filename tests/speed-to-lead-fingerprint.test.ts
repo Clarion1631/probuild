@@ -1,9 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, readFileSync, existsSync, unlinkSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, unlinkSync, readdirSync } from "node:fs";
 import path from "node:path";
-import { computeFingerprint } from "../scripts/speed-to-lead-fingerprint.mjs";
+import { computeFingerprint, FINGERPRINT_INPUTS } from "../scripts/speed-to-lead-fingerprint.mjs";
 import { currentFingerprint } from "../src/lib/speed-to-lead/fingerprint";
+
+// Every Speed-to-Lead table/model this feature owns (spec Data Model) — a
+// FUTURE migration that adds a column to one of these without also being
+// added to FINGERPRINT_INPUTS would change "the related Prisma models"
+// without lapsing LIVE activation, silently defeating the fingerprint's
+// whole purpose. This is a tripwire, not a fix for a migration that exists
+// today: it only fails once someone adds that future migration.
+const SPEED_TO_LEAD_TABLE_NAMES = [
+    "LeadIntakeEvent", "ContactEndpoint", "OutreachMessage", "OutreachVersion",
+    "OutreachAttempt", "OutreachTemplate", "OutreachEvent", "OutreachDailyCounter",
+    "ReadinessRecord",
+];
 
 test("computeFingerprint is deterministic across two runs with no code change", () => {
     assert.equal(computeFingerprint(), computeFingerprint());
@@ -22,6 +34,37 @@ test("computeFingerprint changes when a covered file's content changes", async (
     }
 });
 
+test("computeFingerprint changes when the Speed-to-Lead action-wrapper slice of actions.ts changes", async () => {
+    const target = path.join(__dirname, "..", "src", "lib", "actions.ts");
+    const original = readFileSync(target, "utf8");
+    const marker = "// BEGIN Speed-to-Lead v1 (PB-leads-001).";
+    const idx = original.indexOf(marker);
+    assert.ok(idx !== -1, "the BEGIN Speed-to-Lead marker must exist in actions.ts");
+    const before = computeFingerprint();
+    try {
+        const touched = `${original.slice(0, idx + marker.length)}\n// fingerprint-test-touch\n${original.slice(idx + marker.length)}`;
+        writeFileSync(target, touched);
+        const after = computeFingerprint();
+        assert.notEqual(before, after);
+    } finally {
+        writeFileSync(target, original);
+    }
+});
+
+test("computeFingerprint is UNAFFECTED by a change to actions.ts outside the Speed-to-Lead BEGIN..END slice", async () => {
+    const target = path.join(__dirname, "..", "src", "lib", "actions.ts");
+    const original = readFileSync(target, "utf8");
+    const before = computeFingerprint();
+    try {
+        // Appended at the very end of the file — well outside the marked slice.
+        writeFileSync(target, `${original}\n// fingerprint-test-touch (outside the Speed-to-Lead slice)\n`);
+        const after = computeFingerprint();
+        assert.equal(before, after, "an unrelated action elsewhere in actions.ts must never lapse LIVE activation");
+    } finally {
+        writeFileSync(target, original);
+    }
+});
+
 test("computeFingerprint is unaffected by files outside its covered paths", async () => {
     const scratch = path.join(__dirname, "..", "src", "lib", "speed-to-lead-fingerprint-scratch-file.ts");
     const before = computeFingerprint();
@@ -31,6 +74,24 @@ test("computeFingerprint is unaffected by files outside its covered paths", asyn
         assert.equal(before, after);
     } finally {
         if (existsSync(scratch)) unlinkSync(scratch);
+    }
+});
+
+test("every migration touching a Speed-to-Lead table is a fingerprint input — tripwire for a future migration that forgets to be added", () => {
+    const migrationsRoot = path.join(__dirname, "..", "prisma", "migrations");
+    const coveredPaths = new Set(FINGERPRINT_INPUTS.map(p => p.split(path.sep).join("/")));
+    const tableRefPattern = new RegExp(`"(?:${SPEED_TO_LEAD_TABLE_NAMES.join("|")})"`);
+    for (const entry of readdirSync(migrationsRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const migrationRelPath = `prisma/migrations/${entry.name}/migration.sql`;
+        const migrationAbsPath = path.join(migrationsRoot, entry.name, "migration.sql");
+        if (!existsSync(migrationAbsPath)) continue;
+        const sql = readFileSync(migrationAbsPath, "utf8");
+        if (!tableRefPattern.test(sql)) continue;
+        assert.ok(
+            coveredPaths.has(migrationRelPath),
+            `${migrationRelPath} touches a Speed-to-Lead table but is not in FINGERPRINT_INPUTS — add it, or LIVE activation will not lapse when this feature's schema changes`,
+        );
     }
 });
 

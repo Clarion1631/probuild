@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import LeadStageDropdown from "./LeadStageDropdown";
+import SpeedToLeadBookedCalledButtons from "./SpeedToLeadBookedCalledButtons";
 import EditLeadModal from "./EditLeadModal";
 import GoogleMapPreview from "@/components/GoogleMapPreview";
 import GoogleMapsAutocomplete from "@/components/GoogleMapsAutocomplete";
@@ -391,6 +392,8 @@ export default function LeadDetailsSidebar({
                             <span className="text-sm text-slate-600">Lead Stage</span>
                             <LeadStageDropdown leadId={leadId} currentStage={leadStage} variant="pill" />
                         </div>
+
+                        <SpeedToLeadBookedCalledButtons leadId={leadId} />
 
                         <DetailRow label="Lead Source" value={leadSource} fieldKey="source" />
                         <DetailRow label="Tags" value={null} fieldKey="tags" />

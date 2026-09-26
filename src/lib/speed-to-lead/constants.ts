@@ -45,6 +45,9 @@ export const MIN_DESCRIPTION_LETTERS = 10;
 /** Webhook signing: accepted clock skew for `timestamp.body` HMAC verification. */
 export const WEBHOOK_SKEW_MS = 5 * 60 * 1000;
 
+/** Every individual Gmail API call (poll and dispatch) gets an explicit deadline — an unbounded call could otherwise consume the whole cron invocation's time budget with no result. */
+export const GMAIL_REQUEST_TIMEOUT_MS = 20 * 1000;
+
 // ── Modes (spec "Release — Mode") ───────────────────────────────────────────
 
 export type SpeedToLeadMode = "OFF" | "TEST" | "LIVE";

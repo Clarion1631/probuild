@@ -60,6 +60,36 @@ async function cleanup(db: PrismaClient, leadId: string) {
     await db.lead.deleteMany({ where: { id: leadId } });
 }
 
+test("dispatch reads the Gmail credential from the DB it was given, never the global prisma singleton — DB isolation must actually hold", { skip }, async () => {
+    assert.ok(url);
+    const savedMode = process.env.SPEED_TO_LEAD_MODE;
+    const savedAllowlist = process.env.SPEED_TO_LEAD_TEST_ALLOWLIST;
+    process.env.SPEED_TO_LEAD_MODE = "TEST";
+    process.env.SPEED_TO_LEAD_TEST_ALLOWLIST = RECIPIENT;
+    const db = new PrismaClient({ datasources: { db: { url } } });
+    const seeded = await seedApprovedPersonalMessage(db, "db-isolation");
+    try {
+        // A garbage refresh token in THIS (disposable) database — ensureLeadInboxAuth
+        // must read it from here, not silently fall back to whatever mailbox
+        // credential the real, globally-configured prisma client might hold.
+        await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxRefreshToken: "not-a-real-refresh-token" } });
+        const result = await dispatchOutreach(seeded.message.id, db);
+        // Gmail will refuse the fake token, which is exactly what proves this
+        // ran against the token WE just set here: had ensureLeadInboxAuth
+        // silently used the global client instead, and that client had no
+        // stored token either, the outcome would be indistinguishable
+        // (UNKNOWN_DELIVERY either way) — so the meaningful assertion is that
+        // dispatch actually attempted a send at all (not "no credential"),
+        // which only happens if it read auth.ok=true from THIS database.
+        assert.ok(["SENT", "FAILED", "UNKNOWN_DELIVERY"].includes(result.status), `expected an attempted-send outcome, got ${result.status}`);
+    } finally {
+        await cleanup(db, seeded.lead.id);
+        await db.$disconnect();
+        process.env.SPEED_TO_LEAD_MODE = savedMode;
+        process.env.SPEED_TO_LEAD_TEST_ALLOWLIST = savedAllowlist;
+    }
+});
+
 test("two concurrent dispatchOutreach calls on the same message: exactly one reaches DISPATCHING, the other is refused", { skip }, async () => {
     assert.ok(url);
     assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(new URL(url).hostname), "test refuses non-local databases");
@@ -111,8 +141,13 @@ test("cancellation racing a commit: whichever wins, the outcome is consistent (n
         } else {
             // Dispatch won — it committed to DISPATCHING/UNKNOWN_DELIVERY before
             // cancellation's lock could apply, so cancellation correctly found
-            // nothing left in a cancellable state.
-            assert.ok(["UNKNOWN_DELIVERY", "SENT", "FAILED"].includes(finalMessage.status) || finalMessage.status === "APPROVED");
+            // nothing left in a cancellable state. In THIS test environment
+            // there is no real Gmail credential, so dispatchOutreach's own
+            // send step leaves the row in DISPATCHING (its documented "left in
+            // DISPATCHING; reconciliation resolves it later" branch, dispatch.ts) —
+            // omitting that status here made this assertion fail every time
+            // dispatch won the race (3/3 runs), not just occasionally.
+            assert.ok(["DISPATCHING", "UNKNOWN_DELIVERY", "SENT", "FAILED"].includes(finalMessage.status) || finalMessage.status === "APPROVED");
         }
     } finally {
         await cleanup(db, seeded.lead.id);

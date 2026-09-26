@@ -46,6 +46,11 @@ test("a plain reply with none of the opt-out phrases classifies as reply", () =>
     assert.equal(result, "reply");
 });
 
+test("'stop' as a SUBSTRING of a larger word (e.g. 'nonstop', 'doorstop') is NOT an opt-out — word-boundary, not substring, matching", () => {
+    assert.equal(containsOptOutPhrase("We offer nonstop support and a sturdy doorstop too"), false);
+    assert.equal(classifyInboundMessage({ fromAddress: "client@example.com", headers: [], bodyText: "We offer nonstop support" }), "reply");
+});
+
 test("stripQuotedText removes '>' quote lines", () => {
     const stripped = stripQuotedText("my reply\n> their original text\n> more quoted text");
     assert.equal(stripped, "my reply");

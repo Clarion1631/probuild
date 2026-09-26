@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { canonicalJson } from "@/lib/mcp-schedule-tools";
-import { FIRST_NAME_MAX_LEN, TEMPLATE_A_DEADLINE_MS, templateAEnabled, DISPATCH_FROM_ADDRESS } from "./constants";
+import { FIRST_NAME_MAX_LEN, TEMPLATE_A_DEADLINE_MS, templateAEnabled, DISPATCH_FROM_ADDRESS, SITE_FIXED_PHONE, RICHARD_CALENDLY_PREFIX } from "./constants";
+import { containsOptOutPhrase } from "./reply-detection";
 
 type Db = PrismaClient | Prisma.TransactionClient;
 
@@ -152,8 +153,32 @@ export function templateADeadlinePassed(intakeReceivedAt: Date, now: Date = new 
     return now.getTime() - intakeReceivedAt.getTime() > TEMPLATE_A_DEADLINE_MS;
 }
 
+/**
+ * Required content, enforced server-side rather than trusted from whatever
+ * called this — a template accepting arbitrary fields let an approved
+ * message go out with no opt-out instructions, or with the booking link
+ * (which carries the lead's own name/email as query params, spec Template A
+ * "{bookingLink}") pointed at an unintended domain that would then receive
+ * that PII.
+ */
+function assertValidTemplateFields(fields: TemplateAFields): void {
+    if (fields.fromAddress !== DISPATCH_FROM_ADDRESS) {
+        throw new Error(`invalid fromAddress: Speed-to-Lead only ever sends as ${DISPATCH_FROM_ADDRESS}`);
+    }
+    if (fields.fixedPhone !== SITE_FIXED_PHONE) {
+        throw new Error(`invalid fixedPhone: must be the site's own number (${SITE_FIXED_PHONE})`);
+    }
+    if (!fields.bookingBaseUrl.startsWith(RICHARD_CALENDLY_PREFIX)) {
+        throw new Error(`invalid bookingBaseUrl: must be under ${RICHARD_CALENDLY_PREFIX} — the booking link carries the lead's own name/email, so it may never point at an arbitrary domain`);
+    }
+    if (!containsOptOutPhrase(fields.footer)) {
+        throw new Error("invalid footer: it must contain an opt-out instruction (e.g. \"reply 'no thanks' and I'll stop\")");
+    }
+}
+
 /** Creates a new (unapproved) template row — Justin approves it separately (spec Template A "durable approval"). */
 export async function createOutreachTemplate(fields: TemplateAFields & { testOnly: boolean }, db: Db) {
+    assertValidTemplateFields(fields);
     const contentHash = templateAContentHash(fields);
     return db.outreachTemplate.create({ data: { ...fields, contentHash } });
 }

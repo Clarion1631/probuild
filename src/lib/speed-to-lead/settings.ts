@@ -12,7 +12,16 @@ const PAUSE_KEY = "speedToLeadPaused";
 
 export async function setSpeedToLeadPaused(paused: boolean, db: PrismaClient = prisma): Promise<void> {
     const value = paused ? "true" : "false";
-    await db.automationSetting.upsert({ where: { key: PAUSE_KEY }, create: { key: PAUSE_KEY, value }, update: { value } });
+    // Ensure-then-lock the SAME row dispatch.ts's lockAutomationSettings takes
+    // FOR UPDATE (its own ensure-insert makes this idempotent either way) — a
+    // bare upsert() against a not-yet-existing key does not serialize against
+    // a concurrent dispatch that is discovering the row absent at the same
+    // instant (the first-ever pause race dispatch.ts's comment describes).
+    await db.$transaction(async tx => {
+        await tx.$executeRaw`INSERT INTO "AutomationSetting" (key, value) VALUES (${PAUSE_KEY}, ${value}) ON CONFLICT (key) DO NOTHING`;
+        await tx.$executeRaw`SELECT key FROM "AutomationSetting" WHERE key = ${PAUSE_KEY} FOR UPDATE`;
+        await tx.automationSetting.update({ where: { key: PAUSE_KEY }, data: { value } });
+    });
 }
 
 export async function isSpeedToLeadPaused(db: PrismaClient = prisma): Promise<boolean> {

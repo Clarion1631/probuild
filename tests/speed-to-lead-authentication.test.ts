@@ -44,10 +44,10 @@ test("an authserv-id other than mx.google.com is not trusted even if it claims p
     assert.equal(authenticateMessage(headers, VOICE_FROM).trusted, false);
 });
 
-test("ARC case: direct Authentication-Results fails (post-forward) but the first Google ARC hop shows pass — trusted", () => {
+test("ARC case: direct Authentication-Results fails (post-forward) but Google's own arc=pass vouches for the first Google ARC hop — trusted", () => {
     const headers = [
-        { name: "Authentication-Results", value: "mx.google.com; dkim=fail header.d=gtr-sales.example.com; dmarc=fail" },
-        { name: "ARC-Authentication-Results", value: "i=1; mx.google.com; dkim=pass header.d=gtr-sales.example.com; dmarc=pass" },
+        { name: "Authentication-Results", value: "mx.google.com; arc=pass; dkim=fail header.d=gtr-sales.example.com; dmarc=fail" },
+        { name: "ARC-Authentication-Results", value: "i=1; mx.google.com; dkim=pass header.d=gtr-sales.example.com; dmarc=pass header.from=gtr-sales.example.com" },
     ];
     const verdict = authenticateMessage(headers, "website@gtr-sales.example.com", env);
     assert.equal(verdict.trusted, true);
@@ -55,11 +55,37 @@ test("ARC case: direct Authentication-Results fails (post-forward) but the first
 
 test("ARC case: the ARC hop is not from mx.google.com — not trusted", () => {
     const headers = [
-        { name: "Authentication-Results", value: "mx.google.com; dkim=fail" },
-        { name: "ARC-Authentication-Results", value: "i=1; some.other.host; dkim=pass header.d=gtr-sales.example.com; dmarc=pass" },
+        { name: "Authentication-Results", value: "mx.google.com; arc=pass; dkim=fail" },
+        { name: "ARC-Authentication-Results", value: "i=1; some.other.host; dkim=pass header.d=gtr-sales.example.com; dmarc=pass header.from=gtr-sales.example.com" },
     ];
     const verdict = authenticateMessage(headers, "website@gtr-sales.example.com", env);
     assert.equal(verdict.trusted, false);
+});
+
+test("ARC case: an unsigned ARC-Authentication-Results claims pass, but Google's own receiving header says arc=fail — not trusted (a forged ARC header must never be trusted from text alone)", () => {
+    const headers = [
+        { name: "Authentication-Results", value: "mx.google.com; arc=fail; dkim=fail header.d=gtr-sales.example.com; dmarc=fail" },
+        { name: "ARC-Authentication-Results", value: "i=1; mx.google.com; dkim=pass header.d=gtr-sales.example.com; dmarc=pass header.from=gtr-sales.example.com" },
+    ];
+    const verdict = authenticateMessage(headers, "website@gtr-sales.example.com", env);
+    assert.equal(verdict.trusted, false);
+});
+
+test("ARC case: Google's receiving header carries no arc= verdict at all — the ARC fallback must fail closed, not trust the text", () => {
+    const headers = [
+        { name: "Authentication-Results", value: "mx.google.com; dkim=fail header.d=gtr-sales.example.com; dmarc=fail" },
+        { name: "ARC-Authentication-Results", value: "i=1; mx.google.com; dkim=pass header.d=gtr-sales.example.com; dmarc=pass header.from=gtr-sales.example.com" },
+    ];
+    const verdict = authenticateMessage(headers, "website@gtr-sales.example.com", env);
+    assert.equal(verdict.trusted, false);
+});
+
+test("DKIM and DMARC domains must be independently matched — a DKIM-domain match with no aligned DMARC From-domain is rejected", () => {
+    const headers = [{ name: "Authentication-Results", value: "mx.google.com; dkim=pass header.d=google.com; dmarc=pass" }];
+    // dmarc=pass but no header.from= at all — the old code fell back to
+    // header.d= for "domain" and accepted this; the two mechanisms must be
+    // checked independently.
+    assert.equal(authenticateMessage(headers, VOICE_FROM).trusted, false);
 });
 
 test("no Authentication-Results header at all is not trusted", () => {

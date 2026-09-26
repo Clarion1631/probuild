@@ -2,22 +2,27 @@ import { randomUUID } from "node:crypto";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { computeApprovalHash } from "./approval";
-import { normalizeEndpoint } from "./contact-endpoint";
+import { computeApprovalHash, hashesMatch } from "./approval";
+import { normalizeEndpoint, assertNoHeaderInjection, isValidSingleRecipient } from "./contact-endpoint";
+import { logOutreachEvent } from "./audit";
 import { anyDispatchFreshness, templateAFreshness, type PollHealth } from "./freshness";
-import { templateADeadlinePassed } from "./template";
+import { templateADeadlinePassed, renderTemplateA } from "./template";
 import { isLiveActivatedForCurrentFingerprint } from "./fingerprint";
 import {
     speedToLeadMode,
     isProduction,
     isAllowlistedRecipient,
     dailySendCap,
+    templateAEnabled,
     DISPATCH_FROM_ADDRESS,
     MESSAGE_ID_DOMAIN,
     DISPATCHING_STALE_MS,
+    APPROVAL_COMMIT_WINDOW_MS,
+    DRAFT_EXPIRY_MS,
+    RECONCILE_CHECKPOINTS_MIN,
+    GMAIL_REQUEST_TIMEOUT_MS,
 } from "./constants";
 
-type Db = PrismaClient | Prisma.TransactionClient;
 type Tx = Prisma.TransactionClient;
 
 export type DispatchOutcome =
@@ -28,21 +33,6 @@ export type DispatchOutcome =
     | { status: "ALREADY_IN_FLIGHT" }
     | { status: "NOT_FOUND" };
 
-async function logOutreachEvent(db: Db, params: { leadId?: string | null; messageId?: string | null; kind: string; detail?: unknown }) {
-    try {
-        await db.outreachEvent.create({
-            data: {
-                leadId: params.leadId ?? null,
-                messageId: params.messageId ?? null,
-                kind: params.kind,
-                detail: (params.detail ?? null) as Prisma.InputJsonValue | undefined,
-            },
-        });
-    } catch (error) {
-        // Append-only audit logging must never fail the dispatch it describes.
-        console.error("[speed-to-lead] failed to log OutreachEvent", error instanceof Error ? error.message : "UnknownError");
-    }
-}
 
 function todayUtc(now: Date): string {
     return now.toISOString().slice(0, 10);
@@ -78,15 +68,29 @@ async function tryIncrementDailyCounter(tx: Tx, now: Date, cap: number): Promise
  * waiting to happen rather than a guarantee.
  */
 async function lockAutomationSettings(tx: Tx, keys: string[]): Promise<Map<string, string>> {
+    // Ensure every key this order needs has an always-present row FIRST. A
+    // `SELECT ... FOR UPDATE` that matches zero rows locks nothing, so the
+    // FIRST-EVER write to a key that has never been set (e.g. the first time
+    // this company ever pauses Speed-to-Lead) could commit concurrently with
+    // a dispatch that read "no row" as "not paused" and never serialized
+    // against it at all. Same idempotent ensure-then-lock idiom
+    // lockContactEndpoint already uses below.
+    for (const key of [...keys].sort()) {
+        await tx.$executeRaw`INSERT INTO "AutomationSetting" (key, value) VALUES (${key}, '') ON CONFLICT (key) DO NOTHING`;
+    }
     const rows = await tx.$queryRaw<{ key: string; value: string }[]>`
         SELECT key, value FROM "AutomationSetting" WHERE key = ANY(${keys}) ORDER BY key FOR UPDATE`;
     return new Map(rows.map(r => [r.key, r.value]));
 }
 
-interface LockedTemplateRow { id: string; revokedAt: Date | null; approvedAt: Date | null; testOnly: boolean }
+interface LockedTemplateRow {
+    id: string; revokedAt: Date | null; approvedAt: Date | null; testOnly: boolean;
+    subject: string; body: string; footer: string; fixedPhone: string; bookingBaseUrl: string; fromAddress: string;
+}
 async function lockTemplate(tx: Tx, templateId: string): Promise<LockedTemplateRow | null> {
     const rows = await tx.$queryRaw<LockedTemplateRow[]>`
-        SELECT id, "revokedAt", "approvedAt", "testOnly" FROM "OutreachTemplate" WHERE id = ${templateId} FOR UPDATE`;
+        SELECT id, "revokedAt", "approvedAt", "testOnly", subject, body, footer, "fixedPhone", "bookingBaseUrl", "fromAddress"
+        FROM "OutreachTemplate" WHERE id = ${templateId} FOR UPDATE`;
     return rows.length > 0 ? rows[0] : null;
 }
 
@@ -101,17 +105,18 @@ async function lockContactEndpoint(tx: Tx, endpoint: string): Promise<LockedEndp
     return rows.length > 0 ? rows[0] : null;
 }
 
-interface LockedLeadRow { id: string; stage: string }
+interface LockedLeadRow { id: string; stage: string; bookedAt: Date | null; calledAt: Date | null }
 async function lockLead(tx: Tx, leadId: string): Promise<LockedLeadRow | null> {
     const rows = await tx.$queryRaw<LockedLeadRow[]>`
-        SELECT id, stage FROM "Lead" WHERE id = ${leadId} FOR UPDATE`;
+        SELECT id, stage, "bookedAt", "calledAt" FROM "Lead" WHERE id = ${leadId} FOR UPDATE`;
     return rows.length > 0 ? rows[0] : null;
 }
 
-interface LockedMessageRow { id: string; status: string; kind: string; generation: number; leadId: string; approvedVersionId: string | null; approvalHash: string | null; isTest: boolean; dedupeKey: string }
+interface LockedMessageRow { id: string; status: string; kind: string; generation: number; leadId: string; approvedVersionId: string | null; approvalHash: string | null; isTest: boolean; dedupeKey: string; approvedAt: Date | null; createdAt: Date }
 async function lockMessage(tx: Tx, messageId: string): Promise<LockedMessageRow | null> {
     const rows = await tx.$queryRaw<LockedMessageRow[]>`
-        SELECT id, status, kind, generation, "leadId", "approvedVersionId", "approvalHash", "isTest", "dedupeKey" FROM "OutreachMessage" WHERE id = ${messageId} FOR UPDATE`;
+        SELECT id, status, kind, generation, "leadId", "approvedVersionId", "approvalHash", "isTest", "dedupeKey", "approvedAt", "createdAt"
+        FROM "OutreachMessage" WHERE id = ${messageId} FOR UPDATE`;
     return rows.length > 0 ? rows[0] : null;
 }
 
@@ -121,6 +126,7 @@ interface CommitContext {
     version: { id: string; to: string; subject: string; body: string; footer: string; threading: unknown };
     leadId: string;
     isTest: boolean;
+    kind: string;
 }
 
 async function commitDispatchTransaction(messageId: string, now: () => Date, db: PrismaClient): Promise<{ ok: true; ctx: CommitContext } | { ok: false; outcome: DispatchOutcome }> {
@@ -157,7 +163,9 @@ async function commitDispatchTransaction(messageId: string, now: () => Date, db:
         if (peek.kind === "TEMPLATE_A") {
             if (!templateVersionId) return { ok: false, outcome: { status: "BLOCKED", reason: "template A message has no template reference" } };
             template = await lockTemplate(tx, templateVersionId);
-            if (!template || template.revokedAt) return { ok: false, outcome: { status: "BLOCKED", reason: "template revoked or missing" } };
+            if (!template || template.revokedAt || !template.approvedAt) {
+                return { ok: false, outcome: { status: "BLOCKED", reason: "template revoked, unapproved, or missing" } };
+            }
         }
 
         // 3. ContactEndpoint row — locked for the peeked recipient; if the
@@ -173,6 +181,22 @@ async function commitDispatchTransaction(messageId: string, now: () => Date, db:
         const lead = await lockLead(tx, peek.leadId);
         if (!lead || CLOSED_LEAD_STAGES.includes(lead.stage)) {
             return { ok: false, outcome: { status: "BLOCKED", reason: "lead closed" } };
+        }
+        // Booked/Called cancel existing messages via cancelMessagesForLeadInTx
+        // (followups.ts), but dispatch itself must ALSO refuse here — the
+        // lead row is the SAME row that transaction locks, so this closes the
+        // gap where a message created or re-approved AFTER a Booked/Called
+        // mark would otherwise have nothing checking it at commit time.
+        if (lead.bookedAt || lead.calledAt) {
+            return { ok: false, outcome: { status: "BLOCKED", reason: "lead booked or called" } };
+        }
+        // A JUNK intake verdict (markLeadIntakeJunk) — LeadIntakeEvent is not
+        // part of the shared lock order, so this is a best-effort read rather
+        // than a fully race-proof one, but it is real coverage where none
+        // existed before: dispatch never checked the intake verdict at all.
+        const junkIntake = await tx.leadIntakeEvent.findFirst({ where: { leadId: peek.leadId, verdict: "JUNK" }, select: { id: true } });
+        if (junkIntake) {
+            return { ok: false, outcome: { status: "BLOCKED", reason: "lead marked junk" } };
         }
 
         // 5. message row — the authoritative lock. Everything above this
@@ -205,6 +229,23 @@ async function commitDispatchTransaction(messageId: string, now: () => Date, db:
             return { ok: false, outcome: { status: "BLOCKED", reason: `template A message is ${message.status}, not READY` } };
         }
 
+        // Draft/approval expiry (spec Approval: a 72-hour draft expires; a
+        // personal approval must commit within 30 minutes or it expires). A
+        // bare BLOCKED here would leave the row APPROVED/READY forever, so a
+        // stale approval could fire later once an unrelated pause lift or
+        // LIVE activation "releases" it — cron's dispatchReadyAndApproved
+        // sweeps every APPROVED/READY row every minute regardless of age.
+        // EXPIRED is a real terminal transition, the same one Template A's
+        // own 15-minute deadline already uses below.
+        if (now().getTime() - message.createdAt.getTime() > DRAFT_EXPIRY_MS) {
+            await tx.outreachMessage.update({ where: { id: messageId }, data: { status: "EXPIRED" } });
+            return { ok: false, outcome: { status: "BLOCKED", reason: "draft expired (72 hours)" } };
+        }
+        if (isPersonal && (!message.approvedAt || now().getTime() - message.approvedAt.getTime() > APPROVAL_COMMIT_WINDOW_MS)) {
+            await tx.outreachMessage.update({ where: { id: messageId }, data: { status: "EXPIRED" } });
+            return { ok: false, outcome: { status: "BLOCKED", reason: "approval window expired (30 minutes)" } };
+        }
+
         // approvalHash recheck (personal only) — recomputed from the version
         // plus LIVE server context, not trusted from the stored value alone.
         if (isPersonal) {
@@ -214,18 +255,53 @@ async function commitDispatchTransaction(messageId: string, now: () => Date, db:
                 from: DISPATCH_FROM_ADDRESS, to: version.to, subject: version.subject, body: version.body, footer: version.footer,
                 inReplyTo: threading?.inReplyTo ?? null, references: threading?.references ?? null, threadId: threading?.threadId ?? null,
             });
-            if (!message.approvalHash || recomputed !== message.approvalHash) {
+            if (!message.approvalHash || !hashesMatch(recomputed, message.approvalHash)) {
                 return { ok: false, outcome: { status: "BLOCKED", reason: "approval hash no longer matches" } };
             }
         }
 
-        // Template A deadline (spec Template A: 15 minutes from intake receive time).
+        // Template A: re-check everything the ELIGIBILITY decision at intake
+        // time is not re-verified at commit time otherwise — the flag can be
+        // turned off, the test/live split can drift, and the template's OWN
+        // content can be edited after this message was created and rendered.
         if (message.kind === "TEMPLATE_A") {
-            const renderInputs = version.renderInputs as unknown as { intakeReceivedAt?: string } | null;
+            if (!template) return { ok: false, outcome: { status: "BLOCKED", reason: "template revoked, unapproved, or missing" } };
+            // A testOnly template must never dispatch a non-test message (or
+            // vice versa) — evaluateTemplateAEligibility already keeps these
+            // aligned at intake, but the commit path re-derives everything
+            // from locked rows rather than trusting that invariant silently.
+            if (template.testOnly !== message.isTest) {
+                return { ok: false, outcome: { status: "BLOCKED", reason: "template test/live flag no longer matches this message" } };
+            }
+            // The isTest path is exempt from the live flag (spec Release:
+            // "enabled for readiness runs regardless of SPEED_TO_LEAD_TEMPLATE_A")
+            // — same exemption evaluateTemplateAEligibility applies at intake.
+            if (!message.isTest && !templateAEnabled()) {
+                return { ok: false, outcome: { status: "BLOCKED", reason: "SPEED_TO_LEAD_TEMPLATE_A is off" } };
+            }
+            const renderInputs = version.renderInputs as unknown as { intakeReceivedAt?: string; name?: string; email?: string } | null;
             const intakeReceivedAt = renderInputs?.intakeReceivedAt ? new Date(renderInputs.intakeReceivedAt) : null;
             if (!intakeReceivedAt || templateADeadlinePassed(intakeReceivedAt, now())) {
                 await tx.outreachMessage.update({ where: { id: messageId }, data: { status: "EXPIRED" } });
                 return { ok: false, outcome: { status: "BLOCKED", reason: "template A deadline passed" } };
+            }
+            // Content/render integrity: re-render the CURRENTLY-locked template
+            // with this version's own renderInputs and require an exact match.
+            // Templates are edited in place (approveTemplate updates the same
+            // row rather than versioning it) — without this, editing a
+            // template after a message was rendered from it would silently
+            // change nothing about the already-rendered version, but nothing
+            // here would notice if the two had drifted apart for any other
+            // reason either.
+            if (!renderInputs?.name || !renderInputs?.email) {
+                return { ok: false, outcome: { status: "BLOCKED", reason: "template A message has no render inputs to verify" } };
+            }
+            const rendered = renderTemplateA(
+                { subject: template.subject, body: template.body, footer: template.footer, fixedPhone: template.fixedPhone, bookingBaseUrl: template.bookingBaseUrl, fromAddress: template.fromAddress },
+                { name: renderInputs.name, email: renderInputs.email },
+            );
+            if (rendered.subject !== version.subject || rendered.body !== version.body || rendered.footer !== version.footer) {
+                return { ok: false, outcome: { status: "BLOCKED", reason: "template content has changed since this message was rendered" } };
             }
         }
 
@@ -288,15 +364,55 @@ async function commitDispatchTransaction(messageId: string, now: () => Date, db:
         return {
             ok: true,
             ctx: {
-                attemptId, rfcMessageId, leadId: message.leadId, isTest: message.isTest,
+                attemptId, rfcMessageId, leadId: message.leadId, isTest: message.isTest, kind: message.kind,
                 version: { id: version.id, to: version.to, subject: version.subject, body: version.body, footer: version.footer, threading: version.threading },
             },
         };
     });
 }
 
+/**
+ * Records a provider-confirmed send (called from the direct dispatch path
+ * AND from reconciliation once a search finds the message in Sent) — the
+ * single place threadId, the Lead timing fields, and firstLiveSendAt all get
+ * set together, so reconciliation can never omit them the way a hand-rolled
+ * second copy of this update did before.
+ */
+async function markAttemptSent(
+    db: PrismaClient,
+    ctx: { attemptId: string; messageId: string; leadId: string; kind: string; isTest: boolean; providerMessageId: string; threadId: string | null },
+    now: Date,
+): Promise<void> {
+    await db.$transaction(async tx => {
+        await tx.outreachAttempt.update({ where: { id: ctx.attemptId }, data: { outcome: "SENT", providerMessageId: ctx.providerMessageId, threadId: ctx.threadId } });
+        await tx.outreachMessage.update({ where: { id: ctx.messageId }, data: { status: "SENT" } });
+        if (ctx.kind === "TEMPLATE_A") {
+            await tx.lead.updateMany({ where: { id: ctx.leadId, firstTouchAt: null }, data: { firstTouchAt: now } });
+        } else {
+            await tx.lead.updateMany({ where: { id: ctx.leadId, personalReplyAt: null }, data: { personalReplyAt: now } });
+            if (!ctx.isTest) {
+                await tx.automationSetting.upsert({
+                    where: { key: "firstLiveSendAt" },
+                    create: { key: "firstLiveSendAt", value: now.toISOString() },
+                    update: {},
+                });
+            }
+        }
+    });
+}
+
 /** RFC822 headers + body, base64url-encoded for Gmail's `raw` send field. No CC, BCC or Reply-To (spec Dispatch step 2). */
 export function buildRawMessage(input: { from: string; to: string; subject: string; body: string; footer: string; messageId: string; inReplyTo?: string | null; references?: string | null }): string {
+    // Every value below becomes literal text inside an RFC822 header line —
+    // a comma-separated `to` would bypass the per-endpoint suppression check
+    // (which normalizes and looks up exactly one address), and a CR/LF in
+    // ANY of them injects a brand new header (Bcc, an extra Subject, ...)
+    // into the raw message before it is even base64-encoded.
+    if (!isValidSingleRecipient(input.to)) throw new Error("invalid recipient: exactly one mailbox address is required");
+    assertNoHeaderInjection(input.subject, "subject");
+    assertNoHeaderInjection(input.messageId, "messageId");
+    if (input.inReplyTo) assertNoHeaderInjection(input.inReplyTo, "inReplyTo");
+    if (input.references) assertNoHeaderInjection(input.references, "references");
     const encodeSubject = (s: string) => (/^[\x20-\x7e]*$/.test(s) ? s : `=?UTF-8?B?${Buffer.from(s, "utf8").toString("base64")}?=`);
     const headers = [
         `From: ${input.from}`,
@@ -315,20 +431,32 @@ export function buildRawMessage(input: { from: string; to: string; subject: stri
     return Buffer.from(raw, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-async function sendViaGmail(ctx: CommitContext): Promise<{ outcome: "SENT"; providerMessageId: string; threadId: string | null } | { outcome: "FAILED"; reason: string } | { outcome: "UNKNOWN_DELIVERY" }> {
+async function sendViaGmail(ctx: CommitContext, db: PrismaClient): Promise<{ outcome: "SENT"; providerMessageId: string; threadId: string | null } | { outcome: "FAILED"; reason: string } | { outcome: "UNKNOWN_DELIVERY" }> {
     const { ensureLeadInboxAuth, gmailClientFor } = await import("./gmail-inbox-client");
-    const auth = await ensureLeadInboxAuth();
+    // Explicitly threaded through — a caller running against a disposable
+    // test database must never have this silently reach the REAL configured
+    // mailbox credential via the global prisma singleton instead.
+    const auth = await ensureLeadInboxAuth(db);
     if (!auth.ok || !auth.client) return { outcome: "UNKNOWN_DELIVERY" };
     const gmail = gmailClientFor(auth.client);
     const threading = ctx.version.threading as { inReplyTo: string | null; references: string | null; threadId: string | null };
-    const raw = buildRawMessage({
-        from: DISPATCH_FROM_ADDRESS, to: ctx.version.to, subject: ctx.version.subject, body: ctx.version.body, footer: ctx.version.footer,
-        messageId: ctx.rfcMessageId, inReplyTo: threading.inReplyTo, references: threading.references,
-    });
+    let raw: string;
+    try {
+        raw = buildRawMessage({
+            from: DISPATCH_FROM_ADDRESS, to: ctx.version.to, subject: ctx.version.subject, body: ctx.version.body, footer: ctx.version.footer,
+            messageId: ctx.rfcMessageId, inReplyTo: threading.inReplyTo, references: threading.references,
+        });
+    } catch (error) {
+        // A recipient/header-injection validation failure here is permanent —
+        // no retry will ever make this content valid — so it is a FAILED
+        // outcome, never an uncaught throw (dispatchOutreach's own contract:
+        // "Never throws for an expected refusal").
+        return { outcome: "FAILED", reason: error instanceof Error ? error.message : "invalid message content" };
+    }
     try {
         const res = await gmail.users.messages.send(
             { userId: "me", requestBody: { raw, threadId: threading.threadId ?? undefined } },
-            { retry: false, retryConfig: { retry: 0 } } as Record<string, unknown>,
+            { retry: false, retryConfig: { retry: 0 }, timeout: GMAIL_REQUEST_TIMEOUT_MS } as Record<string, unknown>,
         );
         const providerMessageId = res.data.id;
         if (!providerMessageId) return { outcome: "UNKNOWN_DELIVERY" };
@@ -352,7 +480,7 @@ export async function dispatchOutreach(messageId: string, db: PrismaClient = pri
     if (!committed.ok) return committed.outcome;
     const { ctx } = committed;
 
-    const sendResult = await sendViaGmail(ctx);
+    const sendResult = await sendViaGmail(ctx, db);
     if (sendResult.outcome === "UNKNOWN_DELIVERY") {
         await logOutreachEvent(db, { leadId: ctx.leadId, messageId, kind: "dispatch-unknown-delivery", detail: { attemptId: ctx.attemptId } });
         // Left in DISPATCHING; reconciliation (reconcileUnknownDeliveries) resolves it later.
@@ -368,23 +496,10 @@ export async function dispatchOutreach(messageId: string, db: PrismaClient = pri
         return { status: "FAILED", attemptId: ctx.attemptId, reason: sendResult.reason };
     }
 
-    await db.$transaction(async tx => {
-        await tx.outreachAttempt.update({ where: { id: ctx.attemptId }, data: { outcome: "SENT", providerMessageId: sendResult.providerMessageId, threadId: sendResult.threadId } });
-        await tx.outreachMessage.update({ where: { id: messageId }, data: { status: "SENT" } });
-        const message = await tx.outreachMessage.findUniqueOrThrow({ where: { id: messageId } });
-        if (message.kind === "TEMPLATE_A") {
-            await tx.lead.updateMany({ where: { id: ctx.leadId, firstTouchAt: null }, data: { firstTouchAt: now() } });
-        } else {
-            await tx.lead.updateMany({ where: { id: ctx.leadId, personalReplyAt: null }, data: { personalReplyAt: now() } });
-            if (!ctx.isTest) {
-                await tx.automationSetting.upsert({
-                    where: { key: "firstLiveSendAt" },
-                    create: { key: "firstLiveSendAt", value: now().toISOString() },
-                    update: {},
-                });
-            }
-        }
-    });
+    await markAttemptSent(db, {
+        attemptId: ctx.attemptId, messageId, leadId: ctx.leadId, kind: ctx.kind, isTest: ctx.isTest,
+        providerMessageId: sendResult.providerMessageId, threadId: sendResult.threadId,
+    }, now());
     await logOutreachEvent(db, { leadId: ctx.leadId, messageId, kind: "dispatch-sent", detail: { attemptId: ctx.attemptId, providerMessageId: sendResult.providerMessageId } });
     return { status: "SENT", attemptId: ctx.attemptId, providerMessageId: sendResult.providerMessageId, threadId: sendResult.threadId };
 }
@@ -407,18 +522,37 @@ export async function reconcileUnknownDeliveries(db: PrismaClient = prisma, now:
         include: { message: true },
     });
     const { ensureLeadInboxAuth, gmailClientFor } = await import("./gmail-inbox-client");
-    const auth = await ensureLeadInboxAuth();
+    const auth = await ensureLeadInboxAuth(db);
+    const lastCheckpointMin = RECONCILE_CHECKPOINTS_MIN[RECONCILE_CHECKPOINTS_MIN.length - 1];
     for (const attempt of pending) {
         if (!auth.ok || !auth.client) continue;
+        const ageMin = (now.getTime() - attempt.committedAt.getTime()) / 60_000;
+
+        // Past the last checkpoint AND already reported: spec Dispatch step 3
+        // says reconciliation checks at 1, 5 and 30 minutes and, if still not
+        // found, "nothing is resent" — that is the end of the story for this
+        // attempt. Without this the search (and the push below) ran every
+        // single cron minute forever for an attempt that will never resolve.
+        if (ageMin > lastCheckpointMin) {
+            const alreadyReported = await db.outreachEvent.findFirst({
+                where: { kind: "reconcile-not-found-30m", detail: { path: ["attemptId"], equals: attempt.id } },
+            });
+            if (alreadyReported) continue;
+        }
+
         const gmail = gmailClientFor(auth.client);
         try {
-            const search = await gmail.users.messages.list({ userId: "me", q: `rfc822msgid:${attempt.rfcMessageId}`, maxResults: 1 });
+            // Scoped to Sent (spec: "Reconciliation searches Sent for
+            // rfc822msgid:") — an unscoped search could in principle match a
+            // copy of the message elsewhere in a shared mailbox.
+            const search = await gmail.users.messages.list({ userId: "me", q: `in:sent rfc822msgid:${attempt.rfcMessageId}`, maxResults: 1 }, { timeout: GMAIL_REQUEST_TIMEOUT_MS });
             const found = search.data.messages?.[0];
-            if (found) {
-                await db.$transaction([
-                    db.outreachAttempt.update({ where: { id: attempt.id }, data: { outcome: "SENT", providerMessageId: found.id ?? undefined } }),
-                    db.outreachMessage.update({ where: { id: attempt.messageId }, data: { status: "SENT" } }),
-                ]);
+            if (found?.id) {
+                await markAttemptSent(db, {
+                    attemptId: attempt.id, messageId: attempt.messageId, leadId: attempt.message.leadId,
+                    kind: attempt.message.kind, isTest: attempt.message.isTest,
+                    providerMessageId: found.id, threadId: found.threadId ?? null,
+                }, now);
                 await logOutreachEvent(db, { leadId: attempt.message.leadId, messageId: attempt.messageId, kind: "reconcile-found", detail: { attemptId: attempt.id } });
                 continue;
             }
@@ -426,11 +560,10 @@ export async function reconcileUnknownDeliveries(db: PrismaClient = prisma, now:
             console.error("[speed-to-lead] reconciliation search failed", error instanceof Error ? error.message : "UnknownError");
             continue;
         }
-        const ageMin = (now.getTime() - attempt.committedAt.getTime()) / 60_000;
-        if (ageMin >= 30) {
+        if (ageMin >= lastCheckpointMin) {
             const { pushToJustin } = await import("./push");
             await pushToJustin("Speed-to-Lead: delivery unknown", `Message ${attempt.rfcMessageId} was not found in Sent after 30 minutes. Nothing was resent.`);
-            await logOutreachEvent(db, { leadId: attempt.message.leadId, messageId: attempt.messageId, kind: "reconcile-not-found-30m" });
+            await logOutreachEvent(db, { leadId: attempt.message.leadId, messageId: attempt.messageId, kind: "reconcile-not-found-30m", detail: { attemptId: attempt.id } });
         }
     }
 }

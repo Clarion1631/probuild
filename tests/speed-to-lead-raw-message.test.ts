@@ -52,6 +52,24 @@ test("buildRawMessage encodes a non-ASCII subject as an RFC 2047 encoded-word", 
     assert.match(decoded, /^Subject: =\?UTF-8\?B\?/m);
 });
 
+test("buildRawMessage rejects CRLF in `to` — it must never inject a new header (e.g. Bcc) into the raw message", () => {
+    assert.throws(() => buildRawMessage({
+        from: "a@x.com", to: "victim@x.com\r\nBcc: attacker@evil.com", subject: "s", body: "b", footer: "f", messageId: "<m@x.com>",
+    }));
+});
+
+test("buildRawMessage rejects a comma-separated recipient list — exactly one mailbox, never several bypassing per-endpoint suppression", () => {
+    assert.throws(() => buildRawMessage({
+        from: "a@x.com", to: "victim@x.com,extra@evil.com", subject: "s", body: "b", footer: "f", messageId: "<m@x.com>",
+    }));
+});
+
+test("buildRawMessage rejects CRLF in inReplyTo/references/messageId too", () => {
+    assert.throws(() => buildRawMessage({ from: "a@x.com", to: "b@x.com", subject: "s", body: "b", footer: "f", messageId: "<m@x.com>\r\nX-Injected: yes" }));
+    assert.throws(() => buildRawMessage({ from: "a@x.com", to: "b@x.com", subject: "s", body: "b", footer: "f", messageId: "<m@x.com>", inReplyTo: "<orig@x.com>\r\nX-Injected: yes" }));
+    assert.throws(() => buildRawMessage({ from: "a@x.com", to: "b@x.com", subject: "s", body: "b", footer: "f", messageId: "<m@x.com>", references: "<orig@x.com>\r\nX-Injected: yes" }));
+});
+
 test("buildRawMessage body includes both the body text and the footer", () => {
     const decoded = decode(buildRawMessage({ from: "a@x.com", to: "b@x.com", subject: "s", body: "the body", footer: "the footer", messageId: "<m@x.com>" }));
     // Body is base64-encoded within the message; decode that inner layer too.

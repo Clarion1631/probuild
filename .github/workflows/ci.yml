@@ -59,6 +59,20 @@ jobs:
       - name: Assert the result matches production's shape
         run: node scripts/check-migrations-match.mjs
 
+      # Speed-to-Lead (PB-leads-001) real-Postgres races: dispatch commit
+      # races (two workers, cancellation, the daily cap) and intake races
+      # (fallback-first, webhook-first, concurrent webhook delivery). Both
+      # files are wired into package.json's test:unit, but test:unit ALSO
+      # runs in the "build" job below, which has no Postgres service and
+      # never sets SPEED_TO_LEAD_TEST_URL — their own `skip` guard means they
+      # silently no-op there, so this is the only place they actually run.
+      # `migrate deploy` above already applied this feature's migration to
+      # probuild_migrations, so no separate apply step is needed here.
+      - name: Speed-to-Lead dispatch and intake races against real Postgres
+        run: npx tsx --test tests/speed-to-lead-intake-db.test.ts tests/speed-to-lead-dispatch-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # The APPLY SCRIPT itself, run the way a human runs it before a deploy.
       #
       # `migrate deploy` above proves the committed SQL; it never runs
@@ -601,6 +615,13 @@ jobs:
       - name: Build
         run: npm run build 2>&1 | tee /tmp/build-output.txt
         env:
+          # This PR's ~9 new Prisma models inflate the generated Prisma
+          # Client's types enough to push next build's internal TypeScript
+          # phase over the runner's default heap limit ("Ineffective
+          # mark-compacts near heap limit ... JavaScript heap out of memory").
+          # ubuntu-latest runners carry 7GB; 6GB leaves headroom for the OS
+          # and the rest of the toolchain.
+          NODE_OPTIONS: --max-old-space-size=6144
           NEXT_TELEMETRY_DISABLED: 1
           NEXT_PUBLIC_SUPABASE_URL: https://ghzdbzdnwjxazvmcefbh.supabase.co
           NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
@@ -785,6 +806,11 @@ jobs:
       - name: Build application
         run: npm run build
         env:
+          # See the "Build" step's comment in the "build" job — this is the
+          # step that was actually observed FAILING with
+          # "JavaScript heap out of memory" during next build's TypeScript
+          # phase (gh pr checks 557 / job 108320625900); the fix is identical.
+          NODE_OPTIONS: --max-old-space-size=6144
           NEXT_TELEMETRY_DISABLED: 1
 
       # These assert invariants nothing else does: money lock ordering, portal

@@ -1,4 +1,6 @@
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { google } from "googleapis";
+import type { PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 
 /**
@@ -39,12 +41,73 @@ export function newLeadInboxOAuthClient() {
     return new google.auth.OAuth2(clientId, clientSecret, redirectUri());
 }
 
-export function leadInboxAuthUrl(): string {
+const LEAD_INBOX_STATE_PREFIX = "leadinbox.";
+const LEAD_INBOX_STATE_TTL_MS = 10 * 60 * 1000;
+
+function leadInboxStateSecret(): string {
+    return process.env.NEXTAUTH_SECRET ?? "";
+}
+
+/**
+ * Session-bound, single-use OAuth `state` (CSRF protection, RFC 6749 §10.12).
+ * A constant state lets anyone who can trigger a GET here (no token, no
+ * session tie) complete the flow for a code an attacker obtained — signing it
+ * to the initiating admin's session and a fresh nonce, with a short expiry,
+ * closes that. `verifyAndConsumeLeadInboxState` below spends the nonce
+ * exactly once.
+ */
+export function mintLeadInboxState(sessionEmail: string): string {
+    const nonce = randomUUID();
+    const issuedAt = Date.now();
+    const payload = `${sessionEmail}:${nonce}:${issuedAt}`;
+    const sig = createHmac("sha256", leadInboxStateSecret()).update(payload).digest("hex");
+    return `${LEAD_INBOX_STATE_PREFIX}${Buffer.from(`${payload}:${sig}`).toString("base64url")}`;
+}
+
+/** True for any state value minted by this flow — used to recognize the callback before it is verified. */
+export function isLeadInboxState(state: string | null): boolean {
+    return !!state && state.startsWith(LEAD_INBOX_STATE_PREFIX);
+}
+
+/**
+ * Verifies the signature, expiry and originating session, then CONSUMES the
+ * state so the same authorization redirect can never be replayed: the unique
+ * key insert below throws if this exact nonce was already spent.
+ */
+export async function verifyAndConsumeLeadInboxState(state: string, sessionEmail: string): Promise<boolean> {
+    if (!isLeadInboxState(state) || !leadInboxStateSecret()) return false;
+    let decoded: string;
+    try {
+        decoded = Buffer.from(state.slice(LEAD_INBOX_STATE_PREFIX.length), "base64url").toString("utf8");
+    } catch {
+        return false;
+    }
+    const parts = decoded.split(":");
+    if (parts.length !== 4) return false;
+    const [email, nonce, issuedAtRaw, sig] = parts;
+    const issuedAt = Number(issuedAtRaw);
+    if (!Number.isFinite(issuedAt) || Date.now() - issuedAt > LEAD_INBOX_STATE_TTL_MS) return false;
+    if (email !== sessionEmail) return false;
+    const expected = createHmac("sha256", leadInboxStateSecret()).update(`${email}:${nonce}:${issuedAtRaw}`).digest("hex");
+    const a = Buffer.from(sig, "hex");
+    const b = Buffer.from(expected, "hex");
+    if (a.length === 0 || a.length !== b.length || !timingSafeEqual(a, b)) return false;
+    try {
+        // A fresh, never-before-seen key: the unique constraint on
+        // AutomationSetting.key makes this create() the single-use gate.
+        await prisma.automationSetting.create({ data: { key: `leadInboxOAuthState:${nonce}`, value: "used" } });
+    } catch {
+        return false; // already consumed — replay
+    }
+    return true;
+}
+
+export function leadInboxAuthUrl(sessionEmail: string): string {
     return newLeadInboxOAuthClient().generateAuthUrl({
         access_type: "offline",
         scope: LEAD_INBOX_SCOPES,
         prompt: "consent",
-        state: "purpose=lead-inbox",
+        state: mintLeadInboxState(sessionEmail),
     });
 }
 
@@ -53,10 +116,18 @@ export interface LeadInboxAuth {
     client?: ReturnType<typeof newLeadInboxOAuthClient>;
 }
 
-/** Loads the stored gtrsupport@ refresh token and returns a ready-to-use OAuth client, or `{ ok: false }` if none is connected yet (R0). */
-export async function ensureLeadInboxAuth(): Promise<LeadInboxAuth> {
+/**
+ * Loads the stored gtrsupport@ refresh token and returns a ready-to-use OAuth
+ * client, or `{ ok: false }` if none is connected yet (R0). Takes `db`
+ * explicitly rather than reaching for the global `prisma` singleton — a
+ * caller running against a disposable test database (dispatch.ts's DB tests)
+ * must never have its Gmail send/reconcile path silently fall through to the
+ * REAL configured mailbox credential just because this one function forgot
+ * to accept the database it was given.
+ */
+export async function ensureLeadInboxAuth(db: PrismaClient = prisma): Promise<LeadInboxAuth> {
     try {
-        const settings = await prisma.companySettings.findUnique({
+        const settings = await db.companySettings.findUnique({
             where: { id: "singleton" },
             select: { leadInboxRefreshToken: true },
         });

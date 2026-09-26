@@ -3,8 +3,14 @@ import type { Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { canonicalJson } from "@/lib/mcp-schedule-tools";
 import { DISPATCH_FROM_ADDRESS } from "./constants";
+import { isValidSingleRecipient, assertNoHeaderInjection } from "./contact-endpoint";
+import { containsOptOutPhrase } from "./reply-detection";
+import { logOutreachEvent } from "./audit";
 
 type Db = PrismaClient | Prisma.TransactionClient;
+
+/** Matches the OutreachStatus enum (prisma/schema.prisma) — used to cast a raw-query-read status string back to Prisma's enum type after it has already been validated against an explicit allowlist. */
+type OutreachStatusValue = "DRAFT" | "READY" | "PENDING_APPROVAL" | "APPROVED" | "DISPATCHING" | "SENT" | "FAILED" | "UNKNOWN_DELIVERY" | "CANCELLED" | "SUPERSEDED" | "EXPIRED" | "BLOCKED";
 
 /**
  * Approval (spec "Approval (Justin only, email only)"):
@@ -127,6 +133,7 @@ export async function createOutreachDraftInTx(tx: Db, params: CreateOutreachDraf
             renderInputs: (params.content.renderInputs ?? null) as Prisma.InputJsonValue | undefined,
         },
     });
+    await logOutreachEvent(tx, { leadId: params.leadId, messageId: message.id, kind: "draft-created", detail: { kind: params.kind } });
     return message;
 }
 
@@ -141,17 +148,52 @@ export async function createOutreachDraft(params: CreateOutreachDraftParams, db:
  * has reached DISPATCHING or later — "A version already in DISPATCHING can't
  * be superseded" — the caller renders that as "already in flight".
  */
+/**
+ * Validated once here, at the EDIT boundary (the approval UI's "To" field is
+ * a plain editable text input), and again at buildRawMessage — the actual
+ * RFC822-building boundary — so a CRLF-injected Bcc or a comma-separated
+ * recipient list can never reach either a stored draft or a sent message.
+ */
+function assertValidDraftContent(content: DraftContent): void {
+    if (!isValidSingleRecipient(content.to)) throw new Error("invalid recipient: exactly one mailbox address is required");
+    assertNoHeaderInjection(content.subject, "subject");
+    if (content.threading.inReplyTo) assertNoHeaderInjection(content.threading.inReplyTo, "inReplyTo");
+    if (content.threading.references) assertNoHeaderInjection(content.threading.references, "references");
+    // Required content, enforced server-side rather than trusted from the
+    // caller: an empty or non-compliant footer would leave an approved,
+    // sent message with no opt-out instructions at all.
+    if (!containsOptOutPhrase(content.footer)) {
+        throw new Error("invalid footer: it must contain an opt-out instruction (e.g. \"reply 'no thanks' and I'll stop\")");
+    }
+}
+
+/** The ordinary "edit a draft" source statuses. Send-again needs a DIFFERENT set (FAILED/UNKNOWN_DELIVERY) — see the `allowedStatuses` param below, which callers pass explicitly rather than this default silently growing to cover both. */
+const DEFAULT_EDITABLE_STATUSES = ["DRAFT", "READY", "PENDING_APPROVAL", "APPROVED"] as const;
+
 export async function createNewGeneration(
     messageId: string,
     content: DraftContent,
     db: PrismaClient = prisma,
+    opts: { allowedStatuses?: readonly string[] } = {},
 ) {
+    assertValidDraftContent(content);
+    const allowedStatuses = opts.allowedStatuses ?? DEFAULT_EDITABLE_STATUSES;
     return db.$transaction(async tx => {
-        const message = await tx.outreachMessage.findUniqueOrThrow({ where: { id: messageId } });
-        if (!["DRAFT", "READY", "PENDING_APPROVAL", "APPROVED"].includes(message.status)) {
+        // Lock the message row FIRST (the same "message row" rung dispatch.ts's
+        // commit and cancellation.ts's cancel both take) — an unlocked read
+        // here let an edit observe APPROVED, wait behind a concurrent commit,
+        // and then unconditionally overwrite whatever the commit left (DISPATCHING,
+        // SENT, or CANCELLED) back to DRAFT, resurrecting a message that had
+        // already committed or been invalidated.
+        const rows = await tx.$queryRaw<{ id: string; status: string; generation: number }[]>`
+            SELECT id, status, generation FROM "OutreachMessage" WHERE id = ${messageId} FOR UPDATE`;
+        const lockedRow = rows[0];
+        if (!lockedRow) throw new Error("message not found");
+        if (!allowedStatuses.includes(lockedRow.status)) {
             throw new Error("already in flight");
         }
-        const nextGeneration = message.generation + 1;
+        const locked = lockedRow;
+        const nextGeneration = locked.generation + 1;
         await tx.outreachVersion.create({
             data: {
                 messageId,
@@ -168,11 +210,16 @@ export async function createNewGeneration(
         // Editing invalidates any approval in progress on the OLD generation —
         // back to DRAFT, and a fresh approval is required (spec: "The next
         // personal reply is a new draft generation ... and it needs a fresh
-        // approval").
-        return tx.outreachMessage.update({
-            where: { id: messageId },
+        // approval"). Conditional on the exact row we locked and validated,
+        // never a blind write.
+        const { count } = await tx.outreachMessage.updateMany({
+            where: { id: messageId, status: locked.status as OutreachStatusValue, generation: locked.generation },
             data: { generation: nextGeneration, status: "DRAFT", approvedVersionId: null, approvalHash: null, approvedBy: null, approvedAt: null },
         });
+        if (count === 0) throw new Error("already in flight");
+        const updated = await tx.outreachMessage.findUniqueOrThrow({ where: { id: messageId } });
+        await logOutreachEvent(tx, { leadId: updated.leadId, messageId, kind: "draft-edited", detail: { generation: nextGeneration } });
+        return updated;
     });
 }
 
@@ -203,14 +250,28 @@ export async function approveOutreachVersion(
     params: { messageId: string; versionId: string; approvalHash: string; approvedBy: string; leadId: string },
     db: PrismaClient = prisma,
 ) {
-    return db.$transaction(async tx => {
-        const message = await tx.outreachMessage.findUniqueOrThrow({ where: { id: params.messageId } });
+    // Everything below happens inside ONE transaction that must always COMMIT
+    // (never throw once it has written anything) — a hash mismatch resets the
+    // row to DRAFT and that reset has to land for real, or a throw here would
+    // roll it back too and strand the row in PENDING_APPROVAL forever
+    // (submitForApproval's own CAS only ever accepts DRAFT). The mismatch is
+    // reported to the caller via the `ok: false` result, after commit.
+    const result = await db.$transaction(async tx => {
+        // Lock the message row first — the same rung dispatch.ts's commit and
+        // cancellation.ts's cancel both take — so neither can race this read:
+        // without it, an unlocked read here could observe PENDING_APPROVAL,
+        // lose the lock to a concurrent cancellation, and then unconditionally
+        // overwrite CANCELLED back to APPROVED.
+        const rows = await tx.$queryRaw<{ id: string; status: string; generation: number }[]>`
+            SELECT id, status, generation FROM "OutreachMessage" WHERE id = ${params.messageId} FOR UPDATE`;
+        const locked = rows[0];
+        if (!locked) throw new Error("message not found");
         const version = await tx.outreachVersion.findUniqueOrThrow({ where: { id: params.versionId } });
-        if (version.messageId !== params.messageId || version.generation !== message.generation) {
+        if (version.messageId !== params.messageId || version.generation !== locked.generation) {
             throw new Error("stale version — a newer draft exists");
         }
-        if (message.status !== "PENDING_APPROVAL") {
-            throw new Error(`cannot approve from status ${message.status}`);
+        if (locked.status !== "PENDING_APPROVAL") {
+            throw new Error(`cannot approve from status ${locked.status}`);
         }
         const threading = version.threading as unknown as ThreadingInfo;
         const expected = computeApprovalHash({
@@ -227,11 +288,11 @@ export async function approveOutreachVersion(
             threadId: threading?.threadId ?? null,
         });
         if (!hashesMatch(expected, params.approvalHash)) {
-            await tx.outreachMessage.update({ where: { id: params.messageId }, data: { status: "DRAFT" } });
-            throw new Error("approval hash mismatch — the draft changed, reload and re-approve");
+            await tx.outreachMessage.updateMany({ where: { id: params.messageId, status: "PENDING_APPROVAL" }, data: { status: "DRAFT" } });
+            return { ok: false as const };
         }
-        return tx.outreachMessage.update({
-            where: { id: params.messageId },
+        const { count } = await tx.outreachMessage.updateMany({
+            where: { id: params.messageId, status: "PENDING_APPROVAL", generation: locked.generation },
             data: {
                 status: "APPROVED",
                 approvedVersionId: params.versionId,
@@ -240,5 +301,10 @@ export async function approveOutreachVersion(
                 approvedAt: new Date(),
             },
         });
+        if (count === 0) throw new Error(`cannot approve from status ${locked.status}`);
+        await logOutreachEvent(tx, { leadId: params.leadId, messageId: params.messageId, kind: "approved", detail: { approvedBy: params.approvedBy, versionId: params.versionId } });
+        return { ok: true as const };
     });
+    if (!result.ok) throw new Error("approval hash mismatch — the draft changed, reload and re-approve");
+    return db.outreachMessage.findUniqueOrThrow({ where: { id: params.messageId } });
 }

@@ -2,6 +2,8 @@ import type { Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { normalizeEndpoint } from "./contact-endpoint";
 
+type Tx = Prisma.TransactionClient;
+
 /**
  * Cancellation (spec "Suppression and cancellation — Cancellation"): "any
  * reply, opt-out, bounce, Booked, Called, junk mark or lead close cancels
@@ -19,17 +21,22 @@ export interface CancellationResult {
     cancelledMessageIds: string[];
 }
 
-export async function cancelMessagesForLead(
-    leadId: string,
-    reason: string,
-    db: PrismaClient = prisma,
-): Promise<CancellationResult> {
-    return db.$transaction(async tx => {
-        // 1. pause/mode rows — same lock as dispatch's step 1, so a cancel and a
-        // concurrent commit checking the pause switch can never form a cycle.
-        await tx.$queryRaw`SELECT key FROM "AutomationSetting" WHERE key = ANY(${["speedToLeadPaused", "liveActivation", "firstLiveSendAt"]}) ORDER BY key FOR UPDATE`;
+/**
+ * The core logic, usable INSIDE a transaction the caller already opened —
+ * e.g. followups.ts's markLeadBooked/markLeadCalled and actions.ts's
+ * markLeadJunkAction, which must cancel messages in the SAME transaction as
+ * the context change (bookedAt/calledAt/junk) that makes them cancellable,
+ * or a dispatch racing in the gap between two separate transactions could
+ * still commit. Never opens its own transaction — `Prisma.TransactionClient`
+ * has no `$transaction` method, so this must not either (same convention as
+ * approval.ts's createOutreachDraftInTx).
+ */
+export async function cancelMessagesForLeadInTx(tx: Tx, leadId: string, reason: string): Promise<CancellationResult> {
+    // 1. pause/mode rows — same lock as dispatch's step 1, so a cancel and a
+    // concurrent commit checking the pause switch can never form a cycle.
+    await tx.$queryRaw`SELECT key FROM "AutomationSetting" WHERE key = ANY(${["speedToLeadPaused", "liveActivation", "firstLiveSendAt"]}) ORDER BY key FOR UPDATE`;
 
-        const candidates = await tx.outreachMessage.findMany({
+    const candidates = await tx.outreachMessage.findMany({
             where: { leadId, status: { in: [...CANCELLABLE_STATUSES] } },
             orderBy: { id: "asc" },
             select: { id: true, kind: true, generation: true, approvedVersionId: true },
@@ -72,6 +79,14 @@ export async function cancelMessagesForLead(
             cancelledMessageIds.push(c.id);
         }
 
-        return { cancelledMessageIds };
-    });
+    return { cancelledMessageIds };
+}
+
+/** Top-level entry point: opens its own transaction. See cancelMessagesForLeadInTx for the in-transaction version. */
+export async function cancelMessagesForLead(
+    leadId: string,
+    reason: string,
+    db: PrismaClient = prisma,
+): Promise<CancellationResult> {
+    return db.$transaction(tx => cancelMessagesForLeadInTx(tx, leadId, reason));
 }

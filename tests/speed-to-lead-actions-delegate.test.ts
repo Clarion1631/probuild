@@ -75,6 +75,33 @@ function callsADelegate(node: ts.Node): boolean {
     return found;
 }
 
+function callsFunctionNamed(node: ts.Node, targetName: string): boolean {
+    let found = false;
+    const visit = (n: ts.Node) => {
+        if (found) return;
+        if (ts.isCallExpression(n)) {
+            const callee = n.expression;
+            const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name) ? callee.name.text : "";
+            if (name === targetName) found = true;
+        }
+        n.forEachChild(visit);
+    };
+    node.forEachChild(visit);
+    return found;
+}
+
+/**
+ * Which authorization gate each action must call — a delegate call alone
+ * (the test above) does not prove the gate is still there: deleting
+ * `await speedToLeadApproverSession();` from an action's body still leaves it
+ * calling a `stl*` delegate, so that check alone would pass a build that had
+ * quietly dropped Justin-only authorization. Two actions are deliberately
+ * open to any signed-in user (spec Approval "Who": "Any signed-in user may
+ * press these" for Booked/Called) rather than Justin-only.
+ */
+const SESSION_ONLY_ACTIONS = new Set(["markOutreachLeadBookedAction", "markOutreachLeadCalledAction"]);
+const APPROVER_GATED_ACTIONS = SPEED_TO_LEAD_ACTIONS.filter(name => !SESSION_ONLY_ACTIONS.has(name));
+
 test("every listed name is actually an exported async function in actions.ts", () => {
     for (const name of SPEED_TO_LEAD_ACTIONS) {
         const fn = findExportedFunction(name);
@@ -89,6 +116,22 @@ test("every Speed-to-Lead Server Action delegates: no loops/nested functions, an
         if (!fn?.body) continue;
         assert.equal(containsLoopOrNestedFunction(fn.body), false, `${name} contains a loop or a nested function — business logic belongs in src/lib/speed-to-lead/**, not actions.ts`);
         assert.equal(callsADelegate(fn.body), true, `${name} never calls a stl*-prefixed delegate — it must not implement Speed-to-Lead logic inline`);
+    }
+});
+
+test("every Justin-only Speed-to-Lead action actually calls speedToLeadApproverSession — a delegate call alone does not prove authorization survived", () => {
+    for (const name of APPROVER_GATED_ACTIONS) {
+        const fn = findExportedFunction(name);
+        if (!fn?.body) continue;
+        assert.equal(callsFunctionNamed(fn.body, "speedToLeadApproverSession"), true, `${name} never calls speedToLeadApproverSession() — Justin-only authorization may have been removed`);
+    }
+});
+
+test("the two signed-in-user (not Justin-only) actions still check for a session", () => {
+    for (const name of SESSION_ONLY_ACTIONS) {
+        const fn = findExportedFunction(name);
+        if (!fn?.body) continue;
+        assert.equal(callsFunctionNamed(fn.body, "getServerSession"), true, `${name} never calls getServerSession() — its session check may have been removed`);
     }
 });
 

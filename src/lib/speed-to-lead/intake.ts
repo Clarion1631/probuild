@@ -7,6 +7,7 @@ import type { WebIntakePayload } from "./payload";
 import { FALLBACK_DUE_DELAY_MS } from "./constants";
 import { evaluateTemplateAEligibility, buildTemplateAContent } from "./template";
 import { createOutreachDraftInTx } from "./approval";
+import type { RawHeader } from "./authentication";
 
 type Db = PrismaClient | Prisma.TransactionClient;
 
@@ -185,6 +186,37 @@ export async function recordPendingFallback(
         ON CONFLICT ("externalId") DO NOTHING`;
 }
 
+/** The shape recordPendingFallback actually stores — the raw forwarded email, not a structured form payload. */
+export interface FallbackRawPayload {
+    fromRaw: string;
+    bodyText: string;
+    headers: RawHeader[];
+}
+
+function isFallbackRawPayload(payload: unknown): payload is FallbackRawPayload {
+    return !!payload && typeof payload === "object" && typeof (payload as FallbackRawPayload).bodyText === "string";
+}
+
+const FALLBACK_EMAIL_PATTERN = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+const FALLBACK_PHONE_PATTERN = /\+?\d[\d\s().-]{6,}\d/;
+
+/**
+ * Best-effort contact extraction from the RAW forwarded email
+ * (`recordPendingFallback`'s actual stored shape) — there is no structured
+ * field list here the way there is for a real webhook payload, so this can
+ * only ever feed a REVIEW-quality lead (never REAL; no triage runs on it
+ * either way). A previous version of this function read `payload.name`,
+ * `.email`, `.phone`, `.message` directly, which recordPendingFallback never
+ * wrote, so every promoted fallback lead came out anonymous and empty.
+ */
+function extractFallbackContact(payload: FallbackRawPayload): { name: string; email: string | null; phone: string | null; message: string } {
+    const email = FALLBACK_EMAIL_PATTERN.exec(payload.bodyText)?.[0]?.trim().toLowerCase() ?? null;
+    const phone = FALLBACK_PHONE_PATTERN.exec(payload.bodyText)?.[0]?.trim() ?? null;
+    const firstLine = payload.bodyText.split("\n").map(l => l.trim()).find(Boolean) ?? "";
+    const name = firstLine && firstLine.length <= 200 ? firstLine : "Website inquiry";
+    return { name, email, phone, message: payload.bodyText.trim().slice(0, 10_000) };
+}
+
 /**
  * Cron-invoked (spec Intake: "Each cron run promotes due rows with a
  * conditional update, but only if they are still PENDING_FALLBACK").
@@ -204,18 +236,21 @@ export async function promoteDueFallbacks(now: Date, db: PrismaClient = prisma):
             });
             if (count === 0) return null; // a webhook took it over between the read above and here
             const event = await tx.leadIntakeEvent.findUniqueOrThrow({ where: { id: row.id } });
-            const payload = event.payload as unknown as { name?: string; email?: string; phone?: string; message?: string; projectType?: string; location?: string };
+            const rawPayload = event.payload as unknown;
+            const contact = isFallbackRawPayload(rawPayload)
+                ? extractFallbackContact(rawPayload)
+                : { name: "Website inquiry", email: null, phone: null, message: "" };
             const client = await findOrCreateClientForContact(tx, {
-                name: payload.name ?? "Website inquiry",
-                email: payload.email ?? null,
-                phone: payload.phone ?? null,
+                name: contact.name,
+                email: contact.email,
+                phone: contact.phone,
             });
             const lead = await createLeadRow(tx, {
                 clientId: client.id,
-                name: payload.name?.trim() || "Website inquiry",
-                message: payload.message ?? "",
-                projectType: payload.projectType ?? null,
-                location: payload.location ?? null,
+                name: contact.name,
+                message: contact.message,
+                projectType: null,
+                location: null,
             });
             // Fallback leads are always REVIEW by construction (spec Intake) — there is
             // no per-check reason list the way triageWebLead produces one.
@@ -267,11 +302,12 @@ export async function intakeVoiceEvent(
  * Justin-only and never creates A"). Deliberately does NOT touch Template A
  * eligibility — that is evaluated only at webhook intake time.
  */
-export async function promoteLeadToReal(leadId: string, db: PrismaClient = prisma): Promise<void> {
+export async function promoteLeadToReal(leadId: string, db: Db = prisma): Promise<void> {
     await db.leadIntakeEvent.updateMany({ where: { leadId }, data: { verdict: "REAL" } });
 }
 
-export async function markLeadIntakeJunk(leadId: string, db: PrismaClient = prisma): Promise<void> {
+/** Widened to `Db` (not just `PrismaClient`) so a caller can run this inside its OWN transaction alongside cancelMessagesForLeadInTx — see actions.ts's markLeadJunkAction. */
+export async function markLeadIntakeJunk(leadId: string, db: Db = prisma): Promise<void> {
     await db.leadIntakeEvent.updateMany({ where: { leadId }, data: { verdict: "JUNK" } });
 }
 

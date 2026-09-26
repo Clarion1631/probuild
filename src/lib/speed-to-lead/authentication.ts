@@ -46,7 +46,12 @@ interface AuthResultFields {
     authservId: string | null;
     dkim: string | null;
     dmarc: string | null;
-    domain: string | null;
+    /** Google's own verdict on the ARC chain it received, if it stamped one. */
+    arc: string | null;
+    /** The DKIM signing domain (header.d=) — independent of dmarcDomain. */
+    dkimDomain: string | null;
+    /** The DMARC-aligned From domain (header.from=) — independent of dkimDomain. */
+    dmarcDomain: string | null;
 }
 
 /** Parses one Authentication-Results (or ARC-Authentication-Results) header VALUE. */
@@ -58,8 +63,20 @@ function parseAuthResults(rawValue: string): AuthResultFields {
     const authservId = /^\s*([^\s;]+)/.exec(value)?.[1]?.toLowerCase() ?? null;
     const dkim = /\bdkim=([a-z]+)/i.exec(value)?.[1]?.toLowerCase() ?? null;
     const dmarc = /\bdmarc=([a-z]+)/i.exec(value)?.[1]?.toLowerCase() ?? null;
-    const domain = (/\bheader\.d=([^\s;]+)/i.exec(value)?.[1] ?? /\bheader\.from=([^\s;]+)/i.exec(value)?.[1] ?? null)?.toLowerCase() ?? null;
-    return { authservId, dkim, dmarc, domain };
+    const arc = /\barc=([a-z]+)/i.exec(value)?.[1]?.toLowerCase() ?? null;
+    // header.d= (DKIM signing domain) and header.from= (DMARC-aligned From
+    // domain) are DIFFERENT fields describing different mechanisms — they
+    // must never be conflated into one "whichever is present" value, or a
+    // header carrying one mechanism's domain can satisfy a check meant for
+    // the other.
+    const dkimDomain = (/\bheader\.d=([^\s;]+)/i.exec(value)?.[1] ?? null)?.toLowerCase() ?? null;
+    const dmarcDomain = (/\bheader\.from=([^\s;]+)/i.exec(value)?.[1] ?? null)?.toLowerCase() ?? null;
+    return { authservId, dkim, dmarc, arc, dkimDomain, dmarcDomain };
+}
+
+/** Both DKIM's signing domain and DMARC's aligned From domain must independently match the expected pattern — not "either one." */
+function domainsMatch(parsed: AuthResultFields, expected: string): boolean {
+    return parsed.dkimDomain === expected && parsed.dmarcDomain === expected;
 }
 
 /** The TOPMOST header of a given name — Gmail prepends new hops, so index 0 is the receiving boundary. */
@@ -84,20 +101,28 @@ export function authenticateMessage(headers: RawHeader[], fromAddress: string, e
     if (!pattern) return { trusted: false, reason: "From address is not in the trusted-sender list" };
 
     const directHeader = topmost(headers, "Authentication-Results");
-    if (directHeader) {
-        const parsed = parseAuthResults(directHeader.value);
-        if (parsed.authservId === "mx.google.com" && parsed.dkim === "pass" && parsed.dmarc === "pass" && parsed.domain === pattern.signingDomain) {
-            return { trusted: true, matchedPattern: pattern };
-        }
+    const directParsed = directHeader ? parseAuthResults(directHeader.value) : null;
+    if (directParsed && directParsed.authservId === "mx.google.com" && directParsed.dkim === "pass" && directParsed.dmarc === "pass" && domainsMatch(directParsed, pattern.signingDomain)) {
+        return { trusted: true, matchedPattern: pattern };
     }
 
     // Relayed through connect@: the direct hop's DKIM breaks on forward, so
-    // fall back to the first Google hop recorded in ARC.
-    const arcHeader = topmost(headers, "ARC-Authentication-Results");
-    if (arcHeader) {
-        const parsed = parseAuthResults(arcHeader.value);
-        if (parsed.authservId === "mx.google.com" && parsed.dkim === "pass" && parsed.dmarc === "pass" && parsed.domain === pattern.signingDomain) {
-            return { trusted: true, matchedPattern: pattern };
+    // fall back to the first Google hop recorded in ARC — but an
+    // ARC-Authentication-Results header is ordinary message-header TEXT that
+    // any upstream relay can forge; it is never itself cryptographically
+    // verified here. RFC 8617 §9 makes the RECEIVING server's own chain
+    // validation the trust boundary: Google states that verdict as "arc=" in
+    // its OWN (direct) Authentication-Results header, so the ARC fallback may
+    // only be consulted when Google itself reports "arc=pass" there — never
+    // from the unsigned ARC-Authentication-Results text alone, and never when
+    // the receiving header is silent on arc= or reports anything but pass.
+    if (directParsed?.arc === "pass") {
+        const arcHeader = topmost(headers, "ARC-Authentication-Results");
+        if (arcHeader) {
+            const parsed = parseAuthResults(arcHeader.value);
+            if (parsed.authservId === "mx.google.com" && parsed.dkim === "pass" && parsed.dmarc === "pass" && domainsMatch(parsed, pattern.signingDomain)) {
+                return { trusted: true, matchedPattern: pattern };
+            }
         }
     }
 

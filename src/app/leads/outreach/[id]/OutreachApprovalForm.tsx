@@ -31,10 +31,22 @@ export default function OutreachApprovalForm(props: Props) {
     const [confirmedNotInSent, setConfirmedNotInSent] = useState(false);
     const [pending, startTransition] = useTransition();
 
-    const canApprove = props.status === "PENDING_APPROVAL" || props.status === "DRAFT";
+    // Approve submits props.versionId/props.approvalHash — computed from the
+    // version this page rendered, NOT from whatever is currently typed into
+    // the fields below. Without this check, editing To/Subject/Body and then
+    // clicking Approve would visibly show the edit while actually approving
+    // and sending the ORIGINAL, unedited content — the UI would misrepresent
+    // what actually goes out. An edit must be saved (a fresh generation,
+    // needing its own fresh approval) before it can ever be approved.
+    const hasUnsavedEdits = to !== props.initialTo || subject !== props.initialSubject || body !== props.initialBody;
+    const canApprove = (props.status === "PENDING_APPROVAL" || props.status === "DRAFT") && !hasUnsavedEdits;
     const canSendAgain = props.status === "FAILED" || props.status === "UNKNOWN_DELIVERY";
 
     const onApprove = () => startTransition(async () => {
+        if (hasUnsavedEdits) {
+            toast.error("Save your edits first — Approve sends the last saved version, not what's on screen.");
+            return;
+        }
         try {
             await approveOutreachMessageAction({
                 messageId: props.messageId, versionId: props.versionId, leadId: props.leadId,
@@ -84,6 +96,9 @@ export default function OutreachApprovalForm(props: Props) {
                 <textarea className="hui-input w-full" rows={6} value={body} onChange={e => setBody(e.target.value)} />
             </label>
 
+            {hasUnsavedEdits && (props.status === "PENDING_APPROVAL" || props.status === "DRAFT") && (
+                <p className="text-xs text-amber-600">You have unsaved edits — save the draft before approving, or Approve would send the last saved version instead of what&apos;s shown here.</p>
+            )}
             <div className="flex gap-2 pt-2">
                 <button type="button" className="hui-btn hui-btn-secondary" disabled={pending} onClick={onSaveDraft}>
                     Save draft

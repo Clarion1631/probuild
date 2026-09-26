@@ -28,7 +28,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-const FINGERPRINT_INPUTS = [
+export const FINGERPRINT_INPUTS = [
     "src/lib/speed-to-lead",
     "src/app/api/speed-to-lead",
     "src/app/api/cron/speed-to-lead",
@@ -36,6 +36,27 @@ const FINGERPRINT_INPUTS = [
     "src/app/settings/speed-to-lead",
     "prisma/migrations/20260925120000_speed_to_lead/migration.sql",
 ];
+
+// src/lib/actions.ts is the one place Speed-to-Lead's authorization/CSRF/
+// origin gates live OUTSIDE src/lib/speed-to-lead/** (the Server Action
+// wrappers themselves — see the BEGIN/END markers in that file). Hashing the
+// WHOLE file would lapse LIVE on every unrelated action anyone else adds
+// there; hashing nothing would leave those gates unfingerprinted entirely, so
+// removing an authorization check there would keep LIVE activated. This
+// extracts exactly the marked slice.
+const ACTIONS_FILE = "src/lib/actions.ts";
+const ACTIONS_BEGIN_MARKER = "// BEGIN Speed-to-Lead v1 (PB-leads-001).";
+const ACTIONS_END_MARKER = "// END Speed-to-Lead v1 (PB-leads-001)";
+
+function extractActionsSlice() {
+    const source = readFileSync(path.join(ROOT, ACTIONS_FILE), "utf8");
+    const begin = source.indexOf(ACTIONS_BEGIN_MARKER);
+    const end = source.indexOf(ACTIONS_END_MARKER);
+    if (begin === -1 || end === -1 || end <= begin) {
+        throw new Error(`speed-to-lead-fingerprint: could not find the BEGIN/END Speed-to-Lead markers in ${ACTIONS_FILE} — they were moved or removed`);
+    }
+    return source.slice(begin, end);
+}
 
 function collectFiles(relPath) {
     const abs = path.join(ROOT, relPath);
@@ -66,6 +87,10 @@ export function computeFingerprint() {
         hash.update(readFileSync(path.join(ROOT, file)));
         hash.update("\u0000");
     }
+    hash.update(ACTIONS_FILE);
+    hash.update("\u0000");
+    hash.update(extractActionsSlice());
+    hash.update("\u0000");
     return hash.digest("hex");
 }
 
