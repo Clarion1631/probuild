@@ -342,6 +342,46 @@ test("a push that succeeds but whose 'sent' marker write then fails never causes
     }
 });
 
+test("a push that succeeds but whose 'sent' marker write then fails is STILL never re-sent by a later tick, even once the claim would otherwise look stale (round-4: the marker-write-failure case combined with the stale-claim reclaim)", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    await cleanupDigestSettings(db);
+    const sink = await startSink((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ id: "digest-marker-fail-then-stale" })); });
+    const originalTopic = process.env.SPEED_TO_LEAD_NTFY_TOPIC;
+    const originalBase = process.env.SPEED_TO_LEAD_NTFY_BASE_URL;
+    const originalMode = process.env.SPEED_TO_LEAD_MODE;
+    process.env.SPEED_TO_LEAD_NTFY_TOPIC = "test-topic";
+    process.env.SPEED_TO_LEAD_NTFY_BASE_URL = sink.url;
+    process.env.SPEED_TO_LEAD_MODE = "TEST";
+    const leadId = await makeOwnedLead(db);
+    try {
+        const failingDb = withFailingSentMarkerUpsert(db);
+        const first = await maybeSend0900Digest(NINE_AM_PACIFIC, failingDb);
+        assert.equal(first, false, "the marker write failed, so this call must not report success");
+        assert.equal(sink.hits(), 1, "the push itself must have gone out exactly once");
+
+        // Without the round-4 fix, the claim's updatedAt is never refreshed
+        // on a marker-write failure, so a tick this far past
+        // DIGEST_CLAIM_STALE_MS (5 min) would see an ordinary-looking
+        // "claimed" row past its staleness window, delete it, claim fresh,
+        // and re-send — even though today's digest already went out.
+        const sixMinutesLater = new Date(NINE_AM_PACIFIC.getTime() + 6 * 60 * 1000);
+        const retry = await maybeSend0900Digest(sixMinutesLater, db);
+        assert.equal(retry, false, "a later tick past the staleness window must never reclaim a claim whose push already succeeded");
+        assert.equal(sink.hits(), 1, "still exactly one push for the day — the whole point of this test");
+
+        const sentMarker = await db.automationSetting.findUnique({ where: { key: "speedToLeadDigestLastSentDate" } });
+        assert.equal(sentMarker, null, "the marker still never got written, by construction of this scenario");
+    } finally {
+        process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
+        process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;
+        process.env.SPEED_TO_LEAD_MODE = originalMode;
+        await cleanupLead(db, leadId);
+        await cleanupDigestSettings(db);
+        await sink.close();
+        await db.$disconnect();
+    }
+});
+
 test("promoteLeadToReal flips the verdict to REAL but creates no new alert — a later manual promotion is not a new arrival", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     const leadId = await makeOwnedLead(db);

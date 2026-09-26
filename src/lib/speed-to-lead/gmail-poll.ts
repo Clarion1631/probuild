@@ -44,12 +44,46 @@ interface ResyncState {
     pageToken: string | null;
     /** Message IDs from the page `pageToken` itself already fetched, not yet handled when the last run's budget ran out — resumed before fetching any further page. A page-level `pageToken` alone is not sufficient: it names the NEXT page, so without this a single oversized page re-lists itself and restarts at message #1 every run (finding: page-token granularity alone cannot resume mid-page). */
     pendingMessageIds?: string[];
+    /**
+     * True once `messages.list` pagination itself has reached its terminal
+     * page (an empty `nextPageToken`) for this resync scan. Explicit rather
+     * than inferred from `pageToken: null`, which ALSO means "pagination
+     * never started yet" — a resumed `pendingMessageIds` list whose owning
+     * page was already the last page would otherwise be indistinguishable
+     * from a fresh scan, so draining it fell through into the trailing
+     * `do { ... } while (pageToken)` loop, which unconditionally runs its
+     * body at least once and re-lists from page 1 (round-3 finding:
+     * final-page resync nontermination).
+     */
+    paginationDone?: boolean;
 }
 
 interface IncrementalState {
-    /** historyId to commit once every id in pendingMessageIds has been handled — captured only from a COMPLETED history-list pagination, never a partial one (finding: never checkpoint the mailbox-wide historyId before pagination completes). */
+    /**
+     * historyId to commit once history.list pagination has reached its
+     * true last page (`paginationDone`) AND every id in `pendingMessageIds`
+     * has been handled. Stable across every page of one continuous
+     * history.list series — Gmail returns the mailbox's current historyId
+     * identically on every page of it — so it is captured as soon as ANY
+     * page is fetched, well before pagination itself completes (finding:
+     * never checkpoint the mailbox-wide historyId before pagination
+     * completes — this field alone is not what gates that; `paginationDone`
+     * plus an empty `pendingMessageIds` is).
+     */
     newHistoryId: string;
+    /** Resume point for history.list's OWN pagination — the next page to fetch. Only meaningful while `paginationDone` is false. */
+    pageToken: string | null;
     pendingMessageIds: string[];
+    /**
+     * True once history.list pagination has reached its terminal page (an
+     * empty `nextPageToken`). Explicit for the same reason as
+     * `ResyncState.paginationDone`: a page-capped run must persist BOTH the
+     * page it left off on AND the fact that more pages remain, so a later
+     * run resumes fetching from `pageToken` instead of silently discarding
+     * the partial enumeration and re-listing from page 1 next time
+     * (finding: incremental starvation — "page 11+ unreachable").
+     */
+    paginationDone: boolean;
 }
 
 function headerList(payload: { headers?: { name?: string | null; value?: string | null }[] | null } | undefined): RawHeader[] {
@@ -245,32 +279,124 @@ async function runResyncSlice(db: PrismaClient, gmail: ReturnType<typeof gmailCl
         processed++;
     }
 
+    // Pagination for this resync scan already reached its terminal page on
+    // an earlier run — only the block above (draining pendingMessageIds)
+    // had anything left to do, and it just finished. Without this check the
+    // do-while below would run its body at least once regardless (that is
+    // what `do-while` means) and re-list from page 1 with `pageToken`
+    // undefined, even though there is nothing left to list (round-3 finding:
+    // final-page resync nontermination).
+    if (state.paginationDone) {
+        return { done: true, processed, nextState: state };
+    }
+
     do {
         if (budget.pagesExhausted) {
-            return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: undefined } };
+            return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: undefined, paginationDone: false } };
         }
         budget.spendPage();
         const page = await gmail.users.messages.list({ userId: "me", q: `after:${state.sinceSeconds}`, pageToken }, { timeout: GMAIL_REQUEST_TIMEOUT_MS });
         // Captured immediately: this page's own nextPageToken never changes,
         // so persisting it alongside any of THIS page's own leftover
         // messages below is always correct, regardless of where in the page
-        // the budget runs out.
+        // the budget runs out. By this point `pageToken` already holds the
+        // NEXT page's token (or is falsy if this WAS the last page), so
+        // `!pageToken` correctly means "pagination is now done" even
+        // though `pendingMessageIds` below may still be non-empty.
         pageToken = page.data.nextPageToken ?? undefined;
         const ids = (page.data.messages ?? []).map(m => m.id).filter((id): id is string => !!id);
         let idx = 0;
         while (idx < ids.length) {
             if (budget.exhausted) {
-                return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: ids.slice(idx) } };
+                return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: ids.slice(idx), paginationDone: !pageToken } };
             }
             const completed = await processMessage(db, gmail, ids[idx], budget, now);
             if (!completed) {
-                return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: ids.slice(idx) } };
+                return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: ids.slice(idx), paginationDone: !pageToken } };
             }
             idx++;
             processed++;
         }
     } while (pageToken);
     return { done: true, processed, nextState: state };
+}
+
+/**
+ * Runs a bounded slice of the PRIMARY (non-resync) history.list
+ * enumeration, resumable across runs exactly like `runResyncSlice`, whose
+ * `paginationDone` fix this mirrors (round-4 finding: incremental
+ * starvation — a page-capped run discarded its progress entirely instead of
+ * persisting `pageToken` and its own leftover message ids, so with 11
+ * history pages and 60 leading untrusted messages every run re-listed pages
+ * 1-10 from scratch and page 11 was never reachable).
+ *
+ * Two independent budgets can cut this short: the page cap
+ * (`MAX_HISTORY_PAGES`) while still paginating, and the message-get cap
+ * (`MAX_MESSAGE_GETS`) while processing whatever has been found so far.
+ * Either way, the mailbox-wide cursor (`newHistoryId`) is only ever
+ * COMMITTED by the caller once this returns `done: true` — pagination has
+ * reached its true last page AND every id it ever collected has been
+ * durably processed.
+ */
+async function runIncrementalSlice(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, startHistoryId: string, state: IncrementalState, budget: RunBudget, now: Date): Promise<{ done: boolean; processed: number; nextState: IncrementalState; historyExpired?: boolean }> {
+    let pageToken = state.pageToken ?? undefined;
+    let newHistoryId = state.newHistoryId;
+    let paginationDone = state.paginationDone;
+    // Seeded with the carried-over pendingMessageIds so a newly fetched
+    // page can never re-add an id this run already knows about (finding:
+    // "dedup before full GETs where possible").
+    const seen = new Set(state.pendingMessageIds);
+    const collected: string[] = [];
+
+    while (!paginationDone) {
+        if (budget.pagesExhausted) break; // paginationDone stays false — more pages remain, just not reachable THIS run.
+        budget.spendPage();
+        let page;
+        try {
+            page = await gmail.users.history.list({ userId: "me", startHistoryId, historyTypes: ["messageAdded"], pageToken }, { timeout: GMAIL_REQUEST_TIMEOUT_MS });
+        } catch (error) {
+            // The startHistoryId this enumeration is anchored to has expired
+            // mid-resume — abandon this partial state entirely; the caller
+            // falls back to the H0 resync path exactly as a fresh run would.
+            if (isGoogleApiError(error, 404)) return { done: false, processed: 0, nextState: state, historyExpired: true };
+            throw error;
+        }
+        // The mailbox's CURRENT historyId — the same value on every page of
+        // this one series (Gmail's documented behavior) — so capturing it
+        // here, before pagination is done, is always safe; only COMMITTING
+        // it as the cursor is gated on paginationDone below.
+        if (page.data.historyId) newHistoryId = String(page.data.historyId);
+        for (const h of page.data.history ?? []) {
+            for (const added of h.messagesAdded ?? []) {
+                const id = added.message?.id;
+                if (id && !seen.has(id)) { seen.add(id); collected.push(id); }
+            }
+        }
+        pageToken = page.data.nextPageToken ?? undefined;
+        if (!pageToken) paginationDone = true;
+    }
+
+    const idList = [...state.pendingMessageIds, ...collected];
+    let processed = 0;
+    let idx = 0;
+    while (idx < idList.length) {
+        if (budget.exhausted) break;
+        // A false return means budget ran out mid-message, after this one
+        // was already found trusted but before it could be recorded — it
+        // must count as NOT durably processed (see processMessage's own doc
+        // comment), so it stays in idList (not yet advanced past).
+        const completed = await processMessage(db, gmail, idList[idx], budget, now);
+        if (!completed) break;
+        idx++;
+        processed++;
+    }
+    const remaining = idList.slice(idx);
+
+    return {
+        done: paginationDone && remaining.length === 0,
+        processed,
+        nextState: { newHistoryId, pageToken: pageToken ?? null, pendingMessageIds: remaining, paginationDone },
+    };
 }
 
 /**
@@ -318,32 +444,6 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
             return { ran: true, processed: result.processed, resynced: true };
         }
 
-        // A fixed-budget incremental run from a PRIOR run is still working
-        // through a completed history-list window — resume it before
-        // listing anything new (same reasoning as the resync branch above).
-        const savedIncremental = settingsRow?.leadInboxIncrementalState as unknown as IncrementalState | null;
-        if (savedIncremental?.pendingMessageIds?.length) {
-            const pendingIds = savedIncremental.pendingMessageIds;
-            let idx = 0;
-            let processed = 0;
-            while (idx < pendingIds.length) {
-                if (budget.exhausted) break;
-                const completed = await processMessage(db, gmail, pendingIds[idx], budget, now);
-                if (!completed) break;
-                idx++;
-                processed++;
-            }
-            const remaining = pendingIds.slice(idx);
-            if (remaining.length === 0) {
-                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: savedIncremental.newHistoryId, leadInboxIncrementalState: Prisma.JsonNull } });
-            } else {
-                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxIncrementalState: { newHistoryId: savedIncremental.newHistoryId, pendingMessageIds: remaining } as unknown as object } });
-            }
-            await recordPollHealth(db, startedAt, new Date(), true);
-            await recordSuccessAndClearBackoff(db);
-            return { ran: true, processed };
-        }
-
         if (!settingsRow?.leadInboxHistoryId) {
             // First run: establish a cursor without processing any backlog.
             const profile = await gmail.users.getProfile({ userId: "me" }, { timeout: GMAIL_REQUEST_TIMEOUT_MS });
@@ -357,37 +457,23 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
             return { ran: true, processed: 0 };
         }
 
-        const messageIds = new Set<string>();
-        let pageToken: string | undefined;
-        let newHistoryId: string | null = settingsRow.leadInboxHistoryId;
-        let historyExpired = false;
-        // Set when the page cap cuts pagination short. `page.data.historyId`
-        // is the MAILBOX'S CURRENT historyId (the same value on every page of
-        // one history.list series), not "historyId as of the pages fetched so
-        // far" — committing it as the new cursor after only a partial scan
-        // would permanently skip every history record on the pages never
-        // reached (finding: "permanently skipping unread history").
-        let pagesCappedOut = false;
-        do {
-            if (budget.pagesExhausted) { pagesCappedOut = true; break; }
-            budget.spendPage();
-            let page;
-            try {
-                page = await gmail.users.history.list({ userId: "me", startHistoryId: settingsRow.leadInboxHistoryId, historyTypes: ["messageAdded"], pageToken }, { timeout: GMAIL_REQUEST_TIMEOUT_MS });
-            } catch (error) {
-                if (isGoogleApiError(error, 404)) { historyExpired = true; break; }
-                throw error;
-            }
-            for (const h of page.data.history ?? []) {
-                for (const added of h.messagesAdded ?? []) {
-                    if (added.message?.id) messageIds.add(added.message.id);
-                }
-            }
-            if (page.data.historyId) newHistoryId = String(page.data.historyId);
-            pageToken = page.data.nextPageToken ?? undefined;
-        } while (pageToken);
+        // A fixed-budget incremental run from a PRIOR run may have left
+        // history.list pagination itself unfinished (the page cap), its own
+        // message processing unfinished (the get-budget cap), or both —
+        // resume from EXACTLY where it left off (same reasoning as the
+        // resync branch above; see runIncrementalSlice's own doc comment).
+        // With no saved state, this is just a fresh slice starting at page 1.
+        const savedIncremental = settingsRow.leadInboxIncrementalState as unknown as IncrementalState | null;
+        const incrementalState: IncrementalState = savedIncremental ?? {
+            newHistoryId: settingsRow.leadInboxHistoryId,
+            pageToken: null,
+            pendingMessageIds: [],
+            paginationDone: false,
+        };
 
-        if (historyExpired) {
+        const result = await runIncrementalSlice(db, gmail, settingsRow.leadInboxHistoryId, incrementalState, budget, now);
+
+        if (result.historyExpired) {
             // finding 4a: capture H0 via getProfile BEFORE scanning old mail,
             // so anything that arrives DURING the resync is still covered
             // next run (the cursor becomes H0, not "now").
@@ -407,64 +493,44 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
                     "Speed-to-Lead: inbox poll gap",
                     `The lead inbox could not be resynced past a 72-hour gap. Unscanned window: ${new Date(rawSinceMs).toISOString()} to ${new Date(floorMs).toISOString()}.`,
                 );
-                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: h0, leadInboxCutoffAt: now, leadInboxResyncState: Prisma.JsonNull } });
+                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: h0, leadInboxCutoffAt: now, leadInboxResyncState: Prisma.JsonNull, leadInboxIncrementalState: Prisma.JsonNull } });
                 await recordPollHealth(db, startedAt, new Date(), true);
                 await recordSuccessAndClearBackoff(db);
                 return { ran: true, processed: 0, resynced: true };
             }
 
             const sinceSeconds = Math.max(0, Math.floor(Math.max(rawSinceMs, floorMs) / 1000));
-            const result = await runResyncSlice(db, gmail, { h0, sinceSeconds, pageToken: null }, budget, now);
-            if (result.done) {
-                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: h0, leadInboxResyncState: Prisma.JsonNull } });
+            const resyncResult = await runResyncSlice(db, gmail, { h0, sinceSeconds, pageToken: null }, budget, now);
+            if (resyncResult.done) {
+                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: h0, leadInboxResyncState: Prisma.JsonNull, leadInboxIncrementalState: Prisma.JsonNull } });
             } else {
-                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxResyncState: result.nextState as unknown as object } });
+                // Abandoning the stale incremental state in favor of the
+                // resync now in progress — leaving it behind would let a
+                // later run resume pagination against a pageToken tied to
+                // this now-expired startHistoryId once the resync clears
+                // its own state.
+                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxResyncState: resyncResult.nextState as unknown as object, leadInboxIncrementalState: Prisma.JsonNull } });
             }
             await recordPollHealth(db, startedAt, new Date(), true);
             await recordSuccessAndClearBackoff(db);
-            return { ran: true, processed: result.processed, resynced: true };
+            return { ran: true, processed: resyncResult.processed, resynced: true };
         }
 
-        const idList = Array.from(messageIds);
-        let processed = 0;
-        let idx = 0;
-        while (idx < idList.length) {
-            if (budget.exhausted) break;
-            // A false return means budget ran out mid-message, after this one
-            // was already found trusted but before it could be recorded — it
-            // must count as NOT durably processed, or the cursor gate below
-            // would advance past it (see processMessage's own doc comment).
-            const completed = await processMessage(db, gmail, idList[idx], budget, now);
-            if (!completed) break;
-            idx++;
-            processed++;
-        }
-        const remaining = idList.slice(idx);
-
-        // Cursor advances only after every listed message was durably
-        // processed AND every history page that exists was actually fetched.
-        if (pagesCappedOut) {
-            // Pagination itself was capped short — this window and
-            // newHistoryId are incomplete, so leave everything as-is; the
-            // next run's history.list, starting from the SAME cursor, simply
-            // re-lists the same pages (a message already processed is a
-            // no-op via its externalId's ON CONFLICT DO NOTHING).
-        } else if (remaining.length === 0) {
-            await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: newHistoryId, leadInboxIncrementalState: Prisma.JsonNull } });
+        // Cursor advances only once runIncrementalSlice reports every
+        // history page fetched AND every message it found durably processed.
+        if (result.done) {
+            await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: result.nextState.newHistoryId, leadInboxIncrementalState: Prisma.JsonNull } });
         } else {
-            // The full history window is known (every page was fetched) but
-            // the message-get budget ran out partway through processing it.
-            // Persist exactly which messages are still unhandled so the NEXT
-            // run resumes past them instead of re-listing this SAME window
-            // and re-spending its whole budget on the same leading untrusted
-            // messages every time — with no persisted position, a fixed
-            // per-run budget can otherwise never reach a trusted message
-            // that sorts after enough untrusted ones (finding: starvation).
-            await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxIncrementalState: { newHistoryId, pendingMessageIds: remaining } as unknown as object } });
+            // Persist exactly where pagination and/or message processing
+            // left off so the NEXT run resumes past it — fetching the next
+            // page via the saved pageToken instead of re-listing from page
+            // 1, and re-fetching neither a message nor a page already
+            // handled (finding: incremental starvation).
+            await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxIncrementalState: result.nextState as unknown as object } });
         }
         await recordPollHealth(db, startedAt, new Date(), true);
         await recordSuccessAndClearBackoff(db);
-        return { ran: true, processed };
+        return { ran: true, processed: result.processed };
     } catch (error) {
         console.error("[speed-to-lead] inbox poll failed", safeErrorCategory(error));
         await recordFailureAndBackoff(db, startedAt, now, error);

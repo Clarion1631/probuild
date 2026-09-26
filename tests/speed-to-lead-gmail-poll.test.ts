@@ -316,6 +316,117 @@ test("repeated poll runs make forward progress through a persisted budget-exhaus
     }
 });
 
+test("11 history pages plus 60 leading untrusted messages: pagination resumes via a persisted page token across runs, page 11's trusted message is eventually processed, and the cursor advances only once enumeration is fully complete (round-4: incremental starvation)", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "1000", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
+        getCallCount = 0;
+        let historyListCalls = 0;
+        // Pages 1-10 hold 4 leading untrusted messages each (40 total, well
+        // under MAX_MESSAGE_GETS on their own) — page 11 alone would be
+        // unreachable under the OLD code's page cap (MAX_HISTORY_PAGES=10)
+        // with no persisted page token to resume from. Page 11 then adds 20
+        // more untrusted messages (60 leading untrusted overall) plus the
+        // one trusted message, last.
+        script = {
+            getProfile: () => ({ historyId: "999" }),
+            historyList: (args: { pageToken?: string }) => {
+                historyListCalls++;
+                const pageNum = args.pageToken ? Number(args.pageToken.replace("page-", "")) : 1;
+                const ids = pageNum <= 10
+                    ? Array.from({ length: 4 }, (_, i) => `untrusted-p${pageNum}-${i}`)
+                    : [...Array.from({ length: 20 }, (_, i) => `untrusted-p11-${i}`), "trusted-p11"];
+                return {
+                    history: [{ messagesAdded: ids.map(id => ({ message: { id } })) }],
+                    historyId: "1100",
+                    nextPageToken: pageNum < 11 ? `page-${pageNum + 1}` : undefined,
+                };
+            },
+            messagesGet: (id, format) => {
+                if (id === "trusted-p11") {
+                    return format === "metadata"
+                        ? WEBSITE_HEADERS_METADATA
+                        : { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
+                }
+                return UNTRUSTED_HEADERS_METADATA;
+            },
+        };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+
+        let settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+        let runs = 0;
+        while (settings?.leadInboxHistoryId !== "1100" && runs < 10) {
+            await pollLeadInbox(db, new Date());
+            settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+            runs++;
+            if (runs === 1) {
+                assert.equal(settings?.leadInboxHistoryId, "1000", "the cursor must not advance while page 11 is still unreached");
+            }
+        }
+        assert.ok(runs > 1 && runs < 10, `the scenario must span more than one run and actually terminate, got ${runs}`);
+        assert.equal(settings?.leadInboxHistoryId, "1100", "the cursor advances only once enumeration is fully complete");
+        assert.equal(settings?.leadInboxIncrementalState, null, "no leftover incremental state once done");
+        assert.equal(historyListCalls, 11, "each of the 11 history pages must be fetched exactly once across every run combined — no page 1-10 refetch loop");
+        assert.equal(getCallCount, 62, "60 untrusted x 1 get + 1 trusted x 2 gets = 62, no matter how many runs — proves no message is ever re-fetched");
+
+        const row = await db.leadIntakeEvent.findUnique({ where: { externalId: "voice:trusted-p11" } });
+        assert.ok(row, "the trusted message on page 11, behind 60 leading untrusted ones, must eventually be recorded");
+        assert.equal(row?.source, "WEB_EMAIL_FALLBACK");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("a resync whose last page's own leftover messages exceed one run's budget terminates in a bounded number of runs, instead of re-listing from page 1 forever (round-4: pagination-done vs not-started ambiguity)", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        const now = new Date();
+        await db.companySettings.create({
+            data: { id: "singleton", leadInboxHistoryId: "stale-cursor-2", leadInboxCutoffAt: new Date(now.getTime() - 60 * 60 * 1000), leadInboxLastPollStartedAt: new Date(now.getTime() - 30 * 60 * 1000) },
+        });
+        getCallCount = 0;
+        let messagesListCallsLocal = 0;
+        // Page 1 (10 messages) plus page 2 — the LAST page (no
+        // nextPageToken) — with 45 more: 55 total, more than one run's
+        // MAX_MESSAGE_GETS (50), so page 2's own trailing messages are left
+        // pending with `pageToken: null` — the exact same representation a
+        // FRESH, not-yet-started resync also uses. Without an explicit
+        // "pagination is actually done" flag, draining that leftover on the
+        // next run would fall through into re-listing page 1 forever.
+        const page1Ids = Array.from({ length: 10 }, (_, i) => `resync-a-${i}`);
+        const page2Ids = Array.from({ length: 45 }, (_, i) => `resync-b-${i}`);
+        script = {
+            getProfile: () => ({ historyId: "h0-after-resync-2" }),
+            historyList: () => ({ throw404: true }),
+            messagesList: (args: { pageToken?: string }) => {
+                messagesListCallsLocal++;
+                if (!args.pageToken) return { messages: page1Ids.map(id => ({ id })), nextPageToken: "resync-page-2" };
+                if (args.pageToken === "resync-page-2") return { messages: page2Ids.map(id => ({ id })) };
+                throw new Error(`unexpected pageToken ${args.pageToken}`);
+            },
+            messagesGet: () => UNTRUSTED_HEADERS_METADATA,
+        };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+
+        let settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+        let runs = 0;
+        while (settings?.leadInboxHistoryId !== "h0-after-resync-2" && runs < 5) {
+            await pollLeadInbox(db, now);
+            settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+            runs++;
+        }
+        assert.ok(runs > 1 && runs <= 3, `must terminate in a small, bounded number of runs, got ${runs}`);
+        assert.equal(settings?.leadInboxHistoryId, "h0-after-resync-2", "the resync must actually complete and commit its H0 cursor");
+        assert.equal(settings?.leadInboxResyncState, null, "no leftover resync state once done");
+        assert.equal(messagesListCallsLocal, 2, "each of the resync's 2 pages must be listed exactly once across every run combined — no re-list from page 1");
+        assert.equal(getCallCount, 55, "all 55 messages (10 + 45) must be fetched exactly once total, no matter how many runs it took");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
 test("a gap over 72h resets the cutoff to now WITHOUT attempting a resync scan", { skip }, async () => {
     const db = await freshDb();
     try {
