@@ -16693,6 +16693,165 @@ export async function setMissingReceiptOwner(issueId: string, owner: string, exp
     return { success: true };
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Speed-to-Lead v1 (PB-leads-001). Thin wrappers only — every one of these
+// delegates its real work to src/lib/speed-to-lead/**
+// (tests/speed-to-lead-actions-delegate.test.ts statically checks that shape).
+// See docs/plans/SPEED-TO-LEAD-SPEC.md "Approval (Justin only, email only)".
+// ─────────────────────────────────────────────────────────────────────────
+import { headers as speedToLeadHeaders } from "next/headers";
+import { isApprover } from "./speed-to-lead/constants";
+import { isSameOriginRequest, verifyOutreachCsrfToken } from "./speed-to-lead/csrf";
+import { submitForApproval as stlSubmitForApproval, approveOutreachVersion as stlApproveOutreachVersion, createNewGeneration as stlCreateNewGeneration } from "./speed-to-lead/approval";
+import { dispatchOutreach as stlDispatchOutreach } from "./speed-to-lead/dispatch";
+import { markLeadBooked as stlMarkLeadBooked, markLeadCalled as stlMarkLeadCalled } from "./speed-to-lead/followups";
+import { markEndpointJunk as stlMarkEndpointJunk, clearEndpointSuppression as stlClearEndpointSuppression } from "./speed-to-lead/contact-endpoint";
+import { promoteLeadToReal as stlPromoteLeadToReal, markLeadIntakeJunk as stlMarkLeadIntakeJunk } from "./speed-to-lead/intake";
+import { cancelMessagesForLead as stlCancelMessagesForLead } from "./speed-to-lead/cancellation";
+import { createOutreachTemplate as stlCreateOutreachTemplate, approveTemplate as stlApproveTemplate, revokeTemplate as stlRevokeTemplate } from "./speed-to-lead/template";
+import { setSpeedToLeadPaused as stlSetSpeedToLeadPaused } from "./speed-to-lead/settings";
+import { activateLive as stlActivateLive } from "./speed-to-lead/fingerprint";
+import { runReadinessCheck as stlRunReadinessCheck } from "./speed-to-lead/readiness";
+
+async function speedToLeadApproverSession(): Promise<string> {
+    const session = await getServerSession(authOptions);
+    const email = session?.user?.email ?? null;
+    if (!isApprover(email)) throw new Error("Unauthorized");
+    return email as string;
+}
+
+async function assertSpeedToLeadOrigin(): Promise<void> {
+    const h = await speedToLeadHeaders();
+    if (!isSameOriginRequest(h.get("origin"))) throw new Error("Unauthorized: origin mismatch");
+}
+
+export async function approveOutreachMessageAction(input: { messageId: string; versionId: string; leadId: string; approvalHash: string; csrfToken: string }) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    if (!verifyOutreachCsrfToken(input.csrfToken, approverEmail, input.messageId, input.versionId)) throw new Error("Unauthorized: bad CSRF token");
+    await stlSubmitForApproval(input.messageId, input.versionId);
+    const result = await stlApproveOutreachVersion({ messageId: input.messageId, versionId: input.versionId, approvalHash: input.approvalHash, approvedBy: approverEmail, leadId: input.leadId });
+    await stlDispatchOutreach(input.messageId);
+    revalidatePath(`/leads/outreach/${input.messageId}`);
+    return result;
+}
+
+export async function saveOutreachDraftAction(input: { messageId: string; to: string; subject: string; body: string; footer: string; csrfToken: string }) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    if (!verifyOutreachCsrfToken(input.csrfToken, approverEmail, input.messageId, "draft")) throw new Error("Unauthorized: bad CSRF token");
+    const result = await stlCreateNewGeneration(input.messageId, {
+        to: input.to, subject: input.subject, body: input.body, footer: input.footer,
+        threading: { inReplyTo: null, references: null, threadId: null },
+    });
+    revalidatePath(`/leads/outreach/${input.messageId}`);
+    return result;
+}
+
+export async function sendAgainOutreachMessageAction(input: { messageId: string; to: string; subject: string; body: string; footer: string; confirmedNotInSent: boolean; csrfToken: string }) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    if (!verifyOutreachCsrfToken(input.csrfToken, approverEmail, input.messageId, "send-again")) throw new Error("Unauthorized: bad CSRF token");
+    const message = await prisma.outreachMessage.findUniqueOrThrow({ where: { id: input.messageId } });
+    if (message.status !== "FAILED" && message.status !== "UNKNOWN_DELIVERY") {
+        throw new Error("send-again is only available from FAILED or UNKNOWN_DELIVERY");
+    }
+    if (message.status === "UNKNOWN_DELIVERY" && !input.confirmedNotInSent) {
+        throw new Error("send-again from UNKNOWN_DELIVERY requires confirming the message is not in Sent");
+    }
+    const result = await stlCreateNewGeneration(input.messageId, {
+        to: input.to, subject: input.subject, body: input.body, footer: input.footer,
+        threading: { inReplyTo: null, references: null, threadId: null },
+    });
+    revalidatePath(`/leads/outreach/${input.messageId}`);
+    return result;
+}
+
+export async function markOutreachLeadBookedAction(leadId: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Unauthorized");
+    await stlMarkLeadBooked(leadId);
+    revalidatePath(`/leads/${leadId}`);
+}
+
+export async function markOutreachLeadCalledAction(leadId: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Unauthorized");
+    await stlMarkLeadCalled(leadId);
+    revalidatePath(`/leads/${leadId}`);
+}
+
+export async function promoteLeadToRealAction(leadId: string) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    await stlPromoteLeadToReal(leadId);
+    revalidatePath(`/leads/${leadId}`);
+}
+
+export async function markLeadJunkAction(leadId: string) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const lead = await prisma.lead.findUnique({ where: { id: leadId }, select: { client: { select: { email: true } } } });
+    await stlMarkLeadIntakeJunk(leadId);
+    if (lead?.client?.email) await stlMarkEndpointJunk(lead.client.email);
+    await stlCancelMessagesForLead(leadId, "junk");
+    revalidatePath(`/leads/${leadId}`);
+}
+
+export async function clearOutreachSuppressionAction(input: { endpoint: string; reason: string }) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    await stlClearEndpointSuppression(input.endpoint, { clearedBy: approverEmail, reason: input.reason });
+    revalidatePath("/settings/speed-to-lead");
+}
+
+export async function saveOutreachTemplateAction(input: { subject: string; body: string; footer: string; fixedPhone: string; bookingBaseUrl: string; fromAddress: string; testOnly: boolean }) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const created = await stlCreateOutreachTemplate(input, prisma);
+    revalidatePath("/settings/speed-to-lead");
+    return created;
+}
+
+export async function approveOutreachTemplateAction(templateId: string) {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const updated = await stlApproveTemplate(templateId, approverEmail, prisma);
+    revalidatePath("/settings/speed-to-lead");
+    return updated;
+}
+
+export async function revokeOutreachTemplateAction(templateId: string) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const updated = await stlRevokeTemplate(templateId, prisma);
+    revalidatePath("/settings/speed-to-lead");
+    return updated;
+}
+
+export async function setSpeedToLeadPausedAction(paused: boolean) {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    await stlSetSpeedToLeadPaused(paused);
+    revalidatePath("/settings/speed-to-lead");
+}
+
+export async function runSpeedToLeadReadinessAction() {
+    await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const result = await stlRunReadinessCheck({ deploySha: process.env.VERCEL_GIT_COMMIT_SHA ?? null });
+    revalidatePath("/settings/speed-to-lead");
+    return result;
+}
+
+export async function activateSpeedToLeadLiveAction() {
+    const approverEmail = await speedToLeadApproverSession();
+    await assertSpeedToLeadOrigin();
+    const result = await stlActivateLive({ activatedBy: approverEmail });
+    revalidatePath("/settings/speed-to-lead");
+    return result;
+}
+
 // ============ Payroll (Phase 5 — docs/plans/PHASE-5-GUSTO-AND-MOBILE-RELEASE-SPEC.md) ============
 
 /**
@@ -17692,3 +17851,4 @@ export async function unlockPayrollPeriod(
     revalidatePath("/manager/time-entries");
     return { success: true as const };
 }
+

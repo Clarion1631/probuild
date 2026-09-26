@@ -3,6 +3,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { oauth2Client, saveToken } from "@/lib/gmail-client";
+import { newLeadInboxOAuthClient, leadInboxAuthUrl } from "@/lib/speed-to-lead/gmail-inbox-client";
 
 // Google OAuth capture for the company integrations (Gmail + Drive scopes).
 // Visit /api/gmail/callback signed in as an ADMIN: no code -> redirect to the
@@ -27,10 +28,50 @@ export async function GET(req: NextRequest) {
     }
 
     const code = req.nextUrl.searchParams.get("code");
+    // Speed-to-Lead (PB-leads-001): ?purpose=lead-inbox connects gtrsupport@
+    // as a SECOND, independent Gmail identity — see
+    // src/lib/speed-to-lead/gmail-inbox-client.ts for why it must not share
+    // this route's default (Drive) client's mutable credentials.
+    const state = req.nextUrl.searchParams.get("state");
+    const isLeadInbox = req.nextUrl.searchParams.get("purpose") === "lead-inbox" || state === "purpose=lead-inbox";
 
     if (!code) {
+        if (isLeadInbox) return NextResponse.redirect(leadInboxAuthUrl());
         const { getAuthUrl } = await import("@/lib/gmail-client");
         return NextResponse.redirect(getAuthUrl());
+    }
+
+    if (isLeadInbox) {
+        try {
+            const leadInboxClient = newLeadInboxOAuthClient();
+            const { tokens } = await leadInboxClient.getToken(code);
+            let connectedEmail: string | null = null;
+            if (tokens.refresh_token) {
+                try {
+                    const { google } = await import("googleapis");
+                    leadInboxClient.setCredentials(tokens);
+                    const profile = await google.gmail({ version: "v1", auth: leadInboxClient }).users.getProfile({ userId: "me" });
+                    connectedEmail = profile.data.emailAddress ?? null;
+                } catch {
+                    connectedEmail = null;
+                }
+                await prisma.companySettings.upsert({
+                    where: { id: "singleton" },
+                    create: { id: "singleton", leadInboxRefreshToken: tokens.refresh_token, leadInboxEmail: connectedEmail },
+                    update: { leadInboxRefreshToken: tokens.refresh_token, leadInboxEmail: connectedEmail },
+                });
+            }
+            const note = tokens.refresh_token
+                ? `Lead inbox${connectedEmail ? ` <b>${connectedEmail}</b>` : ""} is connected. Speed-to-Lead can now poll it.`
+                : "Google replied without a refresh token (already connected once?). Revoke ProBuild at myaccount.google.com/permissions and connect again.";
+            return new NextResponse(
+                `<html><body style="font-family:system-ui;padding:40px;max-width:520px"><h2>Lead inbox connected</h2><p>${note}</p><p>You can close this tab.</p></body></html>`,
+                { headers: { "Content-Type": "text/html" } },
+            );
+        } catch (error) {
+            console.error("Error exchanging lead-inbox auth code:", error);
+            return NextResponse.json({ error: "Failed to exchange auth token" }, { status: 500 });
+        }
     }
 
     try {
