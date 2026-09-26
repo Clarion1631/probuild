@@ -8,6 +8,7 @@ import { recordPendingFallback, intakeVoiceEvent } from "./intake";
 import { sendPlainNtfy } from "./alerts";
 import { GMAIL_REQUEST_TIMEOUT_MS } from "./constants";
 import { safeErrorCategory } from "./error-category";
+import { dbNow } from "./db-clock";
 
 /**
  * Read-only lead-inbox scan (v1a: gmail.readonly only, no send scope). The
@@ -71,17 +72,34 @@ export const SCAN_OVERLAP_MS = 72 * 60 * 60 * 1000;
 /** A watermark this old means polls have kept failing: push a health alert (never capped). */
 export const STALE_SCAN_ALERT_MS = 6 * 60 * 60 * 1000;
 /**
- * KNOWN RISK, not fixed here (round-6 finding 3's clock-skew case, already
- * documented as such): a wall-clock anomaly that briefly makes `now` read
- * hours ahead would commit a future watermark the instant one scan
- * completes, silently excluding mail once the clock corrects. A correct fix
- * needs a time source independent of the app clock (e.g. the DB server's own
- * `now()`) to tell that apart from a legitimate long outage, where the
- * watermark must jump forward by exactly as much, in one poll, on purpose
- * (see the "72-hour-gap" test below) — bounding the advance instead would
- * silently break that catch-up. Left as a documented risk pending that
- * design decision rather than guessed at here.
+ * FIXED (round-9; was round-6 finding 3's clock-skew case, previously left
+ * open here): every scan-start / watermark timestamp is now the DATABASE
+ * server's own `now()` (`dbNow`, from "./db-clock"), clamped so it can never
+ * run ahead of the caller's own clock either (see `runPoll`) — never the
+ * app's bare `Date`. A wall-clock anomaly that briefly makes the app's `now`
+ * read hours ahead can no longer commit a future watermark, because the
+ * value written is never sourced from that clock. A legitimate long outage
+ * still jumps the watermark forward by exactly as much, in one poll, on
+ * purpose (see the "72-hour-gap" test below) — that catch-up is unaffected,
+ * since the database's own clock keeps advancing normally through a real
+ * outage.
+ *
+ * Belt-and-suspenders: `runReconciliationSweep` (below) re-scans the
+ * trusted-sender query from `max(cutoff, dbNow - RECONCILE_WINDOW_MS)` once
+ * a day (and immediately on the first poll after any gap over a day —
+ * `isReconcileDue`), REGARDLESS of the watermark. If the watermark is ever
+ * wrong for some other reason — a hand edit, a migration, a bug not yet
+ * found — the sweep still finds and ledgers anything the incremental scan
+ * missed within a day, and pushes one health alert reporting how many
+ * messages it recovered.
  */
+export const RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/** How far back the reconciliation sweep looks, regardless of the watermark. */
+export const RECONCILE_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+/** Durable "last completed a full sweep" marker — governs `isReconcileDue`, independent of the scan watermark it exists to double-check. */
+export const RECONCILE_LAST_RECONCILED_KEY = "speedToLeadReconcileLastCompletedAt";
+/** Durable resume state (JSON) for a sweep that has not yet finished a full pass — its fixed window floor, Gmail page token, and running recovered count. */
+export const RECONCILE_PROGRESS_KEY = "speedToLeadReconcileProgress";
 /** Gmail's own maximum per list page. */
 const LIST_PAGE_SIZE = 500;
 /** A runaway-loop guard, not a working limit: 20 pages x 500 is ~10,000 lead-sender messages in one window. Hitting it leaves the scan incomplete, so it can delay (with the stale alert) but never drop. */
@@ -390,6 +408,130 @@ async function resolvePendingMessages(db: PrismaClient, gmail: ReturnType<typeof
     return { erroredCount, firstError };
 }
 
+interface ReconcileProgress {
+    /** Fixed for the lifetime of one sweep pass, even if it spans several polls, so a resumed pass never shifts its own floor mid-way. */
+    windowFromMs: number;
+    /** Gmail's own opaque page token to resume listing from; unset once every page has been listed. */
+    pageToken?: string;
+    /** Newly-ledgered ids found so far this pass — messages the incremental scan (or an earlier sweep) had no row for at all. */
+    recoveredCount: number;
+    /** Every page has been listed; only the health push (if any is owed) is still outstanding. */
+    scanComplete?: boolean;
+}
+
+async function loadReconcileProgress(db: PrismaClient): Promise<ReconcileProgress | null> {
+    const row = await db.automationSetting.findUnique({ where: { key: RECONCILE_PROGRESS_KEY } });
+    if (!row) return null;
+    try {
+        return JSON.parse(row.value) as ReconcileProgress;
+    } catch {
+        return null;
+    }
+}
+
+async function saveReconcileProgress(db: PrismaClient, progress: ReconcileProgress): Promise<void> {
+    const value = JSON.stringify(progress);
+    await db.automationSetting.upsert({ where: { key: RECONCILE_PROGRESS_KEY }, create: { key: RECONCILE_PROGRESS_KEY, value }, update: { value } });
+}
+
+/**
+ * Is a reconciliation sweep due? An interrupted pass (progress already on
+ * file) always continues. Otherwise it is due once a day, tracked by
+ * `RECONCILE_LAST_RECONCILED_KEY` — and an ABSENT marker (never run, or a
+ * poll gap wiped out the memory of when) is due immediately, which is also
+ * what makes this cover "the first poll after any gap over a day" with no
+ * separate check: a gap that long ages the marker past the interval too.
+ */
+async function isReconcileDue(db: PrismaClient, dbClockNow: Date): Promise<boolean> {
+    if (await loadReconcileProgress(db)) return true;
+    const last = await db.automationSetting.findUnique({ where: { key: RECONCILE_LAST_RECONCILED_KEY } });
+    if (!last) return true;
+    const lastMs = Date.parse(last.value);
+    return !Number.isFinite(lastMs) || dbClockNow.getTime() - lastMs >= RECONCILE_INTERVAL_MS;
+}
+
+/**
+ * Lists the trusted-sender query page by page — the same list-and-ledger
+ * half of `scanWindow`'s own loop — but stops there: it never calls `get`.
+ * Anything it finds unseen becomes a normal PENDING row, and the SAME
+ * `resolvePendingMessages` that already retries every PENDING row every
+ * poll, independent of any window (round-7 finding 1), is what actually
+ * fetches and resolves it — the sweep does not need its own copy of that
+ * machinery. Bounded by list pages and wall time, like `scanWindow`; unlike
+ * it, `pageToken` is a real resume point (round-9): running out of budget
+ * mid-pass returns the very next page to fetch, so a later poll continues
+ * instead of re-listing pages already ledgered.
+ */
+async function sweepListPages(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, q: string, budget: RunBudget, startPageToken: string | undefined): Promise<{ complete: boolean; insertedCount: number; nextPageToken?: string }> {
+    let insertedCount = 0;
+    let pages = 0;
+    let pageToken = startPageToken;
+    do {
+        if (pages >= MAX_LIST_PAGES || !budget.timeLeft) return { complete: false, insertedCount, nextPageToken: pageToken };
+        pages += 1;
+        const page = await gmail.users.messages.list(
+            { userId: "me", q, includeSpamTrash: true, maxResults: LIST_PAGE_SIZE, pageToken },
+            { timeout: GMAIL_REQUEST_TIMEOUT_MS },
+        );
+        const ids = [...new Set((page.data.messages ?? []).map(m => m.id).filter((id): id is string => !!id))];
+        if (ids.length) {
+            const inserted = await db.leadInboxMessage.createMany({ data: ids.map(id => ({ gmailMessageId: id, outcome: "PENDING" })), skipDuplicates: true });
+            insertedCount += inserted.count;
+        }
+        pageToken = page.data.nextPageToken ?? undefined;
+    } while (pageToken);
+    return { complete: true, insertedCount, nextPageToken: undefined };
+}
+
+/**
+ * The daily reconciliation sweep (V1A addendum, round-9): re-scans the
+ * trusted-sender query from `max(cutoff, dbNow - RECONCILE_WINDOW_MS)`
+ * regardless of the watermark, so a wrong watermark — from a clock anomaly
+ * this fix's other half (`dbNow`) should already prevent, or from anything
+ * else — cannot leave a message unseen for longer than a day. Idempotent via
+ * the same `LeadInboxMessage` ledger the incremental scan uses:
+ * `sweepListPages` never re-ledgers or re-fetches an id that already has a
+ * row, so a sweep over ids the incremental scan (or an earlier sweep)
+ * already ledgered costs nothing. Resumable across polls through its own
+ * durable state (`RECONCILE_PROGRESS_KEY`) — a fixed window floor and a real
+ * page-token resume point, so a pass that outruns one poll's budget
+ * continues on the next rather than starting over. The health push (naming
+ * how many were recovered) is sent, and retried on a failed send exactly
+ * like the other health alerts in this file, only once the whole pass has
+ * finished — before that, "recovered" is not yet a final count.
+ */
+async function runReconciliationSweep(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, cutoffAt: Date, dbClockNow: Date, budget: RunBudget): Promise<void> {
+    let progress = await loadReconcileProgress(db) ?? { windowFromMs: Math.max(cutoffAt.getTime(), dbClockNow.getTime() - RECONCILE_WINDOW_MS), recoveredCount: 0 };
+
+    if (!progress.scanComplete) {
+        const q = `${trustedSenderQuery()} after:${Math.floor(progress.windowFromMs / 1000) - 1}`;
+        const page = await sweepListPages(db, gmail, q, budget, progress.pageToken);
+        progress = { ...progress, recoveredCount: progress.recoveredCount + page.insertedCount, pageToken: page.nextPageToken, scanComplete: page.complete };
+        if (!page.complete) {
+            await saveReconcileProgress(db, progress);
+            return;
+        }
+    }
+
+    if (progress.recoveredCount > 0) {
+        const delivered = await sendPlainNtfy(
+            "Speed-to-Lead: reconciliation recovered messages",
+            `The lead-inbox watermark was wrong: the daily reconciliation sweep found ${progress.recoveredCount} lead-sender message(s), since ${new Date(progress.windowFromMs).toISOString()}, that the normal scan had not seen. They now have ledger rows and are going through the normal intake path.`,
+        );
+        if (!delivered) {
+            await saveReconcileProgress(db, progress);
+            return;
+        }
+    }
+
+    await db.automationSetting.deleteMany({ where: { key: RECONCILE_PROGRESS_KEY } });
+    await db.automationSetting.upsert({
+        where: { key: RECONCILE_LAST_RECONCILED_KEY },
+        create: { key: RECONCILE_LAST_RECONCILED_KEY, value: dbClockNow.toISOString() },
+        update: { value: dbClockNow.toISOString() },
+    });
+}
+
 /**
  * Health alerts go straight to ntfy with no flood cap. Each kind is sent once
  * per outage (its marker row, cleared on recovery), and the marker is written
@@ -617,8 +759,18 @@ async function reportUnacceptedMessages(db: PrismaClient, now: Date): Promise<vo
 }
 
 async function runPoll(db: PrismaClient, now: Date): Promise<PollResult> {
-    const startedAt = now;
+    let startedAt = now;
     try {
+        const dbClockNow = await dbNow(db);
+        // Never sourced from the app clock (round-9): a wall-clock anomaly in
+        // THIS process can make `now` read ahead of reality, but this clamp
+        // can never itself read BEHIND the database's own clock, so taking
+        // the lesser of the two is enough on its own to stop this poll from
+        // ever committing a future watermark — see the module docstring's
+        // "FIXED" note above and `runReconciliationSweep`'s independent
+        // second layer.
+        startedAt = now.getTime() > dbClockNow.getTime() ? dbClockNow : now;
+
         const settings = await db.companySettings.findUnique({
             where: { id: SETTINGS_ID },
             select: { leadInboxCutoffAt: true, leadInboxScanWatermarkAt: true, leadInboxNextPollAt: true },
@@ -650,15 +802,23 @@ async function runPoll(db: PrismaClient, now: Date): Promise<PollResult> {
         // for the first successful poll to set this left the gap between
         // connecting and that poll permanently unscanned, with no alert).
         // This is now just a fallback for a credential connected some other
-        // way: the floor is this poll's own time, so mail older than THIS
-        // poll's first run is still never imported.
-        const cutoffAt = settings?.leadInboxCutoffAt ?? now;
+        // way: the floor is this poll's own (database-clock) time, so mail
+        // older than THIS poll's first run is still never imported.
+        const cutoffAt = settings?.leadInboxCutoffAt ?? startedAt;
         const watermarkAt = settings?.leadInboxScanWatermarkAt ?? cutoffAt;
         if (!settings?.leadInboxCutoffAt || !settings?.leadInboxScanWatermarkAt) {
             await db.companySettings.upsert({
                 where: { id: SETTINGS_ID },
                 create: { id: SETTINGS_ID, leadInboxCutoffAt: cutoffAt, leadInboxScanWatermarkAt: watermarkAt },
                 update: { leadInboxCutoffAt: cutoffAt, leadInboxScanWatermarkAt: watermarkAt },
+            });
+            // A brand-new connection has no backlog to reconcile — pin the
+            // marker to now so the first real sweep waits its normal
+            // interval instead of running (pointlessly) on this same poll.
+            await db.automationSetting.upsert({
+                where: { key: RECONCILE_LAST_RECONCILED_KEY },
+                create: { key: RECONCILE_LAST_RECONCILED_KEY, value: dbClockNow.toISOString() },
+                update: { value: dbClockNow.toISOString() },
             });
         }
 
@@ -675,6 +835,13 @@ async function runPoll(db: PrismaClient, now: Date): Promise<PollResult> {
         // or now older than the window now that the watermark can advance
         // past a PENDING id).
         const pendingRetry = await resolvePendingMessages(db, gmail, budget, attempted, now);
+        // The reconciliation sweep (round-9) runs next, when due — it only
+        // lists and ledgers (never `get`s), so it cannot starve the
+        // incremental scan below of its own get-budget; resolvePendingMessages
+        // is what will later fetch anything it finds.
+        if (await isReconcileDue(db, dbClockNow)) {
+            await runReconciliationSweep(db, gmail, cutoffAt, dbClockNow, budget);
+        }
         const scan = await scanWindow(db, gmail, afterMs, budget, attempted, now);
         const erroredCount = scan.erroredCount + pendingRetry.erroredCount;
         const firstError = scan.firstError ?? pendingRetry.firstError;

@@ -27,6 +27,7 @@ const databaseUrl = process.env.SPEED_TO_LEAD_TEST_URL;
 const skip = !databaseUrl && "set SPEED_TO_LEAD_TEST_URL to a disposable PostgreSQL URL";
 
 const GMAIL_INBOX_CLIENT_SPECIFIER = "./gmail-inbox-client";
+const DB_CLOCK_SPECIFIER = "./db-clock";
 const RUN = `pt${Date.now().toString(36)}`;
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
@@ -113,6 +114,16 @@ let pushes: { title: string; body: string }[] = [];
 let ntfyUp = true;
 const originalFetch = globalThis.fetch;
 let originalRequire: typeof Module.prototype.require;
+/**
+ * The fake "database clock" `dbNow` returns: the CURRENT poll's own `now`,
+ * by default, so every existing timing assertion in this file (all written
+ * against the app clock) keeps meaning what it always meant — `now` and the
+ * database's clock trivially agree unless a test says otherwise. Set by
+ * `poll()` before every call. This is the real database's clock in
+ * production (src/lib/speed-to-lead/db-clock.ts) — only the TEST double
+ * ties it to the logical `now` this file already controls.
+ */
+let fakeDbNow = new Date();
 
 before(() => {
     process.env.DATABASE_URL = `${databaseUrl}?pgbouncer=true`;
@@ -131,6 +142,9 @@ before(() => {
                 ensureLeadInboxAuth: async () => (connected ? { ok: true, client: {} } : authError ? { ok: false, error: authError } : { ok: false }),
                 gmailClientFor: () => fakeGmailClient(),
             };
+        }
+        if (id === DB_CLOCK_SPECIFIER) {
+            return { dbNow: async () => fakeDbNow };
         }
         // eslint-disable-next-line prefer-rest-params
         return originalRequire.apply(this, arguments as unknown as [string]);
@@ -169,11 +183,15 @@ beforeEach(() => {
     getCalls = [];
     pushes = [];
     ntfyUp = true;
+    fakeDbNow = new Date();
 });
 
 function freshDb() {
     return new PrismaClient({ datasources: { db: { url: `${databaseUrl}?pgbouncer=true` } } });
 }
+
+const RECONCILE_LAST_RECONCILED_KEY = "speedToLeadReconcileLastCompletedAt";
+const RECONCILE_PROGRESS_KEY = "speedToLeadReconcileProgress";
 
 const MARKER_KEYS = [
     "speedToLeadPollLease",
@@ -182,6 +200,8 @@ const MARKER_KEYS = [
     "speedToLeadDisconnectNoticePending",
     "speedToLeadScanStaleAlertSentAt",
     "speedToLeadUnacceptedNoticeSentAt",
+    RECONCILE_LAST_RECONCILED_KEY,
+    RECONCILE_PROGRESS_KEY,
 ];
 
 async function resetState(db: PrismaClient) {
@@ -190,12 +210,24 @@ async function resetState(db: PrismaClient) {
     await db.automationSetting.deleteMany({ where: { key: { in: MARKER_KEYS } } });
 }
 
+/**
+ * `cutoffAt`/`watermarkAt` as before, PLUS a just-now `RECONCILE_LAST_RECONCILED_KEY`
+ * marker, so a test that seeds settings and does not care about the daily
+ * reconciliation sweep never has one sprung on it (see the sweep-specific
+ * tests below, which explicitly clear this marker to force a sweep).
+ */
 async function seedSettings(db: PrismaClient, data: { cutoffAt: Date; watermarkAt: Date }) {
     await db.companySettings.create({ data: { id: "singleton", leadInboxCutoffAt: data.cutoffAt, leadInboxScanWatermarkAt: data.watermarkAt } });
+    await db.automationSetting.upsert({
+        where: { key: RECONCILE_LAST_RECONCILED_KEY },
+        create: { key: RECONCILE_LAST_RECONCILED_KEY, value: new Date().toISOString() },
+        update: { value: new Date().toISOString() },
+    });
 }
 
 async function poll(db: PrismaClient, now: Date) {
     listCallsThisPoll = 0;
+    fakeDbNow = now;
     const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
     return pollLeadInbox(db, now);
 }
@@ -931,6 +963,119 @@ test("round-8 finding C: recording the disconnect notice's delivery and clearing
         assert.equal(third.ran, true);
         assert.equal(await db.automationSetting.findUnique({ where: { key: "speedToLeadInboxDisconnectedAlertSent" } }), null, "recordSuccessAndClearBackoff clears it on reconnect, same as before this fix");
         assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 2, "no third push: the pending flag was already gone, so there was nothing left to re-send");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-9: a corrupted future watermark (Codex's T+96h clock-jump scenario) leaves a message the incremental scan can never reach, and the daily reconciliation sweep recovers it within a day and pushes a health alert", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        const cutoff = new Date(T - 30 * 24 * HOUR);
+        // Stands in for the pre-fix bug's aftermath: a scan that completed
+        // while the app clock briefly read T+96h committed the watermark
+        // there. The fix (dbNow-sourced scan-start timestamps, in
+        // gmail-poll.ts's runPoll) stops this from happening again — this
+        // test is about the second layer, the sweep, recovering from it if
+        // it ever happens anyway, from any cause.
+        const corruptedWatermark = new Date(T + 96 * HOUR);
+        await seedSettings(db, { cutoffAt: cutoff, watermarkAt: corruptedWatermark });
+        // Force the sweep due, as if it had never run before this corruption.
+        await db.automationSetting.deleteMany({ where: { key: RECONCILE_LAST_RECONCILED_KEY } });
+
+        // The clock has since corrected: this and the next poll run at real
+        // time again — Codex's "clock correction" step. The incremental
+        // scan's own window (watermark - SCAN_OVERLAP_MS) starts far ahead
+        // of real time, so it alone could never see this message.
+        const missed = website("t-skew-missed", T + MINUTE);
+        mailbox = [missed];
+
+        const first = await poll(db, new Date(T + MINUTE));
+        assert.equal(first.ran, true);
+        assert.equal(await intakeRow(db, missed.id), null, "not resolved yet — the sweep only ledgers, it never calls get itself");
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: missed.id } }))?.outcome, "PENDING", "the sweep gave it a ledger row the incremental scan's own window never would have");
+        const recovery = pushes.find(p => /reconciliation/i.test(p.title));
+        assert.ok(recovery, "one health push announces the recovery as soon as the sweep's own pass finishes");
+        assert.match(recovery.body, /watermark was wrong/);
+        assert.match(recovery.body, /found 1 lead-sender message/);
+        assert.equal(await db.automationSetting.findUnique({ where: { key: RECONCILE_PROGRESS_KEY } }), null, "the sweep finished and cleared its own resume state");
+        assert.ok(await db.automationSetting.findUnique({ where: { key: RECONCILE_LAST_RECONCILED_KEY } }), "and stamped the daily marker");
+
+        // The pre-existing PENDING retry (round-7 finding 1) — independent of
+        // any window — is what actually resolves it, well within the "within
+        // a day" bound this fix is required to meet.
+        const second = await poll(db, new Date(T + 2 * MINUTE));
+        assert.equal(second.ran, true);
+        assert.ok(await intakeRow(db, missed.id), "the recovered lead is now a real intake row");
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: missed.id } }))?.outcome, "INTAKE");
+        assert.equal(pushes.filter(p => /reconciliation/i.test(p.title)).length, 1, "the recovery push fires exactly once, not again on a later poll");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-9: a reconciliation sweep never re-lists into a reset — messages the ledger already has a row for cost no gets and are not recounted as recovered", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 30 * 24 * HOUR), watermarkAt: new Date(T - MINUTE) });
+        await db.automationSetting.deleteMany({ where: { key: RECONCILE_LAST_RECONCILED_KEY } });
+
+        const already = website("t-sweep-known", T - 3 * HOUR);
+        mailbox = [already];
+        await db.leadInboxMessage.create({ data: { gmailMessageId: already.id, outcome: "INTAKE" } });
+
+        const result = await poll(db, new Date(T));
+        assert.equal(result.ran, true);
+        assert.equal(gets(already.id), 0, "already-ledgered messages cost no gets — not from the sweep (which never gets at all) and not from the incremental scan (which skips anything already resolved)");
+        assert.equal(pushes.filter(p => /reconciliation/i.test(p.title)).length, 0, "nothing new to recover, so no health push");
+        assert.ok(await db.automationSetting.findUnique({ where: { key: RECONCILE_LAST_RECONCILED_KEY } }), "the sweep still completes and stamps the marker even with nothing to recover");
+        assert.equal(await db.automationSetting.findUnique({ where: { key: RECONCILE_PROGRESS_KEY } }), null);
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: already.id } }))?.outcome, "INTAKE", "its outcome is untouched, never reset back to PENDING");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-9: a reconciliation sweep interrupted by its own list-page budget resumes on the next poll from exactly where it left off, and reports the full recovered count only once it finishes", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 30 * 24 * HOUR), watermarkAt: new Date(T - MINUTE) });
+        await db.automationSetting.deleteMany({ where: { key: RECONCILE_LAST_RECONCILED_KEY } });
+
+        pageSize = 1;
+        // Well outside the incremental scan's own window (afterMs ~= T-72h)
+        // but inside the sweep's 14-day floor, so only the sweep ever lists
+        // these — keeps this test about the sweep's own resumability.
+        const old = Array.from({ length: 22 }, (_, i) => website(`t-sweep-resume-${i}`, T - 10 * 24 * HOUR - i * 1000));
+        mailbox = [...old];
+
+        const first = await poll(db, new Date(T));
+        assert.equal(first.ran, true);
+        assert.equal(gets(old[0].id), 0, "the sweep itself never calls get — it only ledgers ids");
+        const afterFirst = await db.leadInboxMessage.count({ where: { gmailMessageId: { in: old.map(m => m.id) } } });
+        assert.equal(afterFirst, 20, "capped at the sweep's own list-page budget (MAX_LIST_PAGES x pageSize 1), not all 22 yet");
+        assert.equal(pushes.filter(p => /reconciliation/i.test(p.title)).length, 0, "the pass has not finished, so no push yet");
+        const progressRow = await db.automationSetting.findUnique({ where: { key: RECONCILE_PROGRESS_KEY } });
+        assert.ok(progressRow, "durable resume state persists across polls");
+        const savedProgress = JSON.parse(progressRow!.value) as { windowFromMs: number };
+        const sweepEpoch = Math.floor(savedProgress.windowFromMs / 1000) - 1;
+        assert.equal(listCalls.filter(c => c.q.includes(`after:${sweepEpoch}`)).length, 20, "20 pages fetched before the cap");
+
+        const second = await poll(db, new Date(T + MINUTE));
+        assert.equal(second.ran, true);
+        const afterSecond = await db.leadInboxMessage.count({ where: { gmailMessageId: { in: old.map(m => m.id) } } });
+        assert.equal(afterSecond, 22, "the remaining ids are picked up on resume, not skipped");
+        assert.equal(listCalls.filter(c => c.q.includes(`after:${sweepEpoch}`)).length, 22, "22 pages total across both polls — resuming never re-lists a page already covered by the first poll");
+        const recovery = pushes.find(p => /reconciliation/i.test(p.title));
+        assert.ok(recovery, "the push fires once the sweep actually finishes");
+        assert.match(recovery.body, /found 22 lead-sender message/);
+        assert.equal(await db.automationSetting.findUnique({ where: { key: RECONCILE_PROGRESS_KEY } }), null, "progress cleared once complete");
     } finally {
         await db.$disconnect();
     }
