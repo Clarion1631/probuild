@@ -36,15 +36,24 @@ const SPEED_TO_LEAD_OWNED_LEAD_WHERE = {
  */
 export async function markLeadBooked(leadId: string, db: PrismaClient = prisma): Promise<void> {
     await db.$transaction(async tx => {
-        await tx.lead.updateMany({ where: { id: leadId, bookedAt: null }, data: { bookedAt: new Date() } });
+        // cancelMessagesForLeadInTx FIRST — it locks the shared rung in
+        // dispatch.ts's own fixed order (pause/mode, template, ContactEndpoint,
+        // then Lead FOR UPDATE). The bookedAt update must not lock Lead ahead
+        // of it: a `tx.lead.updateMany` before this call takes the Lead row
+        // lock first, and dispatch.ts's commit takes AutomationSetting BEFORE
+        // Lead — two transactions taking those two rows in opposite orders is
+        // a textbook circular-wait deadlock. Updating bookedAt AFTER reuses
+        // the SAME lock cancelMessagesForLeadInTx already holds on this row.
         await cancelMessagesForLeadInTx(tx, leadId, "booked");
+        await tx.lead.updateMany({ where: { id: leadId, bookedAt: null }, data: { bookedAt: new Date() } });
     });
 }
 
 export async function markLeadCalled(leadId: string, db: PrismaClient = prisma): Promise<void> {
     await db.$transaction(async tx => {
-        await tx.lead.updateMany({ where: { id: leadId, calledAt: null }, data: { calledAt: new Date() } });
+        // See markLeadBooked above — same lock-order reasoning.
         await cancelMessagesForLeadInTx(tx, leadId, "called");
+        await tx.lead.updateMany({ where: { id: leadId, calledAt: null }, data: { calledAt: new Date() } });
     });
 }
 

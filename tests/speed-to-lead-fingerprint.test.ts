@@ -51,6 +51,40 @@ test("computeFingerprint changes when the Speed-to-Lead action-wrapper slice of 
     }
 });
 
+test("computeFingerprint changes when the lead-close hook slice of actions.ts changes", async () => {
+    const target = path.join(__dirname, "..", "src", "lib", "actions.ts");
+    const original = readFileSync(target, "utf8");
+    const marker = "// Speed-to-Lead v1 (PB-leads-001) — BEGIN lead-close cancellation hook.";
+    const idx = original.indexOf(marker);
+    assert.ok(idx !== -1, "the lead-close hook BEGIN marker must exist in actions.ts (updateLeadStage)");
+    const before = computeFingerprint();
+    try {
+        const touched = `${original.slice(0, idx + marker.length)}\n// fingerprint-test-touch\n${original.slice(idx + marker.length)}`;
+        writeFileSync(target, touched);
+        const after = computeFingerprint();
+        assert.notEqual(before, after);
+    } finally {
+        writeFileSync(target, original);
+    }
+});
+
+test("computeFingerprint changes when a Speed-to-Lead-dependent Lead/CompanySettings field is renamed in schema.prisma", async () => {
+    const target = path.join(__dirname, "..", "prisma", "schema.prisma");
+    const original = readFileSync(target, "utf8");
+    const before = computeFingerprint();
+    try {
+        // Rename a field Speed-to-Lead depends on but does not own the model
+        // of — this must lapse LIVE the same way a change to the feature's
+        // OWN tables does, without requiring the WHOLE Lead/CompanySettings
+        // model (shared with the rest of ProBuild) to be hashed.
+        writeFileSync(target, original.replace("bookedAt", "bookedAtRenamed"));
+        assert.throws(() => computeFingerprint(), /no longer declares field "bookedAt"/);
+    } finally {
+        writeFileSync(target, original);
+    }
+    assert.equal(computeFingerprint(), before);
+});
+
 test("computeFingerprint is UNAFFECTED by a change to actions.ts outside the Speed-to-Lead BEGIN..END slice", async () => {
     const target = path.join(__dirname, "..", "src", "lib", "actions.ts");
     const original = readFileSync(target, "utf8");

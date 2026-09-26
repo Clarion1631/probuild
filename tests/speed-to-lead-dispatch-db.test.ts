@@ -62,12 +62,24 @@ async function cleanup(db: PrismaClient, leadId: string) {
 
 test("dispatch reads the Gmail credential from the DB it was given, never the global prisma singleton — DB isolation must actually hold", { skip }, async () => {
     assert.ok(url);
+    // Refuses a non-local target BEFORE writing anything destructive — this
+    // test overwrites CompanySettings.leadInboxRefreshToken, and a
+    // misconfigured SPEED_TO_LEAD_TEST_URL pointed at the real database would
+    // otherwise silently clobber the actual, configured mailbox credential
+    // regardless of SPEED_TO_LEAD_MODE. Same guard the two-worker race test
+    // below already has.
+    assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(new URL(url).hostname), "test refuses non-local databases");
     const savedMode = process.env.SPEED_TO_LEAD_MODE;
     const savedAllowlist = process.env.SPEED_TO_LEAD_TEST_ALLOWLIST;
     process.env.SPEED_TO_LEAD_MODE = "TEST";
     process.env.SPEED_TO_LEAD_TEST_ALLOWLIST = RECIPIENT;
     const db = new PrismaClient({ datasources: { db: { url } } });
     const seeded = await seedApprovedPersonalMessage(db, "db-isolation");
+    // The ORIGINAL value in THIS database — restored in `finally` below, not
+    // just left overwritten, even though this is meant to be a disposable
+    // target: the hostname check above is defense-in-depth, not a reason to
+    // skip restoring what was there.
+    const before = await db.companySettings.findUnique({ where: { id: "singleton" }, select: { leadInboxRefreshToken: true } });
     try {
         // A garbage refresh token in THIS (disposable) database — ensureLeadInboxAuth
         // must read it from here, not silently fall back to whatever mailbox
@@ -83,6 +95,7 @@ test("dispatch reads the Gmail credential from the DB it was given, never the gl
         // which only happens if it read auth.ok=true from THIS database.
         assert.ok(["SENT", "FAILED", "UNKNOWN_DELIVERY"].includes(result.status), `expected an attempted-send outcome, got ${result.status}`);
     } finally {
+        await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxRefreshToken: before?.leadInboxRefreshToken ?? null } }).catch(() => undefined);
         await cleanup(db, seeded.lead.id);
         await db.$disconnect();
         process.env.SPEED_TO_LEAD_MODE = savedMode;

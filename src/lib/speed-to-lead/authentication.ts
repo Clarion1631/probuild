@@ -84,6 +84,30 @@ function topmost(headers: RawHeader[], name: string): RawHeader | undefined {
     return headers.find(h => h.name.toLowerCase() === name.toLowerCase());
 }
 
+/** The "i=<n>;" ARC-set instance prefix any ARC-* header value carries — null if absent/unparseable. */
+function arcInstance(rawValue: string): number | null {
+    const m = /^\s*i=(\d+)\s*;/i.exec(rawValue);
+    return m ? Number(m[1]) : null;
+}
+
+/**
+ * The FIRST ARC set (i=1) specifically — never just "whichever
+ * ARC-Authentication-Results header happens to be topmost in array order".
+ * Each hop that participates in ARC PREPENDS its own new header of this name,
+ * so the topmost one is the LATEST/highest instance, the opposite of what
+ * spec text ("its first Google hop") means to trust.
+ */
+function firstArcAuthResults(headers: RawHeader[]): RawHeader | undefined {
+    let best: { header: RawHeader; instance: number } | undefined;
+    for (const h of headers) {
+        if (h.name.toLowerCase() !== "arc-authentication-results") continue;
+        const instance = arcInstance(h.value);
+        if (instance === null) continue;
+        if (!best || instance < best.instance) best = { header: h, instance };
+    }
+    return best?.header;
+}
+
 export interface AuthenticationVerdict {
     trusted: boolean;
     reason?: string;
@@ -116,9 +140,24 @@ export function authenticateMessage(headers: RawHeader[], fromAddress: string, e
     // only be consulted when Google itself reports "arc=pass" there — never
     // from the unsigned ARC-Authentication-Results text alone, and never when
     // the receiving header is silent on arc= or reports anything but pass.
-    if (directParsed?.arc === "pass") {
-        const arcHeader = topmost(headers, "ARC-Authentication-Results");
-        if (arcHeader) {
+    //
+    // Both of those checks must be read off a header we already know is
+    // Google's own: without requiring authservId==="mx.google.com" HERE too,
+    // a crafted topmost "Authentication-Results: attacker.example; arc=pass"
+    // header would still satisfy `directParsed.arc === "pass"` and walk
+    // straight into the ARC branch below — the receiving-boundary check the
+    // FIRST branch above enforces was never re-applied to this one.
+    if (directParsed?.authservId === "mx.google.com" && directParsed.arc === "pass") {
+        // "its first Google hop" (spec): chain validity (arc=pass) proves the
+        // chain was not tampered with SINCE the seal, never that the sealed
+        // CONTENT is truthful (RFC 8617 §9 leaves that to the verifier) — so
+        // the only ARC set worth reading is the FIRST one (i=1), the hop
+        // architecturally required to be Google-controlled ("relayed through
+        // connect@"). A later instance may have been added by any
+        // intermediate hop, trusted or not, even though Google's own
+        // receiving server still reports the overall chain as unbroken.
+        const arcHeader = firstArcAuthResults(headers);
+        if (arcHeader && arcInstance(arcHeader.value) === 1) {
             const parsed = parseAuthResults(arcHeader.value);
             if (parsed.authservId === "mx.google.com" && parsed.dkim === "pass" && parsed.dmarc === "pass" && domainsMatch(parsed, pattern.signingDomain)) {
                 return { trusted: true, matchedPattern: pattern };

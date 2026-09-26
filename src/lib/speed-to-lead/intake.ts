@@ -1,12 +1,14 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHmac } from "node:crypto";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { canonicalJson } from "@/lib/mcp-schedule-tools";
 import { triageWebLead } from "./triage";
 import { normalizeEndpoint } from "./contact-endpoint";
 import type { WebIntakePayload } from "./payload";
 import { FALLBACK_DUE_DELAY_MS } from "./constants";
 import { evaluateTemplateAEligibility, buildTemplateAContent } from "./template";
 import { createOutreachDraftInTx } from "./approval";
+import { verifyWebhookSignature } from "./hmac";
 import type { RawHeader } from "./authentication";
 
 type Db = PrismaClient | Prisma.TransactionClient;
@@ -87,13 +89,42 @@ async function createLeadRow(
  * Never throws on a race — every branch either wins cleanly or discovers it
  * lost and links to the winner's leadId.
  */
+/** A `(timestamp, HMAC-SHA256(LEAD_INGEST_TEST_SECRET, "${timestamp}.${canonicalJson(payload)}"))` pair — see signTestIntakePayload. */
+export interface TestIntakeSignature {
+    timestamp: string;
+    signature: string;
+}
+
+/**
+ * Signs a payload for the ONLY internal caller allowed to request
+ * `isTest: true` (spec Release "Test identity": "isTest is ... signed with
+ * LEAD_INGEST_TEST_SECRET, never from form fields") — readiness.ts's own
+ * runner. Reuses the exact `timestamp.body` HMAC shape hmac.ts already
+ * verifies for the real webhook, with a different secret, so `isTest` is a
+ * genuinely verified claim rather than a bare boolean any in-process caller
+ * could pass.
+ */
+export function signTestIntakePayload(payload: WebIntakePayload, timestamp: string, secret: string = process.env.LEAD_INGEST_TEST_SECRET ?? ""): string {
+    return createHmac("sha256", secret).update(`${timestamp}.${canonicalJson(payload)}`).digest("hex");
+}
+
 export async function intakeWebhookLead(
     payload: WebIntakePayload,
-    opts: { receivedAt: Date; isTest?: boolean },
+    opts: { receivedAt: Date; isTest?: boolean; testSignature?: TestIntakeSignature },
     db: PrismaClient = prisma,
 ): Promise<IntakeOutcome> {
     const externalId = submissionExternalId(payload.submissionId);
-    const isTest = opts.isTest ?? false;
+    // `isTest` is NEVER trusted as a bare boolean — a caller asking for
+    // isTest=true must present a valid HMAC signature over this exact
+    // payload, computed with LEAD_INGEST_TEST_SECRET (verified against
+    // opts.receivedAt, not wall-clock time, so a deliberately backdated
+    // readiness fixture — e.g. the "expired A" negative-path check — is not
+    // itself rejected as a "stale" signature). Anything else silently falls
+    // back to isTest=false rather than trusting the caller's claim.
+    const isTest = !!opts.isTest && !!opts.testSignature && verifyWebhookSignature(
+        { timestamp: opts.testSignature.timestamp, signature: opts.testSignature.signature, rawBody: canonicalJson(payload), secret: process.env.LEAD_INGEST_TEST_SECRET },
+        () => opts.receivedAt,
+    ).ok;
 
     return db.$transaction(async tx => {
         // Step 1: try the direct, fully-processed insert.

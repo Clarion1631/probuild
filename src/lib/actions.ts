@@ -375,15 +375,28 @@ export const getLead = cache(async function getLead(id: string) {
 export async function updateLeadStage(id: string, stage: string) {
     await assertActiveStaff();
     if (CLOSED_LEAD_STAGES.includes(stage)) {
-        // Speed-to-Lead (PB-leads-001): "any ... lead close cancels every
-        // message for that lead that is still before commitment" (spec
-        // Suppression and cancellation). This is the general lead pipeline's
-        // own closing action — the hook lives here rather than duplicated at
-        // every caller that might close a lead.
+        // Speed-to-Lead v1 (PB-leads-001) — BEGIN lead-close cancellation hook.
+        // "any ... lead close cancels every message for that lead that is
+        // still before commitment" (spec Suppression and cancellation). This
+        // is the general lead pipeline's own closing action — the hook lives
+        // here rather than duplicated at every caller that might close a
+        // lead. scripts/speed-to-lead-fingerprint.mjs hashes exactly this
+        // marked slice too, the same reasoning as the BEGIN/END block further
+        // down this file: a change here must lapse LIVE activation. (Marker
+        // text deliberately reads "Speed-to-Lead v1 (PB-leads-001) — BEGIN/END
+        // ...", not "BEGIN Speed-to-Lead v1 (PB-leads-001)...", so it can
+        // never collide with that other marker's own substring match.)
+        //
+        // Cancellation FIRST, the stage write after (see markLeadBooked in
+        // followups.ts for the full lock-order reasoning) — a `tx.lead.update`
+        // before cancelMessagesForLeadInTx would lock Lead ahead of
+        // AutomationSetting, the reverse of dispatch.ts's fixed order, and a
+        // concrete deadlock with a concurrent commit.
         await prisma.$transaction(async tx => {
-            await tx.lead.update({ where: { id }, data: { stage } });
             await stlCancelMessagesForLeadInTx(tx, id, "lead closed");
+            await tx.lead.update({ where: { id }, data: { stage } });
         });
+        // Speed-to-Lead v1 (PB-leads-001) — END lead-close cancellation hook.
     } else {
         await prisma.lead.update({
             where: { id },
@@ -16801,10 +16814,24 @@ export async function sendAgainOutreachMessageAction(input: { messageId: string;
             throw new Error("send-again from UNKNOWN_DELIVERY is only available 30 minutes after the attempt");
         }
     }
+    // Template A is machine-rendered from a standing-approved template and
+    // never goes through the manual approval flow at all — dispatch.ts's
+    // commit only ever accepts a TEMPLATE_A message from READY (never
+    // DRAFT/APPROVED, and it requires the version to carry a
+    // templateVersionId). Without carrying both forward here, a resent A
+    // message loses its template reference and lands at the generic DRAFT
+    // "needs a fresh approval" state, which a TEMPLATE_A message can never
+    // pass through — permanently unsendable.
+    const isTemplateA = message.kind === "TEMPLATE_A";
+    const currentVersion = isTemplateA
+        ? await prisma.outreachVersion.findFirst({ where: { messageId: input.messageId, generation: message.generation } })
+        : null;
     const result = await stlCreateNewGeneration(input.messageId, {
         to: input.to, subject: input.subject, body: input.body, footer: input.footer,
         threading: await stlCurrentThreading(input.messageId),
-    }, prisma, { allowedStatuses: ["FAILED", "UNKNOWN_DELIVERY"] });
+        templateVersionId: isTemplateA ? currentVersion?.templateVersionId ?? null : undefined,
+        renderInputs: isTemplateA ? currentVersion?.renderInputs : undefined,
+    }, prisma, { allowedStatuses: ["FAILED", "UNKNOWN_DELIVERY"], targetStatus: isTemplateA ? "READY" : "DRAFT" });
     revalidatePath(`/leads/outreach/${input.messageId}`);
     return result;
 }
@@ -16837,11 +16864,19 @@ export async function markLeadJunkAction(leadId: string) {
     // cancellation of every pending message all commit together — as
     // separate calls, a dispatch racing the gap between them could still
     // commit against a lead that reads as junk everywhere else already.
+    //
+    // Cancellation FIRST — it locks ContactEndpoint (among other rows) in
+    // dispatch.ts's own fixed order (AutomationSetting, then template, then
+    // ContactEndpoint, then Lead). `stlMarkEndpointJunk`'s upsert taking that
+    // SAME ContactEndpoint row ahead of it (the previous shape) locks it
+    // before AutomationSetting — the reverse of dispatch.ts's order, and a
+    // concrete deadlock with a concurrent commit. Running it after reuses the
+    // lock cancelMessagesForLeadInTx already holds on that row.
     await prisma.$transaction(async tx => {
+        await stlCancelMessagesForLeadInTx(tx, leadId, "junk");
         const lead = await tx.lead.findUnique({ where: { id: leadId }, select: { client: { select: { email: true } } } });
         await stlMarkLeadIntakeJunk(leadId, tx);
         if (lead?.client?.email) await stlMarkEndpointJunk(lead.client.email, tx);
-        await stlCancelMessagesForLeadInTx(tx, leadId, "junk");
     });
     revalidatePath(`/leads/${leadId}`);
 }

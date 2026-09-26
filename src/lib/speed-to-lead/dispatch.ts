@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { computeApprovalHash, hashesMatch } from "./approval";
+import { computeApprovalHash, hashesMatch, assertValidRecipientAndHeaders } from "./approval";
 import { normalizeEndpoint, assertNoHeaderInjection, isValidSingleRecipient } from "./contact-endpoint";
 import { logOutreachEvent } from "./audit";
 import { anyDispatchFreshness, templateAFreshness, type PollHealth } from "./freshness";
@@ -218,6 +218,15 @@ async function commitDispatchTransaction(messageId: string, now: () => Date, db:
         if (!version || version.generation !== message.generation || normalizeEndpoint(version.to) !== normalizeEndpoint(peekedTo ?? "")) {
             return { ok: false, outcome: { status: "BLOCKED", reason: "stale version" } };
         }
+        // Re-checked one last time at the actual commitment point — the step
+        // that creates the OutreachAttempt and consumes the daily-cap slot —
+        // so invalid recipient/header content can never consume an attempt
+        // before buildRawMessage would eventually catch it at send time.
+        try {
+            assertValidRecipientAndHeaders({ to: version.to, subject: version.subject, threading: version.threading as { inReplyTo: string | null; references: string | null; threadId: string | null } });
+        } catch (error) {
+            return { ok: false, outcome: { status: "BLOCKED", reason: error instanceof Error ? error.message : "invalid message content" } };
+        }
 
         // Status + generation preconditions (spec: "the message is APPROVED,
         // or is A in READY" / "the generation is current").
@@ -237,7 +246,16 @@ async function commitDispatchTransaction(messageId: string, now: () => Date, db:
         // sweeps every APPROVED/READY row every minute regardless of age.
         // EXPIRED is a real terminal transition, the same one Template A's
         // own 15-minute deadline already uses below.
-        if (now().getTime() - message.createdAt.getTime() > DRAFT_EXPIRY_MS) {
+        //
+        // Anchored to the CURRENT generation's version.createdAt, never
+        // message.createdAt (the FIRST generation's creation time) — a
+        // message can be edited or sent-again long after the original
+        // generation, and each of those creates a fresh OutreachVersion row
+        // with its own createdAt. Using the original message's timestamp
+        // means a perfectly fresh draft (created seconds ago via edit/
+        // send-again) inherits an expiry clock that started 72+ hours in the
+        // past and can never commit at all.
+        if (now().getTime() - version.createdAt.getTime() > DRAFT_EXPIRY_MS) {
             await tx.outreachMessage.update({ where: { id: messageId }, data: { status: "EXPIRED" } });
             return { ok: false, outcome: { status: "BLOCKED", reason: "draft expired (72 hours)" } };
         }
@@ -391,11 +409,20 @@ async function markAttemptSent(
         } else {
             await tx.lead.updateMany({ where: { id: ctx.leadId, personalReplyAt: null }, data: { personalReplyAt: now } });
             if (!ctx.isTest) {
-                await tx.automationSetting.upsert({
-                    where: { key: "firstLiveSendAt" },
-                    create: { key: "firstLiveSendAt", value: now.toISOString() },
-                    update: {},
-                });
+                // NOT a plain upsert with `update: {}`. lockAutomationSettings
+                // (commitDispatchTransaction step 1) ensures a row for this key
+                // exists BEFORE it is ever locked — for a fresh install that row
+                // is pre-created with value `''`. A plain upsert's `update: {}`
+                // then always takes the UPDATE branch (the row already exists)
+                // and writes NOTHING, so firstLiveSendAt stays `''` forever even
+                // after a real, successful send — permanently blocking every
+                // future real Template A ("no real personal reply has been sent
+                // yet", checked against this exact value). The raw SQL below
+                // only ever sets it ONCE — the first time it is still empty —
+                // preserving "first real send" while actually setting it.
+                await tx.$executeRaw`
+                    INSERT INTO "AutomationSetting" (key, value) VALUES ('firstLiveSendAt', ${now.toISOString()})
+                    ON CONFLICT (key) DO UPDATE SET value = ${now.toISOString()} WHERE "AutomationSetting".value = ''`;
             }
         }
     });
@@ -528,16 +555,28 @@ export async function reconcileUnknownDeliveries(db: PrismaClient = prisma, now:
         if (!auth.ok || !auth.client) continue;
         const ageMin = (now.getTime() - attempt.committedAt.getTime()) / 60_000;
 
-        // Past the last checkpoint AND already reported: spec Dispatch step 3
-        // says reconciliation checks at 1, 5 and 30 minutes and, if still not
-        // found, "nothing is resent" — that is the end of the story for this
-        // attempt. Without this the search (and the push below) ran every
-        // single cron minute forever for an attempt that will never resolve.
         if (ageMin > lastCheckpointMin) {
+            // Past the last checkpoint: spec Dispatch step 3 says
+            // reconciliation checks at 1, 5 and 30 minutes and, if still not
+            // found, "nothing is resent" — that is the end of the story for
+            // this attempt. This read is only a fast-path skip (avoids
+            // re-searching Gmail every single cron invocation forever) — the
+            // ATOMIC claim right before the push/log below (not here) is what
+            // actually prevents two overlapping invocations from both
+            // reporting the same attempt; a transient search failure must
+            // still be retryable next minute, which claiming up-front here
+            // would have prevented.
             const alreadyReported = await db.outreachEvent.findFirst({
                 where: { kind: "reconcile-not-found-30m", detail: { path: ["attemptId"], equals: attempt.id } },
             });
             if (alreadyReported) continue;
+        } else {
+            // Before the last checkpoint: only search AT one of the
+            // checkpoint minutes (a 1-minute cron-tick window around each) —
+            // spec says reconciliation checks "at 1, 5 and 30 minutes", not
+            // continuously on every single cron invocation in between.
+            const atCheckpoint = RECONCILE_CHECKPOINTS_MIN.some(min => ageMin >= min && ageMin < min + 1);
+            if (!atCheckpoint) continue;
         }
 
         const gmail = gmailClientFor(auth.client);
@@ -561,11 +600,48 @@ export async function reconcileUnknownDeliveries(db: PrismaClient = prisma, now:
             continue;
         }
         if (ageMin >= lastCheckpointMin) {
+            // Atomic claim right before the push — a unique-key INSERT either
+            // wins (first and only reporter for this attempt) or throws
+            // (another overlapping invocation already claimed it), never a
+            // separate read-then-write race between two concurrent pushes.
+            try {
+                await db.automationSetting.create({ data: { key: `speedToLeadReconcileReported:${attempt.id}`, value: "reported" } });
+            } catch {
+                continue; // already claimed by another invocation
+            }
             const { pushToJustin } = await import("./push");
             await pushToJustin("Speed-to-Lead: delivery unknown", `Message ${attempt.rfcMessageId} was not found in Sent after 30 minutes. Nothing was resent.`);
             await logOutreachEvent(db, { leadId: attempt.message.leadId, messageId: attempt.messageId, kind: "reconcile-not-found-30m", detail: { attemptId: attempt.id } });
         }
     }
+}
+
+/**
+ * Spec Approval: "an un-acted-on draft expires after 72 hours" — not only the
+ * APPROVED/READY rows commitDispatchTransaction's own check above covers, but
+ * a DRAFT or PENDING_APPROVAL row that was never even submitted for approval.
+ * dispatchReadyAndApproved's sweep never touches those (it only ever queries
+ * READY/APPROVED) and commitDispatchTransaction never runs against them
+ * either (it only ever accepts a message already at APPROVED/READY) — without
+ * this, a never-acted-on draft just sits there forever, past the point the
+ * spec says it should have expired.
+ */
+export async function expireStaleDrafts(db: PrismaClient = prisma, now: Date = new Date()): Promise<number> {
+    const candidates = await db.outreachMessage.findMany({
+        where: { status: { in: ["DRAFT", "PENDING_APPROVAL"] } },
+        select: { id: true, status: true, generation: true },
+    });
+    let expired = 0;
+    for (const m of candidates) {
+        const version = await db.outreachVersion.findFirst({ where: { messageId: m.id, generation: m.generation } });
+        if (!version || now.getTime() - version.createdAt.getTime() <= DRAFT_EXPIRY_MS) continue;
+        const { count } = await db.outreachMessage.updateMany({
+            where: { id: m.id, status: m.status, generation: m.generation },
+            data: { status: "EXPIRED" },
+        });
+        if (count > 0) expired++;
+    }
+    return expired;
 }
 
 /**

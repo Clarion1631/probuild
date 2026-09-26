@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
     renderFirstName, renderBookingLink, substituteTokens, renderTemplateA,
-    templateAContentHash, templateADeadlinePassed, type TemplateAFields,
+    templateAContentHash, templateADeadlinePassed, createOutreachTemplate, type TemplateAFields,
 } from "../src/lib/speed-to-lead/template";
 
 const FIELDS: TemplateAFields = {
@@ -13,6 +13,26 @@ const FIELDS: TemplateAFields = {
     bookingBaseUrl: "https://calendly.com/rlord-goldentouchremodeling/",
     fromAddress: "gtrsupport@goldentouchremodeling.com",
 };
+
+const COMPLIANT_FOOTER = "Golden Touch Remodeling, 5305 NE 121st Ave Suite 310, Vancouver, WA 98682. Reply 'no thanks' and I'll stop.";
+
+test("createOutreachTemplate rejects a bookingBaseUrl that uses '..' to escape the required Calendly prefix", async () => {
+    const fields = { ...FIELDS, footer: COMPLIANT_FOOTER, bookingBaseUrl: `${FIELDS.bookingBaseUrl}../other-owner/consult`, testOnly: true };
+    await assert.rejects(() => createOutreachTemplate(fields, {} as never), /bookingBaseUrl/);
+});
+
+test("createOutreachTemplate rejects a footer with an opt-out word but no mailing address", async () => {
+    const fields = { ...FIELDS, footer: "stop", testOnly: true };
+    await assert.rejects(() => createOutreachTemplate(fields, {} as never), /mailing address/);
+});
+
+test("createOutreachTemplate accepts a footer with both the opt-out phrase and the mailing address", async () => {
+    const created: unknown[] = [];
+    const fakeDb = { outreachTemplate: { create: async (args: { data: unknown }) => { created.push(args.data); return args.data; } } };
+    const fields = { ...FIELDS, footer: COMPLIANT_FOOTER, testOnly: true };
+    await createOutreachTemplate(fields, fakeDb as never);
+    assert.equal(created.length, 1);
+});
 
 test("renderFirstName takes the first word, letters/apostrophe/hyphen only", () => {
     assert.equal(renderFirstName("Jane Doe"), "Jane");

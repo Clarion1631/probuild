@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { canonicalJson } from "@/lib/mcp-schedule-tools";
 import { FIRST_NAME_MAX_LEN, TEMPLATE_A_DEADLINE_MS, templateAEnabled, DISPATCH_FROM_ADDRESS, SITE_FIXED_PHONE, RICHARD_CALENDLY_PREFIX } from "./constants";
-import { containsOptOutPhrase } from "./reply-detection";
+import { assertCompliantFooter } from "./contact-endpoint";
 
 type Db = PrismaClient | Prisma.TransactionClient;
 
@@ -168,12 +168,23 @@ function assertValidTemplateFields(fields: TemplateAFields): void {
     if (fields.fixedPhone !== SITE_FIXED_PHONE) {
         throw new Error(`invalid fixedPhone: must be the site's own number (${SITE_FIXED_PHONE})`);
     }
-    if (!fields.bookingBaseUrl.startsWith(RICHARD_CALENDLY_PREFIX)) {
+    // A bare `startsWith` on the raw string is bypassable: `.../richard.../
+    // ../other-owner/consult` literally STARTS WITH the expected prefix text
+    // even though a normalizing parser (or `new URL()` itself) resolves the
+    // ".." segment to a path OUTSIDE it. Comparing the ORIGIN plus the
+    // PARSED (already `..`-resolved) pathname against the expected prefix's
+    // own parsed pathname closes that.
+    let parsedBookingUrl: URL;
+    try {
+        parsedBookingUrl = new URL(fields.bookingBaseUrl);
+    } catch {
+        throw new Error(`invalid bookingBaseUrl: not a valid URL`);
+    }
+    const expectedPrefix = new URL(RICHARD_CALENDLY_PREFIX);
+    if (parsedBookingUrl.origin !== expectedPrefix.origin || !parsedBookingUrl.pathname.startsWith(expectedPrefix.pathname)) {
         throw new Error(`invalid bookingBaseUrl: must be under ${RICHARD_CALENDLY_PREFIX} — the booking link carries the lead's own name/email, so it may never point at an arbitrary domain`);
     }
-    if (!containsOptOutPhrase(fields.footer)) {
-        throw new Error("invalid footer: it must contain an opt-out instruction (e.g. \"reply 'no thanks' and I'll stop\")");
-    }
+    assertCompliantFooter(fields.footer, "footer");
 }
 
 /** Creates a new (unapproved) template row — Justin approves it separately (spec Template A "durable approval"). */

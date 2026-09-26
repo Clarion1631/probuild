@@ -6,10 +6,11 @@ import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { pollLeadInbox } from "@/lib/speed-to-lead/gmail-poll";
 import { promoteDueFallbacks } from "@/lib/speed-to-lead/intake";
-import { reconcileUnknownDeliveries, dispatchReadyAndApproved } from "@/lib/speed-to-lead/dispatch";
+import { reconcileUnknownDeliveries, dispatchReadyAndApproved, expireStaleDrafts } from "@/lib/speed-to-lead/dispatch";
 import { runFollowupSweep, send0900Digest } from "@/lib/speed-to-lead/followups";
 import { templateADeadlinePassed } from "@/lib/speed-to-lead/template";
 import { pushToJustin } from "@/lib/speed-to-lead/push";
+import { speedToLeadMode } from "@/lib/speed-to-lead/constants";
 
 /** The hour-of-day (0-23) `date` falls on in `timeZone` — Intl can render midnight as "24", so it is normalized back to 0. */
 function hourInTimeZone(date: Date, timeZone: string): number {
@@ -43,6 +44,11 @@ async function expireStaleTemplateA(now: Date): Promise<number> {
 }
 
 async function maybeSend0900Digest(now: Date): Promise<boolean> {
+    // Same OFF gate runFollowupSweep already uses — the digest is a
+    // forward-looking automation just like a follow-up offer, not the
+    // inbox poll's own opt-out safety processing, so it has no reason to run
+    // while the feature is off.
+    if (speedToLeadMode() === "OFF") return false;
     // The business's own local morning (spec Goal 8), not 09:00 UTC — Golden
     // Touch Remodeling is in Vancouver, WA (America/Los_Angeles), where
     // 09:00 UTC lands at 1am or 2am local depending on DST.
@@ -83,12 +89,13 @@ async function handleGET() {
     await pushPromotedFallbacks(promoted);
     await reconcileUnknownDeliveries(prisma, now);
     const expired = await expireStaleTemplateA(now);
+    const staleDraftsExpired = await expireStaleDrafts(prisma, now);
     const dispatched = await dispatchReadyAndApproved(prisma);
     const followups = await runFollowupSweep(now);
     const digestSent = await maybeSend0900Digest(now);
 
     return NextResponse.json({
-        poll, promoted: promoted.length, expired, dispatched: dispatched.attempted, followups, digestSent,
+        poll, promoted: promoted.length, expired, staleDraftsExpired, dispatched: dispatched.attempted, followups, digestSent,
     });
 }
 

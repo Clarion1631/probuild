@@ -58,6 +58,65 @@ function extractActionsSlice() {
     return source.slice(begin, end);
 }
 
+// The lead-close cancellation hook (spec Suppression and cancellation: "...
+// or lead close cancels every message...") lives inside updateLeadStage, the
+// GENERAL lead pipeline's own action — not a Speed-to-Lead action wrapper, so
+// it sits well outside the BEGIN..END slice above. A second, narrower marked
+// slice, same reasoning: a change to it must lapse LIVE activation too.
+const LEAD_CLOSE_HOOK_BEGIN_MARKER = "// Speed-to-Lead v1 (PB-leads-001) — BEGIN lead-close cancellation hook.";
+const LEAD_CLOSE_HOOK_END_MARKER = "// Speed-to-Lead v1 (PB-leads-001) — END lead-close cancellation hook.";
+
+function extractLeadCloseHookSlice() {
+    const source = readFileSync(path.join(ROOT, ACTIONS_FILE), "utf8");
+    const begin = source.indexOf(LEAD_CLOSE_HOOK_BEGIN_MARKER);
+    const end = source.indexOf(LEAD_CLOSE_HOOK_END_MARKER);
+    if (begin === -1 || end === -1 || end <= begin) {
+        throw new Error(`speed-to-lead-fingerprint: could not find the lead-close hook markers in ${ACTIONS_FILE} — they were moved or removed`);
+    }
+    return source.slice(begin, end);
+}
+
+// Fields Speed-to-Lead depends on that live on models it does NOT own
+// (Lead, CompanySettings — both heavily shared with the rest of ProBuild).
+// migration.sql (a FINGERPRINT_INPUTS entry) already covers these AS OF the
+// migration that added them; this covers them going forward too, so a LATER,
+// unrelated migration that renames or drops one of these specific fields
+// still lapses LIVE — without hashing the ENTIRE model (which would lapse
+// LIVE on every unrelated Lead/CompanySettings change forever, the exact
+// "unrelated deploys don't [lapse LIVE]" problem migration.sql-over-
+// schema.prisma already avoids for the feature's OWN tables).
+const SCHEMA_FILE = "prisma/schema.prisma";
+const DEPENDENT_MODEL_FIELDS = {
+    Lead: ["firstTouchAt", "personalReplyAt", "bookedAt", "calledAt"],
+    CompanySettings: [
+        "leadInboxRefreshToken", "leadInboxEmail", "leadInboxHistoryId", "leadInboxCutoffAt",
+        "leadInboxLastPollStartedAt", "leadInboxLastPollAt", "leadInboxLastPollOk",
+    ],
+};
+
+function extractModelBlock(source, modelName) {
+    const re = new RegExp(`model ${modelName} \\{([\\s\\S]*?)\\n\\}`, "m");
+    const m = re.exec(source);
+    if (!m) throw new Error(`speed-to-lead-fingerprint: could not find "model ${modelName}" in ${SCHEMA_FILE}`);
+    return m[1];
+}
+
+function extractDependentModelFields() {
+    const source = readFileSync(path.join(ROOT, SCHEMA_FILE), "utf8");
+    const parts = [];
+    for (const [model, fields] of Object.entries(DEPENDENT_MODEL_FIELDS)) {
+        const block = extractModelBlock(source, model);
+        for (const field of fields) {
+            const lineMatch = new RegExp(`^\\s*${field}\\s+.*$`, "m").exec(block);
+            if (!lineMatch) {
+                throw new Error(`speed-to-lead-fingerprint: model ${model} no longer declares field "${field}" — Speed-to-Lead depends on it (update this script if it was intentionally renamed/removed)`);
+            }
+            parts.push(`${model}.${field}=${lineMatch[0].trim()}`);
+        }
+    }
+    return parts.join("\n");
+}
+
 function collectFiles(relPath) {
     const abs = path.join(ROOT, relPath);
     let stat;
@@ -90,6 +149,10 @@ export function computeFingerprint() {
     hash.update(ACTIONS_FILE);
     hash.update("\u0000");
     hash.update(extractActionsSlice());
+    hash.update("\u0000");
+    hash.update(extractLeadCloseHookSlice());
+    hash.update("\u0000");
+    hash.update(extractDependentModelFields());
     hash.update("\u0000");
     return hash.digest("hex");
 }

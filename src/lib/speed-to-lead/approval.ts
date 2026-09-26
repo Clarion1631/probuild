@@ -3,8 +3,7 @@ import type { Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { canonicalJson } from "@/lib/mcp-schedule-tools";
 import { DISPATCH_FROM_ADDRESS } from "./constants";
-import { isValidSingleRecipient, assertNoHeaderInjection } from "./contact-endpoint";
-import { containsOptOutPhrase } from "./reply-detection";
+import { isValidSingleRecipient, assertNoHeaderInjection, assertCompliantFooter } from "./contact-endpoint";
 import { logOutreachEvent } from "./audit";
 
 type Db = PrismaClient | Prisma.TransactionClient;
@@ -108,6 +107,15 @@ export interface CreateOutreachDraftParams {
  * either.
  */
 export async function createOutreachDraftInTx(tx: Db, params: CreateOutreachDraftParams) {
+    // Recipient format / header-injection only — NOT the footer-compliance
+    // check assertValidDraftContent also runs at edit time: an initial
+    // TEMPLATE_A draft's footer comes straight from an already-validated
+    // template (see template.ts's own assertValidTemplateFields), and
+    // readiness.ts's own internal test fixtures intentionally use a
+    // non-commercial footer for a check that never leaves isTest/allowlisted
+    // recipients — this only closes "invalid content can consume an attempt
+    // first" for the part every caller must satisfy regardless.
+    assertValidRecipientAndHeaders(params.content);
     const existing = await tx.outreachMessage.findUnique({ where: { dedupeKey: params.dedupeKey } });
     if (existing) return existing;
     const message = await tx.outreachMessage.create({
@@ -149,22 +157,33 @@ export async function createOutreachDraft(params: CreateOutreachDraftParams, db:
  * be superseded" — the caller renders that as "already in flight".
  */
 /**
+ * The recipient-format/header-injection half of draft validation — split out
+ * from the footer-compliance check below so it can run at EVERY stage a
+ * message's content is ever written or re-checked (initial creation,
+ * edit/regenerate, approval, and dispatch's own commit), not only at the
+ * edit boundary. Without this at creation/approval/commitment, invalid
+ * content could ride all the way to an OutreachAttempt (consuming a daily-cap
+ * slot and an attempt) before buildRawMessage finally caught it at send time.
+ */
+export function assertValidRecipientAndHeaders(content: Pick<DraftContent, "to" | "subject" | "threading">): void {
+    if (!isValidSingleRecipient(content.to)) throw new Error("invalid recipient: exactly one mailbox address is required");
+    assertNoHeaderInjection(content.subject, "subject");
+    if (content.threading.inReplyTo) assertNoHeaderInjection(content.threading.inReplyTo, "inReplyTo");
+    if (content.threading.references) assertNoHeaderInjection(content.threading.references, "references");
+}
+
+/**
  * Validated once here, at the EDIT boundary (the approval UI's "To" field is
  * a plain editable text input), and again at buildRawMessage — the actual
  * RFC822-building boundary — so a CRLF-injected Bcc or a comma-separated
  * recipient list can never reach either a stored draft or a sent message.
  */
 function assertValidDraftContent(content: DraftContent): void {
-    if (!isValidSingleRecipient(content.to)) throw new Error("invalid recipient: exactly one mailbox address is required");
-    assertNoHeaderInjection(content.subject, "subject");
-    if (content.threading.inReplyTo) assertNoHeaderInjection(content.threading.inReplyTo, "inReplyTo");
-    if (content.threading.references) assertNoHeaderInjection(content.threading.references, "references");
+    assertValidRecipientAndHeaders(content);
     // Required content, enforced server-side rather than trusted from the
     // caller: an empty or non-compliant footer would leave an approved,
-    // sent message with no opt-out instructions at all.
-    if (!containsOptOutPhrase(content.footer)) {
-        throw new Error("invalid footer: it must contain an opt-out instruction (e.g. \"reply 'no thanks' and I'll stop\")");
-    }
+    // sent message with no opt-out instructions (or mailing address) at all.
+    assertCompliantFooter(content.footer, "footer");
 }
 
 /** The ordinary "edit a draft" source statuses. Send-again needs a DIFFERENT set (FAILED/UNKNOWN_DELIVERY) — see the `allowedStatuses` param below, which callers pass explicitly rather than this default silently growing to cover both. */
@@ -174,10 +193,19 @@ export async function createNewGeneration(
     messageId: string,
     content: DraftContent,
     db: PrismaClient = prisma,
-    opts: { allowedStatuses?: readonly string[] } = {},
+    opts: { allowedStatuses?: readonly string[]; targetStatus?: "DRAFT" | "READY" } = {},
 ) {
     assertValidDraftContent(content);
     const allowedStatuses = opts.allowedStatuses ?? DEFAULT_EDITABLE_STATUSES;
+    // Personal/follow-up edits and resends land back in DRAFT and need a
+    // fresh approval (spec Approval "Versions"). Template A is different: it
+    // is pre-approved via the TEMPLATE's own standing approval and never goes
+    // through the manual approval flow at all — dispatch.ts's commit only
+    // ever accepts a TEMPLATE_A message from READY, so a Template A
+    // send-again must land there directly, never at DRAFT (see
+    // sendAgainOutreachMessageAction in actions.ts, the only caller that
+    // passes this).
+    const targetStatus = opts.targetStatus ?? "DRAFT";
     return db.$transaction(async tx => {
         // Lock the message row FIRST (the same "message row" rung dispatch.ts's
         // commit and cancellation.ts's cancel both take) — an unlocked read
@@ -214,7 +242,7 @@ export async function createNewGeneration(
         // never a blind write.
         const { count } = await tx.outreachMessage.updateMany({
             where: { id: messageId, status: locked.status as OutreachStatusValue, generation: locked.generation },
-            data: { generation: nextGeneration, status: "DRAFT", approvedVersionId: null, approvalHash: null, approvedBy: null, approvedAt: null },
+            data: { generation: nextGeneration, status: targetStatus, approvedVersionId: null, approvalHash: null, approvedBy: null, approvedAt: null },
         });
         if (count === 0) throw new Error("already in flight");
         const updated = await tx.outreachMessage.findUniqueOrThrow({ where: { id: messageId } });
@@ -231,6 +259,11 @@ export async function submitForApproval(messageId: string, versionId: string, db
     return db.$transaction(async tx => {
         const version = await tx.outreachVersion.findUniqueOrThrow({ where: { id: versionId } });
         if (version.messageId !== messageId) throw new Error("version does not belong to this message");
+        // Re-checked here too (not just at the edit boundary) — this is the
+        // step that claims the daily-cap/attempt path for real, so invalid
+        // content must never get this far even if it somehow bypassed
+        // createOutreachDraftInTx/createNewGeneration.
+        assertValidRecipientAndHeaders({ to: version.to, subject: version.subject, threading: version.threading as unknown as ThreadingInfo });
         const { count } = await tx.outreachMessage.updateMany({
             where: { id: messageId, status: "DRAFT", generation: version.generation },
             data: { status: "PENDING_APPROVAL" },
@@ -274,6 +307,10 @@ export async function approveOutreachVersion(
             throw new Error(`cannot approve from status ${locked.status}`);
         }
         const threading = version.threading as unknown as ThreadingInfo;
+        // Re-checked again at approval — the step immediately before a
+        // message becomes eligible for dispatch's own commit — so invalid
+        // recipient/header content can never ride an attempt this far.
+        assertValidRecipientAndHeaders({ to: version.to, subject: version.subject, threading });
         const expected = computeApprovalHash({
             leadId: params.leadId,
             messageId: params.messageId,

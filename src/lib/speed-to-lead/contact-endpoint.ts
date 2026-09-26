@@ -1,6 +1,8 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { logOutreachEvent } from "./audit";
+import { containsOptOutPhrase } from "./reply-detection";
+import { GTR_MAILING_ADDRESS } from "./constants";
 
 type Db = PrismaClient | Prisma.TransactionClient;
 
@@ -9,9 +11,9 @@ export function normalizeEndpoint(email: string): string {
     return email.trim().toLowerCase();
 }
 
-/** Throws if `value` carries a CR, LF or NUL — the difference between a value that ends up INSIDE a header and one that injects a NEW header (Bcc, an extra Subject, ...) into the raw RFC822 message dispatch.ts builds. Applies to every value that becomes a header: `to`, `subject`, `inReplyTo`, `references`, the message id. */
+/** Throws if `value` carries any C0 control character (0x00-0x1F) or DEL (0x7F) — not just CR/LF/NUL. RFC 5322 header field bodies are printable US-ASCII/UTF-8 text; ANY control character is unsafe inside one, not only the three that most directly inject a new header. Applies to every value that becomes a header: `to`, `subject`, `inReplyTo`, `references`, the message id. */
 export function assertNoHeaderInjection(value: string, field: string): void {
-    if (/[\r\n\0]/.test(value)) throw new Error(`invalid ${field}: control characters are not allowed in a message header`);
+    if (/[\x00-\x1f\x7f]/.test(value)) throw new Error(`invalid ${field}: control characters are not allowed in a message header`);
 }
 
 /**
@@ -22,8 +24,27 @@ export function assertNoHeaderInjection(value: string, field: string): void {
  */
 const SINGLE_MAILBOX_PATTERN = /^[^\s<>,;"()[\]:\\]+@[^\s<>,;"()[\]:\\]+\.[^\s<>,;"()[\]:\\]{2,}$/;
 export function isValidSingleRecipient(to: string): boolean {
-    if (/[\r\n\0]/.test(to)) return false;
+    if (/[\x00-\x1f\x7f]/.test(to)) return false;
     return SINGLE_MAILBOX_PATTERN.test(to.trim());
+}
+
+/**
+ * A commercial footer needs BOTH an opt-out mechanism AND the sender's
+ * physical mailing address (CAN-SPAM) — a caller-controlled footer that is
+ * just the bare word "stop" satisfies an opt-out-PHRASE check alone with none
+ * of the required instructions or address actually present. The address is
+ * pinned to the one real, known-good value (same pattern as SITE_FIXED_PHONE/
+ * DISPATCH_FROM_ADDRESS), never trusted as free text from whatever called
+ * this. Shared by template.ts (Template A fields) and approval.ts (personal/
+ * follow-up drafts) so the two enforce the identical rule.
+ */
+export function assertCompliantFooter(footer: string, field: string = "footer"): void {
+    if (!containsOptOutPhrase(footer)) {
+        throw new Error(`invalid ${field}: it must contain an opt-out instruction (e.g. "reply 'no thanks' and I'll stop")`);
+    }
+    if (!footer.toLowerCase().includes(GTR_MAILING_ADDRESS.toLowerCase())) {
+        throw new Error(`invalid ${field}: it must contain the company's mailing address (${GTR_MAILING_ADDRESS})`);
+    }
 }
 
 export interface EndpointStatus {

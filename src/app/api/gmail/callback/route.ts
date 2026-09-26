@@ -3,7 +3,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { oauth2Client, saveToken } from "@/lib/gmail-client";
-import { newLeadInboxOAuthClient, leadInboxAuthUrl, isLeadInboxState, verifyAndConsumeLeadInboxState } from "@/lib/speed-to-lead/gmail-inbox-client";
+import { newLeadInboxOAuthClient, leadInboxAuthUrl, isLeadInboxState, verifyAndConsumeLeadInboxState, leadInboxStateNonce, LEAD_INBOX_STATE_COOKIE } from "@/lib/speed-to-lead/gmail-inbox-client";
 import { isApprover, DISPATCH_FROM_ADDRESS } from "@/lib/speed-to-lead/constants";
 
 // Google OAuth capture for the company integrations (Gmail + Drive scopes).
@@ -21,10 +21,15 @@ async function callerIsAdmin(): Promise<boolean> {
     return user?.role === "ADMIN" || user?.role === "MANAGER";
 }
 
-/** Never logs the raw OAuth error (it can carry the authorization code or request/response bodies) — only an allowlisted category and status code. */
+/** The only error.name values this route ever logs — a genuinely finite allowlist, not "whatever the thrower named their error". */
+const OAUTH_ERROR_CATEGORIES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "GaxiosError", "AggregateError"]);
+
+/** Never logs the raw OAuth error (it can carry the authorization code or request/response bodies) — only an allowlisted category and status code. `error.name` is copied through ONLY when it is one of the finite categories above; anything else (including an attacker-influenced or otherwise unrecognized name) falls back to "UnknownError". */
 function safeOAuthErrorCategory(error: unknown): { category: string; status: number | null } {
     const status = (error as { code?: number })?.code ?? (error as { response?: { status?: number } })?.response?.status ?? null;
-    return { category: error instanceof Error ? error.name : "UnknownError", status: typeof status === "number" ? status : null };
+    const name = error instanceof Error ? error.name : null;
+    const category = name && OAUTH_ERROR_CATEGORIES.has(name) ? name : "UnknownError";
+    return { category, status: typeof status === "number" ? status : null };
 }
 
 export async function GET(req: NextRequest) {
@@ -45,9 +50,22 @@ export async function GET(req: NextRequest) {
             return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
         }
         if (!code) {
-            return NextResponse.redirect(leadInboxAuthUrl(sessionEmail as string));
+            const authUrl = leadInboxAuthUrl(sessionEmail as string);
+            const nonce = leadInboxStateNonce(new URL(authUrl).searchParams.get("state") ?? "");
+            const redirect = NextResponse.redirect(authUrl);
+            // Double-submit cookie: binds the state to THIS browser, not just
+            // the approver's email (see verifyAndConsumeLeadInboxState) —
+            // HttpOnly/Secure/SameSite=Lax, scoped to this callback path, and
+            // expiring with the state itself.
+            if (nonce) {
+                redirect.cookies.set(LEAD_INBOX_STATE_COOKIE, nonce, {
+                    httpOnly: true, secure: true, sameSite: "lax", maxAge: 600, path: "/api/gmail/callback",
+                });
+            }
+            return redirect;
         }
-        if (!state || !(await verifyAndConsumeLeadInboxState(state, sessionEmail as string))) {
+        const cookieNonce = req.cookies.get(LEAD_INBOX_STATE_COOKIE)?.value ?? null;
+        if (!state || !(await verifyAndConsumeLeadInboxState(state, sessionEmail as string, cookieNonce))) {
             return NextResponse.json({ error: "Invalid, expired, or already-used state" }, { status: 400 });
         }
         try {

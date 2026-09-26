@@ -80,6 +80,27 @@ test("ARC case: Google's receiving header carries no arc= verdict at all — the
     assert.equal(verdict.trusted, false);
 });
 
+test("ARC case: a non-Google topmost Authentication-Results header claiming arc=pass must never reach the ARC fallback", () => {
+    const headers = [
+        { name: "Authentication-Results", value: "attacker.example; arc=pass; dkim=fail" },
+        { name: "ARC-Authentication-Results", value: "i=1; mx.google.com; dkim=pass header.d=gtr-sales.example.com; dmarc=pass header.from=gtr-sales.example.com" },
+    ];
+    const verdict = authenticateMessage(headers, "website@gtr-sales.example.com", env);
+    assert.equal(verdict.trusted, false);
+});
+
+test("ARC case: only the FIRST ARC set (i=1) is trusted — a later, higher-instance hop's claim is ignored even if it is topmost", () => {
+    const headers = [
+        { name: "Authentication-Results", value: "mx.google.com; arc=pass; dkim=fail" },
+        // Topmost in array order (newest hop) but instance 2 — must not be
+        // read as "the first Google hop" just because it is first in the array.
+        { name: "ARC-Authentication-Results", value: "i=2; mx.google.com; dkim=pass header.d=gtr-sales.example.com; dmarc=pass header.from=gtr-sales.example.com" },
+        { name: "ARC-Authentication-Results", value: "i=1; some.other.host; dkim=fail" },
+    ];
+    const verdict = authenticateMessage(headers, "website@gtr-sales.example.com", env);
+    assert.equal(verdict.trusted, false);
+});
+
 test("DKIM and DMARC domains must be independently matched — a DKIM-domain match with no aligned DMARC From-domain is rejected", () => {
     const headers = [{ name: "Authentication-Results", value: "mx.google.com; dkim=pass header.d=google.com; dmarc=pass" }];
     // dmarc=pass but no header.from= at all — the old code fell back to

@@ -43,6 +43,8 @@ export function newLeadInboxOAuthClient() {
 
 const LEAD_INBOX_STATE_PREFIX = "leadinbox.";
 const LEAD_INBOX_STATE_TTL_MS = 10 * 60 * 1000;
+/** Double-submit cookie set alongside the state redirect and checked back at the callback — see verifyAndConsumeLeadInboxState. */
+export const LEAD_INBOX_STATE_COOKIE = "stl_oauth_nonce";
 
 function leadInboxStateSecret(): string {
     return process.env.NEXTAUTH_SECRET ?? "";
@@ -69,12 +71,34 @@ export function isLeadInboxState(state: string | null): boolean {
     return !!state && state.startsWith(LEAD_INBOX_STATE_PREFIX);
 }
 
+/** The nonce embedded in a minted state — used by the route to set the double-submit cookie right after generating the redirect URL, without changing mintLeadInboxState's own return shape. */
+export function leadInboxStateNonce(state: string): string | null {
+    if (!isLeadInboxState(state)) return null;
+    try {
+        const decoded = Buffer.from(state.slice(LEAD_INBOX_STATE_PREFIX.length), "base64url").toString("utf8");
+        const parts = decoded.split(":");
+        return parts.length === 4 ? parts[1] : null;
+    } catch {
+        return null;
+    }
+}
+
 /**
- * Verifies the signature, expiry and originating session, then CONSUMES the
- * state so the same authorization redirect can never be replayed: the unique
- * key insert below throws if this exact nonce was already spent.
+ * Verifies the signature, expiry, originating session AND originating
+ * BROWSER, then CONSUMES the state so the same authorization redirect can
+ * never be replayed: the unique key insert below throws if this exact nonce
+ * was already spent.
+ *
+ * `cookieNonce` binds the state to the browser that started this flow, not
+ * just the approver's EMAIL — for this single-approver system the email is
+ * one fixed, unchanging value, so email-binding alone means a state minted
+ * for one browser/tab is redeemable by ANY later request that happens to be
+ * authenticated as Justin (a different browser, a copied URL, ...). The
+ * nonce is also written to an HttpOnly cookie when the flow starts
+ * (route.ts's `!code` branch); only the browser holding that cookie can ever
+ * complete it — the standard double-submit-cookie CSRF pattern.
  */
-export async function verifyAndConsumeLeadInboxState(state: string, sessionEmail: string): Promise<boolean> {
+export async function verifyAndConsumeLeadInboxState(state: string, sessionEmail: string, cookieNonce: string | null): Promise<boolean> {
     if (!isLeadInboxState(state) || !leadInboxStateSecret()) return false;
     let decoded: string;
     try {
@@ -85,6 +109,7 @@ export async function verifyAndConsumeLeadInboxState(state: string, sessionEmail
     const parts = decoded.split(":");
     if (parts.length !== 4) return false;
     const [email, nonce, issuedAtRaw, sig] = parts;
+    if (!cookieNonce || nonce !== cookieNonce) return false;
     const issuedAt = Number(issuedAtRaw);
     if (!Number.isFinite(issuedAt) || Date.now() - issuedAt > LEAD_INBOX_STATE_TTL_MS) return false;
     if (email !== sessionEmail) return false;

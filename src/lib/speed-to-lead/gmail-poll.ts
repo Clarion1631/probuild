@@ -28,6 +28,8 @@ interface ParsedMessage {
     from: string;
     headers: RawHeader[];
     bodyText: string;
+    /** The machine-readable `message/delivery-status` MIME part, if this is a `multipart/report` DSN — "" for an ordinary message. */
+    deliveryStatusText: string;
     internalDateMs: number;
 }
 
@@ -51,7 +53,16 @@ function htmlToPlainText(html: string): string {
         .replace(/<\/(?:p|div)>/gi, "\n");
     text = text.replace(/<blockquote[^>]*>([\s\S]*?)<\/blockquote>/gi, (_match, inner: string) => {
         const innerPlain = inner.replace(/<[^>]+>/g, " ");
-        return innerPlain.split("\n").map(line => `> ${line.trim()}`).join("\n");
+        // Leading/trailing "\n" force the quoted lines onto their OWN
+        // line(s), whether or not the source HTML runs straight from
+        // preceding/following text into the tag with no whitespace of its
+        // own (e.g. "Thanks<blockquote>...no thanks...</blockquote>"). Without
+        // it the "> " prefix lands mid-line ("Thanks> ...no thanks..."),
+        // which does not start with ">" and so is never recognized as quoted
+        // by stripQuotedText's line-based filter — a bounced-back copy of our
+        // OWN opt-out footer, quoted in a genuine reply, then reads as the
+        // REPLIER'S OWN opt-out.
+        return `\n${innerPlain.split("\n").map(line => `> ${line.trim()}`).join("\n")}\n`;
     });
     return text.replace(/<[^>]+>/g, " ");
 }
@@ -68,6 +79,26 @@ function extractPlainText(payload: unknown): string {
     }
     if (part.mimeType === "text/html" && part.body?.data) {
         return htmlToPlainText(Buffer.from(part.body.data, "base64url").toString("utf8"));
+    }
+    return "";
+}
+
+/**
+ * RFC 3464/1894 machine-readable DSN fields live in a SIBLING
+ * `message/delivery-status` MIME part of a `multipart/report`, never inside
+ * the human-readable `text/plain`/`text/html` part `extractPlainText` walks —
+ * a real bounce's `Final-Recipient`/`Original-Recipient` fields there were
+ * never read at all before this.
+ */
+function extractDeliveryStatusText(payload: unknown): string {
+    if (!payload || typeof payload !== "object") return "";
+    const part = payload as { mimeType?: string; body?: { data?: string }; parts?: unknown[] };
+    if (part.mimeType === "message/delivery-status" && part.body?.data) {
+        return Buffer.from(part.body.data, "base64url").toString("utf8");
+    }
+    for (const child of part.parts ?? []) {
+        const found = extractDeliveryStatusText(child);
+        if (found) return found;
     }
     return "";
 }
@@ -94,36 +125,58 @@ async function fetchMessage(gmail: ReturnType<typeof gmailClientFor>, id: string
         from: fromEmail.trim().toLowerCase(),
         headers,
         bodyText: extractPlainText(res.data.payload),
+        deliveryStatusText: extractDeliveryStatusText(res.data.payload),
         internalDateMs: res.data.internalDate ? Number(res.data.internalDate) : Date.now(),
     };
 }
 
-/** RFC 3464 DSN bounces name the address that actually failed in a Final-Recipient/Original-Recipient (or, for some MTAs, an X-Failed-Recipients) header — never assume it is the mailer-daemon From address itself. */
-function extractFailedRecipient(msg: { headers: RawHeader[]; bodyText: string }): string | null {
+/** RFC 3464 DSN bounces name the address that actually failed in a Final-Recipient/Original-Recipient (or, for some MTAs, an X-Failed-Recipients) header — never assume it is the mailer-daemon From address itself. Checks the machine-readable `message/delivery-status` part FIRST (where a real DSN actually carries these fields), falling back to the human-readable body for MTAs that only echo them there. */
+function extractFailedRecipient(msg: { headers: RawHeader[]; bodyText: string; deliveryStatusText: string }): string | null {
     const xFailed = msg.headers.find(h => h.name.toLowerCase() === "x-failed-recipients")?.value;
     if (xFailed) return xFailed.split(",")[0]?.trim().toLowerCase() || null;
-    const dsnMatch = /(?:Final|Original)-Recipient:\s*rfc822;\s*<?([^\s>]+@[^\s>]+)>?/i.exec(msg.bodyText);
+    const dsnPattern = /(?:Final|Original)-Recipient:\s*rfc822;\s*<?([^\s>]+@[^\s>]+)>?/i;
+    const dsnMatch = dsnPattern.exec(msg.deliveryStatusText) ?? dsnPattern.exec(msg.bodyText);
     if (dsnMatch) return dsnMatch[1].trim().toLowerCase();
     return null;
 }
 
-/** Leads we have actually contacted at this exact address (a SENT/DISPATCHING/UNKNOWN_DELIVERY OutreachVersion.to) — never a Client row's current email, which misses an address that changed, an additional/duplicate client sharing it, or a still-resolving UNKNOWN_DELIVERY send. */
-const CONTACTED_STATUSES = ["SENT", "DISPATCHING", "UNKNOWN_DELIVERY"] as const;
+/**
+ * Leads we have actually contacted at this exact address — sourced from
+ * OutreachAttempt (a durable, immutable record of every real dispatch commit)
+ * joined to the SPECIFIC version it actually sent, never from the message's
+ * CURRENT status or an arbitrary version under it. Two reasons this must not
+ * be `OutreachMessage.status IN (...) AND versions.some(to = email)`, the
+ * previous shape:
+ *   1. "Send again" (actions.ts) can return a previously-SENT message to
+ *      DRAFT/APPROVED for a retry — its CURRENT status would then no longer
+ *      be SENT/DISPATCHING/UNKNOWN_DELIVERY, silently hiding a real past
+ *      contact that undeniably happened.
+ *   2. `versions.some` matches ANY version ever created under the message,
+ *      including one from a different generation that was edited but NEVER
+ *      actually dispatched — that generation's `to` address was never really
+ *      contacted just because some OTHER generation of the same message was.
+ * An attempt's own outcome (never FAILED — a definite submit-time rejection,
+ * never actually delivered) is the correct predicate; NULL (still
+ * DISPATCHING/UNKNOWN_DELIVERY) and SENT both count.
+ */
 async function findLeadIdsContactedAt(db: PrismaClient, email: string): Promise<Set<string>> {
-    const messages = await db.outreachMessage.findMany({
-        where: { status: { in: [...CONTACTED_STATUSES] }, versions: { some: { to: { equals: email, mode: "insensitive" } } } },
-        select: { leadId: true },
-    });
-    return new Set(messages.map(m => m.leadId));
+    const rows = await db.$queryRaw<{ leadId: string }[]>`
+        SELECT DISTINCT m."leadId" AS "leadId"
+        FROM "OutreachAttempt" a
+        JOIN "OutreachVersion" v ON v.id = a."versionId"
+        JOIN "OutreachMessage" m ON m.id = a."messageId"
+        WHERE (a.outcome IS NULL OR a.outcome != 'FAILED') AND LOWER(v.to) = LOWER(${email})`;
+    return new Set(rows.map(r => r.leadId));
 }
 
-/** Leads correlated by Gmail THREAD to a message we sent — catches a reply that arrives from a different address than the one we emailed. */
+/** Leads correlated by Gmail THREAD to a message we sent — catches a reply that arrives from a different address than the one we emailed. Same OutreachAttempt-sourced predicate as findLeadIdsContactedAt above, for the same reasons. */
 async function findLeadIdsByThread(db: PrismaClient, threadId: string): Promise<Set<string>> {
-    const attempts = await db.outreachAttempt.findMany({
-        where: { threadId, message: { status: { in: [...CONTACTED_STATUSES] } } },
-        select: { message: { select: { leadId: true } } },
-    });
-    return new Set(attempts.map(a => a.message.leadId));
+    const rows = await db.$queryRaw<{ leadId: string }[]>`
+        SELECT DISTINCT m."leadId" AS "leadId"
+        FROM "OutreachAttempt" a
+        JOIN "OutreachMessage" m ON m.id = a."messageId"
+        WHERE a."threadId" = ${threadId} AND (a.outcome IS NULL OR a.outcome != 'FAILED')`;
+    return new Set(rows.map(r => r.leadId));
 }
 
 function isGoogleApiError(error: unknown, status: number): boolean {
@@ -199,9 +252,24 @@ async function processMessage(db: PrismaClient, gmail: ReturnType<typeof gmailCl
     if (classification === "bounce") {
         const failedRecipient = extractFailedRecipient(parsed);
         if (failedRecipient) {
-            await markEndpointBounced(failedRecipient, db);
+            // Contact correlation FIRST, suppression only if it is non-empty.
+            // classifyInboundMessage's `isBounce` is a plain From-address/
+            // Content-Type pattern match — trivially forgeable by anyone
+            // sending mail (no authentication is required or even possible
+            // for a real bounce, since bounces are generated unsigned by
+            // intermediate MTAs) — so ANYONE can shape a message that reads
+            // as a bounce and name an arbitrary `X-Failed-Recipients` address.
+            // Suppressing that address unconditionally (the previous shape)
+            // let a forged bounce silently suppress an address Speed-to-Lead
+            // never even contacted, in every mode including OFF (this poll
+            // runs regardless of mode). Scoping suppression to an address we
+            // can actually prove we dispatched to closes that without
+            // requiring authentication real bounces could never satisfy.
             const leadIds = await findLeadIdsContactedAt(db, failedRecipient);
-            for (const leadId of leadIds) await cancelMessagesForLead(leadId, "bounce", db);
+            if (leadIds.size > 0) {
+                await markEndpointBounced(failedRecipient, db);
+                for (const leadId of leadIds) await cancelMessagesForLead(leadId, "bounce", db);
+            }
         }
         return;
     }

@@ -103,8 +103,10 @@ export function isAllowlistedRecipient(email: string, env: NodeJS.ProcessEnv = p
 
 export const SITE_FIXED_PHONE = "+1 (360) 200-1521";
 export const RICHARD_CALENDLY_PREFIX = "https://calendly.com/rlord-goldentouchremodeling/";
+/** CAN-SPAM: the company's own mailing address, required in every commercial footer — pinned to the one real, known-good value the same way SITE_FIXED_PHONE/DISPATCH_FROM_ADDRESS are, never trusted as free text from a caller. An opt-out WORD alone (e.g. a bare "stop") is not a compliant footer without this. */
+export const GTR_MAILING_ADDRESS = "5305 NE 121st Ave Suite 310, Vancouver, WA 98682";
 export const COMMERCIAL_FOOTER =
-    "Golden Touch Remodeling, 5305 NE 121st Ave Suite 310, Vancouver, WA 98682. " +
+    `Golden Touch Remodeling, ${GTR_MAILING_ADDRESS}. ` +
     "If you'd rather not hear from me, reply 'no thanks' and I'll stop.";
 export const DISPATCH_FROM_ADDRESS = "gtrsupport@goldentouchremodeling.com";
 export const MESSAGE_ID_DOMAIN = "goldentouchremodeling.com";
