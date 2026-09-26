@@ -51,11 +51,85 @@ jobs:
       - name: Apply committed migrations to the throwaway database
         run: npx prisma migrate deploy
 
+      # Round-2 gap fixes (acceptance tests 4, 9, 21, 22): the intake route
+      # handler itself (mode-gate ordering, 32KB cap, generic 401, response
+      # shape) and Booked/Called/the 09:00 digest/promoteLeadToReal's
+      # no-new-alert guarantee had zero coverage before this round. Same
+      # ordering reason as the two steps below (must run before the
+      # known-red migration-match assertion, see its own comment).
+      - name: Speed-to-Lead v1a round-2 fixes (intake route, tracking, digest) against real Postgres
+        run: npx tsx --test tests/speed-to-lead-intake-route.test.ts tests/speed-to-lead-tracking-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # Speed-to-Lead (PB-leads-001) v1a real-Postgres races: intake
+      # (fallback-first, webhook-first, concurrent webhook delivery for one
+      # submissionId, cross-channel dedupe) and alert claim/deliver
+      # concurrency. Both files are wired into package.json's test:unit, but
+      # test:unit ALSO runs in the "build" job below, which has no Postgres
+      # service and never sets SPEED_TO_LEAD_TEST_URL — their own `skip`
+      # guard means they silently no-op there, so this is the only place they
+      # actually run. `migrate deploy` above already applied this feature's
+      # migration to probuild_migrations, so no separate apply step is
+      # needed here.
+      #
+      # Placed BEFORE "Assert the result matches production's shape" (not
+      # after, unlike most DB-gated steps in this job): that assertion is
+      # EXPECTED to fail on this PR until R1 (Justin applies this migration
+      # to prod and refreshes prisma/prisma-blind-spots.json — see the PR
+      # description) — its blind-spots check can't yet know about tables
+      # that don't exist in prod. A step ordered after a failing step never
+      # runs at all (this job has no continue-on-error), so these two would
+      # otherwise never execute in CI. This ordering is scoped to just this
+      # PR's own new tests; the pre-existing steps below the assertion are
+      # left exactly where they were.
+      #
+      # Round-3 fix: these two files run in SEPARATE `tsx --test` invocations,
+      # sequentially — not the single combined invocation round 1 used. Node's
+      # test runner runs the files it's given as concurrent OS processes
+      # against the SAME shared Postgres service; intake-db.test.ts's rows are
+      # now cleaned up in a `finally` block (round 3), but cleanup alone does
+      # not stop alerts-db.test.ts's own "sink hit exactly once" assertion
+      # from picking up an intake-db row that is briefly PENDING and due
+      # DURING the overlap between the two files' concurrent runs, before
+      # intake-db's cleanup for that row has run — reproduced in CI even after
+      # the cleanup fix landed. Running intake-db.test.ts to completion
+      # (including every one of its `finally` blocks) before alerts-db.test.ts
+      # even starts removes the overlap entirely, rather than narrowing it.
+      - name: Speed-to-Lead v1a intake races against real Postgres
+        run: npx tsx --test tests/speed-to-lead-intake-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      - name: Speed-to-Lead v1a alert races against real Postgres
+        run: npx tsx --test tests/speed-to-lead-alerts-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # The inbox poll's windowed scan (watermark, ledger, stale alert),
+      # against real Postgres for CompanySettings/LeadInboxMessage/
+      # LeadIntakeEvent, with a fake Gmail mailbox (require()-patched, same
+      # technique as tests/takeoff-convert-tax.test.ts) standing in for the
+      # Google API — no real Gmail account is ever touched. Same ordering
+      # reason as above.
+      - name: Speed-to-Lead v1a inbox poll (fake Gmail) against real Postgres
+        run: npx tsx --test tests/speed-to-lead-gmail-poll.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # The schema gap the baseline recorded is now closed by
       # 20260814120000_missing_fk_indexes, so `migrate deploy` above already
       # produces the final shape and there is no separate gap file to apply.
       # prisma/EXPECTED_SCHEMA_GAP.sql was deleted with that migration; an
       # absent gap file means the only remaining diff is PRISMA_PHANTOM_DIFF.sql.
+      #
+      # KNOWN RED ON THIS PR (see description): the blind-spots half of this
+      # assertion will report RLS enabled on the 5 new Speed-to-Lead tables
+      # "but not in production's snapshot" until Justin's R1 step. Every step
+      # below this one is consequently skipped on this PR's CI run (no
+      # continue-on-error in this job) — a pre-existing structural property
+      # of this job (any migration needing the same R1 ordering would hit
+      # it), not something this PR's diff changes about the job itself.
       - name: Assert the result matches production's shape
         run: node scripts/check-migrations-match.mjs
 
@@ -601,6 +675,14 @@ jobs:
       - name: Build
         run: npm run build 2>&1 | tee /tmp/build-output.txt
         env:
+          # Speed-to-Lead v1a's 4 new Prisma models are enough to push next
+          # build's internal TypeScript phase over this runner's default
+          # heap limit ("Ineffective mark-compacts near heap limit ...
+          # JavaScript heap out of memory") — the same regression class the
+          # full-build v1 (#557) hit with its larger ~9-model schema addition
+          # and fixed the same way. ubuntu-latest runners carry 7GB; 6GB
+          # leaves headroom for the OS and the rest of the toolchain.
+          NODE_OPTIONS: --max-old-space-size=6144
           NEXT_TELEMETRY_DISABLED: 1
           NEXT_PUBLIC_SUPABASE_URL: https://ghzdbzdnwjxazvmcefbh.supabase.co
           NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
@@ -785,6 +867,11 @@ jobs:
       - name: Build application
         run: npm run build
         env:
+          # See the "Build" step's comment in the "build" job above — this is
+          # the step that was actually observed FAILING with a JavaScript
+          # heap OOM during next build's TypeScript phase; the fix is
+          # identical.
+          NODE_OPTIONS: --max-old-space-size=6144
           NEXT_TELEMETRY_DISABLED: 1
 
       # These assert invariants nothing else does: money lock ordering, portal

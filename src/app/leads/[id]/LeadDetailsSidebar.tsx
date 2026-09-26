@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import LeadStageDropdown from "./LeadStageDropdown";
+import SpeedToLeadBookedCalledButtons from "./SpeedToLeadBookedCalledButtons";
 import EditLeadModal from "./EditLeadModal";
 import GoogleMapPreview from "@/components/GoogleMapPreview";
 import GoogleMapsAutocomplete from "@/components/GoogleMapsAutocomplete";
@@ -36,13 +37,15 @@ interface LeadDetailsSidebarProps {
     initialMessage: string | null;
     managerId?: string | null;
     managerName?: string | null;
+    /** Speed-to-Lead (PB-leads-001) v1a — Justin-only Junk/Promote, computed server-side. */
+    speedToLeadApprover?: boolean;
 }
 
 export default function LeadDetailsSidebar({
     leadId, leadName, leadSource, leadStage, expectedStartDate, targetRevenue, location, projectType,
     clientId, clientName, clientEmail, clientAdditionalEmail, clientPhone, clientAddress, clientCity, clientState, clientZip,
     clientTaxExemptCertUrl = null, clientTaxExemptCertExpiresAt = null, clientTaxExemptCertNote = null,
-    initialMessage, managerId, managerName,
+    initialMessage, managerId, managerName, speedToLeadApprover = false,
 }: LeadDetailsSidebarProps) {
     const router = useRouter();
 
@@ -391,6 +394,8 @@ export default function LeadDetailsSidebar({
                             <span className="text-sm text-slate-600">Lead Stage</span>
                             <LeadStageDropdown leadId={leadId} currentStage={leadStage} variant="pill" />
                         </div>
+
+                        <SpeedToLeadBookedCalledButtons leadId={leadId} isApprover={speedToLeadApprover} />
 
                         <DetailRow label="Lead Source" value={leadSource} fieldKey="source" />
                         <DetailRow label="Tags" value={null} fieldKey="tags" />
