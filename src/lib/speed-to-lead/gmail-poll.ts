@@ -85,18 +85,32 @@ export const STALE_SCAN_ALERT_MS = 6 * 60 * 60 * 1000;
  * outage.
  *
  * Belt-and-suspenders: `runReconciliationSweep` (below) re-scans the
- * trusted-sender query from `max(cutoff, dbNow - RECONCILE_WINDOW_MS)` once
- * a day (and immediately on the first poll after any gap over a day —
- * `isReconcileDue`), REGARDLESS of the watermark. If the watermark is ever
- * wrong for some other reason — a hand edit, a migration, a bug not yet
- * found — the sweep still finds and ledgers anything the incremental scan
- * missed within a day, and pushes one health alert reporting how many
- * messages it recovered.
+ * trusted-sender query from `max(cutoff, lastVerifiedReconcileBoundary -
+ * RECONCILE_FLOOR_MARGIN_MS)` once a day (and immediately on the first poll
+ * after any gap over a day — `isReconcileDue`), REGARDLESS of the watermark.
+ * If the watermark is ever wrong for some other reason — a hand edit, a
+ * migration, a bug not yet found — the sweep still finds and ledgers
+ * anything the incremental scan missed within a day, and pushes one health
+ * alert reporting how many messages it recovered.
+ *
+ * FIXED (Codex 3c, follow-up to round-9): the floor used to be `dbNow -
+ * RECONCILE_WINDOW_MS` (a fixed 14-day lookback from "now"). That floor
+ * moves forward every time it is computed, so a polling gap longer than the
+ * window can walk it right past a message that arrived just after the
+ * watermark corrupted — a lead one minute after a corrupted T+96h watermark,
+ * with no poll for 15 days, would sit before a floor of "now - 14 days" and
+ * never be recovered. The floor now tracks `lastVerifiedReconcileBoundary`
+ * (`RECONCILE_LAST_RECONCILED_KEY`'s own timestamp, clamped to never read
+ * ahead of `dbClockNow`) minus a small margin instead, so a sweep resuming
+ * after ANY gap length starts from where the last completed sweep actually
+ * left off, not from a point relative to whenever it happens to run again.
+ * With no completed sweep yet, the floor is the cutoff — the same as
+ * before.
  */
 export const RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000;
-/** How far back the reconciliation sweep looks, regardless of the watermark. */
-export const RECONCILE_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
-/** Durable "last completed a full sweep" marker — governs `isReconcileDue`, independent of the scan watermark it exists to double-check. */
+/** Margin the floor sits behind `lastVerifiedReconcileBoundary` — the same overlap idea as `SCAN_OVERLAP_MS`, sized small since the boundary is a verified point, not an estimate. */
+export const RECONCILE_FLOOR_MARGIN_MS = 60 * 60 * 1000;
+/** Durable "last completed a full sweep" marker — governs `isReconcileDue`, AND (Codex 3c) doubles as `lastVerifiedReconcileBoundary` for the next sweep's floor. Independent of the scan watermark it exists to double-check. */
 export const RECONCILE_LAST_RECONCILED_KEY = "speedToLeadReconcileLastCompletedAt";
 /** Durable resume state (JSON) for a sweep that has not yet finished a full pass — its fixed window floor, Gmail page token, and running recovered count. */
 export const RECONCILE_PROGRESS_KEY = "speedToLeadReconcileProgress";
@@ -434,6 +448,14 @@ async function saveReconcileProgress(db: PrismaClient, progress: ReconcileProgre
     await db.automationSetting.upsert({ where: { key: RECONCILE_PROGRESS_KEY }, create: { key: RECONCILE_PROGRESS_KEY, value }, update: { value } });
 }
 
+/** Parsed epoch ms of `RECONCILE_LAST_RECONCILED_KEY`, or `null` if it is absent or unparsable. */
+async function loadLastReconciledAtMs(db: PrismaClient): Promise<number | null> {
+    const last = await db.automationSetting.findUnique({ where: { key: RECONCILE_LAST_RECONCILED_KEY } });
+    if (!last) return null;
+    const lastMs = Date.parse(last.value);
+    return Number.isFinite(lastMs) ? lastMs : null;
+}
+
 /**
  * Is a reconciliation sweep due? An interrupted pass (progress already on
  * file) always continues. Otherwise it is due once a day, tracked by
@@ -441,13 +463,20 @@ async function saveReconcileProgress(db: PrismaClient, progress: ReconcileProgre
  * poll gap wiped out the memory of when) is due immediately, which is also
  * what makes this cover "the first poll after any gap over a day" with no
  * separate check: a gap that long ages the marker past the interval too.
+ *
+ * FIXED (Codex item 4): a marker in the FUTURE — negative elapsed against
+ * `dbClockNow` — is corrupted (a clock anomaly, a hand edit, a migration),
+ * not a sign the sweep just ran. It gets the same treatment as an absent
+ * marker: due immediately, rather than silently sitting out an interval that
+ * counts down from a timestamp that has not happened yet from the DB
+ * clock's own point of view.
  */
 async function isReconcileDue(db: PrismaClient, dbClockNow: Date): Promise<boolean> {
     if (await loadReconcileProgress(db)) return true;
-    const last = await db.automationSetting.findUnique({ where: { key: RECONCILE_LAST_RECONCILED_KEY } });
-    if (!last) return true;
-    const lastMs = Date.parse(last.value);
-    return !Number.isFinite(lastMs) || dbClockNow.getTime() - lastMs >= RECONCILE_INTERVAL_MS;
+    const lastMs = await loadLastReconciledAtMs(db);
+    if (lastMs === null) return true;
+    const elapsedMs = dbClockNow.getTime() - lastMs;
+    return elapsedMs < 0 || elapsedMs >= RECONCILE_INTERVAL_MS;
 }
 
 /**
@@ -485,23 +514,40 @@ async function sweepListPages(db: PrismaClient, gmail: ReturnType<typeof gmailCl
 
 /**
  * The daily reconciliation sweep (V1A addendum, round-9): re-scans the
- * trusted-sender query from `max(cutoff, dbNow - RECONCILE_WINDOW_MS)`
- * regardless of the watermark, so a wrong watermark — from a clock anomaly
- * this fix's other half (`dbNow`) should already prevent, or from anything
- * else — cannot leave a message unseen for longer than a day. Idempotent via
- * the same `LeadInboxMessage` ledger the incremental scan uses:
- * `sweepListPages` never re-ledgers or re-fetches an id that already has a
- * row, so a sweep over ids the incremental scan (or an earlier sweep)
- * already ledgered costs nothing. Resumable across polls through its own
- * durable state (`RECONCILE_PROGRESS_KEY`) — a fixed window floor and a real
- * page-token resume point, so a pass that outruns one poll's budget
- * continues on the next rather than starting over. The health push (naming
- * how many were recovered) is sent, and retried on a failed send exactly
- * like the other health alerts in this file, only once the whole pass has
- * finished — before that, "recovered" is not yet a final count.
+ * trusted-sender query from `max(cutoff, lastVerifiedReconcileBoundary -
+ * RECONCILE_FLOOR_MARGIN_MS)` regardless of the watermark, so a wrong
+ * watermark — from a clock anomaly this fix's other half (`dbNow`) should
+ * already prevent, or from anything else — cannot leave a message unseen
+ * indefinitely. Idempotent via the same `LeadInboxMessage` ledger the
+ * incremental scan uses: `sweepListPages` never re-ledgers or re-fetches an
+ * id that already has a row, so a sweep over ids the incremental scan (or an
+ * earlier sweep) already ledgered costs nothing. Resumable across polls
+ * through its own durable state (`RECONCILE_PROGRESS_KEY`) — a fixed window
+ * floor and a real page-token resume point, so a pass that outruns one
+ * poll's budget continues on the next rather than starting over. The health
+ * push (naming how many were recovered) is sent, and retried on a failed
+ * send exactly like the other health alerts in this file, only once the
+ * whole pass has finished — before that, "recovered" is not yet a final
+ * count.
+ *
+ * FIXED (Codex 3c): the floor used to be `dbNow - RECONCILE_WINDOW_MS`, a
+ * fixed lookback from "now" that moves forward every time it is computed —
+ * a polling gap longer than the window could walk it past a message that
+ * arrived just after the watermark corrupted. `lastVerifiedReconcileBoundary`
+ * is `RECONCILE_LAST_RECONCILED_KEY`'s own timestamp (the point the LAST
+ * completed sweep actually verified up to), clamped so it can never read
+ * ahead of `dbClockNow` — the same clamp reasoning as `startedAt` in
+ * `runPoll`, guarding against a corrupted future marker (see
+ * `isReconcileDue`'s own fix) producing a floor in the future. With no
+ * completed sweep yet, the boundary falls back to the cutoff, matching the
+ * cutoff-only floor a first-ever sweep always had.
  */
 async function runReconciliationSweep(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, cutoffAt: Date, dbClockNow: Date, budget: RunBudget): Promise<void> {
-    let progress = await loadReconcileProgress(db) ?? { windowFromMs: Math.max(cutoffAt.getTime(), dbClockNow.getTime() - RECONCILE_WINDOW_MS), recoveredCount: 0 };
+    let progress = await loadReconcileProgress(db);
+    if (!progress) {
+        const lastVerifiedBoundaryMs = Math.min(dbClockNow.getTime(), (await loadLastReconciledAtMs(db)) ?? cutoffAt.getTime());
+        progress = { windowFromMs: Math.max(cutoffAt.getTime(), lastVerifiedBoundaryMs - RECONCILE_FLOOR_MARGIN_MS), recoveredCount: 0 };
+    }
 
     if (!progress.scanComplete) {
         const q = `${trustedSenderQuery()} after:${Math.floor(progress.windowFromMs / 1000) - 1}`;

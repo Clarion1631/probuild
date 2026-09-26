@@ -1080,3 +1080,72 @@ test("round-9: a reconciliation sweep interrupted by its own list-page budget re
         await db.$disconnect();
     }
 });
+
+test("Codex 3c: the sweep floor tracks the last verified reconcile boundary, not dbNow minus a fixed window — a lead one minute after a corrupted watermark survives a 15-day polling gap", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        const cutoff = new Date(T - 30 * 24 * HOUR);
+        // seedSettings stamps RECONCILE_LAST_RECONCILED_KEY to "now" (~T): a
+        // reconciliation sweep genuinely completed and verified coverage up
+        // to this point BEFORE the watermark corrupted forward, same as the
+        // round-9 T+96h clock-jump aftermath above.
+        const corruptedWatermark = new Date(T + 96 * HOUR);
+        await seedSettings(db, { cutoffAt: cutoff, watermarkAt: corruptedWatermark });
+
+        const missed = website("t-sweep-floor-missed", T + MINUTE);
+        mailbox = [missed];
+
+        // No poll at all for 15 days. Under the old floor (dbNow -
+        // RECONCILE_WINDOW_MS, 14 days), a sweep run this late would start
+        // its window at (T+15d - 14d) = T+1d — AFTER this message's T+1m
+        // arrival — and never see it, Codex's counterexample. The fix
+        // floors the sweep at the last VERIFIED boundary (~T) minus a small
+        // margin instead, so the 15-day gap cannot push the floor past it.
+        const resumed = await poll(db, new Date(T + 15 * 24 * HOUR));
+        assert.equal(resumed.ran, true);
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: missed.id } }))?.outcome, "PENDING", "the sweep gave it a ledger row despite the 15-day gap — the incremental scan's own window (corrupted watermark - overlap) starts long after this message and would never list it");
+        const recovery = pushes.find(p => /reconciliation/i.test(p.title));
+        assert.ok(recovery, "the recovery push fires once the sweep's pass finishes");
+        assert.match(recovery.body, /watermark was wrong/);
+        assert.match(recovery.body, /found 1 lead-sender message/);
+        assert.equal(await db.automationSetting.findUnique({ where: { key: RECONCILE_PROGRESS_KEY } }), null, "the sweep finished and cleared its own resume state");
+
+        const next = await poll(db, new Date(T + 15 * 24 * HOUR + MINUTE));
+        assert.equal(next.ran, true);
+        assert.ok(await intakeRow(db, missed.id), "the recovered lead is intaken via the normal PENDING retry, independent of any window");
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: missed.id } }))?.outcome, "INTAKE");
+        assert.equal(pushes.filter(p => /reconciliation/i.test(p.title)).length, 1, "the recovery push fires exactly once, not again on the next poll");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("Codex item 4: a last-completed-reconcile marker in the future (negative elapsed against the DB clock) is treated as due immediately, not skipped, and gets re-stamped with the clamped DB clock", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 30 * 24 * HOUR), watermarkAt: new Date(T - MINUTE) });
+        // Corrupt the marker into the future — a clock anomaly, a hand edit,
+        // a migration — the same class of bad state `dbNow`'s own clamp
+        // (round-9) protects the scan watermark against.
+        const futureMarker = new Date(T + 10 * 24 * HOUR);
+        await db.automationSetting.upsert({
+            where: { key: RECONCILE_LAST_RECONCILED_KEY },
+            create: { key: RECONCILE_LAST_RECONCILED_KEY, value: futureMarker.toISOString() },
+            update: { value: futureMarker.toISOString() },
+        });
+
+        const result = await poll(db, new Date(T));
+        assert.equal(result.ran, true);
+        assert.equal(await db.automationSetting.findUnique({ where: { key: RECONCILE_PROGRESS_KEY } }), null, "the sweep ran to completion in this one poll (nothing to recover) rather than sitting out the future-dated interval");
+        const marker = await db.automationSetting.findUnique({ where: { key: RECONCILE_LAST_RECONCILED_KEY } });
+        assert.ok(marker, "still stamped");
+        assert.notEqual(marker!.value, futureMarker.toISOString(), "the future marker was corrected, not left in place — treating it as due is what makes the sweep run and re-stamp it");
+        assert.equal(marker!.value, new Date(T).toISOString(), "re-stamped with this poll's clamped DB clock (dbClockNow), not left in the future");
+    } finally {
+        await db.$disconnect();
+    }
+});
