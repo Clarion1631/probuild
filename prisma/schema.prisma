@@ -3840,6 +3840,13 @@ model LeadInboxMessage {
   detail         String?
   notifiedAt     DateTime?
   createdAt      DateTime  @default(now())
+  /// Stamped on every failed retry attempt (scanWindow or
+  /// resolvePendingMessages) — drives fair, oldest-first pending rotation.
+  lastAttemptAt  DateTime?
+  /// Failed retry attempts. Past PENDING_STUCK_ATTEMPTS (gmail-poll.ts) a
+  /// still-PENDING row is reported to Justin as stuck instead of staying
+  /// silently invisible.
+  failedAttempts Int       @default(0)
 }
 
 /// At most one row per (lead, channel) — the transactional outbox that makes

@@ -141,6 +141,12 @@ CREATE TABLE IF NOT EXISTS "LeadInboxMessage" (
     CONSTRAINT "LeadInboxMessage_pkey" PRIMARY KEY ("gmailMessageId")
 );
 
+-- AlterTable: LeadInboxMessage — pending-retry rotation and stuck detection (round-8 finding A)
+-- statement-break
+ALTER TABLE "LeadInboxMessage" ADD COLUMN IF NOT EXISTS "lastAttemptAt" TIMESTAMP(3);
+-- statement-break
+ALTER TABLE "LeadInboxMessage" ADD COLUMN IF NOT EXISTS "failedAttempts" INTEGER NOT NULL DEFAULT 0;
+
 -- AlterTable: Lead — Booked/Called
 -- statement-break
 ALTER TABLE "Lead" ADD COLUMN IF NOT EXISTS "bookedAt" TIMESTAMP(3);

@@ -263,6 +263,39 @@ function gets(id: string) {
     return getCalls.filter(c => c.id === id).length;
 }
 
+/**
+ * Wraps a real PrismaClient so every `$transaction` it opens runs with
+ * `tx[modelName][methodName]` replaced by a function that throws — the same
+ * Proxy-around-a-real-transaction technique tests/attribution-lock-order-db
+ * .test.ts uses to inject a failure at one exact point inside an otherwise
+ * real, committed-or-rolled-back transaction. Every other property (every
+ * other model, every other method, `$disconnect`, ...) passes straight
+ * through to the real client untouched.
+ */
+function dbFailingTransactionOn(realDb: PrismaClient, modelName: string, methodName: string): PrismaClient {
+    return new Proxy(realDb, {
+        get(target, prop) {
+            if (prop !== "$transaction") return (target as unknown as Record<string | symbol, unknown>)[prop];
+            const realTransaction = (target as unknown as { $transaction: (fn: (tx: unknown) => unknown) => unknown }).$transaction;
+            return (fn: (tx: unknown) => unknown) => realTransaction((tx: unknown) => {
+                const proxiedTx = new Proxy(tx as Record<string, unknown>, {
+                    get(txTarget, txProp) {
+                        if (txProp !== modelName) return txTarget[txProp as string];
+                        const model = txTarget[txProp as string] as Record<string, unknown>;
+                        return new Proxy(model, {
+                            get(modelTarget, modelProp) {
+                                if (modelProp !== methodName) return modelTarget[modelProp as string];
+                                return async () => { throw new Error("injected boundary failure"); };
+                            },
+                        });
+                    },
+                });
+                return fn(proxiedTx);
+            });
+        },
+    }) as unknown as PrismaClient;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 test("first connected run pins the floor: mail older than the connection is never imported, and mail after it is", { skip }, async () => {
@@ -741,6 +774,146 @@ test("round-7 finding 2: a disconnect notice whose first push fails is retried e
 
         await poll(db, new Date(T + 3 * MINUTE));
         assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 1, "delivered exactly once, not re-sent on later polls");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-8 finding A: a sustained new-mail flood never starves the pending retry, and a PENDING row that crosses the stuck-attempts threshold surfaces in the batched notice", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - MINUTE) });
+
+        // An old PENDING row from an earlier ordinary `get` error (round-7
+        // finding 1's shape) — present in the fake mailbox so a direct
+        // get-by-id can reach it, but it keeps 500ing.
+        const starved = website("t14-starved", T - 10 * MINUTE, { failGets: 10 });
+        mailbox = [starved];
+        await db.leadInboxMessage.create({ data: { gmailMessageId: starved.id, outcome: "PENDING" } });
+
+        // Every poll, 50 more lead-sender messages arrive — comfortably over
+        // MAX_MESSAGE_GETS (50): if resolvePendingMessages still ran AFTER
+        // scanWindow with no reserved share (the pre-fix order), a flood
+        // this size would spend the WHOLE budget on new mail every single
+        // poll and `starved` would never get a look-in, poll after poll.
+        for (let i = 0; i < 4; i++) {
+            const flood = Array.from({ length: 50 }, (_, j) => forgedWebsite(`t14-flood-${i}-${j}`, T + i * MINUTE - j * 1000));
+            mailbox.push(...flood);
+
+            await poll(db, new Date(T + i * MINUTE));
+
+            const row = await db.leadInboxMessage.findUnique({ where: { gmailMessageId: starved.id } });
+            assert.equal(row?.outcome, "PENDING", `poll ${i}: still open, never lost`);
+            assert.equal(row?.failedAttempts, i + 1, `poll ${i}: retried despite the flood, not starved out`);
+            assert.ok(row?.lastAttemptAt && row.lastAttemptAt.getTime() >= T + i * MINUTE, `poll ${i}: lastAttemptAt advanced`);
+        }
+
+        // 4 failed attempts > PENDING_STUCK_ATTEMPTS (3): no longer "merely
+        // still retrying" — reported to Justin so it can never sit invisible
+        // and indefinite.
+        const notice = pushes.find(p => /not taken in as leads/.test(p.title));
+        assert.ok(notice, "the long-stuck row surfaces in the batched notice");
+        assert.ok(notice!.body.includes(starved.id), "names the stuck message");
+        assert.ok(notice!.body.includes("stuck retrying, not yet resolved"), "labelled as stuck, not as a plain rejection");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-8 finding B: clearing the credential and persisting the disconnect-notice pending flag are one transaction — a boundary failure leaves neither, and the next poll still produces the notice", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        // A placeholder credential value, so clearing it is observable —
+        // otherwise the field starts and stays null regardless of whether
+        // the clear itself committed or rolled back.
+        await db.companySettings.create({ data: { id: "singleton", leadInboxRefreshTokenEnc: "test-refresh-token" } });
+        connected = false;
+        authError = Object.assign(new Error("invalid_grant"), { response: { data: { error: "invalid_grant" } } });
+        ntfyUp = true;
+
+        const failingDb = dbFailingTransactionOn(db, "automationSetting", "upsert");
+        const first = await poll(failingDb, new Date(T));
+        // The injected failure throws out of recordFailure's invalid_grant
+        // branch, so runPoll's own outer catch is what actually returns —
+        // "error", not the ordinary "lead inbox not connected" — and its
+        // own (unrelated, non-transactional) recordFailure call is what
+        // schedules the 1-minute backoff below.
+        assert.equal(first.reason, "error");
+        assert.equal(
+            (await db.companySettings.findUnique({ where: { id: "singleton" } }))?.leadInboxRefreshTokenEnc,
+            "test-refresh-token",
+            "the credential clear rolled back with everything else in the failed transaction",
+        );
+        assert.equal(await db.automationSetting.findUnique({ where: { key: "speedToLeadDisconnectNoticePending" } }), null, "the pending flag never landed either — atomic, not half-applied");
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 0, "nothing to retry yet: retryDisconnectNotice saw no pending flag this poll");
+
+        // No more injected failure: the next failed poll's transaction
+        // commits both writes together. (Past the 1-minute backoff the
+        // first poll's generic-failure path scheduled.)
+        const second = await poll(db, new Date(T + 2 * MINUTE));
+        assert.equal(second.reason, "lead inbox not connected");
+        assert.equal(
+            (await db.companySettings.findUnique({ where: { id: "singleton" } }))?.leadInboxRefreshTokenEnc,
+            null,
+            "this time the credential clear committed",
+        );
+        assert.ok(await db.automationSetting.findUnique({ where: { key: "speedToLeadDisconnectNoticePending" } }), "and the pending flag committed with it, in the same transaction");
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 1, "the notice this flag exists for still goes out, right on this poll");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-8 finding C: recording the disconnect notice's delivery and clearing its pending flag are one transaction — a boundary failure leaves neither, so a later reconnect can never re-trigger the notice", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        connected = false;
+        authError = Object.assign(new Error("invalid_grant"), { response: { data: { error: "invalid_grant" } } });
+        ntfyUp = true;
+
+        // The credential-clear + pending-flag write (item B, above) succeeds
+        // normally here; only the LATER clear-the-pending-flag write, inside
+        // retryDisconnectNotice's own transaction, is made to fail.
+        const failingDb = dbFailingTransactionOn(db, "automationSetting", "delete");
+        const first = await poll(failingDb, new Date(T));
+        assert.equal(first.reason, "lead inbox not connected");
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 1, "the push itself still went out — sendPlainNtfy runs before the atomic write");
+        assert.equal(
+            await db.automationSetting.findUnique({ where: { key: "speedToLeadInboxDisconnectedAlertSent" } }),
+            null,
+            "the delivery marker did NOT commit: the pending-flag clear failed inside the SAME transaction",
+        );
+        assert.ok(
+            await db.automationSetting.findUnique({ where: { key: "speedToLeadDisconnectNoticePending" } }),
+            "...so the pending flag is still set too — atomic, it's never true that one landed without the other",
+        );
+
+        // No more injected failure: genuinely not yet delivered, so this is
+        // a real retry, not a phantom resend — and this time both halves
+        // commit together.
+        const second = await poll(db, new Date(T + MINUTE));
+        assert.equal(second.reason, "lead inbox not connected");
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 2);
+        assert.ok(await db.automationSetting.findUnique({ where: { key: "speedToLeadInboxDisconnectedAlertSent" } }), "delivered, and this time recorded");
+        assert.equal(await db.automationSetting.findUnique({ where: { key: "speedToLeadDisconnectNoticePending" } }), null, "cleared in the SAME commit as the marker above");
+
+        // Reconnect: a clean, successful poll. recordSuccessAndClearBackoff
+        // clears the delivered marker as part of ordinary recovery
+        // bookkeeping — the exact event that used to re-trigger the push
+        // when the pending flag had been left set by an earlier failed
+        // clear (round-8 finding C). It is gone now, so there is nothing
+        // left for retryDisconnectNotice to (re)send.
+        connected = true;
+        const third = await poll(db, new Date(T + 2 * MINUTE));
+        assert.equal(third.ran, true);
+        assert.equal(await db.automationSetting.findUnique({ where: { key: "speedToLeadInboxDisconnectedAlertSent" } }), null, "recordSuccessAndClearBackoff clears it on reconnect, same as before this fix");
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 2, "no third push: the pending flag was already gone, so there was nothing left to re-send");
     } finally {
         await db.$disconnect();
     }

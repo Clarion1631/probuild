@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@prisma/client";
+import { Prisma, type PrismaClient } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { acquireCronLease } from "@/lib/cron-lease";
 import { ensureLeadInboxAuth, gmailClientFor } from "./gmail-inbox-client";
@@ -89,6 +89,19 @@ const MAX_LIST_PAGES = 20;
 const MAX_MESSAGE_GETS = 50;
 const WALL_TIME_BUDGET_MS = 40_000;
 const BACKOFF_MINUTES = [1, 2, 4, 8, 15] as const;
+/**
+ * resolvePendingMessages' own reserved slice of one poll's shared get-budget
+ * (round-8 finding A) — up to half of MAX_MESSAGE_GETS, at least a few gets.
+ * It now runs BEFORE scanWindow so a sustained new-mail scan can never
+ * starve the pending-retry queue indefinitely; capping its own share in
+ * return keeps a large pending backlog from doing the same to new mail —
+ * scanWindow always gets whatever of the shared budget is left.
+ */
+const PENDING_RESERVED_GETS = Math.max(4, Math.floor(MAX_MESSAGE_GETS / 2));
+/** A PENDING row this old is reported to Justin as "stuck" (round-8 finding A) rather than staying invisible forever. */
+const PENDING_STUCK_AGE_MS = 2 * 60 * 60 * 1000;
+/** ...or one with more than this many failed attempts, whichever comes first. */
+const PENDING_STUCK_ATTEMPTS = 3;
 
 const POLL_ALERT_SENT_KEY = "speedToLeadPollAlertSentAt";
 const POLL_DISCONNECTED_ALERT_KEY = "speedToLeadInboxDisconnectedAlertSent";
@@ -164,9 +177,15 @@ class RunBudget {
     get timeLeft(): boolean {
         return Date.now() < this.deadline;
     }
-    /** A message costs at most two gets (metadata, then full), so only start one that can finish. */
-    get canStartMessage(): boolean {
-        return this.gets + 2 <= MAX_MESSAGE_GETS && this.timeLeft;
+    /**
+     * A message costs at most two gets (metadata, then full), so only start
+     * one that can finish. `maxGets` caps this call's own share of the
+     * shared budget below the run's overall MAX_MESSAGE_GETS — how
+     * resolvePendingMessages' reserved slice (round-8 finding A) is
+     * enforced, without giving scanWindow a smaller cap than before.
+     */
+    canStartMessage(maxGets: number = MAX_MESSAGE_GETS): boolean {
+        return this.gets + 2 <= Math.min(maxGets, MAX_MESSAGE_GETS) && this.timeLeft;
     }
     spendGet(): void {
         this.gets += 1;
@@ -239,6 +258,22 @@ interface ScanResult {
 }
 
 /**
+ * Stamps a failed attempt on a still-PENDING row (round-8 finding A): both
+ * `scanWindow` and `resolvePendingMessages` call this from their own catch
+ * block, so `lastAttemptAt` reflects the most recent try regardless of which
+ * one made it, and `failedAttempts` is what the "stuck" check in
+ * `reportUnacceptedMessages` reads. Best-effort — a failure to write this
+ * bookkeeping must never mask the real error the caller already logged, or
+ * throw out of a loop that has other messages left to try.
+ */
+async function recordFailedAttempt(db: PrismaClient, id: string, now: Date): Promise<void> {
+    await db.leadInboxMessage.update({
+        where: { gmailMessageId: id },
+        data: { lastAttemptAt: now, failedAttempts: { increment: 1 } },
+    }).catch(() => undefined);
+}
+
+/**
  * Lists the whole window page by page. Every id it sees gets a durable
  * PENDING ledger row THE MOMENT it is listed — before any `get` is even
  * attempted — so a message that then 404s or errors on `get`, or is deleted
@@ -253,7 +288,7 @@ interface ScanResult {
  * still PENDING from an earlier poll. An expired grant is rethrown: it is
  * not about one message.
  */
-async function scanWindow(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, afterMs: number, budget: RunBudget, attempted: Set<string>): Promise<ScanResult> {
+async function scanWindow(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, afterMs: number, budget: RunBudget, attempted: Set<string>, now: Date): Promise<ScanResult> {
     // One second earlier than the window start, so a message stamped in that
     // exact second is inside the window whether Gmail's `after:` is strict or not.
     const q = `${trustedSenderQuery()} after:${Math.floor(afterMs / 1000) - 1}`;
@@ -286,7 +321,7 @@ async function scanWindow(db: PrismaClient, gmail: ReturnType<typeof gmailClient
         for (const id of ids) {
             if (resolved.has(id)) continue;
             if (attempted.has(id)) continue;
-            if (!budget.canStartMessage) return stopped();
+            if (!budget.canStartMessage()) return stopped();
             attempted.add(id);
             try {
                 const result = await processMessage(db, gmail, id, budget);
@@ -300,6 +335,7 @@ async function scanWindow(db: PrismaClient, gmail: ReturnType<typeof gmailClient
                 if (erroredCount === 0) firstError = error;
                 erroredCount += 1;
                 console.error("[speed-to-lead] inbox message not finished; it stays PENDING for the independent retry", safeErrorCategory(error));
+                await recordFailedAttempt(db, id, now);
             }
         }
         pageToken = page.data.nextPageToken ?? undefined;
@@ -315,17 +351,27 @@ async function scanWindow(db: PrismaClient, gmail: ReturnType<typeof gmailClient
  * search again (round-7 finding 1). Skips anything `scanWindow` already
  * attempted this same poll (`attempted`), so a message that is both PENDING
  * and still inside the current window is never fetched twice. Shares the
- * scan's own `RunBudget`, so a PENDING backlog cannot make one poll run
- * unbounded — whatever it cannot finish stays PENDING and is retried next
- * poll, same as any other unfinished message.
+ * scan's own `RunBudget`, capped to its own reserved slice
+ * (`PENDING_RESERVED_GETS`) rather than the full budget — round-8 finding A:
+ * this now runs BEFORE scanWindow (below), so an unbounded pending queue
+ * could otherwise starve new mail every poll the way new mail used to
+ * starve this queue. Rotates fairly: oldest `lastAttemptAt` first, with
+ * never-yet-attempted rows (still null — listed by a scan that then ran out
+ * of budget before reaching them) treated as the oldest of all, so one
+ * unlucky row can never sit at the back of the queue forever.
  */
-async function resolvePendingMessages(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, budget: RunBudget, attempted: Set<string>): Promise<{ erroredCount: number; firstError: unknown }> {
+async function resolvePendingMessages(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, budget: RunBudget, attempted: Set<string>, now: Date): Promise<{ erroredCount: number; firstError: unknown }> {
     let erroredCount = 0;
     let firstError: unknown = null;
-    const pending = await db.leadInboxMessage.findMany({ where: { outcome: "PENDING" }, select: { gmailMessageId: true }, take: 100 });
+    const pending = await db.leadInboxMessage.findMany({
+        where: { outcome: "PENDING" },
+        select: { gmailMessageId: true },
+        orderBy: { lastAttemptAt: { sort: "asc", nulls: "first" } },
+        take: 100,
+    });
     for (const { gmailMessageId: id } of pending) {
         if (attempted.has(id)) continue;
-        if (!budget.canStartMessage) break;
+        if (!budget.canStartMessage(PENDING_RESERVED_GETS)) break;
         attempted.add(id);
         try {
             const result = await processMessage(db, gmail, id, budget);
@@ -338,6 +384,7 @@ async function resolvePendingMessages(db: PrismaClient, gmail: ReturnType<typeof
             if (erroredCount === 0) firstError = error;
             erroredCount += 1;
             console.error("[speed-to-lead] pending inbox message still unresolved", safeErrorCategory(error));
+            await recordFailedAttempt(db, id, now);
         }
     }
     return { erroredCount, firstError };
@@ -351,12 +398,27 @@ async function resolvePendingMessages(db: PrismaClient, gmail: ReturnType<typeof
  * delivered (already had been, or was just now) — callers that need to
  * durably retry something ELSE only once this succeeds (see
  * `retryDisconnectNotice`) key off this.
+ *
+ * `andThen`, when given, runs in the SAME transaction as the marker write —
+ * or, if the marker already existed from an earlier poll, alone in its own
+ * transaction — so recording delivery and a caller's own companion write can
+ * never land as one without the other (round-8 finding C). Without this, a
+ * caller that clears its own flag as a separate statement AFTER this
+ * function returns could end up with delivery recorded but its flag still
+ * set if that later statement failed — and have no way to tell it apart
+ * from "not delivered yet", since the marker alone already says delivered.
  */
-async function sendHealthAlertOnce(db: PrismaClient, key: string, title: string, body: string, now: Date): Promise<boolean> {
+async function sendHealthAlertOnce(db: PrismaClient, key: string, title: string, body: string, now: Date, andThen?: (tx: Prisma.TransactionClient) => Promise<void>): Promise<boolean> {
     try {
-        if (await db.automationSetting.findUnique({ where: { key } })) return true;
+        if (await db.automationSetting.findUnique({ where: { key } })) {
+            if (andThen) await db.$transaction(tx => andThen(tx));
+            return true;
+        }
         if (!(await sendPlainNtfy(title, body))) return false;
-        await db.automationSetting.upsert({ where: { key }, create: { key, value: now.toISOString() }, update: { value: now.toISOString() } });
+        await db.$transaction(async tx => {
+            await tx.automationSetting.upsert({ where: { key }, create: { key, value: now.toISOString() }, update: { value: now.toISOString() } });
+            if (andThen) await andThen(tx);
+        });
         return true;
     } catch (error) {
         console.error("[speed-to-lead] health alert failed", safeErrorCategory(error));
@@ -380,21 +442,34 @@ async function recordPollHealth(db: PrismaClient, startedAt: Date, finishedAt: D
  */
 async function recordFailure(db: PrismaClient, startedAt: Date, now: Date, error: unknown, opts: { backoff: boolean }): Promise<void> {
     if (isInvalidGrant(error)) {
-        await db.companySettings.upsert({
-            where: { id: SETTINGS_ID },
-            create: { id: SETTINGS_ID, leadInboxLastPollStartedAt: startedAt, leadInboxLastPollAt: null, leadInboxLastPollOk: false, leadInboxRefreshTokenEnc: null },
-            update: { leadInboxLastPollStartedAt: startedAt, leadInboxLastPollAt: null, leadInboxLastPollOk: false, leadInboxRefreshTokenEnc: null },
-        });
-        // Durable and independent of the credential (now cleared): from here
-        // on, ensureLeadInboxAuth returns a bare {ok:false} with no `error`
-        // on every later poll (this function only runs on auth.error), so
-        // this flag — not a fresh invalid_grant — is what keeps the notice
-        // retried until `retryDisconnectNotice` actually delivers it
-        // (round-7 finding 2).
-        await db.automationSetting.upsert({
-            where: { key: DISCONNECT_NOTICE_PENDING_KEY },
-            create: { key: DISCONNECT_NOTICE_PENDING_KEY, value: now.toISOString() },
-            update: { value: now.toISOString() },
+        // Clearing the credential and persisting the pending-notice flag
+        // happen in ONE transaction (round-8 finding B): a crash between the
+        // two must never leave one without the other. The credential cleared
+        // with no pending flag would mean `retryDisconnectNotice` never
+        // fires (the only other trigger, a fresh invalid_grant, cannot
+        // happen again once the credential is gone — round-7 finding 2) and
+        // the disconnect goes silent forever; the flag set with the
+        // credential still present would let the notice fire while a retry
+        // might still succeed. Atomic, only the true post-commit state is
+        // ever observed: both, or neither and the next failed poll retries
+        // this whole step from scratch.
+        await db.$transaction(async tx => {
+            await tx.companySettings.upsert({
+                where: { id: SETTINGS_ID },
+                create: { id: SETTINGS_ID, leadInboxLastPollStartedAt: startedAt, leadInboxLastPollAt: null, leadInboxLastPollOk: false, leadInboxRefreshTokenEnc: null },
+                update: { leadInboxLastPollStartedAt: startedAt, leadInboxLastPollAt: null, leadInboxLastPollOk: false, leadInboxRefreshTokenEnc: null },
+            });
+            // Durable and independent of the credential (now cleared): from
+            // here on, ensureLeadInboxAuth returns a bare {ok:false} with no
+            // `error` on every later poll (this function only runs on
+            // auth.error), so this flag — not a fresh invalid_grant — is
+            // what keeps the notice retried until `retryDisconnectNotice`
+            // actually delivers it (round-7 finding 2).
+            await tx.automationSetting.upsert({
+                where: { key: DISCONNECT_NOTICE_PENDING_KEY },
+                create: { key: DISCONNECT_NOTICE_PENDING_KEY, value: now.toISOString() },
+                update: { value: now.toISOString() },
+            });
         });
         return;
     }
@@ -460,22 +535,27 @@ async function alertIfScanStale(db: PrismaClient, now: Date): Promise<void> {
  * invalid_grant branch (the only other trigger for this alert) never runs
  * again (round-7 finding 2). Runs on every leased invocation, same as
  * `alertIfScanStale`. The pending flag is independent of the (now-cleared)
- * credential and is deleted only once `sendHealthAlertOnce` actually
- * delivers the push, so a failed send is retried next poll instead of the
- * notice going quiet forever. Never throws.
+ * credential and is cleared in the SAME transaction as the delivery record
+ * (round-8 finding C), never as a separate write afterward: a failed clear
+ * used to be able to leave delivery recorded but the pending flag still set,
+ * which would then re-fire this same push once `recordSuccessAndClearBackoff`
+ * clears the (unrelated) delivered-marker on a later, successful reconnect —
+ * a resend the credential being fixed again should never trigger. Atomic,
+ * this can't happen: either both land, or neither does and the next poll
+ * retries from scratch. Never throws.
  */
 async function retryDisconnectNotice(db: PrismaClient, now: Date): Promise<void> {
     try {
         const pending = await db.automationSetting.findUnique({ where: { key: DISCONNECT_NOTICE_PENDING_KEY } });
         if (!pending) return;
-        const delivered = await sendHealthAlertOnce(
+        await sendHealthAlertOnce(
             db,
             POLL_DISCONNECTED_ALERT_KEY,
             "Speed-to-Lead: lead inbox disconnected",
             "gtrsupport@ revoked or expired its Gmail connection. Reconnect it in Settings > Speed-to-Lead. The scan picks up everything since its last complete run once reconnected.",
             now,
+            async tx => { await tx.automationSetting.delete({ where: { key: DISCONNECT_NOTICE_PENDING_KEY } }); },
         );
-        if (delivered) await db.automationSetting.delete({ where: { key: DISCONNECT_NOTICE_PENDING_KEY } }).catch(() => undefined);
     } catch (error) {
         console.error("[speed-to-lead] disconnect notice retry failed", safeErrorCategory(error));
     }
@@ -488,10 +568,13 @@ async function retryDisconnectNotice(db: PrismaClient, now: Date): Promise<void>
  * UNACCEPTED_NOTICE_MIN_INTERVAL_MS, each covering every unreported row: a
  * burst of forged mail cannot become a wall of pushes, and nothing is lost
  * while a push waits, because rows stay unreported until a push covering
- * them is delivered. Health alerts never go through this limit. PENDING rows
- * are excluded on purpose (round-7 finding 1): a message that is merely
- * still being retried is not yet "not accepted," and reporting it here would
- * fire a false alarm on an ordinary transient `get` error. Never throws.
+ * them is delivered. Health alerts never go through this limit. An
+ * ordinarily-retrying PENDING row is excluded on purpose (round-7 finding
+ * 1): reporting it here on every ordinary transient `get` error would fire a
+ * false alarm. But a PENDING row old enough (`PENDING_STUCK_AGE_MS`) or with
+ * enough failed attempts (`PENDING_STUCK_ATTEMPTS`) is no longer "merely
+ * still being retried" — it is reported here too, as stuck, so it can never
+ * sit invisible and indefinite (round-8 finding A). Never throws.
  */
 async function reportUnacceptedMessages(db: PrismaClient, now: Date): Promise<void> {
     try {
@@ -499,15 +582,22 @@ async function reportUnacceptedMessages(db: PrismaClient, now: Date): Promise<vo
         const lastMs = last ? Date.parse(last.value) : Number.NaN;
         if (Number.isFinite(lastMs) && now.getTime() - lastMs < UNACCEPTED_NOTICE_MIN_INTERVAL_MS) return;
 
+        const stuckSince = new Date(now.getTime() - PENDING_STUCK_AGE_MS);
         const pending = await db.leadInboxMessage.findMany({
-            where: { outcome: { notIn: ["INTAKE", "PENDING"] }, notifiedAt: null },
+            where: {
+                notifiedAt: null,
+                OR: [
+                    { outcome: { notIn: ["INTAKE", "PENDING"] } },
+                    { outcome: "PENDING", OR: [{ createdAt: { lt: stuckSince } }, { failedAttempts: { gt: PENDING_STUCK_ATTEMPTS } }] },
+                ],
+            },
             orderBy: { createdAt: "asc" },
             take: 500,
             select: { gmailMessageId: true, outcome: true, detail: true },
         });
         if (pending.length === 0) return;
 
-        const lines = pending.slice(0, 5).map(m => `- Gmail id ${m.gmailMessageId}: ${m.outcome === "GONE" ? "deleted before it could be read" : m.detail ?? "not accepted"}`);
+        const lines = pending.slice(0, 5).map(m => `- Gmail id ${m.gmailMessageId}: ${m.outcome === "GONE" ? "deleted before it could be read" : m.outcome === "PENDING" ? "stuck retrying, not yet resolved" : m.detail ?? "not accepted"}`);
         if (pending.length > 5) lines.push(`- and ${pending.length - 5} more`);
         const body = [
             `${pending.length} message(s) from a lead sender (website form or Google Voice) did not become a lead. If one is a real lead, add it by hand. They are still in gtrsupport@ (check Spam and Trash too).`,
@@ -575,12 +665,17 @@ async function runPoll(db: PrismaClient, now: Date): Promise<PollResult> {
         const afterMs = Math.max(cutoffAt.getTime(), watermarkAt.getTime() - SCAN_OVERLAP_MS);
         const budget = new RunBudget();
         const attempted = new Set<string>();
-        const scan = await scanWindow(db, gmail, afterMs, budget, attempted);
-        // Independent of the window search (round-7 finding 1): resolves any
-        // still-PENDING message by a direct get-by-id, including ones the
-        // window above no longer lists at all (deleted, or now older than
-        // the window now that the watermark can advance past a PENDING id).
-        const pendingRetry = await resolvePendingMessages(db, gmail, budget, attempted);
+        // Round-8 finding A: resolvePendingMessages runs FIRST, inside its
+        // own reserved slice of the shared budget, so a sustained new-mail
+        // scan can never starve it indefinitely — it used to run only after
+        // scanWindow, which could spend the whole budget every poll. It is
+        // still independent of the window search (round-7 finding 1):
+        // resolves any still-PENDING message by a direct get-by-id,
+        // including ones the window below no longer lists at all (deleted,
+        // or now older than the window now that the watermark can advance
+        // past a PENDING id).
+        const pendingRetry = await resolvePendingMessages(db, gmail, budget, attempted, now);
+        const scan = await scanWindow(db, gmail, afterMs, budget, attempted, now);
         const erroredCount = scan.erroredCount + pendingRetry.erroredCount;
         const firstError = scan.firstError ?? pendingRetry.firstError;
 
