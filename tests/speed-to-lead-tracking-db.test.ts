@@ -265,10 +265,12 @@ test("a stale digest claim (a crash, or a failed release, between claim and rele
     process.env.SPEED_TO_LEAD_MODE = "TEST";
     const leadId = await makeOwnedLead(db);
     try {
-        // NINE_AM_PACIFIC is 2026-01-15 in America/Los_Angeles.
+        // NINE_AM_PACIFIC is 2026-01-15 in America/Los_Angeles. Staleness is
+        // relative to the `now` maybeSend0900Digest is called with, not real
+        // wall-clock time — this test calls it with the fixed NINE_AM_PACIFIC.
         const claimKey = "speedToLeadDigestClaim:2026-01-15";
         await db.automationSetting.create({ data: { key: claimKey, value: "claimed" } });
-        const staleSince = new Date(Date.now() - 10 * 60 * 1000);
+        const staleSince = new Date(NINE_AM_PACIFIC.getTime() - 10 * 60 * 1000);
         await db.$executeRaw`UPDATE "AutomationSetting" SET "updatedAt" = ${staleSince} WHERE key = ${claimKey}`;
 
         const result = await maybeSend0900Digest(NINE_AM_PACIFIC, db);
