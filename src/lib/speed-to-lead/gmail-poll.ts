@@ -464,19 +464,24 @@ async function loadLastReconciledAtMs(db: PrismaClient): Promise<number | null> 
  * what makes this cover "the first poll after any gap over a day" with no
  * separate check: a gap that long ages the marker past the interval too.
  *
- * FIXED (Codex item 4): a marker in the FUTURE — negative elapsed against
- * `dbClockNow` — is corrupted (a clock anomaly, a hand edit, a migration),
- * not a sign the sweep just ran. It gets the same treatment as an absent
- * marker: due immediately, rather than silently sitting out an interval that
- * counts down from a timestamp that has not happened yet from the DB
- * clock's own point of view.
+ * FIXED (Codex item 4): a marker more than `RECONCILE_FLOOR_MARGIN_MS`
+ * in the FUTURE — negative elapsed against `dbClockNow`, past the same
+ * slack the floor itself tolerates — is corrupted (a clock anomaly, a hand
+ * edit, a migration), not a sign the sweep just ran. It gets the same
+ * treatment as an absent marker: due immediately, rather than silently
+ * sitting out an interval that counts down from a timestamp that has not
+ * happened yet from the DB clock's own point of view. The margin of slack
+ * (rather than treating ANY negative elapsed as corrupted) is what it
+ * already is elsewhere in this file: ordinary skew between the instant a
+ * completed sweep's own dbClockNow was read and the instant a later caller
+ * reads it back is real and harmless, not corruption.
  */
 async function isReconcileDue(db: PrismaClient, dbClockNow: Date): Promise<boolean> {
     if (await loadReconcileProgress(db)) return true;
     const lastMs = await loadLastReconciledAtMs(db);
     if (lastMs === null) return true;
     const elapsedMs = dbClockNow.getTime() - lastMs;
-    return elapsedMs < 0 || elapsedMs >= RECONCILE_INTERVAL_MS;
+    return elapsedMs < -RECONCILE_FLOOR_MARGIN_MS || elapsedMs >= RECONCILE_INTERVAL_MS;
 }
 
 /**
