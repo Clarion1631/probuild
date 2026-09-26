@@ -157,9 +157,9 @@ The status is Codex's grade at `bb693386` (R3) unless noted.
 | 1 | ARC/DKIM trust. It now only gates fallback and Voice intake and alerts, but it must not be forgeable into fake leads. | PARTIAL. R3 probe: an attacker-sealed i=1 ARC set claiming `mx.google.com` is trusted. | See "Authentication rules" below. | 10, 11 |
 | 2 | OAuth callback CSRF and identity | R3: FIXED for signed state, browser nonce and verified mailbox. Still needs session binding and read-only scope. | State HMAC covers `{approverEmail, sid, nonce, issuedAt}`. `sid` is the stable session claim added in `auth.ts`; sessions without it are refused (sign out and in once). Keep the HttpOnly double-submit nonce cookie, single use through the `AutomationSetting` unique key, and the 10-min TTL. Request `gmail.readonly` only, with `include_granted_scopes=false`. After exchange, refuse unless `tokens.scope` is exactly `gmail.readonly` and `getProfile` equals `gtrsupport@goldentouchremodeling.com`. Store the refresh token with `encryptObject`. | 24 |
 | 3 | Proxy bypass for the intake route | R2: FIXED | Keep the exact-path pattern. Add the proxy test: intake is reachable, a sibling path is still redirected, and a Server Action header is refused. | 4 |
-| 4 | History 404 resync | PARTIAL (the cursor can skip mail; wrong lower bound) | (a) `getProfile` first, keeping `historyId` as H0. (b) `messages.list q=after:<since>`, where since = max(cutoff, last successful poll *start* minus 10 min, now minus 72 h). (c) Process idempotently. (d) Save H0 as the cursor, so anything newer is read from H0 next run. (e) Resync state (H0, since, pageToken) persists and resumes across runs. (f) A gap over 72 h resets the cursor and cutoff and sends one ntfy naming the unscanned window. | 13 |
+| 4 | History 404 resync | PARTIAL (the cursor can skip mail; wrong lower bound) | **Superseded in round 6.** There is no history cursor, no resync mode and no 72 h reset any more. Every poll is one windowed `messages.list` query with a watermark that only moves on a complete scan. See "Inbox scan (round 6)" below. | 13 |
 | 5 | Fallback payload shape mismatch | R2: FIXED with a regex. Still fragile: the first line becomes the name. | The poller parses once, at write, into `fallbackPayloadSchema` `{name,email,phone,city,scope,message,submissionId}`. Email comes from `Reply-To` (single address). The other fields come from the site's labels `Name/Email/Phone/Message/Project city/Project scope` in `gtr-sales-draft` `src/app/api/contact/route.ts`, HTML-entity decoded. Promotion reads the same schema. Parse failure gives a "Website inquiry" lead with reason `fallback-unparsed`, still alerted. Store the matched trust rule, not raw headers. | 8 |
-| 6 | Bounded Gmail calls and backoff | PARTIAL (no backoff; OAuth refresh unbounded) | Per run: at most 10 history pages, 50 message gets and 40 s wall time. Stop at a history-record boundary and save that record's `id` as the cursor. Fetch `format:"metadata"` first; `full` only for a trusted website or Voice sender, so the ~200 other connect@ Group messages cost one call each. 10 s per-request timeout, and token refresh bounded (a timeout on the OAuth2 client transport, or a `getAccessToken` race). Consecutive failures back off 1, 2, 4, 8, then 15 min, persisted in `CompanySettings`, honoring `Retry-After`. After 15 min of failure, one ntfy. `invalid_grant` marks the inbox disconnected and sends one ntfy. A 404 on one message skips only that message. | 14, 15 |
+| 6 | Bounded Gmail calls and backoff | PARTIAL (no backoff; OAuth refresh unbounded) | Round 6: per run, at most 50 message gets, 40 s wall time and 20 list pages. Hitting any of them leaves the scan incomplete (the watermark stays) rather than skipping anything. The ledger is checked before any get, so a re-listed message costs nothing. Fetch `format:"metadata"` first; `full` only for a trusted website or Voice sender. The query names only the trusted senders, so other connect@ Group mail is never listed. 10 s per-request timeout, and token refresh bounded. A run that throws backs off 1, 2, 4, 8, then 15 min, persisted in `CompanySettings`; a run that only left some messages unfinished counts as a failure but does not back off. After 5 failed runs, one ntfy. `invalid_grant` marks the inbox disconnected and sends one ntfy. A 404 on one message records it as GONE, which is reported to Justin. | 14, 15 |
 | 7 | No raw OAuth errors in logs | R3: FIXED (finite allowlist) | Keep `safeOAuthErrorCategory`. Apply the same allowlist to the poll's catch and the alert senders. | 24 |
 | 8 | Migration splitter | R2: FIXED | Keep. Add a test that splits the v1a migration file itself and checks that no fragment starts mid-comment or mid-`DO` block. The new migration's header must not contain the marker text. | 26 |
 | 9 | Payroll-manifest test failures in CI | Checker-final: Build + Bundle Size red, 3 tests pinned to `lib/actions.ts` lines | Leave `src/lib/actions.ts` untouched (actions live in `speed-to-lead-actions.ts`), and restore the three test files to main. The `auth.ts` insertion goes below the pinned line 79. | 27 |
@@ -172,6 +172,41 @@ The status is Codex's grade at `bb693386` (R3) unless noted.
 - **Checker R1:** Voice and fallback leads must alert, which the transactional outbox handles.
 
 **Moot in v1a (deleted code):** approval, dispatch and cancellation races; opt-out and bounce handling; template A checks; expiry; follow-ups; readiness; recipient and footer validation; fingerprint; reconciliation; send-again; outreach CSRF; and the R2 regressions tied to them.
+
+### Inbox scan (round 6): windowed query, replacing the history cursor
+
+Five Codex rounds kept finding silent-loss edge cases in the `history.list` cursor, page-token and resync state machine (round 5: B1, the recovery lower bound started too late; B2, flood suppression plus the 72 h reset erased gaps). The volume is tiny (website form relays plus Google Voice notifications, about 0 to 20 a day), so round 6 replaces it with a scan that is loss-free by construction.
+
+**Design** (`src/lib/speed-to-lead/gmail-poll.ts`):
+- Each poll runs `messages.list` with `q = "{from:<trusted sender> ...} after:<epoch>"` and `includeSpamTrash=true`, and pages through all results. The senders come from `trustedSenderPatterns()`, the same list authentication uses. `epoch = max(leadInboxCutoffAt, leadInboxScanWatermarkAt - 24 h)`.
+- `LeadInboxMessage` is a ledger keyed on the Gmail message id. Any id it holds is skipped before any Gmail `get`. Every other listed message goes through the unchanged authentication and intake paths, then gets a ledger row: INTAKE, REJECTED (with authentication's own reason) or GONE (deleted before it could be read).
+- `leadInboxScanWatermarkAt` moves to this scan's start time only when every page was listed and every listed message got its ledger row. Any error or budget stop leaves it where it was, and the next poll reads the same window again. A message that throws is left unfinished and the loop moves on, so one bad message never holds back the leads after it.
+- The first connected poll sets `leadInboxCutoffAt` (the floor) and the watermark to now, so mail from before the connection is never imported.
+- The 24 h overlap is the only guard against Gmail search showing a message after its `internalDate` (index lag, Group relay holds, clock skew). It costs one ledger lookup per re-listed id, about one list page a day's worth, so it is generous on purpose.
+- No history ids, no page-token persistence, no resync mode, no reset. `leadInboxHistoryId`, `leadInboxResyncState` and `leadInboxIncrementalState` are gone from the migration.
+
+**Alerts** (the round-5 flood guard, B3, is removed):
+- Health alerts (disconnected, 5 failed runs in a row, and the new stale-scan alert) go straight to ntfy with no cap. Each is sent once per outage, and its marker is written only after a delivered push, so a failed push is retried next poll.
+- Stale scan: once the watermark is 6 h old, one push says the scan is behind and since when. The watermark is kept, so the next complete scan catches up on its own, and a "caught up" push follows.
+- Every REJECTED or GONE message is pushed to Justin with its Gmail id and reason, batched to at most one push per 15 min. A row stays unreported until a push covering it is delivered, so batching delays but never drops. The settings page shows the watermark and the count of unreported rows.
+
+**Loss-freedom argument.** Take any message M from a trusted sender with `internalDate` d at or after the cutoff.
+1. A ledger row is written only after M's outcome is durable (the intake write committed, or the reject or gone decision was made). A crash before the ledger write only means M is processed again next scan, and intake is idempotent on its own unique keys, so it is never doubled.
+2. The watermark only takes values that are start times of complete scans, and never moves backwards. A scan that starts with watermark W reads everything from W - 24 h.
+3. Take the first complete scan that moves the watermark past d + 24 h, with start S. Its window started at or before d, so M was in it, and it listed after S, which is later than d + 24 h. If Gmail search showed M at that point, the scan could only be complete because M got a ledger row. So M can be passed over only if search showed it more than 24 h after its `internalDate`.
+4. A ledger row is either INTAKE (the unchanged intake and alert path takes over) or REJECTED or GONE, which is pushed to Justin. Neither is silent.
+5. If scans keep failing or stopping, the watermark stays put, every poll reads the whole window again, and the stale-scan alert fires at 6 h. Once polling works, the next complete scan covers everything since, with no lookback limit.
+
+So every lead-sender message ends in exactly one of: an intake row, a push to Justin naming it, or an open window with a visible stale-scan alert.
+
+**Known risks (documented, not silent under normal operation):**
+- Gmail search showing a message more than 24 h after its `internalDate`.
+- A message deleted forever (not trashed) before the first poll lists it, which is normally under a minute.
+- A From address not in `SPEED_TO_LEAD_TRUSTED_SENDERS` is never listed (for example, the site changes its sending address without a config change).
+- ntfy unset or down: health alerts and reject notices wait. They are retried every poll, and the settings page still shows the state.
+- The cron not running at all (mode OFF, or the Vercel cron broken) raises nothing from the poller. Turning the mode back on catches up the whole OFF period as REVIEW leads with internal alerts. To skip that backlog on purpose, set `leadInboxCutoffAt` and `leadInboxScanWatermarkAt` to now first.
+- A message whose processing throws on every attempt keeps the window open. The leads after it still flow, "poll failing" fires after 5 runs, and the stale-scan alert at 6 h.
+
 
 ### Authentication rules (finding 1)
 
@@ -259,17 +294,18 @@ Tests 1 to 27 run in CI or locally with stubbed ntfy and Chat endpoints (a local
 
 **Poll**
 
-13. **Resync** (fake Gmail).
-    - A history 404 uses the snapshot-first order.
-    - A message inserted between the list and the cursor save is processed next run.
-    - A 72 h gap resets the cursor, and exactly one gap push is created (stubbed).
-14. **Failures.** A message 404 skips only that message and the cursor advances. A 5xx aborts the run with the cursor unchanged.
+13. **Window scan** (a fake Gmail mailbox that honors the query; round 6).
+    - The first connected run pins the floor; older mail is never imported.
+    - A message that arrives during a scan, or shows up in search late, is caught by the next scan through the overlap.
+    - Pagination over several pages lists every page before the watermark moves.
+    - A duplicate is never processed twice (re-listed ids cost no gets; two copies of one submission make one intake row).
+    - A long outage raises one stale-scan push, keeps the watermark, then recovers everything with no reset.
+14. **Failures.** A scan that fails mid-way does not move the watermark, and the next scan picks up what it missed. A message whose get fails stays open without holding back later leads or delaying the next poll.
 15. **Bounds.**
-    - Caps are respected, and the next run resumes from the last complete history record.
+    - With 60 rejected messages ahead of a real lead over 11 pages, runs make forward progress through the get budget, each message is fetched once, and the watermark moves only on the finishing run.
     - Every Gmail and token call has a timeout.
-    - Backoff follows 1, 2, 4, 8, 15 min and honors `Retry-After`.
-    - One "poll failing" push after 15 min; `invalid_grant` gives disconnected plus one push.
-    - A non-lead message costs exactly one metadata get.
+    - A run that throws backs off 1, 2, 4, 8, 15 min. One "poll failing" push after 5 failed runs; `invalid_grant` gives disconnected plus one push.
+    - A lead-sender message authentication rejects costs exactly one metadata get and is pushed to Justin. Reject notices are batched to one push per 15 min with nothing lost, and health alerts are never held back.
 
 **Alerts**
 
@@ -349,29 +385,31 @@ CREATE TYPE "LeadAlertStatus"  AS ENUM ('PENDING','SENDING','DELIVERED','DEAD','
 --   clearedAt, clearedBy, createdAt, updatedAt        -- junk only; v2 may add columns
 -- SpeedToLeadEvent (append-only): id, leadId NULL, kind, actor NULL, detail JSONB, createdAt;
 --   INDEX (leadId), INDEX (createdAt)
+-- LeadInboxMessage (round 6, the scan ledger): gmailMessageId PK, outcome TEXT
+--   ('INTAKE' | 'REJECTED' | 'GONE'), detail NULL, notifiedAt NULL, createdAt
 
 ALTER TABLE "Lead" ADD COLUMN IF NOT EXISTS "bookedAt" TIMESTAMP(3);
 ALTER TABLE "Lead" ADD COLUMN IF NOT EXISTS "calledAt" TIMESTAMP(3);
 
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxRefreshTokenEnc" TEXT;
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxEmail" TEXT;
-ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxHistoryId" TEXT;
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxCutoffAt" TIMESTAMP(3);
+ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxScanWatermarkAt" TIMESTAMP(3);
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxLastPollStartedAt" TIMESTAMP(3);
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxLastPollAt" TIMESTAMP(3);
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxLastPollOk" BOOLEAN;
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxFailureCount" INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxNextPollAt" TIMESTAMP(3);
-ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxResyncState" JSONB;
 
 ALTER TABLE "LeadIntakeEvent"  ENABLE ROW LEVEL SECURITY;  -- no policies: deny via PostgREST,
 ALTER TABLE "LeadAlert"        ENABLE ROW LEVEL SECURITY;  -- same as ReceiptRequestCard,
 ALTER TABLE "ContactEndpoint"  ENABLE ROW LEVEL SECURITY;  -- ClockInRequest (these hold lead PII)
 ALTER TABLE "SpeedToLeadEvent" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "LeadInboxMessage" ENABLE ROW LEVEL SECURITY;
 ```
 
 - **Not created (#557 tables dropped from v1a):** `OutreachMessage`, `OutreachVersion`, `OutreachAttempt`, `OutreachTemplate`, `OutreachDailyCounter`, `ReadinessRecord`, `Outreach*` enums, `Lead.firstTouchAt`, `Lead.personalReplyAt`, and plain-text `leadInboxRefreshToken`.
-- **`AutomationSetting` keys** (existing table, no DDL): `speedToLeadPaused`, `speedToLeadDigestLastSentDate`, `leadInboxOAuthState:<nonce>`, `speedToLeadPollAlertSentAt`. The keys `liveActivation` and `firstLiveSendAt` are not used.
+- **`AutomationSetting` keys** (existing table, no DDL): `speedToLeadPaused`, `speedToLeadDigestLastSentDate`, `leadInboxOAuthState:<nonce>`, `speedToLeadPollAlertSentAt`, `speedToLeadInboxDisconnectedAlertSent`, `speedToLeadScanStaleAlertSentAt`, `speedToLeadUnacceptedNoticeSentAt`, and the poll lease `speedToLeadPollLease`. The keys `liveActivation` and `firstLiveSendAt` are not used.
 - **RLS ordering.** `check-migrations-match.mjs` fails if RLS is enabled on a table that production's `prisma/prisma-blind-spots.json` doesn't list. So R1 is: Justin applies the migration to prod, then runs `snapshot-prisma-blind-spots.mjs` (read-only), then the refreshed snapshot is committed to the PR, then CI goes green. That keeps the deploy checklist's schema-before-code order.
 
 ## Rollout and rollback
