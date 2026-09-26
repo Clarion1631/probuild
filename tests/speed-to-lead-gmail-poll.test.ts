@@ -276,8 +276,13 @@ function dbFailingTransactionOn(realDb: PrismaClient, modelName: string, methodN
     return new Proxy(realDb, {
         get(target, prop) {
             if (prop !== "$transaction") return (target as unknown as Record<string | symbol, unknown>)[prop];
-            const realTransaction = (target as unknown as { $transaction: (fn: (tx: unknown) => unknown) => unknown }).$transaction;
-            return (fn: (tx: unknown) => unknown) => realTransaction((tx: unknown) => {
+            const typedTarget = target as unknown as { $transaction: (fn: (tx: unknown) => unknown) => unknown };
+            // Called AS a method on `typedTarget` (not torn off into a bare
+            // reference) — Prisma's real $transaction needs its own client
+            // as `this`; calling it detached throws a TypeError before it
+            // ever opens a transaction, which looked like "the injected
+            // failure" but was really just a broken test double.
+            return (fn: (tx: unknown) => unknown) => typedTarget.$transaction((tx: unknown) => {
                 const proxiedTx = new Proxy(tx as Record<string, unknown>, {
                     get(txTarget, txProp) {
                         if (txProp !== modelName) return txTarget[txProp as string];
@@ -798,22 +803,32 @@ test("round-8 finding A: a sustained new-mail flood never starves the pending re
         // scanWindow with no reserved share (the pre-fix order), a flood
         // this size would spend the WHOLE budget on new mail every single
         // poll and `starved` would never get a look-in, poll after poll.
+        // Polls are spaced 20 minutes apart (well past
+        // UNACCEPTED_NOTICE_MIN_INTERVAL_MS's 15-minute batching window) so
+        // each poll's own flood of newly-REJECTED messages gets its own
+        // fresh notice instead of being held back by the previous one —
+        // otherwise the one push that DOES fire (reporting poll 0's flood)
+        // would be the only one, sent long before `starved` ever crosses
+        // the stuck threshold.
+        const STEP = 20 * MINUTE;
         for (let i = 0; i < 4; i++) {
-            const flood = Array.from({ length: 50 }, (_, j) => forgedWebsite(`t14-flood-${i}-${j}`, T + i * MINUTE - j * 1000));
+            const flood = Array.from({ length: 50 }, (_, j) => forgedWebsite(`t14-flood-${i}-${j}`, T + i * STEP - j * 1000));
             mailbox.push(...flood);
 
-            await poll(db, new Date(T + i * MINUTE));
+            await poll(db, new Date(T + i * STEP));
 
             const row = await db.leadInboxMessage.findUnique({ where: { gmailMessageId: starved.id } });
             assert.equal(row?.outcome, "PENDING", `poll ${i}: still open, never lost`);
             assert.equal(row?.failedAttempts, i + 1, `poll ${i}: retried despite the flood, not starved out`);
-            assert.ok(row?.lastAttemptAt && row.lastAttemptAt.getTime() >= T + i * MINUTE, `poll ${i}: lastAttemptAt advanced`);
+            assert.ok(row?.lastAttemptAt && row.lastAttemptAt.getTime() >= T + i * STEP, `poll ${i}: lastAttemptAt advanced`);
         }
 
         // 4 failed attempts > PENDING_STUCK_ATTEMPTS (3): no longer "merely
         // still retrying" — reported to Justin so it can never sit invisible
-        // and indefinite.
-        const notice = pushes.find(p => /not taken in as leads/.test(p.title));
+        // and indefinite. Each poll's own flood earns its own notice (see
+        // above), so `starved` only ever shows up in the LAST one — the
+        // first three only cover that poll's freshly-rejected flood.
+        const notice = pushes.findLast(p => /not taken in as leads/.test(p.title));
         assert.ok(notice, "the long-stuck row surfaces in the batched notice");
         assert.ok(notice!.body.includes(starved.id), "names the stuck message");
         assert.ok(notice!.body.includes("stuck retrying, not yet resolved"), "labelled as stuck, not as a plain rejection");
@@ -833,7 +848,11 @@ test("round-8 finding B: clearing the credential and persisting the disconnect-n
         await db.companySettings.create({ data: { id: "singleton", leadInboxRefreshTokenEnc: "test-refresh-token" } });
         connected = false;
         authError = Object.assign(new Error("invalid_grant"), { response: { data: { error: "invalid_grant" } } });
-        ntfyUp = true;
+        // Kept down for this whole test: retryDisconnectNotice runs in the
+        // SAME poll's finally block and would otherwise clear the pending
+        // flag itself (that atomic clear is item C, tested separately),
+        // which would make it look like item B's own write never committed.
+        ntfyUp = false;
 
         const failingDb = dbFailingTransactionOn(db, "automationSetting", "upsert");
         const first = await poll(failingDb, new Date(T));
@@ -849,7 +868,6 @@ test("round-8 finding B: clearing the credential and persisting the disconnect-n
             "the credential clear rolled back with everything else in the failed transaction",
         );
         assert.equal(await db.automationSetting.findUnique({ where: { key: "speedToLeadDisconnectNoticePending" } }), null, "the pending flag never landed either — atomic, not half-applied");
-        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 0, "nothing to retry yet: retryDisconnectNotice saw no pending flag this poll");
 
         // No more injected failure: the next failed poll's transaction
         // commits both writes together. (Past the 1-minute backoff the
@@ -861,8 +879,7 @@ test("round-8 finding B: clearing the credential and persisting the disconnect-n
             null,
             "this time the credential clear committed",
         );
-        assert.ok(await db.automationSetting.findUnique({ where: { key: "speedToLeadDisconnectNoticePending" } }), "and the pending flag committed with it, in the same transaction");
-        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 1, "the notice this flag exists for still goes out, right on this poll");
+        assert.ok(await db.automationSetting.findUnique({ where: { key: "speedToLeadDisconnectNoticePending" } }), "and the pending flag committed with it, in the same transaction — retryDisconnectNotice (ntfy still down) never got the chance to clear it itself");
     } finally {
         await db.$disconnect();
     }
