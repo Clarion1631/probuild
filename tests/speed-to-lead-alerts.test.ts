@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createLeadAlertsInTx } from "../src/lib/speed-to-lead/alerts";
+import { createLeadAlertsInTx, asciiSafeHeaderValue } from "../src/lib/speed-to-lead/alerts";
 
 interface RawCall {
     channel: "NTFY" | "CHAT";
@@ -64,3 +64,22 @@ test("isTest is carried through onto the inserted rows", async () => {
     await createLeadAlertsInTx(tx as any, { leadId: "lead-5", verdict: "REAL", reasons: [], isTest: true });
     assert.ok(tx.calls.every(c => c.isTest === true));
 });
+
+// ── asciiSafeHeaderValue ─────────────────────────────────────────────────
+// Regression test: an em dash (or any non-Latin1 character) in an ntfy
+// `Title` header made fetch() throw SYNCHRONOUSLY — a header-validation
+// error, not a network error — which the generic try/catch around the send
+// call then misreported as "network-or-timeout", so a REVIEW-verdict push
+// failed every attempt forever and eventually went DEAD with no real
+// network problem at all. Found via tests/speed-to-lead-alerts-db.test.ts
+// against real Postgres in CI.
+
+test("asciiSafeHeaderValue leaves plain ASCII untouched", () => {
+    assert.equal(asciiSafeHeaderValue("New web lead"), "New web lead");
+});
+
+test("asciiSafeHeaderValue replaces characters outside the HTTP header Latin-1/ASCII range", () => {
+    assert.equal(asciiSafeHeaderValue("New lead — needs review"), "New lead ? needs review");
+    assert.equal(asciiSafeHeaderValue("café"), "caf?");
+});
+

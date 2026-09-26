@@ -55,23 +55,6 @@ async function cleanup(db: PrismaClient, leadId: string): Promise<void> {
     await db.lead.delete({ where: { id: leadId } }).catch(() => undefined);
 }
 
-test("DIAGNOSTIC: a bare fetch() can reach the local sink at all", { skip }, async () => {
-    const sink = await startSink((_req, res) => { res.writeHead(200, { "content-type": "text/plain" }); res.end("ok"); });
-    try {
-        let detail = "";
-        try {
-            const res = await fetch(sink.url, { method: "GET" });
-            detail = `status=${res.status} body=${await res.text()}`;
-        } catch (error) {
-            const e = error as Error & { cause?: unknown };
-            detail = `threw name=${e?.name} message=${e?.message} cause=${JSON.stringify(e?.cause, Object.getOwnPropertyNames(e?.cause ?? {}))}`;
-        }
-        assert.equal(detail.startsWith("status=200"), true, `bare fetch to ${sink.url} — ${detail}`);
-    } finally {
-        await sink.close();
-    }
-});
-
 test("delivered ntfy 2xx-with-id marks the row DELIVERED, sets providerRef, and is never re-claimed by a second concurrent run", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     const sink = await startSink((_req, res) => {

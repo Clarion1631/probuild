@@ -115,7 +115,14 @@ function ntfyContent(ctx: AlertLeadContext, isTest: boolean): { title: string; b
         ctx.verdict ? `verdict: ${ctx.verdict}` : null,
         ctx.lastFourPhone ? `phone ending ${ctx.lastFourPhone}` : null,
     ].filter(Boolean);
-    const title = isTest ? "[TEST] New lead" : ctx.verdict === "REAL" ? "New web lead" : "New lead — needs review";
+    // ASCII only — this becomes the `Title` HTTP header value, and fetch()
+    // throws synchronously on a non-Latin1 header (an em dash is outside
+    // Latin-1's range). That threw exception was previously caught by the
+    // generic network try/catch below and silently misreported as
+    // "network-or-timeout", so this is a real fix, not just cosmetic —
+    // every REVIEW-verdict ntfy push would otherwise fail every attempt,
+    // forever, until it went DEAD.
+    const title = isTest ? "[TEST] New lead" : ctx.verdict === "REAL" ? "New web lead" : "New lead - needs review";
     return { title, body: parts.join(" · "), priority: audience.ntfyPriority === "2" ? NTFY_PRIORITY_SPAM_SIGNAL : NTFY_PRIORITY_DEFAULT };
 }
 
@@ -148,13 +155,28 @@ type SendOutcome =
     | { kind: "rejected"; reason: string }
     | { kind: "unknown"; reason: string; retryAfterMs?: number };
 
+/**
+ * HTTP header VALUES must be Latin-1/ASCII — fetch() throws synchronously
+ * (not a network error) on anything outside that range, e.g. an em dash or
+ * an emoji. That thrown exception looks identical, from the outside, to a
+ * genuine network failure (both land in the same try/catch below), so a
+ * header carrying an unsanitized character would silently retry forever and
+ * eventually go DEAD with no real network problem at all. Defensive on
+ * every header value built from anything other than a literal ASCII string
+ * — never trusted just because today's callers happen to pass plain text.
+ */
+export function asciiSafeHeaderValue(value: string): string {
+    // eslint-disable-next-line no-control-regex
+    return value.replace(/[^\x20-\x7e]/g, "?");
+}
+
 async function sendNtfyAlert(alertId: string, ctx: AlertLeadContext, isTest: boolean): Promise<SendOutcome> {
     const topic = process.env.SPEED_TO_LEAD_NTFY_TOPIC?.trim();
     if (!topic) return { kind: "rejected", reason: "no ntfy topic configured" };
     const base = (process.env.SPEED_TO_LEAD_NTFY_BASE_URL || "https://ntfy.sh").trim().replace(/\/+$/, "");
     const { title, body, priority } = ntfyContent(ctx, isTest);
     const headers: Record<string, string> = {
-        Title: title,
+        Title: asciiSafeHeaderValue(title),
         Priority: priority,
         Tags: `stl-${alertId}`,
         Click: leadUrl(ctx.leadId),
@@ -265,7 +287,7 @@ export async function sendPlainNtfy(title: string, body: string): Promise<boolea
     const topic = process.env.SPEED_TO_LEAD_NTFY_TOPIC?.trim();
     if (!topic) return false;
     const base = (process.env.SPEED_TO_LEAD_NTFY_BASE_URL || "https://ntfy.sh").trim().replace(/\/+$/, "");
-    const headers: Record<string, string> = { Title: title, Priority: NTFY_PRIORITY_DEFAULT };
+    const headers: Record<string, string> = { Title: asciiSafeHeaderValue(title), Priority: NTFY_PRIORITY_DEFAULT };
     const token = process.env.SPEED_TO_LEAD_NTFY_TOKEN?.trim();
     if (token) headers.Authorization = `Bearer ${token}`;
     try {
