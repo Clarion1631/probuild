@@ -127,7 +127,7 @@ If any check fails, the lead is REVIEW with reasons stored. Promotion to REAL is
 
 - **Footer.** Every A, personal reply and follow-up carries a system-added footer that Justin cannot edit, and it is included in `approvalHash`: "Golden Touch Remodeling, 5305 NE 121st Ave Suite 310, Vancouver, WA 98682. If you'd rather not hear from me, reply 'no thanks' and I'll stop."
 - **Truthfulness.** From and Subject must be accurate; subjects are not deceptive.
-- **Advertising identification.** v1 relies on the affirmative-consent exemption, 15 U.S.C. 7702(1) and 7704(a)(5)(A)(i). Every v1 recipient asked GTR to contact them, on their own initiative, through the web form or a first email. v1 never emails anyone else, and messages stay about their inquiry. If counsel disagrees, add an "Advertisement" line to the footer; it's one template field.
+- **Advertising identification.** v1 relies on the affirmative-consent exception to the advertisement label, 15 U.S.C. 7704(a)(5)(B), with consent as defined in 7702(1). Every v1 recipient asked GTR to contact them, on their own initiative, through the web form or a first email. v1 never emails anyone else, and messages stay about their inquiry. If counsel disagrees, add an "Advertisement" line to the footer; it's one template field.
 - **Opt-outs keep working** for at least 30 days after the last lead email, in every mode and after rollback (below).
 
 ## Release (enforced)
