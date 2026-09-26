@@ -179,6 +179,7 @@ const MARKER_KEYS = [
     "speedToLeadPollLease",
     "speedToLeadPollAlertSentAt",
     "speedToLeadInboxDisconnectedAlertSent",
+    "speedToLeadDisconnectNoticePending",
     "speedToLeadScanStaleAlertSentAt",
     "speedToLeadUnacceptedNoticeSentAt",
 ];
@@ -388,11 +389,17 @@ test("a message whose get fails stays open without holding back the leads after 
         mailbox = [stuck, fresh];
 
         const first = await poll(db, new Date(T));
-        assert.deepEqual({ ran: first.ran, complete: first.complete }, { ran: true, complete: false });
+        // round-7 finding 1: a message's own `get` error no longer blocks
+        // the scan's completion — it already has a durable PENDING ledger
+        // row from the moment it was listed, so the watermark is safe to
+        // advance past it (`resolvePendingMessages` retries it independent
+        // of this window, every poll, until it resolves or 404s).
+        assert.deepEqual({ ran: first.ran, complete: first.complete }, { ran: true, complete: true });
         assert.ok(await intakeRow(db, fresh.id), "the lead after the stuck message is not held back");
         assert.equal(await intakeRow(db, stuck.id), null);
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: stuck.id } }))?.outcome, "PENDING", "durably tracked, not lost, even though it errored");
         let settings = await settingsOf(db);
-        assert.equal(settings?.leadInboxScanWatermarkAt?.getTime(), watermark.getTime(), "the watermark must not move past an unfinished message");
+        assert.equal(settings?.leadInboxScanWatermarkAt?.getTime(), T, "safe to advance because the unfinished message is durably PENDING, not because it finished");
         assert.equal(settings?.leadInboxFailureCount, 1);
         assert.equal(settings?.leadInboxLastPollOk, false);
         assert.equal(settings?.leadInboxNextPollAt, null, "no backoff: new leads keep flowing every minute");
@@ -665,6 +672,75 @@ test("health alerts are never held back, while unaccepted-message notices are ba
         assert.equal(notices.length, 2, "the held-back notice goes out once the window has passed");
         assert.ok(notices[1].body.includes(second.id) && !notices[1].body.includes(first.id), "it covers exactly what was not yet reported");
         assert.ok((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: second.id } }))?.notifiedAt);
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-7 finding 1: a listed message whose get fails and is then permanently deleted is durably tracked as PENDING and resolved to GONE, never silent", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - MINUTE) });
+        const doomed = website("t12-doomed", T - 30_000, { failGets: 1 });
+        mailbox = [doomed];
+
+        const first = await poll(db, new Date(T));
+        assert.equal(first.complete, true, "a message's own get error no longer blocks the scan: it is durably PENDING instead");
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: doomed.id } }))?.outcome, "PENDING", "ledgered before the failing get, so it can never vanish with no trace");
+        assert.equal(await intakeRow(db, doomed.id), null);
+        assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), T, "safe to advance past it because it is durably tracked");
+        assert.equal(pushes.length, 0, "still being retried — not yet reported as unaccepted");
+
+        // Deleted from Gmail entirely before the next poll: search will
+        // never list it again, so only a direct get-by-id can resolve it.
+        mailbox = [];
+
+        const second = await poll(db, new Date(T + MINUTE));
+        assert.equal(second.complete, true);
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: doomed.id } }))?.outcome, "GONE", "resolved by the independent retry-by-id, not by search (which lists nothing at all now)");
+        const notice = pushes.find(p => /not taken in as leads/.test(p.title));
+        assert.ok(notice, "never silent: the batched push covers it as soon as it resolves");
+        assert.ok(notice!.body.includes(doomed.id) && notice!.body.includes("deleted before it could be read"));
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-7 finding 2: a disconnect notice whose first push fails is retried every poll until delivered, exactly once, even though later auth returns no error", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - MINUTE) });
+        connected = false;
+        authError = Object.assign(new Error("invalid_grant"), { response: { data: { error: "invalid_grant" } } });
+        ntfyUp = false;
+
+        const first = await poll(db, new Date(T));
+        assert.equal(first.reason, "lead inbox not connected");
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 0, "the push failed, nothing delivered yet");
+        assert.equal((await settingsOf(db))?.leadInboxRefreshTokenEnc, null, "the credential is cleared immediately regardless of the push outcome");
+        assert.ok(await db.automationSetting.findUnique({ where: { key: "speedToLeadDisconnectNoticePending" } }), "a durable pending flag persists across the failed push");
+
+        // The credential is now cleared, so ensureLeadInboxAuth's mock
+        // returns the bare {ok:false} "never connected yet" shape (no
+        // `error`) on every later poll — exactly the round-7 finding 2 gap
+        // that used to make the notice un-retriable from here on.
+        authError = null;
+        ntfyUp = false;
+        const second = await poll(db, new Date(T + MINUTE));
+        assert.equal(second.reason, "lead inbox not connected");
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 0, "still not delivered, still retried rather than abandoned");
+
+        ntfyUp = true;
+        await poll(db, new Date(T + 2 * MINUTE));
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 1, "delivered on the first poll after ntfy recovers");
+        assert.equal(await db.automationSetting.findUnique({ where: { key: "speedToLeadDisconnectNoticePending" } }), null, "the pending flag is cleared once delivered");
+
+        await poll(db, new Date(T + 3 * MINUTE));
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 1, "delivered exactly once, not re-sent on later polls");
     } finally {
         await db.$disconnect();
     }

@@ -24,7 +24,8 @@ export default async function SpeedToLeadSettingsPage() {
             take: 20,
             select: { id: true, leadId: true, channel: true, lastErrorCategory: true, updatedAt: true },
         }),
-        prisma.leadInboxMessage.count({ where: { outcome: { not: "INTAKE" }, notifiedAt: null } }),
+        // PENDING is a message still being retried, not yet "not accepted" (round-7 finding 1) — excluded so a transient `get` error doesn't inflate this count.
+        prisma.leadInboxMessage.count({ where: { outcome: { notIn: ["INTAKE", "PENDING"] }, notifiedAt: null } }),
     ]);
 
     return (
