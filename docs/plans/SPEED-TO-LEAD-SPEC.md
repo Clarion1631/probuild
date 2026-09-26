@@ -78,7 +78,7 @@ If any check fails, the lead is REVIEW with reasons stored. Promotion to REAL is
 ### Suppression and cancellation
 
 - `ContactEndpoint` holds each normalized email once, across all clients and leads. Suppression is permanent unless Justin clears it with a reason.
-- **Cancellation.** In one transaction, using the lock order below, any reply, opt-out, bounce, Booked, Called, junk mark or lead close cancels every message for that lead that is still before commitment (`PENDING_APPROVAL` or `APPROVED`, set to `CANCELLED` with a reason). The next personal reply is a new draft generation built with the new context, and it needs a fresh approval.
+- **Cancellation.** In one transaction, using the lock order below, any reply, opt-out, bounce, Booked, Called, junk mark or lead close cancels every message for that lead that is still before commitment: `DRAFT`, `READY`, `PENDING_APPROVAL` and `APPROVED` are all set to `CANCELLED` with a reason. The next personal reply is a new draft generation built with the new context, and it needs a fresh approval.
 - **Freshness.** A can commit only after a successful inbox poll that **started after the intake's server receive time** and finished within the last 5 minutes. Any dispatch needs a successful poll within 10 minutes. Otherwise the message is `BLOCKED` ("inbox check stale") and Justin gets a push. A stuck poller therefore fails closed.
 
 ### Approval (Justin only, email only)
@@ -92,7 +92,8 @@ If any check fails, the lead is REVIEW with reasons stored. Promotion to REAL is
 ### Dispatch (single path: `dispatchOutreach(messageId)`)
 
 **Lifecycle:**
-- DRAFT → PENDING_APPROVAL → APPROVED → **DISPATCHING** → SENT, FAILED or UNKNOWN_DELIVERY.
+- Personal: DRAFT → PENDING_APPROVAL → APPROVED → **DISPATCHING** → SENT, FAILED or UNKNOWN_DELIVERY.
+- Template A: READY → **DISPATCHING** → the same outcomes.
 - CANCELLED, SUPERSEDED, EXPIRED and BLOCKED are reachable only from states before DISPATCHING.
 
 1. **Commitment point.** One Postgres transaction takes locks in a fixed order, and every invalidating action uses the same order: pause and mode row, then template row, then `ContactEndpoint` row, then lead row, then message row (`FOR UPDATE`). Inside it the transaction checks:
@@ -135,19 +136,20 @@ If any check fails, the lead is REVIEW with reasons stored. Promotion to REAL is
 - **Mode.** `SPEED_TO_LEAD_MODE` is OFF, TEST or LIVE; any other value means OFF. LIVE only has effect on production, **and** after Justin activates it for the current code fingerprint.
 - **Fingerprint.** A prebuild step writes `SPEED_TO_LEAD_FINGERPRINT`, the sha256 of `src/lib/speed-to-lead/**`, the ingest, cron and outreach routes and pages, and the related Prisma models. Server Action wrappers only delegate, which a static test checks.
 - **Readiness runner.** A Justin-only POST runs an in-app check on production using `isTest` leads and allowlisted recipients:
-  - Positive: signed test intake, REAL triage, A committed, `SENT` and reconciled; a personal reply approved and `SENT`; a push delivered.
+  - Positive: signed test intake, REAL triage, A committed from the **test A fixture**, `SENT` and reconciled; a personal reply approved and `SENT`; a push delivered.
   - Negative, each must end `BLOCKED`: a recipient not on the allowlist, a suppressed endpoint, pause on, stale poll, an expired A, and a revoked template.
 
   It writes an append-only `ReadinessRecord` (fingerprint, deploy SHA, results, time). There is no edit path.
 - **Activation.** Justin's POST succeeds only with a PASSED record for the current fingerprint. A changed fingerprint lapses LIVE back to TEST behavior until readiness passes again. Unrelated deploys don't.
 - **Test identity.** `isTest` is set only by the admin "Create test lead" action or by the runner's own ingest, signed with `LEAD_INGEST_TEST_SECRET`, never from form fields. In LIVE, `isTest` leads are still allowlist-only.
-- **First real send.** A stays blocked until a real, Justin-approved personal reply has reached `SENT`.
+- **Test A fixture.** An `OutreachTemplate` row with `testOnly = true` and the same fields as A. Justin approves it with a Justin-only POST before R3. It is enabled for readiness runs regardless of `SPEED_TO_LEAD_TEMPLATE_A`. At commit it renders only for `isTest` leads and sends only to allowlisted test addresses; commit refuses it for any non-test lead.
+- **First real send.** Applies only to **non-test** A: real A stays blocked until a real, Justin-approved personal reply has reached `SENT`. Test A for readiness is not subject to it.
 - **Steps:**
   - **R0 (Justin):** connect gtrsupport@; install ntfy and send a test push; capture a sample `website@` email and a Voice email for the authentication patterns; confirm connect@ delivers to gtrsupport@.
   - **R1:** merge with mode OFF.
   - **R2:** isolated E2E, logged. Then set mode TEST, add the cron, and let the site post. Real leads are pushed but can't be sent to.
-  - **R3:** readiness PASSED, then Justin activates LIVE and approves the first real reply.
-  - **R4:** Justin approves the A template and sets `SPEED_TO_LEAD_TEMPLATE_A=on`.
+  - **R3:** Justin approves the test A fixture; readiness PASSED; then Justin activates LIVE and approves the first real reply.
+  - **R4:** Justin approves the real A template and sets `SPEED_TO_LEAD_TEMPLATE_A=on`. Real A still also needs the first real send from R3.
 
 ## Data Model Changes (additive)
 
@@ -156,7 +158,7 @@ If any check fails, the lead is REVIEW with reasons stored. Promotion to REAL is
 - **`OutreachMessage`:** `leadId`, `kind` (TEMPLATE_A | PERSONAL | FOLLOWUP), `status`, `generation`, `approvedVersionId`, `approvalHash`, `approvedBy`, `approvedAt`, `dedupeKey @unique`, `isTest`.
 - **`OutreachVersion`** (immutable): `messageId`, `generation`, `to`, `subject`, `body`, `footer`, `threading`, `templateVersionId`, `renderInputs`.
 - **`OutreachAttempt`:** `messageId`, `versionId`, `rfcMessageId @unique`, `committedAt`, `outcome`, `providerMessageId`, `threadId`.
-- **`OutreachTemplate`:** the fields listed in Template A.
+- **`OutreachTemplate`:** the fields listed in Template A, plus `testOnly`.
 - **`OutreachEvent`** (append-only), **`OutreachDailyCounter`**, **`ReadinessRecord`** (append-only).
 - **`Lead`:** `firstTouchAt`, `personalReplyAt`, `bookedAt`, `calledAt`.
 - **`CompanySettings`:** the lead-inbox token and email, the history id, the cutoff, and poll health.
@@ -209,5 +211,7 @@ $0: Gmail API, ntfy.sh and templates. The per-minute cron should fit the Vercel 
 | 5 | A's standing approval scope | Template A: subject, body, footer, phone, booking destination and token rules all hashed; durable approval separate from per-message eligibility; 15-minute deadline from the server receive time; no backlog on enabling |
 | 6 | Enforced readiness | Release: a fingerprint-bound, append-only `ReadinessRecord` from the in-app runner; LIVE activation requires it; new negative tests; TEST versus kill-switch wording corrected (Dispatch 4) |
 | 7 | Commercial content on all drafts | A non-editable footer (address plus opt-out) on every lead email, inside the approved hash; the affirmative-consent exemption documented; opt-outs processed in OFF and for 30 days after rollback |
+
+**Codex round 3 targeted fixes:** #4, cancellation now covers `DRAFT`, `READY`, `PENDING_APPROVAL` and `APPROVED` (Suppression and cancellation; Dispatch lifecycle). #6, the first-real-send gate applies only to non-test A, and an approved, enabled test A fixture runs readiness before R3, while real A waits for R4 (Release).
 
 Codex round 1 points were resolved or superseded by v2 and this revision; see the earlier commit `ceae850f`.
