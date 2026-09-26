@@ -73,7 +73,7 @@ test("delivered ntfy 2xx-with-id marks the row DELIVERED, sets providerRef, and 
         await Promise.all([deliverDueAlerts(db), deliverDueAlerts(db)]);
 
         const row = await db.leadAlert.findUnique({ where: { leadId_channel: { leadId: lead.id, channel: "NTFY" } } });
-        assert.equal(row?.status, "DELIVERED");
+        assert.equal(row?.status, "DELIVERED", `got status=${row?.status} attempts=${row?.attempts} lastErrorCategory=${row?.lastErrorCategory}`);
         assert.equal(row?.providerRef, "ntfy-msg-1");
         assert.equal(sink.hits(), 1, "the sink must be hit exactly once across both concurrent runs");
     } finally {
@@ -97,7 +97,7 @@ test("an ntfy 400 goes DEAD immediately, with no retry", { skip }, async () => {
         await db.$transaction(tx => createLeadAlertsInTx(tx, { leadId: lead.id, verdict: "REAL", reasons: [], isTest: false }));
         await deliverDueAlerts(db);
         const row = await db.leadAlert.findUnique({ where: { leadId_channel: { leadId: lead.id, channel: "NTFY" } } });
-        assert.equal(row?.status, "DEAD");
+        assert.equal(row?.status, "DEAD", `got status=${row?.status} attempts=${row?.attempts} lastErrorCategory=${row?.lastErrorCategory}`);
     } finally {
         process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
         process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;
@@ -149,7 +149,7 @@ test("a stale SENDING row (worker died) is reclaimed and delivered on the next r
         });
         await deliverDueAlerts(db);
         const row = await db.leadAlert.findUnique({ where: { leadId_channel: { leadId: lead.id, channel: "NTFY" } } });
-        assert.equal(row?.status, "DELIVERED");
+        assert.equal(row?.status, "DELIVERED", `got status=${row?.status} attempts=${row?.attempts} lastErrorCategory=${row?.lastErrorCategory}`);
     } finally {
         process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
         process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;
@@ -224,10 +224,11 @@ test("ntfy content never carries email, full phone or message text — Click hea
         await db.$transaction(tx => createLeadAlertsInTx(tx, { leadId: lead.id, verdict: "REAL", reasons: [], isTest: false }));
         await deliverDueAlerts(db);
 
+        const row = await db.leadAlert.findUnique({ where: { leadId_channel: { leadId: lead.id, channel: "NTFY" } } });
         assert.ok(!captured.body.includes(email));
         assert.ok(!captured.body.includes("3605551234"));
         assert.ok(!captured.body.includes("very secret message body"));
-        assert.ok(captured.body.includes("1234"), "the last 4 digits of the phone ARE allowed");
+        assert.ok(captured.body.includes("1234"), `the last 4 digits of the phone ARE allowed (row status=${row?.status} lastErrorCategory=${row?.lastErrorCategory}, captured.body=${JSON.stringify(captured.body)})`);
         assert.ok(String(captured.headers?.click ?? "").includes(`/leads/${lead.id}`));
     } finally {
         process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
