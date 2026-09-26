@@ -80,6 +80,26 @@ async function cleanupDigestSettings(db: PrismaClient) {
     await db.automationSetting.deleteMany({ where: { key: { startsWith: "speedToLeadDigest" } } }).catch(() => undefined);
 }
 
+/** A test double that forwards every call to the real client except AutomationSetting.upsert, which always throws — simulates the push succeeding but the "sent" marker write then failing. */
+function withFailingSentMarkerUpsert(real: PrismaClient): PrismaClient {
+    return new Proxy(real, {
+        get(target, prop, receiver) {
+            if (prop === "automationSetting") {
+                const delegate = Reflect.get(target, prop, receiver) as PrismaClient["automationSetting"];
+                return new Proxy(delegate, {
+                    get(delegateTarget, delegateProp, delegateReceiver) {
+                        if (delegateProp === "upsert") {
+                            return async () => { throw new Error("simulated sent-marker write failure"); };
+                        }
+                        return Reflect.get(delegateTarget, delegateProp, delegateReceiver);
+                    },
+                });
+            }
+            return Reflect.get(target, prop, receiver);
+        },
+    }) as PrismaClient;
+}
+
 test("markLeadBooked sets bookedAt exactly once and logs the actor; a second press is a no-op that logs nothing new", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     const leadId = await makeOwnedLead(db);
@@ -222,6 +242,93 @@ test("a failed digest push releases the claim (never marked sent) so a retry wit
         const retry = await maybeSend0900Digest(NINE_AM_PACIFIC, db);
         assert.equal(retry, true, "the released claim must let a retry within the same hour succeed");
         assert.equal(requestCount, 2);
+    } finally {
+        process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
+        process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;
+        process.env.SPEED_TO_LEAD_MODE = originalMode;
+        await cleanupLead(db, leadId);
+        await cleanupDigestSettings(db);
+        await sink.close();
+        await db.$disconnect();
+    }
+});
+
+test("a stale digest claim (a crash, or a failed release, between claim and release) is reclaimed rather than blocking every tick for the rest of the local day", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    await cleanupDigestSettings(db);
+    const sink = await startSink((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ id: "digest-reclaimed" })); });
+    const originalTopic = process.env.SPEED_TO_LEAD_NTFY_TOPIC;
+    const originalBase = process.env.SPEED_TO_LEAD_NTFY_BASE_URL;
+    const originalMode = process.env.SPEED_TO_LEAD_MODE;
+    process.env.SPEED_TO_LEAD_NTFY_TOPIC = "test-topic";
+    process.env.SPEED_TO_LEAD_NTFY_BASE_URL = sink.url;
+    process.env.SPEED_TO_LEAD_MODE = "TEST";
+    const leadId = await makeOwnedLead(db);
+    try {
+        // NINE_AM_PACIFIC is 2026-01-15 in America/Los_Angeles.
+        const claimKey = "speedToLeadDigestClaim:2026-01-15";
+        await db.automationSetting.create({ data: { key: claimKey, value: "claimed" } });
+        const staleSince = new Date(Date.now() - 10 * 60 * 1000);
+        await db.$executeRaw`UPDATE "AutomationSetting" SET "updatedAt" = ${staleSince} WHERE key = ${claimKey}`;
+
+        const result = await maybeSend0900Digest(NINE_AM_PACIFIC, db);
+        assert.equal(result, true, "a stale claim must be reclaimed rather than leaving the digest permanently blocked for the day");
+        assert.equal(sink.hits(), 1);
+    } finally {
+        process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
+        process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;
+        process.env.SPEED_TO_LEAD_MODE = originalMode;
+        await cleanupLead(db, leadId);
+        await cleanupDigestSettings(db);
+        await sink.close();
+        await db.$disconnect();
+    }
+});
+
+test("a FRESH digest claim (a run genuinely still in flight) is never reclaimed out from under it", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    await cleanupDigestSettings(db);
+    const originalMode = process.env.SPEED_TO_LEAD_MODE;
+    process.env.SPEED_TO_LEAD_MODE = "TEST";
+    try {
+        const claimKey = "speedToLeadDigestClaim:2026-01-15";
+        await db.automationSetting.create({ data: { key: claimKey, value: "claimed" } });
+
+        const result = await maybeSend0900Digest(NINE_AM_PACIFIC, db);
+        assert.equal(result, false, "a claim from moments ago must not be reclaimed — it may still be a genuinely in-flight run");
+    } finally {
+        process.env.SPEED_TO_LEAD_MODE = originalMode;
+        await cleanupDigestSettings(db);
+        await db.$disconnect();
+    }
+});
+
+test("a push that succeeds but whose 'sent' marker write then fails never causes a duplicate send — the claim stays put, not released, until the next local day", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    await cleanupDigestSettings(db);
+    const sink = await startSink((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ id: "digest-marker-fail" })); });
+    const originalTopic = process.env.SPEED_TO_LEAD_NTFY_TOPIC;
+    const originalBase = process.env.SPEED_TO_LEAD_NTFY_BASE_URL;
+    const originalMode = process.env.SPEED_TO_LEAD_MODE;
+    process.env.SPEED_TO_LEAD_NTFY_TOPIC = "test-topic";
+    process.env.SPEED_TO_LEAD_NTFY_BASE_URL = sink.url;
+    process.env.SPEED_TO_LEAD_MODE = "TEST";
+    const leadId = await makeOwnedLead(db);
+    try {
+        const failingDb = withFailingSentMarkerUpsert(db);
+        const first = await maybeSend0900Digest(NINE_AM_PACIFIC, failingDb);
+        assert.equal(first, false, "the marker write failed, so this call must not report success");
+        assert.equal(sink.hits(), 1, "the push itself must have gone out exactly once");
+
+        const sentMarker = await db.automationSetting.findUnique({ where: { key: "speedToLeadDigestLastSentDate" } });
+        assert.equal(sentMarker, null, "the marker genuinely never got written");
+
+        // A retry the SAME hour, on the real (non-failing) client, must never
+        // re-send — the claim from the first call's successful push must
+        // still be in place, exactly because it succeeded.
+        const retry = await maybeSend0900Digest(NINE_AM_PACIFIC, db);
+        assert.equal(retry, false, "the claim must never be released after a successful send, even though its marker write failed");
+        assert.equal(sink.hits(), 1, "no second push, ever, for a day whose digest already went out");
     } finally {
         process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
         process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;

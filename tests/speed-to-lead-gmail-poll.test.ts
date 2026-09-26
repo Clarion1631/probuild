@@ -232,6 +232,85 @@ test("an expired history cursor (404) resyncs via messages.list and the new curs
     }
 });
 
+test("the fixed per-run message-get budget can be exhausted by leading untrusted messages before a trusted one is ever reached, and the cursor never commits past it", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "500", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
+        // 60 untrusted messages (each costs exactly one metadata `get`) ahead
+        // of a single trusted one — comfortably more than MAX_MESSAGE_GETS
+        // (50), so the run-budget exhausts on an untrusted message before the
+        // trusted one is ever reached.
+        const untrustedIds = Array.from({ length: 60 }, (_, i) => `untrusted-${i}`);
+        const messagesAdded = [...untrustedIds, "trusted-1"].map(id => ({ message: { id } }));
+        script = {
+            getProfile: () => ({ historyId: "999" }),
+            historyList: () => ({ history: [{ messagesAdded }], historyId: "600" }),
+            messagesGet: (id, format) => {
+                if (id === "trusted-1") return format === "metadata" ? WEBSITE_HEADERS_METADATA : { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
+                return UNTRUSTED_HEADERS_METADATA;
+            },
+        };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+        const result = await pollLeadInbox(db, new Date());
+        assert.equal(result.ran, true);
+        assert.equal(result.processed, 50, "exactly MAX_MESSAGE_GETS untrusted messages processed before the budget ran out");
+
+        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+        assert.equal(settings?.leadInboxHistoryId, "500", "the cursor must NOT advance while the trusted message further down the list is still unhandled");
+        const pending = settings?.leadInboxIncrementalState as unknown as { newHistoryId: string; pendingMessageIds: string[] } | null;
+        assert.equal(pending?.newHistoryId, "600");
+        assert.equal(pending?.pendingMessageIds.length, 11, "the 10 remaining untrusted messages plus the trusted one must be persisted for the next run");
+        assert.ok(pending?.pendingMessageIds.includes("trusted-1"), "the trusted message must still be queued, not lost");
+
+        const rows = await db.leadIntakeEvent.findMany({ where: { source: "WEB_EMAIL_FALLBACK" } });
+        assert.equal(rows.length, 0, "the trusted message must not be recorded until it is actually reached");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("repeated poll runs make forward progress through a persisted budget-exhausted queue, eventually recording the trusted message and committing the cursor — with no message ever re-fetched", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "500", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
+        const untrustedIds = Array.from({ length: 60 }, (_, i) => `untrusted-${i}`);
+        const messagesAdded = [...untrustedIds, "trusted-1"].map(id => ({ message: { id } }));
+        getCallCount = 0;
+        script = {
+            getProfile: () => ({ historyId: "999" }),
+            historyList: () => ({ history: [{ messagesAdded }], historyId: "600" }),
+            messagesGet: (id, format) => {
+                if (id === "trusted-1") return format === "metadata" ? WEBSITE_HEADERS_METADATA : { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
+                return UNTRUSTED_HEADERS_METADATA;
+            },
+        };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+
+        let settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+        let runs = 0;
+        while (settings?.leadInboxHistoryId !== "600" && runs < 10) {
+            await pollLeadInbox(db, new Date());
+            settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+            runs++;
+        }
+        assert.ok(runs > 1, "the scenario must actually require more than one run to finish");
+        assert.equal(settings?.leadInboxHistoryId, "600", "the cursor must eventually commit once every message is handled");
+        assert.equal(settings?.leadInboxIncrementalState, null, "no leftover queue once done");
+
+        const rows = await db.leadIntakeEvent.findMany({ where: { source: "WEB_EMAIL_FALLBACK" } });
+        assert.equal(rows.length, 1, "the trusted message buried behind 60 untrusted ones must eventually be recorded");
+
+        // 60 untrusted messages x 1 get each, plus the trusted message's 2
+        // gets (metadata + full) = 62 total, no matter how many runs it took
+        // — proves no message was ever re-fetched across runs.
+        assert.equal(getCallCount, 62, "every message must be fetched exactly once across all runs combined");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
 test("a gap over 72h resets the cutoff to now WITHOUT attempting a resync scan", { skip }, async () => {
     const db = await freshDb();
     try {

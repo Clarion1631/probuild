@@ -120,3 +120,5 @@ export const ALERT_POST_TIMEOUT_MS = 10_000;
 export const DIGEST_HOUR_LOCAL = 9;
 /** Digest: lists open feature-owned leads received within this window. */
 export const DIGEST_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+/** A digest day-claim row older than this with no "sent" marker is reclaimable by the next tick — a crash between claiming and releasing (or a failed release itself) would otherwise strand the claim for the rest of that local day. Comfortably above any real run's duration (bounded by ALERT_POST_TIMEOUT_MS plus a few DB round trips) and comfortably below the digest hour's own width. */
+export const DIGEST_CLAIM_STALE_MS = 5 * 60 * 1000;

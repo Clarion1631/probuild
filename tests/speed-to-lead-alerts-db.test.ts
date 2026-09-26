@@ -239,6 +239,52 @@ test("ntfy content never carries email, full phone or message text — Click hea
     }
 });
 
+test("a row whose failed-send backoff already pushed nextAttemptAt into the future is never re-claimed by a second invocation's stale 'due' snapshot", { skip }, async () => {
+    // A decoy row sorts first in `due` (earlier nextAttemptAt) so whichever
+    // invocation wins its claim is held up on ITS delayed response — long
+    // enough that the OTHER invocation can fully claim, fail, and back off
+    // the real row below before the held-up one ever reaches it in its own
+    // (stale) in-memory `due` snapshot. Both rows fail, so the real row
+    // returns to PENDING with nextAttemptAt in the future — the specific
+    // branch this test pins is that a later claim attempt is defeated by
+    // nextAttemptAt, not merely by a status that is still SENDING.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const decoyLead = await makeLead(db);
+    const lead = await makeLead(db);
+    const now = new Date();
+    const decoyAlert = await db.leadAlert.create({ data: { leadId: decoyLead.id, channel: "NTFY", status: "PENDING", isTest: false, nextAttemptAt: new Date(now.getTime() - 1000) } });
+    const rowAlert = await db.leadAlert.create({ data: { leadId: lead.id, channel: "NTFY", status: "PENDING", isTest: false, nextAttemptAt: now } });
+    const sink = await startSink((req, res) => {
+        const tag = String(req.headers.tags ?? "");
+        if (tag.includes(decoyAlert.id)) {
+            setTimeout(() => { res.writeHead(500); res.end("decoy fail"); }, 300);
+            return;
+        }
+        res.writeHead(500);
+        res.end("row fail");
+    });
+    const originalTopic = process.env.SPEED_TO_LEAD_NTFY_TOPIC;
+    const originalBase = process.env.SPEED_TO_LEAD_NTFY_BASE_URL;
+    process.env.SPEED_TO_LEAD_NTFY_TOPIC = "test-topic";
+    process.env.SPEED_TO_LEAD_NTFY_BASE_URL = sink.url;
+    try {
+        await Promise.all([deliverDueAlerts(db, now), deliverDueAlerts(db, now)]);
+
+        const row = await db.leadAlert.findUnique({ where: { id: rowAlert.id } });
+        assert.equal(row?.status, "PENDING");
+        assert.equal(row?.attempts, 1, "the row must have been sent exactly once, never re-claimed after its own backoff");
+        assert.ok(row!.nextAttemptAt.getTime() > now.getTime(), "backoff must have pushed nextAttemptAt into the future");
+        assert.equal(sink.hits(), 2, "exactly one send for the decoy and one for the real row — never a third, re-claimed send");
+    } finally {
+        process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
+        process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;
+        await cleanup(db, decoyLead.id);
+        await cleanup(db, lead.id);
+        await sink.close();
+        await db.$disconnect();
+    }
+});
+
 test("a Chat webhook URL outside the chat.googleapis.com allowlist never posts — the CHAT row goes DEAD, not PENDING forever", { skip }, async () => {
     // isValidChatWebhookUrl (src/lib/chat-webhook.ts, reused by alerts.ts)
     // only accepts https://chat.googleapis.com/v1/spaces/... — a local test

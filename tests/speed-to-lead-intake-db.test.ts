@@ -44,11 +44,30 @@ async function countRows(db: PrismaClient, externalId: string) {
     return { rowCount: rows.length, leadIds };
 }
 
+/**
+ * Every test's own rows, removed unconditionally. Without this, leftover
+ * LeadAlert PENDING rows from this file leak into
+ * tests/speed-to-lead-alerts-db.test.ts's `deliverDueAlerts` calls in the
+ * SAME CI step (it scans the whole table with no per-test scope), inflating
+ * that file's sink-hit-count assertions on a shared Postgres — the actual
+ * root cause of the CI `migrations` job going red, not just a flake to step
+ * around (mirrors the `cleanup` helper in speed-to-lead-alerts-db.test.ts).
+ */
+async function cleanup(db: PrismaClient, opts: { externalIds: string[]; leadId?: string | null }): Promise<void> {
+    await db.leadIntakeEvent.deleteMany({ where: { externalId: { in: opts.externalIds } } }).catch(() => undefined);
+    if (opts.leadId) {
+        await db.leadAlert.deleteMany({ where: { leadId: opts.leadId } }).catch(() => undefined);
+        await db.lead.delete({ where: { id: opts.leadId } }).catch(() => undefined);
+    }
+}
+
 test("a single webhook submission creates exactly one Lead, one intake row, and its ntfy alert row", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const p = payload();
+    let leadId: string | null = null;
     try {
-        const p = payload();
         const outcome = await intakeWebhookLead(p, { receivedAt: new Date(), isTest: false }, db);
+        leadId = outcome.leadId;
         assert.equal(outcome.won, true);
         assert.ok(outcome.leadId);
 
@@ -61,14 +80,16 @@ test("a single webhook submission creates exactly one Lead, one intake row, and 
         assert.equal(alerts.filter(a => a.channel === "NTFY").length, 1);
         assert.equal(new Set(alerts.map(a => a.channel)).size, alerts.length); // never two of the same channel
     } finally {
+        await cleanup(db, { externalIds: [`sub:${p.submissionId}`], leadId });
         await db.$disconnect();
     }
 });
 
 test("5 concurrent webhook deliveries for the SAME submissionId produce exactly one Lead and at most one alert per channel", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const p = payload();
+    let leadId: string | null = null;
     try {
-        const p = payload();
         const results = await Promise.all(
             Array.from({ length: 5 }, () => intakeWebhookLead(p, { receivedAt: new Date(), isTest: false }, db)),
         );
@@ -76,23 +97,26 @@ test("5 concurrent webhook deliveries for the SAME submissionId produce exactly 
         assert.equal(winners.length, 1, "exactly one delivery should win the race");
         const leadIds = new Set(results.map(r => r.leadId).filter(Boolean));
         assert.equal(leadIds.size, 1, "every delivery must resolve to the SAME lead");
+        leadId = [...leadIds][0] as string;
 
         const { rowCount } = await countRows(db, `sub:${p.submissionId}`);
         assert.equal(rowCount, 1);
 
-        const alerts = await db.leadAlert.findMany({ where: { leadId: [...leadIds][0] as string } });
+        const alerts = await db.leadAlert.findMany({ where: { leadId } });
         const byChannel = new Map<string, number>();
         for (const a of alerts) byChannel.set(a.channel, (byChannel.get(a.channel) ?? 0) + 1);
         for (const [, count] of byChannel) assert.equal(count, 1);
     } finally {
+        await cleanup(db, { externalIds: [`sub:${p.submissionId}`], leadId });
         await db.$disconnect();
     }
 });
 
 test("fallback-first: the fallback poller's PENDING_FALLBACK row is taken over by the real webhook, using the webhook's own triage", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const p = payload();
+    let leadId: string | null = null;
     try {
-        const p = payload();
         const fallback = parseFallbackEmail({ headers: [{ name: "Reply-To", value: p.email }], bodyText: `Name: ${p.name}\nEmail: ${p.email}\nMessage:\n${p.message}`, submissionId: p.submissionId });
         await db.$transaction(tx => recordPendingFallback(tx, { gmailMessageId: `gm-${p.submissionId}`, receivedAt: new Date(), payload: fallback }));
 
@@ -101,6 +125,7 @@ test("fallback-first: the fallback poller's PENDING_FALLBACK row is taken over b
         assert.equal(before?.source, "WEB_EMAIL_FALLBACK");
 
         const outcome = await intakeWebhookLead(p, { receivedAt: new Date(), isTest: false }, db);
+        leadId = outcome.leadId;
         assert.equal(outcome.won, true);
 
         const after = await db.leadIntakeEvent.findUnique({ where: { externalId: `sub:${p.submissionId}` } });
@@ -111,16 +136,19 @@ test("fallback-first: the fallback poller's PENDING_FALLBACK row is taken over b
         const { rowCount } = await countRows(db, `sub:${p.submissionId}`);
         assert.equal(rowCount, 1, "the takeover must never create a second row");
     } finally {
+        await cleanup(db, { externalIds: [`sub:${p.submissionId}`], leadId });
         await db.$disconnect();
     }
 });
 
 test("cross-channel dedupe: a fallback with no submissionId and a webhook for the same email within 15 minutes collapse to ONE lead", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const email = `cross-${Math.random().toString(36).slice(2)}@example.test`;
+    const messageId = `gm-cross-${Math.random().toString(36).slice(2)}`;
+    const webhookPayload = payload({ email });
+    let leadId: string | null = null;
     try {
-        const email = `cross-${Math.random().toString(36).slice(2)}@example.test`;
         const fallback = parseFallbackEmail({ headers: [{ name: "Reply-To", value: email }], bodyText: `Name: Cross Channel\nEmail: ${email}\nMessage:\nWe need a full remodel of our whole house please.`, submissionId: null });
-        const messageId = `gm-cross-${Math.random().toString(36).slice(2)}`;
         const fallbackOutcome = await db.$transaction(async tx => {
             await recordPendingFallback(tx, { gmailMessageId: messageId, receivedAt: new Date(), payload: fallback });
             // A fallback with no submissionId is due immediately — promote it inline for the test rather than waiting on the cron.
@@ -135,12 +163,13 @@ test("cross-channel dedupe: a fallback with no submissionId and a webhook for th
         const promoted = await promoteDueFallbacks(new Date(Date.now() + 1000), db);
         const fallbackLead = promoted.find(o => o.won)?.leadId;
         assert.ok(fallbackLead, "the fallback should have promoted to a lead");
+        leadId = fallbackLead ?? null;
 
         // Now a webhook arrives for the SAME email, a different submissionId (the site's real webhook twin).
-        const webhookPayload = payload({ email });
         const webhookOutcome = await intakeWebhookLead(webhookPayload, { receivedAt: new Date(), isTest: false }, db);
         assert.equal(webhookOutcome.leadId, fallbackLead, "the webhook must link to the SAME lead the fallback created, not a second one");
     } finally {
+        await cleanup(db, { externalIds: [`voice:${messageId}`, `sub:${webhookPayload.submissionId}`], leadId });
         await db.$disconnect();
     }
 });

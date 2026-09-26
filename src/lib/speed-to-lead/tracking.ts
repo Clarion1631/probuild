@@ -5,7 +5,7 @@ import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { logLeadEvent } from "./audit";
 import { sendPlainNtfy } from "./alerts";
-import { speedToLeadMode, DIGEST_HOUR_LOCAL, DIGEST_LOOKBACK_MS } from "./constants";
+import { speedToLeadMode, DIGEST_HOUR_LOCAL, DIGEST_LOOKBACK_MS, DIGEST_CLAIM_STALE_MS } from "./constants";
 import { safeErrorCategory } from "./error-category";
 
 /**
@@ -83,6 +83,17 @@ export async function send0900Digest(db: PrismaClient = prisma, now: Date = new 
  * marker AFTER the push succeeds; a failed push releases the claim so the
  * next minute within the same local hour retries (v1a fix for #557's
  * write-before-send bug, which lost the whole day on one failed push).
+ *
+ * Two more failure modes than a simple claim/release, both v1a round-3
+ * findings:
+ *  - A crash (or the claim-row delete above itself failing) between
+ *    claiming and releasing would otherwise strand the claim for the rest
+ *    of the local day with the digest never actually sent — a stale claim
+ *    is reclaimed below rather than left to block every later tick.
+ *  - Once the push has actually succeeded, this function must never
+ *    release the claim again for any reason (including the "sent" marker
+ *    write itself failing) — releasing it would let a later retry re-send
+ *    a push that already went out.
  */
 export async function maybeSend0900Digest(now: Date = new Date(), db: PrismaClient = prisma): Promise<boolean> {
     if (speedToLeadMode() === "OFF") return false;
@@ -96,6 +107,16 @@ export async function maybeSend0900Digest(now: Date = new Date(), db: PrismaClie
     const alreadySent = await db.automationSetting.findUnique({ where: { key: sentKey } });
     if (alreadySent?.value === today) return false;
 
+    // A claim old enough that no real in-flight run could still own it is
+    // stale — reclaim it so a prior crash (or a failed release) does not
+    // block every tick for the rest of the day. Guarded by updatedAt so a
+    // claim refreshed by another run between the read and this delete is
+    // left alone.
+    const existingClaim = await db.automationSetting.findUnique({ where: { key: claimKey } });
+    if (existingClaim && now.getTime() - existingClaim.updatedAt.getTime() > DIGEST_CLAIM_STALE_MS) {
+        await db.automationSetting.deleteMany({ where: { key: claimKey, updatedAt: existingClaim.updatedAt } }).catch(() => undefined);
+    }
+
     try {
         // The unique constraint on AutomationSetting.key is the claim — a
         // second concurrent invocation's create() throws and it walks away.
@@ -104,23 +125,37 @@ export async function maybeSend0900Digest(now: Date = new Date(), db: PrismaClie
         return false;
     }
 
+    let delivered: boolean;
     try {
-        const sent = await send0900Digest(db, now);
-        if (!sent) {
-            // sendPlainNtfy resolved false (a real push failure) rather than
-            // throwing — this branch is what actually catches that; the
-            // catch block below alone never would (v1a's #557 write-before-
-            // send bug, reproduced: the "sent" marker must not be written on
-            // a failed push).
-            console.error("[speed-to-lead] 09:00 digest push failed; releasing claim for retry");
-            await db.automationSetting.delete({ where: { key: claimKey } }).catch(() => undefined);
-            return false;
-        }
-        await db.automationSetting.upsert({ where: { key: sentKey }, create: { key: sentKey, value: today }, update: { value: today } });
-        return true;
+        delivered = await send0900Digest(db, now);
     } catch (error) {
         console.error("[speed-to-lead] 09:00 digest failed; releasing claim for retry", safeErrorCategory(error));
         await db.automationSetting.delete({ where: { key: claimKey } }).catch(() => undefined);
         return false;
     }
+
+    if (!delivered) {
+        // sendPlainNtfy resolved false (a real push failure) rather than
+        // throwing — this branch is what actually catches that; the catch
+        // block above alone never would (v1a's #557 write-before-send bug,
+        // reproduced: the "sent" marker must not be written on a failed
+        // push). Nothing went out, so releasing the claim for a same-hour
+        // retry is safe.
+        console.error("[speed-to-lead] 09:00 digest push failed; releasing claim for retry");
+        await db.automationSetting.delete({ where: { key: claimKey } }).catch(() => undefined);
+        return false;
+    }
+
+    // The push already went out — from here on the claim is NEVER released
+    // again. If the marker write below fails, leaving the claim in place is
+    // what stops a retry from re-sending a push that already succeeded; the
+    // next real send is naturally unblocked tomorrow, when `today` (and so
+    // `claimKey`) changes.
+    try {
+        await db.automationSetting.upsert({ where: { key: sentKey }, create: { key: sentKey, value: today }, update: { value: today } });
+    } catch (error) {
+        console.error("[speed-to-lead] 09:00 digest sent but marking it as sent failed; claim left in place to avoid a duplicate send", safeErrorCategory(error));
+        return false;
+    }
+    return true;
 }

@@ -1403,8 +1403,10 @@ model CompanySettings {
   leadInboxLastPollOk       Boolean?
   leadInboxFailureCount     Int       @default(0)
   leadInboxNextPollAt       DateTime?
-  /// `{h0, sinceSeconds, pageToken}` while a multi-run history resync is in progress; null otherwise.
+  /// `{h0, sinceSeconds, pageToken, pendingMessageIds}` while a multi-run history resync is in progress; null otherwise.
   leadInboxResyncState      Json?
+  /// `{newHistoryId, pendingMessageIds}` while a fixed-budget poll run is still working through a completed history-list window; null once every message is handled and the cursor commits.
+  leadInboxIncrementalState Json?
 
   updatedAt DateTime @updatedAt
 }

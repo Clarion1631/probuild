@@ -42,6 +42,14 @@ interface ResyncState {
     h0: string;
     sinceSeconds: number;
     pageToken: string | null;
+    /** Message IDs from the page `pageToken` itself already fetched, not yet handled when the last run's budget ran out — resumed before fetching any further page. A page-level `pageToken` alone is not sufficient: it names the NEXT page, so without this a single oversized page re-lists itself and restarts at message #1 every run (finding: page-token granularity alone cannot resume mid-page). */
+    pendingMessageIds?: string[];
+}
+
+interface IncrementalState {
+    /** historyId to commit once every id in pendingMessageIds has been handled — captured only from a COMPLETED history-list pagination, never a partial one (finding: never checkpoint the mailbox-wide historyId before pagination completes). */
+    newHistoryId: string;
+    pendingMessageIds: string[];
 }
 
 function headerList(payload: { headers?: { name?: string | null; value?: string | null }[] | null } | undefined): RawHeader[] {
@@ -215,25 +223,52 @@ async function recordSuccessAndClearBackoff(db: PrismaClient): Promise<void> {
 async function runResyncSlice(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, state: ResyncState, budget: RunBudget, now: Date): Promise<{ done: boolean; processed: number; nextState: ResyncState }> {
     let processed = 0;
     let pageToken = state.pageToken ?? undefined;
+
+    // Resume the CURRENT page's own leftover messages, if any, before ever
+    // fetching a further page — see ResyncState.pendingMessageIds.
+    const pendingIds = state.pendingMessageIds ?? [];
+    let pendingIdx = 0;
+    while (pendingIdx < pendingIds.length) {
+        if (budget.exhausted) {
+            return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: pendingIds.slice(pendingIdx) } };
+        }
+        // A false return means THIS message's budget cutoff landed after it
+        // was found trusted but before it could be recorded — must be
+        // reported as incomplete immediately, not just relying on the
+        // budget.exhausted check above catching it on the NEXT message
+        // (there may be no next message in this page/batch).
+        const completed = await processMessage(db, gmail, pendingIds[pendingIdx], budget, now);
+        if (!completed) {
+            return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: pendingIds.slice(pendingIdx) } };
+        }
+        pendingIdx++;
+        processed++;
+    }
+
     do {
         if (budget.pagesExhausted) {
-            return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null } };
+            return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: undefined } };
         }
         budget.spendPage();
         const page = await gmail.users.messages.list({ userId: "me", q: `after:${state.sinceSeconds}`, pageToken }, { timeout: GMAIL_REQUEST_TIMEOUT_MS });
-        for (const m of page.data.messages ?? []) {
-            if (!m.id) continue;
-            if (budget.exhausted) return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null } };
-            // A false return means THIS message's budget cutoff landed after
-            // it was found trusted but before it could be recorded — must be
-            // reported as incomplete immediately, not just relying on the
-            // budget.exhausted check above catching it on the NEXT message
-            // (there may be no next message in this page/batch).
-            const completed = await processMessage(db, gmail, m.id, budget, now);
-            if (!completed) return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null } };
+        // Captured immediately: this page's own nextPageToken never changes,
+        // so persisting it alongside any of THIS page's own leftover
+        // messages below is always correct, regardless of where in the page
+        // the budget runs out.
+        pageToken = page.data.nextPageToken ?? undefined;
+        const ids = (page.data.messages ?? []).map(m => m.id).filter((id): id is string => !!id);
+        let idx = 0;
+        while (idx < ids.length) {
+            if (budget.exhausted) {
+                return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: ids.slice(idx) } };
+            }
+            const completed = await processMessage(db, gmail, ids[idx], budget, now);
+            if (!completed) {
+                return { done: false, processed, nextState: { ...state, pageToken: pageToken ?? null, pendingMessageIds: ids.slice(idx) } };
+            }
+            idx++;
             processed++;
         }
-        pageToken = page.data.nextPageToken ?? undefined;
     } while (pageToken);
     return { done: true, processed, nextState: state };
 }
@@ -251,7 +286,7 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
             where: { id: "singleton" },
             select: {
                 leadInboxHistoryId: true, leadInboxCutoffAt: true, leadInboxLastPollAt: true, leadInboxLastPollStartedAt: true,
-                leadInboxNextPollAt: true, leadInboxResyncState: true,
+                leadInboxNextPollAt: true, leadInboxResyncState: true, leadInboxIncrementalState: true,
             },
         });
 
@@ -281,6 +316,32 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
             await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxResyncState: result.nextState as unknown as object } });
             await recordPollHealth(db, startedAt, new Date(), true);
             return { ran: true, processed: result.processed, resynced: true };
+        }
+
+        // A fixed-budget incremental run from a PRIOR run is still working
+        // through a completed history-list window — resume it before
+        // listing anything new (same reasoning as the resync branch above).
+        const savedIncremental = settingsRow?.leadInboxIncrementalState as unknown as IncrementalState | null;
+        if (savedIncremental?.pendingMessageIds?.length) {
+            const pendingIds = savedIncremental.pendingMessageIds;
+            let idx = 0;
+            let processed = 0;
+            while (idx < pendingIds.length) {
+                if (budget.exhausted) break;
+                const completed = await processMessage(db, gmail, pendingIds[idx], budget, now);
+                if (!completed) break;
+                idx++;
+                processed++;
+            }
+            const remaining = pendingIds.slice(idx);
+            if (remaining.length === 0) {
+                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: savedIncremental.newHistoryId, leadInboxIncrementalState: Prisma.JsonNull } });
+            } else {
+                await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxIncrementalState: { newHistoryId: savedIncremental.newHistoryId, pendingMessageIds: remaining } as unknown as object } });
+            }
+            await recordPollHealth(db, startedAt, new Date(), true);
+            await recordSuccessAndClearBackoff(db);
+            return { ran: true, processed };
         }
 
         if (!settingsRow?.leadInboxHistoryId) {
@@ -364,27 +425,42 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
             return { ran: true, processed: result.processed, resynced: true };
         }
 
+        const idList = Array.from(messageIds);
         let processed = 0;
-        let allComplete = true;
-        for (const id of messageIds) {
-            if (budget.exhausted) { allComplete = false; break; }
+        let idx = 0;
+        while (idx < idList.length) {
+            if (budget.exhausted) break;
             // A false return means budget ran out mid-message, after this one
             // was already found trusted but before it could be recorded — it
             // must count as NOT durably processed, or the cursor gate below
             // would advance past it (see processMessage's own doc comment).
-            const completed = await processMessage(db, gmail, id, budget, now);
-            if (!completed) { allComplete = false; break; }
+            const completed = await processMessage(db, gmail, idList[idx], budget, now);
+            if (!completed) break;
+            idx++;
             processed++;
         }
+        const remaining = idList.slice(idx);
 
         // Cursor advances only after every listed message was durably
-        // processed AND every history page that exists was actually fetched
-        // (or the budget stopped us — in which case the NEXT run's
-        // history.list, starting from the SAME cursor, simply re-lists the
-        // same page; a message already processed is a no-op via its
-        // externalId's ON CONFLICT DO NOTHING).
-        if (!pagesCappedOut && allComplete && processed === messageIds.size) {
-            await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: newHistoryId } });
+        // processed AND every history page that exists was actually fetched.
+        if (pagesCappedOut) {
+            // Pagination itself was capped short — this window and
+            // newHistoryId are incomplete, so leave everything as-is; the
+            // next run's history.list, starting from the SAME cursor, simply
+            // re-lists the same pages (a message already processed is a
+            // no-op via its externalId's ON CONFLICT DO NOTHING).
+        } else if (remaining.length === 0) {
+            await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: newHistoryId, leadInboxIncrementalState: Prisma.JsonNull } });
+        } else {
+            // The full history window is known (every page was fetched) but
+            // the message-get budget ran out partway through processing it.
+            // Persist exactly which messages are still unhandled so the NEXT
+            // run resumes past them instead of re-listing this SAME window
+            // and re-spending its whole budget on the same leading untrusted
+            // messages every time — with no persisted position, a fixed
+            // per-run budget can otherwise never reach a trusted message
+            // that sorts after enough untrusted ones (finding: starvation).
+            await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxIncrementalState: { newHistoryId, pendingMessageIds: remaining } as unknown as object } });
         }
         await recordPollHealth(db, startedAt, new Date(), true);
         await recordSuccessAndClearBackoff(db);

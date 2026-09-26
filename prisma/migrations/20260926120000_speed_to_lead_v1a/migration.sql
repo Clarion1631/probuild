@@ -156,6 +156,8 @@ ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxFailureCount" I
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxNextPollAt" TIMESTAMP(3);
 -- statement-break
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxResyncState" JSONB;
+-- statement-break
+ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxIncrementalState" JSONB;
 
 -- RLS — no policies: deny via PostgREST, same as ReceiptRequestCard /
 -- ClockInRequest (these hold lead PII). Prisma's diff engine cannot

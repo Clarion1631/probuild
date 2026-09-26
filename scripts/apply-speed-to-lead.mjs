@@ -81,7 +81,7 @@ const NEW_LEAD_COLUMNS = ['bookedAt', 'calledAt'];
 const NEW_COMPANY_SETTINGS_COLUMNS = [
   'leadInboxRefreshTokenEnc', 'leadInboxEmail', 'leadInboxHistoryId', 'leadInboxCutoffAt',
   'leadInboxLastPollStartedAt', 'leadInboxLastPollAt', 'leadInboxLastPollOk',
-  'leadInboxFailureCount', 'leadInboxNextPollAt', 'leadInboxResyncState',
+  'leadInboxFailureCount', 'leadInboxNextPollAt', 'leadInboxResyncState', 'leadInboxIncrementalState',
 ];
 
 async function verifyShape(tx) {
