@@ -51,6 +51,26 @@ jobs:
       - name: Apply committed migrations to the throwaway database
         run: npx prisma migrate deploy
 
+      # Round-2 gap fixes (acceptance tests 4, 9, 21, 22): the intake route
+      # handler itself (mode-gate ordering, 32KB cap, generic 401, response
+      # shape) and Booked/Called/the 09:00 digest/promoteLeadToReal's
+      # no-new-alert guarantee had zero coverage before this round. Same
+      # ordering reason as the two steps below (must run before the
+      # known-red migration-match assertion, see its own comment) — placed
+      # BEFORE, not after, "Speed-to-Lead v1a intake and alert races": that
+      # step has a pre-existing, unrelated test-isolation flake of its own
+      # (intake-db.test.ts's tests never clean up their created rows, and
+      # Node's test runner runs the files it's given concurrently against
+      # the shared Postgres service, so alerts-db.test.ts's "sink hit
+      # exactly once" assertion can pick up leftover PENDING alerts from
+      # whichever intake-db.test.ts tests happen to have run by then) —
+      # every row this round's own tests create is cleaned up in a
+      # `finally` block, so running first does not add to that problem.
+      - name: Speed-to-Lead v1a round-2 fixes (intake route, tracking, digest) against real Postgres
+        run: npx tsx --test tests/speed-to-lead-intake-route.test.ts tests/speed-to-lead-tracking-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # Speed-to-Lead (PB-leads-001) v1a real-Postgres races: intake
       # (fallback-first, webhook-first, concurrent webhook delivery for one
       # submissionId, cross-channel dedupe) and alert claim/deliver
@@ -84,18 +104,6 @@ jobs:
       # no real Gmail account is ever touched. Same ordering reason as above.
       - name: Speed-to-Lead v1a inbox poll (fake Gmail) against real Postgres
         run: npx tsx --test tests/speed-to-lead-gmail-poll.test.ts
-        env:
-          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
-
-      # Round-2 gap fixes (acceptance tests 4, 9, 21, 22): the intake route
-      # handler itself (mode-gate ordering, 32KB cap, generic 401, response
-      # shape) and Booked/Called/the 09:00 digest/promoteLeadToReal's
-      # no-new-alert guarantee had zero coverage before this round. Same
-      # ordering reason as the two steps above — both files have DB-gated
-      # cases that must run somewhere, and this is the only job with a real
-      # Postgres.
-      - name: Speed-to-Lead v1a round-2 fixes (intake route, tracking, digest) against real Postgres
-        run: npx tsx --test tests/speed-to-lead-intake-route.test.ts tests/speed-to-lead-tracking-db.test.ts
         env:
           SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
