@@ -216,27 +216,40 @@ function authenticateWebsiteGroupRelay(headers: RawHeader[], pattern: TrustedSen
     if (top.authservId !== GOOGLE_AUTHSERV_ID) return { trusted: false, rule: null, reason: "top Authentication-Results is not from mx.google.com" };
     if (findResult(top.results, "arc")?.result !== "pass") return { trusted: false, rule: null, reason: "top-level arc= is not pass" };
 
-    // Exactly one ARC-Seal at i=1, sealed by Google — an attacker-sealed i=1
-    // claiming a DIFFERENT d= must fail here even though Google's OWN
-    // arc=pass verdict above says the chain (as received) is unbroken:
-    // chain validity proves nothing was tampered with SINCE the seal, never
-    // that the sealed content is trustworthy (RFC 8617 §9). A duplicate i=1
-    // (two ARC-Seal headers both claiming instance 1) is treated the same as
-    // missing — never "trust either one".
-    const seals = arcSealEntries(headers).filter(s => s.instance === 1);
-    if (seals.length !== 1) return { trusted: false, rule: null, reason: "expected exactly one ARC-Seal i=1" };
-    if (seals[0].d !== ARC_SEALER_DOMAIN) return { trusted: false, rule: null, reason: "ARC-Seal i=1 was not sealed by google.com" };
+    // This topology has a FIXED shape: exactly two ARC-sealed hops (i=1 the
+    // Group's own ingestion of Resend's mail, i=2 Google's internal relay
+    // from the Group to gtrsupport@'s own Gmail inbox — both hops Google's
+    // own infrastructure, matching the real R0-captured shape). Checking
+    // only the i=1-filtered subset (as this used to) leaves an attacker free
+    // to APPEND a further, correctly-signed downstream ARC set (i=3, or an
+    // i=2 sealed by a domain other than google.com) after a genuine chain —
+    // Google's own top-level arc=pass above proves the chain wasn't tampered
+    // with SINCE each seal, never that every sealer in it should be trusted
+    // (RFC 8617 sections 5.2 and 9). Rejecting any instance shape other than
+    // exactly {1, 2}, and any seal not sealed by google.com, closes that:
+    // a duplicate i=1 (two ARC-Seal headers both claiming instance 1) is
+    // caught the same way — its total count is wrong, never "trust either
+    // one". No RSA verification of our own is needed — this only enforces
+    // the permitted topology on top of Google's own chain-validity verdict.
+    const seals = arcSealEntries(headers);
+    if (JSON.stringify(seals.map(s => s.instance).sort((a, b) => a - b)) !== JSON.stringify([1, 2])) {
+        return { trusted: false, rule: null, reason: "unexpected ARC-Seal chain shape (expected exactly instances 1 and 2 for this topology)" };
+    }
+    if (seals.some(s => s.d !== ARC_SEALER_DOMAIN)) return { trusted: false, rule: null, reason: "an ARC-Seal hop was not sealed by google.com" };
 
-    // Exactly one ARC-Authentication-Results at i=1, itself from mx.google.com
-    // (the hop architecturally required to be Google-controlled — "its first
-    // Google hop"), showing Resend's own dkim=pass (header.s=resend) and
+    // Same shape requirement for ARC-Authentication-Results, plus every hop
+    // (not just i=1) must itself be from mx.google.com — a downstream i=2
+    // from anywhere else is exactly the appended-hop attack this closes.
+    // i=1 additionally shows Resend's own dkim=pass (header.s=resend) and
     // dmarc=pass for the website's real signing domain. The top-level
     // dkim=pass (the Group's own s=google re-signature) is NEVER read here —
     // it says nothing about the original sender.
-    const aars = arcAuthResultsEntries(headers).filter(a => a.instance === 1);
-    if (aars.length !== 1) return { trusted: false, rule: null, reason: "expected exactly one ARC-Authentication-Results i=1" };
-    const aar = aars[0];
-    if (aar.authservId !== GOOGLE_AUTHSERV_ID) return { trusted: false, rule: null, reason: "ARC-Authentication-Results i=1 is not from mx.google.com" };
+    const aars = arcAuthResultsEntries(headers);
+    if (JSON.stringify(aars.map(a => a.instance).sort((a, b) => a - b)) !== JSON.stringify([1, 2])) {
+        return { trusted: false, rule: null, reason: "unexpected ARC-Authentication-Results chain shape (expected exactly instances 1 and 2 for this topology)" };
+    }
+    if (aars.some(a => a.authservId !== GOOGLE_AUTHSERV_ID)) return { trusted: false, rule: null, reason: "an ARC-Authentication-Results hop is not from mx.google.com" };
+    const aar = aars.find(a => a.instance === 1)!;
 
     const resendDkim = findResult(aar.results, "dkim", { tag: "header.s", value: "resend" });
     if (!resendDkim || resendDkim.result !== "pass") return { trusted: false, rule: null, reason: "ARC i=1 has no dkim=pass header.s=resend" };

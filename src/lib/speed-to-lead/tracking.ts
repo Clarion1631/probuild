@@ -14,7 +14,9 @@ import { safeErrorCategory } from "./error-category";
  * unchanged in spirit but with the cancellation step dropped entirely.
  */
 
-/** The claim row's value once its push has actually succeeded but the "sent" marker write then failed — see maybeSend0900Digest's own doc comment. Distinct from the plain "claimed" value so the staleness check below can tell "still in flight" (reclaimable once old enough) apart from "already sent, only the marker write failed" (never reclaimable, no matter how old). */
+/** Written to the per-day claim key BEFORE any push is attempted — see maybeSend0900Digest's own doc comment for why establishing this durably up front (rather than only after a successful push) is what actually closes the duplicate-send gap. */
+const CLAIM_VALUE_SENDING = "sending";
+/** Written AFTER a push has been confirmed delivered, if (and only if) the primary `sentKey` write below it failed. Purely diagnostic for a human inspecting the row — correctness never depends on this write succeeding, since CLAIM_VALUE_SENDING is already non-reclaimable on its own by the time the push even starts. */
 const CLAIM_VALUE_SENT_PENDING = "sent-pending";
 
 /** A Speed-to-Lead-owned lead — one that actually went through this feature's own intake (via its LeadIntakeEvent relation), so a pre-existing CRM lead never appears in the digest. */
@@ -87,25 +89,31 @@ export async function send0900Digest(db: PrismaClient = prisma, now: Date = new 
  * next minute within the same local hour retries (v1a fix for #557's
  * write-before-send bug, which lost the whole day on one failed push).
  *
- * Three more failure modes than a simple claim/release, all v1a round-3 or
- * round-4 findings:
- *  - A crash (or the claim-row delete above itself failing) between
- *    claiming and releasing would otherwise strand the claim for the rest
- *    of the local day with the digest never actually sent — a stale claim
- *    is reclaimed below rather than left to block every later tick.
- *  - Once the push has actually succeeded, this function must never
- *    release the claim again for any reason (including the "sent" marker
- *    write itself failing) — releasing it would let a later retry re-send
- *    a push that already went out.
- *  - That "never release" guarantee is not enough on its own: if the
- *    marker write fails, the claim's `updatedAt` is never refreshed, so
- *    once more than DIGEST_CLAIM_STALE_MS passes, the STALENESS check
- *    above would see that same successfully-sent claim as abandoned and
- *    delete it — letting a later tick claim fresh and re-send (round-4
- *    finding). The marker-write failure branch below marks the claim
- *    `CLAIM_VALUE_SENT_PENDING` instead of leaving it as plain "claimed",
- *    and the staleness check never reclaims a claim in that state, no
- *    matter its age.
+ * Failure modes beyond a simple claim/release, v1a round-3 through round-5
+ * findings:
+ *  - A crash (or the claim-row delete above itself failing) BEFORE the push
+ *    is even attempted would otherwise strand the claim for the rest of the
+ *    local day with the digest never actually sent — a stale claim in that
+ *    state is reclaimed below rather than left to block every later tick.
+ *  - Once the push has actually STARTED, this function must never release
+ *    the claim again for any reason — a crash mid-push, or a failure
+ *    writing the "sent" marker afterward, must never look indistinguishable
+ *    from "never attempted", or a later retry could re-send a push that
+ *    already went out. Round-5 fix: the claim is written as
+ *    CLAIM_VALUE_SENDING BEFORE `send0900Digest` is even called (not only
+ *    AFTER a successful push, as the round-4 design had it) — the OLD
+ *    design's entire protection depended on the after-push
+ *    CLAIM_VALUE_SENT_PENDING write succeeding, and that write's own
+ *    failure was silently swallowed (`.catch(() => undefined)`), which left
+ *    the exact same ambiguity a bare crash mid-push already had: a claim
+ *    that looked exactly like "never attempted" and so was reclaimed and
+ *    re-sent.
+ *  - The staleness check below never reclaims CLAIM_VALUE_SENDING or
+ *    CLAIM_VALUE_SENT_PENDING, no matter their age — re-pushing risks a
+ *    real duplicate send, which is worse than a missed digest a human can
+ *    force by clearing the row. Once such a claim is old enough that no
+ *    real invocation could still be running, this only logs it for manual
+ *    follow-up rather than silently doing nothing forever.
  */
 export async function maybeSend0900Digest(now: Date = new Date(), db: PrismaClient = prisma): Promise<boolean> {
     if (speedToLeadMode() === "OFF") return false;
@@ -119,23 +127,38 @@ export async function maybeSend0900Digest(now: Date = new Date(), db: PrismaClie
     const alreadySent = await db.automationSetting.findUnique({ where: { key: sentKey } });
     if (alreadySent?.value === today) return false;
 
-    // A claim old enough that no real in-flight run could still own it is
-    // stale — reclaim it so a prior crash (or a failed release) does not
-    // block every tick for the rest of the day. Guarded by updatedAt so a
-    // claim refreshed by another run between the read and this delete is
-    // left alone. A claim already marked CLAIM_VALUE_SENT_PENDING is never
-    // reclaimed here regardless of age — it means the push for today
-    // already went out and only the "sent" marker write failed, so treating
-    // it as abandoned would send the same digest a second time.
     const existingClaim = await db.automationSetting.findUnique({ where: { key: claimKey } });
-    if (existingClaim && existingClaim.value !== CLAIM_VALUE_SENT_PENDING && now.getTime() - existingClaim.updatedAt.getTime() > DIGEST_CLAIM_STALE_MS) {
-        await db.automationSetting.deleteMany({ where: { key: claimKey, updatedAt: existingClaim.updatedAt } }).catch(() => undefined);
+    if (existingClaim) {
+        const ageMs = now.getTime() - existingClaim.updatedAt.getTime();
+        if (existingClaim.value === CLAIM_VALUE_SENDING || existingClaim.value === CLAIM_VALUE_SENT_PENDING) {
+            // A push was at least ATTEMPTED under this claim — its outcome
+            // (still running, crashed mid-push, or succeeded but the "sent"
+            // marker write failed) is indistinguishable from here, and every
+            // one of those is safer to treat as "possibly already sent"
+            // than to risk a real duplicate. Never reclaimed, no matter how
+            // old; once old enough that no real invocation could still be
+            // in flight, log it so a human can check and clear it manually.
+            if (ageMs > DIGEST_CLAIM_STALE_MS) {
+                console.error(`[speed-to-lead] 09:00 digest claim ${claimKey} has been "${existingClaim.value}" for ${Math.round(ageMs / 1000)}s — treating as possibly already sent and NOT re-pushing. If it was not actually sent, clear this AutomationSetting row to allow a retry.`);
+            }
+            return false;
+        }
+        // Any other stale value (defensive only — this function itself
+        // never writes anything but CLAIM_VALUE_SENDING going forward) is
+        // safe to reclaim once old enough: nothing was ever attempted under
+        // it. Guarded by updatedAt so a claim refreshed by another run
+        // between the read and this delete is left alone.
+        if (ageMs > DIGEST_CLAIM_STALE_MS) {
+            await db.automationSetting.deleteMany({ where: { key: claimKey, updatedAt: existingClaim.updatedAt } }).catch(() => undefined);
+        }
     }
 
     try {
         // The unique constraint on AutomationSetting.key is the claim — a
         // second concurrent invocation's create() throws and it walks away.
-        await db.automationSetting.create({ data: { key: claimKey, value: "claimed" } });
+        // Marked CLAIM_VALUE_SENDING from this single write on, BEFORE the
+        // push is ever attempted (see doc comment above).
+        await db.automationSetting.create({ data: { key: claimKey, value: CLAIM_VALUE_SENDING } });
     } catch {
         return false;
     }
@@ -161,22 +184,19 @@ export async function maybeSend0900Digest(now: Date = new Date(), db: PrismaClie
         return false;
     }
 
-    // The push already went out — from here on the claim is NEVER released
-    // again. If the marker write below fails, leaving the claim in place is
-    // what stops a retry from re-sending a push that already succeeded; the
-    // next real send is naturally unblocked tomorrow, when `today` (and so
-    // `claimKey`) changes.
+    // The push already went out — the claim has been CLAIM_VALUE_SENDING
+    // (already non-reclaimable) since before the push started, so it is
+    // NEVER released again from here, no matter what happens next.
     try {
         await db.automationSetting.upsert({ where: { key: sentKey }, create: { key: sentKey, value: today }, update: { value: today } });
     } catch (error) {
-        console.error("[speed-to-lead] 09:00 digest sent but marking it as sent failed; claim left in place to avoid a duplicate send", safeErrorCategory(error));
-        // Mark the claim CLAIM_VALUE_SENT_PENDING so a LATER tick's own
-        // staleness check (this same function, possibly run more than
-        // DIGEST_CLAIM_STALE_MS from now) never reclaims and deletes it —
-        // otherwise a tick a few minutes later would see an ordinary
-        // "claimed" row past its staleness window, delete it, claim fresh,
-        // and re-send a push that already went out (round-4 finding).
-        await db.automationSetting.update({ where: { key: claimKey }, data: { value: CLAIM_VALUE_SENT_PENDING } }).catch(() => undefined);
+        console.error("[speed-to-lead] 09:00 digest sent but marking it as sent failed", safeErrorCategory(error));
+        // Purely diagnostic — correctness does not depend on this write
+        // succeeding. If it ALSO fails, the claim simply stays
+        // CLAIM_VALUE_SENDING, which the staleness check above treats
+        // identically to CLAIM_VALUE_SENT_PENDING: never reclaimed.
+        await db.automationSetting.update({ where: { key: claimKey }, data: { value: CLAIM_VALUE_SENT_PENDING } })
+            .catch(err => console.error("[speed-to-lead] also failed marking the claim sent-pending (non-fatal — it stays 'sending', still never reclaimed)", safeErrorCategory(err)));
         return false;
     }
     return true;

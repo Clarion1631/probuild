@@ -100,6 +100,26 @@ function withFailingSentMarkerUpsert(real: PrismaClient): PrismaClient {
     }) as PrismaClient;
 }
 
+/** Like withFailingSentMarkerUpsert, but ALSO fails the fallback claim update — simulates the push succeeding while BOTH marker writes (the "sent" upsert and the sending->sent-pending update) fail, round-5's double-write-failure case. */
+function withFailingDigestMarkerWrites(real: PrismaClient): PrismaClient {
+    return new Proxy(real, {
+        get(target, prop, receiver) {
+            if (prop === "automationSetting") {
+                const delegate = Reflect.get(target, prop, receiver) as PrismaClient["automationSetting"];
+                return new Proxy(delegate, {
+                    get(delegateTarget, delegateProp, delegateReceiver) {
+                        if (delegateProp === "upsert" || delegateProp === "update") {
+                            return async () => { throw new Error("simulated digest marker write failure"); };
+                        }
+                        return Reflect.get(delegateTarget, delegateProp, delegateReceiver);
+                    },
+                });
+            }
+            return Reflect.get(target, prop, receiver);
+        },
+    }) as PrismaClient;
+}
+
 test("markLeadBooked sets bookedAt exactly once and logs the actor; a second press is a no-op that logs nothing new", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     const leadId = await makeOwnedLead(db);
@@ -317,6 +337,7 @@ test("a push that succeeds but whose 'sent' marker write then fails never causes
     process.env.SPEED_TO_LEAD_MODE = "TEST";
     const leadId = await makeOwnedLead(db);
     try {
+        const claimKey = "speedToLeadDigestClaim:2026-01-15";
         const failingDb = withFailingSentMarkerUpsert(db);
         const first = await maybeSend0900Digest(NINE_AM_PACIFIC, failingDb);
         assert.equal(first, false, "the marker write failed, so this call must not report success");
@@ -324,6 +345,9 @@ test("a push that succeeds but whose 'sent' marker write then fails never causes
 
         const sentMarker = await db.automationSetting.findUnique({ where: { key: "speedToLeadDigestLastSentDate" } });
         assert.equal(sentMarker, null, "the marker genuinely never got written");
+
+        const claimAfterFailure = await db.automationSetting.findUnique({ where: { key: claimKey } });
+        assert.equal(claimAfterFailure?.value, "sent-pending", "the claim must record the sentinel distinguishing 'pushed, marker write failed' from 'never attempted'");
 
         // A retry the SAME hour, on the real (non-failing) client, must never
         // re-send — the claim from the first call's successful push must
@@ -342,7 +366,7 @@ test("a push that succeeds but whose 'sent' marker write then fails never causes
     }
 });
 
-test("a push that succeeds but whose 'sent' marker write then fails is STILL never re-sent by a later tick, even once the claim would otherwise look stale (round-4: the marker-write-failure case combined with the stale-claim reclaim)", { skip }, async () => {
+test("a push that succeeds but whose 'sent' marker write then fails is STILL never re-sent by a later tick, even once the claim is GENUINELY aged past the staleness window in the DB (round-4/5: the marker-write-failure case combined with the stale-claim reclaim)", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     await cleanupDigestSettings(db);
     const sink = await startSink((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ id: "digest-marker-fail-then-stale" })); });
@@ -354,20 +378,83 @@ test("a push that succeeds but whose 'sent' marker write then fails is STILL nev
     process.env.SPEED_TO_LEAD_MODE = "TEST";
     const leadId = await makeOwnedLead(db);
     try {
+        const claimKey = "speedToLeadDigestClaim:2026-01-15";
         const failingDb = withFailingSentMarkerUpsert(db);
         const first = await maybeSend0900Digest(NINE_AM_PACIFIC, failingDb);
         assert.equal(first, false, "the marker write failed, so this call must not report success");
         assert.equal(sink.hits(), 1, "the push itself must have gone out exactly once");
 
-        // Without the round-4 fix, the claim's updatedAt is never refreshed
-        // on a marker-write failure, so a tick this far past
-        // DIGEST_CLAIM_STALE_MS (5 min) would see an ordinary-looking
-        // "claimed" row past its staleness window, delete it, claim fresh,
-        // and re-send — even though today's digest already went out.
+        const claimAfterFailure = await db.automationSetting.findUnique({ where: { key: claimKey } });
+        assert.equal(claimAfterFailure?.value, "sent-pending", "the claim must record the sentinel distinguishing 'pushed, marker write failed' from 'never attempted'");
+
+        // Round-5 fix for a falsely-green version of this test: it used to
+        // only advance the `now` ARGUMENT passed to maybeSend0900Digest,
+        // while the row's real `updatedAt` (set by Postgres at claim/update
+        // time, i.e. real wall-clock "now") never moved — so `ageMs` in the
+        // staleness check was actually NEGATIVE (NINE_AM_PACIFIC is a fixed
+        // 2026-01-15 date, long before whenever this suite actually runs),
+        // and the value check (`=== CLAIM_VALUE_SENT_PENDING`) was doing
+        // ALL the protective work, with the age branch never genuinely
+        // exercised. Age the row for real, in the DB, past
+        // DIGEST_CLAIM_STALE_MS (5 min) — a tick this far past would, without
+        // the fix, see an ordinary-looking stale row, delete it, claim
+        // fresh, and re-send, even though today's digest already went out.
+        const staleSince = new Date(NINE_AM_PACIFIC.getTime() - 10 * 60 * 1000);
+        await db.$executeRaw`UPDATE "AutomationSetting" SET "updatedAt" = ${staleSince} WHERE key = ${claimKey}`;
+
         const sixMinutesLater = new Date(NINE_AM_PACIFIC.getTime() + 6 * 60 * 1000);
         const retry = await maybeSend0900Digest(sixMinutesLater, db);
         assert.equal(retry, false, "a later tick past the staleness window must never reclaim a claim whose push already succeeded");
         assert.equal(sink.hits(), 1, "still exactly one push for the day — the whole point of this test");
+
+        const claimAfterRetry = await db.automationSetting.findUnique({ where: { key: claimKey } });
+        assert.equal(claimAfterRetry?.value, "sent-pending", "the sentinel must be untouched — reclaim must never even be attempted for this value");
+
+        const sentMarker = await db.automationSetting.findUnique({ where: { key: "speedToLeadDigestLastSentDate" } });
+        assert.equal(sentMarker, null, "the marker still never got written, by construction of this scenario");
+    } finally {
+        process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
+        process.env.SPEED_TO_LEAD_NTFY_BASE_URL = originalBase;
+        process.env.SPEED_TO_LEAD_MODE = originalMode;
+        await cleanupLead(db, leadId);
+        await cleanupDigestSettings(db);
+        await sink.close();
+        await db.$disconnect();
+    }
+});
+
+test("a push that succeeds but BOTH marker writes fail (the 'sent' upsert AND the sending->sent-pending fallback update) still never causes a duplicate send — the claim stays 'sending', never reclaimed even genuinely aged past staleness (round-5: double-write-failure)", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    await cleanupDigestSettings(db);
+    const sink = await startSink((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ id: "digest-double-marker-fail" })); });
+    const originalTopic = process.env.SPEED_TO_LEAD_NTFY_TOPIC;
+    const originalBase = process.env.SPEED_TO_LEAD_NTFY_BASE_URL;
+    const originalMode = process.env.SPEED_TO_LEAD_MODE;
+    process.env.SPEED_TO_LEAD_NTFY_TOPIC = "test-topic";
+    process.env.SPEED_TO_LEAD_NTFY_BASE_URL = sink.url;
+    process.env.SPEED_TO_LEAD_MODE = "TEST";
+    const leadId = await makeOwnedLead(db);
+    try {
+        const claimKey = "speedToLeadDigestClaim:2026-01-15";
+        const failingDb = withFailingDigestMarkerWrites(db);
+        const first = await maybeSend0900Digest(NINE_AM_PACIFIC, failingDb);
+        assert.equal(first, false, "both marker writes failed, so this call must not report success");
+        assert.equal(sink.hits(), 1, "the push itself must have gone out exactly once");
+
+        const claimAfterDoubleFailure = await db.automationSetting.findUnique({ where: { key: claimKey } });
+        assert.equal(claimAfterDoubleFailure?.value, "sending", "with both marker writes failed, the claim must still read the sentinel written BEFORE the push started — never anything that looks like 'never attempted'");
+
+        // Genuinely age it, in the DB, past the staleness window.
+        const staleSince = new Date(NINE_AM_PACIFIC.getTime() - 10 * 60 * 1000);
+        await db.$executeRaw`UPDATE "AutomationSetting" SET "updatedAt" = ${staleSince} WHERE key = ${claimKey}`;
+
+        const sixMinutesLater = new Date(NINE_AM_PACIFIC.getTime() + 6 * 60 * 1000);
+        const retry = await maybeSend0900Digest(sixMinutesLater, db);
+        assert.equal(retry, false, "a 'sending' claim must never be reclaimed, no matter how stale it looks, once a push may have gone out under it");
+        assert.equal(sink.hits(), 1, "no second push, ever, for a day whose digest already went out");
+
+        const claimAfterRetry = await db.automationSetting.findUnique({ where: { key: claimKey } });
+        assert.equal(claimAfterRetry?.value, "sending", "the sentinel is untouched by the retry — never reclaimed, never rewritten");
 
         const sentMarker = await db.automationSetting.findUnique({ where: { key: "speedToLeadDigestLastSentDate" } });
         assert.equal(sentMarker, null, "the marker still never got written, by construction of this scenario");

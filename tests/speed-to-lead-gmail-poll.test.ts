@@ -100,6 +100,12 @@ async function resetCompanySettings(db: PrismaClient) {
     await db.companySettings.deleteMany({ where: { id: "singleton" } });
 }
 
+// Two ARC-sealed hops (i=1 the Group's own ingestion of Resend's mail, i=2
+// Google's internal relay from the Group to gtrsupport@'s own Gmail inbox) —
+// the real R0-captured shape (authentication.ts's own doc comment), and,
+// since round-5, the ONLY shape authenticateMessage accepts: it rejects any
+// instance count/shape other than exactly {1, 2} (an appended downstream ARC
+// hop forgery, RFC 8617 section 5.2).
 const WEBSITE_HEADERS_METADATA: { payload: GmailPayload } = {
     payload: {
         headers: [
@@ -110,6 +116,8 @@ const WEBSITE_HEADERS_METADATA: { payload: GmailPayload } = {
             { name: "Authentication-Results", value: "mx.google.com; dkim=pass header.i=@goldentouchremodeling.com header.s=google; arc=pass (i=2); dmarc=pass header.from=goldentouchremodeling.com" },
             { name: "ARC-Seal", value: "i=1; a=rsa-sha256; cv=none; d=google.com; s=x; t=1; b=z" },
             { name: "ARC-Authentication-Results", value: "i=1; mx.google.com; dkim=pass header.i=@goldentouchremodeling.com header.s=resend header.b=x; dmarc=pass header.from=goldentouchremodeling.com" },
+            { name: "ARC-Seal", value: "i=2; a=rsa-sha256; cv=pass; d=google.com; s=x; t=2; b=y" },
+            { name: "ARC-Authentication-Results", value: "i=2; mx.google.com; dkim=pass header.i=@goldentouchremodeling.com header.s=google; arc=pass (i=2); dmarc=pass header.from=goldentouchremodeling.com" },
         ],
     },
 };
@@ -422,6 +430,58 @@ test("a resync whose last page's own leftover messages exceed one run's budget t
         assert.equal(settings?.leadInboxResyncState, null, "no leftover resync state once done");
         assert.equal(messagesListCallsLocal, 2, "each of the resync's 2 pages must be listed exactly once across every run combined — no re-list from page 1");
         assert.equal(getCallCount, 55, "all 55 messages (10 + 45) must be fetched exactly once total, no matter how many runs it took");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("a 30-minute-old pending message is drained BEFORE history.list is even called, so it is still processed even though this run's cursor has expired (round-5: draining used to happen AFTER enumeration, abandoning it on a 404)", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        const now = new Date();
+        // A prior run already found "pending-old-1" via history.list (added
+        // to pendingMessageIds) but ran out of get-budget before it could be
+        // recorded, and pagination itself was NOT yet done (there is still
+        // more to enumerate via `pageToken`) — 30 minutes have passed since.
+        // Without the fix, THIS run's history.list call (continuing that
+        // enumeration) throwing a 404 would discard `pendingMessageIds`
+        // entirely via the historyExpired branch, silently losing the
+        // message.
+        await db.companySettings.create({
+            data: {
+                id: "singleton",
+                leadInboxHistoryId: "hist-A",
+                leadInboxCutoffAt: new Date(now.getTime() - 60 * 60 * 1000),
+                leadInboxLastPollStartedAt: new Date(now.getTime() - 60 * 1000),
+                leadInboxIncrementalState: {
+                    newHistoryId: "hist-A",
+                    pageToken: "page-2",
+                    pendingMessageIds: ["pending-old-1"],
+                    paginationDone: false,
+                    since: new Date(now.getTime() - 30 * 60 * 1000).toISOString(),
+                },
+            },
+        });
+        script = {
+            getProfile: () => ({ historyId: "h0-after-drain-recovery" }),
+            historyList: () => ({ throw404: true }),
+            messagesList: () => ({ messages: [] }),
+            messagesGet: (id, format) => {
+                if (id === "pending-old-1") return format === "metadata" ? WEBSITE_HEADERS_METADATA : { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
+                return UNTRUSTED_HEADERS_METADATA;
+            },
+        };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+        await pollLeadInbox(db, now);
+
+        const row = await db.leadIntakeEvent.findUnique({ where: { externalId: "voice:pending-old-1" } });
+        assert.ok(row, "the 30-minute-old pending message must still be processed despite this run's history.list 404ing");
+        assert.equal(row?.source, "WEB_EMAIL_FALLBACK");
+
+        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+        assert.equal(settings?.leadInboxHistoryId, "h0-after-drain-recovery", "the resync fallback must still complete and commit its own H0 cursor");
+        assert.equal(settings?.leadInboxIncrementalState, null, "no leftover incremental state — the abandoned scan was fully superseded by the resync");
     } finally {
         await db.$disconnect();
     }

@@ -154,6 +154,27 @@ test("(i) a Voice From with a non-google.com DKIM domain is untrusted", () => {
     assert.equal(authenticateMessage(headers, "voice-noreply@google.com").trusted, false);
 });
 
+// ── Appended-chain forgery (round-5, RFC 8617 section 5.2) ─────────────────
+
+test("(j) a correctly-signed i=3 ARC set appended AFTER a genuine 2-hop chain, sealed by an attacker domain, is untrusted", () => {
+    const headers = realWebsiteHeaders();
+    headers.push(h("ARC-Seal", "i=3; a=rsa-sha256; cv=pass; d=attacker.example; s=x; t=3; b=z"));
+    headers.push(h("ARC-Authentication-Results", "i=3; mx.google.com; " + WEBSITE_TOP_AR));
+    assert.equal(authenticateMessage(headers, "website@goldentouchremodeling.com").trusted, false);
+});
+
+test("(k) an EXTRA i=3 ARC set appended after a genuine chain is STILL untrusted even when sealed by google.com itself — a topology-shape violation, not just a wrong sealing domain", () => {
+    const headers = realWebsiteHeaders();
+    headers.push(h("ARC-Seal", "i=3; a=rsa-sha256; cv=pass; d=google.com; s=arc-20160816; t=3; b=z"));
+    headers.push(h("ARC-Authentication-Results", "i=3; mx.google.com; " + WEBSITE_TOP_AR));
+    assert.equal(authenticateMessage(headers, "website@goldentouchremodeling.com").trusted, false);
+});
+
+test("(l) a genuine chain missing its i=2 hop entirely (only i=1 present) is untrusted — the permitted topology requires exactly {1, 2}, never a subset", () => {
+    const headers = realWebsiteHeaders().filter(header => !(header.name === "ARC-Seal" && header.value.startsWith("i=2")) && !(header.name === "ARC-Authentication-Results" && header.value.startsWith("i=2")));
+    assert.equal(authenticateMessage(headers, "website@goldentouchremodeling.com").trusted, false);
+});
+
 // ── Config ───────────────────────────────────────────────────────────────
 
 test("an unknown From address is untrusted regardless of headers", () => {

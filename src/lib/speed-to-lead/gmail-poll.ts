@@ -30,6 +30,53 @@ const BACKOFF_MINUTES = [1, 2, 4, 8, 15] as const;
 const POLL_ALERT_SENT_KEY = "speedToLeadPollAlertSentAt";
 const POLL_DISCONNECTED_ALERT_KEY = "speedToLeadInboxDisconnectedAlertSent";
 
+// ── Fallback-path alert flood guard (round-5, defense in depth alongside the
+// ARC topology fix) ─────────────────────────────────────────────────────────
+const FALLBACK_ALERT_FLOOD_KEY = "speedToLeadFallbackAlertFlood";
+/** At most this many of the fallback poller's OWN health alerts (disconnected / repeated-failure / resync-gap) reach ntfy in one rolling hour. */
+const FALLBACK_ALERT_FLOOD_CAP = 5;
+const FALLBACK_ALERT_FLOOD_WINDOW_MS = 60 * 60 * 1000;
+
+interface FallbackAlertFloodState {
+    windowStart: string;
+    count: number;
+    suppressed: number;
+}
+
+/**
+ * A rolling-hour cap on the fallback poller's own health alerts, so a burst
+ * of repeated failures — or a flood of forged/rejected messages probing the
+ * ARC topology check — never turns into a wall of individual pushes to
+ * Justin's phone. Every call still counts even while suppressed, so once the
+ * cap is no longer exhausted the NEXT alert that actually goes out carries a
+ * one-line summary of how many were batched in behind it.
+ */
+export async function sendFallbackPathAlert(db: PrismaClient, title: string, body: string, now: Date): Promise<boolean> {
+    const row = await db.automationSetting.findUnique({ where: { key: FALLBACK_ALERT_FLOOD_KEY } });
+    let state: FallbackAlertFloodState;
+    try {
+        state = row ? (JSON.parse(row.value) as FallbackAlertFloodState) : { windowStart: now.toISOString(), count: 0, suppressed: 0 };
+    } catch {
+        state = { windowStart: now.toISOString(), count: 0, suppressed: 0 };
+    }
+    if (!Number.isFinite(new Date(state.windowStart).getTime()) || now.getTime() - new Date(state.windowStart).getTime() >= FALLBACK_ALERT_FLOOD_WINDOW_MS) {
+        state = { windowStart: now.toISOString(), count: 0, suppressed: 0 };
+    }
+
+    if (state.count >= FALLBACK_ALERT_FLOOD_CAP) {
+        state.suppressed += 1;
+        await db.automationSetting.upsert({ where: { key: FALLBACK_ALERT_FLOOD_KEY }, create: { key: FALLBACK_ALERT_FLOOD_KEY, value: JSON.stringify(state) }, update: { value: JSON.stringify(state) } });
+        return false;
+    }
+
+    const suppressedBefore = state.suppressed;
+    const sentBody = suppressedBefore > 0 ? `${body}\n\n(plus ${suppressedBefore} more alert(s) suppressed this hour)` : body;
+    state.count += 1;
+    state.suppressed = 0;
+    await db.automationSetting.upsert({ where: { key: FALLBACK_ALERT_FLOOD_KEY }, create: { key: FALLBACK_ALERT_FLOOD_KEY, value: JSON.stringify(state) }, update: { value: JSON.stringify(state) } });
+    return sendPlainNtfy(title, sentBody);
+}
+
 export interface PollResult {
     ran: boolean;
     reason?: string;
@@ -84,6 +131,20 @@ interface IncrementalState {
      * (finding: incremental starvation — "page 11+ unreachable").
      */
     paginationDone: boolean;
+    /**
+     * ISO timestamp captured when this NOT-yet-committed incremental scan
+     * first began — i.e. `now` at the moment the prior scan's cursor was
+     * last committed (or the very first scan after establishing the initial
+     * cursor). Pinned across every run this scan remains open; never
+     * advanced by partial progress within it. Round-5 finding: a message
+     * can sit in `pendingMessageIds` for several runs (get-budget
+     * exhaustion) before a LATER run's `history.list` call 404s — the
+     * recovery resync's `since` window must reach back to THIS point (the
+     * earliest unfinished point), not to "the last poll's start minus 10
+     * minutes", which for a message pending far longer than one poll
+     * interval is nowhere near far enough back and silently drops it.
+     */
+    since: string;
 }
 
 function headerList(payload: { headers?: { name?: string | null; value?: string | null }[] | null } | undefined): RawHeader[] {
@@ -215,7 +276,7 @@ async function recordFailureAndBackoff(db: PrismaClient, startedAt: Date, now: D
         });
         const already = await db.automationSetting.findUnique({ where: { key: POLL_DISCONNECTED_ALERT_KEY } });
         if (!already) {
-            await sendPlainNtfy("Speed-to-Lead: lead inbox disconnected", "gtrsupport@ revoked or expired its Gmail connection. Reconnect it in Settings > Speed-to-Lead.");
+            await sendFallbackPathAlert(db, "Speed-to-Lead: lead inbox disconnected", "gtrsupport@ revoked or expired its Gmail connection. Reconnect it in Settings > Speed-to-Lead.", now);
             await db.automationSetting.create({ data: { key: POLL_DISCONNECTED_ALERT_KEY, value: now.toISOString() } }).catch(() => undefined);
         }
         return;
@@ -234,7 +295,7 @@ async function recordFailureAndBackoff(db: PrismaClient, startedAt: Date, now: D
     if (failureCount >= BACKOFF_MINUTES.length) {
         const already = await db.automationSetting.findUnique({ where: { key: POLL_ALERT_SENT_KEY } });
         if (!already) {
-            await sendPlainNtfy("Speed-to-Lead: inbox poll failing", `The lead-inbox poll has failed ${failureCount} times in a row.`);
+            await sendFallbackPathAlert(db, "Speed-to-Lead: inbox poll failing", `The lead-inbox poll has failed ${failureCount} times in a row.`, now);
             await db.automationSetting.create({ data: { key: POLL_ALERT_SENT_KEY, value: now.toISOString() } }).catch(() => undefined);
         }
     }
@@ -339,13 +400,44 @@ async function runResyncSlice(db: PrismaClient, gmail: ReturnType<typeof gmailCl
  * durably processed.
  */
 async function runIncrementalSlice(db: PrismaClient, gmail: ReturnType<typeof gmailClientFor>, startHistoryId: string, state: IncrementalState, budget: RunBudget, now: Date): Promise<{ done: boolean; processed: number; nextState: IncrementalState; historyExpired?: boolean }> {
+    let processed = 0;
+
+    // Drain every id ALREADY known pending from a prior run FIRST — before
+    // ever calling `history.list`, which can itself throw on an expired
+    // cursor. Round-5 regression: this used to run AFTER this run's own
+    // enumeration below, so a pending id (possibly several runs old) sitting
+    // in `state.pendingMessageIds` was silently abandoned whenever a LATER
+    // `history.list` call hit an expired cursor — the caller's
+    // `historyExpired` branch discards `leadInboxIncrementalState` entirely.
+    // By the time pagination can even start below, every previously-known
+    // pending id has either been durably processed, or this run has already
+    // returned without ever touching `history.list`.
+    const pendingIds = state.pendingMessageIds;
+    let pendingIdx = 0;
+    while (pendingIdx < pendingIds.length) {
+        if (budget.exhausted) {
+            return { done: false, processed, nextState: { ...state, pendingMessageIds: pendingIds.slice(pendingIdx) } };
+        }
+        // A false return means budget ran out mid-message, after this one
+        // was already found trusted but before it could be recorded — it
+        // must count as NOT durably processed (see processMessage's own doc
+        // comment), so it stays pending (not yet advanced past).
+        const completed = await processMessage(db, gmail, pendingIds[pendingIdx], budget, now);
+        if (!completed) {
+            return { done: false, processed, nextState: { ...state, pendingMessageIds: pendingIds.slice(pendingIdx) } };
+        }
+        pendingIdx++;
+        processed++;
+    }
+
     let pageToken = state.pageToken ?? undefined;
     let newHistoryId = state.newHistoryId;
     let paginationDone = state.paginationDone;
-    // Seeded with the carried-over pendingMessageIds so a newly fetched
-    // page can never re-add an id this run already knows about (finding:
-    // "dedup before full GETs where possible").
-    const seen = new Set(state.pendingMessageIds);
+    // No need to seed this from state.pendingMessageIds any more — every id
+    // that was ever in it is fully drained by this point (or this function
+    // already returned above), so a newly fetched page can only ever see
+    // ids this run has not already collected.
+    const seen = new Set<string>();
     const collected: string[] = [];
 
     while (!paginationDone) {
@@ -358,7 +450,12 @@ async function runIncrementalSlice(db: PrismaClient, gmail: ReturnType<typeof gm
             // The startHistoryId this enumeration is anchored to has expired
             // mid-resume — abandon this partial state entirely; the caller
             // falls back to the H0 resync path exactly as a fresh run would.
-            if (isGoogleApiError(error, 404)) return { done: false, processed: 0, nextState: state, historyExpired: true };
+            // Every previously-known pending id was already durably drained
+            // above, so only THIS run's own newly-collected (still
+            // unprocessed) ids are at risk here — `state.since`, pinned to
+            // when this scan truly began, is what protects those via the
+            // resync fallback's own `since` window (see caller).
+            if (isGoogleApiError(error, 404)) return { done: false, processed, nextState: { ...state, pendingMessageIds: [] }, historyExpired: true };
             throw error;
         }
         // The mailbox's CURRENT historyId — the same value on every page of
@@ -376,26 +473,20 @@ async function runIncrementalSlice(db: PrismaClient, gmail: ReturnType<typeof gm
         if (!pageToken) paginationDone = true;
     }
 
-    const idList = [...state.pendingMessageIds, ...collected];
-    let processed = 0;
     let idx = 0;
-    while (idx < idList.length) {
+    while (idx < collected.length) {
         if (budget.exhausted) break;
-        // A false return means budget ran out mid-message, after this one
-        // was already found trusted but before it could be recorded — it
-        // must count as NOT durably processed (see processMessage's own doc
-        // comment), so it stays in idList (not yet advanced past).
-        const completed = await processMessage(db, gmail, idList[idx], budget, now);
+        const completed = await processMessage(db, gmail, collected[idx], budget, now);
         if (!completed) break;
         idx++;
         processed++;
     }
-    const remaining = idList.slice(idx);
+    const remaining = collected.slice(idx);
 
     return {
         done: paginationDone && remaining.length === 0,
         processed,
-        nextState: { newHistoryId, pageToken: pageToken ?? null, pendingMessageIds: remaining, paginationDone },
+        nextState: { ...state, newHistoryId, pageToken: pageToken ?? null, pendingMessageIds: remaining, paginationDone },
     };
 }
 
@@ -469,6 +560,7 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
             pageToken: null,
             pendingMessageIds: [],
             paginationDone: false,
+            since: now.toISOString(),
         };
 
         const result = await runIncrementalSlice(db, gmail, settingsRow.leadInboxHistoryId, incrementalState, budget, now);
@@ -480,18 +572,30 @@ export async function pollLeadInbox(db: PrismaClient = prisma, now: Date = new D
             const profile = await gmail.users.getProfile({ userId: "me" }, { timeout: GMAIL_REQUEST_TIMEOUT_MS });
             const h0 = String(profile.data.historyId);
 
+            // Look back as far as EITHER candidate justifies, never less than
+            // before this fix: the last poll's own start (as before), OR —
+            // round-5 finding — this incremental scan's own watermark, which
+            // can be much older than "the last poll start" when a pending
+            // message has been sitting for several runs under the
+            // get-budget cap before a LATER run's history.list call 404s.
+            // Using the MINIMUM (earliest) of the two only ever widens the
+            // resync window, never narrows it relative to the prior formula.
+            const lastPollCandidateMs = (settingsRow.leadInboxLastPollStartedAt?.getTime() ?? 0) - RESYNC_LOOKBACK_MS;
+            const watermarkCandidateMs = new Date(result.nextState.since).getTime() - RESYNC_LOOKBACK_MS;
             const rawSinceMs = Math.max(
                 settingsRow.leadInboxCutoffAt?.getTime() ?? 0,
-                (settingsRow.leadInboxLastPollStartedAt?.getTime() ?? 0) - RESYNC_LOOKBACK_MS,
+                Math.min(lastPollCandidateMs, watermarkCandidateMs),
             );
             const floorMs = now.getTime() - RESYNC_WINDOW_MS;
             if (rawSinceMs > 0 && rawSinceMs < floorMs) {
                 // finding 4f: the real gap exceeds 72h — that window is
                 // unrecoverable. Reset the cutoff to now and notify ONCE,
                 // naming the window, rather than silently truncating it.
-                await sendPlainNtfy(
+                await sendFallbackPathAlert(
+                    db,
                     "Speed-to-Lead: inbox poll gap",
                     `The lead inbox could not be resynced past a 72-hour gap. Unscanned window: ${new Date(rawSinceMs).toISOString()} to ${new Date(floorMs).toISOString()}.`,
+                    now,
                 );
                 await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxHistoryId: h0, leadInboxCutoffAt: now, leadInboxResyncState: Prisma.JsonNull, leadInboxIncrementalState: Prisma.JsonNull } });
                 await recordPollHealth(db, startedAt, new Date(), true);
