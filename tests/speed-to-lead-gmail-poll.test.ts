@@ -54,6 +54,8 @@ interface FakeMessage {
 let mailbox: FakeMessage[] = [];
 let pageSize = 100;
 let connected = true;
+/** When set and `connected` is false, ensureLeadInboxAuth's mock reports this as the failure's error (a credential that WAS stored but can't be used) instead of the bare `{ok:false}` "never connected yet" shape. */
+let authError: unknown = null;
 /** Throw a 500 on list calls whose 1-based index within a poll is in this set (reset per poll). */
 let failListPages = new Set<number>();
 let failAllLists = false;
@@ -126,7 +128,7 @@ before(() => {
     (Module.prototype as unknown as { require: (id: string) => unknown }).require = function (this: NodeModule, id: string) {
         if (id === GMAIL_INBOX_CLIENT_SPECIFIER) {
             return {
-                ensureLeadInboxAuth: async () => (connected ? { ok: true, client: {} } : { ok: false }),
+                ensureLeadInboxAuth: async () => (connected ? { ok: true, client: {} } : authError ? { ok: false, error: authError } : { ok: false }),
                 gmailClientFor: () => fakeGmailClient(),
             };
         }
@@ -159,6 +161,7 @@ beforeEach(() => {
     mailbox = [];
     pageSize = 100;
     connected = true;
+    authError = null;
     failListPages = new Set();
     failAllLists = false;
     afterListHook = null;
@@ -550,7 +553,8 @@ test("a long outage raises one visible stale-scan alert and keeps the watermark,
         const recovered = await poll(db, new Date(T + 30 * MINUTE));
         assert.equal(recovered.complete, true);
         const lastList = listCalls[listCalls.length - 1];
-        assert.ok(lastList.q.includes(`after:${Math.floor((watermark.getTime() - 24 * HOUR) / 1000) - 1}`), `the recovery window reaches back past the whole outage: ${lastList.q}`);
+        const { SCAN_OVERLAP_MS } = await import("../src/lib/speed-to-lead/gmail-poll");
+        assert.ok(lastList.q.includes(`after:${Math.floor((watermark.getTime() - SCAN_OVERLAP_MS) / 1000) - 1}`), `the recovery window reaches back past the whole outage: ${lastList.q}`);
         for (const m of during) assert.ok(await intakeRow(db, m.id), `${m.id} recovered`);
         assert.equal((await intakeRow(db, during[1].id))?.verdict, "REVIEW", "Voice intake is REVIEW");
         assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: forged.id } }))?.outcome, "REJECTED");
@@ -578,6 +582,54 @@ test("a disconnected inbox still raises the stale-scan alert, and a failed push 
         ntfyUp = true;
         await poll(db, new Date(T + MINUTE));
         assert.equal(pushes.filter(p => /scan behind/.test(p.title)).length, 1, "retried once ntfy is back, not marked sent on the failed attempt");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-6 finding 1: a broken (invalid_grant) credential alerts immediately even with no watermark yet, so a bad reconnect is never silent", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        // No seedSettings: this is a fresh singleton with no watermark at
+        // all — alertIfScanStale has nothing to check, so before this fix
+        // the disconnected alert never fired here (see gmail-poll.ts's
+        // runPoll, and the finding's own repro of "zero intake, zero
+        // pushes, failure count zero").
+        const T = Date.now();
+        connected = false;
+        authError = Object.assign(new Error("invalid_grant"), { response: { data: { error: "invalid_grant" } } });
+
+        const result = await poll(db, new Date(T));
+        assert.equal(result.reason, "lead inbox not connected");
+        assert.equal(pushes.filter(p => /disconnected/.test(p.title)).length, 1, "the disconnected alert fires on the very first failed poll, with no watermark to age");
+        assert.equal((await settingsOf(db))?.leadInboxRefreshTokenEnc, null, "the stale credential is cleared so the settings page shows disconnected");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("round-6 finding 1: a broken (non-invalid_grant) credential still trips the repeated-failure alert with no watermark yet", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        connected = false;
+        authError = new Error("token refresh timed out");
+
+        // Spaced past each step's backoff (1, 2, 4, 8 minutes) so every poll
+        // actually attempts auth again instead of returning early.
+        await poll(db, new Date(T));
+        await poll(db, new Date(T + 1 * MINUTE));
+        await poll(db, new Date(T + 3 * MINUTE));
+        await poll(db, new Date(T + 7 * MINUTE));
+        assert.equal(pushes.filter(p => /poll failing/.test(p.title)).length, 0, "not yet — only 4 failures");
+        await poll(db, new Date(T + 15 * MINUTE));
+
+        assert.equal(pushes.filter(p => /poll failing/.test(p.title)).length, 1, "the 5th consecutive auth failure alerts, exactly like a scan failure would");
+        const settings = await settingsOf(db);
+        assert.equal(settings?.leadInboxFailureCount, 5);
+        assert.equal(settings?.leadInboxScanWatermarkAt, null, "still no watermark — this alert could only have come from the failure count, not alertIfScanStale");
     } finally {
         await db.$disconnect();
     }

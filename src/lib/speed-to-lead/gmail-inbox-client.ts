@@ -142,6 +142,16 @@ export function leadInboxAuthUrl(sessionEmail: string, sid: string): string {
 export interface LeadInboxAuth {
     ok: boolean;
     client?: ReturnType<typeof newLeadInboxOAuthClient>;
+    /**
+     * Set only when a credential WAS stored but could not be used (decrypt
+     * failure, empty token, or a failed/timed-out refresh — including
+     * `invalid_grant`). Never set when nothing has been connected yet, so a
+     * caller can tell "not yet activated" (quiet) apart from "was working,
+     * now broken" (must feed failure/alert accounting — see gmail-poll.ts
+     * round-6 finding 1: a broken credential must never fail silently just
+     * because no scan has ever completed).
+     */
+    error?: unknown;
 }
 
 /** Races `promise` against a timeout — bounds the OAuth2 client's own token-refresh call, which is a separate HTTP round trip the per-request `{timeout}` option on a later Gmail API call does not cover. */
@@ -172,16 +182,16 @@ export async function ensureLeadInboxAuth(db: PrismaClient = prisma): Promise<Le
             select: { leadInboxRefreshTokenEnc: true },
         });
         const encrypted = settings?.leadInboxRefreshTokenEnc;
-        if (!encrypted) return { ok: false };
+        if (!encrypted) return { ok: false }; // never connected yet — not a failure, nothing to alert on
         let refreshToken: string;
         try {
             const decrypted = decryptObject(encrypted) as { refreshToken?: string } | null;
             refreshToken = decrypted?.refreshToken ?? "";
-        } catch {
+        } catch (error) {
             console.error("[speed-to-lead] could not decrypt the stored lead-inbox credential");
-            return { ok: false };
+            return { ok: false, error };
         }
-        if (!refreshToken) return { ok: false };
+        if (!refreshToken) return { ok: false, error: new Error("stored lead-inbox credential decrypted with no refresh token") };
         const client = newLeadInboxOAuthClient();
         client.setCredentials({ refresh_token: refreshToken });
         // Bounded refresh check — a hung token endpoint must not consume the
@@ -190,7 +200,7 @@ export async function ensureLeadInboxAuth(db: PrismaClient = prisma): Promise<Le
         return { ok: true, client };
     } catch (error) {
         console.error("[speed-to-lead] could not load or refresh the stored lead-inbox credential", safeErrorCategory(error));
-        return { ok: false };
+        return { ok: false, error };
     }
 }
 

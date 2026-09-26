@@ -52,11 +52,26 @@ const SETTINGS_ID = "singleton";
  * is the only guard against Gmail search showing a message after its
  * `internalDate` (index lag, Group relay holds, clock skew), and it costs one
  * indexed ledger lookup per re-listed id: at 0 to 20 lead-sender messages a
- * day, one list page. So it is set generously rather than tightly.
+ * day, one list page. So it is set generously rather than tightly — Google
+ * documents no hard bound on indexing delay (round-6 finding 3), so 72h
+ * rather than the original 24h, to leave real headroom above any delay this
+ * mailbox's tiny volume has ever needed to survive.
  */
-export const SCAN_OVERLAP_MS = 24 * 60 * 60 * 1000;
+export const SCAN_OVERLAP_MS = 72 * 60 * 60 * 1000;
 /** A watermark this old means polls have kept failing: push a health alert (never capped). */
 export const STALE_SCAN_ALERT_MS = 6 * 60 * 60 * 1000;
+/**
+ * KNOWN RISK, not fixed here (round-6 finding 3's clock-skew case, already
+ * documented as such): a wall-clock anomaly that briefly makes `now` read
+ * hours ahead would commit a future watermark the instant one scan
+ * completes, silently excluding mail once the clock corrects. A correct fix
+ * needs a time source independent of the app clock (e.g. the DB server's own
+ * `now()`) to tell that apart from a legitimate long outage, where the
+ * watermark must jump forward by exactly as much, in one poll, on purpose
+ * (see the "72-hour-gap" test below) — bounding the advance instead would
+ * silently break that catch-up. Left as a documented risk pending that
+ * design decision rather than guessed at here.
+ */
 /** Gmail's own maximum per list page. */
 const LIST_PAGE_SIZE = 500;
 /** A runaway-loop guard, not a working limit: 20 pages x 500 is ~10,000 lead-sender messages in one window. Hitting it leaves the scan incomplete, so it can delay (with the stale alert) but never drop. */
@@ -397,12 +412,27 @@ async function runPoll(db: PrismaClient, now: Date): Promise<PollResult> {
         const auth = await ensureLeadInboxAuth(db);
         if (!auth.ok || !auth.client) {
             await recordPollHealth(db, startedAt, null, false);
+            // A credential that WAS stored but can't be used (round-6 finding
+            // 1) must feed the same failure/alert accounting a scan error
+            // does, or it fails silently forever: with no watermark yet,
+            // alertIfScanStale has nothing to check, so this is the ONLY path
+            // that can ever raise "disconnected" or "poll failing" before the
+            // first scan completes. "Never connected yet" (auth.error unset)
+            // stays quiet, same as before.
+            if (auth.error) {
+                await recordFailure(db, startedAt, now, auth.error, { backoff: true });
+            }
             return { ran: false, reason: "lead inbox not connected" };
         }
         const gmail = gmailClientFor(auth.client);
 
-        // First connected run: the floor is now (mail older than the
-        // connection is never imported), and the watermark starts there.
+        // Normally already set by the OAuth callback at connection time (see
+        // src/app/api/gmail/callback/route.ts — round-6 finding 2: waiting
+        // for the first successful poll to set this left the gap between
+        // connecting and that poll permanently unscanned, with no alert).
+        // This is now just a fallback for a credential connected some other
+        // way: the floor is this poll's own time, so mail older than THIS
+        // poll's first run is still never imported.
         const cutoffAt = settings?.leadInboxCutoffAt ?? now;
         const watermarkAt = settings?.leadInboxScanWatermarkAt ?? cutoffAt;
         if (!settings?.leadInboxCutoffAt || !settings?.leadInboxScanWatermarkAt) {

@@ -102,10 +102,21 @@ export async function GET(req: NextRequest) {
                 );
             }
             const encrypted = encryptLeadInboxRefreshToken(tokens.refresh_token);
+            const connectedAt = new Date();
+            // Round-6 finding 2: anchor the activation cutoff HERE, at
+            // connection time, not at gmail-poll.ts's first successful poll.
+            // Waiting for that first poll left a permanent, unalerted gap for
+            // any mail arriving between connecting and that poll (and, on a
+            // reconnect after auth kept failing, everything since the
+            // original connection — round-6 finding 1). Only set it when it
+            // is not already set, so a reconnect never resets an
+            // already-established cutoff/watermark and rescans history.
+            const existing = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { leadInboxCutoffAt: true } });
+            const activation = existing?.leadInboxCutoffAt ? {} : { leadInboxCutoffAt: connectedAt, leadInboxScanWatermarkAt: connectedAt };
             await prisma.companySettings.upsert({
                 where: { id: "singleton" },
-                create: { id: "singleton", leadInboxRefreshTokenEnc: encrypted, leadInboxEmail: connectedEmail },
-                update: { leadInboxRefreshTokenEnc: encrypted, leadInboxEmail: connectedEmail },
+                create: { id: "singleton", leadInboxRefreshTokenEnc: encrypted, leadInboxEmail: connectedEmail, leadInboxCutoffAt: connectedAt, leadInboxScanWatermarkAt: connectedAt },
+                update: { leadInboxRefreshTokenEnc: encrypted, leadInboxEmail: connectedEmail, ...activation },
             });
             return new NextResponse(
                 `<html><body style="font-family:system-ui;padding:40px;max-width:520px"><h2>Lead inbox connected</h2><p>Lead inbox <b>${connectedEmail}</b> is connected, read-only. Speed-to-Lead can now poll it.</p><p>You can close this tab.</p></body></html>`,
