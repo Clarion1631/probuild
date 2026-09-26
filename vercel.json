@@ -83,6 +83,10 @@
     {
       "path": "/api/cron/receipt-request-cards?retry=1",
       "schedule": "30 16 * * 1-5"
+    },
+    {
+      "path": "/api/cron/speed-to-lead",
+      "schedule": "* * * * *"
     }
   ]
 }

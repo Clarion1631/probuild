@@ -1,13 +1,22 @@
+import { getServerSession } from "next-auth/next";
 import { getLead } from "@/lib/actions";
 import ClientMessaging from "@/components/ClientMessaging";
 import LeadMessagingHeader from "./LeadMessagingHeader";
 import LeadDetailsSidebar from "./LeadDetailsSidebar";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { authOptions } from "@/lib/auth";
+import { isApprover } from "@/lib/speed-to-lead/constants";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
     const leadRaw = await getLead(resolvedParams.id);
     if (!leadRaw) return <div className="p-6">Lead not found</div>;
+
+    // Speed-to-Lead (PB-leads-001) v1a: Junk/Promote on the Booked/Called row
+    // are Justin-only — computed here (server) rather than trusted from a
+    // client prop.
+    const session = await getServerSession(authOptions);
+    const speedToLeadApprover = isApprover(session?.user?.email);
     
     const lead = {
         ...leadRaw,
@@ -64,6 +73,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 initialMessage={initialMessage}
                 managerId={(lead as any).manager?.id || null}
                 managerName={(lead as any).manager?.name || null}
+                speedToLeadApprover={speedToLeadApprover}
             />
         </>
     );

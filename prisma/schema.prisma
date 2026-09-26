@@ -217,6 +217,10 @@ model Lead {
   snoozedUntil DateTime?
   isArchived   Boolean   @default(false)
 
+  // Speed-to-Lead v1a (PB-leads-001) tracking — Booked/Called buttons.
+  bookedAt DateTime?
+  calledAt DateTime?
+
   // Google Drive folder for this lead's photos/videos (mobile intake).
   driveFolderId  String?
   driveFolderUrl String?
@@ -229,19 +233,21 @@ model Lead {
   deleteBatchId String?   @ignore
 
   // Relations
-  estimates      Estimate[]
-  roomDesigns    RoomDesign[]
-  contracts      Contract[]
-  files          ProjectFile[]
-  folders        FileFolder[]
-  tasks          LeadTask[]
-  notes          LeadNote[]
-  meetings       LeadMeeting[]
-  takeoffs       Takeoff[]
-  clientMessages ClientMessage[]
-  scheduleTasks  ScheduleTask[]
-  message        String? // Initial inquiry message from the client
-  project        Project? // reverse relation: the project created from this lead
+  estimates        Estimate[]
+  roomDesigns      RoomDesign[]
+  contracts        Contract[]
+  files            ProjectFile[]
+  folders          FileFolder[]
+  tasks            LeadTask[]
+  notes            LeadNote[]
+  meetings         LeadMeeting[]
+  takeoffs         Takeoff[]
+  clientMessages   ClientMessage[]
+  scheduleTasks    ScheduleTask[]
+  leadIntakeEvents LeadIntakeEvent[]
+  leadAlerts       LeadAlert[]
+  message          String? // Initial inquiry message from the client
+  project          Project? // reverse relation: the project created from this lead
 
   @@index([createdAt])
   @@index([clientId])
@@ -1383,6 +1389,22 @@ model CompanySettings {
 
   // Contract signing
   requireContractCountersign Boolean @default(false) // default for a new contract's requiresCountersign
+
+  // Speed-to-Lead v1a (PB-leads-001) — the gtrsupport@ read-only lead inbox.
+  // The refresh token is encrypted at rest (src/lib/crypto.ts's encryptObject),
+  // never plain text — unlike the pre-existing googleDriveRefreshToken above,
+  // which is a known, flagged, out-of-scope gap (V1A addendum).
+  leadInboxRefreshTokenEnc  String?
+  leadInboxEmail            String?
+  /// The scan floor: set on the first connected poll, so mail older than the connection is never imported.
+  leadInboxCutoffAt         DateTime?
+  /// Start time of the last lead-inbox scan that finished with every message handled. The next scan re-reads from this minus an overlap; it never moves on any error or budget stop.
+  leadInboxScanWatermarkAt  DateTime?
+  leadInboxLastPollStartedAt DateTime?
+  leadInboxLastPollAt       DateTime?
+  leadInboxLastPollOk       Boolean?
+  leadInboxFailureCount     Int       @default(0)
+  leadInboxNextPollAt       DateTime?
 
   updatedAt DateTime @updatedAt
 }
@@ -3739,5 +3761,141 @@ model ReceiptIntake {
   @@index([costCodeId])
   @@index([createdById])
   @@index([dedupWeakKey])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Speed-to-Lead v1a (PB-leads-001) — docs/plans/SPEED-TO-LEAD-V1A.md.
+// Intake, conservative triage, an instant internal alert (ntfy + Chat), and
+// tracking (Booked/Called, the 09:00 digest, the funnel, an append-only
+// audit trail). Sends NOTHING to customers — no template, no approval or
+// dispatch path, no follow-up drafts, no `gmail.send` scope anywhere.
+// ─────────────────────────────────────────────────────────────────────────
+
+enum LeadIntakeSource {
+  WEB
+  WEB_EMAIL_FALLBACK
+  VOICE
+}
+
+enum LeadIntakeState {
+  PENDING_FALLBACK
+  PROCESSED
+}
+
+enum LeadVerdict {
+  REAL
+  REVIEW
+  JUNK
+}
+
+enum LeadAlertChannel {
+  NTFY
+  CHAT
+}
+
+enum LeadAlertStatus {
+  PENDING
+  SENDING
+  DELIVERED
+  DEAD
+  SKIPPED
+}
+
+/// One row per intake event (webhook, Gmail fallback, or Voice), keyed by a
+/// deterministic externalId so a retried webhook or a re-read Gmail message
+/// is exactly-once. RLS enabled, no policies — deny via PostgREST, same as
+/// ReceiptRequestCard/ClockInRequest (these hold lead PII).
+model LeadIntakeEvent {
+  id           String           @id @default(cuid())
+  externalId   String           @unique
+  submissionId String?          @unique
+  source       LeadIntakeSource
+  state        LeadIntakeState
+  dueAt        DateTime?
+  receivedAt   DateTime
+  leadId       String?
+  lead         Lead?            @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  verdict      LeadVerdict?
+  reasons      Json?
+  payload      Json?
+  isTest       Boolean          @default(false)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([state, dueAt])
+  @@index([leadId])
+}
+
+/// One row per Gmail message the lead-inbox scan is finished with
+/// (src/lib/speed-to-lead/gmail-poll.ts). The scan checks this before any
+/// Gmail `get`, so a message it lists again costs nothing. `outcome` is
+/// INTAKE (an intake row was written), REJECTED (failed authentication or the
+/// Voice subject filter; `detail` holds the code-authored reason) or GONE
+/// (deleted before it could be read). Every non-INTAKE row is reported to
+/// Justin by ntfy, and `notifiedAt` records that the report went out.
+model LeadInboxMessage {
+  gmailMessageId String    @id
+  outcome        String
+  detail         String?
+  notifiedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  /// Stamped on every failed retry attempt (scanWindow or
+  /// resolvePendingMessages) — drives fair, oldest-first pending rotation.
+  lastAttemptAt  DateTime?
+  /// Failed retry attempts. Past PENDING_STUCK_ATTEMPTS (gmail-poll.ts) a
+  /// still-PENDING row is reported to Justin as stuck instead of staying
+  /// silently invisible.
+  failedAttempts Int       @default(0)
+}
+
+/// At most one row per (lead, channel) — the transactional outbox that makes
+/// alert delivery exactly-once (V1A "(2) Alert design — Dedupe").
+model LeadAlert {
+  id                String           @id @default(cuid())
+  leadId            String
+  lead              Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  channel           LeadAlertChannel
+  status            LeadAlertStatus  @default(PENDING)
+  attempts          Int              @default(0)
+  nextAttemptAt     DateTime         @default(now())
+  claimedAt         DateTime?
+  deliveredAt       DateTime?
+  providerRef       String?
+  lastErrorCategory String?
+  isTest            Boolean          @default(false)
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  @@unique([leadId, channel])
+  @@index([status, nextAttemptAt])
+}
+
+/// Junk only (v2 may add columns) — `endpoint` is `"email:<addr>"` or
+/// `"phone:<e164>"`. v1a has no suppression/bounce tracking: there is no
+/// outbound send for either to gate.
+model ContactEndpoint {
+  id        String    @id @default(cuid())
+  endpoint  String    @unique
+  junkAt    DateTime?
+  junkBy    String?
+  clearedAt DateTime?
+  clearedBy String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+/// Append-only audit trail (funnel + Justin-visible history). Nothing in
+/// src/ may `.update`/`.delete`/`.upsert` this model —
+/// tests/speed-to-lead-audit-append-only.test.ts is the static proof.
+model SpeedToLeadEvent {
+  id        String   @id @default(cuid())
+  leadId    String?
+  kind      String
+  actor     String?
+  detail    Json?
+  createdAt DateTime @default(now())
+
+  @@index([leadId])
   @@index([createdAt])
 }
