@@ -263,8 +263,12 @@ test("the fixed per-run message-get budget can be exhausted by leading untrusted
         assert.equal(pending?.pendingMessageIds.length, 11, "the 10 remaining untrusted messages plus the trusted one must be persisted for the next run");
         assert.ok(pending?.pendingMessageIds.includes("trusted-1"), "the trusted message must still be queued, not lost");
 
-        const rows = await db.leadIntakeEvent.findMany({ where: { source: "WEB_EMAIL_FALLBACK" } });
-        assert.equal(rows.length, 0, "the trusted message must not be recorded until it is actually reached");
+        // Scoped to THIS message's own externalId (voice:trusted-1 — the
+        // WEBSITE_HEADERS_METADATA fixture carries no X-GTR-Submission-Id),
+        // not a bare source filter — an earlier test in this same file
+        // leaves its own WEB_EMAIL_FALLBACK row behind.
+        const row = await db.leadIntakeEvent.findUnique({ where: { externalId: "voice:trusted-1" } });
+        assert.equal(row, null, "the trusted message must not be recorded until it is actually reached");
     } finally {
         await db.$disconnect();
     }
@@ -299,8 +303,9 @@ test("repeated poll runs make forward progress through a persisted budget-exhaus
         assert.equal(settings?.leadInboxHistoryId, "600", "the cursor must eventually commit once every message is handled");
         assert.equal(settings?.leadInboxIncrementalState, null, "no leftover queue once done");
 
-        const rows = await db.leadIntakeEvent.findMany({ where: { source: "WEB_EMAIL_FALLBACK" } });
-        assert.equal(rows.length, 1, "the trusted message buried behind 60 untrusted ones must eventually be recorded");
+        const row = await db.leadIntakeEvent.findUnique({ where: { externalId: "voice:trusted-1" } });
+        assert.ok(row, "the trusted message buried behind 60 untrusted ones must eventually be recorded");
+        assert.equal(row?.source, "WEB_EMAIL_FALLBACK");
 
         // 60 untrusted messages x 1 get each, plus the trusted message's 2
         // gets (metadata + full) = 62 total, no matter how many runs it took
