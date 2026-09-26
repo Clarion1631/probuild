@@ -1,6 +1,6 @@
 # Spec: Speed-to-Lead v1 (instant acknowledgement plus approved personal replies)
 
-**ID:** PB-leads-001 · **Date:** 2026-09-25 · **Status:** draft v3 (Codex round 2 fixes)
+**ID:** PB-leads-001 · **Date:** 2026-09-25 · **Status:** APPROVED FOR BUILD (Codex r3 + targeted confirmation, 2026-09-25)
 **Branch:** `spec/PB-leads-001-speed-to-lead`
 **Roles:** Justin (the only approver), Richard (takes booked calls)
 
