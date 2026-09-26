@@ -90,7 +90,22 @@ export const authOptions: NextAuthOptions = {
             return true;
         },
         async jwt({ token, user, trigger }) {
-            const staffToken = token as StaffJWT;
+            const staffToken = token as StaffJWT & { sid?: string };
+            // Speed-to-Lead v1a: a stable id for THIS sign-in (`user` is
+            // present only on the initial sign-in call), carried unchanged
+            // across every later refresh of the same session. The lead-inbox
+            // OAuth `state` (src/lib/speed-to-lead/gmail-inbox-client.ts)
+            // binds to this, not just the approver's fixed email, so a state
+            // minted in one browser/tab cannot be redeemed by a later
+            // request merely authenticated as the same user. Uses the global
+            // Web Crypto `randomUUID` (Node 19+) rather than a new top-level
+            // import, so this insertion stays below line 79's
+            // `tx.user.update` — the exact line
+            // tests/payroll-user-writer-manifest.test.ts pins as
+            // "lib/auth.ts:79::update".
+            if (user && !staffToken.sid) {
+                staffToken.sid = crypto.randomUUID();
+            }
             // Always read the latest role, status, and DB id from DB.
             // token.sub on Google sign-ins is the OAuth subject, NOT the local
             // User.id, so anything storing token.sub as a User foreign key fails.

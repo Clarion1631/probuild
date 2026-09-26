@@ -59,6 +59,31 @@ jobs:
       - name: Assert the result matches production's shape
         run: node scripts/check-migrations-match.mjs
 
+      # Speed-to-Lead (PB-leads-001) v1a real-Postgres races: intake
+      # (fallback-first, webhook-first, concurrent webhook delivery for one
+      # submissionId, cross-channel dedupe) and alert claim/deliver
+      # concurrency. Both files are wired into package.json's test:unit, but
+      # test:unit ALSO runs in the "build" job below, which has no Postgres
+      # service and never sets SPEED_TO_LEAD_TEST_URL — their own `skip`
+      # guard means they silently no-op there, so this is the only place they
+      # actually run. `migrate deploy` above already applied this feature's
+      # migration to probuild_migrations, so no separate apply step is
+      # needed here.
+      - name: Speed-to-Lead v1a intake and alert races against real Postgres
+        run: npx tsx --test tests/speed-to-lead-intake-db.test.ts tests/speed-to-lead-alerts-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # The inbox poll's cursor/resync/bounds state machine, against real
+      # Postgres for CompanySettings/LeadIntakeEvent, with a fake Gmail
+      # client (require()-patched, same technique as
+      # tests/takeoff-convert-tax.test.ts) standing in for the Google API —
+      # no real Gmail account is ever touched.
+      - name: Speed-to-Lead v1a inbox poll (fake Gmail) against real Postgres
+        run: npx tsx --test tests/speed-to-lead-gmail-poll.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # The APPLY SCRIPT itself, run the way a human runs it before a deploy.
       #
       # `migrate deploy` above proves the committed SQL; it never runs

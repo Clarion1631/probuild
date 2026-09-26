@@ -1,0 +1,257 @@
+/**
+ * The inbox poll's cursor/resync/bounds state machine (finding 4/6), against
+ * REAL Postgres for CompanySettings/LeadIntakeEvent, with a fake Gmail
+ * client standing in for the Google API — no real Gmail account is ever
+ * touched. The fake is applied via a manual `Module.prototype.require`
+ * patch scoped to gmail-poll.ts's own literal `"./gmail-inbox-client"`
+ * specifier, the same technique (and for the same Node-20-vs-`mock.module()`
+ * reason) documented in tests/takeoff-convert-tax.test.ts's header comment.
+ *
+ * `DATABASE_URL` is pointed at the SAME disposable database as
+ * `SPEED_TO_LEAD_TEST_URL` (with `?pgbouncer=true`, harmless on vanilla
+ * Postgres) so `acquireCronLease`'s default store — which always uses the
+ * global `src/lib/prisma.ts` singleton, not the `db` parameter passed to
+ * `pollLeadInbox` — has a real, reachable database instead of failing
+ * closed on every call.
+ */
+import test, { before, after } from "node:test";
+import assert from "node:assert/strict";
+import Module from "node:module";
+import { PrismaClient } from "@prisma/client";
+
+const databaseUrl = process.env.SPEED_TO_LEAD_TEST_URL;
+const skip = !databaseUrl && "set SPEED_TO_LEAD_TEST_URL to a disposable PostgreSQL URL";
+
+const GMAIL_INBOX_CLIENT_SPECIFIER = "./gmail-inbox-client";
+
+interface GmailPayload {
+    headers?: { name: string; value: string }[];
+    mimeType?: string;
+    body?: { data: string };
+    parts?: unknown[];
+}
+
+interface FakeGmailScript {
+    getProfile: () => { historyId: string };
+    historyList?: (args: { startHistoryId: string; pageToken?: string }) => { history?: unknown[]; historyId?: string; nextPageToken?: string } | { throw404: true };
+    messagesList?: (args: { q: string; pageToken?: string }) => { messages?: { id: string }[]; nextPageToken?: string };
+    messagesGet?: (id: string, format: "metadata" | "full") => { payload: GmailPayload };
+}
+
+let script: FakeGmailScript | null = null;
+let getCallCount = 0;
+let messagesListCalls = 0;
+
+function fakeGmailClient() {
+    return {
+        users: {
+            getProfile: async () => ({ data: { historyId: script!.getProfile().historyId, emailAddress: "gtrsupport@goldentouchremodeling.com" } }),
+            history: {
+                list: async (args: { startHistoryId: string; pageToken?: string }) => {
+                    const result = script!.historyList?.(args) ?? {};
+                    if ((result as { throw404?: boolean }).throw404) {
+                        const err = new Error("Requested entity was not found.") as Error & { code: number };
+                        err.code = 404;
+                        throw err;
+                    }
+                    return { data: result };
+                },
+            },
+            messages: {
+                list: async (args: { q: string; pageToken?: string }) => {
+                    messagesListCalls++;
+                    return { data: script!.messagesList?.(args) ?? {} };
+                },
+                get: async (args: { id: string; format: "metadata" | "full" }) => {
+                    getCallCount++;
+                    return { data: script!.messagesGet?.(args.id, args.format) ?? { payload: {} } };
+                },
+            },
+        },
+    };
+}
+
+let originalRequire: typeof Module.prototype.require;
+
+before(() => {
+    process.env.DATABASE_URL = `${databaseUrl}?pgbouncer=true`;
+    originalRequire = Module.prototype.require;
+    (Module.prototype as unknown as { require: (id: string) => unknown }).require = function (this: NodeModule, id: string) {
+        if (id === GMAIL_INBOX_CLIENT_SPECIFIER) {
+            return {
+                ensureLeadInboxAuth: async () => ({ ok: true, client: {} }),
+                gmailClientFor: () => fakeGmailClient(),
+            };
+        }
+        // eslint-disable-next-line prefer-rest-params
+        return originalRequire.apply(this, arguments as unknown as [string]);
+    } as typeof Module.prototype.require;
+});
+
+after(() => {
+    Module.prototype.require = originalRequire;
+});
+
+async function freshDb() {
+    return new PrismaClient({ datasources: { db: { url: `${databaseUrl}?pgbouncer=true` } } });
+}
+
+async function resetCompanySettings(db: PrismaClient) {
+    await db.companySettings.deleteMany({ where: { id: "singleton" } });
+}
+
+const WEBSITE_HEADERS_METADATA: { payload: GmailPayload } = {
+    payload: {
+        headers: [
+            { name: "From", value: "website@goldentouchremodeling.com" },
+            { name: "Subject", value: "New website inquiry" },
+            { name: "X-Google-Group-Id", value: "347075611006" },
+            { name: "List-ID", value: "<Connect.goldentouchremodeling.com>" },
+            { name: "Authentication-Results", value: "mx.google.com; dkim=pass header.i=@goldentouchremodeling.com header.s=google; arc=pass (i=2); dmarc=pass header.from=goldentouchremodeling.com" },
+            { name: "ARC-Seal", value: "i=1; a=rsa-sha256; cv=none; d=google.com; s=x; t=1; b=z" },
+            { name: "ARC-Authentication-Results", value: "i=1; mx.google.com; dkim=pass header.i=@goldentouchremodeling.com header.s=resend header.b=x; dmarc=pass header.from=goldentouchremodeling.com" },
+        ],
+    },
+};
+
+const UNTRUSTED_HEADERS_METADATA: { payload: GmailPayload } = {
+    payload: {
+        headers: [
+            { name: "From", value: "someone@example.com" },
+            { name: "Subject", value: "Re: your invoice" },
+        ],
+    },
+};
+
+test("first run establishes a cursor without processing any backlog", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        script = { getProfile: () => ({ historyId: "100" }) };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+        const result = await pollLeadInbox(db, new Date());
+        assert.equal(result.ran, true);
+        assert.equal(result.processed, 0);
+        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+        assert.equal(settings?.leadInboxHistoryId, "100");
+        assert.ok(settings?.leadInboxCutoffAt);
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("a trusted website message costs exactly two message-get calls (metadata, then full) and becomes a PENDING_FALLBACK row", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "100", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
+        getCallCount = 0;
+        script = {
+            getProfile: () => ({ historyId: "999" }),
+            historyList: () => ({ history: [{ messagesAdded: [{ message: { id: "web-msg-1" } }] }], historyId: "101" }),
+            messagesGet: (id, format) => {
+                if (format === "metadata") return WEBSITE_HEADERS_METADATA;
+                return { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
+            },
+        };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+        const result = await pollLeadInbox(db, new Date());
+        assert.equal(result.ran, true);
+        assert.equal(result.processed, 1);
+        assert.equal(getCallCount, 2, "metadata-first: exactly one metadata get plus one full get for a trusted sender");
+
+        const rows = await db.leadIntakeEvent.findMany({ where: { source: "WEB_EMAIL_FALLBACK" }, orderBy: { createdAt: "desc" }, take: 1 });
+        assert.equal(rows[0]?.state, "PENDING_FALLBACK");
+
+        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+        assert.equal(settings?.leadInboxHistoryId, "101");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("a non-trusted message costs exactly one metadata get and creates no intake row", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "200", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
+        getCallCount = 0;
+        const before = await db.leadIntakeEvent.count();
+        script = {
+            getProfile: () => ({ historyId: "999" }),
+            historyList: () => ({ history: [{ messagesAdded: [{ message: { id: "spam-msg-1" } }] }], historyId: "201" }),
+            messagesGet: (_id, format) => (format === "metadata" ? UNTRUSTED_HEADERS_METADATA : { payload: {} }),
+        };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+        const result = await pollLeadInbox(db, new Date());
+        assert.equal(result.processed, 1);
+        assert.equal(getCallCount, 1, "an untrusted message must never trigger a full fetch");
+        const after = await db.leadIntakeEvent.count();
+        assert.equal(after, before, "no intake row for an untrusted message");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("an expired history cursor (404) resyncs via messages.list and the new cursor is the pre-scan H0", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        const now = new Date();
+        await db.companySettings.create({
+            data: { id: "singleton", leadInboxHistoryId: "stale-cursor", leadInboxCutoffAt: new Date(now.getTime() - 60 * 60 * 1000), leadInboxLastPollStartedAt: new Date(now.getTime() - 30 * 60 * 1000) },
+        });
+        script = {
+            getProfile: () => ({ historyId: "h0-after-resync" }),
+            historyList: () => ({ throw404: true }),
+            messagesList: () => ({ messages: [{ id: "voice-msg-1" }] }),
+            messagesGet: (_id, format) => {
+                if (format === "metadata") {
+                    return {
+                        payload: {
+                            headers: [
+                                { name: "From", value: "Google Voice <voice-noreply@google.com>" },
+                                { name: "Subject", value: "New missed call from (360) 555-0100" },
+                                { name: "Authentication-Results", value: "mx.google.com; dkim=pass header.i=@google.com header.s=x; dmarc=pass header.from=google.com" },
+                            ],
+                        },
+                    };
+                }
+                return { payload: { mimeType: "text/plain", body: { data: Buffer.from("Missed call from (360) 555-0100").toString("base64url") } } };
+            },
+        };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+        const result = await pollLeadInbox(db, now);
+        assert.equal(result.resynced, true);
+        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+        assert.equal(settings?.leadInboxHistoryId, "h0-after-resync");
+        const rows = await db.leadIntakeEvent.findMany({ where: { source: "VOICE" }, orderBy: { createdAt: "desc" }, take: 1 });
+        assert.equal(rows[0]?.verdict, "REVIEW");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("a gap over 72h resets the cutoff to now WITHOUT attempting a resync scan", { skip }, async () => {
+    const db = await freshDb();
+    try {
+        await resetCompanySettings(db);
+        const now = new Date();
+        const veryOld = new Date(now.getTime() - 100 * 60 * 60 * 1000);
+        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "ancient-cursor", leadInboxCutoffAt: veryOld, leadInboxLastPollStartedAt: veryOld } });
+        messagesListCalls = 0;
+        script = {
+            getProfile: () => ({ historyId: "h0-after-gap" }),
+            historyList: () => ({ throw404: true }),
+        };
+        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+        const result = await pollLeadInbox(db, now);
+        assert.equal(result.resynced, true);
+        assert.equal(messagesListCalls, 0, "an unrecoverable gap must never attempt the resync scan");
+        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
+        assert.equal(settings?.leadInboxHistoryId, "h0-after-gap");
+        assert.ok(settings!.leadInboxCutoffAt!.getTime() >= now.getTime() - 1000);
+    } finally {
+        await db.$disconnect();
+    }
+});
