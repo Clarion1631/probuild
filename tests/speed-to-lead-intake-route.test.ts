@@ -22,6 +22,7 @@ import { test, before, after as afterHook } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import Module from "node:module";
+import { PrismaClient } from "@prisma/client";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-speed-to-lead-intake-route";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test?pgbouncer=true";
@@ -136,12 +137,37 @@ test("an invalid signature gets a generic 401 with zero rows created — never a
 const databaseUrl = process.env.SPEED_TO_LEAD_TEST_URL;
 const skip = !databaseUrl && "set SPEED_TO_LEAD_TEST_URL to a disposable PostgreSQL URL";
 
+/**
+ * The route creates a real Lead + LeadAlert (PENDING, due immediately) via
+ * the same intakeWebhookLead() path speed-to-lead-intake-db.test.ts calls
+ * directly — without this, that row stays PENDING forever in the shared
+ * CI Postgres and inflates every LATER deliverDueAlerts call in the same
+ * job run, including tests/speed-to-lead-alerts-db.test.ts's own "sink hit
+ * exactly once" assertion (reproduced in CI: a deterministic +1, not a
+ * flake — the actual root cause behind Codex's "2 !== 1" finding).
+ */
+async function cleanupRouteTestRow(externalId: string): Promise<void> {
+    if (!databaseUrl) return;
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl } } });
+    try {
+        const row = await db.leadIntakeEvent.findUnique({ where: { externalId } });
+        await db.leadIntakeEvent.deleteMany({ where: { externalId } }).catch(() => undefined);
+        if (row?.leadId) {
+            await db.leadAlert.deleteMany({ where: { leadId: row.leadId } }).catch(() => undefined);
+            await db.lead.delete({ where: { id: row.leadId } }).catch(() => undefined);
+        }
+    } finally {
+        await db.$disconnect();
+    }
+}
+
 test("a validly-signed test-secret submission returns exactly {ok, duplicate} — no leadId, no verdict echoed back", { skip }, async () => {
     process.env.DATABASE_URL = `${databaseUrl}?pgbouncer=true`;
     const originalMode = process.env.SPEED_TO_LEAD_MODE;
     process.env.SPEED_TO_LEAD_MODE = "TEST";
+    const payload = validPayload();
     try {
-        const rawBody = JSON.stringify(validPayload());
+        const rawBody = JSON.stringify(payload);
         const headers = sign(rawBody, TEST_SECRET);
         const res = await POST(new Request("https://probuild.test/api/speed-to-lead/intake", { method: "POST", body: rawBody, headers }));
         assert.equal(res.status, 200);
@@ -151,5 +177,6 @@ test("a validly-signed test-secret submission returns exactly {ok, duplicate} �
         assert.equal(body.duplicate, false);
     } finally {
         process.env.SPEED_TO_LEAD_MODE = originalMode;
+        await cleanupRouteTestRow(`sub:${payload.submissionId}`);
     }
 });
