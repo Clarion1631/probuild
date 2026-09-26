@@ -1396,17 +1396,15 @@ model CompanySettings {
   // which is a known, flagged, out-of-scope gap (V1A addendum).
   leadInboxRefreshTokenEnc  String?
   leadInboxEmail            String?
-  leadInboxHistoryId        String?
+  /// The scan floor: set on the first connected poll, so mail older than the connection is never imported.
   leadInboxCutoffAt         DateTime?
+  /// Start time of the last lead-inbox scan that finished with every message handled. The next scan re-reads from this minus an overlap; it never moves on any error or budget stop.
+  leadInboxScanWatermarkAt  DateTime?
   leadInboxLastPollStartedAt DateTime?
   leadInboxLastPollAt       DateTime?
   leadInboxLastPollOk       Boolean?
   leadInboxFailureCount     Int       @default(0)
   leadInboxNextPollAt       DateTime?
-  /// `{h0, sinceSeconds, pageToken, pendingMessageIds}` while a multi-run history resync is in progress; null otherwise.
-  leadInboxResyncState      Json?
-  /// `{newHistoryId, pendingMessageIds}` while a fixed-budget poll run is still working through a completed history-list window; null once every message is handled and the cursor commits.
-  leadInboxIncrementalState Json?
 
   updatedAt DateTime @updatedAt
 }
@@ -3827,6 +3825,21 @@ model LeadIntakeEvent {
 
   @@index([state, dueAt])
   @@index([leadId])
+}
+
+/// One row per Gmail message the lead-inbox scan is finished with
+/// (src/lib/speed-to-lead/gmail-poll.ts). The scan checks this before any
+/// Gmail `get`, so a message it lists again costs nothing. `outcome` is
+/// INTAKE (an intake row was written), REJECTED (failed authentication or the
+/// Voice subject filter; `detail` holds the code-authored reason) or GONE
+/// (deleted before it could be read). Every non-INTAKE row is reported to
+/// Justin by ntfy, and `notifiedAt` records that the report went out.
+model LeadInboxMessage {
+  gmailMessageId String    @id
+  outcome        String
+  detail         String?
+  notifiedAt     DateTime?
+  createdAt      DateTime  @default(now())
 }
 
 /// At most one row per (lead, channel) — the transactional outbox that makes

@@ -76,12 +76,12 @@ const SET_LOCAL_LOCK_TIMEOUT = 'SET LOCAL lock_timeout = 5000';
 const SET_LOCAL_STATEMENT_TIMEOUT = 'SET LOCAL statement_timeout = 30000';
 const TRANSACTION_TIMEOUT_MS = 60000;
 
-const NEW_TABLES = ['LeadIntakeEvent', 'ContactEndpoint', 'LeadAlert', 'SpeedToLeadEvent'];
+const NEW_TABLES = ['LeadIntakeEvent', 'ContactEndpoint', 'LeadAlert', 'SpeedToLeadEvent', 'LeadInboxMessage'];
 const NEW_LEAD_COLUMNS = ['bookedAt', 'calledAt'];
 const NEW_COMPANY_SETTINGS_COLUMNS = [
-  'leadInboxRefreshTokenEnc', 'leadInboxEmail', 'leadInboxHistoryId', 'leadInboxCutoffAt',
+  'leadInboxRefreshTokenEnc', 'leadInboxEmail', 'leadInboxCutoffAt', 'leadInboxScanWatermarkAt',
   'leadInboxLastPollStartedAt', 'leadInboxLastPollAt', 'leadInboxLastPollOk',
-  'leadInboxFailureCount', 'leadInboxNextPollAt', 'leadInboxResyncState', 'leadInboxIncrementalState',
+  'leadInboxFailureCount', 'leadInboxNextPollAt',
 ];
 
 async function verifyShape(tx) {

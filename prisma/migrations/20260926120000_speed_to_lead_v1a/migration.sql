@@ -1,7 +1,7 @@
 -- Speed-to-Lead v1a (PB-leads-001) — docs/plans/SPEED-TO-LEAD-V1A.md.
--- Additive only: 5 new enums, 4 new tables (LeadIntakeEvent, LeadAlert,
--- ContactEndpoint, SpeedToLeadEvent), 2 new Lead columns, 10 new
--- CompanySettings columns. No existing table is dropped, renamed, or has a
+-- Additive only: 5 new enums, 5 new tables (LeadIntakeEvent, LeadAlert,
+-- ContactEndpoint, SpeedToLeadEvent, LeadInboxMessage), 2 new Lead columns,
+-- 9 new CompanySettings columns. No existing table is dropped, renamed, or has a
 -- column altered/dropped/set NOT NULL. Re-runnable: every statement below is
 -- IF NOT EXISTS or a duplicate_object-safe DO block. Its twin is
 -- scripts/apply-speed-to-lead.mjs — the two carry identical DDL on purpose
@@ -129,6 +129,18 @@ CREATE INDEX IF NOT EXISTS "SpeedToLeadEvent_leadId_idx" ON "SpeedToLeadEvent"("
 -- statement-break
 CREATE INDEX IF NOT EXISTS "SpeedToLeadEvent_createdAt_idx" ON "SpeedToLeadEvent"("createdAt");
 
+-- CreateTable: LeadInboxMessage (the lead-inbox scan's per-message ledger)
+-- statement-break
+CREATE TABLE IF NOT EXISTS "LeadInboxMessage" (
+    "gmailMessageId" TEXT NOT NULL,
+    "outcome" TEXT NOT NULL,
+    "detail" TEXT,
+    "notifiedAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT now(),
+
+    CONSTRAINT "LeadInboxMessage_pkey" PRIMARY KEY ("gmailMessageId")
+);
+
 -- AlterTable: Lead — Booked/Called
 -- statement-break
 ALTER TABLE "Lead" ADD COLUMN IF NOT EXISTS "bookedAt" TIMESTAMP(3);
@@ -141,9 +153,9 @@ ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxRefreshTokenEnc
 -- statement-break
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxEmail" TEXT;
 -- statement-break
-ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxHistoryId" TEXT;
--- statement-break
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxCutoffAt" TIMESTAMP(3);
+-- statement-break
+ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxScanWatermarkAt" TIMESTAMP(3);
 -- statement-break
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxLastPollStartedAt" TIMESTAMP(3);
 -- statement-break
@@ -154,17 +166,13 @@ ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxLastPollOk" BOO
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxFailureCount" INTEGER NOT NULL DEFAULT 0;
 -- statement-break
 ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxNextPollAt" TIMESTAMP(3);
--- statement-break
-ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxResyncState" JSONB;
--- statement-break
-ALTER TABLE "CompanySettings" ADD COLUMN IF NOT EXISTS "leadInboxIncrementalState" JSONB;
 
 -- RLS — no policies: deny via PostgREST, same as ReceiptRequestCard /
 -- ClockInRequest (these hold lead PII). Prisma's diff engine cannot
 -- represent RLS at all, so this is checked separately by
 -- scripts/check-migrations-match.mjs's blind-spots assertion against
 -- prisma/prisma-blind-spots.json — a snapshot of PRODUCTION's actual RLS
--- state. That snapshot will not list these 4 tables until they exist in
+-- state. That snapshot will not list these 5 tables until they exist in
 -- prod, so this assertion is EXPECTED to fail on this PR until R1 (Justin
 -- applies this migration to prod, then re-runs
 -- scripts/snapshot-prisma-blind-spots.mjs and commits the refreshed
@@ -177,3 +185,5 @@ ALTER TABLE "LeadAlert" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "ContactEndpoint" ENABLE ROW LEVEL SECURITY;
 -- statement-break
 ALTER TABLE "SpeedToLeadEvent" ENABLE ROW LEVEL SECURITY;
+-- statement-break
+ALTER TABLE "LeadInboxMessage" ENABLE ROW LEVEL SECURITY;

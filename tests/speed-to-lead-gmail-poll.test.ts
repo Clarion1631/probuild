@@ -1,20 +1,24 @@
 /**
- * The inbox poll's cursor/resync/bounds state machine (finding 4/6), against
- * REAL Postgres for CompanySettings/LeadIntakeEvent, with a fake Gmail
- * client standing in for the Google API — no real Gmail account is ever
- * touched. The fake is applied via a manual `Module.prototype.require`
- * patch scoped to gmail-poll.ts's own literal `"./gmail-inbox-client"`
- * specifier, the same technique (and for the same Node-20-vs-`mock.module()`
- * reason) documented in tests/takeoff-convert-tax.test.ts's header comment.
+ * The lead-inbox windowed scan (src/lib/speed-to-lead/gmail-poll.ts), against
+ * REAL Postgres for CompanySettings / LeadInboxMessage / LeadIntakeEvent, with
+ * a fake Gmail mailbox standing in for the Google API: no real Gmail account
+ * is ever touched. The fake honors the scan's own query (`from:` senders and
+ * `after:<epoch>` against each message's internalDate), `includeSpamTrash`,
+ * and pagination, so the window arithmetic is actually exercised. It is
+ * applied via a manual `Module.prototype.require` patch scoped to
+ * gmail-poll.ts's own literal `"./gmail-inbox-client"` specifier, the same
+ * technique (and for the same Node-20-vs-`mock.module()` reason) documented in
+ * tests/takeoff-convert-tax.test.ts's header comment. ntfy pushes are captured
+ * by replacing `globalThis.fetch`, so nothing leaves the process.
+ *
+ * Every poll gets an explicit logical `now`, so time is deterministic.
  *
  * `DATABASE_URL` is pointed at the SAME disposable database as
  * `SPEED_TO_LEAD_TEST_URL` (with `?pgbouncer=true`, harmless on vanilla
- * Postgres) so `acquireCronLease`'s default store — which always uses the
- * global `src/lib/prisma.ts` singleton, not the `db` parameter passed to
- * `pollLeadInbox` — has a real, reachable database instead of failing
- * closed on every call.
+ * Postgres) so `acquireCronLease`'s default store, which always uses the
+ * global `src/lib/prisma.ts` singleton, has a real, reachable database.
  */
-import test, { before, after } from "node:test";
+import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
 import { PrismaClient } from "@prisma/client";
@@ -23,6 +27,9 @@ const databaseUrl = process.env.SPEED_TO_LEAD_TEST_URL;
 const skip = !databaseUrl && "set SPEED_TO_LEAD_TEST_URL to a disposable PostgreSQL URL";
 
 const GMAIL_INBOX_CLIENT_SPECIFIER = "./gmail-inbox-client";
+const RUN = `pt${Date.now().toString(36)}`;
+const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
 
 interface GmailPayload {
     headers?: { name: string; value: string }[];
@@ -31,55 +38,95 @@ interface GmailPayload {
     parts?: unknown[];
 }
 
-interface FakeGmailScript {
-    getProfile: () => { historyId: string };
-    historyList?: (args: { startHistoryId: string; pageToken?: string }) => { history?: unknown[]; historyId?: string; nextPageToken?: string } | { throw404: true };
-    messagesList?: (args: { q: string; pageToken?: string }) => { messages?: { id: string }[]; nextPageToken?: string };
-    messagesGet?: (id: string, format: "metadata" | "full") => { payload: GmailPayload };
+interface FakeMessage {
+    id: string;
+    internalDateMs: number;
+    /** The From address the search index sees. */
+    from: string;
+    metadata: GmailPayload;
+    full?: GmailPayload;
+    /** Not yet visible to search (index lag); `get` still works. */
+    hidden?: boolean;
+    /** Throw a 500 on the next N `get` calls for this message. */
+    failGets?: number;
 }
 
-let script: FakeGmailScript | null = null;
-let getCallCount = 0;
-let messagesListCalls = 0;
+let mailbox: FakeMessage[] = [];
+let pageSize = 100;
+let connected = true;
+/** Throw a 500 on list calls whose 1-based index within a poll is in this set (reset per poll). */
+let failListPages = new Set<number>();
+let failAllLists = false;
+let listCallsThisPoll = 0;
+let afterListHook: (() => void) | null = null;
+let listCalls: { q: string; pageToken?: string; includeSpamTrash?: boolean }[] = [];
+let getCalls: { id: string; format: string }[] = [];
+
+function httpError(code: number, message: string): Error {
+    return Object.assign(new Error(message), { code });
+}
+
+function searchMatches(q: string): FakeMessage[] {
+    const afterSec = Number(/after:(\d+)/.exec(q)?.[1] ?? "0");
+    const froms = [...q.matchAll(/from:([^\s{}]+)/g)].map(m => m[1].toLowerCase());
+    return mailbox
+        .filter(m => !m.hidden && froms.includes(m.from.toLowerCase()) && m.internalDateMs >= afterSec * 1000)
+        .sort((a, b) => b.internalDateMs - a.internalDateMs);
+}
 
 function fakeGmailClient() {
     return {
         users: {
-            getProfile: async () => ({ data: { historyId: script!.getProfile().historyId, emailAddress: "gtrsupport@goldentouchremodeling.com" } }),
-            history: {
-                list: async (args: { startHistoryId: string; pageToken?: string }) => {
-                    const result = script!.historyList?.(args) ?? {};
-                    if ((result as { throw404?: boolean }).throw404) {
-                        const err = new Error("Requested entity was not found.") as Error & { code: number };
-                        err.code = 404;
-                        throw err;
-                    }
-                    return { data: result };
-                },
-            },
             messages: {
-                list: async (args: { q: string; pageToken?: string }) => {
-                    messagesListCalls++;
-                    return { data: script!.messagesList?.(args) ?? {} };
+                list: async (args: { q: string; pageToken?: string; includeSpamTrash?: boolean }) => {
+                    listCalls.push({ q: args.q, pageToken: args.pageToken, includeSpamTrash: args.includeSpamTrash });
+                    listCallsThisPoll += 1;
+                    if (failAllLists || failListPages.has(listCallsThisPoll)) throw httpError(500, "Backend Error");
+                    const matches = searchMatches(args.q);
+                    const offset = args.pageToken ? Number(args.pageToken.replace("off-", "")) : 0;
+                    const slice = matches.slice(offset, offset + pageSize);
+                    const next = offset + pageSize < matches.length ? `off-${offset + pageSize}` : undefined;
+                    const data = { messages: slice.map(m => ({ id: m.id })), nextPageToken: next };
+                    afterListHook?.();
+                    return { data };
                 },
                 get: async (args: { id: string; format: "metadata" | "full" }) => {
-                    getCallCount++;
-                    return { data: script!.messagesGet?.(args.id, args.format) ?? { payload: {} } };
+                    getCalls.push({ id: args.id, format: args.format });
+                    const message = mailbox.find(m => m.id === args.id);
+                    if (!message) throw httpError(404, "Requested entity was not found.");
+                    if (message.failGets && message.failGets > 0) {
+                        message.failGets -= 1;
+                        throw httpError(500, "Backend Error");
+                    }
+                    const payload = args.format === "metadata" ? message.metadata : message.full ?? {};
+                    return { data: { id: message.id, internalDate: String(message.internalDateMs), payload } };
                 },
             },
         },
     };
 }
 
+// ── ntfy capture ────────────────────────────────────────────────────────────
+let pushes: { title: string; body: string }[] = [];
+let ntfyUp = true;
+const originalFetch = globalThis.fetch;
 let originalRequire: typeof Module.prototype.require;
 
 before(() => {
     process.env.DATABASE_URL = `${databaseUrl}?pgbouncer=true`;
+    delete process.env.SPEED_TO_LEAD_TRUSTED_SENDERS;
+    process.env.SPEED_TO_LEAD_NTFY_TOPIC = "poll-test-topic";
+    process.env.SPEED_TO_LEAD_NTFY_BASE_URL = "http://ntfy.invalid";
+    globalThis.fetch = (async (_url: unknown, init?: { headers?: Record<string, string>; body?: unknown }) => {
+        if (!ntfyUp) return new Response("down", { status: 503 });
+        pushes.push({ title: init?.headers?.Title ?? "", body: String(init?.body ?? "") });
+        return new Response("ok", { status: 200 });
+    }) as unknown as typeof fetch;
     originalRequire = Module.prototype.require;
     (Module.prototype as unknown as { require: (id: string) => unknown }).require = function (this: NodeModule, id: string) {
         if (id === GMAIL_INBOX_CLIENT_SPECIFIER) {
             return {
-                ensureLeadInboxAuth: async () => ({ ok: true, client: {} }),
+                ensureLeadInboxAuth: async () => (connected ? { ok: true, client: {} } : { ok: false }),
                 gmailClientFor: () => fakeGmailClient(),
             };
         }
@@ -88,26 +135,77 @@ before(() => {
     } as typeof Module.prototype.require;
 });
 
-after(() => {
+after(async () => {
     Module.prototype.require = originalRequire;
+    globalThis.fetch = originalFetch;
+    if (!databaseUrl) return;
+    // Remove every intake row (and any Lead a Voice intake created) this file wrote.
+    const db = freshDb();
+    try {
+        const events = await db.leadIntakeEvent.findMany({ where: { OR: [{ externalId: { contains: RUN } }, { submissionId: { contains: RUN } }] }, select: { id: true, leadId: true } });
+        await db.leadIntakeEvent.deleteMany({ where: { id: { in: events.map(e => e.id) } } });
+        const leadIds = events.map(e => e.leadId).filter((id): id is string => !!id);
+        if (leadIds.length) await db.lead.deleteMany({ where: { id: { in: leadIds } } });
+        await resetState(db);
+    } catch (error) {
+        // Cleanup only: never turn a passing suite red over leftover rows in a throwaway database.
+        console.warn("[gmail-poll test] cleanup failed", error instanceof Error ? error.name : error);
+    } finally {
+        await db.$disconnect();
+    }
 });
 
-async function freshDb() {
+beforeEach(() => {
+    mailbox = [];
+    pageSize = 100;
+    connected = true;
+    failListPages = new Set();
+    failAllLists = false;
+    afterListHook = null;
+    listCalls = [];
+    getCalls = [];
+    pushes = [];
+    ntfyUp = true;
+});
+
+function freshDb() {
     return new PrismaClient({ datasources: { db: { url: `${databaseUrl}?pgbouncer=true` } } });
 }
 
-async function resetCompanySettings(db: PrismaClient) {
+const MARKER_KEYS = [
+    "speedToLeadPollLease",
+    "speedToLeadPollAlertSentAt",
+    "speedToLeadInboxDisconnectedAlertSent",
+    "speedToLeadScanStaleAlertSentAt",
+    "speedToLeadUnacceptedNoticeSentAt",
+];
+
+async function resetState(db: PrismaClient) {
     await db.companySettings.deleteMany({ where: { id: "singleton" } });
+    await db.leadInboxMessage.deleteMany({});
+    await db.automationSetting.deleteMany({ where: { key: { in: MARKER_KEYS } } });
 }
 
-// Two ARC-sealed hops (i=1 the Group's own ingestion of Resend's mail, i=2
-// Google's internal relay from the Group to gtrsupport@'s own Gmail inbox) —
-// the real R0-captured shape (authentication.ts's own doc comment), and,
-// since round-5, the ONLY shape authenticateMessage accepts: it rejects any
-// instance count/shape other than exactly {1, 2} (an appended downstream ARC
-// hop forgery, RFC 8617 section 5.2).
-const WEBSITE_HEADERS_METADATA: { payload: GmailPayload } = {
-    payload: {
+async function seedSettings(db: PrismaClient, data: { cutoffAt: Date; watermarkAt: Date }) {
+    await db.companySettings.create({ data: { id: "singleton", leadInboxCutoffAt: data.cutoffAt, leadInboxScanWatermarkAt: data.watermarkAt } });
+}
+
+async function poll(db: PrismaClient, now: Date) {
+    listCallsThisPoll = 0;
+    const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+    return pollLeadInbox(db, now);
+}
+
+async function settingsOf(db: PrismaClient) {
+    return db.companySettings.findUnique({ where: { id: "singleton" } });
+}
+
+// ── Fixtures (the real R0-captured header shapes) ───────────────────────────
+
+const WEBSITE_BODY: GmailPayload = { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } };
+
+function websiteMetadata(submissionId?: string): GmailPayload {
+    return {
         headers: [
             { name: "From", value: "website@goldentouchremodeling.com" },
             { name: "Subject", value: "New website inquiry" },
@@ -118,394 +216,403 @@ const WEBSITE_HEADERS_METADATA: { payload: GmailPayload } = {
             { name: "ARC-Authentication-Results", value: "i=1; mx.google.com; dkim=pass header.i=@goldentouchremodeling.com header.s=resend header.b=x; dmarc=pass header.from=goldentouchremodeling.com" },
             { name: "ARC-Seal", value: "i=2; a=rsa-sha256; cv=pass; d=google.com; s=x; t=2; b=y" },
             { name: "ARC-Authentication-Results", value: "i=2; mx.google.com; dkim=pass header.i=@goldentouchremodeling.com header.s=google; arc=pass (i=2); dmarc=pass header.from=goldentouchremodeling.com" },
+            ...(submissionId ? [{ name: "X-GTR-Submission-Id", value: submissionId }] : []),
         ],
-    },
-};
+    };
+}
 
-const UNTRUSTED_HEADERS_METADATA: { payload: GmailPayload } = {
-    payload: {
-        headers: [
-            { name: "From", value: "someone@example.com" },
-            { name: "Subject", value: "Re: your invoice" },
-        ],
-    },
-};
+function website(id: string, internalDateMs: number, extra: Partial<FakeMessage> = {}): FakeMessage {
+    return { id: `${RUN}-${id}`, internalDateMs, from: "website@goldentouchremodeling.com", metadata: websiteMetadata(), full: WEBSITE_BODY, ...extra };
+}
 
-test("first run establishes a cursor without processing any backlog", { skip }, async () => {
-    const db = await freshDb();
+/** A spoofed `From: website@` with none of the Group/ARC chain: authentication rejects it. */
+function forgedWebsite(id: string, internalDateMs: number): FakeMessage {
+    return {
+        id: `${RUN}-${id}`,
+        internalDateMs,
+        from: "website@goldentouchremodeling.com",
+        metadata: { headers: [{ name: "From", value: "website@goldentouchremodeling.com" }, { name: "Subject", value: "New website inquiry" }, { name: "Authentication-Results", value: "mx.google.com; dkim=pass header.i=@goldentouchremodeling.com header.s=google; dmarc=pass header.from=goldentouchremodeling.com" }] },
+    };
+}
+
+function voice(id: string, internalDateMs: number, phone: string): FakeMessage {
+    return {
+        id: `${RUN}-${id}`,
+        internalDateMs,
+        from: "voice-noreply@google.com",
+        metadata: {
+            headers: [
+                { name: "From", value: "Google Voice <voice-noreply@google.com>" },
+                { name: "Subject", value: `New missed call from ${phone}` },
+                { name: "Authentication-Results", value: "mx.google.com; dkim=pass header.i=@google.com header.s=x; dmarc=pass header.from=google.com" },
+            ],
+        },
+        full: { mimeType: "text/plain", body: { data: Buffer.from(`Missed call from ${phone}`).toString("base64url") } },
+    };
+}
+
+function intakeRow(db: PrismaClient, messageId: string) {
+    return db.leadIntakeEvent.findUnique({ where: { externalId: `voice:${messageId}` } });
+}
+
+function gets(id: string) {
+    return getCalls.filter(c => c.id === id).length;
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+test("first connected run pins the floor: mail older than the connection is never imported, and mail after it is", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        script = { getProfile: () => ({ historyId: "100" }) };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
-        const result = await pollLeadInbox(db, new Date());
-        assert.equal(result.ran, true);
-        assert.equal(result.processed, 0);
-        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-        assert.equal(settings?.leadInboxHistoryId, "100");
-        assert.ok(settings?.leadInboxCutoffAt);
+        await resetState(db);
+        const T = Math.floor(Date.now() / 1000) * 1000;
+        const backlog = website("t1-backlog", T - 2 * HOUR);
+        mailbox = [backlog];
+
+        const first = await poll(db, new Date(T));
+        assert.equal(first.ran, true);
+        assert.equal(first.complete, true);
+        let settings = await settingsOf(db);
+        assert.equal(settings?.leadInboxCutoffAt?.getTime(), T);
+        assert.equal(settings?.leadInboxScanWatermarkAt?.getTime(), T);
+        assert.ok(listCalls[0].q.includes(`after:${T / 1000 - 1}`), `the first window starts at the floor (one second of slack): ${listCalls[0].q}`);
+        assert.ok(listCalls[0].q.includes("from:website@goldentouchremodeling.com") && listCalls[0].q.includes("from:voice-noreply@google.com"), "the query names exactly the trusted senders");
+        assert.equal(listCalls[0].includeSpamTrash, true, "a lead Gmail filed as spam or a human trashed is still listed");
+
+        const arrived = website("t1-new", T + 30_000);
+        mailbox.push(arrived);
+        await poll(db, new Date(T + MINUTE));
+        assert.ok(await intakeRow(db, arrived.id), "mail after the connection is imported");
+        assert.equal(gets(backlog.id), 0, "the pre-connection backlog is never fetched");
+        settings = await settingsOf(db);
+        assert.equal(settings?.leadInboxScanWatermarkAt?.getTime(), T + MINUTE);
     } finally {
         await db.$disconnect();
     }
 });
 
-test("a trusted website message costs exactly two message-get calls (metadata, then full) and becomes a PENDING_FALLBACK row", { skip }, async () => {
-    const db = await freshDb();
+test("a trusted website message costs two gets (metadata, then full) and becomes a PENDING_FALLBACK row plus an INTAKE ledger row", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "100", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
-        getCallCount = 0;
-        script = {
-            getProfile: () => ({ historyId: "999" }),
-            historyList: () => ({ history: [{ messagesAdded: [{ message: { id: "web-msg-1" } }] }], historyId: "101" }),
-            messagesGet: (id, format) => {
-                if (format === "metadata") return WEBSITE_HEADERS_METADATA;
-                return { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
-            },
-        };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
-        const result = await pollLeadInbox(db, new Date());
-        assert.equal(result.ran, true);
-        assert.equal(result.processed, 1);
-        assert.equal(getCallCount, 2, "metadata-first: exactly one metadata get plus one full get for a trusted sender");
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - 5 * MINUTE) });
+        const message = website("t2", T - 2 * MINUTE);
+        mailbox = [message];
 
-        const rows = await db.leadIntakeEvent.findMany({ where: { source: "WEB_EMAIL_FALLBACK" }, orderBy: { createdAt: "desc" }, take: 1 });
-        assert.equal(rows[0]?.state, "PENDING_FALLBACK");
-
-        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-        assert.equal(settings?.leadInboxHistoryId, "101");
+        const result = await poll(db, new Date(T));
+        assert.deepEqual({ ran: result.ran, processed: result.processed, complete: result.complete }, { ran: true, processed: 1, complete: true });
+        assert.deepEqual(getCalls.map(c => c.format), ["metadata", "full"]);
+        assert.equal((await intakeRow(db, message.id))?.state, "PENDING_FALLBACK");
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: message.id } }))?.outcome, "INTAKE");
+        assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), T, "a complete scan moves the watermark to its own start time");
+        assert.equal(pushes.length, 0, "an accepted lead produces no poller push (its alert is the intake path's own)");
     } finally {
         await db.$disconnect();
     }
 });
 
-test("a non-trusted message costs exactly one metadata get and creates no intake row", { skip }, async () => {
-    const db = await freshDb();
+test("a lead-sender message authentication turns away costs one get, makes no intake row, and is pushed to Justin; other senders are never even listed", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "200", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
-        getCallCount = 0;
-        const before = await db.leadIntakeEvent.count();
-        script = {
-            getProfile: () => ({ historyId: "999" }),
-            historyList: () => ({ history: [{ messagesAdded: [{ message: { id: "spam-msg-1" } }] }], historyId: "201" }),
-            messagesGet: (_id, format) => (format === "metadata" ? UNTRUSTED_HEADERS_METADATA : { payload: {} }),
-        };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
-        const result = await pollLeadInbox(db, new Date());
-        assert.equal(result.processed, 1);
-        assert.equal(getCallCount, 1, "an untrusted message must never trigger a full fetch");
-        const after = await db.leadIntakeEvent.count();
-        assert.equal(after, before, "no intake row for an untrusted message");
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - 5 * MINUTE) });
+        const forged = forgedWebsite("t3-forged", T - 3 * MINUTE);
+        const welcome = { ...voice("t3-welcome", T - 2 * MINUTE, "(360) 555-0103") };
+        welcome.metadata = { headers: welcome.metadata.headers!.map(h => (h.name === "Subject" ? { name: "Subject", value: "Welcome to Google Voice" } : h)) };
+        const stranger: FakeMessage = { id: `${RUN}-t3-stranger`, internalDateMs: T - MINUTE, from: "someone@example.com", metadata: { headers: [{ name: "From", value: "someone@example.com" }] } };
+        mailbox = [forged, welcome, stranger];
+
+        const result = await poll(db, new Date(T));
+        assert.equal(result.complete, true);
+        assert.equal(gets(forged.id), 1);
+        assert.equal(gets(welcome.id), 1);
+        assert.equal(gets(stranger.id), 0, "the narrow sender query never lists other mail");
+        assert.equal(await intakeRow(db, forged.id), null);
+        assert.equal(await intakeRow(db, welcome.id), null);
+
+        const ledger = await db.leadInboxMessage.findMany({ where: { gmailMessageId: { in: [forged.id, welcome.id] } } });
+        assert.deepEqual(ledger.map(r => r.outcome).sort(), ["REJECTED", "REJECTED"]);
+        assert.ok(ledger.every(r => r.notifiedAt), "both are marked reported");
+        assert.equal(pushes.length, 1, "one batched push");
+        assert.match(pushes[0].title, /not taken in as leads/);
+        assert.ok(pushes[0].body.includes(forged.id) && pushes[0].body.includes(welcome.id));
     } finally {
         await db.$disconnect();
     }
 });
 
-test("an expired history cursor (404) resyncs via messages.list and the new cursor is the pre-scan H0", { skip }, async () => {
-    const db = await freshDb();
+test("a scan that fails mid-way does not advance the watermark, and the next scan picks up the missed message without re-fetching the rest", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        const now = new Date();
-        await db.companySettings.create({
-            data: { id: "singleton", leadInboxHistoryId: "stale-cursor", leadInboxCutoffAt: new Date(now.getTime() - 60 * 60 * 1000), leadInboxLastPollStartedAt: new Date(now.getTime() - 30 * 60 * 1000) },
-        });
-        script = {
-            getProfile: () => ({ historyId: "h0-after-resync" }),
-            historyList: () => ({ throw404: true }),
-            messagesList: () => ({ messages: [{ id: "voice-msg-1" }] }),
-            messagesGet: (_id, format) => {
-                if (format === "metadata") {
-                    return {
-                        payload: {
-                            headers: [
-                                { name: "From", value: "Google Voice <voice-noreply@google.com>" },
-                                { name: "Subject", value: "New missed call from (360) 555-0100" },
-                                { name: "Authentication-Results", value: "mx.google.com; dkim=pass header.i=@google.com header.s=x; dmarc=pass header.from=google.com" },
-                            ],
-                        },
-                    };
-                }
-                return { payload: { mimeType: "text/plain", body: { data: Buffer.from("Missed call from (360) 555-0100").toString("base64url") } } };
-            },
-        };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
-        const result = await pollLeadInbox(db, now);
-        assert.equal(result.resynced, true);
-        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-        assert.equal(settings?.leadInboxHistoryId, "h0-after-resync");
-        const rows = await db.leadIntakeEvent.findMany({ where: { source: "VOICE" }, orderBy: { createdAt: "desc" }, take: 1 });
-        assert.equal(rows[0]?.verdict, "REVIEW");
+        await resetState(db);
+        const T = Date.now();
+        const watermark = new Date(T - 5 * MINUTE);
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: watermark });
+        pageSize = 2;
+        const messages = [1, 2, 3, 4].map(n => website(`t4-${n}`, T - n * MINUTE));
+        mailbox = [...messages];
+        failListPages = new Set([2]);
+
+        const first = await poll(db, new Date(T));
+        assert.deepEqual({ ran: first.ran, reason: first.reason }, { ran: false, reason: "error" });
+        assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), watermark.getTime(), "the watermark must not move");
+        const page2 = messages.slice(2);
+        for (const m of page2) assert.equal(await intakeRow(db, m.id), null, "page 2 was never reached");
+
+        failListPages = new Set();
+        const second = await poll(db, new Date(T + 2 * MINUTE));
+        assert.equal(second.complete, true);
+        for (const m of messages) assert.ok(await intakeRow(db, m.id), `${m.id} recorded`);
+        assert.equal(getCalls.length, 8, "4 messages x 2 gets: page 1's messages were not fetched again");
+        assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), T + 2 * MINUTE);
     } finally {
         await db.$disconnect();
     }
 });
 
-test("the fixed per-run message-get budget can be exhausted by leading untrusted messages before a trusted one is ever reached, and the cursor never commits past it", { skip }, async () => {
-    const db = await freshDb();
+test("a message whose get fails stays open without holding back the leads after it or delaying the next poll, and a later scan finishes it (the 30-minute-old case)", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "500", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
-        // 60 untrusted messages (each costs exactly one metadata `get`) ahead
-        // of a single trusted one — comfortably more than MAX_MESSAGE_GETS
-        // (50), so the run-budget exhausts on an untrusted message before the
-        // trusted one is ever reached.
-        const untrustedIds = Array.from({ length: 60 }, (_, i) => `untrusted-${i}`);
-        const messagesAdded = [...untrustedIds, "trusted-1"].map(id => ({ message: { id } }));
-        script = {
-            getProfile: () => ({ historyId: "999" }),
-            historyList: () => ({ history: [{ messagesAdded }], historyId: "600" }),
-            messagesGet: (id, format) => {
-                if (id === "trusted-1") return format === "metadata" ? WEBSITE_HEADERS_METADATA : { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
-                return UNTRUSTED_HEADERS_METADATA;
-            },
-        };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
-        const result = await pollLeadInbox(db, new Date());
-        assert.equal(result.ran, true);
-        assert.equal(result.processed, 50, "exactly MAX_MESSAGE_GETS untrusted messages processed before the budget ran out");
+        await resetState(db);
+        const T = Date.now();
+        // The watermark has been pinned 30 minutes back by an earlier failure.
+        const watermark = new Date(T - 30 * MINUTE);
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: watermark });
+        const stuck = website("t5-stuck", T - 29 * MINUTE, { failGets: 3 });
+        const fresh = website("t5-fresh", T - MINUTE);
+        mailbox = [stuck, fresh];
 
-        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-        assert.equal(settings?.leadInboxHistoryId, "500", "the cursor must NOT advance while the trusted message further down the list is still unhandled");
-        const pending = settings?.leadInboxIncrementalState as unknown as { newHistoryId: string; pendingMessageIds: string[] } | null;
-        assert.equal(pending?.newHistoryId, "600");
-        assert.equal(pending?.pendingMessageIds.length, 11, "the 10 remaining untrusted messages plus the trusted one must be persisted for the next run");
-        assert.ok(pending?.pendingMessageIds.includes("trusted-1"), "the trusted message must still be queued, not lost");
+        const first = await poll(db, new Date(T));
+        assert.deepEqual({ ran: first.ran, complete: first.complete }, { ran: true, complete: false });
+        assert.ok(await intakeRow(db, fresh.id), "the lead after the stuck message is not held back");
+        assert.equal(await intakeRow(db, stuck.id), null);
+        let settings = await settingsOf(db);
+        assert.equal(settings?.leadInboxScanWatermarkAt?.getTime(), watermark.getTime(), "the watermark must not move past an unfinished message");
+        assert.equal(settings?.leadInboxFailureCount, 1);
+        assert.equal(settings?.leadInboxLastPollOk, false);
+        assert.equal(settings?.leadInboxNextPollAt, null, "no backoff: new leads keep flowing every minute");
 
-        // Scoped to THIS message's own externalId (voice:trusted-1 — the
-        // WEBSITE_HEADERS_METADATA fixture carries no X-GTR-Submission-Id),
-        // not a bare source filter — an earlier test in this same file
-        // leaves its own WEB_EMAIL_FALLBACK row behind.
-        const row = await db.leadIntakeEvent.findUnique({ where: { externalId: "voice:trusted-1" } });
-        assert.equal(row, null, "the trusted message must not be recorded until it is actually reached");
+        await poll(db, new Date(T + MINUTE));
+        await poll(db, new Date(T + 2 * MINUTE));
+        assert.equal(await intakeRow(db, stuck.id), null, "still failing, still open");
+        const last = await poll(db, new Date(T + 3 * MINUTE));
+        assert.equal(last.complete, true);
+        assert.ok(await intakeRow(db, stuck.id), "the 30-minute-old message is recovered once its get works");
+        settings = await settingsOf(db);
+        assert.equal(settings?.leadInboxScanWatermarkAt?.getTime(), T + 3 * MINUTE);
+        assert.equal(settings?.leadInboxFailureCount, 0);
+        assert.equal(gets(fresh.id), 2, "the finished message was never fetched again on the retries");
     } finally {
         await db.$disconnect();
     }
 });
 
-test("repeated poll runs make forward progress through a persisted budget-exhausted queue, eventually recording the trusted message and committing the cursor — with no message ever re-fetched", { skip }, async () => {
-    const db = await freshDb();
+test("a duplicate is never double-processed: a re-listed message costs no gets, and two copies of one website submission make one intake row", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "500", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
-        const untrustedIds = Array.from({ length: 60 }, (_, i) => `untrusted-${i}`);
-        const messagesAdded = [...untrustedIds, "trusted-1"].map(id => ({ message: { id } }));
-        getCallCount = 0;
-        script = {
-            getProfile: () => ({ historyId: "999" }),
-            historyList: () => ({ history: [{ messagesAdded }], historyId: "600" }),
-            messagesGet: (id, format) => {
-                if (id === "trusted-1") return format === "metadata" ? WEBSITE_HEADERS_METADATA : { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
-                return UNTRUSTED_HEADERS_METADATA;
-            },
-        };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - 5 * MINUTE) });
+        const submissionId = `${RUN}-sub-t6`;
+        const copyA = website("t6-a", T - 2 * MINUTE, { metadata: websiteMetadata(submissionId) });
+        const copyB = website("t6-b", T - MINUTE, { metadata: websiteMetadata(submissionId) });
+        mailbox = [copyA, copyB];
 
-        let settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-        let runs = 0;
-        while (settings?.leadInboxHistoryId !== "600" && runs < 10) {
-            await pollLeadInbox(db, new Date());
-            settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-            runs++;
-        }
-        assert.ok(runs > 1, "the scenario must actually require more than one run to finish");
-        assert.equal(settings?.leadInboxHistoryId, "600", "the cursor must eventually commit once every message is handled");
-        assert.equal(settings?.leadInboxIncrementalState, null, "no leftover queue once done");
+        await poll(db, new Date(T));
+        assert.equal(getCalls.length, 4);
+        assert.equal(await db.leadIntakeEvent.count({ where: { submissionId } }), 1, "one intake row per submission");
 
-        const row = await db.leadIntakeEvent.findUnique({ where: { externalId: "voice:trusted-1" } });
-        assert.ok(row, "the trusted message buried behind 60 untrusted ones must eventually be recorded");
-        assert.equal(row?.source, "WEB_EMAIL_FALLBACK");
-
-        // 60 untrusted messages x 1 get each, plus the trusted message's 2
-        // gets (metadata + full) = 62 total, no matter how many runs it took
-        // — proves no message was ever re-fetched across runs.
-        assert.equal(getCallCount, 62, "every message must be fetched exactly once across all runs combined");
+        const again = await poll(db, new Date(T + MINUTE));
+        assert.equal(again.complete, true);
+        assert.equal(again.processed, 0);
+        assert.equal(getCalls.length, 4, "both copies are re-listed by the overlap, and cost nothing");
+        assert.equal(await db.leadIntakeEvent.count({ where: { submissionId } }), 1);
     } finally {
         await db.$disconnect();
     }
 });
 
-test("11 history pages plus 60 leading untrusted messages: pagination resumes via a persisted page token across runs, page 11's trusted message is eventually processed, and the cursor advances only once enumeration is fully complete (round-4: incremental starvation)", { skip }, async () => {
-    const db = await freshDb();
+test("a message that arrives during a scan, or shows up in search late, is caught by the next scan through the overlap", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "1000", leadInboxCutoffAt: new Date(Date.now() - 60_000) } });
-        getCallCount = 0;
-        let historyListCalls = 0;
-        // Pages 1-10 hold 4 leading untrusted messages each (40 total, well
-        // under MAX_MESSAGE_GETS on their own) — page 11 alone would be
-        // unreachable under the OLD code's page cap (MAX_HISTORY_PAGES=10)
-        // with no persisted page token to resume from. Page 11 then adds 20
-        // more untrusted messages (60 leading untrusted overall) plus the
-        // one trusted message, last.
-        script = {
-            getProfile: () => ({ historyId: "999" }),
-            historyList: (args: { pageToken?: string }) => {
-                historyListCalls++;
-                const pageNum = args.pageToken ? Number(args.pageToken.replace("page-", "")) : 1;
-                const ids = pageNum <= 10
-                    ? Array.from({ length: 4 }, (_, i) => `untrusted-p${pageNum}-${i}`)
-                    : [...Array.from({ length: 20 }, (_, i) => `untrusted-p11-${i}`), "trusted-p11"];
-                return {
-                    history: [{ messagesAdded: ids.map(id => ({ message: { id } })) }],
-                    historyId: "1100",
-                    nextPageToken: pageNum < 11 ? `page-${pageNum + 1}` : undefined,
-                };
-            },
-            messagesGet: (id, format) => {
-                if (id === "trusted-p11") {
-                    return format === "metadata"
-                        ? WEBSITE_HEADERS_METADATA
-                        : { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
-                }
-                return UNTRUSTED_HEADERS_METADATA;
-            },
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - MINUTE) });
+        const early = website("t7-early", T - 30_000);
+        // Delivered 10 minutes BEFORE the scan started, but not visible to
+        // search until after it: without the overlap, the next window
+        // (after:T) would skip it for good.
+        const lagged = website("t7-lagged", T - 10 * MINUTE, { hidden: true });
+        const during = website("t7-during", T + 1000);
+        mailbox = [early, lagged];
+        afterListHook = () => {
+            if (!mailbox.includes(during)) mailbox.push(during);
         };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
 
-        let settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-        let runs = 0;
-        while (settings?.leadInboxHistoryId !== "1100" && runs < 10) {
-            await pollLeadInbox(db, new Date());
-            settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-            runs++;
-            if (runs === 1) {
-                assert.equal(settings?.leadInboxHistoryId, "1000", "the cursor must not advance while page 11 is still unreached");
+        const first = await poll(db, new Date(T));
+        assert.equal(first.complete, true);
+        assert.ok(await intakeRow(db, early.id));
+        assert.equal(await intakeRow(db, during.id), null, "arrived after this scan's list call");
+        assert.equal(await intakeRow(db, lagged.id), null, "not yet visible to search");
+        assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), T);
+
+        afterListHook = null;
+        lagged.hidden = false;
+        const second = await poll(db, new Date(T + MINUTE));
+        assert.equal(second.complete, true);
+        assert.ok(await intakeRow(db, during.id), "the mid-scan arrival is caught by the next scan");
+        assert.ok(await intakeRow(db, lagged.id), "the late-indexed message, older than the watermark, is caught through the overlap");
+        assert.ok(lagged.internalDateMs < T, "precondition: it predates the watermark the first scan committed");
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("pagination over several pages: every page is listed and every message processed before the watermark moves", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - HOUR) });
+        pageSize = 3;
+        const messages = Array.from({ length: 10 }, (_, i) => website(`t8-${i}`, T - (i + 1) * MINUTE));
+        mailbox = [...messages];
+
+        const result = await poll(db, new Date(T));
+        assert.equal(result.complete, true);
+        assert.equal(result.processed, 10);
+        assert.deepEqual(listCalls.map(c => c.pageToken), [undefined, "off-3", "off-6", "off-9"], "4 pages, each fetched once, in order");
+        for (const m of messages) assert.ok(await intakeRow(db, m.id), `${m.id} recorded`);
+        assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), T);
+    } finally {
+        await db.$disconnect();
+    }
+});
+
+test("11 pages with 60 leading rejected messages and one real lead on the last page: runs progress through the get budget, each message is fetched once, and the watermark moves only on the finishing run", { skip }, async () => {
+    const db = freshDb();
+    try {
+        await resetState(db);
+        const T = Date.now();
+        const watermark = new Date(T - 2 * HOUR);
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: watermark });
+        pageSize = 6;
+        const rejected = Array.from({ length: 60 }, (_, i) => forgedWebsite(`t9-rej-${i}`, T - (i + 1) * 1000));
+        const lead = website("t9-lead", T - HOUR);
+        mailbox = [...rejected, lead];
+
+        const runs: boolean[] = [];
+        for (let i = 0; i < 5 && !runs[runs.length - 1]; i++) {
+            const result = await poll(db, new Date(T + i * MINUTE));
+            runs.push(result.complete === true);
+            if (!result.complete) {
+                assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), watermark.getTime(), "an unfinished run never moves the watermark");
             }
         }
-        assert.ok(runs > 1 && runs < 10, `the scenario must span more than one run and actually terminate, got ${runs}`);
-        assert.equal(settings?.leadInboxHistoryId, "1100", "the cursor advances only once enumeration is fully complete");
-        assert.equal(settings?.leadInboxIncrementalState, null, "no leftover incremental state once done");
-        assert.equal(historyListCalls, 11, "each of the 11 history pages must be fetched exactly once across every run combined — no page 1-10 refetch loop");
-        assert.equal(getCallCount, 62, "60 untrusted x 1 get + 1 trusted x 2 gets = 62, no matter how many runs — proves no message is ever re-fetched");
-
-        const row = await db.leadIntakeEvent.findUnique({ where: { externalId: "voice:trusted-p11" } });
-        assert.ok(row, "the trusted message on page 11, behind 60 leading untrusted ones, must eventually be recorded");
-        assert.equal(row?.source, "WEB_EMAIL_FALLBACK");
+        assert.ok(runs.length > 1 && runs[runs.length - 1], `must span more than one run and then finish: ${JSON.stringify(runs)}`);
+        assert.equal(listCalls.filter(c => !c.pageToken).length, runs.length, "each run re-lists from page 1 (no page-token state)");
+        assert.ok(listCalls.some(c => c.pageToken === "off-60"), "page 11 was reached");
+        assert.ok(await intakeRow(db, lead.id), "the real lead on page 11, behind 60 rejected messages, is recorded");
+        assert.equal(getCalls.length, 62, "60 rejected x 1 get + the lead x 2 gets: nothing is ever fetched twice");
+        assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), T + (runs.length - 1) * MINUTE);
     } finally {
         await db.$disconnect();
     }
 });
 
-test("a resync whose last page's own leftover messages exceed one run's budget terminates in a bounded number of runs, instead of re-listing from page 1 forever (round-4: pagination-done vs not-started ambiguity)", { skip }, async () => {
-    const db = await freshDb();
+test("a long outage raises one visible stale-scan alert and keeps the watermark, then the next complete scan recovers everything (the 72-hour-gap case: no reset, no unscanned window)", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        const now = new Date();
-        await db.companySettings.create({
-            data: { id: "singleton", leadInboxHistoryId: "stale-cursor-2", leadInboxCutoffAt: new Date(now.getTime() - 60 * 60 * 1000), leadInboxLastPollStartedAt: new Date(now.getTime() - 30 * 60 * 1000) },
-        });
-        getCallCount = 0;
-        let messagesListCallsLocal = 0;
-        // Page 1 (10 messages) plus page 2 — the LAST page (no
-        // nextPageToken) — with 45 more: 55 total, more than one run's
-        // MAX_MESSAGE_GETS (50), so page 2's own trailing messages are left
-        // pending with `pageToken: null` — the exact same representation a
-        // FRESH, not-yet-started resync also uses. Without an explicit
-        // "pagination is actually done" flag, draining that leftover on the
-        // next run would fall through into re-listing page 1 forever.
-        const page1Ids = Array.from({ length: 10 }, (_, i) => `resync-a-${i}`);
-        const page2Ids = Array.from({ length: 45 }, (_, i) => `resync-b-${i}`);
-        script = {
-            getProfile: () => ({ historyId: "h0-after-resync-2" }),
-            historyList: () => ({ throw404: true }),
-            messagesList: (args: { pageToken?: string }) => {
-                messagesListCallsLocal++;
-                if (!args.pageToken) return { messages: page1Ids.map(id => ({ id })), nextPageToken: "resync-page-2" };
-                if (args.pageToken === "resync-page-2") return { messages: page2Ids.map(id => ({ id })) };
-                throw new Error(`unexpected pageToken ${args.pageToken}`);
-            },
-            messagesGet: () => UNTRUSTED_HEADERS_METADATA,
-        };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
+        await resetState(db);
+        const T = Date.now();
+        const watermark = new Date(T - 100 * HOUR);
+        const cutoff = new Date(T - 30 * 24 * HOUR);
+        await seedSettings(db, { cutoffAt: cutoff, watermarkAt: watermark });
+        const during = [
+            website("t10-a", T - 99 * HOUR),
+            voice("t10-b", T - 50 * HOUR, "(360) 555-0110"),
+            website("t10-c", T - HOUR),
+        ];
+        const forged = forgedWebsite("t10-forged", T - 70 * HOUR);
+        mailbox = [...during, forged];
+        failAllLists = true;
 
-        let settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-        let runs = 0;
-        while (settings?.leadInboxHistoryId !== "h0-after-resync-2" && runs < 5) {
-            await pollLeadInbox(db, now);
-            settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-            runs++;
-        }
-        assert.ok(runs > 1 && runs <= 3, `must terminate in a small, bounded number of runs, got ${runs}`);
-        assert.equal(settings?.leadInboxHistoryId, "h0-after-resync-2", "the resync must actually complete and commit its H0 cursor");
-        assert.equal(settings?.leadInboxResyncState, null, "no leftover resync state once done");
-        assert.equal(messagesListCallsLocal, 2, "each of the resync's 2 pages must be listed exactly once across every run combined — no re-list from page 1");
-        assert.equal(getCallCount, 55, "all 55 messages (10 + 45) must be fetched exactly once total, no matter how many runs it took");
+        await poll(db, new Date(T));
+        assert.equal(pushes.filter(p => /scan behind/.test(p.title)).length, 1, "one stale-scan alert");
+        assert.match(pushes.find(p => /scan behind/.test(p.title))!.body, new RegExp(watermark.toISOString()));
+        await poll(db, new Date(T + 5 * MINUTE));
+        assert.equal(pushes.filter(p => /scan behind/.test(p.title)).length, 1, "sent once per outage, not every poll");
+        assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), watermark.getTime(), "kept, never reset");
+
+        failAllLists = false;
+        const recovered = await poll(db, new Date(T + 30 * MINUTE));
+        assert.equal(recovered.complete, true);
+        const lastList = listCalls[listCalls.length - 1];
+        assert.ok(lastList.q.includes(`after:${Math.floor((watermark.getTime() - 24 * HOUR) / 1000) - 1}`), `the recovery window reaches back past the whole outage: ${lastList.q}`);
+        for (const m of during) assert.ok(await intakeRow(db, m.id), `${m.id} recovered`);
+        assert.equal((await intakeRow(db, during[1].id))?.verdict, "REVIEW", "Voice intake is REVIEW");
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: forged.id } }))?.outcome, "REJECTED");
+        assert.equal((await settingsOf(db))?.leadInboxScanWatermarkAt?.getTime(), T + 30 * MINUTE);
+        assert.equal(pushes.filter(p => /caught up/.test(p.title)).length, 1, "recovery is announced");
+        assert.equal(await db.automationSetting.findUnique({ where: { key: "speedToLeadScanStaleAlertSentAt" } }), null, "the next outage alerts again");
     } finally {
         await db.$disconnect();
     }
 });
 
-test("a 30-minute-old pending message is drained BEFORE history.list is even called, so it is still processed even though this run's cursor has expired (round-5: draining used to happen AFTER enumeration, abandoning it on a 404)", { skip }, async () => {
-    const db = await freshDb();
+test("a disconnected inbox still raises the stale-scan alert, and a failed push is retried on the next poll", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        const now = new Date();
-        // A prior run already found "pending-old-1" via history.list (added
-        // to pendingMessageIds) but ran out of get-budget before it could be
-        // recorded, and pagination itself was NOT yet done (there is still
-        // more to enumerate via `pageToken`) — 30 minutes have passed since.
-        // Without the fix, THIS run's history.list call (continuing that
-        // enumeration) throwing a 404 would discard `pendingMessageIds`
-        // entirely via the historyExpired branch, silently losing the
-        // message.
-        await db.companySettings.create({
-            data: {
-                id: "singleton",
-                leadInboxHistoryId: "hist-A",
-                leadInboxCutoffAt: new Date(now.getTime() - 60 * 60 * 1000),
-                leadInboxLastPollStartedAt: new Date(now.getTime() - 60 * 1000),
-                leadInboxIncrementalState: {
-                    newHistoryId: "hist-A",
-                    pageToken: "page-2",
-                    pendingMessageIds: ["pending-old-1"],
-                    paginationDone: false,
-                    since: new Date(now.getTime() - 30 * 60 * 1000).toISOString(),
-                },
-            },
-        });
-        script = {
-            getProfile: () => ({ historyId: "h0-after-drain-recovery" }),
-            historyList: () => ({ throw404: true }),
-            messagesList: () => ({ messages: [] }),
-            messagesGet: (id, format) => {
-                if (id === "pending-old-1") return format === "metadata" ? WEBSITE_HEADERS_METADATA : { payload: { mimeType: "text/plain", body: { data: Buffer.from("Name: Jane\nEmail: jane@example.com\nMessage:\nplease call me about a remodel").toString("base64url") } } };
-                return UNTRUSTED_HEADERS_METADATA;
-            },
-        };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
-        await pollLeadInbox(db, now);
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - 7 * HOUR) });
+        connected = false;
+        ntfyUp = false;
 
-        const row = await db.leadIntakeEvent.findUnique({ where: { externalId: "voice:pending-old-1" } });
-        assert.ok(row, "the 30-minute-old pending message must still be processed despite this run's history.list 404ing");
-        assert.equal(row?.source, "WEB_EMAIL_FALLBACK");
+        const first = await poll(db, new Date(T));
+        assert.equal(first.reason, "lead inbox not connected");
+        assert.equal(pushes.length, 0);
 
-        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-        assert.equal(settings?.leadInboxHistoryId, "h0-after-drain-recovery", "the resync fallback must still complete and commit its own H0 cursor");
-        assert.equal(settings?.leadInboxIncrementalState, null, "no leftover incremental state — the abandoned scan was fully superseded by the resync");
+        ntfyUp = true;
+        await poll(db, new Date(T + MINUTE));
+        assert.equal(pushes.filter(p => /scan behind/.test(p.title)).length, 1, "retried once ntfy is back, not marked sent on the failed attempt");
     } finally {
         await db.$disconnect();
     }
 });
 
-test("a gap over 72h resets the cutoff to now WITHOUT attempting a resync scan", { skip }, async () => {
-    const db = await freshDb();
+test("health alerts are never held back, while unaccepted-message notices are batched to one push per 15 minutes with nothing lost", { skip }, async () => {
+    const db = freshDb();
     try {
-        await resetCompanySettings(db);
-        const now = new Date();
-        const veryOld = new Date(now.getTime() - 100 * 60 * 60 * 1000);
-        await db.companySettings.create({ data: { id: "singleton", leadInboxHistoryId: "ancient-cursor", leadInboxCutoffAt: veryOld, leadInboxLastPollStartedAt: veryOld } });
-        messagesListCalls = 0;
-        script = {
-            getProfile: () => ({ historyId: "h0-after-gap" }),
-            historyList: () => ({ throw404: true }),
-        };
-        const { pollLeadInbox } = await import("../src/lib/speed-to-lead/gmail-poll");
-        const result = await pollLeadInbox(db, now);
-        assert.equal(result.resynced, true);
-        assert.equal(messagesListCalls, 0, "an unrecoverable gap must never attempt the resync scan");
-        const settings = await db.companySettings.findUnique({ where: { id: "singleton" } });
-        assert.equal(settings?.leadInboxHistoryId, "h0-after-gap");
-        assert.ok(settings!.leadInboxCutoffAt!.getTime() >= now.getTime() - 1000);
+        await resetState(db);
+        const T = Date.now();
+        await seedSettings(db, { cutoffAt: new Date(T - 7 * 24 * HOUR), watermarkAt: new Date(T - MINUTE) });
+        const first = forgedWebsite("t11-r1", T - 30_000);
+        mailbox = [first];
+
+        await poll(db, new Date(T));
+        assert.equal(pushes.filter(p => /not taken in/.test(p.title)).length, 1);
+
+        const second = forgedWebsite("t11-r2", T + MINUTE);
+        mailbox.push(second);
+        await poll(db, new Date(T + 2 * MINUTE));
+        assert.equal(pushes.filter(p => /not taken in/.test(p.title)).length, 1, "held back inside the 15-minute window");
+        assert.equal((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: second.id } }))?.notifiedAt, null, "still unreported, not dropped");
+
+        // A health alert inside that same window is not held back.
+        await db.companySettings.update({ where: { id: "singleton" }, data: { leadInboxScanWatermarkAt: new Date(T - 7 * HOUR) } });
+        failAllLists = true;
+        await poll(db, new Date(T + 3 * MINUTE));
+        assert.equal(pushes.filter(p => /scan behind/.test(p.title)).length, 1, "the stale-scan alert goes out immediately");
+
+        failAllLists = false;
+        await poll(db, new Date(T + 20 * MINUTE));
+        const notices = pushes.filter(p => /not taken in/.test(p.title));
+        assert.equal(notices.length, 2, "the held-back notice goes out once the window has passed");
+        assert.ok(notices[1].body.includes(second.id) && !notices[1].body.includes(first.id), "it covers exactly what was not yet reported");
+        assert.ok((await db.leadInboxMessage.findUnique({ where: { gmailMessageId: second.id } }))?.notifiedAt);
     } finally {
         await db.$disconnect();
     }

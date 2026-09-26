@@ -12,11 +12,11 @@ export default async function SpeedToLeadSettingsPage() {
         return <div className="p-8">Only the Speed-to-Lead approver can view this page.</div>;
     }
 
-    const [paused, settings, deadAlerts] = await Promise.all([
+    const [paused, settings, deadAlerts, unacceptedCount] = await Promise.all([
         prisma.automationSetting.findUnique({ where: { key: "speedToLeadPaused" } }),
         prisma.companySettings.findUnique({
             where: { id: "singleton" },
-            select: { leadInboxEmail: true, leadInboxLastPollAt: true, leadInboxLastPollOk: true, leadInboxFailureCount: true },
+            select: { leadInboxEmail: true, leadInboxLastPollAt: true, leadInboxLastPollOk: true, leadInboxFailureCount: true, leadInboxScanWatermarkAt: true },
         }),
         prisma.leadAlert.findMany({
             where: { status: "DEAD" },
@@ -24,6 +24,7 @@ export default async function SpeedToLeadSettingsPage() {
             take: 20,
             select: { id: true, leadId: true, channel: true, lastErrorCategory: true, updatedAt: true },
         }),
+        prisma.leadInboxMessage.count({ where: { outcome: { not: "INTAKE" }, notifiedAt: null } }),
     ]);
 
     return (
@@ -36,6 +37,8 @@ export default async function SpeedToLeadSettingsPage() {
                     <div><dt className="inline font-medium">Lead inbox:</dt> <dd className="inline">{settings?.leadInboxEmail ?? "not connected"}</dd></div>
                     <div><dt className="inline font-medium">Last poll:</dt> <dd className="inline">{settings?.leadInboxLastPollAt ? `${settings.leadInboxLastPollAt.toISOString()} (${settings.leadInboxLastPollOk ? "ok" : "failed"})` : "never"}</dd></div>
                     <div><dt className="inline font-medium">Consecutive poll failures:</dt> <dd className="inline">{settings?.leadInboxFailureCount ?? 0}</dd></div>
+                    <div><dt className="inline font-medium">Last complete inbox scan:</dt> <dd className="inline">{settings?.leadInboxScanWatermarkAt?.toISOString() ?? "never"}</dd></div>
+                    <div><dt className="inline font-medium">Messages not taken in as leads, not yet pushed:</dt> <dd className="inline">{unacceptedCount}</dd></div>
                 </dl>
             </div>
 

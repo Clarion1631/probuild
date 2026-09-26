@@ -106,11 +106,12 @@ jobs:
         env:
           SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
-      # The inbox poll's cursor/resync/bounds state machine, against real
-      # Postgres for CompanySettings/LeadIntakeEvent, with a fake Gmail
-      # client (require()-patched, same technique as
-      # tests/takeoff-convert-tax.test.ts) standing in for the Google API —
-      # no real Gmail account is ever touched. Same ordering reason as above.
+      # The inbox poll's windowed scan (watermark, ledger, stale alert),
+      # against real Postgres for CompanySettings/LeadInboxMessage/
+      # LeadIntakeEvent, with a fake Gmail mailbox (require()-patched, same
+      # technique as tests/takeoff-convert-tax.test.ts) standing in for the
+      # Google API — no real Gmail account is ever touched. Same ordering
+      # reason as above.
       - name: Speed-to-Lead v1a inbox poll (fake Gmail) against real Postgres
         run: npx tsx --test tests/speed-to-lead-gmail-poll.test.ts
         env:
@@ -123,7 +124,7 @@ jobs:
       # absent gap file means the only remaining diff is PRISMA_PHANTOM_DIFF.sql.
       #
       # KNOWN RED ON THIS PR (see description): the blind-spots half of this
-      # assertion will report RLS enabled on the 4 new Speed-to-Lead tables
+      # assertion will report RLS enabled on the 5 new Speed-to-Lead tables
       # "but not in production's snapshot" until Justin's R1 step. Every step
       # below this one is consequently skipped on this PR's CI run (no
       # continue-on-error in this job) — a pre-existing structural property

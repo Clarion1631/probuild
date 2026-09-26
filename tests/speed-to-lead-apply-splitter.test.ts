@@ -49,8 +49,8 @@ test("the last statement enables RLS on every new table", () => {
     const sql = readFileSync(MIGRATION_PATH, "utf8");
     const statements = splitStatements(sql);
     const rlsStatements = statements.filter(s => s.includes("ENABLE ROW LEVEL SECURITY"));
-    assert.equal(rlsStatements.length, 4);
-    for (const table of ["LeadIntakeEvent", "LeadAlert", "ContactEndpoint", "SpeedToLeadEvent"]) {
+    assert.equal(rlsStatements.length, 5);
+    for (const table of ["LeadIntakeEvent", "LeadAlert", "ContactEndpoint", "SpeedToLeadEvent", "LeadInboxMessage"]) {
         assert.ok(rlsStatements.some(s => s.includes(`"${table}"`)), `missing RLS statement for ${table}`);
     }
 });
