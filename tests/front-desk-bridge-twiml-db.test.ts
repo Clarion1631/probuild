@@ -153,6 +153,14 @@ test("a valid signature but wrong From -> Reject, and a front-desk-bridge-reject
     const events = await db.speedToLeadEvent.findMany({ where: { kind: "front-desk-bridge-rejected" }, orderBy: { createdAt: "desc" }, take: 5 });
     const match = events.find(e => (e.detail as { reason?: string } | null)?.reason === "number-mismatch");
     assert.ok(match, "a wrong From must be logged as number-mismatch");
+
+    // Codex SHIP-BLOCKING finding #4 (round 2 follow-up): this authenticated
+    // CallSid's reject decision must be persisted here too, not only for the
+    // "no eligible row" case, or a replay after the gate no longer applies
+    // could claim a different caller's transfer (see the mode-off test below).
+    const ledgerRow = await db.frontDeskTransfer.findUnique({ where: { bridgeCallSid: params.CallSid } });
+    assert.equal(ledgerRow?.status, "EXPIRED");
+    assert.equal(ledgerRow?.reason, "number-mismatch");
 });
 
 test("a valid signature but wrong To -> Reject, logged as number-mismatch", { skip }, async () => {
@@ -166,6 +174,68 @@ test("a valid signature but wrong To -> Reject, logged as number-mismatch", { sk
     const events = await db.speedToLeadEvent.findMany({ where: { kind: "front-desk-bridge-rejected" }, orderBy: { createdAt: "desc" }, take: 5 });
     const match = events.find(e => (e.detail as { reason?: string } | null)?.reason === "number-mismatch");
     assert.ok(match, "a wrong To must be logged as number-mismatch");
+});
+
+// ── Codex SHIP-BLOCKING finding #4 (round 2 follow-up) ───────────────────
+// An authenticated request rejected by a route-level gate (mode OFF, not
+// configured) used to leave no ledger row, so a Twilio retry of the exact
+// same signed request, replayed after the gate no longer applies, reached
+// resolveInboundBridgeClaim completely fresh and could claim a different,
+// later caller's PREPARED transfer. These tests reproduce that replay
+// against the real route and prove the persisted decision blocks it.
+
+test("mode OFF -> Reject, and the CallSid's decision is persisted as reason mode-off", { skip }, async () => {
+    const original = process.env.FRONT_DESK_MODE;
+    process.env.FRONT_DESK_MODE = "OFF";
+    try {
+        const url = buildUrl();
+        const params = inboundParams();
+        const sig = sign(url, params);
+        const res = await POST(postRequest(url, params, sig));
+        assert.equal(res.status, 200);
+        assert.match(await readTextBody(res), /<Reject\/>/);
+
+        const ledgerRow = await db.frontDeskTransfer.findUnique({ where: { bridgeCallSid: params.CallSid } });
+        assert.equal(ledgerRow?.status, "EXPIRED");
+        assert.equal(ledgerRow?.reason, "mode-off");
+    } finally {
+        process.env.FRONT_DESK_MODE = original;
+    }
+});
+
+test("a request rejected while mode is OFF, replayed with the identical CallSid after mode flips back on, still Rejects — it must NOT claim a different caller's PREPARED transfer", { skip }, async () => {
+    const url = buildUrl();
+    const params = inboundParams();
+    const sig = sign(url, params);
+
+    const original = process.env.FRONT_DESK_MODE;
+    process.env.FRONT_DESK_MODE = "OFF";
+    try {
+        const firstRes = await POST(postRequest(url, params, sig));
+        assert.equal(firstRes.status, 200);
+        assert.match(await readTextBody(firstRes), /<Reject\/>/);
+    } finally {
+        process.env.FRONT_DESK_MODE = original;
+    }
+
+    // A different, genuine caller prepares a transfer while mode is back on.
+    const victim = await db.frontDeskTransfer.create({
+        data: {
+            id: randomUUID(), conversationId: `bridge-replay-victim-${randomUUID()}`, status: "PREPARED", isTest: true,
+            callerName: "Victim Caller", callbackPhoneE164: "+13605550111", city: "X", project: "Y",
+            preparedAt: new Date(),
+        },
+    });
+
+    // Twilio retries the IDENTICAL signed request (same CallSid, same
+    // signature) now that mode is back on.
+    const replayRes = await POST(postRequest(url, params, sig));
+    assert.equal(replayRes.status, 200);
+    assert.match(await readTextBody(replayRes), /<Reject\/>/, "the replay must still reject, not dial Richard for someone else's transfer");
+
+    const victimAfter = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: victim.id } });
+    assert.equal(victimAfter.status, "PREPARED", "the victim's own transfer must be untouched and still claimable by ITS real inbound call");
+    assert.equal(victimAfter.bridgeCallSid, null);
 });
 
 // ── A genuinely valid, well-formed request with nothing PREPARED -> Reject, logged ──

@@ -116,7 +116,26 @@ export type InboundClaimResult =
     | { kind: "claimed"; transferId: string }
     | { kind: "reject" };
 
-/** §3.2 step "inbound": idempotent retry check, then the SKIP LOCKED claim. */
+/**
+ * §3.2 step "inbound": idempotent retry check, then the SKIP LOCKED claim.
+ *
+ * KNOWN-RISK (Codex round-2 review of PR #559, focused pass): the claim
+ * below binds a CallSid to whichever PREPARED row exists, by timing only —
+ * there is no caller-supplied identifier to bind to instead, because
+ * ElevenLabs' `transfer_to_number` (conference type) supports no custom
+ * headers or params on the call it places to the bridge number (spec
+ * `docs/plans/FRONT-DESK-V1.md` line ~336, "Conference transfers don't
+ * support custom headers, so the bridge gets its caller details from
+ * `prepare_transfer`" — the very reason this table-based handoff exists).
+ * If one caller's transfer attempt is delayed past this row's own
+ * `FRONT_DESK_TRANSFER_PREPARED_TTL_MS` AND a second, unrelated caller
+ * prepares in that gap, the first caller's late inbound webhook can claim
+ * the second caller's PREPARED row, and a successful bridge then marks the
+ * second caller CONNECTED — permanently excluding them from missed-transfer
+ * alerts. Closing this fully needs a correlator this architecture doesn't
+ * have (e.g. a dedicated bridge number per active transfer); accepted as a
+ * known risk pending that product decision, not fixed here.
+ */
 export async function resolveInboundBridgeClaim(db: PrismaClient, callSid: string, now: Date = new Date()): Promise<InboundClaimResult> {
     const existing = await db.frontDeskTransfer.findUnique({ where: { bridgeCallSid: callSid } });
     if (existing) {
@@ -181,7 +200,7 @@ export async function resolveInboundBridgeClaim(db: PrismaClient, callSid: strin
  * unique-violation race on — the other write already recorded the decision,
  * which is all this function exists to do.
  */
-async function persistUnmatchedInboundReject(tx: Prisma.TransactionClient, callSid: string, now: Date): Promise<void> {
+async function persistUnmatchedInboundReject(tx: Prisma.TransactionClient, callSid: string, now: Date, reason: string = "bridge-unmatched"): Promise<void> {
     try {
         await tx.frontDeskTransfer.create({
             data: {
@@ -196,12 +215,34 @@ async function persistUnmatchedInboundReject(tx: Prisma.TransactionClient, callS
                 spanish: false,
                 bridgeCallSid: callSid,
                 resolvedAt: now,
-                reason: "bridge-unmatched",
+                reason,
             },
         });
     } catch (err) {
         if (!isUniqueViolation(err)) throw err;
     }
+}
+
+/**
+ * Codex SHIP-BLOCKING finding #4 (round 2 follow-up, PR #559): the route's
+ * own pre-checks — mode OFF, front desk not configured, To/From mismatch —
+ * reject an authenticated inbound webhook WITHOUT ever calling
+ * `resolveInboundBridgeClaim`, so no decision is persisted for that CallSid.
+ * A Twilio retry of the identical signed request, replayed after whichever
+ * gate rejected it changes (mode flips ON, config gets filled in), then
+ * reaches `resolveInboundBridgeClaim` completely fresh and can claim a
+ * DIFFERENT, later caller's PREPARED row — the exact bug finding #4
+ * originally closed for the "no eligible row" case, reopened for these
+ * three earlier exits. The route calls this directly on each of those
+ * exits so every authenticated CallSid's decision is recorded, keyed by the
+ * same unique `bridgeCallSid` column `resolveInboundBridgeClaim`'s own
+ * `existing` lookup already checks first — a replay finds it there and
+ * never reaches the claim query at all.
+ */
+export async function recordInboundRejectIfAbsent(db: PrismaClient, callSid: string, reason: string, now: Date = new Date()): Promise<void> {
+    const existing = await db.frontDeskTransfer.findUnique({ where: { bridgeCallSid: callSid }, select: { id: true } });
+    if (existing) return;
+    await db.$transaction(tx => persistUnmatchedInboundReject(tx, callSid, now, reason));
 }
 
 /** §3.2 step "screen": the row `t` must be DIALING, and `ParentCallSid` (when present) must equal `bridgeCallSid`. */

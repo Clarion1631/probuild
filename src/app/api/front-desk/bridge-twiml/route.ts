@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import twilio from "twilio";
 import { prisma } from "@/lib/prisma";
 import { frontDeskMode, frontDeskMissLineEnabled, frontDeskBridgeNumberE164, frontDeskNumberE164, frontDeskRichardE164 } from "@/lib/front-desk/constants";
-import { resolveInboundBridgeClaim, isValidScreenRequest, resolveScreenResult, resolveActionStep } from "@/lib/front-desk/transfer";
+import { resolveInboundBridgeClaim, isValidScreenRequest, resolveScreenResult, resolveActionStep, recordInboundRejectIfAbsent } from "@/lib/front-desk/transfer";
 import { rejectTwiml, inboundDialTwiml, screenGatherTwiml, screenAcceptedTwiml, screenRejectedTwiml, actionHangupTwiml, actionMissLineTwiml } from "@/lib/front-desk/twiml";
 import { logLeadEvent } from "@/lib/speed-to-lead/audit";
 
@@ -63,8 +63,16 @@ export async function GET(request: Request): Promise<NextResponse> {
 }
 
 async function handleInbound(params: Record<string, string>): Promise<NextResponse> {
+    // Codex SHIP-BLOCKING finding #4 (round 2 follow-up): CallSid is read
+    // FIRST, before any gate below, so every gate that rejects an
+    // authenticated request can persist that decision — see
+    // recordInboundRejectIfAbsent's own comment for why an unrecorded
+    // reject here lets a later replay steal a different caller's transfer.
+    const callSid = params.CallSid || null;
+
     if (frontDeskMode() === "OFF") {
         await logLeadEvent(prisma, { kind: "front-desk-bridge-rejected", detail: { reason: "mode-off" } });
+        if (callSid) await recordInboundRejectIfAbsent(prisma, callSid, "mode-off");
         return xml(rejectTwiml());
     }
     const bridgeNumber = frontDeskBridgeNumberE164();
@@ -72,13 +80,14 @@ async function handleInbound(params: Record<string, string>): Promise<NextRespon
     const richardNumber = frontDeskRichardE164();
     if (!bridgeNumber || !frontDeskNumber || !richardNumber) {
         await logLeadEvent(prisma, { kind: "front-desk-bridge-rejected", detail: { reason: "not-configured" } });
+        if (callSid) await recordInboundRejectIfAbsent(prisma, callSid, "not-configured");
         return xml(rejectTwiml());
     }
     if (params.To !== bridgeNumber || params.From !== frontDeskNumber) {
         await logLeadEvent(prisma, { kind: "front-desk-bridge-rejected", detail: { reason: "number-mismatch" } });
+        if (callSid) await recordInboundRejectIfAbsent(prisma, callSid, "number-mismatch");
         return xml(rejectTwiml());
     }
-    const callSid = params.CallSid;
     if (!callSid) return xml(rejectTwiml());
 
     const claim = await resolveInboundBridgeClaim(prisma, callSid);
