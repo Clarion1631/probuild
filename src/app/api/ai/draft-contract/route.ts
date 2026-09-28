@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getAnthropicText } from "@/lib/anthropic";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 const ESTIMATE_ITEM_SELECT = {
@@ -141,11 +141,15 @@ Write in a professional but accessible tone appropriate for Clark County, WA hom
 
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4096,
+        model: CLAUDE_SONNET_MODEL,
+        output_config: { effort: "high" },
+        max_tokens: 16000,
         messages: [{ role: "user", content: prompt }],
     });
-    const contractHtml = getAnthropicText(response.content)
+    if (response.stop_reason === "refusal") {
+        return NextResponse.json({ error: "The AI declined this request" }, { status: 422 });
+    }
+    const contractHtml = getAnthropicMessageText(response)
         .replace(/^```html\n?/, "")
         .replace(/\n?```$/, "");
 

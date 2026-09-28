@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { isReceiptUrlRef, resolveReceiptUrl } from "@/lib/receipt-intake/receipt-url";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_OPUS_MODEL, getAnthropicText } from "@/lib/anthropic";
 import { GoogleGenAI } from "@google/genai";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
@@ -262,6 +263,12 @@ export function parseReasonablenessJson(text: string): ReasonablenessVerdict | n
  * this route's `maxDuration` (120s). */
 const AI_CALL_TIMEOUT_MS = 20_000;
 
+/** Tier 2 is the Opus 5.5 call at xhigh effort, which thinks longer than the
+ * 20s the fast calls get. It still fits the route budget: the receipt fetch
+ * (20s) + tier 1/reasonableness (20s) + this (45s) = 85s of the 120s
+ * `maxDuration`. */
+const TIER2_TIMEOUT_MS = 45_000;
+
 /**
  * Races `promise` against a `ms` timeout that resolves — never rejects — to
  * `fallback`. A rejection from `promise` itself (before or after the
@@ -508,7 +515,7 @@ async function tier1Gemini(base64: string, mediaType: string): Promise<ModelRead
  * of its own, so a hang here (the "big guns" escalation, not always
  * attempted) could still run the route past `maxDuration` even though the
  * two Gemini calls in `Promise.all` were already bounded. Never throws or
- * hangs past `AI_CALL_TIMEOUT_MS`; a timeout, network failure, or
+ * hangs past `TIER2_TIMEOUT_MS`; a timeout, network failure, refusal, or
  * unparseable response all resolve to `null` — the caller's existing
  * try/catch around this call site becomes a no-op safety net, not the
  * primary guard. */
@@ -518,16 +525,24 @@ async function tier2Claude(base64: string, mediaType: string, booked: BookedValu
         (async () => {
             const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
             const response = await anthropic.messages.create({
-                model: "claude-opus-5",
-                // Opus 5 thinks adaptively and thinking tokens count against this cap;
-                // 2048 risked a truncated JSON tail on a hard receipt.
-                max_tokens: 8000,
+                model: CLAUDE_OPUS_MODEL,
+                // Opus 5.5 always thinks adaptively and thinking tokens count against
+                // this cap; xhigh effort thinks longer, so it gets the full 16000
+                // (the most a non-streaming call should ask for).
+                max_tokens: 16000,
+                // Judgment work: effort xhigh per the 2026-09-28 Opus 5.5 policy. The
+                // installed SDK's `effort` type predates xhigh, so it is cast here; the
+                // API accepts it on Opus 5.5.
+                output_config: { effort: "xhigh" as unknown as "max" },
                 messages: [{ role: "user", content: claudeContent(base64, mediaType, arbitrationPrompt(booked, tier1)) }],
             });
-            const text = response.content.filter(b => b.type === "text").map(b => (b as { text: string }).text).join("");
+            // A refusal is a normal 200 with no usable content: fail closed to null
+            // (the same "couldn't read it" value a timeout produces).
+            if (response.stop_reason === "refusal") return null;
+            const text = getAnthropicText(response.content);
             return parseModelJson(text);
         })(),
-        AI_CALL_TIMEOUT_MS,
+        TIER2_TIMEOUT_MS,
         null,
         "ai-review tier2",
     );

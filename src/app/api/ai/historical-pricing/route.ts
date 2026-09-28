@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { computeEstimateItemTotals, computeEstimateSubtotal, isEstimateSectionRow } from "@/lib/estimate-item-payload";
 
 /** How many recent estimates feed the pricing history. Bounds the query as the book grows. */
@@ -162,8 +163,9 @@ Format your response in clear sections with headers. Use dollar amounts and perc
         });
 
         const message = await anthropic.messages.create({
-            model: "claude-sonnet-4-6",
-            max_tokens: 2048,
+            model: CLAUDE_SONNET_MODEL,
+            output_config: { effort: "high" },
+            max_tokens: 8000,
             messages: [
                 {
                     role: "user",
@@ -173,9 +175,7 @@ Format your response in clear sections with headers. Use dollar amounts and perc
         });
 
         const analysis =
-            message.content[0].type === "text"
-                ? message.content[0].text
-                : "Unable to generate analysis.";
+            getAnthropicMessageText(message) || "Unable to generate analysis.";
 
         return NextResponse.json({ success: true, analysis });
     } catch (error: any) {

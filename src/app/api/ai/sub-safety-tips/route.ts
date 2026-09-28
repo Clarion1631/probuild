@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { prisma } from "@/lib/prisma";
 
 export async function POST(req: NextRequest) {
@@ -67,12 +68,13 @@ Return ONLY the JSON array, no other text.`;
 
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1024,
+        model: CLAUDE_SONNET_MODEL,
+        output_config: { effort: "low" },
+        max_tokens: 2048,
         messages: [{ role: "user", content: prompt }],
     });
 
-    const text = response.content[0].type === "text" ? response.content[0].text : "";
+    const text = getAnthropicMessageText(response);
 
     // Parse the JSON response, falling back to raw text
     let tips: Array<{ title: string; tip: string }> = [];
