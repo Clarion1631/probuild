@@ -25,7 +25,7 @@ export const maxDuration = 120;
  *
  * Tier 1: Gemini Flash independently re-reads the receipt (fast, cheap).
  * Tier 2 ("the big guns"): ONLY when tier 1 flags a mismatch, can't read
- * the document, or fails — Claude Opus 5 arbitrates: reads the receipt
+ * the document, or fails — Claude Opus 5.5 arbitrates: reads the receipt
  * carefully, weighs the booked values against tier 1's read, and rules on
  * what the true bank charge should be.
  *
@@ -749,7 +749,7 @@ export async function POST(request: Request) {
         }
         if (tier2) {
             models.push({
-                model: "Claude Opus 5",
+                model: "Claude Opus 5.5",
                 tier: "big-guns",
                 read: tier2,
                 verdicts: fieldVerdicts(tier2, booked),
