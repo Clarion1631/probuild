@@ -17692,3 +17692,46 @@ export async function unlockPayrollPeriod(
     revalidatePath("/manager/time-entries");
     return { success: true as const };
 }
+
+// ============ Change order offline approval (not payroll) ============
+// Office-side "Mark approved": the customer approved a change order outside
+// ProBuild (phone, text, email, in person). ADMIN/MANAGER only, same gate as the
+// company countersign. The approver is the logged-in staff member, never input.
+// Never contacts the customer; all logic lives in approveChangeOrderOfflineCore.
+export async function markChangeOrderApprovedOffline(
+    changeOrderId: string,
+    input: { method: string; approvedOn: string; note?: string | null; expectedUpdatedAt: string },
+): Promise<
+    | { success: true; code: string; invoiceCode: string | null; milestoneCount: number; awaitingActuals: boolean; warnings: string[] }
+    | { success: false; error: string }
+> {
+    "use server";
+    const user = await assertChangeOrderPermission();
+    if (!isAdminOrManager(user)) throw new Error("Forbidden");
+
+    const existing = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+    if (!existing) return { success: false, error: "Change order not found" };
+    if (!canAccessProject(user, existing.projectId)) throw new Error("Forbidden");
+
+    const { approveChangeOrderOfflineCore } = await import("./billing-core");
+    const result = await approveChangeOrderOfflineCore(changeOrderId, {
+        method: input?.method,
+        approvedOn: input?.approvedOn,
+        note: input?.note,
+        expectedUpdatedAt: String(input?.expectedUpdatedAt ?? ""),
+        actor: { userId: user.id, name: user.name?.trim() || user.email },
+    });
+    if (!result.ok) return { success: false, error: result.error };
+
+    revalidatePath(`/projects/${result.changeOrder.projectId}/change-orders`);
+    revalidatePath(`/projects/${result.changeOrder.projectId}/change-orders/${changeOrderId}`);
+    revalidatePath(`/projects/${result.changeOrder.projectId}/invoices`);
+    return {
+        success: true,
+        code: result.changeOrder.code,
+        invoiceCode: result.billing?.invoiceCode ?? null,
+        milestoneCount: result.billing?.milestones.length ?? 0,
+        awaitingActuals: result.billing === null,
+        warnings: result.warnings,
+    };
+}
