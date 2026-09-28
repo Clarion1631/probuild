@@ -2,6 +2,10 @@ import { getChangeOrder, getProject } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import ChangeOrderEditor from "./ChangeOrderEditor";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { currentStaffUserOrNull, isAdminOrManager } from "@/lib/permissions";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { dayKeyInTimeZone } from "@/lib/tz-date";
+import { isOfflineApproval, offlineApprovalSummary } from "@/lib/change-order-offline-approval";
 
 export const dynamic = "force-dynamic";
 
@@ -27,6 +31,23 @@ export default async function ChangeOrderPage({
         companySignatureUrl: await resolveDocUrl((co as any).companySignatureUrl),
     }));
 
+    // The editor never decides the role itself: the server says whether the
+    // "Mark approved" button may show. Only Draft/Sent COs with no customer
+    // approval on file can be marked approved.
+    const staff = await currentStaffUserOrNull();
+    const timeZone = await resolveCompanyTimeZone();
+    const hasApprovalOnFile = !!(co.approvedBy || co.approvedAt || co.clientSignatureUrl || (co as any).approvalSource);
+    const canMarkApproved = !!staff
+        && isAdminOrManager(staff)
+        && (co.status === "Draft" || co.status === "Sent")
+        && !hasApprovalOnFile;
+    const offline = {
+        canMarkApproved,
+        todayKey: dayKeyInTimeZone(new Date(), timeZone),
+        staffName: (staff?.name?.trim() || staff?.email || "") as string,
+        summary: isOfflineApproval(co as any) ? offlineApprovalSummary(co as any, timeZone) : null,
+    };
+
     return (
         <div className="flex h-[calc(100%+48px)] -m-6 overflow-hidden">
             <div className="flex-1 bg-slate-50 overflow-hidden flex flex-col">
@@ -39,6 +60,7 @@ export default async function ChangeOrderPage({
                         location: project.location || undefined
                     }}
                     initialData={initialData}
+                    offline={offline}
                 />
             </div>
         </div>
