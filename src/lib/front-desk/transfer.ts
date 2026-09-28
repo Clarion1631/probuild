@@ -13,6 +13,7 @@ import { upsertFrontDeskLeadInTx } from "./intake";
 import { reconcileFrontDeskBookings } from "./booking";
 import {
     FRONT_DESK_TRANSFER_PREPARED_TTL_MS, FRONT_DESK_SWEEP_DIALING_MISS_MS, FRONT_DESK_SWEEP_CONNECTED_STALE_MS,
+    FRONT_DESK_INTAKE_TX_TIMEOUT_MS, FRONT_DESK_INTAKE_TX_MAX_WAIT_MS,
     isWithinTransferHours,
 } from "./constants";
 
@@ -62,6 +63,54 @@ export async function handlePrepareTransferTool(db: PrismaClient, input: Prepare
     const phoneE164 = normalizeCallerPhoneE164(input.callbackPhone);
     if (!phoneE164) return { kind: "no_transfer", reason: "invalid_phone" };
 
+    // SHIP-BLOCKING fix (round 3 review of PR #559): resolveInboundBridgeClaim,
+    // below, still attributes a CallSid to a PREPARED row by timing — a
+    // conference transfer carries no correlating value of its own for the
+    // FIRST inbound leg to the bridge number (verified again here: Twilio's
+    // params on that leg are CallSid/AccountSid/To/From only, and `From` is
+    // always the front-desk number, never the caller's — there is nothing to
+    // match on). So a delayed or racing claim can still mark the WRONG
+    // transfer CONNECTED, leaving the real caller with no missed-transfer
+    // alert and the sweep ignoring a row that already looks resolved. That
+    // failure mode was only fatal because a mis-attributed caller had
+    // NOTHING else on file. This closes it a different way, independent of
+    // post-call delivery or of CONNECTED attribution ever being right: the
+    // instant the caller's own details are confirmed (right here — before we
+    // even know whether Richard can take the call, so this also covers
+    // richard_unavailable/outside_hours/busy/already_transferred, every one
+    // of which still means a real caller was just read back their own
+    // details), durably create/enrich their lead through the same v1a intake
+    // path post-call uses and queue the STANDARD alert immediately.
+    // `conversationId` is upsertFrontDeskLeadInTx's idempotency key
+    // (`fd:<conversationId>`), so a retried prepare_transfer call, or this
+    // same call's later post-call/missed-transfer alert, only enriches this
+    // one row — post-call (source: "post-call") always wins a field
+    // conflict, and outcome/reasons are safely overwritten by whatever
+    // resolves the call for real. A wrong or failed CONNECTED attribution,
+    // or the post-call webhook never arriving at all, can now never lose
+    // this caller: the lead and the standard alert already exist before the
+    // bridge is ever dialed.
+    const earlyLead = await db.$transaction(tx => upsertFrontDeskLeadInTx(tx, {
+        conversationId: input.conversationId,
+        source: "transfer",
+        facts: {
+            callerName: input.callerName.trim(),
+            callbackPhone: phoneE164,
+            email: null,
+            city: input.city.trim(),
+            projectType: input.project.trim(),
+            projectSummary: null,
+            preferredTimes: null,
+            messageForRichard: null,
+            transcriptSummary: null,
+        },
+        outcome: "MESSAGE",
+        reasons: ["front-desk-transfer-pending"],
+        isTest: input.isTest,
+        needLead: true,
+        extraChannels: [],
+    }), { timeout: FRONT_DESK_INTAKE_TX_TIMEOUT_MS, maxWait: FRONT_DESK_INTAKE_TX_MAX_WAIT_MS });
+
     const settings = await db.companySettings.findUnique({ where: { id: "singleton" }, select: { frontDeskTakingTransfers: true } });
     if (!settings?.frontDeskTakingTransfers) return { kind: "no_transfer", reason: "richard_unavailable" };
     if (!isWithinTransferHours(now)) return { kind: "no_transfer", reason: "outside_hours" };
@@ -94,6 +143,7 @@ export async function handlePrepareTransferTool(db: PrismaClient, input: Prepare
                     project: input.project.trim(),
                     spanish: input.spanish,
                     preparedAt: now,
+                    leadId: earlyLead.leadId,
                 },
             });
         });
@@ -117,37 +167,72 @@ export type InboundClaimResult =
     | { kind: "reject" };
 
 /**
+ * Every caller/CallSid combination below shares this one advisory-lock key
+ * space. Keying on the CallSid string (not a fixed constant, unlike
+ * booking.ts's single global lock) means only concurrent requests for the
+ * SAME CallSid ever contend — two different callers' inbound webhooks still
+ * run fully in parallel.
+ */
+function callSidLockKey(callSid: string): string {
+    return `front-desk-bridge-callsid:${callSid}`;
+}
+
+/**
  * §3.2 step "inbound": idempotent retry check, then the SKIP LOCKED claim.
  *
- * KNOWN-RISK (Codex round-2 review of PR #559, focused pass): the claim
- * below binds a CallSid to whichever PREPARED row exists, by timing only —
- * there is no caller-supplied identifier to bind to instead, because
- * ElevenLabs' `transfer_to_number` (conference type) supports no custom
- * headers or params on the call it places to the bridge number (spec
- * `docs/plans/FRONT-DESK-V1.md` line ~336, "Conference transfers don't
- * support custom headers, so the bridge gets its caller details from
- * `prepare_transfer`" — the very reason this table-based handoff exists).
- * If one caller's transfer attempt is delayed past this row's own
+ * KNOWN-RISK, narrowed (Codex round-2 review of PR #559; round-3 follow-up
+ * closed the concurrency half). The claim below still binds a CallSid to
+ * whichever PREPARED row exists, by timing only — re-checked again in round
+ * 3: there is genuinely no caller-supplied identifier to bind to instead,
+ * because ElevenLabs' `transfer_to_number` (conference type) places the call
+ * to the bridge number through the number's own static Voice URL, with no
+ * custom headers or params of its own (spec `docs/plans/FRONT-DESK-V1.md`
+ * line ~336, "Conference transfers don't support custom headers, so the
+ * bridge gets its caller details from `prepare_transfer`" — the very reason
+ * this table-based handoff exists). Twilio's own params on this leg —
+ * CallSid, AccountSid, To, From — carry nothing to correlate on: `To`/`From`
+ * are the same two fixed numbers on every single inbound leg. If one
+ * caller's transfer attempt is delayed past this row's own
  * `FRONT_DESK_TRANSFER_PREPARED_TTL_MS` AND a second, unrelated caller
- * prepares in that gap, the first caller's late inbound webhook can claim
- * the second caller's PREPARED row, and a successful bridge then marks the
- * second caller CONNECTED — permanently excluding them from missed-transfer
- * alerts. Closing this fully needs a correlator this architecture doesn't
- * have (e.g. a dedicated bridge number per active transfer); accepted as a
- * known risk pending that product decision, not fixed here.
+ * prepares in that gap, the first caller's late inbound webhook can still
+ * claim the second caller's PREPARED row, and a successful bridge then marks
+ * the second caller CONNECTED with the first caller's details spoken to
+ * Richard. Closing THAT fully needs a correlator this architecture doesn't
+ * have (e.g. a dedicated bridge number per active transfer); still accepted
+ * as a known risk pending that product decision.
+ *
+ * What round 3 DOES close: this is no longer a way to silently lose a
+ * caller. `handlePrepareTransferTool` now creates that caller's lead and
+ * queues the standard alert the moment their details are confirmed, before
+ * any bridge attempt — so a wrong claim can misfile which transfer gets
+ * marked CONNECTED/MISSED and which reason a sweep or the settings page
+ * shows, but it can never leave a caller with zero record. And separately,
+ * every claim/reject decision for a given CallSid is now serialized behind
+ * `pg_advisory_xact_lock` (below): two concurrent deliveries of what is
+ * "the same" CallSid (a genuine race, not just a sequential retry) used to
+ * be able to run the `existing` lookup and the SKIP LOCKED claim query
+ * fully in parallel — one could see no `existing` row, lose the claim race
+ * via SKIP LOCKED, and land in `persistUnmatchedInboundReject` at the same
+ * moment the other was still mid-claim, racing two independent writers
+ * against the same unique `bridgeCallSid` column with no ordering between
+ * them. Now the whole decision (existing-lookup, claim-or-reject) runs
+ * inside one lock per CallSid, so the second request always sees the
+ * first's committed result before deciding anything of its own.
  */
 export async function resolveInboundBridgeClaim(db: PrismaClient, callSid: string, now: Date = new Date()): Promise<InboundClaimResult> {
-    const existing = await db.frontDeskTransfer.findUnique({ where: { bridgeCallSid: callSid } });
-    if (existing) {
-        // A row can carry this CallSid and NOT be DIALING — the claim below
-        // stamps bridgeCallSid and DIALING in one statement, but the
-        // richard-unavailable-at-claim branch right after can immediately
-        // flip it to EXPIRED. A retried inbound webhook for that CallSid
-        // must not re-emit live dial TwiML for an already-expired row.
-        return existing.status === "DIALING" ? { kind: "retry", transferId: existing.id } : { kind: "reject" };
-    }
-
     return db.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${callSidLockKey(callSid)}))`;
+
+        const existing = await tx.frontDeskTransfer.findUnique({ where: { bridgeCallSid: callSid } });
+        if (existing) {
+            // A row can carry this CallSid and NOT be DIALING — the claim below
+            // stamps bridgeCallSid and DIALING in one statement, but the
+            // richard-unavailable-at-claim branch right after can immediately
+            // flip it to EXPIRED. A retried inbound webhook for that CallSid
+            // must not re-emit live dial TwiML for an already-expired row.
+            return existing.status === "DIALING" ? { kind: "retry" as const, transferId: existing.id } : { kind: "reject" as const };
+        }
+
         const rows = await tx.$queryRaw<{ id: string }[]>`
             UPDATE "FrontDeskTransfer" SET status = 'DIALING', "bridgeCallSid" = ${callSid}, "dialStartedAt" = now(), "updatedAt" = now()
             WHERE id = (
@@ -168,7 +253,9 @@ export async function resolveInboundBridgeClaim(db: PrismaClient, callSid: strin
             // it, silently stealing it from its real inbound webhook (which
             // would then find no eligible row and reject THAT caller). Every
             // authenticated CallSid's decision must be persisted so a retry
-            // is idempotent — see persistUnmatchedInboundReject.
+            // is idempotent — see persistUnmatchedInboundReject. The
+            // CallSid-keyed advisory lock above means nothing else can be
+            // deciding this SAME CallSid's fate concurrently any more.
             await persistUnmatchedInboundReject(tx, callSid, now);
             return { kind: "reject" as const };
         }
@@ -184,7 +271,7 @@ export async function resolveInboundBridgeClaim(db: PrismaClient, callSid: strin
             return { kind: "reject" as const };
         }
         return { kind: "claimed" as const, transferId: claimedId };
-    });
+    }, { timeout: FRONT_DESK_INTAKE_TX_TIMEOUT_MS, maxWait: FRONT_DESK_INTAKE_TX_MAX_WAIT_MS });
 }
 
 /**
@@ -198,7 +285,11 @@ export async function resolveInboundBridgeClaim(db: PrismaClient, callSid: strin
  * queries PREPARED/DIALING for "active transfer"). A concurrent duplicate
  * write for the SAME CallSid (two overlapping retries) is fine to lose the
  * unique-violation race on — the other write already recorded the decision,
- * which is all this function exists to do.
+ * which is all this function exists to do. Both callers now hold the
+ * CallSid-keyed advisory lock (`callSidLockKey`) for their whole transaction
+ * before ever reaching here, so that race should no longer be reachable in
+ * practice — the catch below stays as defense in depth, and now VERIFIES
+ * the assumption instead of trusting the error code alone (round-3 fix).
  */
 async function persistUnmatchedInboundReject(tx: Prisma.TransactionClient, callSid: string, now: Date, reason: string = "bridge-unmatched"): Promise<void> {
     try {
@@ -220,6 +311,16 @@ async function persistUnmatchedInboundReject(tx: Prisma.TransactionClient, callS
         });
     } catch (err) {
         if (!isUniqueViolation(err)) throw err;
+        // Round-3 fix: a bare P2002 is not, by itself, proof that THIS
+        // CallSid's decision was recorded — it only proves SOME unique
+        // constraint on this row conflicted (`bridgeCallSid`, the intended
+        // case, but in principle also the synthetic `conversationId`).
+        // Re-read by the unique column this write actually cares about and
+        // confirm a decision for this exact CallSid now exists; if it
+        // doesn't, this was not the benign race this catch exists for, so
+        // surface the original error rather than silently swallowing it.
+        const winner = await tx.frontDeskTransfer.findUnique({ where: { bridgeCallSid: callSid }, select: { id: true } });
+        if (!winner) throw err;
     }
 }
 
@@ -238,11 +339,23 @@ async function persistUnmatchedInboundReject(tx: Prisma.TransactionClient, callS
  * same unique `bridgeCallSid` column `resolveInboundBridgeClaim`'s own
  * `existing` lookup already checks first — a replay finds it there and
  * never reaches the claim query at all.
+ *
+ * Round-3 fix: this used to check `existing` and write its own reject
+ * OUTSIDE any lock, so it could race `resolveInboundBridgeClaim` itself for
+ * the identical CallSid — e.g. a route-level gate (mode OFF) rejecting one
+ * delivery of a webhook at the same moment a concurrent delivery of "the
+ * same" request reached the claim path fresh. It now takes the SAME
+ * CallSid-keyed advisory lock `resolveInboundBridgeClaim` does, so whichever
+ * of the two runs first fully commits its decision before the other is even
+ * allowed to check `existing`.
  */
 export async function recordInboundRejectIfAbsent(db: PrismaClient, callSid: string, reason: string, now: Date = new Date()): Promise<void> {
-    const existing = await db.frontDeskTransfer.findUnique({ where: { bridgeCallSid: callSid }, select: { id: true } });
-    if (existing) return;
-    await db.$transaction(tx => persistUnmatchedInboundReject(tx, callSid, now, reason));
+    await db.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${callSidLockKey(callSid)}))`;
+        const existing = await tx.frontDeskTransfer.findUnique({ where: { bridgeCallSid: callSid }, select: { id: true } });
+        if (existing) return;
+        await persistUnmatchedInboundReject(tx, callSid, now, reason);
+    }, { timeout: FRONT_DESK_INTAKE_TX_TIMEOUT_MS, maxWait: FRONT_DESK_INTAKE_TX_MAX_WAIT_MS });
 }
 
 /** §3.2 step "screen": the row `t` must be DIALING, and `ParentCallSid` (when present) must equal `bridgeCallSid`. */

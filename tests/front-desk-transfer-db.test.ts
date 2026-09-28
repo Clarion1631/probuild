@@ -45,7 +45,20 @@ beforeEach(async () => {
 after(async () => {
     if (skip) return;
     await db.frontDeskTransfer.deleteMany({ where: { conversationId: { in: createdConversationIds } } }).catch(() => undefined);
-    for (const leadId of createdLeadIds) {
+    // Round-3 fix: handlePrepareTransferTool now creates/enriches a Lead the
+    // instant a caller's readback details are confirmed (the ship-blocking
+    // durable-safety-net fix), for every conversationId this file hands out
+    // through conv() — including ones that never got a FrontDeskTransfer row
+    // at all (busy, already_transferred, richard_unavailable, outside_hours).
+    // Sweep every conversationId's LeadIntakeEvent (`fd:<conversationId>`)
+    // too, on top of the leadIds individual tests already track, so none of
+    // these leak into a later test run's NTFY/CHAT alert counts.
+    for (const conversationId of createdConversationIds) {
+        const event = await db.leadIntakeEvent.findUnique({ where: { externalId: `fd:${conversationId}` }, select: { leadId: true } }).catch(() => null);
+        if (event?.leadId) createdLeadIds.push(event.leadId);
+        await db.leadIntakeEvent.deleteMany({ where: { externalId: `fd:${conversationId}` } }).catch(() => undefined);
+    }
+    for (const leadId of new Set(createdLeadIds)) {
         await db.leadAlert.deleteMany({ where: { leadId } }).catch(() => undefined);
         await db.leadIntakeEvent.updateMany({ where: { leadId }, data: { leadId: null } }).catch(() => undefined);
         const lead = await db.lead.findUnique({ where: { id: leadId }, select: { clientId: true } }).catch(() => null);
@@ -129,6 +142,81 @@ test("preparing twice for the SAME conversation -> already_transferred", { skip 
     const second = await handlePrepareTransferTool(db, prepareInput(c), WITHIN_HOURS);
     assert.equal(second.kind, "no_transfer");
     assert.equal((second as { reason: string }).reason, "already_transferred");
+});
+
+// ── SHIP-BLOCKING fix (round 3, PR #559): prepare-transfer's own durable
+// safety net. handlePrepareTransferTool now creates/enriches the caller's
+// lead and queues the standard alert the INSTANT their details are
+// confirmed — before Richard's availability, transfer hours, or the busy/
+// already-transferred check are even reached, and independent of whatever
+// the bridge and the timing-based CallSid claim (resolveInboundBridgeClaim)
+// go on to do with the transfer itself. ──────────────────────────────────
+
+async function leadIdForConversation(conversationId: string): Promise<string> {
+    const event = await db.leadIntakeEvent.findUniqueOrThrow({ where: { externalId: `fd:${conversationId}` } });
+    assert.ok(event.leadId, `expected a lead to already exist for ${conversationId}`);
+    return event.leadId!;
+}
+
+async function standardAlertCount(leadId: string): Promise<number> {
+    const alerts = await db.leadAlert.findMany({ where: { leadId } });
+    return alerts.filter(a => a.channel === "NTFY").length;
+}
+
+test("prepare_transfer creates the lead + standard alert immediately, even when the transfer itself never proceeds (busy, already_transferred, richard_unavailable, outside_hours)", { skip }, async () => {
+    const busyHolder = conv();
+    const holderReady = await handlePrepareTransferTool(db, prepareInput(busyHolder), WITHIN_HOURS);
+    assert.equal(holderReady.kind, "transfer_ready");
+
+    const busyCaller = conv();
+    const busyResult = await handlePrepareTransferTool(db, prepareInput(busyCaller), WITHIN_HOURS);
+    assert.equal((busyResult as { reason: string }).reason, "busy");
+    assert.equal(await standardAlertCount(await leadIdForConversation(busyCaller)), 1, "a caller Richard was too busy for still gets a lead + standard alert");
+
+    const alreadyCaller = conv();
+    const first = await handlePrepareTransferTool(db, prepareInput(alreadyCaller), WITHIN_HOURS);
+    assert.equal(first.kind, "transfer_ready");
+    const second = await handlePrepareTransferTool(db, prepareInput(alreadyCaller), WITHIN_HOURS);
+    assert.equal((second as { reason: string }).reason, "already_transferred");
+    assert.equal(await standardAlertCount(await leadIdForConversation(alreadyCaller)), 1, "re-preparing the SAME conversation enriches ONE lead, never creates a second");
+
+    await db.companySettings.update({ where: { id: "singleton" }, data: { frontDeskTakingTransfers: false } });
+    const unavailableCaller = conv();
+    const unavailableResult = await handlePrepareTransferTool(db, prepareInput(unavailableCaller), WITHIN_HOURS);
+    assert.equal((unavailableResult as { reason: string }).reason, "richard_unavailable");
+    assert.equal(await standardAlertCount(await leadIdForConversation(unavailableCaller)), 1, "richard_unavailable must not lose the caller either");
+    await db.companySettings.update({ where: { id: "singleton" }, data: { frontDeskTakingTransfers: true } });
+
+    const outsideCaller = conv();
+    const outsideResult = await handlePrepareTransferTool(db, prepareInput(outsideCaller), OUTSIDE_HOURS);
+    assert.equal((outsideResult as { reason: string }).reason, "outside_hours");
+    assert.equal(await standardAlertCount(await leadIdForConversation(outsideCaller)), 1, "outside_hours must not lose the caller either");
+});
+
+test("SHIP-BLOCKING fix: whatever the bridge's own attribution outcome — including a WRONG CONNECTED, which fires no missed-transfer alert of its own — prepare_transfer's early lead means exactly one lead and exactly one standard alert exist for the caller", { skip }, async () => {
+    for (const dialBridged of ["true", "false"]) {
+        const c = conv();
+        const prepared = await handlePrepareTransferTool(db, prepareInput(c), WITHIN_HOURS);
+        assert.equal(prepared.kind, "transfer_ready");
+        const leadId = await leadIdForConversation(c);
+        assert.equal(await db.lead.count({ where: { id: leadId } }), 1);
+
+        // Simulate the bridge's claim resolving this row — right or wrong
+        // attribution makes no difference to what's under test here: the
+        // lead already existed before this ran at all.
+        const bridgeCallSid = `CA-${randomUUID()}`;
+        const row = await db.frontDeskTransfer.update({
+            where: { conversationId: c },
+            data: { status: "DIALING", bridgeCallSid, dialStartedAt: WITHIN_HOURS, screenAcceptedAt: WITHIN_HOURS },
+        });
+        const outcome = await resolveActionStep(db, { transferId: row.id, bridgeCallSid, dialCallStatus: "completed", dialBridged });
+        assert.equal(outcome, dialBridged === "true" ? "connected" : "missed");
+
+        assert.equal(await db.lead.count({ where: { id: leadId } }), 1, "still exactly one lead");
+        const alerts = await db.leadAlert.findMany({ where: { leadId } });
+        assert.equal(alerts.filter(a => a.channel === "NTFY").length, 1, "exactly one standard alert — queued once at prepare-transfer time, never duplicated by the later transition");
+        assert.equal(alerts.filter(a => a.channel === "NTFY_URGENT").length, dialBridged === "true" ? 0 : 1, "the urgent miss alert fires only for an actual miss, on top of the standard one — never instead of it");
+    }
 });
 
 // ── Test 34: action transitions ─────────────────────────────────────────
@@ -388,5 +476,46 @@ test("resolveInboundBridgeClaim: claiming while Richard's switch is off -> rejec
     } finally {
         await cleanupBridgeCallSid(callSid);
         await db.companySettings.update({ where: { id: "singleton" }, data: { frontDeskTakingTransfers: true } });
+    }
+});
+
+// ── KNOWN-RISK fix (round 3, PR #559): claim/reject decisions for a given
+// CallSid are now serialized behind a CallSid-keyed pg_advisory_xact_lock,
+// so genuinely concurrent deliveries of "the same" CallSid (not just a
+// sequential retry) can never race the existing-row lookup against the SKIP
+// LOCKED claim query. These run real overlapping transactions against real
+// Postgres via Promise.all, the same technique acceptance test 30 above
+// already uses for handlePrepareTransferTool. ───────────────────────────
+
+test("resolveInboundBridgeClaim: N fully concurrent calls for the SAME CallSid with no PREPARED row waiting -> every one rejects, exactly one persisted decision row (never a race on the unique bridgeCallSid column)", { skip }, async () => {
+    const callSid = `CA-concurrent-reject-${randomUUID()}`;
+    try {
+        const results = await Promise.all(Array.from({ length: 5 }, () => resolveInboundBridgeClaim(db, callSid, WITHIN_HOURS)));
+        assert.ok(results.every(r => r.kind === "reject"), "every concurrent delivery of the same CallSid must reject the same way");
+
+        const rows = await db.frontDeskTransfer.findMany({ where: { bridgeCallSid: callSid } });
+        assert.equal(rows.length, 1, "the advisory lock must serialize these into exactly one persisted decision, never a duplicate-write race");
+    } finally {
+        await cleanupBridgeCallSid(callSid);
+    }
+});
+
+test("resolveInboundBridgeClaim: N fully concurrent calls for the SAME CallSid against ONE PREPARED row -> exactly one claims it, every other one retries with the SAME transferId", { skip }, async () => {
+    const c = conv();
+    const prepared = await handlePrepareTransferTool(db, prepareInput(c), WITHIN_HOURS);
+    assert.equal(prepared.kind, "transfer_ready");
+    const callSid = `CA-concurrent-claim-${randomUUID()}`;
+    try {
+        const results = await Promise.all(Array.from({ length: 5 }, () => resolveInboundBridgeClaim(db, callSid, WITHIN_HOURS)));
+        const claimed = results.filter((r): r is { kind: "claimed"; transferId: string } => r.kind === "claimed");
+        const retried = results.filter((r): r is { kind: "retry"; transferId: string } => r.kind === "retry");
+        assert.equal(claimed.length, 1, "exactly one of these truly-concurrent deliveries claims the transfer");
+        assert.equal(retried.length, 4);
+        assert.ok(retried.every(r => r.transferId === claimed[0].transferId), "every retry must point at the SAME transfer the claim landed on, never a different one");
+
+        const rows = await db.frontDeskTransfer.findMany({ where: { bridgeCallSid: callSid } });
+        assert.equal(rows.length, 1, "one CallSid, one row — never a duplicate write racing the claim");
+    } finally {
+        await cleanupBridgeCallSid(callSid);
     }
 });

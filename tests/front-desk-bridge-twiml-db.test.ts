@@ -184,6 +184,68 @@ test("a valid signature but wrong To -> Reject, logged as number-mismatch", { sk
 // later caller's PREPARED transfer. These tests reproduce that replay
 // against the real route and prove the persisted decision blocks it.
 
+test("front desk not configured (bridge/front-desk/Richard number unset) -> Reject, and the CallSid's decision is persisted as reason not-configured", { skip }, async () => {
+    const original = process.env.FRONT_DESK_RICHARD_E164;
+    delete process.env.FRONT_DESK_RICHARD_E164;
+    try {
+        const url = buildUrl();
+        const params = inboundParams();
+        const sig = sign(url, params);
+        const res = await POST(postRequest(url, params, sig));
+        assert.equal(res.status, 200);
+        assert.match(await readTextBody(res), /<Reject\/>/);
+
+        const ledgerRow = await db.frontDeskTransfer.findUnique({ where: { bridgeCallSid: params.CallSid } });
+        assert.equal(ledgerRow?.status, "EXPIRED");
+        assert.equal(ledgerRow?.reason, "not-configured");
+    } finally {
+        process.env.FRONT_DESK_RICHARD_E164 = original;
+    }
+});
+
+test("a request rejected for number-mismatch because FRONT_DESK_NUMBER_E164 was itself misconfigured, replayed with the identical CallSid after the env var is corrected, still Rejects — it must NOT claim a different caller's PREPARED transfer", { skip }, async () => {
+    const url = buildUrl();
+    const params = inboundParams(); // From is the caller's real, correct front-desk number throughout.
+    const sig = sign(url, params);
+
+    const originalNumber = process.env.FRONT_DESK_NUMBER_E164;
+    process.env.FRONT_DESK_NUMBER_E164 = "+15555550188"; // misconfigured: doesn't match the real From above
+    try {
+        const firstRes = await POST(postRequest(url, params, sig));
+        assert.equal(firstRes.status, 200);
+        assert.match(await readTextBody(firstRes), /<Reject\/>/);
+    } finally {
+        process.env.FRONT_DESK_NUMBER_E164 = originalNumber;
+    }
+
+    const ledgerRow = await db.frontDeskTransfer.findUnique({ where: { bridgeCallSid: params.CallSid } });
+    assert.equal(ledgerRow?.status, "EXPIRED");
+    assert.equal(ledgerRow?.reason, "number-mismatch");
+
+    // A different, genuine caller prepares a transfer once the env var is corrected.
+    const victim = await db.frontDeskTransfer.create({
+        data: {
+            id: randomUUID(), conversationId: `bridge-mismatch-replay-victim-${randomUUID()}`, status: "PREPARED", isTest: true,
+            callerName: "Victim Caller", callbackPhoneE164: "+13605550112", city: "X", project: "Y",
+            preparedAt: new Date(),
+        },
+    });
+
+    try {
+        // Twilio retries the IDENTICAL signed request (same CallSid, same
+        // signature) now that the misconfiguration is fixed.
+        const replayRes = await POST(postRequest(url, params, sig));
+        assert.equal(replayRes.status, 200);
+        assert.match(await readTextBody(replayRes), /<Reject\/>/, "the replay must still reject on the persisted decision, not dial Richard for someone else's transfer");
+
+        const victimAfter = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: victim.id } });
+        assert.equal(victimAfter.status, "PREPARED", "the victim's own transfer must be untouched and still claimable by ITS real inbound call");
+        assert.equal(victimAfter.bridgeCallSid, null);
+    } finally {
+        await db.frontDeskTransfer.deleteMany({ where: { id: victim.id } }).catch(() => undefined);
+    }
+});
+
 test("mode OFF -> Reject, and the CallSid's decision is persisted as reason mode-off", { skip }, async () => {
     const original = process.env.FRONT_DESK_MODE;
     process.env.FRONT_DESK_MODE = "OFF";
