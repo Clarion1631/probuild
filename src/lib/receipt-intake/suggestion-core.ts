@@ -29,7 +29,7 @@ export type SuggestionDependencies = {
     /** The CURRENT open-job list — never the page's stale snapshot. */
     loadOpenJobs: () => Promise<ReadonlyArray<SuggestionJobOption>>;
     /** setReceiptIntakeJob (src/lib/actions.ts), or a test double. */
-    setJob: (id: string, projectId: string, expectedState: string, expectedUpdatedAt: string) => Promise<unknown>;
+    setJob: (id: string, projectId: string, expectedState: string, expectedUpdatedAt: string) => Promise<{ ok: true } | { ok: false; message: string }>;
 };
 
 export async function decideReceiptIntakeJobFromSuggestion(
@@ -38,7 +38,7 @@ export async function decideReceiptIntakeJobFromSuggestion(
     expectedState: string,
     expectedUpdatedAt: string,
     deps: SuggestionDependencies,
-): Promise<unknown> {
+): Promise<{ ok: true } | { ok: false; message: string }> {
     const row = await deps.loadIntake(id);
     if (!row?.sourceFolder) {
         throw new Error("This receipt no longer has a folder to suggest from. Refresh and use Set job.");
@@ -52,5 +52,13 @@ export async function decideReceiptIntakeJobFromSuggestion(
     if (!stillACandidate) {
         throw new Error("That job is no longer open or no longer matches this receipt's folder. Refresh and use Set job.");
     }
-    return deps.setJob(id, projectId, expectedState, expectedUpdatedAt);
+    const result = await deps.setJob(id, projectId, expectedState, expectedUpdatedAt);
+    // setReceiptIntakeJob returns `{ ok: false, message }` for a refusal it
+    // anticipated (stale expectedState/expectedUpdatedAt, a vanished job, a bad
+    // cost code) instead of throwing. The suggestion buttons in
+    // receipt-row-actions.tsx call through the plain useAction wrapper, which
+    // treats "did not throw" as success -- so that refusal has to be converted
+    // into a thrown error here, or a real failure would toast "Job set.".
+    if (!result.ok) throw new Error(result.message);
+    return result;
 }

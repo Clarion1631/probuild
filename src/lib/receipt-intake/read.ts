@@ -259,6 +259,176 @@ export function parseReadJson(text: string, projectPhases: ProjectPhase[]): Read
 }
 
 /**
+ * What `nonReceiptSetJobOverride` decided:
+ *  - "not-applicable": the row wasn't NON_RECEIPT, so this path touches nothing
+ *    — a job set on a NEEDS_JOB/NEEDS_REVIEW row (already docType receipt/
+ *    check/multi) must never be re-stamped by it.
+ *  - "apply": the docType/readJson patch to persist.
+ *  - "refuse": the row WAS NON_RECEIPT, but its readJson is missing or no
+ *    longer parses, so there is nothing to audit the override against. The
+ *    caller must refuse the whole action rather than flip docType with no
+ *    record of why — an override with no evidence behind it is exactly the
+ *    kind of silent reclassification this mechanism exists to prevent.
+ */
+export type NonReceiptOverrideResult =
+    | { kind: "not-applicable" }
+    | { kind: "apply"; docType: string; readJson: string }
+    | { kind: "refuse" };
+
+/**
+ * The Set-job override for a NON_RECEIPT row: a human picking a job on it means
+ * "this IS a receipt, book it here" — not "trust the AI's non_receipt read
+ * after all".
+ *
+ * `docType` (the row's own column) is what book.ts's booking gate reads, so it
+ * is overridden to "receipt" whenever this applies — that alone is enough for
+ * the row to book. `readJson` is patched alongside it, with an audit marker
+ * recording who overrode it and when, because recoverStrongKey (worker.ts)
+ * re-derives a dedup key from readJson and refuses to heal one when its
+ * embedded doc_type disagrees with the row's own column — and because a fresh
+ * re-read (carryForwardDocTypeOverride) needs this marker to keep the override
+ * from being silently undone the next time the AI reads the same document.
+ */
+export function nonReceiptSetJobOverride(
+    currentState: string,
+    readJson: string | null,
+    by: string,
+    at: Date,
+): NonReceiptOverrideResult {
+    if (currentState !== "NON_RECEIPT") return { kind: "not-applicable" };
+    if (!readJson) return { kind: "refuse" };
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(readJson);
+    } catch {
+        return { kind: "refuse" };
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "refuse" };
+    const docType = "receipt";
+    return {
+        kind: "apply",
+        docType,
+        readJson: JSON.stringify({
+            ...(parsed as Record<string, unknown>),
+            doc_type: docType,
+            doc_type_override: { from: "non_receipt", by, at: at.toISOString() },
+        }),
+    };
+}
+
+/** What a trusted `doc_type_override` marker looks like — see `isDocTypeOverrideMarker`. */
+interface DocTypeOverrideMarker {
+    from: "non_receipt";
+    by: string;
+    at: string;
+}
+
+/**
+ * Only `nonReceiptSetJobOverride` may MINT this marker, so only a value shaped
+ * EXACTLY the way it writes one is ever trusted back. Anything else — `true`,
+ * a string, `{}`, a `by` that isn't a real (non-empty) id, an `at` that isn't a
+ * genuine ISO timestamp — is treated as no marker at all, never as a
+ * degraded-but-real one. This is what makes stripDocTypeOverride's job
+ * possible: even if a stray `doc_type_override` key ever reached a row's
+ * readJson some other way (a bug, a model echoing the field name back), it
+ * cannot be READ as authorization for anything unless it happens to reproduce
+ * this exact shape.
+ */
+function isDocTypeOverrideMarker(value: unknown): value is DocTypeOverrideMarker {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const v = value as Record<string, unknown>;
+    if (v.from !== "non_receipt") return false;
+    if (typeof v.by !== "string" || v.by.trim() === "") return false;
+    if (typeof v.at !== "string") return false;
+    const parsedAt = new Date(v.at);
+    return !Number.isNaN(parsedAt.getTime()) && parsedAt.toISOString() === v.at;
+}
+
+/**
+ * The audit marker a prior `nonReceiptSetJobOverride` left in a row's readJson,
+ * or `null` when there isn't a validly-shaped one (never overridden, that JSON
+ * no longer parses, or the key is present but malformed — see
+ * `isDocTypeOverrideMarker`). Malformed is treated exactly like absent: there
+ * is nothing here worth carrying forward or trusting.
+ */
+function docTypeOverrideMarker(priorReadJson: string | null): DocTypeOverrideMarker | null {
+    if (!priorReadJson) return null;
+    try {
+        const parsed: unknown = JSON.parse(priorReadJson);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "doc_type_override" in parsed) {
+            const candidate = (parsed as Record<string, unknown>).doc_type_override;
+            return isDocTypeOverrideMarker(candidate) ? candidate : null;
+        }
+    } catch { /* not parseable: nothing to carry forward */ }
+    return null;
+}
+
+/**
+ * ONLY the server may create a `doc_type_override` marker (nonReceiptSetJobOverride,
+ * a human action). This strips any `doc_type_override` key out of a FRESH
+ * model read's raw JSON, unconditionally, before anything else can touch it —
+ * called on every AI read in processReceived (worker.ts), whether or not this
+ * row has a prior override to carry forward. Without it, a model response that
+ * happened to echo that field name back (coincidence, or a document engineered
+ * to) would sail through untouched on a row with no prior marker, and a LATER
+ * read would then find it and treat a forgery as a real human decision.
+ * Left unchanged when raw doesn't parse, or isn't a plain object (nothing
+ * shaped like a marker can live in an array or scalar top level anyway).
+ */
+export function stripDocTypeOverride(raw: string): string {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return raw;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
+    if (!("doc_type_override" in parsed)) return raw;
+    const rest: Record<string, unknown> = { ...(parsed as Record<string, unknown>) };
+    delete rest.doc_type_override;
+    return JSON.stringify(rest);
+}
+
+/**
+ * A fresh read must never silently undo a human's earlier Set-job override.
+ * "This IS a receipt" was a decision about the DOCUMENT, not about what any
+ * one Gemini call says on any one pass — so when the row's PRIOR readJson
+ * carries a validly-shaped override marker, this read's own docType is
+ * replaced with "receipt" and the marker is carried forward into the NEW
+ * readJson, no matter what this read says. Everything else the fresh read
+ * found (vendor, total, date, memo) still wins; only the classification is
+ * pinned. Returns `read` unchanged when there is no prior override to protect
+ * — callers are expected to have already run `stripDocTypeOverride` on
+ * `read.raw` so that "no prior override" case can't leak a forged one through.
+ *
+ * `read.raw` is only guaranteed to be JSON that PARSED — parseReadJson's own
+ * gate (`typeof json !== "object"`) does not exclude arrays, so a model
+ * response could in principle be array-shaped rather than an object. Rewriting
+ * that into a synthetic `{...}` would silently discard whatever the model
+ * actually returned, so when raw isn't a plain object this only pins the
+ * STRUCTURED `docType` field and leaves `raw` untouched — the marker simply
+ * does not survive into a raw shape it cannot be embedded in.
+ */
+export function carryForwardDocTypeOverride(read: ReadResult, priorReadJson: string | null): ReadResult {
+    const marker = docTypeOverrideMarker(priorReadJson);
+    if (!marker) return read;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(read.raw);
+    } catch {
+        parsed = null;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { ...read, docType: "receipt" };
+    }
+    return {
+        ...read,
+        docType: "receipt",
+        raw: JSON.stringify({ ...(parsed as Record<string, unknown>), doc_type: "receipt", doc_type_override: marker }),
+    };
+}
+
+/**
  * Read one document. `fileBytes` is the raw file; text/plain goes in as a text
  * part the way v1 does (:1093), everything else as inline_data.
  */

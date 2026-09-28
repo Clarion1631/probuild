@@ -254,11 +254,11 @@ test("receipt-row-actions.tsx: Set job calls setReceiptIntakeJob directly, sugge
     );
     assert.match(
         source,
-        /onClick=\{\(\) => run\(\(\) => setReceiptIntakeJob\(intakeId, projectId, expectedState, expectedUpdatedAt\)\)\}/,
+        /await setReceiptIntakeJob\(intakeId, projectId, expectedState, expectedUpdatedAt\)/,
         "the plain Set job button must keep calling setReceiptIntakeJob directly, unchanged",
     );
     const suggestionCalls = source.match(
-        /onClick=\{\(\) => run\(\(\) => setReceiptIntakeJobFromSuggestion\(intakeId, job\.id, expectedState, expectedUpdatedAt\)\)\}/g,
+        /onClick=\{\(\) => runSuggestion\(\(\) => setReceiptIntakeJobFromSuggestion\(intakeId, job\.id, expectedState, expectedUpdatedAt\)\)\}/g,
     );
     assert.ok(suggestionCalls, "suggestion buttons must call setReceiptIntakeJobFromSuggestion");
     // Both the "exact" and "prefix" suggestion button groups must use the wrapper.
