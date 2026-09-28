@@ -1,14 +1,22 @@
 "use client";
 
 import { useState } from "react";
-import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient, previewCostPlusChangeOrder, billCostPlusChangeOrder } from "@/lib/actions";
+import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient, previewCostPlusChangeOrder, billCostPlusChangeOrder, markChangeOrderApprovedOffline } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
 import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
+import { OFFLINE_APPROVAL_METHODS, OFFLINE_APPROVAL_NOTE_MAX } from "@/lib/change-order-offline-approval";
 
-export default function ChangeOrderEditor({ context, initialData }: { context: any, initialData: any }) {
+type OfflineApprovalProps = {
+    canMarkApproved: boolean;
+    todayKey: string;
+    staffName: string;
+    summary: string | null;
+};
+
+export default function ChangeOrderEditor({ context, initialData, offline }: { context: any, initialData: any, offline: OfflineApprovalProps }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialData.title);
     const [description, setDescription] = useState(initialData.description || "");
@@ -26,21 +34,34 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [isSending, setIsSending] = useState(false);
     const [isBilling, setIsBilling] = useState(false);
     const [billingPreview, setBillingPreview] = useState<any | null>(null);
+    const [showOfflineModal, setShowOfflineModal] = useState(false);
+    const [offlineMethod, setOfflineMethod] = useState("");
+    const [offlineDate, setOfflineDate] = useState(offline.todayKey);
+    const [offlineNote, setOfflineNote] = useState("");
+    const [offlineError, setOfflineError] = useState<{ method?: string; date?: string } | null>(null);
+    const [isMarkingApproved, setIsMarkingApproved] = useState(false);
+    // Pin for the server's stale check; refreshed from every save so the button
+    // approves exactly what the person just saw and saved.
+    const [latestUpdatedAt, setLatestUpdatedAt] = useState<string>(new Date(initialData.updatedAt).toISOString());
 
     // A signed CO is a contract: title, description, and items are the approved
     // scope and remain immutable after approval. The server enforces the same
     // rule; these disabled controls make that invariant visible in the editor.
     const isApproved = status === "Approved";
-    const hasSignatureAudit = !!(
-        initialData.approvedBy
-        || initialData.approvedAt
-        || initialData.clientSignatureUrl
-        || initialData.companySignedBy
-        || initialData.companySignedAt
-        || initialData.companySignatureUrl
-    );
+    const hasSignatureAudit =
+        initialData.approvedBy != null
+        || initialData.approvedAt != null
+        || initialData.clientSignatureUrl != null
+        || initialData.approvalSource != null
+        || initialData.companySignedBy != null
+        || initialData.companySignedAt != null
+        || initialData.companySignatureUrl != null;
     const isScopeLocked = isApproved || hasSignatureAudit;
     const canCountersign = status === "Sent" || status === "Approved";
+    const isOfflineApproved = initialData.approvalSource === "OFFLINE";
+    // Only a CUSTOMER approval on file blocks this (a company countersignature does not).
+    const hasCustomerApproval = initialData.approvedBy != null || initialData.approvedAt != null || initialData.clientSignatureUrl != null || initialData.approvalSource != null;
+    const showMarkApproved = offline.canMarkApproved && (status === "Draft" || status === "Sent") && !hasCustomerApproval;
 
     // Same integer-cents math as the server's item sync and billChangeOrderCore,
     // so the Revised Amount shown here is exactly what billing will charge.
@@ -117,6 +138,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                 })),
             });
             setStatus(updated.status);
+            if (updated.updatedAt) setLatestUpdatedAt(new Date(updated.updatedAt).toISOString());
             toast.success("Change Order saved");
             router.refresh();
             return true;
@@ -125,6 +147,50 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             return false;
         } finally {
             setIsSaving(false);
+        }
+    }
+
+    // Save first (same pattern as Send): a failed save aborts, so the office never
+    // approves amounts that did not persist.
+    async function openMarkApproved() {
+        const saved = isScopeLocked ? true : await handleSave();
+        if (!saved) return;
+        setOfflineMethod("");
+        setOfflineDate(offline.todayKey);
+        setOfflineNote("");
+        setOfflineError(null);
+        setShowOfflineModal(true);
+    }
+
+    async function handleMarkApproved() {
+        const errors: { method?: string; date?: string } = {};
+        if (!OFFLINE_APPROVAL_METHODS.some((row) => row.value === offlineMethod)) errors.method = "Choose how the customer approved.";
+        if (!offlineDate || offlineDate > offline.todayKey) errors.date = "The approval date can't be in the future.";
+        setOfflineError(errors.method || errors.date ? errors : null);
+        if (errors.method || errors.date) return;
+        setIsMarkingApproved(true);
+        try {
+            const result = await markChangeOrderApprovedOffline(initialData.id, {
+                method: offlineMethod,
+                approvedOn: offlineDate,
+                note: offlineNote.trim() || null,
+                expectedUpdatedAt: latestUpdatedAt,
+            });
+            if (!result.success) {
+                toast.error(result.error);
+                return;
+            }
+            toast.success(result.awaitingActuals
+                ? `${result.code} marked approved. Bill actuals when the work is done.`
+                : `${result.code} marked approved and added to invoice ${result.invoiceCode}. The customer was not notified.`);
+            for (const warning of result.warnings) toast.warning(`Marked approved, but ${warning}.`);
+            setStatus("Approved");
+            setShowOfflineModal(false);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Could not mark this change order approved");
+        } finally {
+            setIsMarkingApproved(false);
         }
     }
 
@@ -302,6 +368,15 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                     >
                         {isSending ? "Sending..." : "Send for Approval"}
                     </button>
+                    {showMarkApproved && (
+                        <button
+                            onClick={openMarkApproved}
+                            disabled={isSaving || isSending || isMarkingApproved}
+                            className="hui-btn hui-btn-secondary bg-green-50 text-green-700 hover:bg-green-100 border-green-200 disabled:opacity-50"
+                        >
+                            Mark approved
+                        </button>
+                    )}
                     <button
                         onClick={handleSave}
                         disabled={isSaving || isScopeLocked}
@@ -612,12 +687,18 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 <span className={`px-2 py-0.5 rounded text-xs border ${
                                     initialData.approvedBy ? "bg-green-100 text-green-800 border-green-200" :
                                     "bg-slate-100 text-slate-600 border-slate-200"
-                                }`}>{initialData.approvedBy ? "Signed" : "Pending Signature"}</span>
+                                }`}>{isOfflineApproved ? "Approved offline" : initialData.approvedBy ? "Signed" : "Pending Signature"}</span>
                             </div>
                             <div className="p-6 grid grid-cols-2 gap-8">
                                 <div className="border border-slate-200 rounded-lg p-6 bg-slate-50/50">
                                     <h4 className="font-semibold text-slate-700 mb-4 tracking-wide text-sm uppercase">Client Signature</h4>
-                                    {initialData.approvedBy ? (
+                                    {isOfflineApproved ? (
+                                        <div className="space-y-2 text-sm text-slate-600">
+                                            <p>{offline.summary}</p>
+                                            <p>Not signed electronically.</p>
+                                            {initialData.approvalNote && <p>Note: {initialData.approvalNote}</p>}
+                                        </div>
+                                    ) : initialData.approvedBy ? (
                                         <div className="space-y-4">
                                             <div className="bg-white p-4 border border-slate-200 rounded flex items-center justify-center min-h-[100px]">
                                                 {initialData.clientSignatureUrl ? (
@@ -702,6 +783,88 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                     <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3">
                         <button className="hui-btn hui-btn-secondary" onClick={() => setBillingPreview(null)}>Cancel</button>
                         <button className="hui-btn hui-btn-primary disabled:opacity-50" disabled={isBilling} onClick={confirmBillActuals}>{isBilling ? "Billing…" : "Confirm & bill"}</button>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {showOfflineModal && (
+            <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4">
+                <div className="bg-white rounded-xl shadow-xl max-w-md w-full border border-hui-border overflow-hidden">
+                    <div className="px-6 py-4 border-b border-hui-border flex items-center justify-between">
+                        <h2 className="text-lg font-bold text-hui-textMain">Mark approved</h2>
+                        <button onClick={() => setShowOfflineModal(false)} disabled={isMarkingApproved} className="text-hui-textMuted hover:text-hui-textMain">
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                        </button>
+                    </div>
+                    <div className="p-6 space-y-4 text-sm">
+                        <p className="text-hui-textMuted">Use this when the customer approved {initialData.code} outside ProBuild, like on a call or by text.</p>
+                        {pricingType === "COST_PLUS" ? (
+                            <p className="text-hui-textMain">Terms: cost + {markupPercent || 10}% + tax, billed later from actual time and expenses.</p>
+                        ) : (
+                            <div className="space-y-1 text-hui-textMain">
+                                <div className="flex justify-between"><span>Subtotal</span><strong>{formatCurrency(subtotal)}</strong></div>
+                                <div className="flex justify-between"><span>{taxLabel}</span><strong>{formatCurrency(tax)}</strong></div>
+                                <div className="flex justify-between border-t border-slate-200 pt-1"><span>Total</span><strong>{formatCurrency(total)}</strong></div>
+                            </div>
+                        )}
+                        <div>
+                            <label className="block font-medium text-hui-textMain mb-1" htmlFor="offline-approval-method">How did the customer approve?</label>
+                            <select
+                                id="offline-approval-method"
+                                className="hui-input w-full"
+                                value={offlineMethod}
+                                onChange={(e) => setOfflineMethod(e.target.value)}
+                            >
+                                <option value="">Choose one</option>
+                                {OFFLINE_APPROVAL_METHODS.map((row) => (
+                                    <option key={row.value} value={row.value}>{row.label}</option>
+                                ))}
+                            </select>
+                            {offlineError?.method && <p className="text-xs text-red-600 mt-1">{offlineError.method}</p>}
+                        </div>
+                        <div>
+                            <label className="block font-medium text-hui-textMain mb-1" htmlFor="offline-approval-date">Date approved</label>
+                            <input
+                                id="offline-approval-date"
+                                type="date"
+                                className="hui-input w-full"
+                                value={offlineDate}
+                                max={offline.todayKey}
+                                onChange={(e) => setOfflineDate(e.target.value)}
+                            />
+                            <p className="text-xs text-slate-500 mt-1">You can pick an earlier date. It can&apos;t be in the future.</p>
+                            {offlineError?.date && <p className="text-xs text-red-600 mt-1">{offlineError.date}</p>}
+                        </div>
+                        <div>
+                            <label className="block font-medium text-hui-textMain mb-1" htmlFor="offline-approval-note">Note (optional)</label>
+                            <textarea
+                                id="offline-approval-note"
+                                className="hui-input w-full h-20 resize-y"
+                                placeholder="For example: approved on a call with the project manager."
+                                maxLength={OFFLINE_APPROVAL_NOTE_MAX}
+                                value={offlineNote}
+                                onChange={(e) => setOfflineNote(e.target.value)}
+                            />
+                            <p className="text-xs text-slate-500 mt-1">Only your team sees this note.</p>
+                        </div>
+                        <div className="bg-amber-50 border border-amber-200 rounded-md p-3 text-amber-900 space-y-1">
+                            {pricingType === "COST_PLUS" ? (
+                                <p>The customer will not be notified. Nothing is billed now. Bill the actual time and expenses from this page when the work is done.</p>
+                            ) : (
+                                <>
+                                    <p>The customer will not be notified. Send the bill from the invoice when you&apos;re ready.</p>
+                                    <p>ProBuild adds this change order to the invoice now. Nothing goes to QuickBooks until you send it.</p>
+                                </>
+                            )}
+                        </div>
+                        <p className="text-xs text-slate-500">Recorded by {offline.staffName}.</p>
+                    </div>
+                    <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3">
+                        <button className="hui-btn hui-btn-secondary" disabled={isMarkingApproved} onClick={() => setShowOfflineModal(false)}>Cancel</button>
+                        <button className="hui-btn hui-btn-primary disabled:opacity-50" disabled={isMarkingApproved} onClick={handleMarkApproved}>
+                            {isMarkingApproved ? "Marking approved…" : "Mark approved"}
+                        </button>
                     </div>
                 </div>
             </div>

@@ -59,6 +59,7 @@ which fires on *payments*, never on edits.
 | Split invoice milestones | `splitInvoiceMilestonesCore`, `src/lib/billing-core.ts` | No |
 | Add invoice milestone | `addInvoiceMilestone`, `src/lib/actions.ts` | No |
 | Delete invoice milestone | `deleteInvoiceMilestoneCore`, `src/lib/billing-core.ts` | No |
+| Offline CO approval | `approveChangeOrderOfflineCore`, `src/lib/billing-core.ts` (creates the CO milestones via `billChangeOrderInTx`, in the same transaction as the approval) | No. Never emails or texts the customer and never touches QuickBooks; the new milestones stay unrequested (`qbInvoiceSentAt` NULL) until staff sends them. Reminders and the automatic paid receipt skip such milestones until then. |
 | Payment settle | `recordPayment`, `recordEstimatePayment`, Stripe webhook, portal payment, QB sync | Yes — by design, via the single-writer outbox (`enqueueMilestonePaid`). This is payment lifecycle, not editing. |
 | Payment unsettle (undo) | `unrecordPayment` / `unrecordEstimatePayment` | No — both mirrors are released, but no notification is enqueued. |
 

@@ -153,10 +153,10 @@ export async function getProjectBilling(projectId: string) {
         changeOrders: (await prisma.changeOrder.findMany({
             where: { projectId },
             orderBy: { createdAt: "desc" },
-            select: { id: true, code: true, title: true, status: true, totalAmount: true, approvedAt: true, sentAt: true },
+            select: { id: true, code: true, title: true, status: true, totalAmount: true, approvedAt: true, sentAt: true, approvalSource: true, approvalMethod: true },
         })).map(co => ({
             id: co.id, code: co.code, title: co.title, status: co.status,
-            total: Number(co.totalAmount), approvedAt: co.approvedAt, sentAt: co.sentAt,
+            total: Number(co.totalAmount), approvedAt: co.approvedAt, sentAt: co.sentAt, approvalSource: co.approvalSource, approvalMethod: co.approvalMethod,
         })),
         invoices: project.invoices.map(inv => ({
             id: inv.id, code: inv.code, status: inv.status,
@@ -1935,168 +1935,175 @@ async function billChangeOrderCoreLegacy(changeOrderId: string) {
 // a silent stall. Never throws: the customer's approval must stand regardless.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * The billing transaction body, extracted so the offline approval can bill in
+ * the SAME transaction that flips the status. Behavior is unchanged: locks the
+ * CO row, then estimate -> invoice, and returns the outcome union.
+ */
+export async function billChangeOrderInTx(tx: Prisma.TransactionClient, changeOrderId: string) {
+    const locked = await tx.$queryRaw<Array<{
+        id: string; code: string; title: string; status: string; pricingType: string;
+        totalAmount: unknown; projectId: string; estimateId: string;
+    }>>`
+        SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "projectId", "estimateId"
+        FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+    const co = locked[0];
+    if (!co) return { ok: false as const, error: "Change order not found" };
+    if (co.status !== "Approved") {
+        return { ok: false as const, error: `Change order ${co.code} must be Approved before it can be billed.` };
+    }
+    if (co.pricingType === "COST_PLUS") {
+        return { ok: false as const, error: `${co.code} is cost plus — use bill_cost_plus_change_order with a through date.` };
+    }
+    // Billing invoices the stored totalAmount and never re-derives it from items, so the
+    // send and approval guards do not protect a CO that reached Approved before those
+    // guards existed. Re-check the one condition that makes the stored total untrustworthy
+    // rather than revalidating the whole subtotal — an Approved CO is a signed number, and
+    // failing it on ordinary drift would block legitimate billing.
+    const billItems = await tx.changeOrderItem.findMany({
+        where: { changeOrderId },
+        select: { name: true, type: true },
+    });
+    const sectionRows = coSectionRowNames(billItems);
+    if (sectionRows.length > 0) return { ok: false as const, error: coSectionRowError(co.code, sectionRows) };
+
+    const subtotalCents = Math.round(Number(co.totalAmount) * 100);
+    if (subtotalCents <= 0) return { ok: false as const, error: `Change order ${co.code} has a $0 total — nothing to bill.` };
+    const estimateTax = await tx.estimate.findUnique({
+        where: { id: co.estimateId },
+        select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+    });
+    const rate = coTaxRate(estimateTax);
+    const totalTaxCents = Math.round(subtotalCents * rate);
+    const invoice = await findChangeOrderInvoice(tx, co);
+    if (!invoice) return { ok: false as const, error: "This project has no invoice yet — create the invoice first, then bill the change order." };
+    await lockMoneyParents(tx, { estimateId: co.estimateId, invoiceId: invoice.id });
+    const lockedInvoice = await tx.invoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
+
+    const schedules = await tx.changeOrderPaymentSchedule.findMany({
+        where: { changeOrderId },
+        orderBy: [{ order: "asc" }, { createdAt: "asc" }],
+    });
+    if (schedules.length === 1) return { ok: false as const, error: "Fixed change-order splits require at least two schedule rows" };
+    if (schedules.some((row) => Math.round(Number(row.amount) * 100) <= 0)) {
+        return { ok: false as const, error: "Every fixed change-order schedule amount must be greater than zero" };
+    }
+    const priorCents = schedules.slice(0, -1).reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0);
+    const pretaxPlans = schedules.length
+        ? schedules.map((row, index) => ({
+            sourceCoScheduleId: row.id as string | null,
+            name: `${co.code} — ${row.name}`.slice(0, 300),
+            dueDate: row.dueDate,
+            pretaxCents: index === schedules.length - 1 ? subtotalCents - priorCents : Math.round(Number(row.amount) * 100),
+        }))
+        : [{ sourceCoScheduleId: null as string | null, name: `${co.code} — ${co.title}`.slice(0, 300), dueDate: null as Date | null, pretaxCents: subtotalCents }];
+    if (pretaxPlans.some((plan) => plan.pretaxCents <= 0)) {
+        return { ok: false as const, error: "Fixed change-order schedule rows reach or exceed the subtotal before the final remainder" };
+    }
+    if (schedules.length) {
+        const storedCents = schedules.reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0);
+        if (storedCents !== subtotalCents) return { ok: false as const, error: "Change-order schedule amounts are out of sync with the signed subtotal" };
+    }
+
+    let allocatedTaxCents = 0;
+    const plans = pretaxPlans.map((plan, index) => {
+        const taxCents = index === pretaxPlans.length - 1
+            ? totalTaxCents - allocatedTaxCents
+            : Math.round(plan.pretaxCents * rate);
+        allocatedTaxCents += taxCents;
+        return { ...plan, taxCents, totalCents: plan.pretaxCents + taxCents };
+    });
+    const existing = await tx.paymentSchedule.findMany({
+        where: {
+            invoice: { projectId: co.projectId },
+            status: { not: "Canceled" },
+            OR: [{ sourceChangeOrderId: co.id }, { name: { startsWith: `${co.code} — ` } }],
+        },
+    });
+    const milestones: Array<{
+        id: string; name: string; amount: number; pretaxAmount: number; taxAmount: number;
+        status: string; created: boolean;
+    }> = [];
+    let newPretaxCents = 0;
+    let newTaxCents = 0;
+    let newTotalCents = 0;
+    for (const plan of plans) {
+        const prior = plan.sourceCoScheduleId
+            ? existing.find((row) => row.sourceCoScheduleId === plan.sourceCoScheduleId || row.name === plan.name)
+            : existing.find((row) => !row.sourceCoScheduleId);
+        if (prior) {
+            if (Math.round(Number(prior.amount) * 100) !== plan.totalCents) {
+                return { ok: false as const, error: `Existing milestone "${prior.name}" does not match the signed change-order amount` };
+            }
+            milestones.push({
+                id: prior.id,
+                name: prior.name,
+                amount: Number(prior.amount),
+                pretaxAmount: Number(prior.pretaxAmount ?? plan.pretaxCents / 100),
+                taxAmount: Number(prior.taxAmount ?? plan.taxCents / 100),
+                status: prior.status,
+                created: false,
+            });
+            continue;
+        }
+        const created = await tx.paymentSchedule.create({
+            data: {
+                invoiceId: invoice.id,
+                name: plan.name,
+                amount: plan.totalCents / 100,
+                pretaxAmount: plan.pretaxCents / 100,
+                taxAmount: plan.taxCents / 100,
+                sourceChangeOrderId: co.id,
+                sourceCoScheduleId: plan.sourceCoScheduleId,
+                dueDate: plan.dueDate,
+                status: "Pending",
+            },
+        });
+        newPretaxCents += plan.pretaxCents;
+        newTaxCents += plan.taxCents;
+        newTotalCents += plan.totalCents;
+        milestones.push({
+            id: created.id,
+            name: created.name,
+            amount: plan.totalCents / 100,
+            pretaxAmount: plan.pretaxCents / 100,
+            taxAmount: plan.taxCents / 100,
+            status: created.status,
+            created: true,
+        });
+    }
+    if (newTotalCents > 0) {
+        await tx.invoice.update({
+            where: { id: invoice.id },
+            data: {
+                subtotal: { increment: newPretaxCents / 100 },
+                taxAmount: { increment: newTaxCents / 100 },
+                totalAmount: { increment: newTotalCents / 100 },
+                balanceDue: { increment: newTotalCents / 100 },
+                ...(lockedInvoice?.status === "Paid" ? { status: "Partially Paid" } : {}),
+            },
+        });
+    }
+    return {
+        ok: true as const,
+        alreadyBilled: milestones.every((row) => !row.created),
+        milestones,
+        subtotal: subtotalCents / 100,
+        taxAmount: totalTaxCents / 100,
+        amount: (subtotalCents + totalTaxCents) / 100,
+        taxLabel: coTaxLabel(estimateTax),
+        invoiceId: invoice.id,
+        invoiceCode: invoice.code,
+        projectId: co.projectId,
+        coCode: co.code,
+    };
+}
+
 export async function billChangeOrderCore(
     changeOrderId: string,
     dependencies: { logActivity?: typeof logActivityLazy; revalidatePath?: typeof revalidatePath } = {},
 ) {
-    const outcome = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        const locked = await tx.$queryRaw<Array<{
-            id: string; code: string; title: string; status: string; pricingType: string;
-            totalAmount: unknown; projectId: string; estimateId: string;
-        }>>`
-            SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "projectId", "estimateId"
-            FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
-        const co = locked[0];
-        if (!co) return { ok: false as const, error: "Change order not found" };
-        if (co.status !== "Approved") {
-            return { ok: false as const, error: `Change order ${co.code} must be Approved before it can be billed.` };
-        }
-        if (co.pricingType === "COST_PLUS") {
-            return { ok: false as const, error: `${co.code} is cost plus — use bill_cost_plus_change_order with a through date.` };
-        }
-        // Billing invoices the stored totalAmount and never re-derives it from items, so the
-        // send and approval guards do not protect a CO that reached Approved before those
-        // guards existed. Re-check the one condition that makes the stored total untrustworthy
-        // rather than revalidating the whole subtotal — an Approved CO is a signed number, and
-        // failing it on ordinary drift would block legitimate billing.
-        const billItems = await tx.changeOrderItem.findMany({
-            where: { changeOrderId },
-            select: { name: true, type: true },
-        });
-        const sectionRows = coSectionRowNames(billItems);
-        if (sectionRows.length > 0) return { ok: false as const, error: coSectionRowError(co.code, sectionRows) };
-
-        const subtotalCents = Math.round(Number(co.totalAmount) * 100);
-        if (subtotalCents <= 0) return { ok: false as const, error: `Change order ${co.code} has a $0 total — nothing to bill.` };
-        const estimateTax = await tx.estimate.findUnique({
-            where: { id: co.estimateId },
-            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
-        });
-        const rate = coTaxRate(estimateTax);
-        const totalTaxCents = Math.round(subtotalCents * rate);
-        const invoice = await findChangeOrderInvoice(tx, co);
-        if (!invoice) return { ok: false as const, error: "This project has no invoice yet — create the invoice first, then bill the change order." };
-        await lockMoneyParents(tx, { estimateId: co.estimateId, invoiceId: invoice.id });
-        const lockedInvoice = await tx.invoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
-
-        const schedules = await tx.changeOrderPaymentSchedule.findMany({
-            where: { changeOrderId },
-            orderBy: [{ order: "asc" }, { createdAt: "asc" }],
-        });
-        if (schedules.length === 1) return { ok: false as const, error: "Fixed change-order splits require at least two schedule rows" };
-        if (schedules.some((row) => Math.round(Number(row.amount) * 100) <= 0)) {
-            return { ok: false as const, error: "Every fixed change-order schedule amount must be greater than zero" };
-        }
-        const priorCents = schedules.slice(0, -1).reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0);
-        const pretaxPlans = schedules.length
-            ? schedules.map((row, index) => ({
-                sourceCoScheduleId: row.id as string | null,
-                name: `${co.code} — ${row.name}`.slice(0, 300),
-                dueDate: row.dueDate,
-                pretaxCents: index === schedules.length - 1 ? subtotalCents - priorCents : Math.round(Number(row.amount) * 100),
-            }))
-            : [{ sourceCoScheduleId: null as string | null, name: `${co.code} — ${co.title}`.slice(0, 300), dueDate: null as Date | null, pretaxCents: subtotalCents }];
-        if (pretaxPlans.some((plan) => plan.pretaxCents <= 0)) {
-            return { ok: false as const, error: "Fixed change-order schedule rows reach or exceed the subtotal before the final remainder" };
-        }
-        if (schedules.length) {
-            const storedCents = schedules.reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0);
-            if (storedCents !== subtotalCents) return { ok: false as const, error: "Change-order schedule amounts are out of sync with the signed subtotal" };
-        }
-
-        let allocatedTaxCents = 0;
-        const plans = pretaxPlans.map((plan, index) => {
-            const taxCents = index === pretaxPlans.length - 1
-                ? totalTaxCents - allocatedTaxCents
-                : Math.round(plan.pretaxCents * rate);
-            allocatedTaxCents += taxCents;
-            return { ...plan, taxCents, totalCents: plan.pretaxCents + taxCents };
-        });
-        const existing = await tx.paymentSchedule.findMany({
-            where: {
-                invoice: { projectId: co.projectId },
-                status: { not: "Canceled" },
-                OR: [{ sourceChangeOrderId: co.id }, { name: { startsWith: `${co.code} — ` } }],
-            },
-        });
-        const milestones: Array<{
-            id: string; name: string; amount: number; pretaxAmount: number; taxAmount: number;
-            status: string; created: boolean;
-        }> = [];
-        let newPretaxCents = 0;
-        let newTaxCents = 0;
-        let newTotalCents = 0;
-        for (const plan of plans) {
-            const prior = plan.sourceCoScheduleId
-                ? existing.find((row) => row.sourceCoScheduleId === plan.sourceCoScheduleId || row.name === plan.name)
-                : existing.find((row) => !row.sourceCoScheduleId);
-            if (prior) {
-                if (Math.round(Number(prior.amount) * 100) !== plan.totalCents) {
-                    return { ok: false as const, error: `Existing milestone "${prior.name}" does not match the signed change-order amount` };
-                }
-                milestones.push({
-                    id: prior.id,
-                    name: prior.name,
-                    amount: Number(prior.amount),
-                    pretaxAmount: Number(prior.pretaxAmount ?? plan.pretaxCents / 100),
-                    taxAmount: Number(prior.taxAmount ?? plan.taxCents / 100),
-                    status: prior.status,
-                    created: false,
-                });
-                continue;
-            }
-            const created = await tx.paymentSchedule.create({
-                data: {
-                    invoiceId: invoice.id,
-                    name: plan.name,
-                    amount: plan.totalCents / 100,
-                    pretaxAmount: plan.pretaxCents / 100,
-                    taxAmount: plan.taxCents / 100,
-                    sourceChangeOrderId: co.id,
-                    sourceCoScheduleId: plan.sourceCoScheduleId,
-                    dueDate: plan.dueDate,
-                    status: "Pending",
-                },
-            });
-            newPretaxCents += plan.pretaxCents;
-            newTaxCents += plan.taxCents;
-            newTotalCents += plan.totalCents;
-            milestones.push({
-                id: created.id,
-                name: created.name,
-                amount: plan.totalCents / 100,
-                pretaxAmount: plan.pretaxCents / 100,
-                taxAmount: plan.taxCents / 100,
-                status: created.status,
-                created: true,
-            });
-        }
-        if (newTotalCents > 0) {
-            await tx.invoice.update({
-                where: { id: invoice.id },
-                data: {
-                    subtotal: { increment: newPretaxCents / 100 },
-                    taxAmount: { increment: newTaxCents / 100 },
-                    totalAmount: { increment: newTotalCents / 100 },
-                    balanceDue: { increment: newTotalCents / 100 },
-                    ...(lockedInvoice?.status === "Paid" ? { status: "Partially Paid" } : {}),
-                },
-            });
-        }
-        return {
-            ok: true as const,
-            alreadyBilled: milestones.every((row) => !row.created),
-            milestones,
-            subtotal: subtotalCents / 100,
-            taxAmount: totalTaxCents / 100,
-            amount: (subtotalCents + totalTaxCents) / 100,
-            taxLabel: coTaxLabel(estimateTax),
-            invoiceId: invoice.id,
-            invoiceCode: invoice.code,
-            projectId: co.projectId,
-            coCode: co.code,
-        };
-    }, { timeout: 15_000 }));
+    const outcome = await withTxRetry(() => prisma.$transaction((tx) => billChangeOrderInTx(tx, changeOrderId), { timeout: 15_000 }));
 
     if (!outcome.ok) return outcome;
     try {
@@ -2134,11 +2141,318 @@ export async function billChangeOrderCore(
     };
 }
 
+// Imports for the offline approval below sit here, not in the top import block, so no
+// line above the line-keyed payroll manifests (billing-core.ts:1787) moves.
+import { assertChangeOrderApprovableInTx } from "./change-order-core";
+import {
+    OFFLINE_APPROVAL_SOURCE,
+    OfflineApprovalInputError,
+    formatOfflineApprovalDate,
+    offlineApprovalMethodPhrase,
+    parseOfflineApprovalInput,
+} from "./change-order-offline-approval";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Office-side "Mark approved": the customer approved outside ProBuild (phone,
+// text, email, in person). Approval and billing commit in ONE transaction under
+// the CO row lock. This path NEVER contacts the customer: it does not call
+// sendMilestoneInvoicesCore, pushMilestoneToQuickBooks, sendChangeOrderToClientCore,
+// or any customer-addressed notification. The only email goes to the team address.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type OfflineApprovalResult =
+    | {
+        ok: true;
+        changeOrder: { id: string; code: string; projectId: string; pricingType: "FIXED" | "COST_PLUS" };
+        approvedAt: string;
+        billing:
+            | {
+                invoiceId: string; invoiceCode: string; amount: number; subtotal: number; taxAmount: number;
+                milestones: Array<{ id: string; name: string; amount: number; created: boolean }>;
+            }
+            | null;
+        warnings: string[];
+    }
+    | { ok: false; code: "NOT_FOUND" | "ALREADY_APPROVED" | "NOT_APPROVABLE" | "STALE" | "INVALID" | "BILLING_FAILED"; error: string };
+
+class OfflineApprovalBillingError extends Error {}
+
+export async function approveChangeOrderOfflineCore(
+    changeOrderId: string,
+    input: {
+        method: unknown;
+        approvedOn: unknown;
+        note?: unknown;
+        expectedUpdatedAt: string;
+        actor: { userId: string; name: string };
+    },
+    dependencies: {
+        now?: () => Date;
+        logActivity?: typeof logActivityLazy;
+        revalidatePath?: typeof revalidatePath;
+        applySchedule?: (changeOrderId: string) => Promise<void>;
+        notifyTeam?: typeof sendNotification;
+    } = {},
+): Promise<OfflineApprovalResult> {
+    const timeZone = await resolveCompanyTimeZone();
+    let parsed: ReturnType<typeof parseOfflineApprovalInput>;
+    try {
+        parsed = parseOfflineApprovalInput(input, { now: (dependencies.now ?? (() => new Date()))(), timeZone });
+    } catch (error) {
+        if (error instanceof OfflineApprovalInputError) return { ok: false, code: "INVALID", error: error.message };
+        throw error;
+    }
+    const expectedMs = new Date(input.expectedUpdatedAt).getTime();
+    const staffName = input.actor.name.trim();
+    if (!staffName) return { ok: false, code: "INVALID", error: "The staff member's name is required." };
+
+    type TxOutcome =
+        | { ok: false; code: "NOT_FOUND" | "ALREADY_APPROVED" | "NOT_APPROVABLE" | "STALE" | "INVALID"; error: string }
+        | {
+            ok: true;
+            co: { id: string; code: string; title: string; projectId: string; pricingType: "FIXED" | "COST_PLUS"; markupPercent: number | null };
+            bill: Extract<Awaited<ReturnType<typeof billChangeOrderInTx>>, { ok: true }> | null;
+        };
+
+    let outcome: TxOutcome;
+    try {
+        outcome = await withTxRetry(() => prisma.$transaction(async (tx): Promise<TxOutcome> => {
+            // Same parent-row lock as edit, send, sign, bill, and co-audit repair, so an
+            // offline approval and a portal signature serialize.
+            const locked = await tx.$queryRaw<Array<{
+                id: string; code: string; title: string; status: string; pricingType: string; totalAmount: unknown;
+                updatedAt: Date; projectId: string; markupPercent: number | null;
+                approvedBy: string | null; approvedAt: Date | null; clientSignatureUrl: string | null; approvalSource: string | null;
+            }>>`
+                SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "updatedAt", "projectId", "markupPercent",
+                       "approvedBy", "approvedAt", "clientSignatureUrl", "approvalSource"
+                FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+            const current = locked[0];
+            if (!current) return { ok: false, code: "NOT_FOUND", error: "Change order not found" };
+
+            const hasAudit = current.approvedBy != null || current.approvedAt != null || current.clientSignatureUrl != null || current.approvalSource != null;
+            if (current.status === "Approved" || hasAudit) {
+                return {
+                    ok: false,
+                    code: "ALREADY_APPROVED",
+                    error: current.approvalSource === OFFLINE_APPROVAL_SOURCE
+                        ? `${current.code} is already marked approved.`
+                        : current.clientSignatureUrl || current.approvedBy || current.approvedAt
+                            ? `The customer already signed ${current.code}.`
+                            : `${current.code} is already approved.`,
+                };
+            }
+            if (current.status !== "Draft" && current.status !== "Sent") {
+                return { ok: false, code: "NOT_APPROVABLE", error: "Only Draft or Sent change orders can be marked approved." };
+            }
+            if (!Number.isFinite(expectedMs) || new Date(current.updatedAt).getTime() !== expectedMs) {
+                return { ok: false, code: "STALE", error: "This change order changed since you opened it. Refresh and try again." };
+            }
+
+            try {
+                await assertChangeOrderApprovableInTx(tx, current);
+            } catch (error) {
+                return { ok: false, code: "INVALID", error: error instanceof Error ? error.message : "Change order cannot be approved." };
+            }
+
+            const pricingType = current.pricingType === "COST_PLUS" ? "COST_PLUS" as const : "FIXED" as const;
+            if (pricingType === "FIXED") {
+                const schedules = await tx.changeOrderPaymentSchedule.findMany({ where: { changeOrderId }, select: { amount: true } });
+                const scheduleError = "The payment schedule doesn't add up to the subtotal. Fix the schedule, then try again.";
+                if (schedules.length === 1) return { ok: false, code: "INVALID", error: scheduleError };
+                if (schedules.length > 0) {
+                    const cents = schedules.map((row) => Math.round(Number(row.amount) * 100));
+                    const sum = cents.reduce((total, value) => total + value, 0);
+                    if (cents.some((value) => value <= 0) || sum !== Math.round(Number(current.totalAmount) * 100)) {
+                        return { ok: false, code: "INVALID", error: scheduleError };
+                    }
+                }
+            }
+
+            await tx.changeOrder.update({
+                where: { id: changeOrderId },
+                data: {
+                    status: "Approved",
+                    approvedBy: staffName,
+                    approvedAt: parsed.approvedAt,
+                    approvalSource: OFFLINE_APPROVAL_SOURCE,
+                    approvalMethod: parsed.method,
+                    approvalNote: parsed.note,
+                },
+            });
+
+            let bill: Extract<Awaited<ReturnType<typeof billChangeOrderInTx>>, { ok: true }> | null = null;
+            if (pricingType === "FIXED") {
+                const result = await billChangeOrderInTx(tx, changeOrderId);
+                if (!result.ok) throw new OfflineApprovalBillingError(`Couldn't add ${current.code} to the invoice: ${result.error}`);
+                bill = result;
+                // billChangeOrderInTx may REUSE a milestone staff created by hand with the CO's
+                // name. Give it the same provenance a new milestone gets, in this same transaction,
+                // so it is held from automatic reminders and receipts exactly like the others. Done
+                // here, not in the shared biller, so the signed path is untouched.
+                const reusedIds = result.milestones.filter((row) => !row.created).map((row) => row.id);
+                if (reusedIds.length > 0) {
+                    const scheduleRows = await tx.changeOrderPaymentSchedule.findMany({ where: { changeOrderId }, select: { id: true, name: true } });
+                    const reusedRows = await tx.paymentSchedule.findMany({
+                        where: { id: { in: reusedIds } },
+                        select: { id: true, name: true, sourceChangeOrderId: true, sourceCoScheduleId: true },
+                    });
+                    for (const row of reusedRows) {
+                        if (row.sourceChangeOrderId) continue;
+                        const data: { sourceChangeOrderId: string; sourceCoScheduleId?: string } = { sourceChangeOrderId: changeOrderId };
+                        if (!row.sourceCoScheduleId) {
+                            const match = scheduleRows.find((sched) => `${current.code} — ${sched.name}`.slice(0, 300) === row.name);
+                            if (match && !(await tx.paymentSchedule.findFirst({ where: { sourceCoScheduleId: match.id }, select: { id: true } }))) {
+                                data.sourceCoScheduleId = match.id;
+                            }
+                        }
+                        await tx.paymentSchedule.update({ where: { id: row.id }, data });
+                    }
+                }
+            }
+            return {
+                ok: true,
+                co: { id: current.id, code: current.code, title: current.title, projectId: current.projectId, pricingType, markupPercent: current.markupPercent },
+                bill,
+            };
+        }, { timeout: 15_000 }));
+    } catch (error) {
+        if (error instanceof OfflineApprovalBillingError) {
+            return { ok: false, code: "BILLING_FAILED", error: error.message };
+        }
+        throw error;
+    }
+
+    if (!outcome.ok) return outcome;
+
+    // Committed. Everything below is best effort and reported as warnings.
+    const { co, bill } = outcome;
+    const warnings: string[] = [];
+    const logActivity = dependencies.logActivity ?? logActivityLazy;
+    const revalidate = dependencies.revalidatePath ?? revalidatePath;
+
+    try {
+        await logActivity({
+            projectId: co.projectId,
+            actorType: "TEAM",
+            actorName: staffName,
+            actorUserId: input.actor.userId,
+            action: "approved_change_order_offline",
+            entityType: "change_order",
+            entityId: co.id,
+            entityName: co.code,
+            metadata: {
+                method: parsed.method,
+                approvedOn: parsed.approvedOn,
+                note: parsed.note,
+                billing: bill ? "billed_no_send" : "awaiting_actuals",
+                ...(bill ? { invoiceCode: bill.invoiceCode, milestones: bill.milestones.map((row) => row.name), amount: bill.amount } : {}),
+            },
+        });
+    } catch {
+        warnings.push("the activity log entry could not be written");
+    }
+    if (bill) {
+        try {
+            await logActivity({
+                projectId: co.projectId,
+                actorType: "TEAM",
+                actorName: staffName,
+                actorUserId: input.actor.userId,
+                action: "billed_change_order",
+                entityType: "invoice",
+                entityId: bill.invoiceId,
+                entityName: `Invoice ${bill.invoiceCode}`,
+                metadata: { changeOrder: co.code, milestones: bill.milestones.map((row) => row.name), amount: bill.amount },
+            });
+        } catch {
+            warnings.push("the billing activity entry could not be written");
+        }
+    }
+
+    try {
+        if (dependencies.applySchedule) {
+            await dependencies.applySchedule(co.id);
+        } else {
+            const { applyChangeOrderToSchedule, CoSchedulePreconditionError } = await import("./schedule-core");
+            try {
+                await applyChangeOrderToSchedule({ changeOrderId: co.id, mode: "merge", actor: { type: "SYSTEM", name: "system" } });
+            } catch (error) {
+                if (!(error instanceof CoSchedulePreconditionError)) throw error;
+            }
+        }
+    } catch (error) {
+        warnings.push(`the schedule update failed (billing unaffected): ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    try {
+        const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { notificationEmail: true, companyName: true, email: true } });
+        const to = settings?.notificationEmail?.trim() || settings?.email?.trim();
+        if (to) {
+            const esc = escapeHtml;
+            const phrase = offlineApprovalMethodPhrase(parsed.method);
+            const dateLabel = formatOfflineApprovalDate(parsed.approvedAt, timeZone);
+            const totalLabel = bill ? formatCurrency(bill.amount) : `cost + ${co.markupPercent ?? 10}% + tax`;
+            const subject = `Change order approved by ${staffName} (${phrase}): ${co.code} ${co.title} (${totalLabel})`;
+            const detail = bill
+                ? `Added to invoice ${bill.invoiceCode} as ${bill.milestones.length} unpaid milestone${bill.milestones.length === 1 ? "" : "s"} for ${formatCurrency(bill.amount)}. The customer was not notified. Send the payment request from the invoice when you're ready.`
+                : "No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.";
+            const teamSend = await (dependencies.notifyTeam ?? sendNotification)(
+                to,
+                subject,
+                `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; color: #333;">
+                    <h2 style="font-size:18px;">Change order approved by ${esc(staffName)}</h2>
+                    <p>${esc(staffName)} recorded that the customer approved <strong>${esc(co.code)}</strong> ${esc(phrase)} on ${esc(dateLabel)}.</p>
+                    <p>${esc(detail)}</p>
+                    ${parsed.note ? `<p>Note: ${esc(parsed.note)}</p>` : ""}
+                </div>`,
+                undefined,
+                { fromName: settings?.companyName || "ProBuild" },
+            );
+            if (teamSend && !teamSend.success) {
+                console.warn(`[approveChangeOrderOfflineCore] team email for ${co.code} was not delivered`);
+                warnings.push("the team email could not be sent");
+            }
+        }
+    } catch {
+        warnings.push("the team email could not be sent");
+    }
+
+    try {
+        revalidate(`/projects/${co.projectId}/change-orders`);
+        revalidate(`/projects/${co.projectId}/change-orders/${co.id}`);
+        if (bill) {
+            revalidate(`/projects/${co.projectId}/invoices`);
+            revalidate(`/projects/${co.projectId}/invoices/${bill.invoiceId}`);
+            revalidate("/invoices");
+        }
+    } catch {
+        warnings.push("the page refresh failed");
+    }
+
+    return {
+        ok: true,
+        changeOrder: { id: co.id, code: co.code, projectId: co.projectId, pricingType: co.pricingType },
+        approvedAt: parsed.approvedAt.toISOString(),
+        billing: bill
+            ? {
+                invoiceId: bill.invoiceId,
+                invoiceCode: bill.invoiceCode,
+                amount: bill.amount,
+                subtotal: bill.subtotal,
+                taxAmount: bill.taxAmount,
+                milestones: bill.milestones.map((row) => ({ id: row.id, name: row.name, amount: row.amount, created: row.created })),
+            }
+            : null,
+        warnings,
+    };
+}
+
 export async function handleChangeOrderApproved(
     changeOrderId: string,
     opts?: { notify?: boolean; freshlyApproved?: boolean },
-): Promise<{ billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean }> {
-    const summary: { billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean } = { billed: false, sent: false, issues: [] };
+): Promise<{ billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean; skippedOffline?: boolean }> {
+    const summary: { billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean; skippedOffline?: boolean } = { billed: false, sent: false, issues: [] };
     let coLabel = changeOrderId;
     let amountLabel = "";
     let projectName = "";
@@ -2147,8 +2461,14 @@ export async function handleChangeOrderApproved(
     try {
         const co = await prisma.changeOrder.findUnique({
             where: { id: changeOrderId },
-            select: { code: true, title: true, totalAmount: true, pricingType: true, markupPercent: true, approvedBy: true, project: { select: { name: true } } },
+            select: { code: true, title: true, totalAmount: true, pricingType: true, markupPercent: true, approvedBy: true, approvalSource: true, project: { select: { name: true } } },
         });
+        // An office-recorded approval never bills, sends, schedules, or notifies from here:
+        // approveChangeOrderOfflineCore already did its own billing (no send) and the
+        // customer must only hear from us when staff explicitly sends something.
+        if (co?.approvalSource === OFFLINE_APPROVAL_SOURCE) {
+            return { billed: false, sent: false, issues: [], skippedOffline: true };
+        }
         if (co) {
             coLabel = `${co.code} — ${co.title}`;
             amountLabel = formatCurrency(co.totalAmount);
