@@ -173,6 +173,11 @@ test("prepare_transfer creates the lead + standard alert immediately, even when 
     assert.equal((busyResult as { reason: string }).reason, "busy");
     assert.equal(await standardAlertCount(await leadIdForConversation(busyCaller)), 1, "a caller Richard was too busy for still gets a lead + standard alert");
 
+    // Free up the one-active-transfer slot busyHolder is still occupying
+    // before testing already_transferred below, which needs its OWN first
+    // prepare to succeed.
+    await db.frontDeskTransfer.updateMany({ where: { conversationId: busyHolder }, data: { status: "EXPIRED", resolvedAt: WITHIN_HOURS, reason: "test-cleanup" } });
+
     const alreadyCaller = conv();
     const first = await handlePrepareTransferTool(db, prepareInput(alreadyCaller), WITHIN_HOURS);
     assert.equal(first.kind, "transfer_ready");
