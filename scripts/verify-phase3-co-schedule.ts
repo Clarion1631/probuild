@@ -1,6 +1,7 @@
 // E2E verification for PB-pipeline-003 Phase 3 (CO -> schedule & cash).
 // Creates uniquely named far-future fixtures, exercises spec cases (a)-(f),
 // and cleans every fixture in finally. Run after apply-co-schedule-schema.mjs.
+import assert from "node:assert/strict";
 import fs from "node:fs";
 import { prisma } from "../src/lib/prisma";
 import { coSignedAmount } from "../src/lib/co-tax";
@@ -382,7 +383,12 @@ async function main() {
         const taskCrewActionBody = actionsSource.slice(actionsSource.indexOf("export async function updateTaskCrewAction"), actionsSource.indexOf("export async function updateProjectColor"));
         pass("(f) protected dashboard actions enforce company edit roles", applyActionBody.includes('["ADMIN", "MANAGER"]') && taskCrewActionBody.includes('["ADMIN", "MANAGER"]'));
         pass("(f) MCP exposes apply_change_order_to_schedule", mcpSource.includes('"apply_change_order_to_schedule"') && mcpSource.includes("applyChangeOrderToSchedule"));
-        const mcpGeneratorBody = mcpSource.slice(mcpSource.indexOf('"generate_project_schedule"'), mcpSource.indexOf('"assign_project_crew"'));
+        const mcpGeneratorMatch = mcpSource.match(/registerTool\(\s*"generate_project_schedule"/);
+        assert.ok(mcpGeneratorMatch, "generate_project_schedule registerTool call not found");
+        const mcpCrewMatch = mcpSource.match(/registerTool\(\s*"assign_project_crew"/);
+        assert.ok(mcpCrewMatch, "assign_project_crew registerTool call not found");
+        assert.ok(mcpCrewMatch.index > mcpGeneratorMatch.index, "assign_project_crew registerTool call must appear after generate_project_schedule");
+        const mcpGeneratorBody = mcpSource.slice(mcpGeneratorMatch.index, mcpCrewMatch.index);
         pass("(f) MCP generator preserves explicit merge semantics", !mcpGeneratorBody.includes("requireEmptyProject"));
         pass("(f) MCP schedule read exposes unapplied CO details", mcpSource.includes("unappliedChangeOrders"));
         pass("(f) MCP advertises contract version 1.11.0", mcpSource.includes('version: "1.11.0"'));
