@@ -5,7 +5,7 @@
  * this test. Mirrors tests/speed-to-lead-alerts-db.test.ts's sink pattern.
  * Zero prior test referenced NTFY_URGENT at all.
  */
-import test from "node:test";
+import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { randomUUID } from "node:crypto";
@@ -16,24 +16,29 @@ import { setSpeedToLeadPaused } from "../src/lib/speed-to-lead/settings";
 const databaseUrl = process.env.SPEED_TO_LEAD_TEST_URL;
 const skip = !databaseUrl && "set SPEED_TO_LEAD_TEST_URL to a disposable PostgreSQL URL";
 
-/** Same shape as speed-to-lead-alerts-db.test.ts's sink — drains every request before responding. */
+/**
+ * Same shape as speed-to-lead-alerts-db.test.ts's sink — drains every request
+ * before responding. Every hit is recorded with its Click header
+ * (`sendNtfyAlert`/`sendNtfyUrgentAlert` always set `Click: leadUrl(leadId)`),
+ * so a test reads only ITS OWN lead's deliveries: `deliverDueAlerts` scans
+ * the WHOLE table, and on the shared CI Postgres a PENDING row another step
+ * left behind lands on this same sink.
+ */
 async function startSink(): Promise<{
     url: string;
     close: () => Promise<void>;
-    lastHeaders: () => Record<string, string | string[] | undefined>;
-    lastBody: () => string;
     hits: () => number;
+    hitsForLead: (leadId: string) => number;
+    lastForLead: (leadId: string) => { headers: Record<string, string | string[] | undefined>; body: string };
 }> {
-    let hitCount = 0;
-    let headers: Record<string, string | string[] | undefined> = {};
-    let body = "";
+    const received: { click: string; headers: Record<string, string | string[] | undefined>; body: string }[] = [];
     const server = http.createServer((req, res) => {
-        hitCount++;
-        headers = req.headers;
+        const hit = { click: String(req.headers.click ?? ""), headers: req.headers, body: "" };
+        received.push(hit);
         const chunks: Buffer[] = [];
         req.on("data", c => chunks.push(c));
         req.on("end", () => {
-            body = Buffer.concat(chunks).toString("utf8");
+            hit.body = Buffer.concat(chunks).toString("utf8");
             res.setHeader("Connection", "close");
             res.end(JSON.stringify({ id: `sink-${randomUUID()}` }));
         });
@@ -41,14 +46,38 @@ async function startSink(): Promise<{
     await new Promise<void>(resolve => server.listen(0, resolve));
     const address = server.address();
     const port = typeof address === "object" && address ? address.port : 0;
+    const forLead = (leadId: string) => received.filter(h => h.click.endsWith(`/leads/${leadId}`));
     return {
         url: `http://127.0.0.1:${port}`,
         close: () => new Promise(resolve => server.close(() => resolve())),
-        lastHeaders: () => headers,
-        lastBody: () => body,
-        hits: () => hitCount,
+        hits: () => received.length,
+        hitsForLead: (leadId: string) => forLead(leadId).length,
+        lastForLead: (leadId: string) => {
+            const own = forLead(leadId);
+            assert.ok(own.length > 0, `no sink hit for lead ${leadId}`);
+            return own[own.length - 1];
+        },
     };
 }
+
+/**
+ * Diagnostic only: names any due PENDING LeadAlert row an earlier CI step
+ * left behind, so a cleanup leak shows up by lead name instead of as an
+ * unexplained extra delivery. Never fails the suite.
+ */
+before(async () => {
+    if (skip) return;
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        const stray = await db.leadAlert.findMany({
+            where: { status: "PENDING", nextAttemptAt: { lte: new Date() } },
+            select: { channel: true, createdAt: true, lead: { select: { id: true, name: true } } },
+        }).catch(() => []);
+        for (const row of stray) console.warn(`[front-desk-alerts-db] stray due PENDING ${row.channel} alert from an earlier step: lead ${row.lead.id} "${row.lead.name}", created ${row.createdAt.toISOString()}`);
+    } finally {
+        await db.$disconnect();
+    }
+});
 
 async function makeFrontDeskLead(db: PrismaClient, opts: { reasons: string[]; isTest: boolean; phone?: string }) {
     const client = await db.client.create({ data: { name: "Front Desk Caller", initials: "FD", primaryPhone: opts.phone ?? "+13605551234" } });
@@ -87,14 +116,13 @@ test("NTFY_URGENT: priority 5, ASCII [TEST]-prefixed title, phone masked to last
 
         const row = await db.leadAlert.findUnique({ where: { leadId_channel: { leadId: lead.id, channel: "NTFY_URGENT" } } });
         assert.equal(row?.status, "DELIVERED");
-        assert.equal(sink.hits(), 1);
+        assert.equal(sink.hitsForLead(lead.id), 1);
 
-        const headers = sink.lastHeaders();
+        const { headers, body } = sink.lastForLead(lead.id);
         assert.equal(headers.priority, "5");
         assert.equal(headers.title, "[TEST] Missed transfer - call back now");
         assert.match(String(headers.title), /^[\x20-\x7e]+$/, "the Title header value must be ASCII-safe");
 
-        const body = sink.lastBody();
         assert.match(body, /9876/, "the last 4 digits must appear");
         assert.doesNotMatch(body, /13605559876|3605559876|605559876/, "the full phone number must never appear on ntfy");
     } finally {
@@ -119,7 +147,7 @@ test("NTFY_URGENT: LIVE mode carries no [TEST] prefix", { skip }, async () => {
         leadId = lead.id; clientId = client.id;
         await db.leadAlert.create({ data: { id: randomUUID(), leadId: lead.id, channel: "NTFY_URGENT", status: "PENDING", isTest: false } });
         await deliverDueAlerts(db);
-        assert.equal(sink.lastHeaders().title, "Missed transfer - call back now");
+        assert.equal(sink.lastForLead(lead.id).headers.title, "Missed transfer - call back now");
     } finally {
         if (leadId) await cleanup(db, leadId, clientId);
         process.env.FRONT_DESK_URGENT_NTFY_TOPIC = originalTopic;
@@ -196,8 +224,9 @@ test("the ntfy title uses the §1 front-desk reason mapping, and 'Booking uncert
 
         const row = await db.leadAlert.findUnique({ where: { leadId_channel: { leadId: lead.id, channel: "NTFY" } } });
         assert.equal(row?.status, "DELIVERED");
-        assert.equal(sink.lastHeaders().title, "[TEST] Front desk: transferred");
-        assert.match(sink.lastBody(), /Booking uncertain, don't rebook/);
+        const { headers, body } = sink.lastForLead(lead.id);
+        assert.equal(headers.title, "[TEST] Front desk: transferred");
+        assert.match(body, /Booking uncertain, don't rebook/);
     } finally {
         if (leadId) await cleanup(db, leadId, clientId);
         process.env.SPEED_TO_LEAD_NTFY_TOPIC = originalTopic;
@@ -220,7 +249,7 @@ test("ntfy phone privacy: the body carries only the last 4 digits, never the ful
         leadId = lead.id; clientId = client.id;
         await db.leadAlert.create({ data: { id: randomUUID(), leadId: lead.id, channel: "NTFY", status: "PENDING", isTest: true } });
         await deliverDueAlerts(db);
-        const body = sink.lastBody();
+        const { body } = sink.lastForLead(lead.id);
         assert.match(body, /4321/);
         assert.doesNotMatch(body, /13605554321|3605554321|605554321/);
     } finally {
