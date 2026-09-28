@@ -1,20 +1,31 @@
 /**
- * Front Desk v1 acceptance tests 20, 22, 23, 24, 25, 26, 27 — against a REAL
- * PostgreSQL (SPEED_TO_LEAD_TEST_URL, same opt-in shape as the other
- * front-desk-*-db.test.ts files). Calendly itself is a counting fake over
- * `global.fetch` — nothing here reaches a real host.
+ * Front Desk v1 acceptance tests 7 (half), 8, 18, 19, 20, 22, 23, 24, 25, 26,
+ * 27 — against a REAL PostgreSQL (SPEED_TO_LEAD_TEST_URL, same opt-in shape
+ * as the other front-desk-*-db.test.ts files). Calendly itself is a counting
+ * fake over `global.fetch` — nothing here reaches a real host. Also covers
+ * Codex SHIP-BLOCKING finding #1 (round 1 review of PR #559).
  */
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 import { encryptObject } from "../src/lib/crypto";
-import { handleBookTool, pacificDayStartUtc } from "../src/lib/front-desk/booking";
+import { handleBookTool, handleAvailabilityTool, pacificDayStartUtc } from "../src/lib/front-desk/booking";
 import { pacificDateString, pacificTimeString } from "../src/lib/front-desk/constants";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-front-desk-booking-tests";
 process.env.FRONT_DESK_BOOKING = "ON";
 process.env.FRONT_DESK_TEST_INVITEE_DOMAINS = "example.test";
+// Codex SHIP-BLOCKING finding #1 (round 1 review of PR #559): a real
+// Calendly invitee POST can send the customer an email/calendar invite
+// Calendly controls, so it stays behind this SECOND gate
+// (`frontDeskBookingLiveSendVerified`), independent of FRONT_DESK_BOOKING,
+// until a verified no-send mechanism exists. This whole file deliberately
+// sets it ON, alongside FRONT_DESK_BOOKING, so the reservation/POST state
+// machine below — replay, caps, races — stays fully exercised for when it is
+// eventually re-enabled for real. The disabled-by-default behavior itself
+// (this flag left OFF) is proven separately, below.
+process.env.FRONT_DESK_BOOKING_LIVE_SEND = "ON";
 
 const databaseUrl = process.env.SPEED_TO_LEAD_TEST_URL;
 const skip = !databaseUrl && "set SPEED_TO_LEAD_TEST_URL to a disposable PostgreSQL URL";
@@ -29,6 +40,9 @@ let inviteeResponder: (requestBody: unknown) => { status: number; json?: unknown
     status: 201,
     json: { resource: { uri: `https://api.calendly.com/scheduled_events/x/invitees/${randomUUID()}` }, event: "https://api.calendly.com/scheduled_events/x", cancel_url: "https://calendly.com/cancel", reschedule_url: "https://calendly.com/reschedule" },
 });
+/** §2.1 availability tool (tests 7 half, 18, 19) — a counting fake over `/event_type_available_times`. */
+let availableTimesResponder: () => { status: number; json?: unknown } = () => ({ status: 200, json: { collection: [] } });
+let availableTimesCallCount = 0;
 
 function fakeResponse(status: number, json: unknown): Response {
     return new Response(JSON.stringify(json), { status, headers: { "content-type": "application/json" } });
@@ -61,6 +75,11 @@ before(async () => {
             const result = inviteeResponder(body);
             return fakeResponse(result.status, result.json ?? {});
         }
+        if (url.includes("/event_type_available_times")) {
+            availableTimesCallCount++;
+            const result = availableTimesResponder();
+            return fakeResponse(result.status, result.json ?? {});
+        }
         return fakeResponse(404, { message: "unhandled in test fake" });
     }) as typeof fetch;
 });
@@ -80,6 +99,8 @@ beforeEach(async () => {
         status: 201,
         json: { resource: { uri: `https://api.calendly.com/scheduled_events/x/invitees/${randomUUID()}` }, event: "https://api.calendly.com/scheduled_events/x", cancel_url: "https://calendly.com/cancel", reschedule_url: "https://calendly.com/reschedule" },
     });
+    availableTimesResponder = () => ({ status: 200, json: { collection: [] } });
+    availableTimesCallCount = 0;
     // The daily cap (§2.2 step 3.5) counts every active row created TODAY
     // across the WHOLE table — real, and shared by every test below in this
     // one file's run against one real Postgres. Without this, a test late in
@@ -338,6 +359,177 @@ test("acceptance test 27: 8 concurrent bookings (distinct callers/slots), cap 6 
     const capped = results.filter(r => r.kind === "not_booked" && (r as { reason: string }).reason === "daily_cap");
     assert.equal(succeeded.length, 6, JSON.stringify(results));
     assert.equal(capped.length, 2, JSON.stringify(results));
+});
+
+// ── Codex SHIP-BLOCKING finding #1 (round 1 review of PR #559) ────────────
+//
+// A real Calendly invitee POST sends the customer an email/calendar invite
+// Calendly itself controls — omitting text_reminder_number does not suppress
+// it. `frontDeskBookingLiveSendVerified` is a SECOND gate, independent of
+// FRONT_DESK_BOOKING, that must ALSO be explicitly ON before any POST is
+// attempted. This file otherwise sets it ON everywhere above so the
+// reservation/POST state machine stays fully proven; these tests are the one
+// place it is deliberately left at its real, safe default (OFF).
+
+test("Codex finding #1: with FRONT_DESK_BOOKING_LIVE_SEND unset (the real default), handleBookTool never calls Calendly — even with FRONT_DESK_BOOKING=ON — and makes zero FrontDeskBooking writes", { skip }, async () => {
+    const original = process.env.FRONT_DESK_BOOKING_LIVE_SEND;
+    delete process.env.FRONT_DESK_BOOKING_LIVE_SEND;
+    try {
+        const conversationId = `conv-${randomUUID()}`;
+        const slot = futureSlot(90);
+        await seedCallWithSlot(conversationId, { ...slot, offer: 1 });
+        const before = inviteePostCount;
+        const result = await handleBookTool(db, bookInput({
+            conversationId, slotId: slot.id,
+            confirmedDate: pacificDateString(new Date(slot.startTime)),
+            confirmedTime: pacificTimeString(new Date(slot.startTime)),
+        }));
+        assert.equal(result.kind, "not_booked");
+        assert.equal((result as { reason: string }).reason, "booking_disabled");
+        assert.equal((result as { mode?: string }).mode, "take_preferred_times");
+        assert.equal(inviteePostCount, before, "no Calendly POST may ever happen while the live-send gate is off");
+        const rows = await db.frontDeskBooking.findMany({ where: { conversationId } });
+        assert.deepEqual(rows, [], "no FrontDeskBooking row at all — the gate is checked before any reservation attempt");
+    } finally {
+        if (original === undefined) delete process.env.FRONT_DESK_BOOKING_LIVE_SEND;
+        else process.env.FRONT_DESK_BOOKING_LIVE_SEND = original;
+    }
+});
+
+test("Codex finding #1: FRONT_DESK_BOOKING_LIVE_SEND='off' (garbage/explicit-off) also disables booking", { skip }, async () => {
+    const original = process.env.FRONT_DESK_BOOKING_LIVE_SEND;
+    process.env.FRONT_DESK_BOOKING_LIVE_SEND = "off";
+    try {
+        const conversationId = `conv-${randomUUID()}`;
+        const slot = futureSlot(91);
+        await seedCallWithSlot(conversationId, { ...slot, offer: 1 });
+        const result = await handleBookTool(db, bookInput({
+            conversationId, slotId: slot.id,
+            confirmedDate: pacificDateString(new Date(slot.startTime)),
+            confirmedTime: pacificTimeString(new Date(slot.startTime)),
+        }));
+        assert.equal((result as { reason: string }).reason, "booking_disabled");
+    } finally {
+        if (original === undefined) delete process.env.FRONT_DESK_BOOKING_LIVE_SEND;
+        else process.env.FRONT_DESK_BOOKING_LIVE_SEND = original;
+    }
+});
+
+// ── Test 8: TEST-mode invitee-domain restriction ───────────────────────────
+
+test("acceptance test 8: in TEST, an invitee email outside FRONT_DESK_TEST_INVITEE_DOMAINS -> test_invitee_not_allowed, with no POST", { skip }, async () => {
+    const conversationId = `conv-${randomUUID()}`;
+    const slot = futureSlot(92);
+    await seedCallWithSlot(conversationId, { ...slot, offer: 1 });
+    const before = inviteePostCount;
+    const result = await handleBookTool(db, bookInput({
+        conversationId, slotId: slot.id,
+        confirmedDate: pacificDateString(new Date(slot.startTime)),
+        confirmedTime: pacificTimeString(new Date(slot.startTime)),
+        email: `not-allowed-${randomUUID()}@not-example.test`,
+        isTest: true,
+    }));
+    assert.equal(result.kind, "not_booked");
+    assert.equal((result as { reason: string }).reason, "test_invitee_not_allowed");
+    assert.equal(inviteePostCount, before);
+});
+
+test("acceptance test 8: in TEST, an invitee email ON the allowlist proceeds past the domain check", { skip }, async () => {
+    const conversationId = `conv-${randomUUID()}`;
+    const slot = futureSlot(93);
+    await seedCallWithSlot(conversationId, { ...slot, offer: 1 });
+    const result = await handleBookTool(db, bookInput({
+        conversationId, slotId: slot.id,
+        confirmedDate: pacificDateString(new Date(slot.startTime)),
+        confirmedTime: pacificTimeString(new Date(slot.startTime)),
+        email: `allowed-${randomUUID()}@example.test`,
+        isTest: true,
+    }));
+    assert.notEqual((result as { reason?: string }).reason, "test_invitee_not_allowed");
+});
+
+// ── Availability tool (tests 7 half, 18, 19) — zero prior coverage ─────────
+
+function availabilityInput(overrides: Partial<Parameters<typeof handleAvailabilityTool>[1]> = {}): Parameters<typeof handleAvailabilityTool>[1] {
+    return {
+        conversationId: `conv-${randomUUID()}`,
+        agentId: "agent_x",
+        isTest: true,
+        preferredDate: null,
+        partOfDay: null,
+        ...overrides,
+    };
+}
+
+test("acceptance test 18: available slots come back in Pacific (spoken/date/time), at most 3, correct across the PDT->PST fall-back", { skip }, async () => {
+    // 2026-11-01 02:00 Pacific is the fall-back instant; pick times either side of it.
+    const times = [
+        "2026-10-30T16:00:00.000Z", // 2026-10-30 09:00 PDT
+        "2026-10-30T17:00:00.000Z",
+        "2026-11-02T17:00:00.000Z", // 2026-11-02 09:00 PST (after fall-back)
+        "2026-11-02T18:00:00.000Z",
+    ];
+    availableTimesResponder = () => ({ status: 200, json: { collection: times.map(t => ({ status: "available", invitee_remaining: 1, start_time: t })) } });
+    const now = new Date("2026-10-25T12:00:00.000Z"); // inside the 7-day window for all four times above
+    const result = await handleAvailabilityTool(db, availabilityInput(), now);
+    assert.equal(result.status, "ok");
+    if (result.status !== "ok") return;
+    assert.ok(result.slots.length <= 3, "at most 3 slots per offer");
+    assert.equal(result.timezone, "America/Los_Angeles");
+    const first = result.slots[0];
+    assert.equal(first.date, "2026-10-30");
+    assert.equal(first.time, "09:00");
+    assert.match(first.spoken, /9:00\s*AM Pacific$/);
+});
+
+test("acceptance test 18: any Calendly availability failure -> take_preferred_times:calendly_unavailable, never slots", { skip }, async () => {
+    availableTimesResponder = () => ({ status: 500, json: { message: "outage" } });
+    const result = await handleAvailabilityTool(db, availabilityInput(), new Date());
+    assert.equal(result.status, "take_preferred_times");
+    assert.equal((result as { reason: string }).reason, "calendly_unavailable");
+});
+
+test("acceptance test 19: slot ids are never reused across re-offers in the same call; the 4th offer call -> offer_limit", { skip }, async () => {
+    // 4 available times per offer so each of the 3 offer calls gets a fresh, non-overlapping set.
+    availableTimesResponder = () => ({
+        status: 200,
+        json: {
+            collection: Array.from({ length: 4 }, (_, i) => ({
+                status: "available", invitee_remaining: 1,
+                start_time: new Date(Date.now() + (24 + i * 6) * 60 * 60 * 1000).toISOString(),
+            })),
+        },
+    });
+    const input = availabilityInput();
+    const now = new Date();
+
+    const offer1 = await handleAvailabilityTool(db, input, now);
+    assert.equal(offer1.status, "ok");
+    const offer2 = await handleAvailabilityTool(db, input, now);
+    assert.equal(offer2.status, "ok");
+    const offer3 = await handleAvailabilityTool(db, input, now);
+    assert.equal(offer3.status, "ok");
+
+    const allIds = [offer1, offer2, offer3].flatMap(r => (r.status === "ok" ? r.slots.map(s => s.slot_id) : []));
+    assert.equal(new Set(allIds).size, allIds.length, "no slot_id was reused across the 3 offer calls");
+
+    const offer4 = await handleAvailabilityTool(db, input, now);
+    assert.equal(offer4.status, "take_preferred_times");
+    assert.equal((offer4 as { reason: string }).reason, "offer_limit");
+});
+
+test("acceptance test 7 (half): FRONT_DESK_BOOKING off -> availability take_preferred_times:booking_off, no Calendly call", { skip }, async () => {
+    const original = process.env.FRONT_DESK_BOOKING;
+    process.env.FRONT_DESK_BOOKING = "OFF";
+    try {
+        const before = availableTimesCallCount;
+        const result = await handleAvailabilityTool(db, availabilityInput(), new Date());
+        assert.equal(result.status, "take_preferred_times");
+        assert.equal((result as { reason: string }).reason, "booking_off");
+        assert.equal(availableTimesCallCount, before);
+    } finally {
+        process.env.FRONT_DESK_BOOKING = original;
+    }
 });
 
 // ── pacificDayStartUtc ────────────────────────────────────────────────────

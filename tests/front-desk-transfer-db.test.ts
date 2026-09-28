@@ -1,13 +1,13 @@
 /**
- * Front Desk v1 acceptance tests 29, 30, 34, 35, 36 — against a REAL
- * PostgreSQL (SPEED_TO_LEAD_TEST_URL).
+ * Front Desk v1 acceptance tests 9 (half), 29, 30, 31 (part), 34, 35, 36 —
+ * against a REAL PostgreSQL (SPEED_TO_LEAD_TEST_URL).
  */
 import test, { before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
-import { handlePrepareTransferTool, resolveActionStep, resolveScreenResult, runFrontDeskSweeps } from "../src/lib/front-desk/transfer";
-import { FRONT_DESK_SWEEP_DIALING_MISS_MS, FRONT_DESK_TRANSFER_PREPARED_TTL_MS } from "../src/lib/front-desk/constants";
+import { handlePrepareTransferTool, resolveActionStep, resolveScreenResult, resolveInboundBridgeClaim, runFrontDeskSweeps } from "../src/lib/front-desk/transfer";
+import { FRONT_DESK_SWEEP_DIALING_MISS_MS, FRONT_DESK_SWEEP_CONNECTED_STALE_MS, FRONT_DESK_TRANSFER_PREPARED_TTL_MS } from "../src/lib/front-desk/constants";
 
 const databaseUrl = process.env.SPEED_TO_LEAD_TEST_URL;
 const skip = !databaseUrl && "set SPEED_TO_LEAD_TEST_URL to a disposable PostgreSQL URL";
@@ -102,7 +102,7 @@ test("acceptance test 30: two conversations prepare concurrently -> exactly one 
     assert.equal(busy.length, 1);
 });
 
-test("a stale PREPARED row older than 60s does not block a new prepare", { skip }, async () => {
+test("a stale PREPARED row older than 60s does not block a new prepare, and Codex finding #2: it gets the same missed-transfer alert as a real MISSED transition", { skip }, async () => {
     const staleConv = conv();
     await db.frontDeskTransfer.create({
         data: {
@@ -116,6 +116,10 @@ test("a stale PREPARED row older than 60s does not block a new prepare", { skip 
     assert.equal(result.kind, "transfer_ready");
     const stale = await db.frontDeskTransfer.findUniqueOrThrow({ where: { conversationId: staleConv } });
     assert.equal(stale.status, "EXPIRED");
+    assert.ok(stale.leadId, "an expired-on-cleanup PREPARED row must not vanish silently — it needs a lead + alert same as a real miss");
+    createdLeadIds.push(stale.leadId!);
+    const alerts = await db.leadAlert.findMany({ where: { leadId: stale.leadId! } });
+    assert.equal(alerts.filter(a => a.channel === "NTFY_URGENT").length, 1);
 });
 
 test("preparing twice for the SAME conversation -> already_transferred", { skip }, async () => {
@@ -257,7 +261,37 @@ test("sweep: an accepted DIALING row is left alone until 4 hours", { skip }, asy
     assert.equal(swept.status, "DIALING", "an accepted call stays DIALING until 4h, not swept early");
 });
 
-test("sweep: a PREPARED row older than 60s -> EXPIRED, no alert", { skip }, async () => {
+// Codex SHIP-BLOCKING finding #3 (round 1 review of PR #559): pressing 1
+// (screenAcceptedAt) is not confirmed bridge evidence — if the `action`
+// callback never arrives, the sweep must not guess CONNECTED. It resolves
+// MISSED and alerts, same as every other unconfirmed-connection case.
+test("sweep: an accepted DIALING row past 4 hours with NO action callback -> MISSED + alert, never CONNECTED on an unconfirmed guess", { skip }, async () => {
+    const sweepNow = new Date(WITHIN_HOURS.getTime() + 10_000);
+    const staleAccepted = await db.frontDeskTransfer.create({
+        data: {
+            id: randomUUID(), conversationId: conv(), status: "DIALING", isTest: true,
+            callerName: "Stale Accepted", callbackPhoneE164: "+13605550144", city: "X", project: "Y",
+            bridgeCallSid: `CA-${randomUUID()}`,
+            dialStartedAt: new Date(sweepNow.getTime() - FRONT_DESK_SWEEP_CONNECTED_STALE_MS - 5000),
+            screenAcceptedAt: new Date(sweepNow.getTime() - FRONT_DESK_SWEEP_CONNECTED_STALE_MS - 5000),
+        },
+    });
+
+    await runFrontDeskSweeps(sweepNow, db);
+
+    const swept = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: staleAccepted.id } });
+    assert.equal(swept.status, "MISSED");
+    assert.equal(swept.reason, "no-action-callback");
+    assert.ok(swept.leadId, "an unconfirmed connection must alert staff, same as any other miss");
+    createdLeadIds.push(swept.leadId!);
+    const alerts = await db.leadAlert.findMany({ where: { leadId: swept.leadId! } });
+    assert.equal(alerts.filter(a => a.channel === "NTFY_URGENT").length, 1);
+});
+
+// Codex SHIP-BLOCKING finding #2 (round 1 review of PR #559): a PREPARED
+// row the sweep expires is this caller's LAST safety net if the post-call
+// webhook never arrives — it must alert, not vanish silently.
+test("sweep: a PREPARED row older than 60s -> EXPIRED, alerted (same safety net as any other miss)", { skip }, async () => {
     const sweepNow = new Date(WITHIN_HOURS.getTime() + 10_000);
     const stalePrepared = await db.frontDeskTransfer.create({
         data: {
@@ -271,5 +305,88 @@ test("sweep: a PREPARED row older than 60s -> EXPIRED, no alert", { skip }, asyn
 
     const swept = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: stalePrepared.id } });
     assert.equal(swept.status, "EXPIRED");
-    assert.equal(swept.leadId, null, "an expired PREPARED row is never alerted");
+    assert.ok(swept.leadId, "an expired PREPARED row must now be alerted (Codex finding #2)");
+    createdLeadIds.push(swept.leadId!);
+    const alerts = await db.leadAlert.findMany({ where: { leadId: swept.leadId! } });
+    assert.equal(alerts.filter(a => a.channel === "NTFY_URGENT").length, 1);
+});
+
+// ── resolveInboundBridgeClaim (test 31 part, test 9 half) — no prior test in
+// this repo called this function at all; the coverage below also proves
+// Codex SHIP-BLOCKING finding #4 (round 1 review of PR #559). ─────────────
+
+async function cleanupBridgeCallSid(callSid: string): Promise<void> {
+    await db.frontDeskTransfer.deleteMany({ where: { bridgeCallSid: callSid } }).catch(() => undefined);
+}
+
+test("resolveInboundBridgeClaim: no PREPARED row -> reject; retrying the SAME CallSid still rejects even if a DIFFERENT caller becomes PREPARED in between", { skip }, async () => {
+    const callSid = `CA-unmatched-${randomUUID()}`;
+    try {
+        const first = await resolveInboundBridgeClaim(db, callSid, WITHIN_HOURS);
+        assert.equal(first.kind, "reject");
+
+        // A genuinely different caller becomes PREPARED before the retry —
+        // Codex finding #4: without a persisted decision for `callSid`, the
+        // retry below could claim THIS transfer and steal it.
+        const c = conv();
+        const prepared = await handlePrepareTransferTool(db, prepareInput(c), WITHIN_HOURS);
+        assert.equal(prepared.kind, "transfer_ready");
+
+        const retry = await resolveInboundBridgeClaim(db, callSid, new Date(WITHIN_HOURS.getTime() + 1000));
+        assert.equal(retry.kind, "reject", "a replayed reject must stay a reject, never claim an unrelated later transfer");
+
+        // The genuinely new transfer must still be claimable by ITS OWN real CallSid.
+        const realCallSid = `CA-real-${randomUUID()}`;
+        const realClaim = await resolveInboundBridgeClaim(db, realCallSid, new Date(WITHIN_HOURS.getTime() + 2000));
+        assert.equal(realClaim.kind, "claimed", "the real caller's own inbound request must still be able to claim their transfer");
+        if (realClaim.kind === "claimed") await cleanupBridgeCallSid(realCallSid);
+    } finally {
+        await cleanupBridgeCallSid(callSid);
+    }
+});
+
+test("resolveInboundBridgeClaim: a PREPARED row is claimed; retrying the SAME CallSid returns the SAME transferId as 'retry', not a fresh claim", { skip }, async () => {
+    const c = conv();
+    const prepared = await handlePrepareTransferTool(db, prepareInput(c), WITHIN_HOURS);
+    assert.equal(prepared.kind, "transfer_ready");
+    const callSid = `CA-claim-${randomUUID()}`;
+    try {
+        const claim = await resolveInboundBridgeClaim(db, callSid, WITHIN_HOURS);
+        assert.equal(claim.kind, "claimed");
+        const transferId = claim.kind === "claimed" ? claim.transferId : null;
+
+        const retry = await resolveInboundBridgeClaim(db, callSid, new Date(WITHIN_HOURS.getTime() + 500));
+        assert.equal(retry.kind, "retry");
+        assert.equal(retry.kind === "retry" ? retry.transferId : null, transferId, "a retry must re-emit TwiML for the SAME transfer, never claim a different one");
+    } finally {
+        await cleanupBridgeCallSid(callSid);
+    }
+});
+
+test("resolveInboundBridgeClaim: claiming while Richard's switch is off -> reject, row EXPIRED reason richard-unavailable-at-claim, and (Codex finding #2) alerted", { skip }, async () => {
+    const c = conv();
+    const prepared = await handlePrepareTransferTool(db, prepareInput(c), WITHIN_HOURS);
+    assert.equal(prepared.kind, "transfer_ready");
+
+    await db.companySettings.update({ where: { id: "singleton" }, data: { frontDeskTakingTransfers: false } });
+    const callSid = `CA-unavailable-${randomUUID()}`;
+    try {
+        const claim = await resolveInboundBridgeClaim(db, callSid, WITHIN_HOURS);
+        assert.equal(claim.kind, "reject");
+
+        const row = await db.frontDeskTransfer.findUniqueOrThrow({ where: { bridgeCallSid: callSid } });
+        assert.equal(row.status, "EXPIRED");
+        assert.equal(row.reason, "richard-unavailable-at-claim");
+        assert.ok(row.leadId, "a caller Twilio already dialed the bridge for must be alerted when the claim itself fails");
+        createdLeadIds.push(row.leadId!);
+        const alerts = await db.leadAlert.findMany({ where: { leadId: row.leadId! } });
+        assert.equal(alerts.filter(a => a.channel === "NTFY_URGENT").length, 1);
+
+        // Idempotent retry: still rejects, does not re-attempt a claim.
+        const retry = await resolveInboundBridgeClaim(db, callSid, new Date(WITHIN_HOURS.getTime() + 500));
+        assert.equal(retry.kind, "reject");
+    } finally {
+        await cleanupBridgeCallSid(callSid);
+        await db.companySettings.update({ where: { id: "singleton" }, data: { frontDeskTakingTransfers: true } });
+    }
 });

@@ -147,6 +147,34 @@ jobs:
           SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
           NEXTAUTH_SECRET: test-secret-for-front-desk-reconcile-tests
 
+      # Round-2 fixes (acceptance test 3): the bridge-twiml route's own
+      # Twilio-signature/AccountSid/From/To checks, against the REAL route
+      # handler — zero prior test invoked that route at all. Same ordering
+      # reason as the Front Desk steps above (must run before the known-red
+      # migration-match assertion below).
+      - name: Front Desk v1 bridge-twiml route signature and account checks against real Postgres
+        run: npx tsx --test tests/front-desk-bridge-twiml-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # Round-2 fixes (acceptance test 10): the post-call route's own
+      # type/agent_id ignore branch, against the REAL route handler — the
+      # existing post-call tests only exercise processPostCallInTx directly.
+      - name: Front Desk v1 post-call route ignore-branch against real Postgres
+        run: npx tsx --test tests/front-desk-post-call-route-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # Round-2 fixes (acceptance tests 14, 37): NTFY_URGENT delivery
+      # (priority 5, [TEST] prefix, missing-topic DEAD, paused SKIPPED) and
+      # front-desk card/ntfy rendered content (reason-mapped titles, booking-
+      # uncertain body text, phone-digit masking) — zero prior test
+      # referenced NTFY_URGENT at all.
+      - name: Front Desk v1 NTFY_URGENT delivery and card content against real Postgres
+        run: npx tsx --test tests/front-desk-alerts-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # THE APPLY SCRIPT ITSELF, run twice for idempotency — `migrate deploy`
       # above already brought this database to the final shape, so this
       # proves apply-front-desk.mjs's own statements and verifyShape() are

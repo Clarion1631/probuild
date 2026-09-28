@@ -6,7 +6,10 @@
  */
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { decryptObject } from "@/lib/crypto";
-import { FRONT_DESK_CALENDLY_AVAILABILITY_TIMEOUT_MS, FRONT_DESK_CALENDLY_POST_TIMEOUT_MS, FRONT_DESK_CALENDLY_TOKEN_CHECK_TIMEOUT_MS, FRONT_DESK_PACIFIC_TZ } from "./constants";
+import {
+    FRONT_DESK_CALENDLY_AVAILABILITY_TIMEOUT_MS, FRONT_DESK_CALENDLY_POST_TIMEOUT_MS, FRONT_DESK_CALENDLY_TOKEN_CHECK_TIMEOUT_MS, FRONT_DESK_PACIFIC_TZ,
+    frontDeskBookingLiveSendVerified,
+} from "./constants";
 
 type Db = PrismaClient | Prisma.TransactionClient;
 
@@ -115,14 +118,24 @@ export type CreateInviteeOutcome =
     | { kind: "plan" }
     | { kind: "rate_limited" }
     /** timeout, network error, or 5xx — §2.2's table maps every one of these to UNCERTAIN. */
-    | { kind: "uncertain" };
+    | { kind: "uncertain" }
+    /** Codex SHIP-BLOCKING finding #1: the live-send gate (`frontDeskBookingLiveSendVerified`) isn't on — no request was made. */
+    | { kind: "disabled" };
 
 /**
  * §2.2 step 4: never sends `text_reminder_number`, `event_guests` or
  * `questions_and_answers` (P§4) — the body below is the complete, fixed
  * shape, not assembled from caller-supplied extras.
+ *
+ * Codex SHIP-BLOCKING finding #1 (round 1 review of PR #559): this is the
+ * ONLY place in the codebase that can create a real Calendly invitee, so the
+ * live-send gate is enforced here, first, before any network access — never
+ * relying solely on `handleBookTool`'s own earlier check. Both must agree
+ * for a real POST to ever leave this process.
  */
 export async function createInvitee(token: string, params: CreateInviteeParams): Promise<CreateInviteeOutcome> {
+    if (!frontDeskBookingLiveSendVerified()) return { kind: "disabled" };
+
     const body = {
         event_type: params.eventTypeUri,
         start_time: params.startTimeIso,

@@ -68,9 +68,19 @@ export async function handlePrepareTransferTool(db: PrismaClient, input: Prepare
 
     try {
         await db.$transaction(async tx => {
-            await tx.$executeRaw`
+            // Codex SHIP-BLOCKING finding #2 (round 1 review of PR #559):
+            // this cleanup silently dropped its own caller with no alert and
+            // no lead — the post-call webhook is this call's only remaining
+            // safety net, and if it never arrives (agent crash, delivery
+            // failure) that caller vanishes with zero trace. Every row this
+            // expires gets the same missed-transfer alert a real MISSED
+            // transition gets; `RETURNING id` is what lets us know which
+            // rows to alert for without a second read.
+            const expiredRows = await tx.$queryRaw<{ id: string }[]>`
                 UPDATE "FrontDeskTransfer" SET status = 'EXPIRED', "resolvedAt" = now(), reason = 'stale-prepared'
-                WHERE status = 'PREPARED' AND "preparedAt" < ${new Date(now.getTime() - FRONT_DESK_TRANSFER_PREPARED_TTL_MS)}`;
+                WHERE status = 'PREPARED' AND "preparedAt" < ${new Date(now.getTime() - FRONT_DESK_TRANSFER_PREPARED_TTL_MS)}
+                RETURNING id`;
+            for (const row of expiredRows) await sendMissedTransferAlert(tx, row.id);
 
             await tx.frontDeskTransfer.create({
                 data: {
@@ -128,15 +138,70 @@ export async function resolveInboundBridgeClaim(db: PrismaClient, callSid: strin
             )
             RETURNING id`;
         const claimedId = rows[0]?.id;
-        if (!claimedId) return { kind: "reject" as const };
+        if (!claimedId) {
+            // Codex SHIP-BLOCKING finding #4 (round 1 review of PR #559): an
+            // unmatched inbound request left NO record of this CallSid's
+            // decision. A Twilio retry of the SAME request (its response was
+            // lost in transit, not a real failure) re-ran this whole
+            // function with nothing to find via the `existing` lookup above
+            // — if a DIFFERENT caller had since become PREPARED, the retry
+            // would claim THEIR transfer and stamp this stale CallSid onto
+            // it, silently stealing it from its real inbound webhook (which
+            // would then find no eligible row and reject THAT caller). Every
+            // authenticated CallSid's decision must be persisted so a retry
+            // is idempotent — see persistUnmatchedInboundReject.
+            await persistUnmatchedInboundReject(tx, callSid, now);
+            return { kind: "reject" as const };
+        }
 
         const settings = await tx.companySettings.findUnique({ where: { id: "singleton" }, select: { frontDeskTakingTransfers: true } });
         if (!settings?.frontDeskTakingTransfers) {
             await tx.frontDeskTransfer.update({ where: { id: claimedId }, data: { status: "EXPIRED", resolvedAt: now, reason: "richard-unavailable-at-claim" } });
+            // Codex SHIP-BLOCKING finding #2: same reasoning as the
+            // stale-PREPARED cleanup above — this caller was mid-transfer
+            // (Twilio already dialed the bridge) when it failed, so it needs
+            // the same safety net a real MISSED transition gets.
+            await sendMissedTransferAlert(tx, claimedId);
             return { kind: "reject" as const };
         }
         return { kind: "claimed" as const, transferId: claimedId };
     });
+}
+
+/**
+ * Codex SHIP-BLOCKING finding #4: persists an unmatched inbound CallSid's
+ * reject decision, keyed by the SAME unique `bridgeCallSid` column the
+ * claimed path already uses, so a retry finds it via `resolveInboundBridgeClaim`'s
+ * `existing` lookup and never re-attempts a claim. This row is created
+ * already EXPIRED with synthetic caller data — it is not a real call, never
+ * participates in the one-active-transfer partial index (that only covers
+ * PREPARED/DIALING), and never surfaces on the settings page (which only
+ * queries PREPARED/DIALING for "active transfer"). A concurrent duplicate
+ * write for the SAME CallSid (two overlapping retries) is fine to lose the
+ * unique-violation race on — the other write already recorded the decision,
+ * which is all this function exists to do.
+ */
+async function persistUnmatchedInboundReject(tx: Prisma.TransactionClient, callSid: string, now: Date): Promise<void> {
+    try {
+        await tx.frontDeskTransfer.create({
+            data: {
+                id: randomUUID(),
+                conversationId: `reject:${callSid}`,
+                status: "EXPIRED",
+                isTest: false,
+                callerName: "",
+                callbackPhoneE164: "",
+                city: "",
+                project: "",
+                spanish: false,
+                bridgeCallSid: callSid,
+                resolvedAt: now,
+                reason: "bridge-unmatched",
+            },
+        });
+    } catch (err) {
+        if (!isUniqueViolation(err)) throw err;
+    }
 }
 
 /** §3.2 step "screen": the row `t` must be DIALING, and `ParentCallSid` (when present) must equal `bridgeCallSid`. */
@@ -232,25 +297,53 @@ async function sendMissedTransferAlert(tx: Prisma.TransactionClient, transferId:
 async function sweepTransfers(now: Date, db: PrismaClient): Promise<number> {
     let count = 0;
 
-    const expiredPrepared = await db.frontDeskTransfer.updateMany({
+    // Codex SHIP-BLOCKING finding #2: same "no caller left silently
+    // stranded" reasoning as handlePrepareTransferTool's own stale-PREPARED
+    // cleanup — this is the sweep's copy of that same cleanup, so it needs
+    // the same per-row alert rather than a single bulk update.
+    const stalePrepared = await db.frontDeskTransfer.findMany({
         where: { status: "PREPARED", preparedAt: { lt: new Date(now.getTime() - FRONT_DESK_TRANSFER_PREPARED_TTL_MS) } },
-        data: { status: "EXPIRED", resolvedAt: now, reason: "stale-prepared" },
+        select: { id: true },
     });
-    count += expiredPrepared.count;
+    for (const row of stalePrepared) {
+        const swept = await db.$transaction(async tx => {
+            const updated = await tx.frontDeskTransfer.updateMany({
+                where: { id: row.id, status: "PREPARED" },
+                data: { status: "EXPIRED", resolvedAt: now, reason: "stale-prepared" },
+            });
+            if (updated.count > 0) await sendMissedTransferAlert(tx, row.id);
+            return updated.count;
+        });
+        count += swept;
+    }
 
-    // An accepted call keeps the row DIALING until the Dial ends, and that
-    // correctly keeps other transfers `busy` too — only reclassified as
-    // CONNECTED (no alert) once it has clearly run its course.
+    // Codex SHIP-BLOCKING finding #3 (round 1 review of PR #559): pressing 1
+    // (screenAcceptedAt) only proves Richard interacted with the screen
+    // Gather — it is NOT confirmed bridge evidence. That's `DialBridged`,
+    // set only by resolveActionStep, which always moves the row off DIALING
+    // when it runs — so if this row is STILL DIALING this long after
+    // acceptance, the `action` callback never arrived and we have no
+    // evidence the parties ever actually connected (the TwiML response
+    // could have failed, or the caller could have disconnected before the
+    // bridge held). Resolve on the safe side, same as every other
+    // unconfirmed-connection case in this file: MISSED, alerted — never
+    // CONNECTED on an unconfirmed guess. An accepted call still keeps the
+    // row DIALING (and other transfers correctly `busy`) for up to this
+    // long, so a real, long call is never swept prematurely.
     const staleAccepted = await db.frontDeskTransfer.findMany({
         where: { status: "DIALING", screenAcceptedAt: { lt: new Date(now.getTime() - FRONT_DESK_SWEEP_CONNECTED_STALE_MS) } },
         select: { id: true },
     });
     for (const row of staleAccepted) {
-        const updated = await db.frontDeskTransfer.updateMany({
-            where: { id: row.id, status: "DIALING" },
-            data: { status: "CONNECTED", resolvedAt: now, reason: "no-action-callback" },
+        const swept = await db.$transaction(async tx => {
+            const updated = await tx.frontDeskTransfer.updateMany({
+                where: { id: row.id, status: "DIALING" },
+                data: { status: "MISSED", resolvedAt: now, reason: "no-action-callback" },
+            });
+            if (updated.count > 0) await sendMissedTransferAlert(tx, row.id);
+            return updated.count;
         });
-        count += updated.count;
+        count += swept;
     }
 
     // Covers a caller or ElevenLabs hanging up before Twilio's `action` ever arrives.

@@ -36,6 +36,22 @@ export function frontDeskBookingEnabled(env: NodeJS.ProcessEnv = process.env): b
     return (env.FRONT_DESK_BOOKING ?? "").trim().toUpperCase() === "ON";
 }
 
+/**
+ * Codex SHIP-BLOCKING finding #1 (round 1 review of PR #559): omitting
+ * `text_reminder_number` from the Calendly invitee POST does not suppress
+ * Calendly's own standard notifications/workflows, so a real `createInvitee`
+ * call sends the customer an email/calendar invite Calendly controls, not
+ * ProBuild — a live-send path `FRONT_DESK_BOOKING=ON` alone was never meant
+ * to unlock (P§7's "booking gate" is a separate decision). This is a SECOND,
+ * independent gate on top of `frontDeskBookingEnabled` — both must be true
+ * before `handleBookTool` ever calls Calendly's `/invitees` endpoint. It
+ * stays OFF until Richard/Justin verify a no-send booking mechanism (e.g. a
+ * Calendly event configured with notifications off) and deliberately set it.
+ */
+export function frontDeskBookingLiveSendVerified(env: NodeJS.ProcessEnv = process.env): boolean {
+    return (env.FRONT_DESK_BOOKING_LIVE_SEND ?? "").trim().toUpperCase() === "ON";
+}
+
 /** §4: the fixed miss line on the bridge — off by default (test #1 result B only). */
 export function frontDeskMissLineEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
     return (env.FRONT_DESK_MISS_LINE ?? "").trim().toUpperCase() === "ON";

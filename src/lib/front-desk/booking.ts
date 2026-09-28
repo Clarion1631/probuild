@@ -12,7 +12,7 @@ import {
     FRONT_DESK_MAX_SLOTS_PER_OFFER, FRONT_DESK_SLOT_TTL_MS, FRONT_DESK_BOOK_REPLAY_POLL_MS,
     FRONT_DESK_BOOK_REPLAY_WAIT_MS, FRONT_DESK_RECONCILE_SUBMITTING_MIN_AGE_MS, FRONT_DESK_RECONCILE_MAX_AGE_MS,
     FRONT_DESK_RECONCILE_RETRY_COOLDOWN_MS, FRONT_DESK_RECONCILE_ABSENT_GRACE_MS,
-    frontDeskBookingEnabled, frontDeskTestInviteeDomains, pacificDateString, pacificTimeString, pacificSpoken, pacificParts,
+    frontDeskBookingEnabled, frontDeskBookingLiveSendVerified, frontDeskTestInviteeDomains, pacificDateString, pacificTimeString, pacificSpoken, pacificParts,
 } from "./constants";
 import { loadFrontDeskCalendlyConfig, getAvailableTimes, createInvitee, listScheduledEvents, listScheduledEventInvitees, type CreateInviteeOutcome } from "./calendly";
 
@@ -138,7 +138,7 @@ export async function handleAvailabilityTool(db: PrismaClient, input: Availabili
 // ── §2.2 book tool ───────────────────────────────────────────────────────
 
 export type BookNotBookedReason =
-    | "front_desk_off" | "booking_off" | "not_configured" | "test_invitee_not_allowed"
+    | "front_desk_off" | "booking_off" | "booking_disabled" | "not_configured" | "test_invitee_not_allowed"
     | "readback_incomplete" | "readback_mismatch" | "invalid_email" | "invalid_phone"
     | "slot_unknown" | "slot_expired" | "slot_taken"
     | "already_booked" | "daily_cap" | "too_many_attempts"
@@ -171,6 +171,12 @@ function requiredFieldsPresent(input: BookToolInput): boolean {
 
 export async function handleBookTool(db: PrismaClient, input: BookToolInput, now: Date = new Date()): Promise<BookOutcome> {
     if (!frontDeskBookingEnabled()) return { kind: "not_booked", reason: "booking_off", mode: "take_preferred_times" };
+    // Codex SHIP-BLOCKING finding #1 (round 1 review of PR #559): a second,
+    // independent gate on top of `frontDeskBookingEnabled` — see its doc
+    // comment. Checked before any DB access (same shape as the OFF check
+    // above), so a live-send-unverified deployment never even creates a
+    // FrontDeskBooking row for an attempt that can't complete.
+    if (!frontDeskBookingLiveSendVerified()) return { kind: "not_booked", reason: "booking_disabled", mode: "take_preferred_times" };
     if (!requiredFieldsPresent(input) || input.readbackConfirmed !== true) {
         return { kind: "not_booked", reason: "readback_incomplete" };
     }
@@ -302,6 +308,13 @@ async function applyBookingOutcome(db: PrismaClient, rowId: string, result: Crea
     if (result.kind === "rate_limited") {
         await db.frontDeskBooking.updateMany({ where: { id: rowId, status: "SUBMITTING" }, data: { status: "NOT_BOOKED", reason: "rate_limited", resolvedAt: now } });
         return { kind: "not_booked", reason: "rate_limited" };
+    }
+    if (result.kind === "disabled") {
+        // Belt-and-braces: handleBookTool's own gate already returns before
+        // reaching here, so this only fires if some future call site skips
+        // that check — never leave a reserved row stuck in SUBMITTING.
+        await db.frontDeskBooking.updateMany({ where: { id: rowId, status: "SUBMITTING" }, data: { status: "NOT_BOOKED", reason: "booking_disabled", resolvedAt: now } });
+        return { kind: "not_booked", reason: "booking_disabled", mode: "take_preferred_times" };
     }
     // uncertain: timeout, network error, or 5xx.
     await db.frontDeskBooking.updateMany({ where: { id: rowId, status: "SUBMITTING" }, data: { status: "UNCERTAIN" } });
