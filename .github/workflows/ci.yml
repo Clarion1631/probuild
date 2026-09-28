@@ -117,6 +117,41 @@ jobs:
         env:
           SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # Front Desk v1 (PB-frontdesk-001) — stacked on Speed-to-Lead v1a,
+      # same reasoning as the three steps above: `migrate deploy` has already
+      # applied this feature's migration, and these steps must run BEFORE
+      # "Assert the result matches production's shape" below, which is
+      # EXPECTED to fail on this PR until Justin's J3 (apply to prod) and
+      # re-snapshot prisma/prisma-blind-spots.json — see the PR description
+      # and docs/plans/FRONT-DESK-V1.md §5's note. Every step after that
+      # assertion is consequently skipped on this PR's CI run.
+      - name: Front Desk v1 post-call webhook races against real Postgres
+        run: npx tsx --test tests/front-desk-post-call-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      - name: Front Desk v1 booking state machine and reservation races against real Postgres
+        run: npx tsx --test tests/front-desk-booking-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          NEXTAUTH_SECRET: test-secret-for-front-desk-booking-tests
+
+      - name: Front Desk v1 transfer bridge state machine and sweep against real Postgres
+        run: npx tsx --test tests/front-desk-transfer-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # THE APPLY SCRIPT ITSELF, run twice for idempotency — `migrate deploy`
+      # above already brought this database to the final shape, so this
+      # proves apply-front-desk.mjs's own statements and verifyShape() are
+      # correct, not just the committed migration.sql.
+      - name: Front Desk v1 apply script — idempotent against real Postgres
+        run: |
+          node scripts/apply-front-desk.mjs --target ci --yes --expect-db probuild_migrations --expect-host localhost
+          node scripts/apply-front-desk.mjs --target ci --yes --expect-db probuild_migrations --expect-host localhost
+        env:
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       # The schema gap the baseline recorded is now closed by
       # 20260814120000_missing_fk_indexes, so `migrate deploy` above already
       # produces the final shape and there is no separate gap file to apply.

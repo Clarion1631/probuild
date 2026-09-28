@@ -32,6 +32,7 @@ const ACTION_MODULES = [
     "src/lib/time-expense-actions.ts",
     "src/lib/receipt-intake/suggestion-actions.ts",
     "src/lib/speed-to-lead-actions.ts",
+    "src/lib/front-desk-actions.ts",
 ];
 
 /**

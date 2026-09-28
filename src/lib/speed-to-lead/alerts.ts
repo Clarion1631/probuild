@@ -106,14 +106,38 @@ function leadUrl(leadId: string): string {
     return `${base}/leads/${leadId}`;
 }
 
+/**
+ * Front Desk v1 (PB-frontdesk-001) §1 "Feeding v1a" — a card/ntfy title for
+ * a front-desk-sourced lead, keyed off the FIRST matching reason (the
+ * precedence order of §1's outcome table). `null` for every non-front-desk
+ * lead, so v1a's own titles are unaffected.
+ */
+const FRONT_DESK_REASON_TITLES: ReadonlyArray<[TriageReason, string]> = [
+    ["front-desk-booked", "Front desk: booked"],
+    ["front-desk-transferred", "Front desk: transferred"],
+    ["front-desk-missed-transfer", "Front desk: missed transfer"],
+    ["front-desk-transfer-pending", "Front desk: call"],
+    ["front-desk-existing-client", "Front desk: existing client"],
+    ["front-desk-message", "Front desk: message"],
+];
+
+function frontDeskTitle(reasons: readonly TriageReason[]): string | null {
+    for (const [reason, title] of FRONT_DESK_REASON_TITLES) {
+        if (reasons.includes(reason)) return title;
+    }
+    return null;
+}
+
 function ntfyContent(ctx: AlertLeadContext, isTest: boolean): { title: string; body: string; priority: string } {
     const audience = alertAudience(ctx.verdict ?? "REVIEW", ctx.reasons, isTest);
+    const bookingUncertain = ctx.reasons.includes("front-desk-booking-uncertain");
     const parts = [
         `${ctx.firstName}`,
         ctx.city ? `${ctx.city}` : null,
         ctx.projectScope ? `${ctx.projectScope}` : null,
         ctx.verdict ? `verdict: ${ctx.verdict}` : null,
         ctx.lastFourPhone ? `phone ending ${ctx.lastFourPhone}` : null,
+        bookingUncertain ? "Booking uncertain, don't rebook" : null,
     ].filter(Boolean);
     // ASCII only — this becomes the `Title` HTTP header value, and fetch()
     // throws synchronously on a non-Latin1 header (an em dash is outside
@@ -122,16 +146,23 @@ function ntfyContent(ctx: AlertLeadContext, isTest: boolean): { title: string; b
     // "network-or-timeout", so this is a real fix, not just cosmetic —
     // every REVIEW-verdict ntfy push would otherwise fail every attempt,
     // forever, until it went DEAD.
-    const title = isTest ? "[TEST] New lead" : ctx.verdict === "REAL" ? "New web lead" : "New lead - needs review";
+    const frontDesk = frontDeskTitle(ctx.reasons);
+    const title = isTest
+        ? `[TEST] ${frontDesk ?? "New lead"}`
+        : frontDesk ?? (ctx.verdict === "REAL" ? "New web lead" : "New lead - needs review");
     return { title, body: parts.join(" · "), priority: audience.ntfyPriority === "2" ? NTFY_PRIORITY_SPAM_SIGNAL : NTFY_PRIORITY_DEFAULT };
 }
 
 function chatCardText(ctx: AlertLeadContext, isTest: boolean): string {
-    const label = isTest
-        ? "[TEST] not a customer"
-        : ctx.verdict === "REVIEW" && ctx.reasons.length > 0
-            ? `Needs review: ${ctx.reasons.join(", ")}`
-            : null;
+    const bookingUncertain = ctx.reasons.includes("front-desk-booking-uncertain");
+    const missedTransfer = ctx.reasons.includes("front-desk-missed-transfer");
+    const label = missedTransfer
+        ? "MISSED TRANSFER, call back now"
+        : isTest
+            ? "[TEST] not a customer"
+            : ctx.verdict === "REVIEW" && ctx.reasons.length > 0
+                ? `Needs review: ${ctx.reasons.join(", ")}`
+                : null;
     const lines = [
         `📞 *New lead${label ? ` — ${label}` : ""}*`,
         "",
@@ -142,6 +173,7 @@ function chatCardText(ctx: AlertLeadContext, isTest: boolean): string {
         ctx.projectScope ? `Scope: ${ctx.projectScope}` : null,
         ctx.verdict ? `Verdict: ${ctx.verdict}` : null,
         ctx.messageExcerpt ? `Message: ${ctx.messageExcerpt}` : null,
+        bookingUncertain ? "Booking uncertain, don't rebook" : null,
         "",
         leadUrl(ctx.leadId),
     ].filter((l): l is string => l !== null);
@@ -178,6 +210,50 @@ async function sendNtfyAlert(alertId: string, ctx: AlertLeadContext, isTest: boo
     const headers: Record<string, string> = {
         Title: asciiSafeHeaderValue(title),
         Priority: priority,
+        Tags: `stl-${alertId}`,
+        Click: leadUrl(ctx.leadId),
+    };
+    const token = process.env.SPEED_TO_LEAD_NTFY_TOKEN?.trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+
+    let res: Response;
+    try {
+        res = await fetch(`${base}/${encodeURIComponent(topic)}`, {
+            method: "POST",
+            headers,
+            body,
+            signal: AbortSignal.timeout(ALERT_POST_TIMEOUT_MS),
+        });
+    } catch {
+        return { kind: "unknown", reason: "network-or-timeout" };
+    }
+    if (res.status === 429) {
+        const retryAfterSec = Number(res.headers.get("retry-after"));
+        return { kind: "unknown", reason: "http-429", retryAfterMs: Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : undefined };
+    }
+    if (res.status >= 400 && res.status < 500) return { kind: "rejected", reason: `http-${res.status}` };
+    if (!res.ok) return { kind: "unknown", reason: `http-${res.status}` };
+    const parsed = (await res.json().catch(() => null)) as { id?: unknown } | null;
+    if (typeof parsed?.id === "string" && parsed.id) return { kind: "delivered", providerRef: parsed.id };
+    return { kind: "unknown", reason: "2xx-no-identity" };
+}
+
+/**
+ * Front Desk v1 §3.4 "NTFY_URGENT delivery" — Richard's own missed-transfer
+ * push, always priority 5, never `[TEST]`-gated the way the other two
+ * channels are (a test miss should still page whoever is testing it).
+ */
+async function sendNtfyUrgentAlert(alertId: string, ctx: AlertLeadContext, isTest: boolean): Promise<SendOutcome> {
+    const topic = process.env.FRONT_DESK_URGENT_NTFY_TOPIC?.trim();
+    if (!topic) return { kind: "rejected", reason: "no urgent ntfy topic configured" };
+    const base = (process.env.SPEED_TO_LEAD_NTFY_BASE_URL || "https://ntfy.sh").trim().replace(/\/+$/, "");
+    const title = isTest ? "[TEST] Missed transfer - call back now" : "Missed transfer - call back now";
+    const body = [ctx.firstName, ctx.city, ctx.projectScope, ctx.lastFourPhone ? `phone ending ${ctx.lastFourPhone}` : null]
+        .filter(Boolean)
+        .join(" · ");
+    const headers: Record<string, string> = {
+        Title: asciiSafeHeaderValue(title),
+        Priority: "5",
         Tags: `stl-${alertId}`,
         Click: leadUrl(ctx.leadId),
     };
@@ -250,6 +326,7 @@ const ALLOWED_ERROR_CATEGORIES = new Set([
     "network-or-timeout", "http-429", "http-400", "http-401", "http-403", "http-404",
     "http-500", "http-502", "http-503", "2xx-no-identity",
     "no ntfy topic configured", "no valid chat webhook configured", "lead-missing",
+    "no urgent ntfy topic configured",
 ]);
 function safeErrorCategory(reason: string): string {
     return ALLOWED_ERROR_CATEGORIES.has(reason) ? reason : "unknown-error";
@@ -373,9 +450,22 @@ export async function deliverDueAlerts(db: PrismaClient = prisma, now: Date = ne
             await db.leadAlert.update({ where: { id: row.id }, data: { status: "DEAD", lastErrorCategory: "lead-missing" } });
             continue;
         }
-        const outcome = row.channel === "NTFY"
-            ? await sendNtfyAlert(row.id, ctx, row.isTest)
-            : await sendChatAlert(row.id, row.leadId, ctx, row.isTest);
+        let outcome: SendOutcome;
+        switch (row.channel) {
+            case "NTFY":
+                outcome = await sendNtfyAlert(row.id, ctx, row.isTest);
+                break;
+            case "CHAT":
+                outcome = await sendChatAlert(row.id, row.leadId, ctx, row.isTest);
+                break;
+            case "NTFY_URGENT":
+                outcome = await sendNtfyUrgentAlert(row.id, ctx, row.isTest);
+                break;
+            default: {
+                const exhaustive: never = row.channel;
+                throw new Error(`unhandled LeadAlertChannel: ${exhaustive}`);
+            }
+        }
         await applyOutcome(db, { id: row.id, attempts: row.attempts + 1, leadId: row.leadId }, outcome, now);
     }
     return { attempted };

@@ -246,6 +246,8 @@ model Lead {
   scheduleTasks    ScheduleTask[]
   leadIntakeEvents LeadIntakeEvent[]
   leadAlerts       LeadAlert[]
+  frontDeskCalls     FrontDeskCall[]
+  frontDeskTransfers FrontDeskTransfer[]
   message          String? // Initial inquiry message from the client
   project          Project? // reverse relation: the project created from this lead
 
@@ -1405,6 +1407,21 @@ model CompanySettings {
   leadInboxLastPollOk       Boolean?
   leadInboxFailureCount     Int       @default(0)
   leadInboxNextPollAt       DateTime?
+
+  // Front Desk v1 (PB-frontdesk-001) — docs/plans/FRONT-DESK-V1.md §2.4, §4.
+  /// Richard's admin toggle: is he taking transfers right now? The no-redeploy transfer off switch.
+  frontDeskTakingTransfers   Boolean   @default(false)
+  frontDeskTakingTransfersBy String?
+  frontDeskTakingTransfersAt DateTime?
+  /// AES-256-GCM ciphertext (src/lib/crypto.ts encryptObject) — never plaintext, never logged.
+  frontDeskCalendlyTokenEnc      String?
+  frontDeskCalendlyTokenSetBy    String?
+  frontDeskCalendlyTokenSetAt    DateTime?
+  frontDeskCalendlyUserUri       String?
+  frontDeskCalendlyPlan          String?
+  frontDeskCalendlyEventTypeUri     String?
+  frontDeskCalendlyTestEventTypeUri String?
+  frontDeskCalendlyAuthFailedAt     DateTime?
 
   updatedAt DateTime @updatedAt
 }
@@ -3776,6 +3793,8 @@ enum LeadIntakeSource {
   WEB
   WEB_EMAIL_FALLBACK
   VOICE
+  /// Front Desk v1 (PB-frontdesk-001) — a lead from the AI phone agent's post-call webhook.
+  FRONT_DESK_CALL
 }
 
 enum LeadIntakeState {
@@ -3792,6 +3811,8 @@ enum LeadVerdict {
 enum LeadAlertChannel {
   NTFY
   CHAT
+  /// Front Desk v1 — a missed-transfer push straight to Richard, priority 5, never Chat.
+  NTFY_URGENT
 }
 
 enum LeadAlertStatus {
@@ -3869,6 +3890,121 @@ model LeadAlert {
 
   @@unique([leadId, channel])
   @@index([status, nextAttemptAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Front Desk v1 (PB-frontdesk-001) — docs/plans/FRONT-DESK-V1.md. Stacked on
+// Speed-to-Lead v1a: the AI phone agent feeds leads into the SAME
+// LeadIntakeEvent/Lead/LeadAlert pipeline above (source FRONT_DESK_CALL),
+// through upsertFrontDeskLeadInTx (src/lib/front-desk/intake.ts). These three
+// tables are this feature's OWN state — the call record, the booking attempt
+// ledger, and the live transfer — never sent to a customer. RLS enabled, no
+// policies, same as every LeadIntakeEvent-adjacent table above.
+// ─────────────────────────────────────────────────────────────────────────
+
+enum FrontDeskOutcome {
+  BOOKED
+  TRANSFERRED
+  MISSED_TRANSFER
+  MESSAGE
+  SPAM
+}
+
+enum FrontDeskBookingStatus {
+  SUBMITTING
+  BOOKED
+  NOT_BOOKED
+  UNCERTAIN
+}
+
+enum FrontDeskTransferStatus {
+  PREPARED
+  DIALING
+  CONNECTED
+  MISSED
+  EXPIRED
+}
+
+/// One row per ElevenLabs conversation_id (§1). Idempotency key for the
+/// post-call webhook and the slot-offer ledger for the availability tool.
+model FrontDeskCall {
+  id                  String            @id @default(cuid())
+  conversationId      String            @unique
+  agentId             String?
+  isTest              Boolean           @default(false)
+  callerPhoneE164     String?
+  /// Every slot ever offered on this call: {id, startTime, expiresAt, offer}. Ids are never reused within a call (§2.1).
+  offeredSlots        Json              @default("[]")
+  slotSeq             Int               @default(0)
+  outcome             FrontDeskOutcome?
+  postCallProcessedAt DateTime?
+  leadId              String?
+  lead                Lead?             @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@index([leadId])
+}
+
+/// One row per booking ATTEMPT (not per call) — §2.2's state machine and the
+/// partial unique indexes below are what make the reservation step race-safe.
+model FrontDeskBooking {
+  id                 String                  @id @default(cuid())
+  conversationId     String
+  requestHash        String
+  status             FrontDeskBookingStatus
+  reason             String?
+  isTest             Boolean                 @default(false)
+  eventTypeUri       String
+  startTime          DateTime
+  phoneE164          String
+  emailLower         String
+  inviteeUri         String?
+  eventUri           String?
+  cancelUrl          String?
+  rescheduleUrl      String?
+  submittedAt        DateTime?
+  resolvedAt         DateTime?
+  lastReconcileAt    DateTime?
+  reconcileStoppedAt DateTime?
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+
+  @@unique([conversationId, requestHash])
+  @@index([phoneE164])
+  @@index([emailLower])
+  @@index([status, updatedAt])
+}
+
+/// At most one row PREPARED or DIALING at a time, across every call — the
+/// partial unique index below on `(true) WHERE status IN (...)` is Richard's
+/// "one live transfer at a time" rule (§3.1), which Prisma cannot express and
+/// so is appended by hand to the migration (§5's note).
+model FrontDeskTransfer {
+  id                String                   @id @default(cuid())
+  conversationId    String                   @unique
+  status            FrontDeskTransferStatus
+  isTest            Boolean                  @default(false)
+  callerName        String
+  callbackPhoneE164 String
+  city              String
+  project           String
+  spanish           Boolean                  @default(false)
+  preparedAt        DateTime                 @default(now())
+  bridgeCallSid     String?                  @unique
+  dialStartedAt     DateTime?
+  screenAcceptedAt  DateTime?
+  dialCallSid       String?
+  dialCallStatus    String?
+  dialBridged       Boolean?
+  resolvedAt        DateTime?
+  reason            String?
+  leadId            String?
+  lead              Lead?                    @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+
+  @@index([leadId])
 }
 
 /// Junk only (v2 may add columns) — `endpoint` is `"email:<addr>"` or

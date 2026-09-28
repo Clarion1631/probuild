@@ -33,7 +33,13 @@ export interface IntakeOutcome {
     verdict: "REAL" | "REVIEW" | "JUNK" | null;
 }
 
-async function findOrCreateClientForContact(
+/**
+ * Exported for Front Desk v1 (PB-frontdesk-001): its own
+ * `upsertFrontDeskLeadInTx` (src/lib/front-desk/intake.ts) resolves the
+ * caller to the same Client rows a web/fallback/voice lead would, by email
+ * or phone.
+ */
+export async function findOrCreateClientForContact(
     tx: Db,
     contact: { name: string; email: string | null; phone: string | null },
 ): Promise<{ id: string }> {
@@ -57,9 +63,13 @@ async function findOrCreateClientForContact(
     });
 }
 
-async function createLeadRow(
+/**
+ * Exported for Front Desk v1: `source` defaults to "Website" so every
+ * existing v1a call site (which never passes it) is unchanged.
+ */
+export async function createLeadRow(
     tx: Db,
-    input: { clientId: string; name: string; message: string; projectType: string | null; location: string | null },
+    input: { clientId: string; name: string; message: string; projectType: string | null; location: string | null; source?: string },
 ) {
     return tx.lead.create({
         data: {
@@ -68,7 +78,7 @@ async function createLeadRow(
             message: input.message,
             projectType: input.projectType,
             location: input.location,
-            source: "Website",
+            source: input.source ?? "Website",
         },
     });
 }
