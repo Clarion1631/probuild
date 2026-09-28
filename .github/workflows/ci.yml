@@ -798,10 +798,14 @@ jobs:
       - name: Apply DepositIngest reservation index
         run: node scripts/apply-deposit-ingest-schema.mjs
 
+      # The type-check inside `next build` peaks near Node 20's default ~4 GB heap on this codebase
+      # (actions.ts alone is 17k lines) and died with "JavaScript heap out of memory" at 4040 MB.
+      # The runner has far more RAM than that, so give the build headroom.
       - name: Build application
         run: npm run build
         env:
           NEXT_TELEMETRY_DISABLED: 1
+          NODE_OPTIONS: --max-old-space-size=6144
 
       # These assert invariants nothing else does: money lock ordering, portal
       # visibility, dispatch publication, evidence classification. CI never ran
