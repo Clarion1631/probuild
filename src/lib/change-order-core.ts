@@ -1,3 +1,4 @@
+import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { billableCoItems, coLineCents, coSectionRowError, coSectionRowNames } from "./co-tax";
@@ -357,6 +358,42 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
     }, { timeout: 15_000 });
 }
 
+/**
+ * Validation shared by the signed portal approval and the office-side offline
+ * approval. Runs inside the caller's transaction on the already locked row so
+ * both approval paths enforce one copy of the rules.
+ */
+export async function assertChangeOrderApprovableInTx(
+    tx: Prisma.TransactionClient,
+    current: { id: string; code: string; pricingType: string; totalAmount: unknown },
+): Promise<void> {
+    const id = current.id;
+    if (current.pricingType === "COST_PLUS") {
+        const scheduleCount = await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId: id } });
+        if (scheduleCount > 0) throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
+    }
+
+    const items = await tx.changeOrderItem.findMany({
+        where: { changeOrderId: id },
+        select: { name: true, type: true, quantity: true, unitCost: true },
+    });
+    // Legacy rows written before section headers were rejected at the write path.
+    const sectionRows = coSectionRowNames(items);
+    if (sectionRows.length > 0) throw new Error(coSectionRowError(current.code, sectionRows));
+    if (current.pricingType !== "COST_PLUS" && items.length === 0) {
+        throw new Error(`Change order ${current.code} must contain at least one priced item before it can be approved.`);
+    }
+
+    const storedSubtotalCents = Math.round(Number(current.totalAmount) * 100);
+    const renderedSubtotalCents = itemSubtotalCents(items);
+    if (current.pricingType !== "COST_PLUS" && (storedSubtotalCents <= 0 || renderedSubtotalCents <= 0)) {
+        throw new Error(`Change order ${current.code} must have a positive subtotal before it can be approved.`);
+    }
+    if (current.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
+        throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
+    }
+}
+
 export async function approveChangeOrderCore(
     id: string,
     approval: { signatureName: string; clientSignatureUrl: string | null; approvedAt: Date },
@@ -380,30 +417,7 @@ export async function approveChangeOrderCore(
             throw new Error("A client name and persisted signature is required to approve a change order.");
         }
 
-        if (current.pricingType === "COST_PLUS") {
-            const scheduleCount = await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId: id } });
-            if (scheduleCount > 0) throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
-        }
-
-        const items = await tx.changeOrderItem.findMany({
-            where: { changeOrderId: id },
-            select: { name: true, type: true, quantity: true, unitCost: true },
-        });
-        // Legacy rows written before section headers were rejected at the write path.
-        const sectionRows = coSectionRowNames(items);
-        if (sectionRows.length > 0) throw new Error(coSectionRowError(current.code, sectionRows));
-        if (current.pricingType !== "COST_PLUS" && items.length === 0) {
-            throw new Error(`Change order ${current.code} must contain at least one priced item before it can be approved.`);
-        }
-
-        const storedSubtotalCents = Math.round(Number(current.totalAmount) * 100);
-        const renderedSubtotalCents = itemSubtotalCents(items);
-        if (current.pricingType !== "COST_PLUS" && (storedSubtotalCents <= 0 || renderedSubtotalCents <= 0)) {
-            throw new Error(`Change order ${current.code} must have a positive subtotal before it can be approved.`);
-        }
-        if (current.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
-            throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
-        }
+        await assertChangeOrderApprovableInTx(tx, current);
 
         const co = await tx.changeOrder.update({
             where: { id },
