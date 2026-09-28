@@ -9,6 +9,7 @@ import {
     loadCandidatesFromManifest,
     PAYER_NAME_MAX,
     MEMO_TEXT_MAX,
+    DEFAULT_KINDS,
 } from "../scripts/extract-check-payers.mjs";
 
 // ── the MICR / routing / account ban ────────────────────────────────────
@@ -186,6 +187,35 @@ test("parseModelJson still throws on genuinely invalid JSON", () => {
     assert.throws(() => parseModelJson("```json\nnot json at all\n```"));
 });
 
+// ── trailing/leading prose around the object (prod bug: bank ref
+// 26236015002403's $25k cashier's check response had trailing text after
+// the JSON object and threw "Unexpected non-whitespace character after
+// JSON at position 132") ────────────────────────────────────────────────
+
+test("parseModelJson recovers a JSON object with trailing prose after it", () => {
+    const raw = '{"payerName": "Christensen", "memoText": null} Note: amount verified against courtesy box.';
+    assert.deepEqual(parseModelJson(raw), { payerName: "Christensen", memoText: null });
+});
+
+test("parseModelJson recovers a JSON object with leading prose before it", () => {
+    const raw = 'Here is the extraction: {"payerName": "Christensen", "memoText": null}';
+    assert.deepEqual(parseModelJson(raw), { payerName: "Christensen", memoText: null });
+});
+
+test("parseModelJson recovers a fenced JSON object that also has trailing text", () => {
+    const raw = '```json\n{"payerName": "Christensen"}\n``` (end of response)';
+    assert.deepEqual(parseModelJson(raw), { payerName: "Christensen" });
+});
+
+test("parseModelJson does not get confused by braces nested inside string values", () => {
+    const raw = '{"payerName": "Smith {Trust}", "memoText": "job #{4412}"} trailing junk';
+    assert.deepEqual(parseModelJson(raw), { payerName: "Smith {Trust}", memoText: "job #{4412}" });
+});
+
+test("parseModelJson still throws when there is no JSON object at all", () => {
+    assert.throws(() => parseModelJson("Sorry, I cannot read this image."));
+});
+
 test("scrubExtraction keeps payer/memo, drops fields carrying account-like runs", () => {
     const out = scrubExtraction(
         {
@@ -277,4 +307,18 @@ test("loadCandidatesFromManifest honors the limit", () => {
         },
     };
     assert.equal(loadCandidatesFromManifest(manifest, ["CHECK_FRONT"], 1).length, 1);
+});
+
+// ── default kinds must cover DEPOSIT_SLIP (prod bug: a default run found
+// only 1 of 18 filed images because DEFAULT_KINDS omitted DEPOSIT_SLIP) ──
+
+test("DEFAULT_KINDS includes DEPOSIT_SLIP", () => {
+    // scripts/post-bank-images.mjs assigns the FRONT image of every branch
+    // deposit (one with no check number) the kind DEPOSIT_SLIP, not
+    // DEPOSIT_PHOTO — for those deposits the "front" image IS the
+    // substitute-check page carrying the payer's name, so a default
+    // extraction run that skips DEPOSIT_SLIP silently skips the payer for
+    // every branch deposit.
+    assert.ok(DEFAULT_KINDS.includes("DEPOSIT_SLIP"));
+    assert.deepEqual(DEFAULT_KINDS, ["CHECK_FRONT", "DEPOSIT_SLIP", "DEPOSIT_PHOTO"]);
 });

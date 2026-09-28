@@ -2,8 +2,9 @@
 //
 // A WTB inbound line says only "OTHER DEPOSITS DEPOSIT - DDA/MMKT". The image
 // is the only evidence naming the payer, and the memo line often names the
-// job. This reads BankImage rows (kind CHECK_FRONT / DEPOSIT_PHOTO by
-// default) that have not been extracted yet, sends each image to Gemini
+// job. This reads BankImage rows (kind CHECK_FRONT / DEPOSIT_SLIP /
+// DEPOSIT_PHOTO by default) that have not been extracted yet, sends each
+// image to Gemini
 // Vision, and stores ONLY payerName + memoText (+ extractedAt +
 // extractionModel) via scripts/apply-check-payer-extraction.mjs's columns.
 //
@@ -46,7 +47,12 @@ export const IMAGES_DIR =
 export const MANIFEST_PATH = path.join(IMAGES_DIR, "_manifest.json");
 
 export const GEMINI_MODEL = "gemini-3-flash-preview";
-export const DEFAULT_KINDS = ["CHECK_FRONT", "DEPOSIT_PHOTO"];
+// DEPOSIT_SLIP is included because scripts/post-bank-images.mjs assigns the
+// FRONT image of every branch deposit (no check number) the kind
+// DEPOSIT_SLIP, not DEPOSIT_PHOTO — for those deposits the "front" IS the
+// substitute check image that names the payer, so leaving DEPOSIT_SLIP out
+// of the default silently skips the exact images that carry the payer.
+export const DEFAULT_KINDS = ["CHECK_FRONT", "DEPOSIT_SLIP", "DEPOSIT_PHOTO"];
 export const ALL_KINDS = ["CHECK_FRONT", "CHECK_BACK", "DEPOSIT_SLIP", "DEPOSIT_PHOTO"];
 export const DEFAULT_LIMIT = 25;
 
@@ -190,15 +196,63 @@ Return ONLY a JSON object, nothing else:
 {"payerName": string|null, "documentDate": string|null, "amount": string|null, "memoText": string|null, "checkNumber": string|null}`;
 
 /**
+ * Scan `text` for the first balanced top-level `{...}` object — tracking
+ * brace depth while respecting string literals (quotes and backslash
+ * escapes) so a brace inside a string value never throws off the count.
+ * Returns the substring, or null if no balanced object is found.
+ *
+ * @param {string} text
+ * @returns {string | null}
+ */
+function extractFirstBalancedObject(text) {
+    const start = text.indexOf("{");
+    if (start < 0) return null;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch === "\\") {
+                escaped = true;
+            } else if (ch === '"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+        } else if (ch === "{") {
+            depth++;
+        } else if (ch === "}") {
+            depth--;
+            if (depth === 0) return text.slice(start, i + 1);
+        }
+    }
+    return null;
+}
+
+/**
  * Pure. Parse a model response as JSON, tolerating a ```json ... ``` (or
  * bare ```) fence wrapper — models sometimes emit fences even with
- * responseMimeType: application/json.
+ * responseMimeType: application/json. Also tolerates stray prose before
+ * and/or after the JSON object: if a straight JSON.parse fails, falls back
+ * to extracting the first balanced top-level `{...}` object and parsing
+ * that. Rethrows the original parse error when no such object exists.
  */
 export function parseModelJson(rawText) {
     let text = String(rawText ?? "").trim();
     const fenced = text.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/i);
     if (fenced) text = fenced[1].trim();
-    return JSON.parse(text);
+    try {
+        return JSON.parse(text);
+    } catch (err) {
+        const candidate = extractFirstBalancedObject(text);
+        if (candidate === null) throw err;
+        return JSON.parse(candidate);
+    }
 }
 
 export async function extractViaGemini(apiKey, imageBytes, mime) {
