@@ -141,6 +141,12 @@ jobs:
         env:
           SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      - name: Front Desk v1 booking reconciler against real Postgres
+        run: npx tsx --test tests/front-desk-reconcile-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          NEXTAUTH_SECRET: test-secret-for-front-desk-reconcile-tests
+
       # THE APPLY SCRIPT ITSELF, run twice for idempotency — `migrate deploy`
       # above already brought this database to the final shape, so this
       # proves apply-front-desk.mjs's own statements and verifyShape() are

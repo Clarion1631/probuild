@@ -107,7 +107,12 @@ function bookInput(overrides: Partial<Parameters<typeof handleBookTool>[1]> = {}
         confirmedTime: "",
         name: "Race Caller",
         email: `race-${randomUUID()}@example.test`,
-        callbackPhone: "+13605550100",
+        // A random suffix, not a fixed constant: two tests in this file that
+        // each book a real slot and don't care about phone collisions must
+        // never accidentally trip §2.2's "double booking by phone" guard
+        // against EACH OTHER (they share one real, uncleaned-between-tests
+        // Postgres table within this file's run).
+        callbackPhone: `+1360555${String(1000 + Math.floor(Math.random() * 9000))}`,
         readbackConfirmed: true,
         ...overrides,
     };
@@ -309,6 +314,12 @@ test("after a Calendly rejection, a fresh slot may be attempted; the 4th attempt
 // ── Test 27: the daily cap ──────────────────────────────────────────────
 
 test("acceptance test 27: 8 concurrent bookings (distinct callers/slots), cap 6 -> exactly 6 succeed to SUBMITTING-or-better and 2 get daily_cap", { skip }, async () => {
+    // The cap counts every active row created TODAY (Pacific), and this file's
+    // earlier tests have already created some today's-worth of real rows in
+    // this shared Postgres — clear the slate so the cap this test is actually
+    // proving is the constant (6), not "6 minus however many prior tests ran".
+    await db.frontDeskBooking.deleteMany({});
+
     const inputs = await Promise.all(Array.from({ length: 8 }, async (_, i) => {
         const conversationId = `conv-cap-${randomUUID()}`;
         const slot = futureSlot(80 + i, "1");
