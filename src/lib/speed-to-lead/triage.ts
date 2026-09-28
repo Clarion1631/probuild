@@ -30,7 +30,17 @@ export type TriageReason =
     | "existing-customer"
     | "email-fallback"
     | "voice"
-    | "fallback-unparsed";
+    | "fallback-unparsed"
+    // Front Desk v1 (PB-frontdesk-001) — none of these carry a spam signal;
+    // see SPAM_SIGNAL_REASONS below, which none of them join.
+    | "front-desk-booked"
+    | "front-desk-transferred"
+    | "front-desk-missed-transfer"
+    | "front-desk-message"
+    | "front-desk-existing-client"
+    | "front-desk-transfer-pending"
+    | "front-desk-booking-uncertain"
+    | "front-desk-spam";
 
 export interface TriageResult {
     verdict: "REAL" | "REVIEW" | "JUNK";

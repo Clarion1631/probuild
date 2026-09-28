@@ -117,6 +117,91 @@ jobs:
         env:
           SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # Front Desk v1 (PB-frontdesk-001) — stacked on Speed-to-Lead v1a,
+      # same reasoning as the three steps above: `migrate deploy` has already
+      # applied this feature's migration, and these steps must run BEFORE
+      # "Assert the result matches production's shape" below, which is
+      # EXPECTED to fail on this PR until Justin's J3 (apply to prod) and
+      # re-snapshot prisma/prisma-blind-spots.json — see the PR description
+      # and docs/plans/FRONT-DESK-V1.md §5's note. Every step after that
+      # assertion is consequently skipped on this PR's CI run.
+      - name: Front Desk v1 post-call webhook races against real Postgres
+        run: npx tsx --test tests/front-desk-post-call-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      - name: Front Desk v1 booking state machine and reservation races against real Postgres
+        run: npx tsx --test tests/front-desk-booking-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          NEXTAUTH_SECRET: test-secret-for-front-desk-booking-tests
+
+      - name: Front Desk v1 transfer bridge state machine and sweep against real Postgres
+        run: npx tsx --test tests/front-desk-transfer-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      - name: Front Desk v1 booking reconciler against real Postgres
+        run: npx tsx --test tests/front-desk-reconcile-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          NEXTAUTH_SECRET: test-secret-for-front-desk-reconcile-tests
+
+      # Round-2 fixes (acceptance test 3): the bridge-twiml route's own
+      # Twilio-signature/AccountSid/From/To checks, against the REAL route
+      # handler — zero prior test invoked that route at all. Same ordering
+      # reason as the Front Desk steps above (must run before the known-red
+      # migration-match assertion below).
+      #
+      # Round-3 fix: unlike the front-desk-*-db.test.ts files above (which
+      # construct their own PrismaClient straight from SPEED_TO_LEAD_TEST_URL,
+      # bypassing validation), this file drives the REAL route handler, which
+      # imports src/lib/prisma's singleton — that module refuses any
+      # DATABASE_URL lacking ?pgbouncer=true (production-safety check, see
+      # src/lib/prisma.ts). The test's own before() copies SPEED_TO_LEAD_TEST_URL
+      # into DATABASE_URL verbatim, so this step's copy needs the same suffix
+      # every other DATABASE_URL in this file carries. Missing here since the
+      # step (and this test file) were added in the round-2 commit whose CI
+      # never actually ran (checker finding #1) — the gap was never exercised
+      # until now.
+      - name: Front Desk v1 bridge-twiml route signature and account checks against real Postgres
+        run: npx tsx --test tests/front-desk-bridge-twiml-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # Round-2 fixes (acceptance test 10): the post-call route's own
+      # type/agent_id ignore branch, against the REAL route handler — the
+      # existing post-call tests only exercise processPostCallInTx directly.
+      # Round-3 fix: same pgbouncer gap as the bridge-twiml step above — this
+      # file also drives a real route handler through src/lib/prisma's
+      # validated singleton.
+      - name: Front Desk v1 post-call route ignore-branch against real Postgres
+        run: npx tsx --test tests/front-desk-post-call-route-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # Round-2 fixes (acceptance tests 14, 37): NTFY_URGENT delivery
+      # (priority 5, [TEST] prefix, missing-topic DEAD, paused SKIPPED) and
+      # front-desk card/ntfy rendered content (reason-mapped titles, booking-
+      # uncertain body text, phone-digit masking) — zero prior test
+      # referenced NTFY_URGENT at all.
+      - name: Front Desk v1 NTFY_URGENT delivery and card content against real Postgres
+        run: npx tsx --test tests/front-desk-alerts-db.test.ts
+        env:
+          SPEED_TO_LEAD_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # THE APPLY SCRIPT ITSELF, run twice for idempotency — `migrate deploy`
+      # above already brought this database to the final shape, so this
+      # proves apply-front-desk.mjs's own statements and verifyShape() are
+      # correct, not just the committed migration.sql.
+      - name: Front Desk v1 apply script — idempotent against real Postgres
+        run: |
+          FRONT_DESK_DB_HOST=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')
+          test -n "$FRONT_DESK_DB_HOST"
+          export DATABASE_URL="postgresql://probuild:probuild@${FRONT_DESK_DB_HOST}:5432/probuild_migrations?pgbouncer=true"
+          node scripts/apply-front-desk.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$FRONT_DESK_DB_HOST"
+          node scripts/apply-front-desk.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$FRONT_DESK_DB_HOST"
+
       # The schema gap the baseline recorded is now closed by
       # 20260814120000_missing_fk_indexes, so `migrate deploy` above already
       # produces the final shape and there is no separate gap file to apply.

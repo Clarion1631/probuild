@@ -7,6 +7,8 @@ import { promoteDueFallbacks } from "@/lib/speed-to-lead/intake";
 import { deliverDueAlerts } from "@/lib/speed-to-lead/alerts";
 import { maybeSend0900Digest } from "@/lib/speed-to-lead/tracking";
 import { speedToLeadMode } from "@/lib/speed-to-lead/constants";
+import { frontDeskMode } from "@/lib/front-desk/constants";
+import { runFrontDeskSweeps } from "@/lib/front-desk/transfer";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 55;
@@ -27,7 +29,12 @@ async function handleGET() {
     const delivered = await deliverDueAlerts(prisma, now);
     const digestSent = await maybeSend0900Digest(now, prisma);
 
-    return NextResponse.json({ poll, promoted: promoted.length, delivered: delivered.attempted, digestSent });
+    // Front Desk v1 (PB-frontdesk-001) §3.4/§2.3 — the transfer sweep and the
+    // booking reconciler, gated on the front desk's OWN mode (which is
+    // already forced OFF whenever v1a itself is OFF; see frontDeskMode()).
+    const frontDesk = frontDeskMode() === "OFF" ? null : await runFrontDeskSweeps(now, prisma);
+
+    return NextResponse.json({ poll, promoted: promoted.length, delivered: delivered.attempted, digestSent, frontDesk });
 }
 
 export const GET = withCronHeartbeat("SPEED_TO_LEAD", async request => {
