@@ -566,6 +566,22 @@ jobs:
         env:
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # Same drop / apply / assert / apply-again shape for the change order
+      # offline-approval columns, then the real-Postgres race tests.
+      - name: Apply change order offline approval schema
+        run: |
+          CO_DB_HOST=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')
+          test -n "$CO_DB_HOST"
+          export DATABASE_URL="postgresql://probuild:probuild@${CO_DB_HOST}:5432/probuild_migrations?pgbouncer=true"
+          node scripts/ci-change-order-offline-approval-columns.mjs drop
+          node scripts/apply-change-order-offline-approval.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$CO_DB_HOST"
+          node scripts/ci-change-order-offline-approval-columns.mjs assert-present
+          node scripts/apply-change-order-offline-approval.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$CO_DB_HOST"
+          npx tsx --test tests/change-order-offline-approval-db.test.ts
+        env:
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest
