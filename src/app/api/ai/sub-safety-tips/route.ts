@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
-import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
+import { AnthropicRefusalError, CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { prisma } from "@/lib/prisma";
 
 export async function POST(req: NextRequest) {
@@ -74,7 +74,15 @@ Return ONLY the JSON array, no other text.`;
         messages: [{ role: "user", content: prompt }],
     });
 
-    const text = getAnthropicMessageText(response);
+    let text: string;
+    try {
+        text = getAnthropicMessageText(response);
+    } catch (err) {
+        if (err instanceof AnthropicRefusalError) {
+            return NextResponse.json({ error: err.message }, { status: 422 });
+        }
+        throw err;
+    }
 
     // Parse the JSON response, falling back to raw text
     let tips: Array<{ title: string; tip: string }> = [];
