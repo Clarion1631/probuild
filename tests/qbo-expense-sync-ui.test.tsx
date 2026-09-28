@@ -27,7 +27,7 @@ test("receipt audit surface renders QBO imports as finalized non-actionable reco
             date: "2026-07-21T00:00:00.000Z",
             status: "Reviewed",
             estimate: {
-                project: { id: "project-1", name: "Mueller Bathroom Remodel" },
+                project: { id: "project-1", name: "Sample Job C" },
             },
             costCode: null,
             createdAt: "2026-07-29T12:00:00.000Z",
@@ -37,7 +37,7 @@ test("receipt audit surface renders QBO imports as finalized non-actionable reco
     assert.match(markup, /Finalized in QuickBooks/);
     assert.match(markup, /QBO UI Vendor/);
     assert.match(markup, /\$321\.45/);
-    assert.match(markup, /Mueller Bathroom Remodel/);
+    assert.match(markup, /Sample Job C/);
     assert.match(markup, /Showing 1 of 142/);
     assert.doesNotMatch(markup, />Approve</);
     assert.doesNotMatch(markup, />Reject</);
