@@ -227,15 +227,22 @@ test("a request rejected while mode is OFF, replayed with the identical CallSid 
         },
     });
 
-    // Twilio retries the IDENTICAL signed request (same CallSid, same
-    // signature) now that mode is back on.
-    const replayRes = await POST(postRequest(url, params, sig));
-    assert.equal(replayRes.status, 200);
-    assert.match(await readTextBody(replayRes), /<Reject\/>/, "the replay must still reject, not dial Richard for someone else's transfer");
+    try {
+        // Twilio retries the IDENTICAL signed request (same CallSid, same
+        // signature) now that mode is back on.
+        const replayRes = await POST(postRequest(url, params, sig));
+        assert.equal(replayRes.status, 200);
+        assert.match(await readTextBody(replayRes), /<Reject\/>/, "the replay must still reject, not dial Richard for someone else's transfer");
 
-    const victimAfter = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: victim.id } });
-    assert.equal(victimAfter.status, "PREPARED", "the victim's own transfer must be untouched and still claimable by ITS real inbound call");
-    assert.equal(victimAfter.bridgeCallSid, null);
+        const victimAfter = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: victim.id } });
+        assert.equal(victimAfter.status, "PREPARED", "the victim's own transfer must be untouched and still claimable by ITS real inbound call");
+        assert.equal(victimAfter.bridgeCallSid, null);
+    } finally {
+        // Left PREPARED, the victim is claimed by the NEXT inbound request in
+        // this file, which then leaves a lead plus due NTFY/NTFY_URGENT alerts
+        // on the shared CI Postgres for every later deliverDueAlerts() call.
+        await db.frontDeskTransfer.deleteMany({ where: { id: victim.id } }).catch(() => undefined);
+    }
 });
 
 // ── A genuinely valid, well-formed request with nothing PREPARED -> Reject, logged ──
