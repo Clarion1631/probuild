@@ -1,0 +1,3 @@
+ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "approvalSource" TEXT;
+ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "approvalMethod" TEXT;
+ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "approvalNote" TEXT;

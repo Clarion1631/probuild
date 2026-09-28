@@ -3,6 +3,7 @@ import { milestoneSendBlockedReason } from "./qbo-create-markers";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
 import { isBackdatedPayment, formatMoneyDate } from "@/lib/payment-date";
+import { OFFLINE_APPROVAL_SOURCE } from "@/lib/change-order-offline-approval";
 
 function isToggleOn(settings: { notificationToggles?: string | null } | null, key: string): boolean {
     if (!settings?.notificationToggles) return true;
@@ -178,10 +179,33 @@ export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { de
         //    the auto-receipt — a stale "Payment Confirmed" email blindsides the client.
         //    receiptSentAt stays null so staff can still send one via the Send Receipt
         //    button when they want to.
-        if (s.invoice.client?.email && !s.receiptSentAt && !opts?.suppressClientReceipt && !isBackdatedPayment(s.paymentDate)) {
+        //    Also skipped for a milestone that came from an OFFLINE-approved change order
+        //    and was never requested (qbInvoiceSentAt NULL): the customer must only hear
+        //    from us on an explicit staff action, and recording a prior payment is not
+        //    one. The explicit Send Receipt button still works (receiptSentAt stays null).
+        let heldOfflineCo = false;
+        const wantsAutoReceipt = !!s.invoice.client?.email && !s.receiptSentAt && !opts?.suppressClientReceipt && !isBackdatedPayment(s.paymentDate);
+        if (wantsAutoReceipt) {
+            // Re-read the milestone's provenance fresh, right before deciding: the row fetched at
+            // the top of this function can be stale by now, and a milestone that only just got
+            // linked to an offline-approved change order must not be sent a receipt on old data.
+            const fresh = await prisma.paymentSchedule.findUnique({
+                where: { id: s.id },
+                select: { sourceChangeOrderId: true, qbInvoiceSentAt: true },
+            });
+            if (fresh?.sourceChangeOrderId && !fresh.qbInvoiceSentAt) {
+                const source = await prisma.changeOrder.findUnique({
+                    where: { id: fresh.sourceChangeOrderId },
+                    select: { approvalSource: true },
+                });
+                heldOfflineCo = source?.approvalSource === OFFLINE_APPROVAL_SOURCE;
+            }
+        }
+        const receiptTo = s.invoice.client?.email;
+        if (wantsAutoReceipt && !heldOfflineCo && receiptTo) {
             const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/portal/invoices/${s.invoice.id}`;
             const receiptSend = await sendNotification(
-                s.invoice.client.email,
+                receiptTo,
                 `Payment Receipt — Invoice #${s.invoice.code}`,
                 receiptBodyHtml({
                     invoiceLike: { code: s.invoice.code, kind: "invoice" },

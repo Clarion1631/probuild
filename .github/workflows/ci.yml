@@ -566,6 +566,22 @@ jobs:
         env:
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # Same drop / apply / assert / apply-again shape for the change order
+      # offline-approval columns, then the real-Postgres race tests.
+      - name: Apply change order offline approval schema
+        run: |
+          CO_DB_HOST=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')
+          test -n "$CO_DB_HOST"
+          export DATABASE_URL="postgresql://probuild:probuild@${CO_DB_HOST}:5432/probuild_migrations?pgbouncer=true"
+          node scripts/ci-change-order-offline-approval-columns.mjs drop
+          node scripts/apply-change-order-offline-approval.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$CO_DB_HOST"
+          node scripts/ci-change-order-offline-approval-columns.mjs assert-present
+          node scripts/apply-change-order-offline-approval.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$CO_DB_HOST"
+          npx tsx --test tests/change-order-offline-approval-db.test.ts
+        env:
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest
@@ -782,10 +798,14 @@ jobs:
       - name: Apply DepositIngest reservation index
         run: node scripts/apply-deposit-ingest-schema.mjs
 
+      # The type-check inside `next build` peaks near Node 20's default ~4 GB heap on this codebase
+      # (actions.ts alone is 17k lines) and died with "JavaScript heap out of memory" at 4040 MB.
+      # The runner has far more RAM than that, so give the build headroom.
       - name: Build application
         run: npm run build
         env:
           NEXT_TELEMETRY_DISABLED: 1
+          NODE_OPTIONS: --max-old-space-size=6144
 
       # These assert invariants nothing else does: money lock ordering, portal
       # visibility, dispatch publication, evidence classification. CI never ran

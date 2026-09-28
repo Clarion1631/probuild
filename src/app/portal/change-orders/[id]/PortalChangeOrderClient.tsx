@@ -9,7 +9,7 @@ import { formatCurrency } from "@/lib/utils";
 import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems } from "@/lib/co-tax";
 import { buildPdf } from "@/lib/build-pdf";
 
-export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
+export default function PortalChangeOrderClient({ initialData, companySettings, offlineApprovalLabel }: { initialData: any, companySettings?: any, offlineApprovalLabel?: string | null }) {
     const [isApproving, setIsApproving] = useState(false);
     const [signature, setSignature] = useState("");
     const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
@@ -43,6 +43,8 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     };
 
     const isApproved = initialData.status === "Approved";
+    // Approved by the office on the customer's word (phone, text, email, in person): no signature exists.
+    const isOfflineApproved = isApproved && initialData.approvalSource === "OFFLINE";
     const isSent = initialData.status === "Sent";
     const isDeclined = initialData.status === "Declined";
     // Draft covers "never sent yet" and "pulled back for edits after being sent" — the
@@ -176,7 +178,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         Back to Portal
                     </Link>
                     {isApproved && (
-                        <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Approved & Signed</span>
+                        <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">{isOfflineApproved ? "✓ Approved" : "✓ Approved & Signed"}</span>
                     )}
                 </div>
             </header>
@@ -286,8 +288,24 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         </div>
                     )}
 
+                    {/* Offline approval: honest wording, no signature image or box */}
+                    {isOfflineApproved && (
+                        <div data-pdf-row="true" className="mx-5 sm:mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
+                            <div className="flex items-start gap-3">
+                                <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center shrink-0">
+                                    <svg className="h-4 w-4 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
+                                </div>
+                                <div>
+                                    <h3 className="text-sm font-semibold text-green-800">Approved</h3>
+                                    <p className="text-sm text-green-700 mt-0.5">{offlineApprovalLabel}</p>
+                                    <p className="text-xs text-green-600 mt-0.5">Recorded by the office. Not signed electronically.</p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {/* Signed Badge */}
-                    {isApproved && initialData.approvedBy && (
+                    {isApproved && !isOfflineApproved && initialData.approvedBy && (
                         <div data-pdf-row="true" className="mx-5 sm:mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
                             <div className="flex items-start gap-3">
                                 <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center shrink-0">

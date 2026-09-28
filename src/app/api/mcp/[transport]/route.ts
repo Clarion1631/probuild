@@ -1348,7 +1348,7 @@ function createHandler(actor: RouteMcpActor) {
                     pricingType: co.pricingType,
                     markupPercent: co.markupPercent,
                     subtotal: Number(co.totalAmount),
-                    signature: { approvedBy: co.approvedBy, approvedAt: co.approvedAt, signed: Boolean(co.approvedAt && co.clientSignatureUrl) },
+                    signature: { approvedBy: co.approvedBy, approvedAt: co.approvedAt, signed: Boolean(co.approvedAt && co.clientSignatureUrl), approvalSource: co.approvalSource, approvalMethod: co.approvalMethod, approvalNote: co.approvalNote },
                     paymentSchedules: co.paymentSchedules.map((row) => ({ ...row, amount: Number(row.amount) })),
                     actualsToDate: {
                         hours: co.timeEntries.reduce((sum, row) => sum + (row.durationHours ?? 0), 0),
