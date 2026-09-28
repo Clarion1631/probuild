@@ -2338,6 +2338,29 @@ export async function approveChangeOrderOfflineCore(
                 const result = await billChangeOrderInTx(tx, changeOrderId);
                 if (!result.ok) throw new OfflineApprovalBillingError(`Couldn't add ${current.code} to the invoice: ${result.error}`);
                 bill = result;
+                // billChangeOrderInTx may REUSE a milestone staff created by hand with the CO's
+                // name. Give it the same provenance a new milestone gets, in this same transaction,
+                // so it is held from automatic reminders and receipts exactly like the others. Done
+                // here, not in the shared biller, so the signed path is untouched.
+                const reusedIds = result.milestones.filter((row) => !row.created).map((row) => row.id);
+                if (reusedIds.length > 0) {
+                    const scheduleRows = await tx.changeOrderPaymentSchedule.findMany({ where: { changeOrderId }, select: { id: true, name: true } });
+                    const reusedRows = await tx.paymentSchedule.findMany({
+                        where: { id: { in: reusedIds } },
+                        select: { id: true, name: true, sourceChangeOrderId: true, sourceCoScheduleId: true },
+                    });
+                    for (const row of reusedRows) {
+                        if (row.sourceChangeOrderId) continue;
+                        const data: { sourceChangeOrderId: string; sourceCoScheduleId?: string } = { sourceChangeOrderId: changeOrderId };
+                        if (!row.sourceCoScheduleId) {
+                            const match = scheduleRows.find((sched) => `${current.code} — ${sched.name}`.slice(0, 300) === row.name);
+                            if (match && !(await tx.paymentSchedule.findFirst({ where: { sourceCoScheduleId: match.id }, select: { id: true } }))) {
+                                data.sourceCoScheduleId = match.id;
+                            }
+                        }
+                        await tx.paymentSchedule.update({ where: { id: row.id }, data });
+                    }
+                }
             }
             return {
                 ok: true,
@@ -2426,7 +2449,7 @@ export async function approveChangeOrderOfflineCore(
             const detail = bill
                 ? `Added to invoice ${bill.invoiceCode} as ${bill.milestones.length} unpaid milestone${bill.milestones.length === 1 ? "" : "s"} for ${formatCurrency(bill.amount)}. The customer was not notified. Send the payment request from the invoice when you're ready.`
                 : "No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.";
-            await (dependencies.notifyTeam ?? sendNotification)(
+            const teamSend = await (dependencies.notifyTeam ?? sendNotification)(
                 to,
                 subject,
                 `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; color: #333;">
@@ -2438,6 +2461,10 @@ export async function approveChangeOrderOfflineCore(
                 undefined,
                 { fromName: settings?.companyName || "ProBuild" },
             );
+            if (teamSend && !teamSend.success) {
+                console.warn(`[approveChangeOrderOfflineCore] team email for ${co.code} was not delivered`);
+                warnings.push("the team email could not be sent");
+            }
         }
     } catch {
         warnings.push("the team email could not be sent");

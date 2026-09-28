@@ -17,6 +17,22 @@ import { pathToFileURL } from "node:url";
 /** The CI database `.github/workflows/ci.yml` points every step at. */
 export const EXPECTED_CI_DATABASE = "probuild_migrations";
 
+/** The CI database role `.github/workflows/ci.yml` creates on the postgres service. */
+export const EXPECTED_CI_USER = "probuild";
+
+/**
+ * The hosts ci.yml uses: the service published on localhost (job-level env) or the
+ * service container's own address on the Docker bridge (the `docker inspect` IP the
+ * apply steps build their URL from, 172.16.0.0/12). Anything else, including any
+ * other private or public address, is refused.
+ */
+export function isCiServiceHost(hostname) {
+    const host = String(hostname ?? "").replace(/^\[|\]$/g, "");
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
+    const match = /^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
+    return !!match && Number(match[1]) >= 16 && Number(match[1]) <= 31;
+}
+
 /**
  * Refuses anything that is not obviously the throwaway CI database. Never
  * connects -- pure URL parsing -- so it is safe to call before deciding
@@ -34,6 +50,9 @@ export function assertCiDatabaseTarget(databaseUrl, expectedDb = EXPECTED_CI_DAT
     }
     if (/supabase\.(co|com)/i.test(parsed.hostname)) {
         throw new Error(`REFUSING: DATABASE_URL host ${JSON.stringify(parsed.hostname)} looks like production (Supabase).`);
+    }
+    if (!isCiServiceHost(parsed.hostname)) {
+        throw new Error(`REFUSING: DATABASE_URL host ${JSON.stringify(parsed.hostname)} is not the CI service host.`);
     }
     const rawDb = parsed.pathname.replace(/^\//, "");
     let database;
@@ -64,6 +83,12 @@ async function main() {
     const prisma = new PrismaClient();
     try {
         if (mode === "drop") {
+            // The URL looked right; now ask the server who we are actually connected to
+            // BEFORE any destructive statement.
+            const identity = await prisma.$queryRawUnsafe("SELECT current_database() AS db, current_user AS usr");
+            if (identity[0]?.db !== EXPECTED_CI_DATABASE || identity[0]?.usr !== EXPECTED_CI_USER) {
+                throw new Error(`REFUSING: connected as ${JSON.stringify(identity[0]?.usr)} to ${JSON.stringify(identity[0]?.db)}, expected ${EXPECTED_CI_USER} on ${EXPECTED_CI_DATABASE}.`);
+            }
             for (const column of COLUMNS) {
                 await prisma.$executeRawUnsafe(`ALTER TABLE "ChangeOrder" DROP COLUMN IF EXISTS "${column}"`);
             }

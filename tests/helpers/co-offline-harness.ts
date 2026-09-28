@@ -194,8 +194,12 @@ export function makeWorld(options: WorldOptions = {}) {
 
     const fakeTx = (): Row => ({
         ...models,
-        $queryRaw: async (strings: TemplateStringsArray) => {
+        $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
             const text = strings.join("?");
+            if (text.includes('FROM "PaymentSchedule"')) {
+                const row = state.milestones.find((m) => m.id === values[0]);
+                return row ? [{ sourceChangeOrderId: row.sourceChangeOrderId ?? null, qbInvoiceSentAt: row.qbInvoiceSentAt ?? null }] : [];
+            }
             if (!text.includes('FROM "ChangeOrder"')) return [];
             const co = { ...state.co };
             return [co];

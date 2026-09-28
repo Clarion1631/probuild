@@ -296,3 +296,38 @@ test("T3 reminders: an approval that commits AFTER the offline-id snapshot is st
     assert.equal(live.skipped, 2);
     assertNothingReachedCustomer("stale snapshot");
 });
+
+test("T3 receipt: provenance is re-read fresh, so a stale first read cannot send the customer a receipt", async () => {
+    fresh();
+    await approveOffline();
+    world.emails.length = 0;
+    const milestone = world.state.milestones[0];
+    settle(milestone);
+    // The row read at the top of the function predates the milestone being linked to the offline CO.
+    const original = world.prisma.paymentSchedule.findUnique;
+    let calls = 0;
+    world.prisma.paymentSchedule.findUnique = async (args: Row) => {
+        calls += 1;
+        const row = await original(args);
+        return calls === 1 ? { ...row, sourceChangeOrderId: null, qbInvoiceSentAt: null } : row;
+    };
+    await notifications.notifyMilestonePaid(milestone.id);
+    assert.ok(calls >= 2, "a second, fresh read happened");
+    assert.equal(world.customerEmails().length, 0);
+    assert.equal(milestone.receiptSentAt, null);
+});
+
+test("T3 reminders: a milestone linked to an offline CO after selection is not claimed", async () => {
+    fresh();
+    await approveOffline();
+    dueTomorrow();
+    for (const m of world.state.milestones) m.qbInvoiceLink = "https://example.test/pay"; // hosted link: a claim WOULD send
+    // Selection sees stale rows (no provenance) and an empty offline id list.
+    world.prisma.changeOrder.findMany = async () => [];
+    const original = world.prisma.paymentSchedule.findMany;
+    world.prisma.paymentSchedule.findMany = async (args: Row) => (await original(args)).map((row: Row) => ({ ...row, sourceChangeOrderId: null }));
+    const live = await reminders.sendPaymentReminders();
+    assert.equal(live.sent, 0);
+    assert.equal(world.state.milestones.every((m) => m.lastReminderAt === null), true, "no claim landed");
+    assertNothingReachedCustomer("claim race");
+});

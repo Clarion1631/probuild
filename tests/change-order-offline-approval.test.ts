@@ -137,3 +137,26 @@ test("G6: the staff-only approvalNote is stripped at the portal action boundary 
     const page = readFileSync(path.join(__dirname, "..", "src", "app", "portal", "change-orders", "[id]", "page.tsx"), "utf8");
     assert.match(page, /delete \(initialData as \{ approvalNote\?: unknown \}\)\.approvalNote/);
 });
+
+test("E: the update and delete guards treat any non-null approval column, including approvalSource, as locked", () => {
+    const src = readFileSync(path.join(__dirname, "..", "src", "lib", "change-order-core.ts"), "utf8");
+    assert.equal((src.match(/current\.approvalSource != null/g) ?? []).length, 2, "update guard and delete guard");
+    assert.doesNotMatch(src, /hasSignatureAudit = Boolean\(/);
+    assert.equal((src.match(/"approvedBy", "approvedAt", "clientSignatureUrl", "approvalSource"/g) ?? []).length, 2, "both locked selects read approvalSource");
+});
+
+test("G: the CI column-drop helper only accepts the CI service host", async () => {
+    const helper = await import("../scripts/ci-change-order-offline-approval-columns.mjs");
+    for (const ok of ["postgresql://probuild:x@localhost:5432/probuild_migrations", "postgresql://probuild:x@172.18.0.2:5432/probuild_migrations"]) {
+        assert.doesNotThrow(() => helper.assertCiDatabaseTarget(ok));
+    }
+    for (const bad of [
+        "postgresql://x:x@10.0.0.5:5432/probuild_migrations",
+        "postgresql://x:x@db.example.com:5432/probuild_migrations",
+        "postgresql://x:x@172.40.0.2:5432/probuild_migrations",
+        "postgresql://x:x@aws-0-us.pooler.supabase.com:5432/probuild_migrations",
+        "postgresql://x:x@localhost:5432/postgres",
+    ]) {
+        assert.throws(() => helper.assertCiDatabaseTarget(bad), /REFUSING/, bad);
+    }
+});

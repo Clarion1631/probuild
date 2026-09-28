@@ -183,3 +183,145 @@ test("offline approval racing a portal signature: exactly one Approved outcome",
         }
     });
 });
+
+// ── Reminder hold, on real SQL ──────────────────────────────────────────────
+
+const DAY_MS = 86_400_000;
+type Hook = { afterSelect: null | (() => Promise<void>) };
+const hook: Hook = { afterSelect: null };
+const remindedTo: string[] = [];
+let sendPaymentReminders: ((opts?: { dryRun?: boolean }) => Promise<{ sent: number; skipped: number }>) | null = null;
+
+/**
+ * payment-reminders is loaded ONCE with a thin Prisma wrapper that delegates to the real client, plus a
+ * recorder in place of the email sender. The wrapper's only trick is `hook.afterSelect`, which runs after the
+ * candidate SELECT and before the claim, so a test can change a milestone in exactly that window.
+ */
+async function loadReminders() {
+    if (sendPaymentReminders) return sendPaymentReminders;
+    const { prisma: real } = await import("../src/lib/prisma");
+    const bindOn = (target: object, prop: string | symbol) => {
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+    };
+    const wrapped = new Proxy(real, {
+        get(target, prop) {
+            if (prop !== "paymentSchedule") return bindOn(target, prop);
+            const model = Reflect.get(target, prop) as unknown as Record<string, (...args: unknown[]) => unknown>;
+            return new Proxy(model, {
+                get(m, method) {
+                    if (method !== "findMany") return bindOn(m, method);
+                    return async (args: unknown) => {
+                        const rows = await m.findMany(args);
+                        const run = hook.afterSelect;
+                        hook.afterSelect = null;
+                        if (run) await run();
+                        return rows;
+                    };
+                },
+            });
+        },
+    });
+    const { default: Module } = await import("node:module");
+    const originalRequire = Module.prototype.require;
+    (Module.prototype as unknown as { require: (id: string) => unknown }).require = function (this: NodeModule, id: string) {
+        if (id === "@/lib/prisma") return { prisma: wrapped };
+        if (id === "@/lib/email") return { sendNotification: async (to: string) => { remindedTo.push(to); return { success: true }; } };
+        // eslint-disable-next-line prefer-rest-params
+        return originalRequire.apply(this, arguments as unknown as [string]);
+    } as typeof Module.prototype.require;
+    try {
+        const mod = await import("../src/lib/payment-reminders");
+        sendPaymentReminders = mod.sendPaymentReminders;
+    } finally {
+        Module.prototype.require = originalRequire;
+    }
+    return sendPaymentReminders!;
+}
+
+type ReminderWorld = { db: PrismaClient; email: string; ids: Seeded; invoiceId: string; offlineCoId: string; ordinary: string; derived: string };
+
+async function reminderWorld(tag: string, body: (w: ReminderWorld) => Promise<void>) {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl } } });
+    const email = `offline-co-${tag}@example.test`;
+    const ids = await seed(db, tag);
+    await db.client.update({ where: { id: ids.clientId }, data: { email } });
+    await db.project.update({ where: { id: ids.projectId }, data: { paymentRemindersEnabled: true } });
+    const offlineCo = await db.changeOrder.create({
+        data: {
+            projectId: ids.projectId, estimateId: ids.estimateId, code: `CO-OFF-${tag}`, title: "Offline example", status: "Approved",
+            pricingType: "FIXED", totalAmount: 500, approvalSource: "OFFLINE", approvalMethod: "PHONE", approvedBy: "Jordan Lee", approvedAt: new Date(),
+        },
+    });
+    const due = () => new Date(Date.now() + DAY_MS);
+    const link = "https://example.test/pay";
+    const ordinary = await db.paymentSchedule.create({ data: { invoiceId: ids.invoiceId!, name: "Ordinary deposit", amount: 100, dueDate: due(), qbInvoiceLink: link } });
+    const derived = await db.paymentSchedule.create({
+        data: { invoiceId: ids.invoiceId!, name: `${offlineCo.code} — Payment 1`, amount: 550, dueDate: due(), qbInvoiceLink: link, sourceChangeOrderId: offlineCo.id },
+    });
+    try {
+        await body({ db, email, ids, invoiceId: ids.invoiceId!, offlineCoId: offlineCo.id, ordinary: ordinary.id, derived: derived.id });
+    } finally {
+        await cleanup(db, ids);
+        await db.$disconnect();
+    }
+}
+
+const reminded = (db: PrismaClient, id: string) => db.paymentSchedule.findUniqueOrThrow({ where: { id }, select: { lastReminderAt: true } }).then((r) => r.lastReminderAt !== null);
+
+test("reminder hold (real SQL): ordinary unsent is reminded, offline-derived unsent is not, and it is after qbInvoiceSentAt is stamped", { skip }, async () => {
+    const run = await loadReminders();
+    await reminderWorld(`h1${Date.now()}`, async ({ db, ordinary, derived, email }) => {
+        remindedTo.length = 0;
+        await run();
+        assert.equal(await reminded(db, ordinary), true, "an ordinary unrequested milestone keeps its reminders (the NULL trap)");
+        assert.equal(await reminded(db, derived), false, "an offline-derived, never-requested milestone is held");
+        assert.equal(remindedTo.filter((to) => to === email).length, 1, "exactly one email to the client: the ordinary milestone");
+
+        await db.paymentSchedule.update({ where: { id: derived }, data: { qbInvoiceSentAt: new Date() } });
+        await run();
+        assert.equal(await reminded(db, derived), true, "once staff has sent it, normal reminder rules apply again");
+    });
+});
+
+test("reminder claim (real SQL): a milestone linked to an offline CO after candidate selection is not claimed", { skip }, async () => {
+    const run = await loadReminders();
+    await reminderWorld(`h2${Date.now()}`, async ({ db, ordinary, ids, email }) => {
+        // Only the ordinary milestone is under test; park the derived one so it cannot muddy the count.
+        await db.paymentSchedule.updateMany({ where: { invoiceId: ids.invoiceId! , id: { not: ordinary } }, data: { dueDate: null } });
+        remindedTo.length = 0;
+        hook.afterSelect = async () => {
+            // After the SELECT (and after the offline-id snapshot) an office approval lands: a new offline CO is
+            // committed and the hand-made milestone is linked to it.
+            const late = await db.changeOrder.create({
+                data: {
+                    projectId: ids.projectId, estimateId: ids.estimateId, code: `CO-LATE-${Date.now()}`, title: "Late offline", status: "Approved",
+                    pricingType: "FIXED", totalAmount: 100, approvalSource: "OFFLINE", approvalMethod: "TEXT", approvedBy: "Jordan Lee", approvedAt: new Date(),
+                },
+            });
+            await db.paymentSchedule.update({ where: { id: ordinary }, data: { sourceChangeOrderId: late.id } });
+        };
+        const result = await run();
+        assert.equal(hook.afterSelect, null, "the hook ran between selection and claim");
+        assert.equal(await reminded(db, ordinary), false, "the claim refused a milestone that is now offline-derived");
+        assert.equal(remindedTo.filter((to) => to === email).length, 0, "nothing was emailed");
+        assert.ok(result.skipped >= 1);
+    });
+});
+
+test("a hand-made milestone reused by the approval is stamped with the change order's provenance", { skip }, async () => {
+    await withWorld(`r${Date.now()}`, {}, async (db, ids) => {
+        const { code } = await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId }, select: { code: true } });
+        const manual = await db.paymentSchedule.create({
+            data: { invoiceId: ids.invoiceId!, name: `${code} — Deposit`, amount: 440, pretaxAmount: 400, taxAmount: 40, status: "Paid", paymentDate: new Date(), paidAt: new Date() },
+        });
+        const result = await offline(ids, db);
+        assert.equal(result.ok, true, JSON.stringify(result));
+        const rows = await milestones(db, ids);
+        assert.equal(rows.length, 2, "the manual milestone was reused, one new one created");
+        const reused = rows.find((row) => row.id === manual.id)!;
+        assert.equal(reused.sourceChangeOrderId, ids.changeOrderId);
+        assert.ok(reused.sourceCoScheduleId, "the schedule link was attached too");
+        assert.equal(Number(reused.amount), 440);
+    });
+});

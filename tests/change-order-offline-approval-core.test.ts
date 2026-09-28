@@ -250,3 +250,37 @@ test("T2: any non-null approval audit column refuses, even an empty string", asy
     assert.deepEqual([result.ok, result.code], [false, "ALREADY_APPROVED"]);
     assert.equal(world.state.milestones.length, 0);
 });
+
+function manualMilestone(overrides: Row = {}) {
+    return {
+        id: "ms-manual", invoiceId: "inv-1", name: "CO-00001 — Payment 1", amount: 440, status: "Pending", dueDate: null,
+        sourceChangeOrderId: null, sourceCoScheduleId: null, qbInvoiceSentAt: null, qbInvoiceLink: null, lastReminderAt: null,
+        receiptSentAt: null, sourceScheduleId: null, paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null,
+        ...overrides,
+    };
+}
+
+test("T2: a reused hand-made milestone gets the same provenance as a new one, in the same transaction", async () => {
+    world.state.milestones.push(manualMilestone());
+    const result = await core("co-1", input(), deps());
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(world.state.milestones.length, 2, "one reused, one created");
+    const reused = world.state.milestones.find((m) => m.id === "ms-manual")!;
+    assert.equal(reused.sourceChangeOrderId, "co-1");
+    assert.equal(reused.sourceCoScheduleId, "cos-1");
+    assert.equal(reused.amount, 440, "amount untouched");
+    assert.ok(world.state.milestones.every((m) => m.sourceChangeOrderId === "co-1"));
+});
+
+test("T2: a reused milestone that already carries provenance is left alone", async () => {
+    world.state.milestones.push(manualMilestone({ sourceChangeOrderId: "co-1", sourceCoScheduleId: "cos-1" }));
+    const result = await core("co-1", input(), deps());
+    assert.equal(result.ok, true);
+    assert.equal(world.state.milestones.find((m) => m.id === "ms-manual")!.sourceCoScheduleId, "cos-1");
+});
+
+test("T2: a failed team email is reported as a warning, not swallowed", async () => {
+    const result = await core("co-1", input(), deps({ notifyTeam: async () => ({ success: false }) }));
+    assert.equal(result.ok, true);
+    assert.ok(result.warnings.some((w: string) => /team email/.test(w)));
+});

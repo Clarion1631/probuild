@@ -36,7 +36,7 @@ export default async function ChangeOrderPage({
     // approval on file can be marked approved.
     const staff = await currentStaffUserOrNull();
     const timeZone = await resolveCompanyTimeZone();
-    const hasApprovalOnFile = !!(co.approvedBy || co.approvedAt || co.clientSignatureUrl || (co as any).approvalSource);
+    const hasApprovalOnFile = co.approvedBy != null || co.approvedAt != null || co.clientSignatureUrl != null || (co as any).approvalSource != null;
     const canMarkApproved = !!staff
         && isAdminOrManager(staff)
         && (co.status === "Draft" || co.status === "Sent")

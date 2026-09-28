@@ -103,12 +103,13 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             approvedBy: string | null;
             approvedAt: Date | null;
             clientSignatureUrl: string | null;
+            approvalSource: string | null;
             companySignedBy: string | null;
             companySignedAt: Date | null;
             companySignatureUrl: string | null;
         }>>`
             SELECT "code", "status", "title", "description", "totalAmount", "pricingType", "markupPercent",
-                   "approvedBy", "approvedAt", "clientSignatureUrl",
+                   "approvedBy", "approvedAt", "clientSignatureUrl", "approvalSource",
                    "companySignedBy", "companySignedAt", "companySignatureUrl"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
@@ -127,14 +128,14 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
         // portal/PDF cannot drift from the approval audit trail afterward.
         const hasScopeWrite = ["title", "description", "items", "pricingType", "markupPercent", "paymentSchedules"]
             .some((field) => Object.prototype.hasOwnProperty.call(data, field));
-        const hasSignatureAudit = Boolean(
-            current.approvedBy
-            || current.approvedAt
-            || current.clientSignatureUrl
-            || current.companySignedBy
-            || current.companySignedAt
-            || current.companySignatureUrl,
-        );
+        const hasSignatureAudit =
+            current.approvedBy != null
+            || current.approvedAt != null
+            || current.clientSignatureUrl != null
+            || current.approvalSource != null
+            || current.companySignedBy != null
+            || current.companySignedAt != null
+            || current.companySignatureUrl != null;
         if ((current.status === "Approved" || hasSignatureAudit) && hasScopeWrite) {
             throw new Error("This change order's signed scope is locked. Create a new change order for additional work.");
         }
@@ -446,24 +447,25 @@ export async function deleteChangeOrderCore(id: string) {
             approvedBy: string | null;
             approvedAt: Date | null;
             clientSignatureUrl: string | null;
+            approvalSource: string | null;
             companySignedBy: string | null;
             companySignedAt: Date | null;
             companySignatureUrl: string | null;
         }>>`
             SELECT "id", "projectId", "status",
-                   "approvedBy", "approvedAt", "clientSignatureUrl",
+                   "approvedBy", "approvedAt", "clientSignatureUrl", "approvalSource",
                    "companySignedBy", "companySignedAt", "companySignatureUrl"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
-        const hasSignatureAudit = Boolean(
-            current.approvedBy
-            || current.approvedAt
-            || current.clientSignatureUrl
-            || current.companySignedBy
-            || current.companySignedAt
-            || current.companySignatureUrl,
-        );
+        const hasSignatureAudit =
+            current.approvedBy != null
+            || current.approvedAt != null
+            || current.clientSignatureUrl != null
+            || current.approvalSource != null
+            || current.companySignedBy != null
+            || current.companySignedAt != null
+            || current.companySignatureUrl != null;
         if (current.status !== "Draft" || hasSignatureAudit) {
             throw new Error("Only unsigned Draft change orders can be deleted. Sent and signed records must remain in the audit trail.");
         }

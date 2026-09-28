@@ -48,19 +48,19 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
     // scope and remain immutable after approval. The server enforces the same
     // rule; these disabled controls make that invariant visible in the editor.
     const isApproved = status === "Approved";
-    const hasSignatureAudit = !!(
-        initialData.approvedBy
-        || initialData.approvedAt
-        || initialData.clientSignatureUrl
-        || initialData.companySignedBy
-        || initialData.companySignedAt
-        || initialData.companySignatureUrl
-    );
+    const hasSignatureAudit =
+        initialData.approvedBy != null
+        || initialData.approvedAt != null
+        || initialData.clientSignatureUrl != null
+        || initialData.approvalSource != null
+        || initialData.companySignedBy != null
+        || initialData.companySignedAt != null
+        || initialData.companySignatureUrl != null;
     const isScopeLocked = isApproved || hasSignatureAudit;
     const canCountersign = status === "Sent" || status === "Approved";
     const isOfflineApproved = initialData.approvalSource === "OFFLINE";
     // Only a CUSTOMER approval on file blocks this (a company countersignature does not).
-    const hasCustomerApproval = !!(initialData.approvedBy || initialData.approvedAt || initialData.clientSignatureUrl || initialData.approvalSource);
+    const hasCustomerApproval = initialData.approvedBy != null || initialData.approvedAt != null || initialData.clientSignatureUrl != null || initialData.approvalSource != null;
     const showMarkApproved = offline.canMarkApproved && (status === "Draft" || status === "Sent") && !hasCustomerApproval;
 
     // Same integer-cents math as the server's item sync and billChangeOrderCore,
