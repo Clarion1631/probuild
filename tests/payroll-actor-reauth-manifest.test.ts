@@ -44,7 +44,10 @@ const PAYROLL_BANNER = "// ============ Payroll (Phase 5";
 function payrollSection(): string {
     const start = ACTIONS.indexOf(PAYROLL_BANNER);
     assert.ok(start > 0, "the payroll section banner moved — this whole file scans from it");
-    return ACTIONS.slice(start);
+    // The section runs to the NEXT banner (or the end of the file), so an unrelated action
+    // appended under its own banner is not misread as a payroll action.
+    const next = ACTIONS.indexOf("\n// ============ ", start + PAYROLL_BANNER.length);
+    return next > 0 ? ACTIONS.slice(start, next) : ACTIONS.slice(start);
 }
 
 /** Every exported server action in the payroll section, with its body text. */
