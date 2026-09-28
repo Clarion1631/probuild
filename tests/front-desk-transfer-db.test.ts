@@ -2,7 +2,7 @@
  * Front Desk v1 acceptance tests 29, 30, 34, 35, 36 — against a REAL
  * PostgreSQL (SPEED_TO_LEAD_TEST_URL).
  */
-import test, { before, after } from "node:test";
+import test, { before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
@@ -28,6 +28,18 @@ before(async () => {
         create: { id: "singleton", frontDeskTakingTransfers: true },
         update: { frontDeskTakingTransfers: true },
     });
+});
+
+beforeEach(async () => {
+    if (skip) return;
+    // §3.1's partial unique index allows at most one PREPARED-or-DIALING row
+    // across the WHOLE table at a time — real, and enforced regardless of
+    // whether a row was created via handlePrepareTransferTool or a direct
+    // create() (makeDialingTransfer). Several tests below deliberately leave
+    // their own row active (that IS the behavior under test), so every test
+    // must start from a clean slate rather than each remembering to clean up
+    // after itself.
+    await db.frontDeskTransfer.updateMany({ where: { status: { in: ["PREPARED", "DIALING"] } }, data: { status: "EXPIRED", resolvedAt: WITHIN_HOURS, reason: "test-cleanup" } });
 });
 
 after(async () => {
@@ -78,9 +90,6 @@ test("prepare-transfer: readback_incomplete, invalid_phone, outside_hours, richa
 });
 
 test("acceptance test 30: two conversations prepare concurrently -> exactly one transfer_ready, one busy", { skip }, async () => {
-    // Clear any leftover active row from a prior test file run.
-    await db.frontDeskTransfer.updateMany({ where: { status: { in: ["PREPARED", "DIALING"] } }, data: { status: "EXPIRED", resolvedAt: WITHIN_HOURS, reason: "test-cleanup" } });
-
     const c1 = conv();
     const c2 = conv();
     const [r1, r2] = await Promise.all([
@@ -94,7 +103,6 @@ test("acceptance test 30: two conversations prepare concurrently -> exactly one 
 });
 
 test("a stale PREPARED row older than 60s does not block a new prepare", { skip }, async () => {
-    await db.frontDeskTransfer.updateMany({ where: { status: { in: ["PREPARED", "DIALING"] } }, data: { status: "EXPIRED", resolvedAt: WITHIN_HOURS, reason: "test-cleanup" } });
     const staleConv = conv();
     await db.frontDeskTransfer.create({
         data: {
@@ -111,7 +119,6 @@ test("a stale PREPARED row older than 60s does not block a new prepare", { skip 
 });
 
 test("preparing twice for the SAME conversation -> already_transferred", { skip }, async () => {
-    await db.frontDeskTransfer.updateMany({ where: { status: { in: ["PREPARED", "DIALING"] } }, data: { status: "EXPIRED", resolvedAt: WITHIN_HOURS, reason: "test-cleanup" } });
     const c = conv();
     const first = await handlePrepareTransferTool(db, prepareInput(c), WITHIN_HOURS);
     assert.equal(first.kind, "transfer_ready");
@@ -123,6 +130,12 @@ test("preparing twice for the SAME conversation -> already_transferred", { skip 
 // ── Test 34: action transitions ─────────────────────────────────────────
 
 async function makeDialingTransfer(opts: { screenAccepted?: boolean } = {}) {
+    // Self-contained, not just relying on the outer beforeEach: a test that
+    // calls this more than once (e.g. the screen-result loop below) must not
+    // trip the one-active-transfer partial unique index against ITS OWN
+    // still-DIALING previous row — a rejected screen-result leaves the row
+    // DIALING, it does not resolve it.
+    await db.frontDeskTransfer.updateMany({ where: { status: { in: ["PREPARED", "DIALING"] } }, data: { status: "EXPIRED", resolvedAt: WITHIN_HOURS, reason: "test-cleanup" } });
     const conversationId = conv();
     const bridgeCallSid = `CA-${randomUUID()}`;
     const row = await db.frontDeskTransfer.create({
@@ -201,10 +214,15 @@ test("screen-result: only Digits=1 sets screenAcceptedAt; 2, *, empty and a wron
 });
 
 // ── Test 36: sweep ───────────────────────────────────────────────────────
+//
+// One active row at a time, split into three tests rather than three
+// simultaneous rows in one — §3.1's partial unique index means real
+// Postgres can never actually hold more than one PREPARED-or-DIALING
+// FrontDeskTransfer row at once, the same invariant `beforeEach` above
+// depends on.
 
-test("acceptance test 36: sweep — unaccepted DIALING older than 90s -> MISSED + alert; accepted isn't touched until 4h; PREPARED older than 60s -> EXPIRED, no alert", { skip }, async () => {
+test("sweep: an unaccepted DIALING row older than 90s -> MISSED + urgent alert", { skip }, async () => {
     const sweepNow = new Date(WITHIN_HOURS.getTime() + 10_000);
-
     const staleUnaccepted = await db.frontDeskTransfer.create({
         data: {
             id: randomUUID(), conversationId: conv(), status: "DIALING", isTest: true,
@@ -212,6 +230,19 @@ test("acceptance test 36: sweep — unaccepted DIALING older than 90s -> MISSED 
             bridgeCallSid: `CA-${randomUUID()}`, dialStartedAt: new Date(sweepNow.getTime() - FRONT_DESK_SWEEP_DIALING_MISS_MS - 5000),
         },
     });
+
+    await runFrontDeskSweeps(sweepNow, db);
+
+    const swept = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: staleUnaccepted.id } });
+    assert.equal(swept.status, "MISSED");
+    assert.ok(swept.leadId, "a swept miss must create/link a lead the same as an action-step miss does");
+    createdLeadIds.push(swept.leadId!);
+    const alerts = await db.leadAlert.findMany({ where: { leadId: swept.leadId! } });
+    assert.equal(alerts.filter(a => a.channel === "NTFY_URGENT").length, 1);
+});
+
+test("sweep: an accepted DIALING row is left alone until 4 hours", { skip }, async () => {
+    const sweepNow = new Date(WITHIN_HOURS.getTime() + 10_000);
     const freshAccepted = await db.frontDeskTransfer.create({
         data: {
             id: randomUUID(), conversationId: conv(), status: "DIALING", isTest: true,
@@ -219,6 +250,15 @@ test("acceptance test 36: sweep — unaccepted DIALING older than 90s -> MISSED 
             bridgeCallSid: `CA-${randomUUID()}`, dialStartedAt: sweepNow, screenAcceptedAt: sweepNow,
         },
     });
+
+    await runFrontDeskSweeps(sweepNow, db);
+
+    const swept = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: freshAccepted.id } });
+    assert.equal(swept.status, "DIALING", "an accepted call stays DIALING until 4h, not swept early");
+});
+
+test("sweep: a PREPARED row older than 60s -> EXPIRED, no alert", { skip }, async () => {
+    const sweepNow = new Date(WITHIN_HOURS.getTime() + 10_000);
     const stalePrepared = await db.frontDeskTransfer.create({
         data: {
             id: randomUUID(), conversationId: conv(), status: "PREPARED", isTest: true,
@@ -229,18 +269,7 @@ test("acceptance test 36: sweep — unaccepted DIALING older than 90s -> MISSED 
 
     await runFrontDeskSweeps(sweepNow, db);
 
-    const swept1 = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: staleUnaccepted.id } });
-    assert.equal(swept1.status, "MISSED");
-    if (swept1.leadId) {
-        createdLeadIds.push(swept1.leadId);
-        const alerts = await db.leadAlert.findMany({ where: { leadId: swept1.leadId } });
-        assert.equal(alerts.filter(a => a.channel === "NTFY_URGENT").length, 1);
-    }
-
-    const swept2 = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: freshAccepted.id } });
-    assert.equal(swept2.status, "DIALING", "an accepted call stays DIALING until 4h, not swept early");
-
-    const swept3 = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: stalePrepared.id } });
-    assert.equal(swept3.status, "EXPIRED");
-    assert.equal(swept3.leadId, null, "an expired PREPARED row is never alerted");
+    const swept = await db.frontDeskTransfer.findUniqueOrThrow({ where: { id: stalePrepared.id } });
+    assert.equal(swept.status, "EXPIRED");
+    assert.equal(swept.leadId, null, "an expired PREPARED row is never alerted");
 });

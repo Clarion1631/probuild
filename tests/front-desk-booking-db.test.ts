@@ -74,12 +74,18 @@ after(async () => {
     await db.$disconnect();
 });
 
-beforeEach(() => {
+beforeEach(async () => {
     inviteePostCount = 0;
     inviteeResponder = () => ({
         status: 201,
         json: { resource: { uri: `https://api.calendly.com/scheduled_events/x/invitees/${randomUUID()}` }, event: "https://api.calendly.com/scheduled_events/x", cancel_url: "https://calendly.com/cancel", reschedule_url: "https://calendly.com/reschedule" },
     });
+    // The daily cap (§2.2 step 3.5) counts every active row created TODAY
+    // across the WHOLE table — real, and shared by every test below in this
+    // one file's run against one real Postgres. Without this, a test late in
+    // the file inherits however much of the day's 6-row budget earlier tests
+    // happened to consume, rather than proving the cap on its own terms.
+    if (!skip) await db.frontDeskBooking.deleteMany({});
 });
 
 async function seedCallWithSlot(conversationId: string, slot: { id: string; startTime: string; expiresAt: string; offer: number }) {
@@ -314,12 +320,6 @@ test("after a Calendly rejection, a fresh slot may be attempted; the 4th attempt
 // ── Test 27: the daily cap ──────────────────────────────────────────────
 
 test("acceptance test 27: 8 concurrent bookings (distinct callers/slots), cap 6 -> exactly 6 succeed to SUBMITTING-or-better and 2 get daily_cap", { skip }, async () => {
-    // The cap counts every active row created TODAY (Pacific), and this file's
-    // earlier tests have already created some today's-worth of real rows in
-    // this shared Postgres — clear the slate so the cap this test is actually
-    // proving is the constant (6), not "6 minus however many prior tests ran".
-    await db.frontDeskBooking.deleteMany({});
-
     const inputs = await Promise.all(Array.from({ length: 8 }, async (_, i) => {
         const conversationId = `conv-cap-${randomUUID()}`;
         const slot = futureSlot(80 + i, "1");
