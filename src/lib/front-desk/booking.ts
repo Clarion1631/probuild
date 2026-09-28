@@ -34,17 +34,22 @@ function parseOfferedSlots(value: unknown): OfferedSlot[] {
     return value.filter((s): s is OfferedSlot => !!s && typeof s === "object" && typeof (s as OfferedSlot).id === "string" && typeof (s as OfferedSlot).startTime === "string");
 }
 
-/** The UTC instant of Pacific local midnight for the calendar day `date` falls on — the daily cap's day boundary. Binary search rather than a fixed offset, so it is correct across the DST transition. */
+/**
+ * The UTC instant of Pacific local midnight for the calendar day `date`
+ * falls on — the daily cap's day boundary. America/Los_Angeles is always
+ * exactly UTC-7 (PDT) or UTC-8 (PST), never a fractional offset, so the
+ * boundary is always one of exactly two candidate instants; this checks
+ * both directly rather than converging on one by binary search, which only
+ * ever lands within its loop tolerance of the true (whole-second) instant.
+ */
 export function pacificDayStartUtc(date: Date): Date {
     const dateStr = pacificDateString(date);
-    let lo = new Date(`${dateStr}T00:00:00.000Z`).getTime(); // Pacific is always behind UTC, so this is <= the boundary
-    let hi = lo + 24 * 60 * 60 * 1000; // 24h later is always >= the boundary
-    while (hi - lo > 1000) {
-        const mid = lo + Math.floor((hi - lo) / 2);
-        if (pacificDateString(new Date(mid)) === dateStr) hi = mid;
-        else lo = mid;
+    for (const utcOffsetHours of [7, 8]) {
+        const candidate = new Date(`${dateStr}T${String(utcOffsetHours).padStart(2, "0")}:00:00.000Z`);
+        if (pacificDateString(candidate) === dateStr && pacificTimeString(candidate) === "00:00") return candidate;
     }
-    return new Date(hi);
+    // Unreachable for any real America/Los_Angeles offset; fail safe rather than throw.
+    return new Date(`${dateStr}T08:00:00.000Z`);
 }
 
 // ── §2.1 availability tool ──────────────────────────────────────────────────

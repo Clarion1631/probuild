@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 import { encryptObject } from "../src/lib/crypto";
 import { handleBookTool, pacificDayStartUtc } from "../src/lib/front-desk/booking";
+import { pacificDateString, pacificTimeString } from "../src/lib/front-desk/constants";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-front-desk-booking-tests";
 process.env.FRONT_DESK_BOOKING = "ON";
@@ -167,8 +168,8 @@ test("the invitee POST body has the fixed location.kind and timezone, and never 
         capturedBody = body as Record<string, unknown>;
         return { status: 201, json: { resource: { uri: "https://api.calendly.com/x/invitees/y" }, event: "https://api.calendly.com/x", cancel_url: "c", reschedule_url: "r" } };
     };
-    const dateStr = new Date(slot.startTime).toISOString().slice(0, 10);
-    const result = await handleBookTool(db, bookInput({ conversationId, slotId: slot.id, confirmedDate: dateStr, confirmedTime: new Date(slot.startTime).toISOString().slice(11, 16) }));
+    const dateStr = pacificDateString(new Date(slot.startTime));
+    const result = await handleBookTool(db, bookInput({ conversationId, slotId: slot.id, confirmedDate: dateStr, confirmedTime: pacificTimeString(new Date(slot.startTime)) }));
     assert.equal(result.kind, result.kind); // no-op — real assertion is on the body below; date/time formatting is UTC-based here purely to reach a POST
     assert.ok(capturedBody);
     const body = capturedBody as unknown as { location: { kind: string }; invitee: { timezone: string }; tracking: { utm_content: string } };
@@ -188,8 +189,8 @@ test("acceptance test 23: 2 concurrent identical book requests produce ONE Calen
     const slot = futureSlot(30);
     await seedCallWithSlot(conversationId, { ...slot, offer: 1 });
     const email = `same-${randomUUID()}@example.test`;
-    const dateStr = new Date(slot.startTime).toISOString().slice(0, 10);
-    const timeStr = new Date(slot.startTime).toISOString().slice(11, 16);
+    const dateStr = pacificDateString(new Date(slot.startTime));
+    const timeStr = pacificTimeString(new Date(slot.startTime));
     const input = bookInput({ conversationId, slotId: slot.id, confirmedDate: dateStr, confirmedTime: timeStr, email, callbackPhone: "+13605550111", name: "Same Caller" });
 
     const [a, b] = await Promise.all([handleBookTool(db, input), handleBookTool(db, input)]);
@@ -202,8 +203,8 @@ test("acceptance test 23: 2 concurrent identical book requests produce ONE Calen
 
 test("acceptance test 24: two conversations booking the SAME slot concurrently -> one POST, the other gets slot_taken", { skip }, async () => {
     const slot = futureSlot(31);
-    const dateStr = new Date(slot.startTime).toISOString().slice(0, 10);
-    const timeStr = new Date(slot.startTime).toISOString().slice(11, 16);
+    const dateStr = pacificDateString(new Date(slot.startTime));
+    const timeStr = pacificTimeString(new Date(slot.startTime));
 
     const conv1 = `conv-${randomUUID()}`;
     const conv2 = `conv-${randomUUID()}`;
@@ -233,8 +234,8 @@ test("acceptance test 25: two conversations, same phone, different slots -> one 
     await seedCallWithSlot(conv2, { ...slotB, offer: 1 });
 
     const phone = "+13605550131";
-    const input1 = bookInput({ conversationId: conv1, slotId: "1", confirmedDate: new Date(slotA.startTime).toISOString().slice(0, 10), confirmedTime: new Date(slotA.startTime).toISOString().slice(11, 16), callbackPhone: phone });
-    const input2 = bookInput({ conversationId: conv2, slotId: "1", confirmedDate: new Date(slotB.startTime).toISOString().slice(0, 10), confirmedTime: new Date(slotB.startTime).toISOString().slice(11, 16), callbackPhone: phone });
+    const input1 = bookInput({ conversationId: conv1, slotId: "1", confirmedDate: pacificDateString(new Date(slotA.startTime)), confirmedTime: pacificTimeString(new Date(slotA.startTime)), callbackPhone: phone });
+    const input2 = bookInput({ conversationId: conv2, slotId: "1", confirmedDate: pacificDateString(new Date(slotB.startTime)), confirmedTime: pacificTimeString(new Date(slotB.startTime)), callbackPhone: phone });
 
     const r1 = await handleBookTool(db, input1);
     assert.equal(r1.kind, "booked");
@@ -252,8 +253,8 @@ test("same email, different slots -> the second gets already_booked", { skip }, 
     await seedCallWithSlot(conv2, { ...slotB, offer: 1 });
 
     const email = `dupe-${randomUUID()}@example.test`;
-    const input1 = bookInput({ conversationId: conv1, slotId: "1", confirmedDate: new Date(slotA.startTime).toISOString().slice(0, 10), confirmedTime: new Date(slotA.startTime).toISOString().slice(11, 16), email, callbackPhone: "+13605550141" });
-    const input2 = bookInput({ conversationId: conv2, slotId: "1", confirmedDate: new Date(slotB.startTime).toISOString().slice(0, 10), confirmedTime: new Date(slotB.startTime).toISOString().slice(11, 16), email, callbackPhone: "+13605550142" });
+    const input1 = bookInput({ conversationId: conv1, slotId: "1", confirmedDate: pacificDateString(new Date(slotA.startTime)), confirmedTime: pacificTimeString(new Date(slotA.startTime)), email, callbackPhone: "+13605550141" });
+    const input2 = bookInput({ conversationId: conv2, slotId: "1", confirmedDate: pacificDateString(new Date(slotB.startTime)), confirmedTime: pacificTimeString(new Date(slotB.startTime)), email, callbackPhone: "+13605550142" });
 
     const r1 = await handleBookTool(db, input1);
     assert.equal(r1.kind, "booked");
@@ -267,13 +268,13 @@ test("acceptance test 26: after booked, a second slot in the same call -> alread
     const conversationId = `conv-${randomUUID()}`;
     const slot1 = futureSlot(40, "1");
     await seedCallWithSlot(conversationId, { ...slot1, offer: 1 });
-    const input1 = bookInput({ conversationId, slotId: "1", confirmedDate: new Date(slot1.startTime).toISOString().slice(0, 10), confirmedTime: new Date(slot1.startTime).toISOString().slice(11, 16) });
+    const input1 = bookInput({ conversationId, slotId: "1", confirmedDate: pacificDateString(new Date(slot1.startTime)), confirmedTime: pacificTimeString(new Date(slot1.startTime)) });
     const first = await handleBookTool(db, input1);
     assert.equal(first.kind, "booked");
 
     const slot2 = futureSlot(41, "2");
     await db.frontDeskCall.updateMany({ where: { conversationId }, data: { offeredSlots: [{ ...slot1, offer: 1 }, { ...slot2, offer: 2 }] as unknown as object, slotSeq: 2 } });
-    const secondAttempt = await handleBookTool(db, bookInput({ conversationId, slotId: "2", confirmedDate: new Date(slot2.startTime).toISOString().slice(0, 10), confirmedTime: new Date(slot2.startTime).toISOString().slice(11, 16) }));
+    const secondAttempt = await handleBookTool(db, bookInput({ conversationId, slotId: "2", confirmedDate: pacificDateString(new Date(slot2.startTime)), confirmedTime: pacificTimeString(new Date(slot2.startTime)) }));
     assert.equal((secondAttempt as { reason: string }).reason, "already_booked");
 });
 
@@ -290,7 +291,7 @@ test("after a Calendly rejection, a fresh slot may be attempted; the 4th attempt
         } else {
             await db.frontDeskCall.create({ data: { id: randomUUID(), conversationId, isTest: true, offeredSlots: slots as unknown as object, slotSeq: i } });
         }
-        const result = await handleBookTool(db, bookInput({ conversationId, slotId: String(i), confirmedDate: new Date(slot.startTime).toISOString().slice(0, 10), confirmedTime: new Date(slot.startTime).toISOString().slice(11, 16) }));
+        const result = await handleBookTool(db, bookInput({ conversationId, slotId: String(i), confirmedDate: pacificDateString(new Date(slot.startTime)), confirmedTime: pacificTimeString(new Date(slot.startTime)) }));
         if (i <= 3) assert.equal((result as { reason: string }).reason, "calendly_rejected", `attempt ${i}`);
     }
 
@@ -300,7 +301,7 @@ test("after a Calendly rejection, a fresh slot may be attempted; the 4th attempt
     const slots = ((existing?.offeredSlots as unknown[]) ?? []).concat([{ ...slot4, offer: 4 }]);
     await db.frontDeskCall.update({ where: { conversationId }, data: { offeredSlots: slots as unknown as object } });
     const before = inviteePostCount;
-    const fourth = await handleBookTool(db, bookInput({ conversationId, slotId: "4", confirmedDate: new Date(slot4.startTime).toISOString().slice(0, 10), confirmedTime: new Date(slot4.startTime).toISOString().slice(11, 16) }));
+    const fourth = await handleBookTool(db, bookInput({ conversationId, slotId: "4", confirmedDate: pacificDateString(new Date(slot4.startTime)), confirmedTime: pacificTimeString(new Date(slot4.startTime)) }));
     assert.equal((fourth as { reason: string }).reason, "too_many_attempts");
     assert.equal(inviteePostCount, before, "too_many_attempts must not POST to Calendly");
 });
@@ -314,8 +315,8 @@ test("acceptance test 27: 8 concurrent bookings (distinct callers/slots), cap 6 
         await seedCallWithSlot(conversationId, { ...slot, offer: 1 });
         return bookInput({
             conversationId, slotId: "1",
-            confirmedDate: new Date(slot.startTime).toISOString().slice(0, 10),
-            confirmedTime: new Date(slot.startTime).toISOString().slice(11, 16),
+            confirmedDate: pacificDateString(new Date(slot.startTime)),
+            confirmedTime: pacificTimeString(new Date(slot.startTime)),
             email: `cap-${i}-${randomUUID()}@example.test`,
             callbackPhone: `+1360555${String(1000 + i).slice(-4)}`,
         });
