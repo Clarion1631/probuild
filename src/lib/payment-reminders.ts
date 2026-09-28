@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
 import { utcMidnight, daysBetweenUtc, dueDateLabel } from "@/lib/date-utils";
+import { OFFLINE_APPROVAL_SOURCE, offlineHoldMilestoneWhere } from "@/lib/change-order-offline-approval";
 
 // Same writer as actions.ts's logActivity, but reached via a lazy dynamic import so this
 // module (imported by the cron route) never pulls in actions.ts's "use server"
@@ -164,11 +165,22 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
             client: { email: { not: null } },
         };
 
+        // Offline-approved change orders never contact the customer on their own: a
+        // milestone that came from one and was never requested (qbInvoiceSentAt NULL) is
+        // held back until staff sends it. Null-safe (see offlineHoldMilestoneWhere), so
+        // ordinary milestones keep their reminders.
+        const offlineCoIds = (await prisma.changeOrder.findMany({
+            where: { approvalSource: OFFLINE_APPROVAL_SOURCE },
+            select: { id: true },
+        })).map(row => row.id);
+        const offlineHold = offlineHoldMilestoneWhere(offlineCoIds);
+
         const eligibilityWhere: Prisma.PaymentScheduleWhereInput = {
             status: "Pending",
             dueDate: { not: null, lt: upcomingCutoff, gte: overdueFloor },
             OR: throttleOr,
             invoice: invoiceFilter,
+            ...(offlineHold ? { AND: [offlineHold] } : {}),
         };
 
         // Wide window (see SELECTION_WINDOW_SIZE) — filtered for paid mirrors, THEN sliced
@@ -287,7 +299,7 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                         status: "Pending",
                         dueDate: { not: null, lt: upcomingCutoff, gte: overdueFloor },
                         invoice: invoiceFilter,
-                        AND: [{ OR: throttleOr }, { OR: mirrorOr }],
+                        AND: [{ OR: throttleOr }, { OR: mirrorOr }, ...(offlineHold ? [offlineHold] : [])],
                     },
                     data: { lastReminderAt: claimedAt },
                 });

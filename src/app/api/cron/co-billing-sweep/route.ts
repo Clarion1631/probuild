@@ -28,6 +28,9 @@ async function handleGET(request: Request) {
     const candidates = await prisma.changeOrder.findMany({
         where: {
             status: "Approved",
+            // Office-recorded approvals never auto-bill or send from here (explicit null,
+            // not `not: "OFFLINE"`, because SQL <> drops NULL rows, i.e. every signed CO).
+            approvalSource: null,
             approvedAt: { lte: new Date(now - 15 * 60_000), gte: new Date(now - 2 * 60 * 60_000) },
         },
         select: { id: true, code: true, projectId: true },
@@ -49,6 +52,10 @@ async function handleGET(request: Request) {
             continue;
         }
         const outcome = await handleChangeOrderApproved(co.id);
+        if (outcome.skippedOffline) {
+            results.push({ code: co.code, action: "skipped (offline approval)" });
+            continue;
+        }
         results.push({ code: co.code, action: outcome.sent ? "billed + sent" : `alerted: ${outcome.issues.join("; ")}` });
     }
 
