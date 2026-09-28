@@ -242,3 +242,11 @@ test("T2: the team email HTML-escapes staff-supplied values", async () => {
     assert.doesNotMatch(world.emails[0].html, /<script>/);
     assert.doesNotMatch(world.emails[0].html, /<b>Lee<\/b>/);
 });
+
+test("T2: any non-null approval audit column refuses, even an empty string", async () => {
+    fresh({ scheduleAmounts: [400, 600] });
+    world.state.co.clientSignatureUrl = "";
+    const result = await core("co-1", input(), deps());
+    assert.deepEqual([result.ok, result.code], [false, "ALREADY_APPROVED"]);
+    assert.equal(world.state.milestones.length, 0);
+});

@@ -283,3 +283,16 @@ test("T3 tripwire: the offline core never references a customer send function", 
     // The single email goes to the team address.
     assert.match(code, /notificationEmail\?\.trim\(\) \|\| settings\?\.email\?\.trim\(\)/);
 });
+
+test("T3 reminders: an approval that commits AFTER the offline-id snapshot is still held by the live per-milestone check", async () => {
+    fresh();
+    await approveOffline();
+    dueTomorrow();
+    // The run read its offline id list before the approval committed, so the list is empty and
+    // the selection and claim holds are absent. The live check must still stop the send.
+    world.prisma.changeOrder.findMany = async () => [];
+    const live = await reminders.sendPaymentReminders();
+    assert.equal(live.sent, 0);
+    assert.equal(live.skipped, 2);
+    assertNothingReachedCustomer("stale snapshot");
+});

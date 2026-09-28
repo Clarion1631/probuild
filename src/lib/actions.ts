@@ -9750,7 +9750,7 @@ export async function getChangeOrderForPortal(id: string) {
             items: { orderBy: { order: "asc" } },
             paymentSchedules: { orderBy: { order: "asc" } }
         }
-    });
+    }).then((row) => { if (row) delete (row as { approvalNote?: unknown }).approvalNote; return row; }); // staff-only note: never leaves this action, even to a portal client calling it directly
 }
 
 export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput) {
@@ -17723,9 +17723,14 @@ export async function markChangeOrderApprovedOffline(
     });
     if (!result.ok) return { success: false, error: result.error };
 
-    revalidatePath(`/projects/${result.changeOrder.projectId}/change-orders`);
-    revalidatePath(`/projects/${result.changeOrder.projectId}/change-orders/${changeOrderId}`);
-    revalidatePath(`/projects/${result.changeOrder.projectId}/invoices`);
+    try {
+        // The approval is already committed: a cache refresh failure must never turn it into an error.
+        revalidatePath(`/projects/${result.changeOrder.projectId}/change-orders`);
+        revalidatePath(`/projects/${result.changeOrder.projectId}/change-orders/${changeOrderId}`);
+        revalidatePath(`/projects/${result.changeOrder.projectId}/invoices`);
+    } catch {
+        /* not in a request context */
+    }
     return {
         success: true,
         code: result.changeOrder.code,

@@ -194,6 +194,8 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                 dueDate: true,
                 qbInvoiceLink: true,
                 sourceScheduleId: true,
+                sourceChangeOrderId: true,
+                qbInvoiceSentAt: true,
                 lastReminderAt: true,
                 invoice: {
                     select: {
@@ -269,6 +271,22 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                 if (!clientEmail || !schedule.dueDate) {
                     result.skipped++;
                     continue;
+                }
+
+                // Live re-check, straight from the database, for anything that came from a change
+                // order and was never requested. The id list above is a snapshot: an office approval
+                // that committed after it was read would otherwise slip through this run. The milestone
+                // and its change order's approvalSource commit in one transaction, so if the milestone
+                // is visible here, so is the OFFLINE flag.
+                if (schedule.sourceChangeOrderId && !schedule.qbInvoiceSentAt) {
+                    const source = await prisma.changeOrder.findUnique({
+                        where: { id: schedule.sourceChangeOrderId },
+                        select: { approvalSource: true },
+                    });
+                    if (source?.approvalSource === OFFLINE_APPROVAL_SOURCE) {
+                        result.skipped++;
+                        continue;
+                    }
                 }
 
                 const daysUntil = daysBetweenUtc(now, schedule.dueDate);

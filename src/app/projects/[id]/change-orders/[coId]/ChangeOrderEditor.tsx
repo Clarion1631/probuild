@@ -59,7 +59,9 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
     const isScopeLocked = isApproved || hasSignatureAudit;
     const canCountersign = status === "Sent" || status === "Approved";
     const isOfflineApproved = initialData.approvalSource === "OFFLINE";
-    const showMarkApproved = offline.canMarkApproved && (status === "Draft" || status === "Sent") && !hasSignatureAudit;
+    // Only a CUSTOMER approval on file blocks this (a company countersignature does not).
+    const hasCustomerApproval = !!(initialData.approvedBy || initialData.approvedAt || initialData.clientSignatureUrl || initialData.approvalSource);
+    const showMarkApproved = offline.canMarkApproved && (status === "Draft" || status === "Sent") && !hasCustomerApproval;
 
     // Same integer-cents math as the server's item sync and billChangeOrderCore,
     // so the Revised Amount shown here is exactly what billing will charge.

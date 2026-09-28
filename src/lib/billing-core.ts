@@ -2282,7 +2282,7 @@ export async function approveChangeOrderOfflineCore(
             const current = locked[0];
             if (!current) return { ok: false, code: "NOT_FOUND", error: "Change order not found" };
 
-            const hasAudit = !!(current.approvedBy || current.approvedAt || current.clientSignatureUrl || current.approvalSource);
+            const hasAudit = current.approvedBy != null || current.approvedAt != null || current.clientSignatureUrl != null || current.approvalSource != null;
             if (current.status === "Approved" || hasAudit) {
                 return {
                     ok: false,

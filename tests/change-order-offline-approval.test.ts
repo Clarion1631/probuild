@@ -128,3 +128,12 @@ test("T5: the action is the last export of actions.ts, so no line-keyed manifest
     const exports = [...src.matchAll(/^export (?:async )?function (\w+)/gm)].map((m) => m[1]);
     assert.equal(exports[exports.length - 1], "markChangeOrderApprovedOffline");
 });
+
+test("G6: the staff-only approvalNote is stripped at the portal action boundary and the portal page", () => {
+    const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const start = actions.indexOf("export async function getChangeOrderForPortal(");
+    const body = actions.slice(start, actions.indexOf("export async function updateChangeOrder(", start));
+    assert.match(body, /delete \(row as \{ approvalNote\?: unknown \}\)\.approvalNote/);
+    const page = readFileSync(path.join(__dirname, "..", "src", "app", "portal", "change-orders", "[id]", "page.tsx"), "utf8");
+    assert.match(page, /delete \(initialData as \{ approvalNote\?: unknown \}\)\.approvalNote/);
+});
