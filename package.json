@@ -5,6 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "typecheck": "tsc --noEmit",
+    "check:quiet": "node scripts/quiet-check.mjs",
+    "typecheck:quiet": "node scripts/quiet-check.mjs typecheck",
+    "lint:quiet": "node scripts/quiet-check.mjs lint",
+    "test:quiet": "node scripts/quiet-check.mjs test",
     "build:next": "next build",
     "build": "npm run typecheck && npm run build:next",
     "start": "next start",
