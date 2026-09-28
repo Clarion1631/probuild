@@ -153,10 +153,11 @@ jobs:
       # correct, not just the committed migration.sql.
       - name: Front Desk v1 apply script — idempotent against real Postgres
         run: |
-          node scripts/apply-front-desk.mjs --target ci --yes --expect-db probuild_migrations --expect-host localhost
-          node scripts/apply-front-desk.mjs --target ci --yes --expect-db probuild_migrations --expect-host localhost
-        env:
-          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+          FRONT_DESK_DB_HOST=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')
+          test -n "$FRONT_DESK_DB_HOST"
+          export DATABASE_URL="postgresql://probuild:probuild@${FRONT_DESK_DB_HOST}:5432/probuild_migrations?pgbouncer=true"
+          node scripts/apply-front-desk.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$FRONT_DESK_DB_HOST"
+          node scripts/apply-front-desk.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$FRONT_DESK_DB_HOST"
 
       # The schema gap the baseline recorded is now closed by
       # 20260814120000_missing_fk_indexes, so `migrate deploy` above already
