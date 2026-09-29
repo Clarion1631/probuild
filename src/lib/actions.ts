@@ -2839,15 +2839,28 @@ export async function deleteInvoice(invoiceId: string) {
 
     // Guard failures return { error } instead of throwing: production masks
     // thrown server-action messages, so the client would never see the reason.
+    let core: typeof import("./billing-core");
     try {
-        const { deleteInvoiceCore } = await import("./billing-core");
-        const projectId = await deleteInvoiceCore(invoiceId);
+        core = await import("./billing-core");
+    } catch (e) {
+        // Nothing has run yet, so this message is true without billing-core.
+        console.error("deleteInvoice: could not load billing-core:", e);
+        return { success: false as const, error: "Could not delete this invoice. Nothing was deleted. Try again, and tell support if it keeps failing." };
+    }
+    let projectId: string;
+    try {
+        projectId = await core.deleteInvoiceCore(invoiceId);
+    } catch (e: any) {
+        return { success: false as const, error: core.deleteInvoiceFailureMessage(e) };
+    }
+    // The delete has committed. A revalidation failure must not turn it into "Nothing was deleted".
+    try {
         revalidatePath("/projects/" + projectId + "/invoices");
         revalidatePath("/invoices");
-        return { success: true as const, projectId };
-    } catch (e: any) {
-        return { success: false as const, error: (await import("./billing-core")).deleteInvoiceFailureMessage(e) };
+    } catch (e) {
+        console.error("deleteInvoice: revalidation failed after a committed delete:", e);
     }
+    return { success: true as const, projectId };
 }
 export async function updateInvoiceNotes(invoiceId: string, notes: string) {
     await assertInvoicePermission();
