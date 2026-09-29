@@ -20,3 +20,7 @@ prisma/migrations/**/*.sql     text eol=lf
 prisma/PRISMA_PHANTOM_DIFF.sql text eol=lf
 prisma/prisma-blind-spots.json text eol=lf
 prisma/schema.prisma           text eol=lf
+
+# The test:unit allow-list, one path per line. Branches that each add tests
+# append lines here; union merge keeps both sides instead of conflicting.
+tests/unit-list.txt merge=union

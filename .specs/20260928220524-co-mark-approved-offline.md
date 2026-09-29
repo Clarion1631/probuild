@@ -539,7 +539,7 @@ Send for Approval, portal-link email, client messages, and MCP send tools after 
 - `src/components/RecordPaymentModal.tsx` (optional note)
 - `src/app/api/mcp/[transport]/route.ts` (`list_change_orders` payload; G9 tool if shipped)
 - `docs/MILESTONE-EDITING.md` (new table row)
-- `package.json` (`test:unit` list)
+- `tests/unit-list.txt` (the `test:unit` list)
 - Tests: new files in the Test Plan; `tests/estimate-item-payload.test.ts` only if the section-row count changes; `tests/payroll-writer-manifest.test.ts` and `tests/payroll-user-writer-manifest.test.ts` only if a keyed line moves
 
 ## Data Model Changes
@@ -574,16 +574,14 @@ P2022 on every CO page until they exist (CLAUDE.md pre-deploy checklist item 2; 
 
 ## Test Plan
 
-Runner: Node's test runner through tsx. CI runs `npm run test:unit` on Ubuntu (`ci.yml:598-599`).
-On Windows the script is too long for cmd, so run files directly and then the **whole** list:
+Runner: Node's test runner through tsx. CI runs `npm run test:unit` on Ubuntu. Run single files directly, then the **whole** list before pushing:
 
 ```powershell
 node --import tsx --test tests/change-order-offline-approval.test.ts   # one file
-$list = (node -p "require('./package.json').scripts['test:unit'].replace(/^tsx --test /,'')") -split ' '
-node --import tsx --test @list                                          # the whole list, before pushing
+npm run test:unit                                                       # the whole list, before pushing
 ```
 
-Every new hermetic test file must be added to the `test:unit` list in `package.json`. Module fakes use
+Every new hermetic test file must be added to `tests/unit-list.txt` (the `test:unit` list). Module fakes use
 the scoped CommonJS `require` patch used by `tests/ar-digest-listing.test.ts` and
 `tests/deposit-sweep.test.ts` (`mock.module()` is unusable; CI pins Node 20).
 
