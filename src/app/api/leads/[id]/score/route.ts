@@ -3,6 +3,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     const session = await getServerSession(authOptions);
@@ -72,12 +73,13 @@ Return ONLY a JSON object with these exact fields:
     try {
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const response = await anthropic.messages.create({
-            model: "claude-sonnet-4-6",
-            max_tokens: 512,
+            model: CLAUDE_SONNET_MODEL,
+            output_config: { effort: "medium" },
+            max_tokens: 4096,
             messages: [{ role: "user", content: prompt }],
         });
 
-        const text = (response.content[0] as { type: "text"; text: string }).text || "{}";
+        const text = getAnthropicMessageText(response) || "{}";
 
         let result: { score?: number; rating?: string; summary?: string; topFactors?: string[] };
         try {

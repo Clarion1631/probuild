@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
-import { getAnthropicText } from "@/lib/anthropic";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 // Only unlocked items are sent — locked (PO-committed or user-set budget) items are
@@ -135,12 +135,13 @@ OUTPUT — return ONLY valid JSON in this exact shape:
     try {
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const response = await anthropic.messages.create({
-            model: "claude-sonnet-4-6",
-            max_tokens: 8000,
+            model: CLAUDE_SONNET_MODEL,
+            output_config: { effort: "high" },
+            max_tokens: 16000,
             messages: [{ role: "user", content: prompt }],
         });
 
-        const rawText = getAnthropicText(response.content);
+        const rawText = getAnthropicMessageText(response);
         if (!rawText) {
             return NextResponse.json({ error: "No response from AI" }, { status: 502 });
         }

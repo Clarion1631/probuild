@@ -3,6 +3,7 @@
 // src/app/api/selections/ai-sort/route.ts so it's importable directly by
 // tests/the verifier script — mirrors selection-item-thread-dependencies.ts.
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "./anthropic";
 import { mockSelectionAiSortComplete } from "./selection-ai-sort-mock";
 
 // Mock gate. The plan's literal wording gates on
@@ -34,10 +35,10 @@ export async function completeSelectionAiSort(prompt: string): Promise<string> {
     // routes.
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4000,
+        model: CLAUDE_SONNET_MODEL,
+        output_config: { effort: "medium" },
+        max_tokens: 8000,
         messages: [{ role: "user", content: prompt }],
     });
-    const block = response.content[0];
-    return ("text" in block ? block.text : "").trim();
+    return getAnthropicMessageText(response);
 }

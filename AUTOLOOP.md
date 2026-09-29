@@ -8,8 +8,8 @@ no API keys.
 
 ```
 Issue (label: auto-fix)
-  → Planner: Claude Fable 5 subagent — plan + visual acceptance criteria
-  → Executor: Claude Opus 5, medium effort — implement, test, open PR
+  → Planner: Claude Opus 5.5 subagent (xhigh effort) — plan + visual acceptance criteria
+  → Executor: Claude Sonnet 5.5, high effort — implement, test, open PR
   → Reviewer: Codex CLI (gpt-5.6-sol, xhigh) — adversarial review gate
       ↳ REQUEST_CHANGES → Claude fixes → re-review (automatic loop)
   → Gauntlet visual verify: real Chromium against the Vercel PREVIEW deploy
@@ -57,9 +57,13 @@ Issue (label: auto-fix)
 
 ## Tuning knobs
 
-- Executor model/effort: `--model claude-opus-5 --effort medium` in
-  `claude_args` (both workflows).
-- Planner model: `model: claude-fable-5` in `.claude/agents/planner.md`.
+- Executor / code-fixing model: `--model claude-sonnet-5-5 --effort high` in
+  `claude_args` (`claude-auto-fix-loop.yml`, and the `fix-review-feedback` job
+  of `claude-pr-gate.yml`).
+- Judging model (visual verification): `--model claude-opus-5-5 --effort xhigh`
+  in the `gauntlet-visual-verify` job of `claude-pr-gate.yml`.
+- Planner model: `model: opus` + `effort: xhigh` in `.claude/agents/planner.md`
+  (the repo executor subagent is `model: sonnet` + `effort: medium`).
 - Reviewer: `--model gpt-5.6-sol -c model_reasoning_effort="xhigh"` in
   `claude-pr-gate.yml`.
 - Verification strictness: rounds and criteria rules in

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { prisma } from "@/lib/prisma";
+import { CLAUDE_SONNET_MODEL } from "@/lib/anthropic";
 import { PROJECT_STATUS_IN_PROGRESS } from "@/lib/project-status";
 import { createRateLimiter } from "@/app/api/ai/polish-notes/route";
 import {
@@ -22,8 +23,8 @@ export const maxDuration = 30;
 // anything: the worker confirms on the phone (PATCH /api/time-entries/[id]/
 // logistics), a manager can re-route later (/manager/logistics).
 //
-// Model per plan 02: claude-sonnet-5 (short, cheap, JSON-schema-enforced,
-// tool-less). The dump is fenced as untrusted data — see
+// Model per plan 02, now claude-sonnet-5-5 (policy 2026-09-28): short, cheap, JSON-schema-enforced,
+// and tool-less. The dump is fenced as untrusted data — see
 // src/lib/logistics-formalize.ts for the injection posture.
 
 const checkRateLimit = createRateLimiter();
@@ -64,8 +65,8 @@ export async function POST(req: Request) {
         // Bounded well inside maxDuration (30s): one retry, 20s each way at most.
         const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, timeout: 20_000, maxRetries: 1 });
         const response = await client.messages.parse({
-            model: "claude-sonnet-5",
-            // Sonnet 5 thinks adaptively by default and that counts against
+            model: CLAUDE_SONNET_MODEL,
+            // Sonnet 5.5 thinks adaptively by default and that counts against
             // max_tokens: a multi-job dump exhausted 1024 and parsed as null in
             // testing. Formatting a paragraph is a low-effort task.
             max_tokens: 4096,
@@ -81,7 +82,8 @@ export async function POST(req: Request) {
             ],
             output_config: { format: zodOutputFormat(FormalizeOutputSchema), effort: "low" },
         });
-        if (!response.parsed_output) {
+        // A refusal is a normal 200 with no parsed output — same graceful path.
+        if (response.stop_reason === "refusal" || !response.parsed_output) {
             return NextResponse.json({ error: "Could not clean this up right now — you can still submit your own words" }, { status: 502 });
         }
         const result = sanitizeFormalizeOutput(response.parsed_output, jobs);
