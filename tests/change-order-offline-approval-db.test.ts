@@ -77,12 +77,21 @@ async function withWorld(tag: string, opts: { withInvoice?: boolean }, body: (db
     }
 }
 
+// The server rejects an approval date later than the company-local today
+// (parseOfflineApprovalInput), so "today" here must be the company-local day,
+// not the UTC date: from 00:00 UTC until local midnight the UTC date is tomorrow.
+async function companyToday(): Promise<string> {
+    const { resolveCompanyTimeZone } = await import("../src/lib/company-timezone");
+    const { dayKeyInTimeZone } = await import("../src/lib/tz-date");
+    return dayKeyInTimeZone(new Date(), await resolveCompanyTimeZone());
+}
+
 async function offline(ids: Seeded, db: PrismaClient) {
     const { approveChangeOrderOfflineCore } = await import("../src/lib/billing-core");
     const row = await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId }, select: { updatedAt: true } });
     return approveChangeOrderOfflineCore(ids.changeOrderId, {
         method: "PHONE",
-        approvedOn: new Date().toISOString().slice(0, 10),
+        approvedOn: await companyToday(),
         note: "internal",
         expectedUpdatedAt: row.updatedAt.toISOString(),
         actor: ACTOR,
@@ -139,8 +148,9 @@ test("two offline approvals racing: one wins, one is ALREADY_APPROVED, one set o
     await withWorld(`d${Date.now()}`, {}, async (db, ids) => {
         const { approveChangeOrderOfflineCore } = await import("../src/lib/billing-core");
         const row = await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId }, select: { updatedAt: true } });
+        const approvedOn = await companyToday();
         const call = () => approveChangeOrderOfflineCore(ids.changeOrderId, {
-            method: "TEXT", approvedOn: new Date().toISOString().slice(0, 10), expectedUpdatedAt: row.updatedAt.toISOString(), actor: ACTOR,
+            method: "TEXT", approvedOn, expectedUpdatedAt: row.updatedAt.toISOString(), actor: ACTOR,
         }, quiet);
         const results = await Promise.all([call(), call()]);
         assert.equal(results.filter((r) => r.ok).length, 1, JSON.stringify(results));
@@ -157,7 +167,7 @@ test("offline approval racing a portal signature: exactly one Approved outcome",
         const row = await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId }, select: { updatedAt: true } });
         const [offlineResult, portalResult] = await Promise.allSettled([
             approveChangeOrderOfflineCore(ids.changeOrderId, {
-                method: "EMAIL", approvedOn: new Date().toISOString().slice(0, 10), expectedUpdatedAt: row.updatedAt.toISOString(), actor: ACTOR,
+                method: "EMAIL", approvedOn: await companyToday(), expectedUpdatedAt: row.updatedAt.toISOString(), actor: ACTOR,
             }, quiet),
             approveChangeOrderCore(ids.changeOrderId, { signatureName: "Customer A", clientSignatureUrl: "https://example.test/sig.png", approvedAt: new Date() }),
         ]);
