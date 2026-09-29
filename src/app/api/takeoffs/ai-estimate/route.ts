@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { isTaxCostCode, numOr, numOrNull, rmc, TAX_COST_CODE } from "@/lib/takeoff-costing";
 import { getDefaultSalesTax } from "@/lib/sales-tax";
 import { buildSalesTaxPromptSections, resolveSalesTax, salesTaxAmount, salesTaxLineName } from "@/lib/takeoff-tax-prompt";
@@ -287,12 +288,13 @@ Sort items by phase code, then by cost type within each phase. Be thorough and p
     try {
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const response = await anthropic.messages.create({
-            model: "claude-sonnet-4-6",
-            max_tokens: 8192,
+            model: CLAUDE_SONNET_MODEL,
+            output_config: { effort: "high" },
+            max_tokens: 16000,
             messages: [{ role: "user", content: contentBlocks as any }],
         });
 
-        const rawText = (response.content[0] as { type: "text"; text: string }).text;
+        const rawText = getAnthropicMessageText(response);
 
         if (!rawText) {
             return NextResponse.json({ error: "No response from AI" }, { status: 502 });

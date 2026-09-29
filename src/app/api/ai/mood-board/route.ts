@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 
@@ -88,12 +89,13 @@ Return ONLY raw JSON, with no markdown formatting or backticks.`;
         contentBlocks.push({ type: "text", text: textPrompt });
 
         const result = await anthropic.messages.create({
-            model: "claude-sonnet-4-6",
-            max_tokens: 2048,
+            model: CLAUDE_SONNET_MODEL,
+            output_config: { effort: "medium" },
+            max_tokens: 4096,
             messages: [{ role: "user", content: contentBlocks }],
         });
 
-        let text = (result.content[0] as { type: "text"; text: string }).text;
+        let text = getAnthropicMessageText(result);
 
         // Strip markdown backticks if present
         if (text.includes("```json")) text = text.replace(/```json/g, "");

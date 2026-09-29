@@ -3,8 +3,10 @@
  *
  * Phase 2's /automation Receipts tab reuses this unchanged, so the list route
  * and the page can never disagree about what a row is. `readJson` is
- * deliberately absent: it is the raw model output, kept for audit, and nothing
- * outside the worker should read from it.
+ * deliberately absent from THIS select: it is the raw model output, kept for
+ * audit, and nothing outside the worker should read from it through this
+ * select. The Receipts page loader also reads `readJson`, through its own
+ * select, only to derive `amountUnread`; it never leaves the server.
  */
 import { prisma } from "@/lib/prisma";
 import { signReceiptDownloadUrl } from "./bucket";
@@ -14,6 +16,7 @@ export const RECEIPT_INTAKE_LIST_SELECT = {
     id: true,
     source: true,
     sourceRef: true,
+    sourceFolder: true,
     state: true,
     dryRun: true,
     stateReason: true,

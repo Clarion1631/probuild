@@ -605,3 +605,144 @@ test("the exceptions banner makes no claim about which rail is live", async () =
     assert.match(html, /voided or re-classified after the send to QuickBooks had already started/);
     assert.doesNotMatch(html, /while receipts book into ProBuild/);
 });
+
+// ── Drive folder facts and suggestion buttons ─────────────────────────────
+
+const renderWithJobs = async (queue: ReceiptQueue, filters: ReceiptFilters, jobs: Array<{ id: string; name: string }>) =>
+    renderToStaticMarkup(await ReceiptsTab({
+        queue, filters, jobs,
+        filterHref: () => "/automation?tab=receipts", nativeActive: false, sign: recordingSigner().sign,
+    }));
+
+test("Pick the job (To-do view): a folder that is a whole-word prefix of one open job draws a button", async () => {
+    const queue = queueOf({
+        needsJob: [intake("f1", { state: "NEEDS_JOB", sourceFolder: "Oak Street Kitchen" })],
+    });
+    const jobs = [{ id: "j1", name: "Oak Street Kitchen Remodel" }, { id: "j2", name: "Pine Avenue Bath" }];
+    const html = await renderWithJobs(queue, parseReceiptFilters({}), jobs);
+
+    assert.match(html, /Folder: Oak Street Kitchen/);
+    assert.match(html, /Starts with the folder name:/);
+    assert.match(html, /<button[^>]*>Oak Street Kitchen Remodel<\/button>/);
+    assert.doesNotMatch(html, /<button[^>]*>Pine Avenue Bath<\/button>/);
+});
+
+test("the same row and jobs under ?group=needs-job draws the same suggestion", async () => {
+    const queue = queueOf({
+        needsJob: [intake("f1", { state: "NEEDS_JOB", sourceFolder: "Oak Street Kitchen" })],
+    });
+    const jobs = [{ id: "j1", name: "Oak Street Kitchen Remodel" }, { id: "j2", name: "Pine Avenue Bath" }];
+    const html = await renderWithJobs(queue, { ...PRE_VIEW, group: "needs-job" }, jobs);
+
+    assert.match(html, /Folder: Oak Street Kitchen/);
+    assert.match(html, /Starts with the folder name:/);
+    assert.match(html, /<button[^>]*>Oak Street Kitchen Remodel<\/button>/);
+});
+
+test("an exact-name job draws Same name as the folder, one button", async () => {
+    const queue = queueOf({
+        needsJob: [intake("f1", { state: "NEEDS_JOB", sourceFolder: "Oak Street Kitchen" })],
+    });
+    const jobs = [{ id: "j1", name: "Oak Street Kitchen" }, { id: "j2", name: "Pine Avenue Bath" }];
+    const html = await renderWithJobs(queue, parseReceiptFilters({}), jobs);
+
+    assert.match(html, /Same name as the folder:/);
+    assert.match(html, /<button[^>]*>Oak Street Kitchen<\/button>/);
+});
+
+test("overhead: Shop offers no Shop Annex button, and offers itself when it is open", async () => {
+    const queueNoShop = queueOf({
+        needsJob: [intake("f1", { state: "NEEDS_JOB", sourceFolder: "Shop" })],
+    });
+    const htmlNoShop = await renderWithJobs(queueNoShop, parseReceiptFilters({}), [{ id: "j1", name: "Shop Annex" }]);
+    assert.doesNotMatch(htmlNoShop, /Starts with the folder name:/);
+    assert.doesNotMatch(htmlNoShop, /Same name as the folder:/);
+    assert.doesNotMatch(htmlNoShop, /<button[^>]*>Shop Annex<\/button>/);
+
+    const queueWithShop = queueOf({
+        needsJob: [intake("f2", { state: "NEEDS_JOB", sourceFolder: "Shop" })],
+    });
+    const htmlWithShop = await renderWithJobs(
+        queueWithShop, parseReceiptFilters({}),
+        [{ id: "j1", name: "Shop" }, { id: "j2", name: "Shop Annex" }],
+    );
+    assert.match(htmlWithShop, /Same name as the folder:/);
+    assert.match(htmlWithShop, /<button[^>]*>Shop<\/button>/);
+    assert.doesNotMatch(htmlWithShop, /<button[^>]*>Shop Annex<\/button>/);
+});
+
+test("namesakes draw the sameName sentence; more than 4 prefix hits draw tooMany, both with no buttons", async () => {
+    const namesakeQueue = queueOf({
+        needsJob: [intake("f1", { state: "NEEDS_JOB", sourceFolder: "Oak Street Kitchen" })],
+    });
+    const htmlNamesake = await renderWithJobs(
+        namesakeQueue, parseReceiptFilters({}),
+        [{ id: "j1", name: "Oak Street Kitchen" }, { id: "j2", name: "oak street kitchen" }],
+    );
+    assert.match(htmlNamesake, /More than one open job has this name, so there is no button\. Tell Justin\./);
+    // The generic "Set job" button is always there; no JOB-NAMED suggestion
+    // button is what this case must not draw.
+    assert.doesNotMatch(htmlNamesake, /<button[^>]*>Oak Street Kitchen<\/button>/);
+    assert.doesNotMatch(htmlNamesake, /<button[^>]*>oak street kitchen<\/button>/);
+
+    const tooManyQueue = queueOf({
+        needsJob: [intake("f2", { state: "NEEDS_JOB", sourceFolder: "Oak Street" })],
+    });
+    const fiveJobs = ["A", "B", "C", "D", "E"].map((letter, i) => ({ id: `j${i}`, name: `Oak Street ${letter}` }));
+    const htmlTooMany = await renderWithJobs(tooManyQueue, parseReceiptFilters({}), fiveJobs);
+    assert.match(htmlTooMany, /Several open jobs start with this folder name\. Pick one from the list\./);
+    for (const letter of ["A", "B", "C", "D", "E"]) {
+        assert.doesNotMatch(htmlTooMany, new RegExp(`<button[^>]*>Oak Street ${letter}<\\/button>`));
+    }
+});
+
+test("a job list at the cap shows the folder fact but no suggestion", async () => {
+    const queue = queueOf({
+        needsJob: [intake("f1", { state: "NEEDS_JOB", sourceFolder: "Oak Street Kitchen" })],
+    });
+    const cappedJobs = Array.from({ length: 200 }, (_, i) =>
+        i === 100 ? { id: "exact", name: "Oak Street Kitchen" } : { id: `j${i}`, name: `Job ${i}` });
+    const html = await renderWithJobs(queue, parseReceiptFilters({}), cappedJobs);
+
+    assert.match(html, /Folder: Oak Street Kitchen/);
+    assert.doesNotMatch(html, /Same name as the folder:|Starts with the folder name:/);
+});
+
+test("a NEEDS_REVIEW row that already has a job gets no suggestion, even in Pick the job", async () => {
+    const queue = queueOf({
+        needsReview: [intake("nr1", {
+            state: "NEEDS_REVIEW", stateReason: "no-estimate",
+            projectId: "j1", projectName: "Oak Street Kitchen Remodel",
+            sourceFolder: "Oak Street Kitchen",
+        })],
+    });
+    const jobs = [{ id: "j1", name: "Oak Street Kitchen Remodel" }];
+    const html = await renderWithJobs(queue, parseReceiptFilters({}), jobs);
+
+    assert.match(html, /Pick the job/);
+    assert.doesNotMatch(html, /Starts with the folder name:|Same name as the folder:/);
+});
+
+test("a booked row still shows its folder fact", async () => {
+    const queue = queueOf({
+        bookedToday: [intake("bk1", { state: "BOOKED", sourceFolder: "Pine Avenue" })],
+    });
+    const html = await render(queue, { ...PRE_VIEW, group: "booked-today" });
+    assert.match(html, /Folder: Pine Avenue/);
+});
+
+test("amount not read draws instead of $0.00, only when the flag is set", async () => {
+    const unread = queueOf({
+        needsReview: [intake("u1", { totalCents: 0, amountUnread: true })],
+    });
+    const htmlUnread = await render(unread, { ...PRE_VIEW, group: "needs-review" });
+    assert.match(htmlUnread, /amount not read/);
+    assert.doesNotMatch(htmlUnread, /\$0\.00/);
+
+    const zero = queueOf({
+        needsReview: [intake("z1", { totalCents: 0 })],
+    });
+    const htmlZero = await render(zero, { ...PRE_VIEW, group: "needs-review" });
+    assert.match(htmlZero, /\$0\.00/);
+    assert.doesNotMatch(htmlZero, /amount not read/);
+});

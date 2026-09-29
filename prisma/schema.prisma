@@ -1905,6 +1905,12 @@ model ChangeOrder {
   approvedBy         String?
   approvedAt         DateTime?
 
+  // Office-recorded approval: the customer approved outside ProBuild (phone, text, email, in person).
+  // Set only by approveChangeOrderOfflineCore. Null for portal-signed and legacy rows.
+  approvalSource String? // "OFFLINE" | null
+  approvalMethod String? // PHONE | TEXT | EMAIL | IN_PERSON | OTHER (OFFLINE rows only)
+  approvalNote   String? // staff-only; never rendered to the customer or printed on the PDF
+
   // Company countersignature (set by countersignChangeOrderAsCompany — ADMIN/MANAGER).
   // Separate fields so countersigning never overwrites the customer's approval/audit trail.
   companySignatureUrl String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
@@ -3589,6 +3595,10 @@ model ReceiptIntake {
   /// "drive:<fileId>" | "email:<gmailMsgId>:<sha16>" | "mobile:<uploadId>" |
   /// "chat:<messageName>:<n>" | "web:<uuid>" — the caller's idempotency key.
   sourceRef   String  @unique
+  /// The Drive folder the forwarder filed this under, as it saw it (cleaned, at most
+  /// 200 characters). Written once at intake, only for the shared-secret drive
+  /// forwarder. A display and suggestion hint, never a job by itself.
+  sourceFolder String?
   /// STAGING is the state a row is BORN in: the object is not in the bucket
   /// yet, so the worker's claim predicate excludes it. The intake route flips
   /// it to RECEIVED in one UPDATE after the upload lands. A row that never gets

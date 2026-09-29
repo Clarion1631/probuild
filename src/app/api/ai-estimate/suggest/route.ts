@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 
 export async function POST(req: NextRequest) {
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -22,8 +23,9 @@ export async function POST(req: NextRequest) {
       }
 
       const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 200,
+        model: CLAUDE_SONNET_MODEL,
+        output_config: { effort: "low" },
+        max_tokens: 1024,
         messages: [{
           role: "user",
           content: `You are a construction estimator. Write a brief, specific description (1-2 lines max) for this estimate line item.
@@ -40,8 +42,7 @@ Return ONLY the description text, nothing else. Be specific and practical — in
         }],
       });
 
-      const block = response.content[0];
-      const description = ("text" in block ? block.text : "").trim().replace(/^["']|["']$/g, "");
+      const description = getAnthropicMessageText(response).replace(/^["']|["']$/g, "");
       return NextResponse.json({ description });
     }
 
@@ -54,8 +55,9 @@ Return ONLY the description text, nothing else. Be specific and practical — in
       const existingNames = (existingItems || []).map((i: any) => i.name).filter(Boolean).join(", ");
 
       const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 800,
+        model: CLAUDE_SONNET_MODEL,
+        output_config: { effort: "medium" },
+        max_tokens: 2048,
         messages: [{
           role: "user",
           content: `You are a construction estimator. Suggest 3-5 sub-items that break down this line item into specific tasks/materials.
@@ -78,8 +80,7 @@ Be specific to residential remodeling in the Pacific Northwest. Return ONLY the 
         }],
       });
 
-      const block2 = response.content[0];
-      const rawText = ("text" in block2 ? block2.text : "").trim();
+      const rawText = getAnthropicMessageText(response);
       let suggestions;
       try {
         suggestions = JSON.parse(rawText);

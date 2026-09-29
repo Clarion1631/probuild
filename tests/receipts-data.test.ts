@@ -104,3 +104,51 @@ test("the Chat thread stamp is read from displayDetails.card", async () => {
     assert.equal(withCard.pdfUrl, "https://drive.example/memo.pdf");
     assert.equal(toMissingReceiptRow(issueRow()).threadName, null);
 });
+
+test("INTAKE_SELECT reads readJson and sourceFolder", async () => {
+    const { INTAKE_SELECT } = await loadDataModule();
+    assert.equal(INTAKE_SELECT.readJson, true);
+    assert.equal(INTAKE_SELECT.sourceFolder, true, "inherited from RECEIPT_INTAKE_LIST_SELECT");
+});
+
+const rawIntakeRow = (over: Record<string, unknown> = {}) => ({
+    id: "ri-1",
+    state: "NEEDS_JOB",
+    stateReason: null,
+    source: "drive",
+    projectId: null,
+    project: null,
+    costCodeId: null,
+    vendor: "Oak Street Hardware",
+    txnDate: null,
+    totalCents: 0,
+    fileName: "receipt.pdf",
+    storagePath: "receipts/intake/ri-1.pdf",
+    duplicateOfId: null,
+    qbPurchaseId: null,
+    postVoidQbPurchaseId: null,
+    attempts: 0,
+    lastError: null,
+    nextRetryAt: null,
+    bookedAt: null,
+    createdAt: new Date("2026-09-21T16:00:00.000Z"),
+    updatedAt: new Date("2026-09-21T16:00:00.000Z"),
+    sourceFolder: "Oak Street Kitchen",
+    readJson: null,
+    ...over,
+});
+
+test("toIntakeRow carries sourceFolder and never leaks readJson", async () => {
+    const { toIntakeRow } = await loadDataModule();
+    const row = toIntakeRow(rawIntakeRow() as never);
+    assert.equal(row.sourceFolder, "Oak Street Kitchen");
+    assert.ok(!("readJson" in row), "readJson must not reach IntakeRow");
+});
+
+test("toIntakeRow derives amountUnread from the stored read, not totalCents alone", async () => {
+    const { toIntakeRow } = await loadDataModule();
+    const unread = toIntakeRow(rawIntakeRow({ totalCents: 0, readJson: '{"total_amount":""}' }) as never);
+    assert.equal(unread.amountUnread, true);
+    const read = toIntakeRow(rawIntakeRow({ totalCents: 0, readJson: '{"total_amount":"0.00"}' }) as never);
+    assert.equal(read.amountUnread, false);
+});

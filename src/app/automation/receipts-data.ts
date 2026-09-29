@@ -12,7 +12,8 @@ import { POSSIBLE_ORPHAN_REASON } from "@/lib/receipt-intake/park";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
 import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner } from "@/lib/receipt-requests";
 import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
-import { RECEIPT_GROUP_TAKE, missingReceiptMatchesFilters, ownerRank, type ReceiptFilters } from "./receipts-filters";
+import { RECEIPT_GROUP_TAKE, JOB_OPTIONS_TAKE, missingReceiptMatchesFilters, ownerRank, type ReceiptFilters } from "./receipts-filters";
+import { amountNotRead } from "@/lib/receipt-intake/read";
 
 /**
  * Per-group display cap. Badge counts come from count queries, never from these.
@@ -56,6 +57,10 @@ export type IntakeRow = {
      * not silently apply to the second.
      */
     updatedAt: string;
+    /** The Drive folder this was filed under, cleaned. Optional: absent parts render null. */
+    sourceFolder?: string | null;
+    /** True only for a stored zero the model never actually read — see read.ts's amountNotRead. */
+    amountUnread?: boolean;
 };
 
 export interface MissingReceiptRow {
@@ -158,9 +163,13 @@ function toUncertainCardRow(row: {
     };
 }
 
-const INTAKE_SELECT = {
+// readJson: only to derive amountUnread below (read.ts's amountNotRead) — see
+// the note in queries.ts. It is mapped to a plain boolean in toIntakeRow and
+// never copied onto IntakeRow itself, so it never reaches the browser.
+export const INTAKE_SELECT = {
     ...RECEIPT_INTAKE_LIST_SELECT,
     project: { select: { name: true } },
+    readJson: true,
 } as const;
 
 type RawIntake = Awaited<ReturnType<typeof loadIntakes>>[number];
@@ -174,7 +183,7 @@ async function loadIntakes(where: Record<string, unknown>) {
     });
 }
 
-function toIntakeRow(row: RawIntake): IntakeRow {
+export function toIntakeRow(row: RawIntake): IntakeRow {
     return {
         id: row.id,
         state: row.state,
@@ -197,6 +206,8 @@ function toIntakeRow(row: RawIntake): IntakeRow {
         bookedAt: row.bookedAt ? row.bookedAt.toISOString() : null,
         createdAt: row.createdAt.toISOString(),
         updatedAt: row.updatedAt.toISOString(),
+        sourceFolder: row.sourceFolder,
+        amountUnread: amountNotRead(row.totalCents, row.readJson),
     };
 }
 
@@ -433,7 +444,7 @@ export async function fetchJobOptions(): Promise<Array<{ id: string; name: strin
     return prisma.project.findMany({
         where: { status: { in: OPEN_PROJECT_STATUSES } },
         orderBy: { name: "asc" },
-        take: 200,
+        take: JOB_OPTIONS_TAKE,
         select: { id: true, name: true },
     });
 }

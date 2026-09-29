@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import { withCronHeartbeat, isRecord } from "@/lib/cron-heartbeat";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
@@ -1545,7 +1546,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
     };
 }
 
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     // isCronAuthorized: constant-time compare, and it fails CLOSED.
     //
     // The hand-rolled version this replaces had both problems the shared helper
@@ -1566,3 +1567,9 @@ export async function GET(request: Request) {
     }
     return NextResponse.json(summary);
 }
+
+// Always answers 200; a row parked in RETRY state (byState.RETRY) is not
+// visible in the status code, so the heartbeat needs its own look at the body.
+export const GET = withCronHeartbeat("RECEIPT_INTAKE_WORKER", handleGET, {
+    isFailure: body => isRecord(body) && isRecord(body.byState) && typeof body.byState.RETRY === "number" && body.byState.RETRY > 0,
+});

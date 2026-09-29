@@ -423,6 +423,40 @@ test("moveReceiptExpenseToJob: role check — a non-ADMIN/MANAGER user gets notA
     assertNoMoveWrites();
 });
 
+test("moveReceiptExpenseToJob: a manager who can see only the SOURCE project is refused before any transaction starts", async () => {
+    // Codex xhigh post-merge review of #534, §7.5. canAccessProject already
+    // gates both ends before moveReceiptExpenseToJobCore is ever called
+    // (time-expense-actions.ts) -- this is the missing test proving it, not
+    // a code fix. The check throws a plain Error("Forbidden"), the same
+    // shape deleteExpense's own scope checks use elsewhere in this file, not
+    // a { ok: false, message } refusal.
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser({ projectIds: [FROM_PROJECT] }); // no access to TO_PROJECT
+    let message: string | null = null;
+    try {
+        await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    } catch (error) {
+        message = (error as Error).message;
+    }
+    assert.equal(message, "Forbidden");
+    assert.equal(transactionCalls, 0, "no transaction runs when the destination job is out of scope");
+    assertNoMoveWrites();
+});
+
+test("moveReceiptExpenseToJob: a manager who can see only the DESTINATION project is refused before any transaction starts", async () => {
+    storedExpense = receiptBookedExpense();
+    currentUser = moverUser({ projectIds: [TO_PROJECT] }); // no access to FROM_PROJECT
+    let message: string | null = null;
+    try {
+        await moveReceiptExpenseToJob("e1", FROM_PROJECT, TO_PROJECT);
+    } catch (error) {
+        message = (error as Error).message;
+    }
+    assert.equal(message, "Forbidden");
+    assert.equal(transactionCalls, 0, "no transaction runs when the source job is out of scope");
+    assertNoMoveWrites();
+});
+
 test("moveReceiptExpenseToJob: not receipt-booked", async () => {
     storedExpense = receiptBookedExpense({ receiptIntake: null });
     currentUser = moverUser();
@@ -561,7 +595,7 @@ test("moveReceiptExpenseToJob: reattributeExpense target-moved refuses changed",
 
 test("moveReceiptExpenseToJob: reattributeExpense source-moved refuses changed", async () => {
     // The job the expense is LEAVING changes under the same peek/re-read gap
-    // (expense-attribution.ts:1079-1084): reattributeExpense's own read
+    // (expense-attribution.ts:1081-1086): reattributeExpense's own read
     // (call 3) sees no projectId of its own, so it falls back to the
     // estimate's projectId peek, and that peek disagrees with its own
     // locked re-read.

@@ -394,3 +394,40 @@ export async function readReceipt(
     // must spend an attempt on it.
     return { ok: false, decisive: sawDecisiveFailure };
 }
+
+/**
+ * Did the model's raw `total_amount` actually READ as a number, straight from
+ * the stored `readJson`? A blank or unrecognized value and a literal zero are
+ * currently stored the same way (`cleanMoney` gives "0.00" for both), so this
+ * is the one place that still tells them apart.
+ *
+ * null when there is no `readJson`, or it does not parse: unknown, so
+ * today's display is kept. Otherwise, the same coercion this module already
+ * uses (`coerce`), stripped the way `cleanMoney` strips it
+ * (`[^0-9.\-]`), and whether `parseFloat` on what is left gives a finite
+ * number. So "", "N/A", "unknown", "-" and a missing key mean NOT read;
+ * "0", "0.00", "$0.00" and "(12.50)" mean read.
+ */
+export function totalWasRead(readJson: string | null | undefined): boolean | null {
+    if (!readJson) return null;
+    let json: Record<string, unknown>;
+    try {
+        json = JSON.parse(readJson);
+    } catch {
+        return null;
+    }
+    if (!json || typeof json !== "object") return null;
+    const stripped = coerce(json.total_amount).replace(/[^0-9.\-]/g, "");
+    return Number.isFinite(parseFloat(stripped));
+}
+
+/**
+ * A stored total of exactly 0 that the model never actually read — as
+ * opposed to a receipt that genuinely reads $0.00. A person's or booking's
+ * later non-zero `totalCents` always wins here, because this needs
+ * `totalCents === 0` too; a null `totalCents` (never read at all) keeps
+ * today's "—" and is not "unread" in this sense.
+ */
+export function amountNotRead(totalCents: number | null, readJson: string | null | undefined): boolean {
+    return totalCents === 0 && totalWasRead(readJson) === false;
+}

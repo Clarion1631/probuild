@@ -2,6 +2,7 @@
 import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { prisma } from "@/lib/prisma";
 import { displayEndDate, toDateKey, durationDays, isTaskOverdue } from "@/lib/schedule-dates";
 import { toCompanyDayKey } from "@/lib/company-day";
@@ -99,11 +100,15 @@ DATA CONFIDENCE: [Low | Medium | High] — [1 sentence explaining what additiona
 
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4096,
+        model: CLAUDE_SONNET_MODEL,
+        output_config: { effort: "high" },
+        max_tokens: 8000,
         messages: [{ role: "user", content: prompt }],
     });
-    const analysis = (response.content[0] as { type: "text"; text: string }).text.trim();
+    if (response.stop_reason === "refusal") {
+        return NextResponse.json({ error: "The AI declined this request" }, { status: 422 });
+    }
+    const analysis = getAnthropicMessageText(response);
 
     return NextResponse.json({ success: true, analysis });
 }

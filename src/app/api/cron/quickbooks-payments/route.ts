@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { syncQuickBooksPayments } from "@/lib/quickbooks-payments";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import { withCronHeartbeat, isRecord } from "@/lib/cron-heartbeat";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -10,7 +11,7 @@ export const maxDuration = 120;
  * checks Vanessa applies in QBO off the Washington Trust bank feed) back into
  * ProBuild payment milestones, so ProBuild / QuickBooks / the bank stay in sync.
  */
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     // Was fail-OPEN: the check only ran when VERCEL_ENV === "production", so any
     // preview or non-Vercel runtime could trigger a money sync unauthenticated,
     // and a missing CRON_SECRET made `Bearer undefined` a valid credential.
@@ -35,3 +36,11 @@ export async function GET(request: Request) {
     }
     return NextResponse.json(result);
 }
+
+// The 503 above already covers a full runFailed outage; the wrapper's default
+// status-based rule catches that without help. What it can't see is a 200
+// carrying PARTIAL per-row errors (some settled, some didn't, runFailed still
+// false) — that needs its own look at the body.
+export const GET = withCronHeartbeat("QUICKBOOKS_PAYMENTS", handleGET, {
+    isFailure: body => isRecord(body) && Array.isArray(body.errors) && body.errors.length > 0,
+});

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { sendPaymentReminders } from "@/lib/payment-reminders";
+import { withCronHeartbeat, isRecord } from "@/lib/cron-heartbeat";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -18,7 +19,7 @@ export const maxDuration = 60;
  * sending back on. Absent the env var, this query param can only turn dry-run on, never
  * off — omitting it defaults to a real (non-dry) run.
  */
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     // Any deployed environment (production or preview) requires the cron secret,
     // and fails closed if CRON_SECRET is unset. Only local dev skips the check.
     const authHeader = request.headers.get("authorization");
@@ -34,3 +35,9 @@ export async function GET(request: Request) {
     console.log("[cron/payment-reminders]", JSON.stringify(result));
     return NextResponse.json(result);
 }
+
+// Always answers 200; `failed` (per-milestone caught send errors) does not
+// move the status, so the heartbeat needs its own look at the body.
+export const GET = withCronHeartbeat("PAYMENT_REMINDERS", handleGET, {
+    isFailure: body => isRecord(body) && typeof body.failed === "number" && body.failed > 0,
+});

@@ -466,7 +466,7 @@ test("the cards cron reports partial — ok:false, HTTP 200 — for an uncertain
     );
     // ok:false so it is visible; 200 so the platform does not treat it as a
     // crashed invocation and re-run it (which would risk the duplicate card).
-    assert.match(source, /ok: failures\.length === 0 && uncertainTransitions\.length === 0,/);
+    assert.match(source, /ok: failures\.length === 0 && uncertainTransitions\.length === 0 && !scanIncomplete,/);
     assert.match(source, /partial: failures\.length === 0 && uncertainTransitions\.length > 0,/);
     assert.match(source, /status: failures\.length > 0 \? 500 : 200/);
     // TRANSITIONS, not the reported list: an old uncertain row must not make

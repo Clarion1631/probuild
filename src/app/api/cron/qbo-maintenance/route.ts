@@ -4,6 +4,7 @@ import { isCronAuthorized } from "@/lib/cron-auth";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { PAYMENTS_SYNC_EVENT_KIND, QBO_MAINTENANCE_SOURCE } from "@/lib/pipeline-health";
 import { POST as runMaintenance } from "@/app/api/integrations/qbo-maintenance/route";
+import { withCronHeartbeat } from "@/lib/cron-heartbeat";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -28,7 +29,7 @@ export const maxDuration = 120;
  * sweeps never contend with the payments cron for the same QuickBooks
  * connection. `pipeline-health` treats two missed runs as stale.
  */
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
     }
@@ -83,3 +84,8 @@ export async function GET(request: Request) {
         { status: ok ? status : (status >= 400 ? status : 503) },
     );
 }
+
+// Status already mirrors `ok` exactly (200 only when genuinely clean, 503+
+// otherwise, including the secret-missing guard above) — the wrapper's
+// default status-based rule classifies this correctly with no predicate.
+export const GET = withCronHeartbeat("QBO_MAINTENANCE", handleGET);

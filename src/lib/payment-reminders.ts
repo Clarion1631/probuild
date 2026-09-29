@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
 import { utcMidnight, daysBetweenUtc, dueDateLabel } from "@/lib/date-utils";
+import { OFFLINE_APPROVAL_SOURCE, offlineHoldMilestoneWhere } from "@/lib/change-order-offline-approval";
 
 // Same writer as actions.ts's logActivity, but reached via a lazy dynamic import so this
 // module (imported by the cron route) never pulls in actions.ts's "use server"
@@ -164,11 +165,22 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
             client: { email: { not: null } },
         };
 
+        // Offline-approved change orders never contact the customer on their own: a
+        // milestone that came from one and was never requested (qbInvoiceSentAt NULL) is
+        // held back until staff sends it. Null-safe (see offlineHoldMilestoneWhere), so
+        // ordinary milestones keep their reminders.
+        const offlineCoIds = (await prisma.changeOrder.findMany({
+            where: { approvalSource: OFFLINE_APPROVAL_SOURCE },
+            select: { id: true },
+        })).map(row => row.id);
+        const offlineHold = offlineHoldMilestoneWhere(offlineCoIds);
+
         const eligibilityWhere: Prisma.PaymentScheduleWhereInput = {
             status: "Pending",
             dueDate: { not: null, lt: upcomingCutoff, gte: overdueFloor },
             OR: throttleOr,
             invoice: invoiceFilter,
+            ...(offlineHold ? { AND: [offlineHold] } : {}),
         };
 
         // Wide window (see SELECTION_WINDOW_SIZE) — filtered for paid mirrors, THEN sliced
@@ -281,16 +293,34 @@ export async function sendPaymentReminders(opts?: { dryRun?: boolean }): Promise
                 // week's run (throttle window) picks it back up — an acceptable tradeoff for
                 // never double-sending.
                 claimedAt = new Date();
-                const claim = await prisma.paymentSchedule.updateMany({
-                    where: {
-                        id: schedule.id,
-                        status: "Pending",
-                        dueDate: { not: null, lt: upcomingCutoff, gte: overdueFloor },
-                        invoice: invoiceFilter,
-                        AND: [{ OR: throttleOr }, { OR: mirrorOr }],
-                    },
-                    data: { lastReminderAt: claimedAt },
-                });
+                // The claim also re-decides the offline hold against the milestone's CURRENT
+                // provenance, under the milestone's row lock, not against the id snapshot taken
+                // before selection. An office approval that links this milestone to an offline
+                // change order stamps the same row (in the same transaction that flips the change
+                // order), so it either committed before this lock (seen here) or waits until this
+                // claim commits, in which case the reminder simply came first.
+                const claim = await prisma.$transaction(async (tx) => {
+                    const current = (await tx.$queryRaw<Array<{ sourceChangeOrderId: string | null; qbInvoiceSentAt: Date | null }>>`
+                        SELECT "sourceChangeOrderId", "qbInvoiceSentAt" FROM "PaymentSchedule" WHERE "id" = ${schedule.id} FOR UPDATE`)[0];
+                    if (!current) return { count: 0 };
+                    if (current.sourceChangeOrderId && !current.qbInvoiceSentAt) {
+                        const source = await tx.changeOrder.findUnique({
+                            where: { id: current.sourceChangeOrderId },
+                            select: { approvalSource: true },
+                        });
+                        if (source?.approvalSource === OFFLINE_APPROVAL_SOURCE) return { count: 0 };
+                    }
+                    return tx.paymentSchedule.updateMany({
+                        where: {
+                            id: schedule.id,
+                            status: "Pending",
+                            dueDate: { not: null, lt: upcomingCutoff, gte: overdueFloor },
+                            invoice: invoiceFilter,
+                            AND: [{ OR: throttleOr }, { OR: mirrorOr }, ...(offlineHold ? [offlineHold] : [])],
+                        },
+                        data: { lastReminderAt: claimedAt },
+                    });
+                }, { timeout: 15_000 });
                 if (claim.count !== 1) {
                     claimedAt = null; // nothing was claimed — no revert needed
                     result.skipped++;

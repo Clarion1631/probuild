@@ -32,8 +32,11 @@ test("the cron route is a GET, fails closed, and does not reimplement the sweeps
     const src = readFileSync("src/app/api/cron/qbo-maintenance/route.ts", "utf8");
 
     // Vercel cron issues GET. A POST-only handler is why none of this ran.
-    assert.match(src, /export async function GET\(/);
-    assert.doesNotMatch(src, /export async function POST\(/);
+    // (Exported via withCronHeartbeat's wrapper rather than a bare
+    // `export async function GET` — see src/lib/cron-heartbeat.ts — but it is
+    // still a GET, and still the only export.)
+    assert.match(src, /export const GET = withCronHeartbeat\(/);
+    assert.doesNotMatch(src, /export (async function|const) POST[\s(=]/);
 
     // The shared cron gate: constant-time bearer, no environment escape hatch.
     assert.match(src, /isCronAuthorized\(request\)/);
