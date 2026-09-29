@@ -409,6 +409,7 @@ function seedMilestone(opts: {
     invoiceStatus?: string;
     name?: string;
     paymentDate?: Date | null;
+    firstRequestedAt?: Date | null;
 }) {
     scheduleSeq += 1;
     const id = `sched-${scheduleSeq}`;
@@ -427,6 +428,9 @@ function seedMilestone(opts: {
         // one the chronology rule requires. Tests that care about the boundary
         // set this explicitly.
         qbInvoiceSentAt: opts.requested === false ? null : new Date(TODAY.getTime() - 30 * 86_400_000),
+        // Defaults to NULL: every existing test here exercises the
+        // qbInvoiceSentAt fallback (a row requested before this column existed).
+        firstRequestedAt: opts.firstRequestedAt ?? null,
         paymentDate: opts.paymentDate ?? null,
         invoice: {
             id: `inv-${scheduleSeq}`,
@@ -1140,10 +1144,14 @@ test("the Hoppe case: three Pending milestones at the same amount, only one REQU
     // The candidate query itself must carry the requested filter — this is the
     // rule, and it lives in SQL.
     assert.deepEqual(
-        queries.paymentSchedule[0].where.qbInvoiceSentAt,
-        { not: null, lte: requestedByInstant(SETTLED_DAY) },
-        'requested, AND requested before the money arrived',
+        queries.paymentSchedule[0].where.OR,
+        [
+            { firstRequestedAt: { not: null, lte: requestedByInstant(SETTLED_DAY) } },
+            { firstRequestedAt: null, qbInvoiceSentAt: { not: null, lte: requestedByInstant(SETTLED_DAY) } },
+        ],
+        "FIRST requested before the money arrived; a row with no firstRequestedAt falls back to qbInvoiceSentAt",
     );
+    assert.equal(queries.paymentSchedule[0].where.qbInvoiceSentAt, undefined, "the last-send column never gates chronology on its own");
     assert.equal(tables.paymentSchedule.rows.find(r => r.id === requested)!.status, "Paid");
 });
 
@@ -1995,6 +2003,32 @@ test("P0: chronology — a milestone requested AFTER the deposit is not a candid
         const result = creditResult(body, "REF-SAMEDAY");
         assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
         assert.equal(result.scheduleId, milestone);
+    });
+});
+
+test("P0: chronology judges the FIRST request: a resend after the deposit does not disqualify it", async t => {
+    await t.test("first requested before the credit, resent the day after: still applies", async () => {
+        const milestone = seedMilestone({ amount: 7575.75, firstRequestedAt: new Date(TODAY.getTime() - 30 * 86_400_000) });
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceSentAt =
+            new Date(`${isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS)}T16:00:00.000Z`);
+
+        const { body } = await post(bankBatch([{ ref: "REF-RESENT", amount: 7575.75 }]));
+        const result = creditResult(body, "REF-RESENT");
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+    });
+
+    await t.test("first requested the day after the credit: refused, and the reason says so", async () => {
+        const dayAfter = new Date(`${isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS)}T16:00:00.000Z`);
+        const milestone = seedMilestone({ amount: 7676.76, firstRequestedAt: dayAfter });
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceSentAt =
+            new Date(dayAfter.getTime() + 60 * 60 * 1000);
+
+        const { body } = await post(bankBatch([{ ref: "REF-LATE-FIRST", amount: 7676.76 }]));
+        const result = creditResult(body, "REF-LATE-FIRST");
+        assert.equal(result.status, "unmatched");
+        assert.match(String(result.reason), /milestone requested after the deposit/);
+        assert.equal(calls.buildQBPaymentRequest.length, 0);
     });
 });
 

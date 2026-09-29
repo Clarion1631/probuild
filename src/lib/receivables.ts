@@ -38,6 +38,9 @@ export interface ReceivableMilestone {
     qbInvoiceSentAt: Date | null;
     qbSyncError: string | null;
     qbSyncedAt: Date | null;
+    /** First request, never moved by a resend (milestone-request-stamp.ts).
+     *  Null on a row requested before the column existed: age from qbInvoiceSentAt. */
+    firstRequestedAt: Date | null;
 }
 
 export interface ReceivableProgressBilling {
@@ -157,10 +160,13 @@ export function isLiveQboLink(qbInvoiceId: string | null, qbSyncError: string | 
  * necessarily the true earliest event, only the earliest the row still
  * holds. `qbSyncedAt` is written at link time but a drift reconcile can
  * rewrite it; `qbInvoiceSentAt` holds only the LAST send, so a resend moves
- * it forward; breaking a QuickBooks link clears `qbSyncedAt` entirely
- * (`claimQBInvoiceUnlink` in quickbooks-payments.ts keeps `qbInvoiceSentAt`
- * on purpose, which is why the milestone loop below still finds it). None of
- * that is visible here — `billedAt` can only ever reflect what survives.
+ * it forward, which is why the milestone loop ages from `firstRequestedAt`
+ * (set once, never moved) and reads `qbInvoiceSentAt` only for a row
+ * requested before that column existed; breaking a QuickBooks link clears
+ * `qbSyncedAt` entirely (`claimQBInvoiceUnlink` in quickbooks-payments.ts
+ * keeps both request dates on purpose, which is why the milestone loop below
+ * still finds it). None of that is visible here — `billedAt` can only ever
+ * reflect what survives.
  */
 function earliest(...dates: Array<Date | null | undefined>): Date | null {
     let min: Date | null = null;
@@ -275,7 +281,8 @@ export function computeInvoiceReceivable(inv: ReceivableInvoiceInput, now: numbe
             label: m.name,
             cents,
             dueDate: m.dueDate,
-            billedAt: earliest(ownInQbo ? m.qbSyncedAt : null, m.qbInvoiceSentAt, pbEv?.billedAt) ?? inv.issueDate ?? inv.sentAt ?? m.createdAt,
+            // Aged from the FIRST request: a resend moves only qbInvoiceSentAt.
+            billedAt: earliest(ownInQbo ? m.qbSyncedAt : null, m.firstRequestedAt ?? m.qbInvoiceSentAt, pbEv?.billedAt) ?? inv.issueDate ?? inv.sentAt ?? m.createdAt,
             requested,
             inQuickBooks: inQbo,
             progressBillingCode: pbEv ? pbEv.codes.join(", ") : null,

@@ -246,12 +246,13 @@ export async function claimQBInvoiceUnlink(
             qbInvoiceId: expectedQbInvoiceId,
             qbSyncError: expectedQbSyncError,
         },
+        // qbInvoiceSentAt (and firstRequestedAt) deliberately survive the unlink:
+        // they record that a payment request was emailed (the portal's "due"
+        // marker, and AR aging's first-request date), which stays true even
+        // when the QBO invoice behind it is voided and re-staged.
         data: {
             qbInvoiceId: null,
             qbInvoiceLink: null,
-            // qbInvoiceSentAt deliberately survives the unlink: it records that a
-            // payment request was emailed (the portal's "due" marker), which stays
-            // true even when the QBO invoice behind it is voided and re-staged.
             qbSyncedAt: null,
             // Also clears the ambiguous-create marker: unlinking is the
             // documented way to release a milestone parked by an unknown-outcome

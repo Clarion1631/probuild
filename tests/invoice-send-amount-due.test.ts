@@ -63,6 +63,7 @@ function toMilestone(m: RawMilestone): ReceivableMilestone {
         dueDate: parseDate(m.dueDate), createdAt: new Date(m.createdAt),
         qbInvoiceId: m.qbInvoiceId, qbInvoiceSentAt: parseDate(m.qbInvoiceSentAt),
         qbSyncError: m.qbSyncError, qbSyncedAt: parseDate(m.qbSyncedAt),
+        firstRequestedAt: null,
     };
 }
 
@@ -170,6 +171,7 @@ test("computeInvoiceAmountDue: Draft milestone invoice with nothing requested ->
         id: "ms-draft-1", name: "Deposit", amount: "500.00", status: "Pending",
         dueDate: null, createdAt: new Date("2026-01-01T00:00:00.000Z"),
         qbInvoiceId: null, qbInvoiceSentAt: null, qbSyncError: null, qbSyncedAt: null,
+        firstRequestedAt: null,
     };
     const inv: ReceivableInvoiceInput = {
         status: "Draft", balanceDue: "500.00", issueDate: null, sentAt: null,
@@ -217,6 +219,7 @@ const paymentScheduleUpdateManyCalls: Row[] = [];
 // link-refresh loop -- an empty array after a call is direct proof that
 // step never ran (used by the expectedDue-mismatch test below).
 const paymentScheduleUpdateCalls: Row[] = [];
+const executeRawCalls: Row[] = [];
 const sentEmails: Row[] = [];
 let forceEmailFailure = false;
 let forceStampThrow = false;
@@ -245,6 +248,11 @@ const fakePrisma = {
     companySettings: {
         findUnique: async () => ({ companyName: "Test Co", email: null }),
     },
+    $executeRaw: (strings: TemplateStringsArray, ...values: unknown[]) => {
+        executeRawCalls.push({ sql: strings.join("?"), values });
+        return Promise.resolve(1);
+    },
+    $transaction: async (ops: Promise<unknown>[]) => Promise.all(ops),
 };
 
 async function fakeSendNotification(to: string, subject: string, html: string, _attachments?: unknown, options?: Row) {
@@ -258,6 +266,7 @@ beforeEach(() => {
     invoiceUpdateCalls.length = 0;
     paymentScheduleUpdateManyCalls.length = 0;
     paymentScheduleUpdateCalls.length = 0;
+    executeRawCalls.length = 0;
     sentEmails.length = 0;
     forceEmailFailure = false;
     forceStampThrow = false;
@@ -363,11 +372,32 @@ test("sendInvoiceToClientCore: INV-00246 sends only the billed amount and stamps
         invoiceId: raw.code, status: "Pending", id: { in: ["ms-INV-00246-2"] },
     });
 
+    assert.equal(executeRawCalls.length, 1);
+    assert.equal(executeRawCalls[0].values[1], raw.code);
+    assert.deepEqual(executeRawCalls[0].values[2], ["ms-INV-00246-2"]);
+    // first-request stamp and last-sent stamp share one instant
+    assert.equal(
+        (executeRawCalls[0].values[0] as Date).getTime(),
+        paymentScheduleUpdateManyCalls[0].data.qbInvoiceSentAt.getTime(),
+    );
+
     // Non-Draft: only sentAt is written, status/issueDate stay untouched.
     assert.equal(invoiceUpdateCalls.length, 1);
     assert.deepEqual(invoiceUpdateCalls[0].where, { id: raw.code });
     assert.deepEqual(Object.keys(invoiceUpdateCalls[0].data).sort(), ["sentAt"]);
     assert.ok(invoiceUpdateCalls[0].data.sentAt instanceof Date);
+});
+
+test("sendInvoiceToClientCore: a whole-invoice RESEND runs the same guarded first-request statement", async () => {
+    const raw = rawFixture("INV-00246");
+    invoiceRows[raw.code] = toSendShape(raw);
+
+    await sendInvoiceToClientCore(raw.code);
+    await sendInvoiceToClientCore(raw.code);
+
+    assert.equal(executeRawCalls.length, 2);
+    assert.equal(executeRawCalls[0].sql, executeRawCalls[1].sql);
+    assert.ok(executeRawCalls[0].sql.includes('"firstRequestedAt" IS NULL'));
 });
 
 test("sendInvoiceToClientCore: a Draft invoice with a requested milestone flips to Issued and stamps issueDate + sentAt", async () => {
@@ -444,6 +474,7 @@ test("sendInvoiceToClientCore: legacy zero-milestone Issued invoice emails its b
     assert.ok(sentEmails[0].html.includes("$500.00"));
 
     assert.equal(paymentScheduleUpdateManyCalls.length, 0, "no milestone to stamp");
+    assert.equal(executeRawCalls.length, 0);
 
     const hrefMatch = (sentEmails[0].html as string).match(/href="([^"]+)"/);
     assert.ok(hrefMatch);
@@ -465,6 +496,7 @@ test("sendInvoiceToClientCore: legacy zero-milestone Draft invoice has nothing d
     assert.equal(sentEmails.length, 0);
     assert.equal(invoiceUpdateCalls.length, 0);
     assert.equal(paymentScheduleUpdateManyCalls.length, 0);
+    assert.equal(executeRawCalls.length, 0);
 });
 
 test("sendInvoiceToClientCore: INV-00319 (nothing billed) sends nothing and reports nothingDue", async () => {
@@ -480,6 +512,7 @@ test("sendInvoiceToClientCore: INV-00319 (nothing billed) sends nothing and repo
     assert.equal(sentEmails.length, 0, "no email should be sent");
     assert.equal(invoiceUpdateCalls.length, 0, "no invoice status/sentAt write");
     assert.equal(paymentScheduleUpdateManyCalls.length, 0, "no stamp");
+    assert.equal(executeRawCalls.length, 0);
 });
 
 test("sendInvoiceToClientCore: email provider failure leaves no stamp", async () => {
@@ -492,6 +525,7 @@ test("sendInvoiceToClientCore: email provider failure leaves no stamp", async ()
     assert.equal(result.nothingDue, undefined);
     assert.equal(sentEmails.length, 1, "the send was attempted");
     assert.equal(paymentScheduleUpdateManyCalls.length, 0, "a failed send must not stamp anything");
+    assert.equal(executeRawCalls.length, 0);
 });
 
 test("sendInvoiceToClientCore: a failed stamp is fail-soft -- still success, and the failure is logged", async () => {
@@ -539,6 +573,7 @@ test("sendInvoiceToClientCore: expectedDue mismatch (milestone swapped for an eq
     assert.equal(sentEmails.length, 0);
     assert.equal(invoiceUpdateCalls.length, 0);
     assert.equal(paymentScheduleUpdateManyCalls.length, 0);
+    assert.equal(executeRawCalls.length, 0);
 });
 
 test("sendInvoiceToClientCore: expectedDue built from a differently-ordered due still matches and sends", async () => {
@@ -594,6 +629,7 @@ test("resendInvoiceCore: nothing billed returns the nothing-due result without s
     assert.equal(sentEmails.length, 0);
     assert.equal(invoiceUpdateCalls.length, 0);
     assert.equal(paymentScheduleUpdateManyCalls.length, 0);
+    assert.equal(executeRawCalls.length, 0);
 });
 
 test("resendInvoiceCore: a mismatching expectedDue is refused before ever touching QuickBooks", async () => {
@@ -611,6 +647,7 @@ test("resendInvoiceCore: a mismatching expectedDue is refused before ever touchi
     assert.equal(sentEmails.length, 0);
     assert.equal(invoiceUpdateCalls.length, 0);
     assert.equal(paymentScheduleUpdateManyCalls.length, 0);
+    assert.equal(executeRawCalls.length, 0);
     // paymentSchedule.update (singular) is only ever called from the
     // QuickBooks link-refresh loop -- zero calls proves that loop never ran.
     assert.equal(paymentScheduleUpdateCalls.length, 0, "the QuickBooks refresh step must never run");

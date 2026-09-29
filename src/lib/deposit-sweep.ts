@@ -327,11 +327,13 @@ export function bankCreditIsOldEnough(postDate: string, now: Date): boolean {
  * make it a candidate for a deposit that landed a week ago and belonged to
  * something else.
  *
- * NOTE: `qbInvoiceSentAt` is a LAST-send timestamp, not a first-send one, so a
- * re-send after the deposit pushes the milestone outside this bound and it
- * stops being auto-appliable — the credit goes to a human instead. That is the
- * safe direction: the alternative is booking money against a row whose request
- * history we cannot actually reconstruct.
+ * Judged by the FIRST request (PaymentSchedule.firstRequestedAt, falling back
+ * to qbInvoiceSentAt on a row requested before that column existed), not the
+ * last send: a resend after the client paid moves only qbInvoiceSentAt, so it
+ * no longer pushes a real payment out of range. Both columns only ever hold
+ * real send times, so this bound can still wrongly EXCLUDE (a row resent
+ * before the column was backfilled carries that later send) but never wrongly
+ * include a milestone that was first asked for after the money arrived.
  */
 export function requestedByInstant(postDate: string): Date {
     return endOfDateInTimeZone(postDate, COMPANY_TIME_ZONE);

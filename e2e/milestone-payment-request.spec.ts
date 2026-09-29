@@ -175,6 +175,7 @@ test.describe("sendMilestoneInvoicesCore fail-closed (no QuickBooks connection)"
 
         const ms = await prisma.paymentSchedule.findUnique({ where: { id: FIX.milestone } });
         expect(ms?.qbInvoiceSentAt).toBeNull();
+        expect(ms?.firstRequestedAt).toBeNull();
 
         const logs = await prisma.activityLog.count({ where: { entityId: FIX.invoice, action: "sent_invoice" } });
         expect(logs).toBe(0);

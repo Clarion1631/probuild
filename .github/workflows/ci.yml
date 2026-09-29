@@ -582,6 +582,18 @@ jobs:
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
           PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      - name: Apply first-request marker and prove the set-once stamp against real Postgres
+        run: |
+          FRA_DB_HOST=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')
+          test -n "$FRA_DB_HOST"
+          export DATABASE_URL="postgresql://probuild:probuild@${FRA_DB_HOST}:5432/probuild_migrations?pgbouncer=true"
+          node scripts/apply-first-requested-at.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$FRA_DB_HOST"
+          node scripts/apply-first-requested-at.mjs --target ci --yes --expect-db probuild_migrations --expect-host "$FRA_DB_HOST"
+          npx tsx --test tests/first-requested-at-db.test.ts
+        env:
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+          FIRST_REQUESTED_AT_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest
