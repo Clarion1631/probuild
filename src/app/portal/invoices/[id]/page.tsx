@@ -3,6 +3,7 @@ import { notFound, redirect } from "next/navigation";
 import PortalInvoiceClient from "./PortalInvoiceClient";
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
+import { billedMilestoneIds, PROGRESS_BILLING_EVIDENCE_SELECT } from "@/lib/receivables";
 import { stripe } from "@/lib/stripe";
 import { toNum } from "@/lib/prisma-helpers";
 import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
@@ -173,9 +174,18 @@ export default async function PortalInvoicePage({
         }
     }
 
+    // Access was already checked by getInvoiceForPortal; this only adds the live
+    // progress-billing evidence so "billed" matches the AR digest exactly.
+    const progressBillings = await prisma.progressBilling.findMany({
+        where: { invoiceId: invoice.id, status: { in: ["Staged", "Sent"] } },
+        select: PROGRESS_BILLING_EVIDENCE_SELECT,
+    });
+    const billedIds = billedMilestoneIds(invoice.payments || [], progressBillings);
+
     return (
         <PortalInvoiceClient
             initialInvoice={invoice}
+            billedMilestoneIds={billedIds}
             companySettings={settings}
             paymentSuccess={resolvedSearch.payment === "success"}
             focusMilestoneParam={resolvedSearch.milestone || null}
