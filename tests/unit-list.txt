@@ -2,12 +2,14 @@
 # on every PR. One path per line, relative to the repo root. Blank lines and
 # lines starting with # are skipped; a path that does not exist fails the run.
 #
-# A new test file runs in CI only if it is listed here. Some tests stay out on
-# purpose, e.g. *-db.test.ts suites that need a database run as their own steps
-# in .github/workflows/ci.yml.
+# A new test file runs in `npm run test:unit` only if it is listed here. Some
+# tests stay out on purpose, e.g. *-db.test.ts suites that need a database run
+# as their own steps in .github/workflows/ci.yml.
 #
 # Add new paths at the end. .gitattributes merges this file with merge=union,
-# so two branches that both append lines merge without a conflict.
+# so two branches that both append lines merge without a conflict. Union merge
+# can also bring back a line one branch deleted, so after merging a removal,
+# check that the line is still gone.
 tests/receipt-outreach-review.test.ts
 tests/receipt-cards-completeness.test.ts
 tests/receipt-cards-incomplete-handler.test.ts

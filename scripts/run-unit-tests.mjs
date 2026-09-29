@@ -39,9 +39,15 @@ if (missing.length > 0) {
 // already over 11,000, so split it into as few node runs as stay under the cap
 // (one run today). Every run happens even if an earlier one fails.
 const MAX_COMMAND_CHARS = 30_000;
-const nodeArgs = ["--import", "tsx", "--test", ...process.argv.slice(2)];
-const cost = (arg) => arg.length + 3; // the argument, a space, and quotes if needed
-const baseCost = [process.execPath, ...nodeArgs].reduce((sum, arg) => sum + cost(arg), 0);
+const forwarded = process.argv.slice(2);
+const nodeArgs = ["--import", "tsx", "--test", ...forwarded];
+// A path costs its length plus a space and a pair of quotes (Windows paths
+// cannot contain `"`). A forwarded argument may need every character escaped,
+// so it is counted twice over.
+const cost = (arg) => arg.length + 3;
+const baseCost =
+  [process.execPath, "--import", "tsx", "--test"].reduce((sum, arg) => sum + cost(arg), 0) +
+  forwarded.reduce((sum, arg) => sum + 2 * arg.length + 3, 0);
 const runs = [[]];
 let used = baseCost;
 for (const file of files) {

@@ -65,7 +65,7 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 npm run test:unit                              # the whole list; works on Windows too
 node --import tsx --test tests/<name>.test.ts  # one file
 ```
-A new test file runs in CI only if its path is in `tests/unit-list.txt` (one path per line; add it at the end).
+A new test file runs in `npm run test:unit` (CI's unit-test step) only if its path is in `tests/unit-list.txt` (one path per line; add it at the end).
 
 **Error diagnosis (Sentry)**
 ```bash
