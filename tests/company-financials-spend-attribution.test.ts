@@ -51,6 +51,9 @@ const fakePrisma = {
     companySettings: {
         findUnique: async () => ({ timeZone: "America/Los_Angeles" }),
     },
+    // AR aging now reads Invoice, not PaymentSchedule (src/lib/receivables.ts) —
+    // this suite doesn't exercise arAging, so an empty result is enough.
+    invoice: { findMany: async () => [] },
     paymentSchedule: { findMany: async () => [] },
     retainer: { findMany: async () => [] },
     timeEntry: { findMany: async () => [] },

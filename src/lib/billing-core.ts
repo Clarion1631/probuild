@@ -66,7 +66,7 @@ export function outageNote(error: unknown): string {
 }
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
-import { computeInvoiceReceivable, type ReceivableInvoiceInput, type ReceivableMilestone, type ReceivableProgressBilling } from "./receivables";
+import { computeInvoiceReceivable, RECEIVABLE_INVOICE_WHERE, RECEIVABLE_INVOICE_SELECT, RECEIVABLE_PAYMENTS_ARGS, RECEIVABLE_PROGRESS_BILLINGS_ARGS, toReceivableInput } from "./receivables";
 import { computeInvoiceAmountDue, type InvoiceAmountDue } from "./invoice-amount-due";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
@@ -178,66 +178,14 @@ export async function getProjectBilling(projectId: string) {
 // Accounts receivable: every invoice still owed money, across all projects.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Shared with sendInvoiceToClientCore/loadInvoiceAmountDue: exactly which
-// Pending milestones and live progress billings feed computeInvoiceReceivable/
-// computeInvoiceAmountDue, so the AR digest and the invoice-send path can
-// never see a different set of "billed" evidence for the same invoice.
-// Milestone order is PR #289's deterministic schedule order (createdAt, id
-// tiebreak — same-transaction inserts share a createdAt), the same orderBy
-// used for invoice payments in actions.ts and pdf.ts, so an amount-due
-// email's item order matches the invoice editor/portal schedule order.
-const RECEIVABLE_PAYMENTS_ARGS = {
-    where: { status: "Pending" },
-    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-    select: {
-        id: true, name: true, amount: true, status: true, dueDate: true, createdAt: true,
-        qbInvoiceId: true, qbInvoiceSentAt: true, qbSyncError: true, qbSyncedAt: true,
-    },
-} satisfies Prisma.Invoice$paymentsArgs;
-const RECEIVABLE_PROGRESS_BILLINGS_ARGS = {
-    where: { status: { in: ["Staged", "Sent"] } },
-    select: {
-        id: true, code: true, status: true,
-        qbInvoiceId: true, qbSyncError: true, qbSyncedAt: true, qbInvoiceSentAt: true, sentAt: true, createdAt: true,
-        lines: { select: { scheduleId: true } },
-    },
-} satisfies Prisma.Invoice$progressBillingsArgs;
-const RECEIVABLE_INVOICE_SELECT = {
-    status: true, balanceDue: true, issueDate: true, sentAt: true, createdAt: true,
-    _count: { select: { payments: true } },
-    payments: RECEIVABLE_PAYMENTS_ARGS,
-    progressBillings: RECEIVABLE_PROGRESS_BILLINGS_ARGS,
-};
-
-function toReceivableInput(row: {
-    status: string;
-    balanceDue: ReceivableInvoiceInput["balanceDue"];
-    issueDate: Date | null;
-    sentAt: Date | null;
-    createdAt: Date;
-    _count: { payments: number };
-    payments: ReceivableMilestone[];
-    progressBillings: ReceivableProgressBilling[];
-}): ReceivableInvoiceInput {
-    return { ...row, milestoneCount: row._count.payments };
-}
+// The receivable query (RECEIVABLE_INVOICE_WHERE / _SELECT / _PAYMENTS_ARGS /
+// _PROGRESS_BILLINGS_ARGS, toReceivableInput) lives in src/lib/receivables.ts,
+// shared with sendInvoiceToClientCore/loadInvoiceAmountDue below, the Open
+// Invoices report and the company-charts AR aging.
 
 export async function listReceivables(now: number = Date.now()) {
     const invoices = await prisma.invoice.findMany({
-        // balanceDue > 0 alone misses an invoice whose balance has drifted to
-        // 0 (or negative) while it still carries a billed, unpaid milestone —
-        // a Pending one that was requested or linked, or a live progress
-        // billing. The balanceDue branch stays so a legacy zero-milestone
-        // invoice (no Pending rows, no progress billings) with a genuine
-        // positive balance is still found.
-        where: {
-            status: { not: "Canceled" },
-            OR: [
-                { balanceDue: { gt: 0 } },
-                { payments: { some: { status: "Pending" } } },
-                { progressBillings: { some: { status: { in: ["Staged", "Sent"] } } } },
-            ],
-        },
+        where: RECEIVABLE_INVOICE_WHERE,
         orderBy: { issueDate: "asc" },
         select: {
             id: true, code: true, totalAmount: true,

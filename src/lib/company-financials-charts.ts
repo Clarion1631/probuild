@@ -3,6 +3,11 @@ import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { prisma } from "@/lib/prisma";
 import { getParam, getAllParams, type SearchParamMap } from "@/lib/report-utils";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import {
+    RECEIVABLE_INVOICE_WHERE, RECEIVABLE_INVOICE_SELECT, RECEIVABLE_NET_TERMS_DAYS,
+    computeInvoiceReceivable, toReceivableInput, toCents,
+    type ReceivableInvoiceInput, type Money,
+} from "@/lib/receivables";
 
 // "Shop" is the sanctioned overhead bucket. The id now lives in ONE place
 // (src/lib/overhead-project.ts) so this page, the QBO expense sync, and the job
@@ -16,7 +21,10 @@ import {
 
 // Same parent-status gating as computeProjectFinancials (src/lib/project-financials.ts,
 // includeUnissued: false) — Draft invoices/retainers are not receivables and must
-// never show up as "collected" or as outstanding AR.
+// never show up as "collected". (AR aging no longer gates on this — see
+// RECEIVABLE_INVOICE_WHERE in src/lib/receivables.ts, the same billed-and-unpaid
+// predicate the AR digest uses, which lets a Draft invoice contribute a
+// milestone only if it was actually requested or linked.)
 const INVOICE_PARENT_STATUSES = ["Issued", "Paid", "Overdue", "Partially Paid", "Sent"];
 const RETAINER_STATUSES = ["Sent", "Paid", "Partially Paid"];
 
@@ -225,6 +233,67 @@ function ageBucket(dueDate: Date | null, todayDayNumber: number, timeZone: strin
     return "91+";
 }
 
+function pastDueBucket(daysPastDue: number): "1-30" | "31-60" | "61-90" | "91+" {
+    if (daysPastDue <= 30) return "1-30";
+    if (daysPastDue <= 60) return "31-60";
+    if (daysPastDue <= 90) return "61-90";
+    return "91+";
+}
+
+/**
+ * Billed-and-unpaid AR aging — the digest's own universe, billed predicate,
+ * and per-item aging (src/lib/receivables.ts), bucketed here the same way the
+ * chart always has. Invoice items resolve through the digest's own `overdue`
+ * flag rather than a raw due-date diff: a due date governs outright when the
+ * item has one (with the same 24h grace `computeInvoiceReceivable` applies),
+ * and net-30-from-billed otherwise — so an item can be "not yet due" with no
+ * due date at all. Retainers keep the pre-existing `ageBucket()` rule
+ * unchanged.
+ */
+export function buildArAging(
+    invoices: ReceivableInvoiceInput[],
+    openRetainers: { balanceDue: Money; dueDate: Date | null }[],
+    now: number,
+    timeZone: string,
+): ArAgingBucket[] {
+    const todayDayNumber = companyDayNumber(new Date(now), timeZone);
+    const centsByBucket: Partial<Record<(typeof AR_BUCKET_ORDER)[number], number>> = {};
+    const add = (bucket: (typeof AR_BUCKET_ORDER)[number], cents: number) => {
+        centsByBucket[bucket] = (centsByBucket[bucket] ?? 0) + cents;
+    };
+
+    for (const inv of invoices) {
+        const receivable = computeInvoiceReceivable(inv, now);
+        for (const item of receivable.items) {
+            if (!item.overdue) {
+                // Includes a net-30 item (no due date of its own) billed 30
+                // days ago or less — the digest's own flag decides, not a
+                // raw day-diff off a due date the item may not even have.
+                add("Not yet due", item.cents);
+                continue;
+            }
+            const daysPastDue = item.dueDate
+                ? todayDayNumber - companyDayNumber(item.dueDate, timeZone)
+                : item.ageDays - RECEIVABLE_NET_TERMS_DAYS;
+            add(pastDueBucket(Math.max(1, daysPastDue)), item.cents);
+        }
+    }
+
+    // "No due date" can now only receive retainers without a due date —
+    // every invoice item above resolves to "Not yet due" or a numbered
+    // past-due bucket; computeInvoiceReceivable always has a net-30
+    // fallback for a milestone with no due date of its own.
+    for (const r of openRetainers) {
+        add(ageBucket(r.dueDate, todayDayNumber, timeZone), toCents(r.balanceDue));
+    }
+
+    return AR_BUCKET_ORDER.map((bucket) => ({
+        bucket,
+        amount: (centsByBucket[bucket] ?? 0) / 100,
+        color: AR_BUCKET_COLORS[bucket],
+    }));
+}
+
 // A date-range predicate approximating `effectiveDate = a ?? b` at the SQL
 // level (COALESCE-equivalent via OR branches), so history outside the selected
 // range is never fetched. Omitted entirely for the "All" preset (from = null).
@@ -261,6 +330,7 @@ export async function getCompanyFinancialsChartData(
     const { from, to, projectIds, includeOverhead } = filters;
     const inRange = (d: Date) => (!from || d >= from) && d < to;
     const allJobIds = jobProjects.map((p) => p.id);
+    const now = Date.now(); // one snapshot instant for the AR aging pass below
 
     const [
         paidSchedules,
@@ -269,7 +339,7 @@ export async function getCompanyFinancialsChartData(
         timeEntries,
         overheadExpenses,
         overheadTimeEntries,
-        unpaidSchedules,
+        arInvoices,
         openRetainers,
         allTimeDirectTotals,
         allTimeLegacyTotals,
@@ -335,13 +405,15 @@ export async function getCompanyFinancialsChartData(
                   select: { laborCost: true, burdenCost: true, startTime: true },
               })
             : Promise.resolve([] as { laborCost: unknown; burdenCost: unknown; startTime: Date }[]),
-        // AR aging (snapshot, no date-range filter) — same parent-status gate as "collected".
-        prisma.paymentSchedule.findMany({
-            where: {
-                status: { notIn: ["Paid", "Canceled"] },
-                invoice: { projectId: { in: projectIds }, status: { in: INVOICE_PARENT_STATUSES } },
-            },
-            select: { amount: true, dueDate: true },
+        // AR aging (snapshot, no date-range filter) — the digest's own
+        // universe and billed predicate (src/lib/receivables.ts), not a
+        // parent-status gate: a Draft invoice only contributes a milestone
+        // that was actually requested or linked, so this deliberately does
+        // NOT reuse INVOICE_PARENT_STATUSES (kept below for "collected",
+        // which must still exclude Draft money).
+        prisma.invoice.findMany({
+            where: { AND: [RECEIVABLE_INVOICE_WHERE, { projectId: { in: projectIds } }] },
+            select: RECEIVABLE_INVOICE_SELECT,
         }),
         prisma.retainer.findMany({
             where: { projectId: { in: projectIds }, status: { in: RETAINER_STATUSES }, balanceDue: { gt: 0 } },
@@ -526,23 +598,9 @@ export async function getCompanyFinancialsChartData(
     // ---- Chart C: AR aging — as-of-today snapshot, not date-range filtered ----
     // (Like the stat tiles/jobs table, "what's outstanding right now" is a
     // position statement, not a trend — only the project filter applies.)
-    // Bucketed by normalized company-calendar-day difference: dates are stored
-    // at company-local noon, so elapsed-86400s math can misfire across DST.
-    const todayDayNumber = companyDayNumber(new Date(), timeZone);
-    const arTotals: Partial<Record<(typeof AR_BUCKET_ORDER)[number], number>> = {};
-    for (const s of unpaidSchedules) {
-        const bucket = ageBucket(s.dueDate, todayDayNumber, timeZone);
-        arTotals[bucket] = (arTotals[bucket] ?? 0) + Number(s.amount);
-    }
-    for (const r of openRetainers) {
-        const bucket = ageBucket(r.dueDate, todayDayNumber, timeZone);
-        arTotals[bucket] = (arTotals[bucket] ?? 0) + Number(r.balanceDue);
-    }
-    const arAging: ArAgingBucket[] = AR_BUCKET_ORDER.map((bucket) => ({
-        bucket,
-        amount: arTotals[bucket] ?? 0,
-        color: AR_BUCKET_COLORS[bucket],
-    }));
+    // Billed-and-unpaid, same universe/predicate as the AR digest; per-item
+    // aging and bucketing both live in buildArAging() now.
+    const arAging = buildArAging(arInvoices.map(toReceivableInput), openRetainers, now, timeZone);
 
     // ---- Chart D: Overhead ratio by month ----
     const overheadRatio: OverheadRatioMonthPoint[] = includeOverhead

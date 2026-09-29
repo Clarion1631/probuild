@@ -140,7 +140,7 @@ export const DEPOSIT_INGEST_BUDGET_MS = 50_000;
 
 const MAX_ATTEMPTS = 8; // like the notification outbox (src/lib/payment-outbox.ts)
 const STALE_PROCESSING_MS = 5 * 60_000;
-const OPEN_INVOICE_STATUSES = ["Issued", "Overdue", "Partially Paid"]; // matches src/lib/open-invoices-report.ts's canon
+const OPEN_INVOICE_STATUSES = ["Issued", "Overdue", "Partially Paid"]; // invoices still awaiting a client payment, for deposit-matching purposes (independent of src/lib/open-invoices-report.ts, which now defaults to every non-Canceled invoice)
 
 interface NormalizedPayload {
     fileId: string;

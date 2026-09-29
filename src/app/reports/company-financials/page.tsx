@@ -274,7 +274,7 @@ export default async function CompanyFinancialsPage({
                 >
                     <SpendByProjectChart series={chartData.spendByProject.series} data={chartData.spendByProject.data} />
                 </ChartPanel>
-                <ChartPanel title="AR aging" subtitle="Outstanding balances as of today." isEmpty={arEmpty}>
+                <ChartPanel title="AR aging" subtitle="Billed, unpaid balances as of today." isEmpty={arEmpty}>
                     <ArAgingChart data={chartData.arAging} />
                 </ChartPanel>
             </div>
