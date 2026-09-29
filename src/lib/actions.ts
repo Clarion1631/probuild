@@ -9159,29 +9159,20 @@ export async function deleteProjects(projectIds: string[]) {
     // still destroys estimates, invoices, messages, files). An active session
     // alone let any staff role — FIELD_CREW included — remove a job.
     if (user.role !== "ADMIN") throw new Error("Forbidden");
-    const { deleteParentsWithTimeEntries } = await import("./payroll-parent-delete");
-    // ONE transaction for the whole selection: every project is checked before
-    // any project is deleted. Looping per project left the caller half-deleted
-    // when the third job in the list turned out to have time entries — the
-    // first two were already gone and there was nothing to undo them with.
-    //
-    // A single deleteMany, which is what this used to be, was worse still: it
-    // CASCADEd every punch on every job in the list into nothing — locked,
-    // exported, paid hours included — and reported success.
-    //
-    // A project with ANY time entries — locked or not — throws
-    // TimeEntriesExistError out of here and rolls the batch back. Historical
-    // paid hours predate PayrollPeriod and have no lock to trip, so "unlocked"
-    // is never read as "safe to delete". Server actions have no status code,
-    // so the caller sees the error's message.
-    await deleteParentsWithTimeEntries(
-        projectIds.map((projectId) => ({ projectId })),
-        async (tx) => {
-            await (tx as unknown as typeof prisma).project.deleteMany({ where: { id: { in: projectIds } } });
-        }
-    );
+    // The whole transaction (payroll-history check, money guard, delete)
+    // lives in deleteProjectsCore (billing-core.ts) so it can be unit-tested
+    // without a next-auth session. Refusals come back as { success: false,
+    // error } rather than a throw, same as deleteInvoice: production masks
+    // thrown server-action messages, so a thrown refusal reached the admin
+    // as a bare "Failed to delete project" with the reason stripped.
+    const { deleteProjectsCore, deleteProjectsFailureMessage } = await import("./billing-core");
+    try {
+        await deleteProjectsCore(projectIds);
+    } catch (e) {
+        return { success: false as const, error: deleteProjectsFailureMessage(e, projectIds.length) };
+    }
     revalidatePath(`/projects`);
-    return { success: true };
+    return { success: true as const };
 }
 
 export async function updateCompanyProjectStatuses(statuses: string) {

@@ -213,7 +213,15 @@ test("all staff financial actions authorize inside the exported action", () => {
   }
 
   for (const name of ["deleteLead", "updateProjectStatus", "updateProjectName", "deleteProjects"]) {
-    expectGuardBeforeDatabase(source, name, "await assertActiveStaff(");
+    // deleteProjects' transaction body was extracted into deleteProjectsCore
+    // (billing-core.ts) so it could be unit-tested without a next-auth
+    // session. Without this, action.indexOf("prisma.") finds nothing in
+    // deleteProjects' own body, databaseIndex stays -1, and
+    // expectGuardBeforeDatabase's `if (databaseIndex >= 0)` SKIPS the
+    // "authorize before database access" assertion entirely instead of
+    // checking it — a silent pass, not a real one.
+    const databaseMarker = name === "deleteProjects" ? "deleteProjectsCore(" : "prisma.";
+    expectGuardBeforeDatabase(source, name, "await assertActiveStaff(", databaseMarker);
   }
   for (const name of ["saveCompanySettings", "updateCompanyProjectStatuses", "saveCompanySubcontractorTrades"]) {
     expectGuardBeforeDatabase(source, name, "await assertCompanySettingsPermission(");

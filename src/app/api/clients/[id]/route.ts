@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { normalizeE164 } from "@/lib/phone";
+import { deleteClientCore, isDeleteBlockedError } from "@/lib/billing-core";
 export const dynamic = 'force-dynamic';
 
 async function requireManagerSession() {
@@ -76,12 +77,13 @@ export async function DELETE(
             return NextResponse.json({ error: "Client ID is required" }, { status: 400 });
         }
 
-        await prisma.client.delete({
-            where: { id },
-        });
+        await deleteClientCore(id);
 
         return NextResponse.json({ success: true });
     } catch (error) {
+        if (isDeleteBlockedError(error)) {
+            return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });
+        }
         console.error("Error deleting client:", error);
         return NextResponse.json({ error: "Failed to delete client" }, { status: 500 });
     }

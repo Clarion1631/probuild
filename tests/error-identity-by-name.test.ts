@@ -54,6 +54,7 @@ const GUARDED_ERRORS: { klass: string; guard: string; owner: string }[] = [
         guard: "isReceiptMoveRefusedError",
         owner: "src/lib/receipt-intake/booked-expense.ts",
     },
+    { klass: "DeleteBlockedError", guard: "isDeleteBlockedError", owner: "src/lib/billing-core.ts" },
 ];
 
 test("no src/ file uses instanceof for an error that has a shared name-based guard", () => {
