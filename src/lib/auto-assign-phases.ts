@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { prisma } from "@/lib/prisma";
 import { extractJsonObject } from "./ai-json";
 import { isEstimateSectionRow } from "./estimate-item-payload";
@@ -94,13 +95,13 @@ Rules:
 
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 4000,
+    model: CLAUDE_SONNET_MODEL,
+    output_config: { effort: "medium" },
+    max_tokens: 8000,
     messages: [{ role: "user", content: prompt }],
   });
 
-  const block = response.content[0];
-  const rawText = ("text" in block ? block.text : "").trim();
+  const rawText = getAnthropicMessageText(response);
   if (!rawText) {
     throw new Error("No response from AI");
   }

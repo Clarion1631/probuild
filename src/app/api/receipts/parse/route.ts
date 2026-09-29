@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { createParsedReceiptExpense } from "@/lib/receipt-parse-expense";
@@ -244,8 +245,9 @@ export async function POST(req: NextRequest) {
 
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const result = await anthropic.messages.create({
-            model: "claude-sonnet-4-6",
-            max_tokens: 1024,
+            model: CLAUDE_SONNET_MODEL,
+            output_config: { effort: "high" },
+            max_tokens: 8000,
             messages: [
                 {
                     role: "user",
@@ -257,7 +259,7 @@ export async function POST(req: NextRequest) {
             ],
         });
 
-        const text = (result.content[0] as { type: "text"; text: string }).text.trim();
+        const text = getAnthropicMessageText(result);
         let parsed: Record<string, unknown>;
         try {
             parsed = JSON.parse(text);

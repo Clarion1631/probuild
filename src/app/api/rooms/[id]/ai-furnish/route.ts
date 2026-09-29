@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
 import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicText } from "@/lib/anthropic";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { CABINETS, APPLIANCES, FIXTURES, LIGHTING, FURNITURE, getItemDef } from "@/lib/studio/catalog";
 import type { DesignDoc, PlacedItem, ApiRoomAsset } from "@/lib/studio/doc";
 import { newItemId, toApiPayload } from "@/lib/studio/doc";
@@ -129,15 +129,16 @@ Return JSON in this exact shape:
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         console.log("Calling Claude for design layout...");
         const response = await anthropic.messages.create({
-            model: "claude-sonnet-4-6",
-            max_tokens: 4000,
+            model: CLAUDE_SONNET_MODEL,
+            output_config: { effort: "medium" },
+            max_tokens: 8000,
             messages: [
                 { role: "user", content: systemPrompt },
                 { role: "user", content: userPrompt }
             ],
         });
 
-        const rawText = getAnthropicText(response.content).trim();
+        const rawText = getAnthropicMessageText(response).trim();
         const parsed = extractJsonObject<{ items: any[] }>(rawText);
         if (!parsed) {
             throw new Error("Could not parse JSON from AI response");

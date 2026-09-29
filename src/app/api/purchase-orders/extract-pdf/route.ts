@@ -3,7 +3,7 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicText } from "@/lib/anthropic";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 
 // Simple in-memory rate limit: 10 extractions per user per hour
 const rateLimitMap = new Map<string, number[]>();
@@ -64,8 +64,9 @@ export async function POST(req: Request) {
 
     try {
         const response = await anthropic.messages.create({
-            model: "claude-3-5-sonnet-20241022",
-            max_tokens: 2048,
+            model: CLAUDE_SONNET_MODEL,
+            output_config: { effort: "high" },
+            max_tokens: 16000,
             system: `You are a construction procurement assistant. Extract purchase order or invoice data from the attached PDF.
 Return ONLY valid JSON with this exact shape — no markdown fences, no extra commentary:
 {
@@ -93,7 +94,7 @@ Rules:
             ],
         });
 
-        const text = getAnthropicText(response.content)
+        const text = getAnthropicMessageText(response)
             .replace(/^```(?:json)?\s*/i, "")
             .replace(/\s*```$/i, "")
             .trim();

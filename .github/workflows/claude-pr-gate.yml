@@ -155,8 +155,8 @@ jobs:
             If you believe an item is wrong, explain why in a PR comment instead of
             changing code, and mark it as disputed.
           claude_args: |
-            --model claude-opus-5
-            --effort medium
+            --model claude-sonnet-5-5
+            --effort high
             --allowedTools "Bash(gh:*),Bash(git:*),Bash(npm:*),Bash(npx:*),Read,Edit,Write,Grep,Glob,Task"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -187,8 +187,8 @@ jobs:
             criterion in a real browser per the gauntlet-verify skill. The fix must
             be verified 100% or the gate fails.
           claude_args: |
-            --model claude-opus-5
-            --effort medium
+            --model claude-opus-5-5
+            --effort xhigh
             --allowedTools "Bash(npx:*),Bash(npm:*),Bash(node:*),Bash(gh:*),Read,Write,Edit,Grep,Glob,Task"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { PermissionKey, hasPermission, canAccessProject } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { isAncestorFinancial } from "@/lib/file-auth";
+import { CLAUDE_SONNET_MODEL } from "@/lib/anthropic";
 
 // Agent runtime for the in-app help chat: gives the assistant live access to
 // ProBuild's own MCP server (src/app/api/mcp/[transport]/route.ts) so it can
@@ -492,8 +493,11 @@ Rules:
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 2048,
+        model: CLAUDE_SONNET_MODEL,
+        // Sonnet 5.5 thinks adaptively (thinking counts against max_tokens); a
+        // multi-step tool loop is the case the guide sets to medium effort.
+        output_config: { effort: "medium" },
+        max_tokens: 8192,
         system: systemPrompt,
         messages,
         ...(anthropicTools.length > 0 ? { tools: anthropicTools } : {}),
@@ -507,6 +511,11 @@ Rules:
     }
 
     const data = await response.json();
+    // A refusal is a normal 200 with empty/partial content: end the turn with a
+    // plain answer instead of pushing it back into the tool loop.
+    if (data.stop_reason === "refusal") {
+      return { text: "I can't help with that request.", activity };
+    }
     const content = data.content ?? [];
     messages.push({ role: "assistant", content });
 
