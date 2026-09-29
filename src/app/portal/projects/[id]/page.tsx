@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { isMilestoneBilled, milestonePayLink } from "@/lib/receivables";
 import Link from 'next/link';
 import { notFound } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
@@ -185,7 +186,7 @@ export default async function PortalProjectDetail(props: {
     // "Due" in the portal means REQUESTED and unpaid — qbInvoiceSentAt is stamped
     // when a milestone payment request is emailed. Unrequested milestones are part
     // of the schedule, not an ask; they must never roll up into a due amount.
-    const isRequested = (p: any) => p.status === 'Pending' && p.qbInvoiceSentAt;
+    const isRequested = (p: any) => isMilestoneBilled(p);
     const pendingPayments: { invoiceId: string; payment: any }[] = [];
     if (visibility.showInvoices) {
         for (const inv of project.invoices) {
@@ -351,7 +352,7 @@ export default async function PortalProjectDetail(props: {
                                                 amount={Number(pendingPayments[0].payment.amount)}
                                                 label="Pay Now"
                                                 settings={settings}
-                                                qbPayLink={pendingPayments[0].payment.qbInvoiceLink || null}
+                                                qbPayLink={milestonePayLink(pendingPayments[0].payment)}
                                             />
                                         ) : (
                                             <Link
@@ -528,7 +529,7 @@ export default async function PortalProjectDetail(props: {
                                                             amount={Number(payment.amount)}
                                                             label="Pay Now"
                                                             settings={settings}
-                                                            qbPayLink={payment.qbInvoiceLink || null}
+                                                            qbPayLink={milestonePayLink(payment)}
                                                         />
                                                     ) : (
                                                         <div className="flex flex-col sm:items-end">

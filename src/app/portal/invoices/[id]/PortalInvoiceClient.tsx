@@ -9,6 +9,7 @@ import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
 import { buildPdf } from "@/lib/build-pdf";
 import { formatMoneyDate } from "@/lib/payment-date";
+import { isMilestoneBilled, milestonePayLink } from "@/lib/receivables";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -134,7 +135,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
     // The rest of the schedule is context, not an ask — the client should never
     // see the whole contract balance presented as due.
     const requestedDueNow = (initialInvoice.payments || [])
-        .filter((p: any) => p.status === "Pending" && p.qbInvoiceSentAt)
+        .filter((p: any) => isMilestoneBilled(p))
         .reduce((sum: number, p: any) => sum + Number(p.amount), 0);
 
     // Split on blank lines so each paragraph can be its own top-level
@@ -266,7 +267,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                             amount={Number(focusedPayments[0].amount)}
                                             label="Pay Now"
                                             settings={companySettings}
-                                            qbPayLink={focusedPayments[0].status === "Pending" && !focusedPayments[0].qbSyncError ? (focusedPayments[0].qbInvoiceLink || null) : null}
+                                            qbPayLink={milestonePayLink(focusedPayments[0])}
                                         />
                                     </div>
                                 )}
@@ -332,7 +333,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                     const isPaidItem = payment.status === "Paid";
                                     // Overdue only means something once the payment was actually
                                     // requested — an unrequested scheduled milestone can't be late.
-                                    const isPastDue = payment.dueDate && new Date(payment.dueDate) < new Date() && payment.status === "Pending" && payment.qbInvoiceSentAt;
+                                    const isPastDue = payment.dueDate && new Date(payment.dueDate) < new Date() && isMilestoneBilled(payment);
                                     const isFocused = payment.status === "Pending" && focusIds.includes(payment.id);
 
                                     return (
@@ -392,7 +393,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                                     qbInvoiceSentAt is stamped when the payment-request email
                                                     goes out; Processing/Canceled rows must never re-offer
                                                     checkout. Unrequested rows are schedule context, not an ask. */}
-                                                {!isPaidItem && (payment.status === "Pending" && payment.qbInvoiceSentAt ? (
+                                                {!isPaidItem && (isMilestoneBilled(payment) ? (
                                                     <div data-pdf-skip="true">
                                                         <PortalPayButton
                                                             invoiceId={initialInvoice.id}
@@ -400,7 +401,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                                             amount={payment.amount}
                                                             label="Pay Now"
                                                             settings={companySettings}
-                                                            qbPayLink={payment.status === "Pending" && !payment.qbSyncError ? (payment.qbInvoiceLink || null) : null}
+                                                            qbPayLink={payment.status === "Pending" ? milestonePayLink(payment) : null}
                                                         />
                                                     </div>
                                                 ) : (

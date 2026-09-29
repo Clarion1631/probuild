@@ -152,6 +152,29 @@ export function isLiveQboLink(qbInvoiceId: string | null, qbSyncError: string | 
     return !!qbInvoiceId && qbSyncError !== "voided" && qbSyncError !== "notFound" && !isPendingDeletion(qbSyncError);
 }
 
+/** Per-milestone "billed and unpaid" decision for the client portal: the same
+ *  rule computeInvoiceReceivable applies to a milestone's OWN evidence. A
+ *  Pending milestone is billed once the client was asked (`qbInvoiceSentAt`)
+ *  or it has its own live QuickBooks invoice. A merely scheduled milestone is
+ *  not. Progress-billing evidence is not consulted here: staging never writes
+ *  a pay link onto the milestone, so the portal has nothing to pay through. */
+export function isMilestoneBilled(m: {
+    status: string;
+    qbInvoiceId?: string | null;
+    qbInvoiceSentAt?: Date | string | null;
+    qbSyncError?: string | null;
+}): boolean {
+    if (m.status !== "Pending") return false;
+    return m.qbInvoiceSentAt != null || isLiveQboLink(m.qbInvoiceId ?? null, m.qbSyncError ?? null);
+}
+
+/** The QuickBooks-hosted pay page for a billed milestone, or null (the Pay
+ *  button then falls back to its other methods). Never offered for a milestone
+ *  whose QuickBooks invoice carries a sync-error marker. */
+export function milestonePayLink(m: { qbInvoiceLink?: string | null; qbSyncError?: string | null }): string | null {
+    return m.qbSyncError ? null : (m.qbInvoiceLink || null);
+}
+
 /**
  * The earliest RETAINED billing evidence among the given dates — not
  * necessarily the true earliest event, only the earliest the row still
