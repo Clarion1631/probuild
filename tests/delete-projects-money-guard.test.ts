@@ -431,3 +431,47 @@ test("source pins: ProjectsClient checks the result before touching state", () =
         assert.ok(s.includes("toast.error(res.error, { duration: 15000 })"));
     }
 });
+
+// Characterization test: passes today; exists so a future schema edit cannot quietly make receipts
+// or payment evidence cascade away with a Project, Client or Invoice.
+function cascadeReachable(schema: string, roots: string[]): Set<string> {
+    const edges = new Map<string, Set<string>>(); // parent model -> models deleted with it
+    let model: string | null = null;
+    for (const line of schema.split(/\r?\n/)) {
+        const open = /^model\s+(\w+)\s*\{/.exec(line);
+        if (open) { model = open[1]; continue; }
+        if (/^\s*\}\s*$/.test(line)) { model = null; continue; }
+        if (!model) continue;
+        const field = /^\s*\w+\s+(\w+)\[?\]?\??\s.*@relation\(.*onDelete:\s*Cascade/.exec(line);
+        if (field) {
+            const parent = field[1];
+            if (!edges.has(parent)) edges.set(parent, new Set());
+            edges.get(parent)!.add(model);
+        }
+    }
+    const seen = new Set<string>();
+    const queue = [...roots];
+    while (queue.length) {
+        const m = queue.shift()!;
+        for (const child of edges.get(m) ?? []) {
+            if (!seen.has(child)) { seen.add(child); queue.push(child); }
+        }
+    }
+    return seen;
+}
+
+test("schema: no receipt or payment-evidence table is reachable by cascade from Project, Client or Invoice", () => {
+    const schema = fs.readFileSync(path.join(process.cwd(), "prisma", "schema.prisma"), "utf8");
+    const forbidden = ["Expense", "ReceiptIntake", "DepositIngest", "StripeEvent", "PaymentNotification", "BankLine", "RefundEvent"];
+    const reached = cascadeReachable(schema, ["Project", "Client", "Invoice"]);
+    assert.ok(reached.has("Invoice"), "sanity: the walker follows Project -> Invoice");
+    for (const m of forbidden) assert.ok(!reached.has(m), `${m} must not be reachable by onDelete: Cascade`);
+    for (const m of ["Expense", "ReceiptIntake"]) {
+        const block = new RegExp(String.raw`^model ${m} \{[\s\S]*?^\s*\}\s*$`, "m").exec(schema)?.[0] ?? "";
+        assert.match(block, /^\s*project\s+Project\?.*onDelete: SetNull/m, `${m}.project must be onDelete: SetNull`);
+    }
+    // The walker can fail: flipping Expense.project to Cascade makes Expense reachable.
+    const flipped = schema.replace(/^(model Expense \{[\s\S]*?\n\s*project\s+Project\?.*)onDelete: SetNull/m, "$1onDelete: Cascade");
+    assert.notEqual(flipped, schema);
+    assert.ok(cascadeReachable(flipped, ["Project", "Client", "Invoice"]).has("Expense"));
+});
