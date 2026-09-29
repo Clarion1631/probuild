@@ -15,7 +15,7 @@ function revalidatePath(path: string) {
     }
 }
 import { prisma } from "@/lib/prisma";
-import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { withTxRetry, lockMoneyParents, lockClientRow } from "./tx-retry";
 import {
     isBlockedByAmbiguousCreate,
     isQboInvoiceLinkedOrPending,
@@ -3371,20 +3371,577 @@ export async function assertInvoiceHasNoChangeOrderBilling(
     invoiceId: string,
     operation: "delete" | "re-split",
 ) {
+    if (await invoiceHasChangeOrderBilling(tx, invoiceId)) {
+        throw new Error(changeOrderBillingRefusal(operation));
+    }
+}
+
+/** A milestone that bills change-order work: fixed-price billing stamps sourceChangeOrderId (and
+ *  sourceCoScheduleId per CO schedule row); cost-plus billing also links a ChangeOrderBilling. One
+ *  definition, used by the single-invoice check above and the multi-invoice delete guards below. */
+function changeOrderBilledMilestoneOr(): Prisma.PaymentScheduleWhereInput[] {
+    return [
+        { sourceChangeOrderId: { not: null } },
+        { sourceCoScheduleId: { not: null } },
+        { coBilling: { isNot: null } },
+    ];
+}
+
+function changeOrderBillingRefusal(operation: "delete" | "re-split"): string {
+    return "Cannot " + operation + " an invoice with change-order billing. Void/rebill the change-order billing before trying again.";
+}
+
+async function invoiceHasChangeOrderBilling(tx: Prisma.TransactionClient, invoiceId: string): Promise<boolean> {
     const schedule = await tx.paymentSchedule.findFirst({
-        where: {
-            invoiceId,
-            OR: [
-                { sourceChangeOrderId: { not: null } },
-                { sourceCoScheduleId: { not: null } },
-                { coBilling: { isNot: null } },
-            ],
-        },
+        where: { invoiceId, OR: changeOrderBilledMilestoneOr() },
         select: { id: true },
     });
-    if (schedule) {
-        throw new Error("Cannot " + operation + " an invoice with change-order billing. Void/rebill the change-order billing before trying again.");
+    return !!schedule;
+}
+
+/**
+ * Names every QuickBooks-linked-or-pending row blocking a whole-invoice
+ * delete and what to do about it. Shown verbatim to the user via
+ * `toast.error(res.error)` in InvoiceEditor.tsx.
+ *
+ * Confirmed (`qbInvoiceId` set) and pending (marker only — see
+ * `isQboInvoiceLinkedOrPending`) get different wording: a confirmed link IS a
+ * live QuickBooks invoice, so deleting here abandons it; a pending marker only
+ * MIGHT be one, because a previous send never came back with a confirmed
+ * result (same fact `QBResolveRequiredError` reports) — so the real next step
+ * differs between the two, not just the sentence describing the state.
+ */
+function qboDeleteBlockReason(
+    rows: Array<{ label: string; qbInvoiceId: string | null; qbSyncError: string | null }>,
+    nextStep: { confirmedOne: string; confirmedMany: string; pendingOne: string; pendingMany: string },
+): string {
+    const confirmed = rows.filter((r) => r.qbInvoiceId).map((r) => `"${r.label}"`);
+    const pending = rows.filter((r) => !r.qbInvoiceId).map((r) => `"${r.label}"`);
+    const sentences: string[] = [];
+    if (confirmed.length > 0) {
+        const many = confirmed.length > 1;
+        sentences.push(
+            `${confirmed.join(", ")} ${many ? "are" : "is"} already in QuickBooks — deleting this invoice would leave ${many ? "them" : "it"} open in QuickBooks. ${many ? nextStep.confirmedMany : nextStep.confirmedOne}`,
+        );
     }
+    if (pending.length > 0) {
+        const many = pending.length > 1;
+        sentences.push(
+            `${pending.join(", ")} may already be in QuickBooks — a previous QuickBooks send ended without a confirmed result and must be resolved first. ${many ? nextStep.pendingMany : nextStep.pendingOne}`,
+        );
+    }
+    return sentences.join(" ");
+}
+
+type QboBlockRow = { label: string; qbInvoiceId: string | null; qbSyncError: string | null };
+
+export type InvoiceDeleteBlocker =
+    | { kind: "recorded-payments" }
+    | { kind: "paid-status" }
+    | { kind: "change-order-billing" }
+    | { kind: "qbo-milestones"; rows: QboBlockRow[] }
+    | { kind: "qbo-progress-billings"; rows: QboBlockRow[] }
+    | { kind: "qbo-invoice"; rows: QboBlockRow[] }
+    | { kind: "stripe-payment-reversed"; milestoneNames: string[] }
+    | { kind: "stripe-checkout-open"; milestoneNames: string[] };
+
+/** Everything the rules read. Callers pass rows read AFTER the Invoice, PaymentSchedule and
+ *  ProgressBilling locks, never a pre-lock read. */
+export type InvoiceDeleteFacts = {
+    code: string;
+    status: string;
+    qbInvoiceId: string | null;
+    qbSyncMarker: string | null;
+    payments: Array<{
+        name: string;
+        status: string;
+        qbInvoiceId: string | null;
+        qbSyncError: string | null;
+        stripeSessionId?: string | null;
+        stripePaymentIntentId?: string | null;
+    }>;
+    progressBillings: Array<{ code: string; qbInvoiceId: string | null; qbSyncError: string | null }>;
+};
+
+/**
+ * Stripe state that makes a non-Paid milestone unsafe to delete.
+ * - "payment-reversed": a PaymentIntent is recorded, so a Stripe charge settled this row and was
+ *   later refunded or undone; deleting drops ProBuild's only record of that charge.
+ * - "checkout-open": only a Checkout Session id. The customer may still be able to pay it, and a
+ *   payment that lands after the row is gone is dropped silently. The stored id cannot prove there
+ *   is no other live session for the milestone, so no StripeEvent-based exemption.
+ */
+export function stripeDeleteState(p: {
+    status: string;
+    stripeSessionId?: string | null;
+    stripePaymentIntentId?: string | null;
+}): "payment-reversed" | "checkout-open" | null {
+    if (p.status === "Paid") return null;
+    if (p.stripePaymentIntentId) return "payment-reversed";
+    if (p.stripeSessionId) return "checkout-open";
+    return null;
+}
+
+/**
+ * The first reason a whole invoice may not be deleted, or null. deleteInvoiceCore's rules, in its
+ * order, shared with the Project and Client cascades so the three paths cannot drift.
+ * `hasChangeOrderBilling` is a thunk so deleteInvoiceCore still runs its change-order query only
+ * after the two paid checks pass, exactly as before.
+ */
+export async function findInvoiceDeleteBlocker(
+    invoice: InvoiceDeleteFacts,
+    hasChangeOrderBilling: () => Promise<boolean>,
+): Promise<InvoiceDeleteBlocker | null> {
+    if (invoice.payments.some((p) => p.status === "Paid")) return { kind: "recorded-payments" };
+    if (invoice.status === "Paid" || invoice.status === "Partially Paid") return { kind: "paid-status" };
+    if (await hasChangeOrderBilling()) return { kind: "change-order-billing" };
+    // Every QuickBooks-linkable row this delete would cascade away. Checked
+    // under the locks taken above, against the row just read under them.
+    //
+    // A milestone queued for QuickBooks deletion (Break QB Link with "Also
+    // delete the staged invoice in QuickBooks" checked) is caught here too,
+    // but only as a SIDE EFFECT: claimQBInvoiceUnlink pins its CAS to the
+    // schedule's qbInvoiceId, so `breakQBInvoiceLink` (actions.ts) keeps
+    // qbInvoiceId SET on the row from the moment it writes
+    // PENDING_DELETION_MARKER (qbo-create-markers.ts) until the QuickBooks
+    // delete is confirmed and claimQBInvoiceUnlink clears both fields
+    // together — or, if that unlink CAS itself loses (a settle raced it),
+    // qbInvoiceId stays set forever and quickbooks-payments.ts's
+    // PAID_PENDING_DELETION_FLAG takes over. Neither marker is in
+    // PENDING_CREATE_MARKERS, so isQboInvoiceLinkedOrPending only refuses
+    // these rows because qbInvoiceId is still truthy — if that flow is ever
+    // changed to clear qbInvoiceId before the QuickBooks delete is
+    // confirmed, this guard must start checking those two markers by name,
+    // the same way it checks the create markers today.
+    const milestones = invoice.payments.filter((p) => isQboInvoiceLinkedOrPending(p));
+    if (milestones.length > 0) {
+        return { kind: "qbo-milestones", rows: milestones.map((m) => ({ label: m.name, qbInvoiceId: m.qbInvoiceId, qbSyncError: m.qbSyncError })) };
+    }
+    const billings = invoice.progressBillings.filter((b) => isQboInvoiceLinkedOrPending(b));
+    if (billings.length > 0) {
+        return { kind: "qbo-progress-billings", rows: billings.map((b) => ({ label: b.code, qbInvoiceId: b.qbInvoiceId, qbSyncError: b.qbSyncError })) };
+    }
+    // The invoice's own document-sync link — same marker vocabulary as the
+    // milestone/progress-billing qbSyncError (see the qbSyncMarker doc
+    // comment on the Invoice model), so the same predicate reads it too.
+    if (isQboInvoiceLinkedOrPending({ qbInvoiceId: invoice.qbInvoiceId, qbSyncError: invoice.qbSyncMarker })) {
+        return { kind: "qbo-invoice", rows: [{ label: invoice.code, qbInvoiceId: invoice.qbInvoiceId, qbSyncError: invoice.qbSyncMarker }] };
+    }
+    const reversed = invoice.payments.filter((p) => stripeDeleteState(p) === "payment-reversed");
+    if (reversed.length > 0) return { kind: "stripe-payment-reversed", milestoneNames: reversed.map((p) => p.name) };
+    const open = invoice.payments.filter((p) => stripeDeleteState(p) === "checkout-open");
+    if (open.length > 0) return { kind: "stripe-checkout-open", milestoneNames: open.map((p) => p.name) };
+    return null;
+}
+
+/** Caps a name list at 3 entries, e.g. `milestone "Deposit"` or `milestones "A", "B", "C" and 2 more`. */
+const MAX_LISTED_LABELS = 3;
+function labelList(noun: string, labels: string[]): string {
+    const shown = labels.slice(0, MAX_LISTED_LABELS).map((l) => `"${l}"`).join(", ");
+    const more = labels.length > MAX_LISTED_LABELS ? ` and ${labels.length - MAX_LISTED_LABELS} more` : "";
+    return `${noun}${labels.length === 1 ? "" : "s"} ${shown}${more}`;
+}
+
+/** deleteInvoiceCore's refusal message for a blocker, shown verbatim via `toast.error(res.error)`. */
+export function invoiceDeleteBlockMessage(blocker: InvoiceDeleteBlocker): string {
+    switch (blocker.kind) {
+        case "recorded-payments":
+            return "Cannot delete an invoice with recorded payments";
+        case "paid-status":
+            return "Cannot delete a paid or partially paid invoice";
+        case "change-order-billing":
+            return changeOrderBillingRefusal("delete");
+        case "qbo-milestones":
+            return qboDeleteBlockReason(blocker.rows, {
+                confirmedOne: `Use "Break QB Link" and check "Also delete the staged invoice in QuickBooks" — a local-only unlink would still leave it open in QuickBooks.`,
+                confirmedMany: `Use "Break QB Link" on each one and check "Also delete the staged invoice in QuickBooks" — a local-only unlink would still leave them open in QuickBooks.`,
+                pendingOne: `Use "Break QB Link" first — it asks QuickBooks whether an invoice exists and links it here if so. If it links one, break the link again and check "Also delete the staged invoice in QuickBooks" before this invoice can be deleted.`,
+                pendingMany: `Use "Break QB Link" on each one first — it asks QuickBooks whether an invoice exists and links it here if so. If it links one, break the link again and check "Also delete the staged invoice in QuickBooks" before this invoice can be deleted.`,
+            });
+        case "qbo-progress-billings":
+            return qboDeleteBlockReason(blocker.rows, {
+                // Fixing it in QuickBooks does not clear ProBuild's own link —
+                // there is no in-app control that unlinks a progress billing —
+                // so pointing the user at QuickBooks would be misleading. Same
+                // text for confirmed and pending: neither can be cleared here.
+                confirmedOne: `ProBuild has no way to unlink this yet, so this invoice can't be deleted here — ask an admin.`,
+                confirmedMany: `ProBuild has no way to unlink these yet, so this invoice can't be deleted here — ask an admin.`,
+                pendingOne: `ProBuild has no way to unlink this yet, so this invoice can't be deleted here — ask an admin.`,
+                pendingMany: `ProBuild has no way to unlink these yet, so this invoice can't be deleted here — ask an admin.`,
+            });
+        case "qbo-invoice": {
+            const noUnlink = `ProBuild has no way to unlink this yet, so it can't be deleted here — ask an admin.`;
+            return qboDeleteBlockReason(blocker.rows, { confirmedOne: noUnlink, confirmedMany: noUnlink, pendingOne: noUnlink, pendingMany: noUnlink });
+        }
+        case "stripe-payment-reversed": {
+            const one = blocker.milestoneNames.length === 1;
+            return `Cannot delete this invoice: ${labelList("milestone", blocker.milestoneNames)} ${one ? "was" : "were"} paid through Stripe and later marked unpaid in ProBuild (refunded, or the payment was undone). Deleting the invoice would remove ProBuild's only record of ${one ? "that Stripe charge" : "those Stripe charges"}. Check the ${one ? "charge" : "charges"} in Stripe. ProBuild has no way to clear ${one ? "this link" : "these links"} yet, so the invoice can't be deleted.`;
+        }
+        case "stripe-checkout-open": {
+            const one = blocker.milestoneNames.length === 1;
+            return `Cannot delete this invoice: ${one ? "a Stripe checkout was started for" : "Stripe checkouts were started for"} ${labelList("milestone", blocker.milestoneNames)}, and ProBuild can't tell whether the customer can still pay through ${one ? "it" : "them"}. A payment that arrived after the invoice was deleted would not be recorded anywhere in ProBuild. ProBuild has no way to release a checkout yet, so the invoice can't be deleted.`;
+        }
+    }
+}
+
+/** The clause the cascades put after `invoice <code> ` (or `invoice <code> on "<project>" `). */
+export function invoiceDeleteBlockClause(blocker: InvoiceDeleteBlocker): string {
+    switch (blocker.kind) {
+        case "recorded-payments":
+            return "has recorded payments";
+        case "paid-status":
+            return "is paid or partially paid";
+        case "change-order-billing":
+            return "has change-order billing";
+        case "qbo-milestones":
+            return `is linked or pending in QuickBooks (${labelList("milestone", blocker.rows.map((r) => r.label))})`;
+        case "qbo-progress-billings":
+            return `is linked or pending in QuickBooks (${labelList("progress billing", blocker.rows.map((r) => r.label))})`;
+        case "qbo-invoice":
+            return "is linked or pending in QuickBooks";
+        case "stripe-payment-reversed": {
+            const one = blocker.milestoneNames.length === 1;
+            return `${one ? "has a Stripe payment that was" : "has Stripe payments that were"} later marked unpaid (${labelList("milestone", blocker.milestoneNames)})`;
+        }
+        case "stripe-checkout-open": {
+            const one = blocker.milestoneNames.length === 1;
+            return `${one ? "has a Stripe checkout that may" : "has Stripe checkouts that may"} still be payable (${labelList("milestone", blocker.milestoneNames)})`;
+        }
+    }
+}
+
+const MAX_LISTED_DELETE_BLOCKS = 5;
+const PROJECT_DELETE_TAIL = "Open each listed invoice or retainer to see what is holding it. To take a finished or lost job off the projects list without deleting it, set its status to Closed Complete or Closed Lost.";
+const CLIENT_DELETE_TAIL = "Open each listed invoice or retainer to see what is holding it.";
+function cascadeDeleteBlockedMessage(lead: string, entries: string[], tail: string): string {
+    const listed = entries.slice(0, MAX_LISTED_DELETE_BLOCKS).join("; ");
+    const more = entries.length > MAX_LISTED_DELETE_BLOCKS ? `; and ${entries.length - MAX_LISTED_DELETE_BLOCKS} more` : "";
+    return `${lead}: ${listed}${more}. Nothing was deleted. ${tail}`;
+}
+
+/** A refused delete: thrown inside the transaction so nothing is written, carrying the HTTP status
+ *  and a stable code for route callers. Name-based check: the tsx loader can hand a caller a second
+ *  copy of this module (tests/error-identity-by-name.test.ts explains why). */
+export class DeleteBlockedError extends Error {
+    readonly status: 404 | 409;
+    readonly code: string;
+    constructor(status: 404 | 409, code: string, message: string) {
+        super(message);
+        this.name = "DeleteBlockedError";
+        this.status = status;
+        this.code = code;
+    }
+}
+
+export function isDeleteBlockedError(error: unknown): error is DeleteBlockedError {
+    return (
+        error instanceof DeleteBlockedError ||
+        (error instanceof Error && error.name === "DeleteBlockedError")
+    );
+}
+
+type DeleteBlockEntry = { projectId: string; code: string; clause: string };
+
+/** Reads the already-locked invoices with their children and returns one entry per invoice
+ *  deleteInvoiceCore would refuse, in (projectId, id) order. Caller holds the Invoice,
+ *  PaymentSchedule and ProgressBilling locks for every id. */
+async function listInvoiceDeleteBlocks(
+    tx: Prisma.TransactionClient,
+    invoiceIds: string[],
+): Promise<DeleteBlockEntry[]> {
+    const invoices = await tx.invoice.findMany({
+        where: { id: { in: invoiceIds } },
+        include: { payments: true, progressBillings: true },
+        orderBy: [{ projectId: "asc" }, { id: "asc" }],
+    });
+    const coBilled = await tx.paymentSchedule.findMany({
+        where: { invoiceId: { in: invoiceIds }, OR: changeOrderBilledMilestoneOr() },
+        select: { invoiceId: true },
+    });
+    const coBilledInvoiceIds = new Set(coBilled.map((row) => row.invoiceId));
+    const entries: DeleteBlockEntry[] = [];
+    for (const invoice of invoices) {
+        const blocker = await findInvoiceDeleteBlocker(invoice, async () => coBilledInvoiceIds.has(invoice.id));
+        if (blocker) entries.push({ projectId: invoice.projectId, code: invoice.code, clause: invoiceDeleteBlockClause(blocker) });
+    }
+    return entries;
+}
+
+/** Why a retainer may not cascade away with its project or client, or null. Status is what the
+ *  office sets in RetainerEditor ("Partially Paid" / "Paid"); amountPaid > 0 covers legacy rows.
+ *  amountPaid arrives as Prisma.Decimal from $queryRaw (Number() handles it) or a number in tests. */
+export function retainerDeleteClause(r: { status: string; amountPaid: unknown }): string | null {
+    if (r.status === "Paid" || r.status === "Partially Paid") return `is marked ${r.status}`;
+    if (Number(r.amountPaid ?? 0) > 0) return "has a recorded payment";
+    return null;
+}
+
+type LockedRetainerRow = { id: string; code: string; status: string; amountPaid: unknown; projectId: string };
+
+/** One entry per blocked retainer, in (projectId, id) order. Rows come from the FOR UPDATE statement. */
+function retainerDeleteEntries(rows: LockedRetainerRow[]): DeleteBlockEntry[] {
+    return [...rows]
+        .sort((a, b) => (a.projectId < b.projectId ? -1 : a.projectId > b.projectId ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .flatMap((r) => {
+            const clause = retainerDeleteClause(r);
+            return clause ? [{ projectId: r.projectId, code: r.code, clause }] : [];
+        });
+}
+
+/**
+ * Delete a whole invoice — the transaction body behind the `deleteInvoice`
+ * server action, split out (mirrors `deleteInvoiceMilestoneCore`) so it can be
+ * unit-tested without a next-auth session. `deleteInvoice` in actions.ts stays
+ * the thin wrapper: permission check, this call, revalidatePath.
+ *
+ * Refuses when the invoice itself, any milestone, or any progress billing is
+ * linked or pending in QuickBooks (`isQboInvoiceLinkedOrPending`). Both
+ * PaymentSchedule and ProgressBilling cascade-delete with their Invoice
+ * (schema.prisma `onDelete: Cascade`), so deleting past any of the three would
+ * silently abandon a real, collectible QuickBooks invoice with nothing left in
+ * ProBuild pointing at it — a real incident left three QuickBooks invoices
+ * open after their ProBuild invoice was deleted.
+ *
+ * Also refuses while any non-Paid milestone carries Stripe state
+ * (`stripeDeleteState`): a recorded PaymentIntent is a refunded or undone
+ * charge whose only ProBuild record is that row, and a bare session id is a
+ * checkout that may still be paid (a session stays payable for 24h, and ACH
+ * settles days later with only a session id on the row); a payment landing
+ * after the delete claims zero rows, reads as already paid and is marked
+ * PROCESSED.
+ */
+export async function deleteInvoiceCore(invoiceId: string): Promise<string> {
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId });
+        // Lock the child rows BEFORE reading them (same shape as
+        // loadCostPlusActuals' lockRows path). The two QBO push claims that can
+        // land on these rows work differently: the milestone push
+        // (claimMilestonePreCreateUnderLock, quickbooks-payments.ts) takes its
+        // OWN short-lived Invoice lock and commits before ever calling
+        // QuickBooks; the progress-billing push
+        // (stageProgressBillingToQuickBooksCore, progress-billing.ts) takes no
+        // lock at all — a bare prisma.progressBilling.updateMany. Locking the
+        // rows directly here covers both: a concurrent claim has either already
+        // committed (its marker is visible in the read below, and this
+        // refuses) or is blocked on these locks and finds its row gone once it
+        // gets through — its own CAS then matches zero rows and it aborts
+        // before ever calling QuickBooks.
+        await tx.$queryRaw`SELECT "id" FROM "PaymentSchedule" WHERE "invoiceId" = ${invoiceId} ORDER BY "id" FOR UPDATE`;
+        await tx.$queryRaw`SELECT "id" FROM "ProgressBilling" WHERE "invoiceId" = ${invoiceId} ORDER BY "id" FOR UPDATE`;
+
+        const invoice = await tx.invoice.findUnique({
+            where: { id: invoiceId },
+            include: { payments: true, progressBillings: true },
+        });
+        if (!invoice) throw new DeleteBlockedError(404, "INVOICE_NOT_FOUND", "Invoice not found");
+
+        const blocker = await findInvoiceDeleteBlocker(invoice, () => invoiceHasChangeOrderBilling(tx, invoiceId));
+        if (blocker) throw new DeleteBlockedError(409, "INVOICE_DELETE_BLOCKED", invoiceDeleteBlockMessage(blocker));
+
+        await tx.invoice.delete({ where: { id: invoiceId } });
+        return invoice.projectId;
+    }));
+}
+
+type PayrollTx = import("./payroll-period").PayrollTxClient;
+
+/**
+ * Delete several projects at once — the transaction body behind the
+ * `deleteProjects` server action. ONE transaction for the whole selection:
+ * every project is checked before any project is deleted. Looping per project
+ * left the caller half-deleted when the third job in the list turned out to
+ * have time entries — the first two were already gone and there was nothing
+ * to undo them with. A single deleteMany, which is what this used to be, was
+ * worse still: it CASCADEd every punch on every job in the list into nothing
+ * — locked, exported, paid hours included — and reported success. A project
+ * with ANY time entries — locked or not — throws TimeEntriesExistError out of
+ * here and rolls the batch back. Historical paid hours predate PayrollPeriod
+ * and have no lock to trip, so "unlocked" is never read as "safe to delete".
+ *
+ * A project whose invoices or retainers still hold money state is refused too — see
+ * lockProjectsAndCheckMoney. Invoice and Retainer cascade from Project and PaymentSchedule /
+ * ProgressBilling cascade from Invoice, so without it this deleted paid milestones,
+ * QuickBooks-linked invoices, Stripe-touched milestones and paid retainers that
+ * deleteInvoiceCore refuses to delete one at a time.
+ */
+export async function deleteProjectsCore(projectIds: string[]): Promise<void> {
+    const { deleteParentsWithTimeEntries } = await import("./payroll-parent-delete");
+    // Same limits as dispatch-publication's multi-project FOR UPDATE transaction: this one can
+    // wait on several project, invoice and milestone row locks before the cascade itself runs.
+    // Passed through the runTransaction seam so payroll-parent-delete.ts stays untouched.
+    const runTransaction = <T>(fn: (tx: PayrollTx) => Promise<T>): Promise<T> =>
+        prisma.$transaction((tx) => fn(tx as unknown as PayrollTx), { maxWait: 5_000, timeout: 20_000 });
+    await withTxRetry(() => deleteParentsWithTimeEntries(
+        projectIds.map((projectId) => ({ projectId })),
+        async (tx) => {
+            await lockProjectsAndCheckMoney(tx as unknown as Prisma.TransactionClient, projectIds);
+            await (tx as unknown as typeof prisma).project.deleteMany({ where: { id: { in: projectIds } } });
+        },
+        { runTransaction },
+    ));
+}
+
+/**
+ * Runs inside deleteProjectsCore's transaction, after the payroll lock and time-entry count, before
+ * the delete. Lock order (tx-retry.ts): Project → Estimate → Invoice → Client → child rows, with the
+ * projects' change orders between Project and Estimate (schedule-core.ts takes Project → ChangeOrder;
+ * billChangeOrderCore and billCostPlusChangeOrderCore take ChangeOrder → Estimate → Invoice). One
+ * statement per table, ascending id: the row lock is taken above the sort, so rows lock in id order
+ * (same form as dispatch-publication.ts and lockAttributionParents).
+ *
+ * FOR UPDATE on the projects also blocks every insert that would hang a NEW invoice, change order,
+ * estimate or retainer off them (an FK insert takes FOR KEY SHARE on its parent), and FOR UPDATE on
+ * the invoices blocks new milestones and progress billings, so the set read below cannot grow before
+ * the delete. The ChangeOrder and Estimate locks exist only to keep that order: the cascade deletes
+ * the change orders and SET NULLs Estimate.projectId anyway, and taking those row locks there, after
+ * the Invoice locks, would invert ChangeOrder → Estimate → Invoice (change-order billing) and
+ * Estimate → Invoice (the Stripe webhook, payment recording).
+ *
+ * Estimate is locked FOR NO KEY UPDATE, the mode the cascade's own SET NULL takes: it still waits
+ * for lockMoneyParents (FOR UPDATE) and lockAttributionParents (FOR SHARE), but it does not block
+ * the FOR KEY SHARE an FK check takes, so an insert that references the estimate and then waits on
+ * our Project lock (createInvoiceFromEstimateCore's invoice.create, createChangeOrder) cannot
+ * deadlock with us. Every other table is locked FOR UPDATE because the cascade deletes those rows.
+ * Retainers go last with the other child rows; their only writers are single lock-free statements.
+ */
+async function lockProjectsAndCheckMoney(tx: Prisma.TransactionClient, projectIds: string[]): Promise<void> {
+    const ids = [...new Set(projectIds)].sort();
+    if (ids.length === 0) return;
+
+    const projects = await tx.$queryRaw<Array<{ id: string; name: string }>>`
+        SELECT "id", "name" FROM "Project" WHERE "id" = ANY(${ids}::text[]) ORDER BY "id" FOR UPDATE`;
+    const lockedProjectIds = projects.map((p) => p.id);
+    if (lockedProjectIds.length === 0) return;
+
+    await tx.$queryRaw`SELECT "id" FROM "ChangeOrder" WHERE "projectId" = ANY(${lockedProjectIds}::text[]) ORDER BY "id" FOR UPDATE`;
+    await tx.$queryRaw`SELECT "id" FROM "Estimate" WHERE "projectId" = ANY(${lockedProjectIds}::text[]) ORDER BY "id" FOR NO KEY UPDATE`;
+    const lockedInvoices = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT "id" FROM "Invoice" WHERE "projectId" = ANY(${lockedProjectIds}::text[]) ORDER BY "id" FOR UPDATE`;
+    const invoiceIds = lockedInvoices.map((i) => i.id);
+
+    if (invoiceIds.length > 0) {
+        // deleteInvoiceCore's child locks, for every invoice the cascade will take.
+        await tx.$queryRaw`SELECT "id" FROM "PaymentSchedule" WHERE "invoiceId" = ANY(${invoiceIds}::text[]) ORDER BY "id" FOR UPDATE`;
+        await tx.$queryRaw`SELECT "id" FROM "ProgressBilling" WHERE "invoiceId" = ANY(${invoiceIds}::text[]) ORDER BY "id" FOR UPDATE`;
+    }
+    const retainers = await tx.$queryRaw<LockedRetainerRow[]>`
+        SELECT "id", "code", "status", "amountPaid", "projectId" FROM "Retainer" WHERE "projectId" = ANY(${lockedProjectIds}::text[]) ORDER BY "id" FOR UPDATE`;
+
+    // Every rule below reads rows read after the last lock above.
+    const invoiceEntries = invoiceIds.length > 0 ? await listInvoiceDeleteBlocks(tx, invoiceIds) : [];
+    const retainerEntries = retainerDeleteEntries(retainers);
+    if (invoiceEntries.length === 0 && retainerEntries.length === 0) return;
+    const nameOf = new Map(projects.map((p) => [p.id, p.name]));
+    const on = (projectId: string) => `on "${nameOf.get(projectId) ?? projectId}"`;
+    throw new DeleteBlockedError(409, "PROJECT_DELETE_BLOCKED", cascadeDeleteBlockedMessage(
+        lockedProjectIds.length === 1 ? "Cannot delete this project" : "Cannot delete these projects",
+        [
+            ...invoiceEntries.map((e) => `invoice ${e.code} ${on(e.projectId)} ${e.clause}`),
+            ...retainerEntries.map((e) => `retainer ${e.code} ${on(e.projectId)} ${e.clause}`),
+        ],
+        PROJECT_DELETE_TAIL,
+    ));
+}
+
+/**
+ * What deleteProjects shows the admin when deleteProjectsCore throws. Our own refusals pass
+ * through; anything else (Prisma/Postgres errors, timeouts, deadlocks after withTxRetry gave up) is
+ * logged and replaced, because its raw text ("Transaction already closed ...", "Invalid
+ * `tx.project.deleteMany()` invocation ...") means nothing to an office admin. Name-based checks
+ * only: billing-core must not import payroll-parent-delete statically (it would add an import line),
+ * and TimeEntriesExistError's own guard is name-based too.
+ */
+export function deleteProjectsFailureMessage(error: unknown, projectCount: number): string {
+    if (isDeleteBlockedError(error)) return error.message;
+    if (error instanceof Error && error.name === "TimeEntriesExistError") {
+        if (projectCount <= 1) return error.message;
+        const count = (error as Error & { count?: number }).count;
+        const entries = typeof count === "number" ? `${count} time ${count === 1 ? "entry exists" : "entries exist"}` : "Time entries exist";
+        return `Cannot delete these projects: ${entries} across the selected projects, and payroll history is never deleted this way. Deselect the projects that have time entries and try again. Nothing was deleted.`;
+    }
+    console.error("deleteProjects failed:", error);
+    return "Could not delete the selected projects. Nothing was deleted. Try again, and tell support if it keeps failing.";
+}
+
+/** The single-invoice counterpart: typed refusals pass through, anything else is logged and replaced. */
+export function deleteInvoiceFailureMessage(error: unknown): string {
+    if (isDeleteBlockedError(error)) return error.message;
+    console.error("deleteInvoice failed:", error);
+    return "Could not delete this invoice. Nothing was deleted. Try again, and tell support if it keeps failing.";
+}
+
+/**
+ * Delete a client: the transaction behind DELETE /api/clients/[id] (MANAGER/ADMIN; the route checks
+ * the session, then calls this). Invoice and Retainer CASCADE from Client and PaymentSchedule /
+ * ProgressBilling cascade from Invoice, so a bare client.delete() took every money record under the
+ * client's invoices and retainers with it. Project and Lead RESTRICT (baseline migration), so in
+ * practice only a client with no projects or leads gets this far, but Invoice.clientId and
+ * Retainer.clientId are snapshots taken when the row was created, not joins through the project, so
+ * one can still name a client none of whose projects own it. deleteInvoiceCore's rules apply to
+ * every invoice the cascade would take, and the retainer rule to every retainer.
+ */
+export async function deleteClientCore(clientId: string): Promise<void> {
+    await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // 1. PEEK, lock-free. Invoice comes BEFORE Client in the global order (tx-retry.ts), so the
+        //    ids must be known before the Client lock: peek, lock, re-read under the locks, refuse
+        //    if it moved (finalizeProgressBillingLinkUnderLock's shape).
+        const peek = await tx.invoice.findMany({ where: { clientId }, select: { id: true } });
+        const lockedInvoiceIds = peek.map((i) => i.id).sort();
+        if (lockedInvoiceIds.length > 0) {
+            await tx.$queryRaw`SELECT "id" FROM "Invoice" WHERE "id" = ANY(${lockedInvoiceIds}::text[]) ORDER BY "id" FOR UPDATE`;
+        }
+        // 2. The client. FOR UPDATE also blocks every insert that would hang a new invoice,
+        //    project, lead or retainer off it until this commits.
+        await lockClientRow(tx, clientId, "update");
+        const client = await tx.client.findUnique({ where: { id: clientId }, select: { id: true } });
+        if (!client) throw new DeleteBlockedError(404, "CLIENT_NOT_FOUND", "Client not found");
+
+        // 3. An invoice committed for this client between the peek and the Client lock was never
+        //    locked: refuse rather than delete it unchecked.
+        const current = await tx.invoice.findMany({ where: { clientId }, select: { id: true } });
+        const locked = new Set(lockedInvoiceIds);
+        if (current.some((i) => !locked.has(i.id))) {
+            throw new DeleteBlockedError(409, "CLIENT_CHANGED", "This client's invoices changed while it was being deleted. Nothing was deleted. Refresh and try again.");
+        }
+
+        // 4. Project and Lead RESTRICT this delete; say so instead of the FK's 500.
+        const projectCount = await tx.project.count({ where: { clientId } });
+        const leadCount = await tx.lead.count({ where: { clientId } });
+        if (projectCount > 0 || leadCount > 0) {
+            throw new DeleteBlockedError(409, "CLIENT_HAS_PROJECTS", clientHasProjectsMessage(projectCount, leadCount));
+        }
+
+        // 5. Child rows: the invoices' milestones and progress billings, then the client's
+        //    retainers. Then the rules, on rows read after the last lock.
+        const invoiceIds = current.map((i) => i.id).sort();
+        if (invoiceIds.length > 0) {
+            await tx.$queryRaw`SELECT "id" FROM "PaymentSchedule" WHERE "invoiceId" = ANY(${invoiceIds}::text[]) ORDER BY "id" FOR UPDATE`;
+            await tx.$queryRaw`SELECT "id" FROM "ProgressBilling" WHERE "invoiceId" = ANY(${invoiceIds}::text[]) ORDER BY "id" FOR UPDATE`;
+        }
+        const retainers = await tx.$queryRaw<LockedRetainerRow[]>`
+            SELECT "id", "code", "status", "amountPaid", "projectId" FROM "Retainer" WHERE "clientId" = ${clientId} ORDER BY "id" FOR UPDATE`;
+        const invoiceEntries = invoiceIds.length > 0 ? await listInvoiceDeleteBlocks(tx, invoiceIds) : [];
+        const retainerEntries = retainerDeleteEntries(retainers);
+        if (invoiceEntries.length > 0 || retainerEntries.length > 0) {
+            throw new DeleteBlockedError(409, "CLIENT_DELETE_BLOCKED", cascadeDeleteBlockedMessage(
+                "Cannot delete this client",
+                [
+                    ...invoiceEntries.map((e) => `invoice ${e.code} ${e.clause}`),
+                    ...retainerEntries.map((e) => `retainer ${e.code} ${e.clause}`),
+                ],
+                CLIENT_DELETE_TAIL,
+            ));
+        }
+
+        await tx.client.delete({ where: { id: clientId } });
+    }));
+}
+
+function clientHasProjectsMessage(projectCount: number, leadCount: number): string {
+    const parts: string[] = [];
+    if (projectCount > 0) parts.push(`${projectCount} ${projectCount === 1 ? "project" : "projects"}`);
+    if (leadCount > 0) parts.push(`${leadCount} ${leadCount === 1 ? "lead" : "leads"}`);
+    return `This client still has ${parts.join(" and ")}. A client can only be deleted once it has no projects or leads. Nothing was deleted.`;
 }
 
 export async function splitInvoiceMilestonesCore(

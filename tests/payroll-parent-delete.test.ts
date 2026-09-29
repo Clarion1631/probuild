@@ -138,15 +138,21 @@ test("one parent WITH time entries refuses the whole batch, not just that parent
     assert.equal(parentsDeleted, false, "the clean project must survive too — it is one transaction");
 });
 
-test("deleteProjects deletes the whole set in ONE call, not a loop", () => {
-    const actions = read("src/lib/actions.ts");
-    const fn = actions.slice(actions.indexOf("export async function deleteProjects"));
+test("deleteProjectsCore deletes the whole set in ONE call, not a loop", () => {
+    const billingCore = read("src/lib/billing-core.ts");
+    const fn = billingCore.slice(billingCore.indexOf("export async function deleteProjectsCore"));
     const body = fn.slice(0, fn.indexOf("\nexport "));
     assert.match(body, /deleteParentsWithTimeEntries\(/);
     assert.match(body, /projectIds\.map\(\(projectId\) => \(\{ projectId \}\)\)/);
     assert.match(body, /project\.deleteMany\(\{ where: \{ id: \{ in: projectIds \} \} \}\)/);
     // No per-project loop: that is what left a half-deleted selection.
     assert.doesNotMatch(body, /for \(const projectId of projectIds\)/);
+
+    const actions = read("src/lib/actions.ts");
+    const actionFn = actions.slice(actions.indexOf("export async function deleteProjects"));
+    const actionBody = actionFn.slice(0, actionFn.indexOf("\nexport "));
+    assert.match(actionBody, /deleteProjectsCore\(projectIds\)/);
+    assert.doesNotMatch(actionBody, /\.project\.deleteMany\(/);
 });
 
 // ── deleteProjects requires ADMIN, not just an active session ───────────────
@@ -170,10 +176,10 @@ test("deleteProjects requires the ADMIN role, refusing with the SAME error shape
     const body = fn.slice(0, fn.indexOf("\nexport "));
     assert.match(body, /const user = await assertActiveStaff\(\);/);
     assert.match(body, /if \(user\.role !== "ADMIN"\) throw new Error\("Forbidden"\);/);
-    // The check happens BEFORE deleteParentsWithTimeEntries — a refused
+    // The check happens BEFORE deleteProjectsCore — a refused
     // request must never reach the payroll-history check, let alone the delete.
     assert.ok(
-        body.indexOf('throw new Error("Forbidden")') < body.indexOf("deleteParentsWithTimeEntries("),
+        body.indexOf('throw new Error("Forbidden")') < body.indexOf("deleteProjectsCore("),
         "the role check must run before any delete is attempted"
     );
 });

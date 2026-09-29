@@ -227,9 +227,15 @@ test.describe.serial("staff status revokes existing sessions", () => {
       const nextAction = source.indexOf("\nexport async function ", actionStart + 1);
       const actionSource = source.slice(actionStart, nextAction === -1 ? undefined : nextAction);
       const authIndex = actionSource.indexOf("await assertInvoicePermission()");
-      const databaseIndex = actionSource.indexOf("prisma.");
+      // deleteInvoice's transaction body was extracted into deleteInvoiceCore
+      // (billing-core.ts) so it could be unit-tested without a next-auth
+      // session; the call to it IS deleteInvoice's database-access point
+      // now — its own body has no literal "prisma." left to find.
+      const databaseMarker = actionName === "deleteInvoice" ? "deleteInvoiceCore(" : "prisma.";
+      const databaseIndex = actionSource.indexOf(databaseMarker);
 
       expect(authIndex, `${actionName} must authorize internally`).toBeGreaterThanOrEqual(0);
+      expect(databaseIndex, `${actionName} must access the database`).toBeGreaterThanOrEqual(0);
       expect(authIndex, `${actionName} must authorize before database access`).toBeLessThan(databaseIndex);
     }
   });

@@ -69,9 +69,13 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
     async function handleDeleteProject(projectId: string) {
         if (!confirm("Are you sure you want to delete this project?")) return;
         try {
-            await deleteProjects([projectId]);
-            setProjects((prev: any) => prev.filter((p: any) => p.id !== projectId));
-            toast.success("Project deleted");
+            const res = await deleteProjects([projectId]);
+            if (!res.success) {
+                toast.error(res.error, { duration: 15000 });
+            } else {
+                setProjects((prev: any) => prev.filter((p: any) => p.id !== projectId));
+                toast.success("Project deleted");
+            }
         } catch {
             toast.error("Failed to delete project");
         }
@@ -113,7 +117,11 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
         if (!confirm(`Are you sure you want to delete ${selectedIds.length} projects?`)) return;
         setIsDeleting(true);
         try {
-            await deleteProjects(selectedIds);
+            const res = await deleteProjects(selectedIds);
+            if (!res.success) {
+                toast.error(res.error, { duration: 15000 });
+                return;
+            }
             setProjects((prev: any) => prev.filter((p: any) => !selectedIds.includes(p.id)));
             setSelectedIds([]);
             toast.success("Projects deleted successfully");
