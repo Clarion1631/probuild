@@ -1,6 +1,6 @@
 import { test, expect, type APIRequestContext } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 /**
  * POST/GET /api/receipts/intake — request-level auth matrix and idempotency.
@@ -71,6 +71,13 @@ const SOURCE_REF = `${REF_PREFIX}${FILE_ID}`;
 // the prefix, so they are tracked explicitly for teardown.
 const minted: string[] = [];
 
+// The "Drive folder name" describe block's own project, created once in its
+// beforeAll (so it exists before that describe's tests run) and torn down in
+// the FILE-LEVEL afterAll below, after receipt cleanup and before disconnect
+// — not in a nested describe's own afterAll, which would not establish that
+// ordering against the outer one.
+let e2eFolderProjectId: string | null = null;
+
 // A real 1x1 PNG: the endpoint decides the stored mime on the BYTES, so a
 // placeholder string would be refused (which is itself asserted below).
 const PNG_BASE64 =
@@ -117,6 +124,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => {
     await prisma.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: REF_PREFIX } } });
     if (minted.length) await prisma.receiptIntake.deleteMany({ where: { id: { in: minted } } });
+    if (e2eFolderProjectId) await prisma.project.delete({ where: { id: e2eFolderProjectId } }).catch(() => { /* already gone */ });
     await prisma.$disconnect();
 });
 
@@ -1950,5 +1958,136 @@ test.describe("round-10 finalize authorization and recovery", () => {
         // The row must not exist — a STAGING row for a document we will never
         // accept is something the sweeper then has to reason about.
         expect(await prisma.receiptIntake.findUnique({ where: { sourceRef: ref } })).toBeNull();
+    });
+});
+
+test.describe("Drive folder name", () => {
+    const r = Date.now().toString(36);
+    let jobId: string;
+
+    test.beforeAll(async () => {
+        // findUniqueOrThrow, not a hardcoded client id: this asserts the e2e
+        // seed project actually exists and gives a real, typed clientId rather
+        // than assuming one.
+        const seedProject = await prisma.project.findUniqueOrThrow({
+            where: { id: PROJECT_ID },
+            select: { clientId: true },
+        });
+        const project = await prisma.project.create({
+            data: { name: `E2E Folder ${r} Remodel`, clientId: seedProject.clientId, status: "In Progress" },
+        });
+        jobId = project.id;
+        e2eFolderProjectId = project.id;
+    });
+
+    test("a secret drive POST keeps its cleaned folder and gets no job from it, even though an open job's name starts with it", async ({ request }) => {
+        const ref = `${REF_PREFIX}folder-${r}`;
+        const { res, body } = await postIntake(request, intakeBody({
+            sourceRef: ref,
+            folderName: `  E2E\tFolder ${r} `,
+        }));
+        expect(res.status(), JSON.stringify(body)).toBe(200);
+
+        const row = await prisma.receiptIntake.findUnique({ where: { id: body.id } });
+        expect(row?.sourceFolder).toBe(`E2E Folder ${r}`);
+        expect(row?.projectId).toBeNull();
+    });
+
+    test("a replay keeps the first folder", async ({ request }) => {
+        const ref = `${REF_PREFIX}folder-replay-${r}`;
+        const first = await postIntake(request, intakeBody({ sourceRef: ref, folderName: `E2E Folder ${r}` }));
+        expect(first.res.status(), JSON.stringify(first.body)).toBe(200);
+
+        const replay = await postIntake(request, intakeBody({ sourceRef: ref, folderName: "Other Folder" }));
+        expect(replay.res.status()).toBe(200);
+        expect(replay.body.id).toBe(first.body.id);
+
+        const row = await prisma.receiptIntake.findUnique({ where: { id: first.body.id } });
+        expect(row?.sourceFolder).toBe(`E2E Folder ${r}`);
+    });
+
+    test("a session upload's folder is ignored", async ({ request }) => {
+        const uploadId = randomUUID();
+        const res = await request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json" },
+            data: JSON.stringify({ fileBase64: PNG_BASE64, mimeType: "image/png", uploadId, folderName: "Oak Street" }),
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(200);
+        const body = await res.json();
+        minted.push(body.id);
+
+        const row = await prisma.receiptIntake.findUnique({ where: { id: body.id } });
+        expect(row?.sourceFolder).toBeNull();
+    });
+
+    test("the page shows the folder, offers the job, and one tap sets it", async ({ page }) => {
+        const ref = `${REF_PREFIX}pick-${r}`;
+        const created = await prisma.receiptIntake.create({
+            data: {
+                source: "drive", sourceRef: ref, state: "NEEDS_JOB",
+                storagePath: `receipts/intake/e2e-pick-${r}.png`, mimeType: "image/png",
+                fileSize: 1, fileSha256: "0".repeat(64),
+                vendor: `E2E Vendor ${r}`, totalCents: 1234,
+                sourceFolder: `E2E Folder ${r}`,
+            },
+        });
+
+        await page.goto("/automation?tab=receipts&group=needs-job");
+        await expect(page.getByText(`E2E Vendor ${r}`)).toBeVisible();
+        await expect(page.getByText(`Folder: E2E Folder ${r}`)).toBeVisible();
+        await expect(page.getByText("Starts with the folder name:")).toBeVisible();
+
+        // The button's accessible name is its aria-label ("Set job to …"), not
+        // just the visible job name (build brief step 8).
+        await page.getByRole("button", { name: `Set job to E2E Folder ${r} Remodel` }).click();
+        await expect(page.getByText("Job set.")).toBeVisible();
+
+        await expect
+            .poll(async () => {
+                const polled = await prisma.receiptIntake.findUnique({ where: { id: created.id } });
+                return polled?.state;
+            }, { timeout: 15_000 })
+            .toBe("READ");
+        const finished = await prisma.receiptIntake.findUnique({ where: { id: created.id } });
+        expect(finished?.projectId).toBe(jobId);
+    });
+
+    test("an unread total says so; a read zero does not", async ({ page }) => {
+        const unreadRef = `${REF_PREFIX}unread-${r}`;
+        const zeroRef = `${REF_PREFIX}zero-${r}`;
+        await prisma.receiptIntake.create({
+            data: {
+                source: "drive", sourceRef: unreadRef, state: "NEEDS_REVIEW", stateReason: "refund-or-zero",
+                storagePath: `receipts/intake/e2e-unread-${r}.png`, mimeType: "image/png",
+                fileSize: 1, fileSha256: "1".repeat(64),
+                vendor: `E2E Unread ${r}`, totalCents: 0, readAt: new Date(),
+                readJson: JSON.stringify({ total_amount: "" }),
+            },
+        });
+        await prisma.receiptIntake.create({
+            data: {
+                source: "drive", sourceRef: zeroRef, state: "NEEDS_REVIEW", stateReason: "refund-or-zero",
+                storagePath: `receipts/intake/e2e-zero-${r}.png`, mimeType: "image/png",
+                fileSize: 1, fileSha256: "2".repeat(64),
+                vendor: `E2E Zero ${r}`, totalCents: 0, readAt: new Date(),
+                readJson: JSON.stringify({ total_amount: "0.00" }),
+            },
+        });
+
+        await page.goto("/automation?tab=receipts&group=needs-review");
+        // The vendor names carry the same run suffix `r`, so a page-wide check
+        // cannot cross-match the other row -- each string only appears once.
+        await expect(page.getByText(`E2E Unread ${r}`)).toBeVisible();
+        await expect(page.getByText("amount not read")).toBeVisible();
+        await expect(page.getByText("I could not read a total on this one")).toBeVisible();
+
+        await expect(page.getByText(`E2E Zero ${r}`)).toBeVisible();
+        // {exact: true} because "$0.00" also appears as a substring of the
+        // reason sentence below ("The total reads as $0.00. …") -- without it
+        // this locator matches both elements and Playwright's strict mode
+        // refuses to resolve it.
+        await expect(page.getByText("$0.00", { exact: true })).toBeVisible();
+        await expect(page.getByText("The total reads as $0.00.", { exact: false })).toBeVisible();
     });
 });

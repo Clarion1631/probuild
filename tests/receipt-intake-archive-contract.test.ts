@@ -35,7 +35,7 @@ test("the archive payload carries everything the v1 filename is built from", () 
 test("the archive payload withholds everything the mirror has no business seeing", () => {
     // Least privilege applies to a script the same way it does to a user: a
     // leaked or over-shared secret should expose as little as still works.
-    for (const field of ["lastError", "fileSha256", "createdById", "readJson", "dedupStrongKey", "dedupWeakKey", "attempts", "busyPasses"]) {
+    for (const field of ["lastError", "fileSha256", "createdById", "readJson", "dedupStrongKey", "dedupWeakKey", "attempts", "busyPasses", "sourceFolder"]) {
         assert.ok(!(field in RECEIPT_INTAKE_ARCHIVE_SELECT), `${field} must not be exposed`);
         // ...and it IS in the staff select, so this is a real narrowing rather
         // than a column that simply does not exist.
@@ -43,6 +43,13 @@ test("the archive payload withholds everything the mirror has no business seeing
             assert.ok(field in RECEIPT_INTAKE_LIST_SELECT, `${field} should exist on the staff select`);
         }
     }
+});
+
+test("readJson is absent from the staff select too — nothing selects it except the page loader's own select", () => {
+    // The loop above deliberately skips this field for its "exists on the
+    // staff select" half; this pins the other half explicitly, since nothing
+    // else in this file asserted it.
+    assert.ok(!("readJson" in RECEIPT_INTAKE_LIST_SELECT));
 });
 
 test("the mirror may only ask for the two states it acts on", () => {

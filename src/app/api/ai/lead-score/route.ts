@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getAnthropicText } from "@/lib/anthropic";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
@@ -69,11 +69,15 @@ CONFIDENCE NOTE: [1-2 sentences on what would increase or decrease this score]`;
 
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
+        model: CLAUDE_SONNET_MODEL,
+        output_config: { effort: "medium" },
         max_tokens: 4096,
         messages: [{ role: "user", content: prompt }],
     });
-    const analysis = getAnthropicText(response.content);
+    if (response.stop_reason === "refusal") {
+        return NextResponse.json({ error: "The AI declined this request" }, { status: 422 });
+    }
+    const analysis = getAnthropicMessageText(response);
 
     // Parse probability
     const probMatch = analysis.match(/CLOSE PROBABILITY:\s*(\d+)%/);

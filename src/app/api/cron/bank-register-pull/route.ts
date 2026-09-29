@@ -4,6 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
+import { withCronHeartbeat } from "@/lib/cron-heartbeat";
 import {
     BANK_PULL_LAST_SUCCESS_KEY,
     BANK_PULL_AMBIGUOUS_KEY,
@@ -563,7 +564,7 @@ export function pullContinuationPending(state: PullWindowState): boolean {
         || state.stampPending === true;
 }
 
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
@@ -629,6 +630,12 @@ export async function GET(request: Request) {
         await releaseLease(CLAIM_LOCK_KEY, token);
     }
 }
+
+// runPull() and the skip branches above already set status from their own
+// ok/error state (see runPull's own `NextResponse.json(summary, { status })`
+// at its end) — the wrapper's default status-based rule classifies this
+// correctly with no predicate.
+export const GET = withCronHeartbeat("BANK_REGISTER_PULL", handleGET);
 
 /**
  * How far back a mint pass looks for still-unlinked QBO observations: THE SAME

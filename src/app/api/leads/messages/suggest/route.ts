@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import { displayEndDate, toDateKey, formatDateKey } from "@/lib/schedule-dates";
 
 // POST /api/leads/messages/suggest — AI-generated message suggestion
@@ -139,13 +140,14 @@ TASK: ${contextPrompt}`;
     try {
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const response = await anthropic.messages.create({
-            model: "claude-sonnet-4-6",
-            max_tokens: 512,
+            model: CLAUDE_SONNET_MODEL,
+            output_config: { effort: "low" },
+            max_tokens: 2048,
             system: systemPrompt,
             messages: [{ role: "user", content: userPrompt }],
         });
 
-        const suggestion = (response.content[0] as { type: "text"; text: string }).text?.trim() || "";
+        const suggestion = getAnthropicMessageText(response);
 
         return NextResponse.json({ suggestion });
     } catch (e: any) {

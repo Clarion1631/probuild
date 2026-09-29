@@ -28,6 +28,7 @@ import {
     MAX_STORED_BYTES,
 } from "@/lib/receipt-intake/intake-core";
 import { finalizeDisposition, leaseFence, verifyStoredCopy } from "@/lib/receipt-intake/stored-object";
+import { intakeFolderOf } from "@/lib/receipt-intake/folder";
 import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 import {
     ARCHIVE_READABLE_STATES,
@@ -104,6 +105,8 @@ interface ParsedBody {
     uploadId: string | null;
     projectId: string | null;
     costCodeId: string | null;
+    /** The Drive folder the forwarder filed this under, uncleaned. Only kept from the shared-secret drive source — see `intakeFolderOf`. */
+    folderName: string | null;
     /**
      * Phase 3: did this material get installed at a customer job? Tri-state on
      * purpose — `null` means the caller did not say, which is NOT the same as
@@ -188,6 +191,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
             uploadId: str(form.get("uploadId")),
             projectId: str(form.get("projectId")),
             costCodeId: str(form.get("costCodeId")),
+            folderName: str(form.get("folderName")),
             installedAtCustomer: optionalBool(form.get("installedAtCustomer")),
             threadName: str(form.get("threadName")),
             archivedByV1: form.get("archivedByV1") === "true",
@@ -221,6 +225,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
         uploadId: str(json.uploadId),
         projectId: str(json.projectId),
         costCodeId: str(json.costCodeId),
+        folderName: str(json.folderName),
         installedAtCustomer: optionalBool(json.installedAtCustomer),
         threadName: str(json.threadName),
         // Strict === true: only an explicit boolean may mark a row as already
@@ -265,6 +270,8 @@ export async function POST(req: Request) {
     });
     if (!decided.ok) return bad(decided.reason);
     const { source, sourceRef } = decided;
+    // Kept only from the shared-secret drive forwarder — see intakeFolderOf.
+    const sourceFolder = intakeFolderOf(auth.via, source, parsed.folderName);
 
     // A session/Bearer caller may only file against a project they can reach.
     // The secret caller is a trusted forwarder resolving the project from the
@@ -339,6 +346,8 @@ export async function POST(req: Request) {
                 // claim that v1 already put this document in the books, and it
                 // is what stops v2 from booking it at cutover.
                 archivedByV1: auth.via === "secret" ? parsed.archivedByV1 : false,
+                // Only the shared-secret drive forwarder; written once, never updated.
+                sourceFolder,
                 storagePath,
                 fileName: parsed.fileName,
                 mimeType,
@@ -364,6 +373,18 @@ export async function POST(req: Request) {
             return bad("unknown-project-or-cost-code");
         }
         throw error;
+    }
+
+    // One line, drive forwarder only. The folder text itself is not logged,
+    // only whether one was kept and its length -- this is a rollout signal
+    // (6.4/8), not an audit trail. Synchronous: no AutomationEvent write to
+    // await or fail.
+    if (auth.via === "secret" && source === "drive") {
+        console.info("[receipts/intake] drive folder", JSON.stringify({
+            intakeId: created.id,
+            hasFolder: sourceFolder !== null,
+            chars: sourceFolder?.length ?? 0,
+        }));
     }
 
     const supabase = getSupabase();

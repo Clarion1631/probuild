@@ -3,6 +3,7 @@
 // src/app/api/selections/link-schedule/route.ts so it's importable directly
 // by tests/the verifier script — mirrors selection-ai-sort-dependencies.ts.
 import Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "./anthropic";
 import { mockDecisionScheduleLinkComplete } from "./decision-schedule-link-mock";
 // Same mock gate as AI Auto-Sort — reused, not duplicated. Both features
 // gate on the identical SELECTION_AI_MOCK/VERCEL expression (see
@@ -21,10 +22,10 @@ export async function completeDecisionScheduleLink(prompt: string): Promise<stri
     // matches the codebase's uniform model choice across all AI routes.
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4000,
+        model: CLAUDE_SONNET_MODEL,
+        output_config: { effort: "medium" },
+        max_tokens: 8000,
         messages: [{ role: "user", content: prompt }],
     });
-    const block = response.content[0];
-    return ("text" in block ? block.text : "").trim();
+    return getAnthropicMessageText(response);
 }

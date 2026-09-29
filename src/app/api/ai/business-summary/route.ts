@@ -2,7 +2,7 @@
 import { nonVoidedTimeEntryWhere } from "@/lib/time-entry-void";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getAnthropicText } from "@/lib/anthropic";
+import { CLAUDE_SONNET_MODEL, getAnthropicMessageText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
 export async function POST(req: NextRequest) {
@@ -129,11 +129,15 @@ TOP RISKS
 
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4096,
+        model: CLAUDE_SONNET_MODEL,
+        output_config: { effort: "high" },
+        max_tokens: 8000,
         messages: [{ role: "user", content: prompt }],
     });
-    const summary = getAnthropicText(response.content);
+    if (response.stop_reason === "refusal") {
+        return NextResponse.json({ error: "The AI declined this request" }, { status: 422 });
+    }
+    const summary = getAnthropicMessageText(response);
 
     return NextResponse.json({
         success: true,

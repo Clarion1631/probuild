@@ -14,6 +14,8 @@ import {
     unmarkReceiptIntakeDuplicate,
     voidReceiptIntake,
 } from "@/lib/actions";
+import { setReceiptIntakeJobFromSuggestion } from "@/lib/receipt-intake/suggestion-actions";
+import { FOLDER_COPY, type FolderSuggestions } from "@/lib/receipt-intake/folder";
 
 /**
  * The interactive bits of a receipt-queue row — the same "just the button"
@@ -47,6 +49,7 @@ export function SetJobControl({
     currentProjectId,
     expectedState,
     expectedUpdatedAt,
+    suggestions,
 }: {
     intakeId: string;
     jobs: Array<{ id: string; name: string }>;
@@ -59,9 +62,11 @@ export function SetJobControl({
      * about the first would otherwise land on the second.
      */
     expectedUpdatedAt: string;
+    /** Folder-based job suggestions for this row, if any (folder.ts). */
+    suggestions?: FolderSuggestions;
 }) {
     const [projectId, setProjectId] = useState(currentProjectId ?? "");
-    const { pending, run } = useAction("Job set — the pipeline will pick it up");
+    const { pending, run } = useAction("Job set.");
 
     return (
         <div className="flex items-center gap-2 flex-wrap">
@@ -86,6 +91,46 @@ export function SetJobControl({
             >
                 Set job
             </button>
+            {suggestions?.kind === "exact" && (
+                <span className="basis-full flex items-center gap-2 flex-wrap text-xs text-hui-textMuted">
+                    {FOLDER_COPY.exactLead}
+                    {suggestions.jobs.map(job => (
+                        <button
+                            key={job.id}
+                            type="button"
+                            className={BTN}
+                            disabled={pending}
+                            aria-label={`Set job to ${job.name}`}
+                            onClick={() => run(() => setReceiptIntakeJobFromSuggestion(intakeId, job.id, expectedState, expectedUpdatedAt))}
+                        >
+                            {job.name}
+                        </button>
+                    ))}
+                </span>
+            )}
+            {suggestions?.kind === "prefix" && (
+                <span className="basis-full flex items-center gap-2 flex-wrap text-xs text-hui-textMuted">
+                    {FOLDER_COPY.prefixLead}
+                    {suggestions.jobs.map(job => (
+                        <button
+                            key={job.id}
+                            type="button"
+                            className={BTN}
+                            disabled={pending}
+                            aria-label={`Set job to ${job.name}`}
+                            onClick={() => run(() => setReceiptIntakeJobFromSuggestion(intakeId, job.id, expectedState, expectedUpdatedAt))}
+                        >
+                            {job.name}
+                        </button>
+                    ))}
+                </span>
+            )}
+            {suggestions?.kind === "same-name" && (
+                <span className="basis-full text-xs text-hui-textMuted">{FOLDER_COPY.sameName}</span>
+            )}
+            {suggestions?.kind === "too-many" && (
+                <span className="basis-full text-xs text-hui-textMuted">{FOLDER_COPY.tooMany}</span>
+            )}
         </div>
     );
 }

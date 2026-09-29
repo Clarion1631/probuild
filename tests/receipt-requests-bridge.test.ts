@@ -325,7 +325,7 @@ test("a configured webhook that fails to deliver FAILS the run", () => {
     // A 200 here meant nobody was ever told the crew's card did not go out.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     assert.match(source, /failures\.push\(card\.owner\);/);
-    assert.match(source, /ok: failures\.length === 0 && uncertainTransitions\.length === 0,/);
+    assert.match(source, /ok: failures\.length === 0 && uncertainTransitions\.length === 0 && !scanIncomplete,/);
     // A REFUSED delivery is a 500 — it is worth retrying. An UNCONFIRMED one is
     // partial: ok:false, HTTP 200, because it needs a human and not another
     // attempt (see tests/receipt-request-cards.test.ts).

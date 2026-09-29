@@ -3,6 +3,8 @@ import { notFound } from "next/navigation";
 import PortalChangeOrderClient from "./PortalChangeOrderClient";
 import Link from "next/link";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { isOfflineApproval, offlineApprovalSummary } from "@/lib/change-order-offline-approval";
 
 export default async function PortalChangeOrderPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -38,6 +40,14 @@ export default async function PortalChangeOrderPage({ params }: { params: Promis
         clientSignatureUrl: await resolveDocUrl((changeOrder as any).clientSignatureUrl),
         companySignatureUrl: await resolveDocUrl((changeOrder as any).companySignatureUrl),
     };
+    // The staff note about an offline approval is internal: it must never cross
+    // the server -> client boundary on the customer portal.
+    delete (initialData as { approvalNote?: unknown }).approvalNote;
 
-    return <PortalChangeOrderClient initialData={initialData} companySettings={settings} />;
+    // Formatted on the server in the company time zone (no browser zone drift).
+    const offlineApprovalLabel = isOfflineApproval(changeOrder as any)
+        ? offlineApprovalSummary(changeOrder as any, await resolveCompanyTimeZone())
+        : null;
+
+    return <PortalChangeOrderClient initialData={initialData} companySettings={settings} offlineApprovalLabel={offlineApprovalLabel} />;
 }

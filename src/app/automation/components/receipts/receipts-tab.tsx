@@ -4,14 +4,16 @@ import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 import { signReceiptDownloadUrls } from "@/lib/receipt-intake/bucket";
 import { RECEIPT_URL_TTL_SECONDS } from "@/lib/receipt-intake/receipt-url";
 import { retryTargetFor } from "@/lib/receipt-intake/route-state";
-import { describeStateReason } from "@/lib/receipt-intake/reason-text";
+import { describeStateReason, AMOUNT_NOT_READ_TEXT } from "@/lib/receipt-intake/reason-text";
 import { isPossibleOrphanReason } from "@/lib/receipt-intake/park";
+import { suggestJobsForFolder, folderFact, type FolderSuggestions } from "@/lib/receipt-intake/folder";
 import { StatCard } from "../shared/stat-card";
 import MarkReviewedButton from "../register/mark-reviewed-button";
 import {
     RECEIPT_GROUPS,
     RECEIPT_GROUP_LABELS,
     OWNER_ORDER,
+    JOB_OPTIONS_TAKE,
     groupIsVisible,
     showsTodoView,
     type ReceiptFilters,
@@ -100,14 +102,28 @@ function RowFacts({ row }: { row: IntakeRow }) {
         <div className="min-w-[16rem]">
             <p className="text-sm text-hui-textMain font-medium">
                 {row.vendor ?? row.fileName ?? "Unread receipt"}
-                <span className="ml-2 font-normal tabular-nums">{amountLabel(row.totalCents)}</span>
+                <span className="ml-2 font-normal tabular-nums">{row.amountUnread ? AMOUNT_NOT_READ_TEXT : amountLabel(row.totalCents)}</span>
             </p>
             <p className="text-xs text-hui-textMuted">
                 {row.txnDate ?? pacificDay(row.createdAt)} · {row.source}
                 {row.projectName ? ` · ${row.projectName}` : ""}
+                {row.sourceFolder ? ` · ${folderFact(row.sourceFolder)}` : null}
             </p>
         </div>
     );
+}
+
+/**
+ * Suggestions for THIS row's Set job control, or undefined for no buttons.
+ *
+ * Only where picking a job is what finishes the row: NEEDS_JOB, no job yet,
+ * and a folder to suggest from. A `no-estimate` row already has a job, so it
+ * is excluded by `projectId !== null` even where it is drawn in Pick the job.
+ */
+function folderSuggestionsFor(row: IntakeRow, jobs: Array<{ id: string; name: string }>): FolderSuggestions | undefined {
+    if (row.state !== "NEEDS_JOB" || row.projectId !== null || !row.sourceFolder) return undefined;
+    const s = suggestJobsForFolder(row.sourceFolder, jobs, JOB_OPTIONS_TAKE);
+    return s.kind === "none" ? undefined : s;
 }
 
 /**
@@ -493,7 +509,7 @@ export async function ReceiptsTab({
                             <RowShell key={row.id}>
                                 <RowFacts row={row} />
                                 <div className="flex items-center gap-3 flex-wrap">
-                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
+                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} suggestions={folderSuggestionsFor(row, jobs)} />
                                     <ReceiptLink href={links.get(row.storagePath)} />
                                     <VoidButton intakeId={row.id} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                 </div>
@@ -770,7 +786,7 @@ function TodoIntakeRowView({ row, pile, jobs, links }: {
                     and a row parked for a reason nobody has words for needs the
                     code passed on, not a guess acted on. */}
                 {pile === "pick-the-job" && (
-                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
+                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} suggestions={folderSuggestionsFor(row, jobs)} />
                 )}
                 <ReceiptLink href={links.get(row.storagePath)} />
             </div>

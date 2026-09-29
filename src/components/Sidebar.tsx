@@ -18,7 +18,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
         // Desktop / iPad-landscape icon rail. Hidden below lg — the mobile drawer
         // (MobileNavDrawer) takes over there. Keeping this rail untouched at >= lg
         // preserves the existing desktop layout pixel-for-pixel.
-        <aside className="hidden lg:flex w-20 bg-hui-sidebar text-white flex-col min-h-screen items-center py-4 relative z-50">
+        <aside className="hidden lg:flex w-20 bg-hui-sidebar text-white flex-col h-full items-center py-4 relative z-50">
             {/* Search Flyout */}
             {isSearchOpen && (
                 <div className="absolute left-20 top-0 w-64 bg-slate-50 min-h-screen shadow-xl border-r border-slate-200 text-slate-800 flex flex-col z-40">
@@ -41,7 +41,7 @@ export default function Sidebar({ logoUrl }: { logoUrl?: string }) {
                 </Link>
             </div>
 
-            <nav className="flex-1 w-full space-y-2 flex flex-col items-center">
+            <nav className="flex-1 w-full min-h-0 overflow-y-auto space-y-2 flex flex-col items-center">
                 <button
                     onClick={() => setIsSearchOpen(!isSearchOpen)}
                     className={`flex flex-col items-center justify-center w-full py-3 hover:bg-[#2a2a2a] transition ${isSearchOpen ? 'text-white bg-[#2a2a2a]' : 'text-slate-400'}`}

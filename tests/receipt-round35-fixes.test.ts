@@ -583,9 +583,10 @@ test("a scan that runs off the end WRAPS, and only a complete pass claims an exa
 // ── 3. The deadline bounds the SEND, not just the revalidation ──────────────
 
 /**
- * Drive the real cron. `?retry=1` with a completed matching-policy cycle means nothing scans:
- * the run's only job is the claimed row already on
- * the books, which is exactly the send phase under test.
+ * Drive the real cron. `?retry=1` with a completed matching-policy cycle still
+ * scans (selection is allowed), but the queue is one row, so the read is
+ * complete unless a test stops the clock before the first page. The run's real
+ * job is the claimed row already on the books: the send phase under test.
  */
 async function runCards(): Promise<Record<string, unknown>> {
     const res = await cardsGET(new Request("https://probuild.test/api/cron/receipt-request-cards?retry=1"));
@@ -662,7 +663,15 @@ test("with less than the send headroom left, no row is flipped to POSTING and Ch
     assert.equal(row.postedAt, null);
     assert.equal(row.claimedAt, null, "the claim is RELEASED, so the next invocation may take it");
     assert.equal(row.claimToken, null);
-    assert.equal(summary.ok, true, "deferring is not a failure — nothing went wrong, there was simply no time");
+    // The scan shares this clock and stopped before its first page, so this
+    // run selects nothing new (cards-complete-scan-spec.md) and reports
+    // ok:false for THAT. A deferral on its own is still not a failure: see
+    // "a complete read whose send is deferred for time is still ok" in
+    // tests/receipt-cards-complete-scan.test.ts.
+    assert.equal(summary.scanDeadlineHit, true);
+    assert.equal(summary.scanPages, 0);
+    assert.equal(summary.scanIncomplete, true);
+    assert.equal(summary.ok, false);
     assert.deepEqual(summary.uncertainTransitions, []);
 });
 

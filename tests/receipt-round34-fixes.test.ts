@@ -416,7 +416,7 @@ test("the candidate scan stops on the clock, and says the count is not a total",
     assert.equal(scan.deadlineHit, true);
     assert.equal(
         scan.exhausted, false,
-        "so `overflowExact` is false and the card prints no 'and N more' it cannot stand behind",
+        "so GET selects nothing from this pass (cards-complete-scan-spec.md)",
     );
 
     // The control: with budget, the SAME scan runs to the page cap rather than

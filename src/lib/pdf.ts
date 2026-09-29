@@ -1445,9 +1445,19 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         checkNewPage(100);
         page.drawText('Client Approval', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
         y -= 20;
-        page.drawText(`Approved By: ${co.approvedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
-        y -= 15;
-        page.drawText(`Date: ${co.approvedAt ? new Date(co.approvedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
+        if (co.approvalSource === 'OFFLINE') {
+            // Office-recorded approval: no signature exists, so say so. The staff-only
+            // approvalNote is deliberately never printed (this PDF is served to the customer).
+            const { offlineApprovalSummary } = await import('./change-order-offline-approval');
+            const { resolveCompanyTimeZone } = await import('./company-timezone');
+            page.drawText(offlineApprovalSummary(co, await resolveCompanyTimeZone()), { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+            y -= 15;
+            page.drawText('Recorded by the office. Not signed electronically.', { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
+        } else {
+            page.drawText(`Approved By: ${co.approvedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+            y -= 15;
+            page.drawText(`Date: ${co.approvedAt ? new Date(co.approvedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
+        }
     }
 
     if (co.companySignedBy) {

@@ -272,7 +272,10 @@ test("a checkpoint failure propagates even if it resembles budget deferral", asy
 test("production wiring keeps one entry clock, full closure, and bounded orphan attempts", async () => {
   const { readFileSync } = await import("node:fs");
   const source = readFileSync("src/app/api/cron/receipt-requests/route.ts", "utf8");
-  const get = source.slice(source.indexOf("export async function GET"));
+  // Exported via withCronHeartbeat's wrapper rather than a bare
+  // `export async function GET` (see src/lib/cron-heartbeat.ts); the
+  // handler itself is still named and still defined here.
+  const get = source.slice(source.indexOf("async function handleGET"));
   assert.ok(get.indexOf("createSweepBudget(Date.now(), Date.now, RUN_BUDGET_MS)") < get.indexOf("isCronAuthorized(request)"));
   assert.equal(source.split("runCheckpointedUnits([page], budget").length - 1, 2);
   assert.ok(source.includes("loadCompetingComponent(row, budget.expired)"));
