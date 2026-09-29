@@ -2846,7 +2846,7 @@ export async function deleteInvoice(invoiceId: string) {
         revalidatePath("/invoices");
         return { success: true as const, projectId };
     } catch (e: any) {
-        return { success: false as const, error: e?.message || "Cannot delete this invoice" };
+        return { success: false as const, error: (await import("./billing-core")).deleteInvoiceFailureMessage(e) };
     }
 }
 export async function updateInvoiceNotes(invoiceId: string, notes: string) {

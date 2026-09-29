@@ -265,3 +265,55 @@ test("retainerDeleteClause", async () => {
     assert.equal(r({ status: "Draft", amountPaid: 0 }), null);
     assert.equal(r({ status: "Sent", amountPaid: null }), null);
 });
+
+test("refusals are typed DeleteBlockedError with status and code", async () => {
+    const { isDeleteBlockedError } = await import("../src/lib/billing-core");
+    const { error } = await runDelete(baseInvoice({ payments: [milestone("Deposit", { stripeSessionId: "cs_test_1" })] }));
+    assert.equal(isDeleteBlockedError(error), true);
+    assert.equal(error.code, "INVOICE_DELETE_BLOCKED");
+    assert.equal(error.status, 409);
+    assert.equal(error.message, OPEN_ONE);
+});
+
+test("a missing invoice is a typed 404", async () => {
+    const { isDeleteBlockedError } = await import("../src/lib/billing-core");
+    const { deleteInvoiceCore } = await import("../src/lib/billing-core");
+    const tx = {
+        $queryRaw: async () => [],
+        invoice: { findUnique: async () => null, delete: async () => null },
+        paymentSchedule: { findFirst: async () => null },
+    };
+    let err: any;
+    await withFakePrisma({ $transaction: async (fn: any) => fn(tx) }, async () => {
+        try { await deleteInvoiceCore("nope"); } catch (e) { err = e; }
+    });
+    assert.equal(isDeleteBlockedError(err), true);
+    assert.equal(err.status, 404);
+    assert.equal(err.code, "INVOICE_NOT_FOUND");
+    assert.equal(err.message, "Invoice not found");
+});
+
+test("deleteInvoiceFailureMessage", async () => {
+    const { deleteInvoiceFailureMessage: f, DeleteBlockedError } = await import("../src/lib/billing-core");
+    const generic = "Could not delete this invoice. Nothing was deleted. Try again, and tell support if it keeps failing.";
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+        const out = f(new Error("Invalid `tx.invoice.delete()` invocation: Transaction already closed"));
+        assert.equal(out, generic);
+        assert.ok(!out.includes("Invalid `"));
+    } finally {
+        console.error = originalError;
+    }
+    assert.equal(f(new DeleteBlockedError(409, "X", "msg")), "msg");
+});
+
+test("source pins: deleteInvoice action", async () => {
+    const fs = await import("node:fs");
+    const src = fs.readFileSync("src/lib/actions.ts", "utf8");
+    const start = src.indexOf("export async function deleteInvoice(");
+    const body = src.slice(start, src.indexOf("export async function", start + 10));
+    assert.ok(body.includes("deleteInvoiceFailureMessage(e)"));
+    assert.ok(!body.includes("e?.message ||"));
+    assert.ok(body.indexOf("deleteInvoiceCore(") > body.indexOf("assertInvoicePermission()"));
+});

@@ -3413,10 +3413,10 @@ export async function deleteInvoiceCore(invoiceId: string): Promise<string> {
             where: { id: invoiceId },
             include: { payments: true, progressBillings: true },
         });
-        if (!invoice) throw new Error("Invoice not found");
+        if (!invoice) throw new DeleteBlockedError(404, "INVOICE_NOT_FOUND", "Invoice not found");
 
         const blocker = await findInvoiceDeleteBlocker(invoice, () => invoiceHasChangeOrderBilling(tx, invoiceId));
-        if (blocker) throw new Error(invoiceDeleteBlockMessage(blocker));
+        if (blocker) throw new DeleteBlockedError(409, "INVOICE_DELETE_BLOCKED", invoiceDeleteBlockMessage(blocker));
 
         await tx.invoice.delete({ where: { id: invoiceId } });
         return invoice.projectId;
@@ -3541,6 +3541,13 @@ export function deleteProjectsFailureMessage(error: unknown, projectCount: numbe
     }
     console.error("deleteProjects failed:", error);
     return "Could not delete the selected projects. Nothing was deleted. Try again, and tell support if it keeps failing.";
+}
+
+/** The single-invoice counterpart: typed refusals pass through, anything else is logged and replaced. */
+export function deleteInvoiceFailureMessage(error: unknown): string {
+    if (isDeleteBlockedError(error)) return error.message;
+    console.error("deleteInvoice failed:", error);
+    return "Could not delete this invoice. Nothing was deleted. Try again, and tell support if it keeps failing.";
 }
 
 /**
