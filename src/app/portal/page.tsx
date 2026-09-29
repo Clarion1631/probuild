@@ -3,6 +3,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { resolveSessionClientId } from "@/lib/portal-auth";
+import { billedMilestoneIds, PROGRESS_BILLING_EVIDENCE_SELECT } from "@/lib/receivables";
 import Link from 'next/link';
 import Avatar from "@/components/Avatar";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
@@ -23,7 +24,11 @@ export default async function PortalDashboard() {
                 client: { select: { name: true } },
                 invoices: {
                     where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
-                    select: { id: true, payments: { select: { amount: true, status: true, qbInvoiceSentAt: true } } }
+                    select: {
+                        id: true,
+                        payments: { select: { id: true, amount: true, status: true, qbInvoiceSentAt: true, qbInvoiceId: true, qbSyncError: true } },
+                        progressBillings: { where: { status: { in: ['Staged', 'Sent'] } }, select: PROGRESS_BILLING_EVIDENCE_SELECT },
+                    }
                 }
             }
         });
@@ -69,7 +74,11 @@ export default async function PortalDashboard() {
                     include: {
                         invoices: {
                             where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
-                            select: { id: true, payments: { select: { amount: true, status: true, qbInvoiceSentAt: true } } }
+                            select: {
+                        id: true,
+                        payments: { select: { id: true, amount: true, status: true, qbInvoiceSentAt: true, qbInvoiceId: true, qbSyncError: true } },
+                        progressBillings: { where: { status: { in: ['Staged', 'Sent'] } }, select: PROGRESS_BILLING_EVIDENCE_SELECT },
+                    }
                         }
                     }
                 }
@@ -136,12 +145,14 @@ export default async function PortalDashboard() {
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                     {projects.map(p => {
                         // "Payment Due" badge only when a REQUESTED milestone is outstanding
-                        // (qbInvoiceSentAt stamps the payment-request email) — never for the
+                        // (requested, or its own live QuickBooks bill; see billedMilestoneIds) — never for the
                         // remaining contract balance.
-                        const activeInvoices = (p.invoices || []).reduce((sum: number, inv: any) =>
-                            sum + (inv.payments || [])
-                                .filter((pm: any) => pm.status === 'Pending' && pm.qbInvoiceSentAt)
-                                .reduce((s: number, pm: any) => s + Number(pm.amount), 0), 0);
+                        const activeInvoices = (p.invoices || []).reduce((sum: number, inv: any) => {
+                            const billed = new Set(billedMilestoneIds(inv.payments || [], inv.progressBillings || []));
+                            return sum + (inv.payments || [])
+                                .filter((pm: any) => billed.has(pm.id))
+                                .reduce((s: number, pm: any) => s + Number(pm.amount), 0);
+                        }, 0);
 
                         return (
                             <Link href={`/portal/projects/${p.id}`} key={p.id} className="hui-card group overflow-hidden hover:shadow-md transition flex flex-col">

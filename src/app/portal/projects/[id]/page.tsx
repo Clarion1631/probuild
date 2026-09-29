@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { billedMilestoneIds, milestonePayLink, PROGRESS_BILLING_EVIDENCE_SELECT } from "@/lib/receivables";
 import Link from 'next/link';
 import { notFound } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
@@ -103,7 +104,8 @@ export default async function PortalProjectDetail(props: {
                 where: { status: { not: 'Draft' } },
                 orderBy: { issueDate: 'desc' },
                 include: {
-                    payments: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] }
+                    payments: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] },
+                    progressBillings: { where: { status: { in: ['Staged', 'Sent'] } }, select: PROGRESS_BILLING_EVIDENCE_SELECT },
                 }
             },
             changeOrders: {
@@ -185,7 +187,11 @@ export default async function PortalProjectDetail(props: {
     // "Due" in the portal means REQUESTED and unpaid — qbInvoiceSentAt is stamped
     // when a milestone payment request is emailed. Unrequested milestones are part
     // of the schedule, not an ask; they must never roll up into a due amount.
-    const isRequested = (p: any) => p.status === 'Pending' && p.qbInvoiceSentAt;
+    const billedIds = new Set<string>();
+    for (const inv of project.invoices) {
+        for (const id of billedMilestoneIds(inv.payments || [], (inv as any).progressBillings || [])) billedIds.add(id);
+    }
+    const isRequested = (p: any) => billedIds.has(p.id);
     const pendingPayments: { invoiceId: string; payment: any }[] = [];
     if (visibility.showInvoices) {
         for (const inv of project.invoices) {
@@ -351,7 +357,7 @@ export default async function PortalProjectDetail(props: {
                                                 amount={Number(pendingPayments[0].payment.amount)}
                                                 label="Pay Now"
                                                 settings={settings}
-                                                qbPayLink={pendingPayments[0].payment.qbInvoiceLink || null}
+                                                qbPayLink={milestonePayLink(pendingPayments[0].payment, isRequested(pendingPayments[0].payment))}
                                             />
                                         ) : (
                                             <Link
@@ -528,7 +534,7 @@ export default async function PortalProjectDetail(props: {
                                                             amount={Number(payment.amount)}
                                                             label="Pay Now"
                                                             settings={settings}
-                                                            qbPayLink={payment.qbInvoiceLink || null}
+                                                            qbPayLink={milestonePayLink(payment, isRequested(payment))}
                                                         />
                                                     ) : (
                                                         <div className="flex flex-col sm:items-end">

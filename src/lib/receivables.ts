@@ -152,6 +152,104 @@ export function isLiveQboLink(qbInvoiceId: string | null, qbSyncError: string | 
     return !!qbInvoiceId && qbSyncError !== "voided" && qbSyncError !== "notFound" && !isPendingDeletion(qbSyncError);
 }
 
+/** Prisma `select` for the progress billings computeInvoiceReceivable needs
+ *  (plain object so client-safe code can share it with server pages). */
+export const PROGRESS_BILLING_EVIDENCE_SELECT = {
+    id: true, code: true, status: true,
+    qbInvoiceId: true, qbSyncError: true, qbSyncedAt: true, qbInvoiceSentAt: true, sentAt: true, createdAt: true,
+    lines: { select: { scheduleId: true } },
+} as const;
+
+type PbEvidence = { requested: boolean; billedAt: Date; codes: string[] };
+
+/** Merged progress-billing evidence per covered milestone id: live (Staged/
+ *  Sent, live QuickBooks link) billings only. If a milestone is covered by
+ *  more than one live billing this still produces ONE entry for it: OR the
+ *  requested flags, take the earliest billedAt, join the codes. */
+export function buildProgressBillingEvidence(progressBillings: ReceivableProgressBilling[]): Map<string, PbEvidence> {
+    const livePBs = progressBillings.filter(
+        pb => (pb.status === "Staged" || pb.status === "Sent") && isLiveQboLink(pb.qbInvoiceId, pb.qbSyncError),
+    );
+    const pbEvidence = new Map<string, PbEvidence>();
+    for (const pb of livePBs) {
+        const requested = !!(pb.qbInvoiceSentAt || pb.sentAt);
+        const billedAt = earliest(pb.qbSyncedAt, pb.qbInvoiceSentAt, pb.sentAt) ?? pb.createdAt;
+        for (const line of pb.lines) {
+            // A Staged/Sent billing's lines always carry a real scheduleId
+            // (createProgressBillingCore materializes every custom line into
+            // a Pending PaymentSchedule before the billing row is persisted),
+            // so this check is just defensive.
+            if (!line.scheduleId) continue;
+            const existing = pbEvidence.get(line.scheduleId);
+            if (!existing) {
+                pbEvidence.set(line.scheduleId, { requested, billedAt, codes: [pb.code] });
+            } else {
+                existing.requested = existing.requested || requested;
+                if (billedAt.getTime() < existing.billedAt.getTime()) existing.billedAt = billedAt;
+                existing.codes.push(pb.code);
+            }
+        }
+    }
+    return pbEvidence;
+}
+
+export interface MilestoneClassification {
+    cents: number;
+    /** billed and unpaid: counted as owed (AR digest, invoice email, portal). */
+    billed: boolean;
+    requested: boolean;
+    inQuickBooks: boolean;
+    ownInQbo: boolean;
+    pbEv: PbEvidence | undefined;
+}
+
+/** THE per-milestone "is it billed" decision. computeInvoiceReceivable (AR
+ *  digest, invoice email) and the client portal both call this, so they agree
+ *  by construction. Returns null for a milestone that never counts at all
+ *  (not Pending, or a zero/negative/rounds-to-zero amount). A billed
+ *  milestone was either requested (its own `qbInvoiceSentAt`, or a live
+ *  progress billing that was sent) or is in QuickBooks (its own live invoice
+ *  or a live progress billing line). Anything else is scheduled backlog. */
+export function classifyMilestone(
+    m: { amount: Money; status: string; qbInvoiceId?: string | null; qbInvoiceSentAt?: Date | string | null; qbSyncError?: string | null },
+    pbEvidence: Map<string, PbEvidence>,
+    id: string,
+): MilestoneClassification | null {
+    if (m.status !== "Pending") return null; // Paid/Canceled/Processing never count
+    const cents = toCents(m.amount);
+    if (cents <= 0) return null; // legacy $0 placeholder rows
+    const pbEv = pbEvidence.get(id);
+    // Being on a LIVE billing's line means a real, live QuickBooks document
+    // already represents this milestone's money, regardless of its own
+    // qbInvoiceId (staging never writes one onto the milestone itself).
+    const ownInQbo = isLiveQboLink(m.qbInvoiceId ?? null, m.qbSyncError ?? null);
+    const inQuickBooks = ownInQbo || !!pbEv;
+    const requested = m.qbInvoiceSentAt != null || !!pbEv?.requested;
+    return { cents, billed: requested || inQuickBooks, requested, inQuickBooks, ownInQbo, pbEv };
+}
+
+/** Ids of the milestones the client portal treats as billed and unpaid (due
+ *  now, Pay button offered): exactly the ones computeInvoiceReceivable counts. */
+export function billedMilestoneIds(
+    payments: Array<{ id: string; amount: Money; status: string; qbInvoiceId?: string | null; qbInvoiceSentAt?: Date | string | null; qbSyncError?: string | null }>,
+    progressBillings: ReceivableProgressBilling[],
+): string[] {
+    const ev = buildProgressBillingEvidence(progressBillings);
+    return payments.filter(p => classifyMilestone(p, ev, p.id)?.billed).map(p => p.id);
+}
+
+/** The QuickBooks-hosted pay page for a milestone, or null (the Pay button
+ *  then falls back to its other methods). Offered only for a billed milestone
+ *  (see billedMilestoneIds), never one that is not Pending, and never one whose
+ *  QuickBooks invoice carries a sync-error marker. */
+export function milestonePayLink(
+    m: { status: string; qbInvoiceLink?: string | null; qbSyncError?: string | null },
+    billed: boolean,
+): string | null {
+    if (!billed || m.status !== "Pending" || m.qbSyncError) return null;
+    return m.qbInvoiceLink || null;
+}
+
 /**
  * The earliest RETAINED billing evidence among the given dates — not
  * necessarily the true earliest event, only the earliest the row still
@@ -203,43 +301,7 @@ export function computeInvoiceReceivable(inv: ReceivableInvoiceInput, now: numbe
     // this module implements: QBO invoices run ~0.1% over their ProBuild
     // milestone on a tax-rate mismatch) — so this and QuickBooks's own total
     // are expected to disagree by exactly that, not a bug to chase here.
-    const livePBs = inv.progressBillings.filter(
-        pb => (pb.status === "Staged" || pb.status === "Sent") && isLiveQboLink(pb.qbInvoiceId, pb.qbSyncError),
-    );
-    // Merged evidence per covered milestone id. If a milestone is somehow
-    // covered by more than one live billing (single ownership failing
-    // elsewhere), this still only ever produces ONE item for it below: OR
-    // the requested/inQuickBooks flags together, take the earliest billedAt,
-    // and join the codes for display.
-    const pbEvidence = new Map<string, { requested: boolean; billedAt: Date; codes: string[] }>();
-    for (const pb of livePBs) {
-        const requested = !!(pb.qbInvoiceSentAt || pb.sentAt);
-        const billedAt = earliest(pb.qbSyncedAt, pb.qbInvoiceSentAt, pb.sentAt) ?? pb.createdAt;
-        for (const line of pb.lines) {
-            // A Staged/Sent billing's lines always carry a real scheduleId.
-            // createProgressBillingCore materializes every custom (no
-            // scheduleId) line into its own brand-new Pending PaymentSchedule
-            // BEFORE the billing or any ProgressBillingLine row is ever
-            // persisted (progress-billing.ts, "Materialize custom lines as
-            // milestones": every line index not already resolved to a
-            // milestone gets `tx.paymentSchedule.create` and
-            // `resolvedScheduleIds.set(i, newSchedule.id)`, and only THEN
-            // does `progressBillingLine.createMany` run, reading
-            // `resolvedScheduleIds.get(i) ?? null` for every line). So the
-            // `?? null` there is unreachable by the time a billing can be
-            // staged, and `line.scheduleId` below is never actually null —
-            // the check is just defensive.
-            if (!line.scheduleId) continue;
-            const existing = pbEvidence.get(line.scheduleId);
-            if (!existing) {
-                pbEvidence.set(line.scheduleId, { requested, billedAt, codes: [pb.code] });
-            } else {
-                existing.requested = existing.requested || requested;
-                if (billedAt.getTime() < existing.billedAt.getTime()) existing.billedAt = billedAt;
-                existing.codes.push(pb.code);
-            }
-        }
-    }
+    const pbEvidence = buildProgressBillingEvidence(inv.progressBillings);
 
     // Backlog: summed directly from Pending-but-unbilled milestones below,
     // not from balanceDue minus receivable. A residual subtraction would
@@ -251,19 +313,10 @@ export function computeInvoiceReceivable(inv: ReceivableInvoiceInput, now: numbe
     let unbilledCents = 0;
 
     for (const m of inv.payments) {
-        if (m.status !== "Pending") continue; // Paid/Canceled never count
-        const cents = toCents(m.amount);
-        if (cents <= 0) continue; // legacy $0 placeholder rows
-        const pbEv = pbEvidence.get(m.id);
-        // Being on a LIVE billing's line means a real, live QuickBooks
-        // document already represents this milestone's money — that is what
-        // "live" means for the billing, so a covered milestone is always
-        // inQuickBooks, regardless of its own qbInvoiceId (staging never
-        // writes one onto the milestone itself).
-        const ownInQbo = isLiveQboLink(m.qbInvoiceId, m.qbSyncError);
-        const inQbo = ownInQbo || !!pbEv;
-        const requested = m.qbInvoiceSentAt != null || !!pbEv?.requested;
-        if (!requested && !inQbo) {
+        const c = classifyMilestone(m, pbEvidence, m.id);
+        if (!c) continue; // not Pending, or a $0 placeholder row
+        const { cents, requested, ownInQbo, pbEv } = c;
+        if (!c.billed) {
             // Scheduled, not billed: backlog. A Draft invoice isn't final,
             // so it contributes no backlog (matches the legacy branch below).
             if (inv.status !== "Draft") unbilledCents += cents;
@@ -277,7 +330,7 @@ export function computeInvoiceReceivable(inv: ReceivableInvoiceInput, now: numbe
             dueDate: m.dueDate,
             billedAt: earliest(ownInQbo ? m.qbSyncedAt : null, m.qbInvoiceSentAt, pbEv?.billedAt) ?? inv.issueDate ?? inv.sentAt ?? m.createdAt,
             requested,
-            inQuickBooks: inQbo,
+            inQuickBooks: c.inQuickBooks,
             progressBillingCode: pbEv ? pbEv.codes.join(", ") : null,
         });
     }
