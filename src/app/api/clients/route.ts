@@ -49,7 +49,7 @@ export async function POST(req: Request) {
                 companyName: data.companyName,
                 primaryPhone: data.primaryPhone,
                 primaryPhoneE164: normalizeE164(data.primaryPhone),
-                additionalEmail: data.additionalEmail,
+                additionalEmail: data.additionalEmail?.trim() || null,
                 additionalPhone: data.additionalPhone,
                 additionalPhoneE164: normalizeE164(data.additionalPhone),
                 addressLine1: data.addressLine1,

@@ -131,7 +131,7 @@ export default function LeadDetailsSidebar({
             await updateClient(clientId, {
                 name: cName,
                 email: cEmail || undefined,
-                additionalEmail: cAdditionalEmail || undefined,
+                additionalEmail: cAdditionalEmail.trim(),
                 primaryPhone: cPhone || undefined,
                 addressLine1: cAddr || undefined,
                 city: cCity || undefined,
