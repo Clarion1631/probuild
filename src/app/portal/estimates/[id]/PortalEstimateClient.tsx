@@ -508,7 +508,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                                 <div data-pdf-row="true" key={sub.id} className="flex flex-wrap justify-end gap-y-1 sm:flex-nowrap items-start bg-white px-5 sm:px-10 py-3">
                                                     <div className="w-full pl-3 sm:w-auto sm:flex-1 sm:pl-6">
                                                         <div className="text-sm font-medium text-slate-700">{sub.name}</div>
-                                                        {sub.description && <div className="text-xs text-slate-400 mt-1 leading-relaxed max-w-[85%]">{sub.description}</div>}
+                                                        {sub.description && <div className="text-xs text-slate-600 mt-1 leading-relaxed max-w-[85%]">{sub.description}</div>}
                                                     </div>
                                                     <div className="w-12 sm:w-20 text-right text-sm text-slate-500">{sub.quantity}</div>
                                                     <div className="w-20 sm:w-32 text-right text-sm text-slate-500">{formatCurrency(sub.unitCost)}</div>
@@ -524,7 +524,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                     <div data-pdf-row="true" key={item.id} className="flex flex-wrap justify-end gap-y-1 sm:flex-nowrap items-start px-5 sm:px-10 py-3 bg-white">
                                         <div className="w-full sm:w-auto sm:flex-1">
                                             <div className="text-sm font-medium text-slate-800">{item.name}</div>
-                                            {item.description && <div className="text-xs text-slate-400 mt-1 leading-relaxed max-w-[85%]">{item.description}</div>}
+                                            {item.description && <div className="text-xs text-slate-600 mt-1 leading-relaxed max-w-[85%]">{item.description}</div>}
                                         </div>
                                         <div className="w-12 sm:w-20 text-right text-sm text-slate-500">{item.quantity}</div>
                                         <div className="w-20 sm:w-32 text-right text-sm text-slate-500">{formatCurrency(item.unitCost)}</div>
