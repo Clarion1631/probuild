@@ -777,7 +777,7 @@ export async function createClient(data: { name: string; email?: string; company
     return client;
 }
 
-export async function updateClient(clientId: string, data: { name?: string; email?: string; additionalEmail?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string }) {
+export async function updateClient(clientId: string, data: { name?: string; email?: string; additionalEmail?: string | null; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string }) {
     "use server";
     await assertActiveStaff();
     const name = data.name?.trim();
@@ -787,7 +787,7 @@ export async function updateClient(clientId: string, data: { name?: string; emai
         data: {
             name,
             email: data.email,
-            additionalEmail: data.additionalEmail || undefined,
+            additionalEmail: data.additionalEmail === undefined ? undefined : (data.additionalEmail?.trim() || null),
             primaryPhone: data.primaryPhone,
             // Keep E164 in sync with the raw value when caller updates the phone.
             ...(data.primaryPhone !== undefined ? { primaryPhoneE164: normalizeE164(data.primaryPhone) } : {}),

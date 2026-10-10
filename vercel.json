@@ -29,10 +29,6 @@
       "schedule": "0 15 * * 1"
     },
     {
-      "path": "/api/cron/payment-reminders",
-      "schedule": "0 16 * * *"
-    },
-    {
       "path": "/api/cron/review-alerts-backstop",
       "schedule": "15 */1 * * *"
     },

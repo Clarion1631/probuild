@@ -43,6 +43,10 @@ export async function PUT(
         if (initials) {
             updateData.initials = initials;
         }
+        // An empty Email 2 must clear the column, not store "" or be skipped.
+        if ("additionalEmail" in data) {
+            updateData.additionalEmail = typeof data.additionalEmail === "string" ? data.additionalEmail.trim() || null : null;
+        }
         // Keep E.164 columns in sync when caller updates raw phone fields.
         if ("primaryPhone" in data) {
             updateData.primaryPhoneE164 = normalizeE164(data.primaryPhone);
