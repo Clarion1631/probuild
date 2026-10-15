@@ -3,10 +3,22 @@ import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { formatCurrency } from "@/lib/utils";
+import { currentStaffUserOrNull } from "@/lib/permissions";
+import { hasPermission } from "@/lib/access-rules";
+import { buildChangeOrderEstimateOptions } from "@/lib/change-order-estimate-options";
+import NewChangeOrderButton from "./NewChangeOrderButton";
 
-export default async function ChangeOrdersPage({ params }: { params: Promise<{ id: string }> }) {
+export default async function ChangeOrdersPage({
+    params,
+    searchParams,
+}: {
+    params: Promise<{ id: string }>;
+    searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+}) {
     const resolvedParams = await params;
-    
+    const sp = await searchParams;
+    const defaultOpen = sp.new === "1";
+
     const [project, changeOrders, invoices] = await Promise.all([
         getProject(resolvedParams.id),
         prisma.changeOrder.findMany({
@@ -21,6 +33,44 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
 
     if (!project) notFound();
 
+    // Picker data. The invoices query above drops Drafts, so it is not reused here.
+    // project.estimates is already access-scoped by getProject; intersecting keeps the picker scoped.
+    const [pickerEstimates, projectNewestInvoice, staff] = await Promise.all([
+        prisma.estimate.findMany({
+            where: {
+                projectId: project.id,
+                archivedAt: null,
+                id: { in: (project.estimates ?? []).map((e: any) => e.id) },
+            },
+            select: {
+                id: true,
+                code: true,
+                title: true,
+                status: true,
+                createdAt: true,
+                invoices: { orderBy: { createdAt: "desc" }, take: 1, select: { code: true, createdAt: true } },
+            },
+        }),
+        prisma.invoice.findFirst({
+            where: { projectId: project.id },
+            orderBy: { createdAt: "desc" },
+            select: { code: true },
+        }),
+        currentStaffUserOrNull(),
+    ]);
+    const { options, defaultEstimateId } = buildChangeOrderEstimateOptions(
+        pickerEstimates.map((e: any) => ({
+            id: e.id,
+            code: e.code,
+            title: e.title,
+            status: e.status,
+            createdAt: e.createdAt,
+            newestInvoice: e.invoices[0] ?? null,
+        })),
+        projectNewestInvoice,
+    );
+    const canCreate = !!staff && hasPermission(staff, "changeOrders");
+
     const totalInvoiced = invoices.reduce((sum: number, inv: any) => sum + Number(inv.totalAmount), 0);
     const totalCOs = changeOrders.reduce((sum: number, co: any) => sum + Number(co.totalAmount), 0);
 
@@ -32,6 +82,14 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
                     <p className="text-sm text-hui-textMuted mt-1">Manage modifications to the project scope and budget.</p>
                 </div>
                 <div className="flex items-center gap-3">
+                    {canCreate && (
+                        <NewChangeOrderButton
+                            projectId={project.id}
+                            options={options}
+                            defaultEstimateId={defaultEstimateId}
+                            defaultOpen={defaultOpen}
+                        />
+                    )}
                     <Link href={`/projects/${resolvedParams.id}`} className="hui-btn hui-btn-secondary">
                         Back to Project
                     </Link>
@@ -82,7 +140,7 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
                                 <tr>
                                     <td colSpan={6} className="px-4 py-8 text-center text-hui-textMuted">
                                         <p>No change orders found.</p>
-                                        <p className="text-xs mt-1">Go to an Estimate and select items to generate a Change Order.</p>
+                                        {canCreate && <p className="text-xs mt-1">Click New change order to start one.</p>}
                                     </td>
                                 </tr>
                             ) : (
