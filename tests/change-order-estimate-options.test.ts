@@ -24,7 +24,7 @@ function row(
 }
 
 test("empty input gives no options and a null default", () => {
-    const out = buildChangeOrderEstimateOptions([], { code: "INV-1" });
+    const out = buildChangeOrderEstimateOptions([], { code: "INV-1", estimateId: null });
     assert.deepEqual(out.options, []);
     assert.equal(out.defaultEstimateId, null);
 });
@@ -35,7 +35,7 @@ test("the estimate with its own invoice is the default even when a newer estimat
         row("newer-draft", { created: "2026-04-01T00:00:00Z" }),
         row("main", { status: "Approved", created: "2026-01-01T00:00:00Z", invoice: ["INV-1", "2026-02-01T00:00:00Z"] }),
     ];
-    const out = buildChangeOrderEstimateOptions(rows, { code: "INV-1" });
+    const out = buildChangeOrderEstimateOptions(rows, { code: "INV-1", estimateId: "main" });
     assert.equal(out.defaultEstimateId, "main");
     assert.deepEqual(out.options.map((o) => o.id), ["main", "newer-approved", "newer-draft"]);
 });
@@ -45,7 +45,7 @@ test("two invoiced estimates: the newer invoice wins", () => {
         row("a", { invoice: ["INV-1", "2026-02-01T00:00:00Z"], created: "2026-05-01T00:00:00Z" }),
         row("b", { invoice: ["INV-2", "2026-03-01T00:00:00Z"], created: "2026-01-01T00:00:00Z" }),
     ];
-    const out = buildChangeOrderEstimateOptions(rows, { code: "INV-2" });
+    const out = buildChangeOrderEstimateOptions(rows, { code: "INV-2", estimateId: "b" });
     assert.deepEqual(out.options.map((o) => o.id), ["b", "a"]);
     assert.equal(out.defaultEstimateId, "b");
 });
@@ -67,7 +67,7 @@ test("billsTo uses own invoice, else project fallback, else null", () => {
         row("own", { invoice: ["INV-7", "2026-02-01T00:00:00Z"] }),
         row("none", { created: "2026-02-01T00:00:00Z" }),
     ];
-    const withProject = buildChangeOrderEstimateOptions(rows, { code: "INV-9" });
+    const withProject = buildChangeOrderEstimateOptions(rows, { code: "INV-9", estimateId: null });
     const own = withProject.options.find((o) => o.id === "own")!;
     const none = withProject.options.find((o) => o.id === "none")!;
     assert.equal(own.invoiceCode, "INV-7");
@@ -89,4 +89,35 @@ test("ties break deterministically and the input array is not mutated", () => {
     const out = buildChangeOrderEstimateOptions(rows, null);
     assert.deepEqual(rows.map((r) => r.id), snapshot);
     assert.deepEqual(out.options.map((o) => o.id), ["a", "b"]);
+});
+
+test("newest invoice's estimate is not offered (archived): nothing is pre-selected", () => {
+    const rows = [
+        row("older-contract", { status: "Approved", invoice: ["INV-1", "2026-02-01T00:00:00Z"] }),
+        row("no-invoice", { created: "2026-03-01T00:00:00Z" }),
+    ];
+    const out = buildChangeOrderEstimateOptions(rows, { code: "INV-5", estimateId: "archived-contract" });
+    assert.equal(out.defaultEstimateId, null);
+    assert.deepEqual(out.options.map((o) => o.id), ["older-contract", "no-invoice"]);
+    const fallback = out.options.find((o) => o.id === "no-invoice")!;
+    assert.equal(fallback.billsToInvoiceCode, "INV-5");
+    assert.equal(fallback.billsToProjectFallback, true);
+});
+
+test("newest invoice has no estimate (manual invoice): default is the first sorted option", () => {
+    const rows = [
+        row("no-invoice", { status: "Approved", created: "2026-03-01T00:00:00Z" }),
+        row("contract", { invoice: ["INV-1", "2026-02-01T00:00:00Z"] }),
+    ];
+    const out = buildChangeOrderEstimateOptions(rows, { code: "INV-3", estimateId: null });
+    assert.equal(out.defaultEstimateId, "contract");
+});
+
+test("the newest invoice's estimate is the default even when invoice timestamps tie", () => {
+    const rows = [
+        row("a", { created: "2026-05-01T00:00:00Z", invoice: ["INV-1", "2026-02-01T00:00:00Z"] }),
+        row("b", { created: "2026-01-01T00:00:00Z", invoice: ["INV-2", "2026-02-01T00:00:00Z"] }),
+    ];
+    const out = buildChangeOrderEstimateOptions(rows, { code: "INV-2", estimateId: "b" });
+    assert.equal(out.defaultEstimateId, "b");
 });

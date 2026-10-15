@@ -51,7 +51,7 @@ function compareRows(a: ChangeOrderEstimateRow, b: ChangeOrderEstimateRow): numb
 
 export function buildChangeOrderEstimateOptions(
     rows: ChangeOrderEstimateRow[],
-    projectNewestInvoice: { code: string } | null,
+    projectNewestInvoice: { code: string; estimateId: string | null } | null,
 ): { options: ChangeOrderEstimateOption[]; defaultEstimateId: string | null } {
     const options = [...rows].sort(compareRows).map((row): ChangeOrderEstimateOption => {
         const invoiceCode = row.newestInvoice?.code ?? null;
@@ -66,5 +66,12 @@ export function buildChangeOrderEstimateOptions(
             billsToProjectFallback: fallbackCode !== null,
         };
     });
-    return { options, defaultEstimateId: options[0]?.id ?? null };
+    // Default to the estimate behind the project's newest invoice (the main contract).
+    // If that estimate is not offered (archived), pre-select nothing: guessing another
+    // estimate would silently change where the CO bills and which tax rate it uses.
+    const owner = projectNewestInvoice?.estimateId ?? null;
+    const defaultEstimateId = owner
+        ? (options.some((o) => o.id === owner) ? owner : null)
+        : options[0]?.id ?? null;
+    return { options, defaultEstimateId };
 }

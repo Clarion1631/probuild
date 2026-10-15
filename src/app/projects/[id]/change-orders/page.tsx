@@ -54,7 +54,7 @@ export default async function ChangeOrdersPage({
         prisma.invoice.findFirst({
             where: { projectId: project.id },
             orderBy: { createdAt: "desc" },
-            select: { code: true },
+            select: { code: true, estimateId: true },
         }),
         currentStaffUserOrNull(),
     ]);
