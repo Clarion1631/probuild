@@ -68,7 +68,7 @@ export default function IncomingPaymentsCard({ projectId, incoming }: { projectI
                         <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/estimates`); }}>New Estimate</DropdownMenuItem>
                         <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/invoices/new`); }}>New Invoice</DropdownMenuItem>
                         <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/retainers`); }}>New Retainer</DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/change-orders`); }}>New Change Order</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => { setDropdownOpen(false); router.push(`/projects/${projectId}/change-orders?new=1`); }}>New Change Order</DropdownMenuItem>
                     </DropdownMenuContent>
                 </div>
             </div>
