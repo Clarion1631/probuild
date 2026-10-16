@@ -280,7 +280,9 @@ test("a signed credit is applied to the default target, no payment email is atte
         assert.deepEqual(first, { billed: true, sent: false, issues: [] }, "no schedule-hook issue, no send issue");
         assert.equal(r2(amountOf("ms-final")), 5679.36);
         assert.equal(world.state.billings.length, 1);
-        assert.equal(world.state.billings[0].createdBy, "Customer signature");
+        // This CO was approved without the in-transaction apply (legacy row), so the
+        // automatic billing applied it: a neutral actor, not "Customer signature".
+        assert.equal(world.state.billings[0].createdBy, "Change order billing");
         assert.equal(sendReads, 0, "sendMilestoneInvoicesCore was never called");
 
         assert.equal(world.emails.length, 1);
@@ -290,6 +292,7 @@ test("a signed credit is applied to the default target, no payment email is atte
 
         const second = await billing.handleChangeOrderApproved("co-1");
         assert.deepEqual(second, { billed: true, sent: false, issues: [] });
+        assert.equal(world.emails.length, 1, "a replay of an applied credit sends no second team email");
         assert.equal(world.state.billings.length, 1);
         assert.equal(r2(amountOf("ms-final")), 5679.36, "no second reduction");
         assert.equal(sendReads, 0);
@@ -337,6 +340,19 @@ test("billing a $0 change order is still refused (no milestone, no marker)", asy
     assert.match(result.error, /has a \$0 total — nothing to bill/);
     assert.equal(world.state.milestones.length, 3);
     assert.equal(world.state.billings.length, 0);
+});
+
+test("refused: a legacy milestone on a tax-exempt invoice can't take a taxed credit (invoice tax would go negative)", async () => {
+    // The project-invoice fallback: the CO's estimate taxes at 8.8%, the invoice carries no tax.
+    Object.assign(world.state.invoices[0], { taxAmount: 0, subtotal: 29637.12 });
+    await refuses("BILLING_FAILED", /The credit's tax \(\$265\.76\) is more than the tax on invoice INV-00001 \(\$0\.00\)/);
+});
+
+test("refused: a split milestone whose pre-tax amount the credit would consume gets its own message", async () => {
+    // Cabinets: $3,020.00 pre-tax + $792.00 tax. The amount would stay positive, the pre-tax would hit $0.
+    Object.assign(world.state.milestones.find((row) => row.id === "ms-cabinets")!, { amount: 3812, pretaxAmount: 3020, taxAmount: 792 });
+    await refuses("BILLING_FAILED", /The credit would take Cabinets's pre-tax amount to \$0 or less \(\$3,020\.00 before tax against \$3,020\.00\)/,
+        { targetMilestoneId: "ms-cabinets" });
 });
 
 // ── Sweep ────────────────────────────────────────────────────────────────────
@@ -465,12 +481,59 @@ test("portal signing refuses a credit whose default target can't take it, and ap
     await assert.rejects(approveChangeOrderCore("co-1", signature), /not smaller than Final \(\$1,000\.00\)/);
     assert.equal(world.state.co.status, "Sent");
 
+    assert.equal(world.state.billings.length, 0, "the refused approval applied nothing");
+    assert.equal(amountOf("ms-final"), 1000);
+
     creditWorld({ status: "Sent" });
     const approved = await approveChangeOrderCore("co-1", signature);
     assert.equal(approved?.transitioned, true);
     assert.equal(world.state.co.status, "Approved");
-    assert.equal(world.state.billings.length, 0, "approval alone applies nothing; billing does");
-    assert.equal(amountOf("ms-final"), 8965.12);
+    // The credit is applied in the approval's own transaction, on the default target.
+    assert.equal(world.state.billings.length, 1);
+    assert.equal(world.state.billings[0].createdBy, "Customer signature");
+    assert.equal(r2(amountOf("ms-final")), 5679.36);
+    assert.equal(world.emails.length, 0, "the core itself notifies nobody");
+});
+
+test("portal signing: the apply re-decides the default under the lock, and a refusal rolls the approval back", async () => {
+    const { approveChangeOrderCore } = await import("../src/lib/change-order-core");
+    const signature = { signatureName: "Customer A", clientSignatureUrl: "https://example.test/sig.png", approvedAt: NOW };
+    creditWorld({ status: "Sent" });
+    // QuickBooks sends landed on Cabinets and Final before the signature: Deposit is now the last eligible row.
+    for (const id of ["ms-cabinets", "ms-final"]) world.state.milestones.find((row) => row.id === id)!.qbInvoiceSentAt = new Date("2026-09-20T00:00:00.000Z");
+    const approved = await approveChangeOrderCore("co-1", signature);
+    assert.equal(approved?.transitioned, true);
+    assert.equal(r2(amountOf("ms-deposit")), 7594.24);
+
+    creditWorld({ status: "Sent" });
+    for (const row of world.state.milestones) row.qbInvoiceSentAt = new Date("2026-09-20T00:00:00.000Z");
+    await assert.rejects(approveChangeOrderCore("co-1", signature), /has no unpaid milestone it can come off/);
+    assert.equal(world.state.co.status, "Sent", "the Approved write rolled back with the refused apply");
+    assert.equal(world.state.co.approvedBy, null);
+    assert.equal(world.state.co.clientSignatureUrl, null);
+    assert.equal(world.state.billings.length, 0);
+});
+
+test("after a portal-signed credit, handleChangeOrderApproved bills nothing new, sends nothing, and notifies the team exactly once", async () => {
+    const { approveChangeOrderCore } = await import("../src/lib/change-order-core");
+    creditWorld({ status: "Sent" });
+    await approveChangeOrderCore("co-1", { signatureName: "Customer A", clientSignatureUrl: "https://example.test/sig.png", approvedAt: NOW });
+    assert.equal(world.state.billings.length, 1);
+
+    // The inline after() automation passes freshlyApproved.
+    const first = await billing.handleChangeOrderApproved("co-1", { freshlyApproved: true });
+    assert.deepEqual(first, { billed: true, sent: false, issues: [] });
+    assert.equal(world.emails.length, 1);
+    assert.equal(world.emails[0].to, TEAM_EMAIL);
+    assert.equal(world.emails[0].subject, "✅ Change order credit applied — CO-00001 — Example change (-$3,285.76)");
+
+    // A replay (no freshlyApproved, credit already applied) stays quiet.
+    const replay = await billing.handleChangeOrderApproved("co-1");
+    assert.deepEqual(replay, { billed: true, sent: false, issues: [] });
+    assert.equal(world.emails.length, 1, "no second team email");
+    assert.equal(world.state.billings.length, 1);
+    assert.equal(r2(amountOf("ms-final")), 5679.36, "no second reduction");
+    assertNoCustomerContact("portal credit");
 });
 
 // ── "Edit amounts" rebalance after a credit ──────────────────────────────────
@@ -562,4 +625,66 @@ test("after a credit the per-pool check still refuses moving money from an estim
     ]), /move money between estimate-linked milestones and extra charges/);
     assert.equal(JSON.stringify(world.state.estimateSchedules), epsBefore, "nothing mirrored");
     assert.equal(r2(amountOf("ms-final")), 5679.36);
+});
+
+// ── v1 refusals: no split, no delete of a credited milestone ─────────────────
+
+test("progress billing refuses to SPLIT a milestone a credit was taken off; billing it whole passes the guard", async () => {
+    const { createProgressBillingCore } = await import("../src/lib/progress-billing");
+    withEstimateRows();
+    assert.equal((await offline()).ok, true); // credit lands on Final (estimate-linked)
+    const final = world.state.milestones.find((row) => row.id === "ms-final")!;
+    final.amount = 5679.36; // normalise the fake's float sum to the stored cents
+    const before = JSON.stringify({ milestones: world.state.milestones, eps: world.state.estimateSchedules });
+
+    await assert.rejects(
+        createProgressBillingCore("inv-1", { description: "Partial final", lines: [{ scheduleId: "ms-final", description: "Final", amount: 1000 }] }),
+        /"Final" has a change-order credit taken off it, so it can't be split\. Bill the whole milestone, or bill a different one\./,
+    );
+    assert.equal(JSON.stringify({ milestones: world.state.milestones, eps: world.state.estimateSchedules }), before, "nothing split, estimate row untouched");
+
+    // A whole-milestone bill gets past the guard and reaches the claim (stopped there by this test).
+    const originalUpdateMany = world.prisma.paymentSchedule.updateMany;
+    world.prisma.paymentSchedule.updateMany = async () => { throw new Error("reached the claim"); };
+    try {
+        await assert.rejects(
+            createProgressBillingCore("inv-1", { description: "Final", lines: [{ scheduleId: "ms-final", description: "Final", amount: 5679.36 }] }),
+            /reached the claim/,
+        );
+    } finally {
+        world.prisma.paymentSchedule.updateMany = originalUpdateMany;
+    }
+
+    // A milestone with no credit still splits past the guard (Deposit has none).
+    world.prisma.paymentSchedule.updateMany = async () => { throw new Error("reached the claim"); };
+    try {
+        await assert.rejects(
+            createProgressBillingCore("inv-1", { description: "Partial deposit", lines: [{ scheduleId: "ms-deposit", description: "Deposit", amount: 1000 }] }),
+            /reached the claim/,
+        );
+    } finally {
+        world.prisma.paymentSchedule.updateMany = originalUpdateMany;
+    }
+});
+
+test("deleting an extra-charge milestone a credit was taken off is refused; an uncredited extra still deletes", async () => {
+    world.state.milestones.push(
+        milestone("ms-extra", "Extra charge", 5000, { createdAt: "2026-10-01T00:00:00.000Z" }),
+        milestone("ms-extra-2", "Second extra", 250, { createdAt: "2026-10-02T00:00:00.000Z" }),
+    );
+    assert.equal((await offline({ targetMilestoneId: "ms-extra" })).ok, true);
+    assert.equal(r2(amountOf("ms-extra")), 1714.24);
+    const invoiceTotal = r2(world.state.invoices[0].totalAmount);
+
+    await assert.rejects(
+        billing.deleteInvoiceMilestoneCore("ms-extra"),
+        /"Extra charge" has a change-order credit taken off it, so it can't be deleted\. The credit would be left pointing at a milestone that no longer exists\./,
+    );
+    assert.ok(world.state.milestones.some((row) => row.id === "ms-extra"), "the credited row survives");
+    assert.equal(r2(world.state.invoices[0].totalAmount), invoiceTotal);
+
+    const removed = await billing.deleteInvoiceMilestoneCore("ms-extra-2");
+    assert.equal(removed.success, true);
+    assert.ok(!world.state.milestones.some((row) => row.id === "ms-extra-2"));
+    assert.equal(r2(world.state.invoices[0].totalAmount), r2(invoiceTotal - 250));
 });

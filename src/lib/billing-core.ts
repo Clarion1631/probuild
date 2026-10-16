@@ -2034,7 +2034,7 @@ export async function billChangeOrderInTx(
         // CO's invoice (idempotent on the ChangeOrderBilling marker it writes).
         const applied = await applyChangeOrderCreditInTx(tx, co.id, {
             targetMilestoneId: opts.creditTargetMilestoneId ?? null,
-            actor: opts.creditActor ?? "Customer signature",
+            actor: opts.creditActor ?? "Change order billing",
         });
         if (!applied.ok) return { ok: false as const, error: applied.error };
         return {
@@ -2264,6 +2264,7 @@ import {
 } from "./change-order-offline-approval";
 import {
     CO_CREDIT_CHANGED_ERROR,
+    coCreditedMilestoneError,
     buildCreditTargets,
     coCreditCents,
     coCreditCostPlusError,
@@ -2273,6 +2274,7 @@ import {
     type CoCreditCents,
     type CreditTargetRow,
 } from "./change-order-credit";
+import { creditCentsByMilestoneInTx } from "./change-order-credit-markers";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Credit change orders (FIXED, subtotal < 0). Approving one LOWERS one existing
@@ -2301,7 +2303,7 @@ export type ChangeOrderCreditApplied = {
 };
 
 export type ChangeOrderCreditTargets = {
-    invoice: { id: string; code: string; estimateId: string | null } | null;
+    invoice: { id: string; code: string; estimateId: string | null; subtotalCents: number; taxCents: number } | null;
     rows: CreditTargetRow[];
     defaultId: string | null;
     credit: CoCreditCents & { rate: number; taxLabel: string };
@@ -2326,34 +2328,25 @@ async function creditCentsInTx(tx: Prisma.TransactionClient, co: { estimateId: s
 }
 
 /** Every milestone on the invoice, ranked, with eligibility and fit for this credit. */
-async function creditRowsInTx(tx: Prisma.TransactionClient, invoiceId: string, credit: CoCreditCents) {
+async function creditRowsInTx(tx: Prisma.TransactionClient, invoice: { id: string; code: string }, credit: CoCreditCents) {
+    const invoiceId = invoice.id;
+    // The invoice's own subtotal and tax drop by the credit's parts too; neither may go
+    // below $0 (checked for every target, legacy and split alike).
+    const invoiceRow = await tx.invoice.findUnique({ where: { id: invoiceId }, select: { subtotal: true, taxAmount: true } });
+    const invoiceTotals = {
+        code: invoice.code,
+        subtotalCents: Math.round(Number(invoiceRow?.subtotal ?? 0) * 100),
+        taxCents: Math.round(Number(invoiceRow?.taxAmount ?? 0) * 100),
+    };
     const milestones = await tx.paymentSchedule.findMany({ where: { invoiceId }, select: CREDIT_MILESTONE_SELECT });
     const sourceIds = [...new Set(milestones.map((row) => row.sourceScheduleId).filter((id): id is string => !!id))];
     const linked = sourceIds.length > 0
         ? await tx.estimatePaymentSchedule.findMany({ where: { id: { in: sourceIds } }, select: { id: true, order: true } })
         : [];
     const scheduleOrder = new Map(linked.map((row) => [row.id, row.order]));
-    return { milestones, ...buildCreditTargets(milestones, scheduleOrder, credit) };
+    return { milestones, invoiceTotals, ...buildCreditTargets(milestones, scheduleOrder, credit, invoiceTotals) };
 }
 
-/**
- * How much credit (positive cents) credit change orders took off each milestone of this
- * invoice, keyed by milestone id, from the credit markers (snapshot.kind === "credit").
- * The estimate mirror of such a milestone is its invoice amount plus this.
- */
-async function creditCentsByMilestoneInTx(tx: Prisma.TransactionClient, invoiceId: string): Promise<Map<string, number>> {
-    const markers = await tx.changeOrderBilling.findMany({
-        where: { paymentScheduleId: null, snapshot: { path: ["invoiceId"], equals: invoiceId } },
-        select: { totalCents: true, snapshot: true },
-    });
-    const byMilestone = new Map<string, number>();
-    for (const marker of markers) {
-        const snapshot = marker.snapshot as { kind?: unknown; paymentScheduleId?: unknown } | null;
-        if (snapshot?.kind !== "credit" || typeof snapshot.paymentScheduleId !== "string") continue;
-        byMilestone.set(snapshot.paymentScheduleId, (byMilestone.get(snapshot.paymentScheduleId) ?? 0) + Math.abs(marker.totalCents));
-    }
-    return byMilestone;
-}
 
 /**
  * The credit's invoice (same pick as billing: the CO's estimate's newest invoice,
@@ -2368,8 +2361,11 @@ export async function loadChangeOrderCreditTargetsInTx(
     const found = await findChangeOrderInvoice(tx, co);
     if (!found) return { invoice: null, rows: [], defaultId: null, credit };
     const link = await tx.invoice.findUnique({ where: { id: found.id }, select: { estimateId: true } });
-    const { rows, defaultId } = await creditRowsInTx(tx, found.id, credit);
-    return { invoice: { id: found.id, code: found.code, estimateId: link?.estimateId ?? null }, rows, defaultId, credit };
+    const { rows, defaultId, invoiceTotals } = await creditRowsInTx(tx, found, credit);
+    return {
+        invoice: { id: found.id, code: found.code, estimateId: link?.estimateId ?? null, subtotalCents: invoiceTotals.subtotalCents, taxCents: invoiceTotals.taxCents },
+        rows, defaultId, credit,
+    };
 }
 
 /** Read-only credit targets for the CO editor. Null unless the CO is a FIXED credit. */
@@ -2446,16 +2442,22 @@ export async function applyChangeOrderCreditInTx(
     // own estimate can be a different (newer) one; taking both invents a second order.
     await lockMoneyParents(tx, { estimateId: link?.estimateId ?? null, invoiceId: found.id });
 
-    // Re-read every milestone under the lock; eligibility and fit are decided on this read.
-    const { milestones, rows, defaultId } = await creditRowsInTx(tx, found.id, credit);
+    // Re-read the invoice totals and every milestone under the lock; eligibility, fit, and
+    // the invoice-level floor (subtotal and tax stay >= $0) are decided on this read.
+    const { milestones, rows, defaultId } = await creditRowsInTx(tx, found, credit);
     const targetId = opts.targetMilestoneId ?? defaultId;
     const refusal = creditTargetError(co.code, { invoice: found, rows, defaultId }, targetId);
     if (refusal) return { ok: false, error: refusal };
     const target = milestones.find((row) => row.id === targetId)!;
     const plan = planCreditReduction(target, credit);
 
-    // CAS on the amount just read and on every eligibility field, so a send, sync,
+    // CAS on the amount just read and on every eligibility column, so a send, sync,
     // payment or reminder that lands without the invoice lock can't be overwritten.
+    // The one eligibility condition not repeated here is "no coBilling": nothing can
+    // attach a ChangeOrderBilling to an EXISTING milestone. Its only writers are the
+    // cost-plus biller, which links the milestone it creates in the same transaction,
+    // and this credit marker, which links none (paymentScheduleId null); no code
+    // updates paymentScheduleId afterwards.
     const updated = await tx.paymentSchedule.updateMany({
         where: {
             id: target.id,
@@ -2886,6 +2888,7 @@ export async function handleChangeOrderApproved(
     let sentTo = "";
     let isCredit = false;
     let credit: ChangeOrderCreditApplied | null = null;
+    let creditAlreadyApplied = false;
 
     try {
         const co = await prisma.changeOrder.findUnique({
@@ -2925,6 +2928,9 @@ export async function handleChangeOrderApproved(
                 // selected"), and a replay (alreadyBilled) is not an issue either.
                 summary.billed = true;
                 credit = bill.credit;
+                // A portal signature applies the credit inside approveChangeOrderCore's own
+                // transaction, so this is normally the idempotent replay of that apply.
+                creditAlreadyApplied = bill.alreadyBilled;
                 amountLabel = formatCurrency(bill.credit.amount);
             } else if (bill.alreadyBilled) {
             // Only the call that FRESHLY billed the CO may auto-send — this makes a
@@ -2972,6 +2978,10 @@ export async function handleChangeOrderApproved(
 
     // Team notification (System Notification Email in Settings → Company).
     if (opts?.notify === false) return summary;
+    // A credit notifies the team once: from the request that approved it (freshlyApproved,
+    // the inline after() call) or from the call that actually applied it. A replay of an
+    // already-applied credit stays quiet. Positive change orders keep their behavior.
+    if (credit && creditAlreadyApplied && !opts?.freshlyApproved) return summary;
     try {
         const esc = escapeHtml;
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { notificationEmail: true, companyName: true, email: true } });
@@ -3726,6 +3736,12 @@ export async function deleteInvoiceMilestoneCore(
         }
         if (locked.stripeSessionId || locked.stripePaymentIntentId) {
             throw new Error("A payment is in progress on this milestone — wait for it to finish or void it before deleting");
+        }
+        // A credit change order lowered this milestone: deleting it would leave the credit's
+        // marker pointing at a row that no longer exists, reading as applied with nothing on
+        // the invoice. Refused in v1. Read under the invoice lock taken above.
+        if ((await creditCentsByMilestoneInTx(tx, locked.invoiceId)).has(locked.id)) {
+            throw new Error(coCreditedMilestoneError(locked.name, "deleted"));
         }
 
         // Re-assert every deletable-state predicate checked above IN the delete

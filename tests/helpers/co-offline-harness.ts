@@ -156,6 +156,10 @@ export function makeWorld(options: WorldOptions = {}) {
         },
         estimate: { findUnique: async () => ({ ...state.estimate }) },
         estimatePaymentSchedule: {
+            findUnique: async ({ where }: Row) => {
+                const row = state.estimateSchedules.find((eps) => eps.id === where.id);
+                return row ? { ...row } : null;
+            },
             findMany: async ({ where }: Row = {}) => state.estimateSchedules.filter((row) => matches(row, where)).map((row) => ({ ...row })),
             updateMany: async ({ where, data }: Row) => {
                 const hit = state.estimateSchedules.filter((row) => matches(row, where));
@@ -226,7 +230,14 @@ export function makeWorld(options: WorldOptions = {}) {
                 for (const row of hit) applyData(row, data);
                 return { count: hit.length };
             },
+            deleteMany: async ({ where }: Row) => {
+                const before = state.milestones.length;
+                state.milestones = state.milestones.filter((m) => !matches(m, where));
+                return { count: before - state.milestones.length };
+            },
         },
+        // Progress billing reads earlier billing lines per milestone; this world has none.
+        progressBillingLine: { findMany: async () => [] },
         companySettings: { findUnique: async () => ({ ...state.settings }) },
         activityLog: {
             findFirst: async () => null,

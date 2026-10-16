@@ -32,6 +32,8 @@
 import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents, lockClientRow, lockProjectRow } from "./tx-retry";
 import { toNum } from "./prisma-helpers";
+import { coCreditedMilestoneError } from "./change-order-credit";
+import { creditCentsByMilestoneInTx } from "./change-order-credit-markers";
 import type { Prisma, ProgressBilling, ProgressBillingLine } from "@prisma/client";
 import { createRouteDeadline, remainingBudgetMs, QB_DOC_NUMBER_MAX_LEN, canonicalPrivateNote, qboTxnDate, type RouteDeadline, type QBTokens, type RemoteDocumentFacts } from "./quickbooks";
 import { documentMatchesClaim } from "./qbo-document-sync";
@@ -294,6 +296,7 @@ export async function createProgressBillingCore(
             throw new Error("Internal error: split amounts do not sum to the expected total");
         }
 
+        let creditedMilestones: Map<string, number> | null = null;
         // ── Consumption guard ──────────────────────────────────────────────
         // A milestone can only ever be claimed for its full amount, across
         // EVERY non-Void progress billing that has referenced it — not just
@@ -341,6 +344,16 @@ export async function createProgressBillingCore(
                     throw new Error(
                         `"${schedule.name}": billed amount $${splitAmounts[i].toFixed(2)} exceeds what's left — $${committed.toFixed(2)} of $${toNum(schedule.amount).toFixed(2)} is already billed${codes ? ` on ${codes}` : ""}.`
                     );
+                }
+                // A milestone a credit change order lowered can't be SPLIT in v1: AUTO-SPLIT
+                // below rewrites its estimate row to the lowered amount, losing the credit's
+                // add-back (the estimate row is invoice + credit). Billing it whole is fine.
+                // Same full-bill test as AUTO-SPLIT; read under the locks taken above.
+                if (splitAmounts[i] < toNum(schedule.amount)) {
+                    creditedMilestones ??= await creditCentsByMilestoneInTx(tx, invoiceId);
+                    if (creditedMilestones.has(schedule.id)) {
+                        throw new Error(coCreditedMilestoneError(schedule.name, "split"));
+                    }
                 }
             }
         }

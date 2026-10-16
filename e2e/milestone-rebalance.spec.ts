@@ -266,7 +266,7 @@ test.describe.serial("updatePendingMilestoneAmountsCore", () => {
         await prisma.estimatePaymentSchedule.create({ data: { id: epsA, estimateId, name: "Deposit", amount: 1000, status: "Pending", order: 1 } });
         await prisma.estimatePaymentSchedule.create({ data: { id: epsB, estimateId, name: "Final", amount: 1000, status: "Pending", order: 2 } });
         await prisma.invoice.create({
-            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", subtotal: 2000, totalAmount: 2000, balanceDue: 2000 },
+            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", subtotal: 1818.18, taxRate: 10, taxAmount: 181.82, totalAmount: 2000, balanceDue: 2000 },
         });
         await prisma.paymentSchedule.create({ data: { id: psA, invoiceId, name: "Deposit", amount: 1000, status: "Pending", sourceScheduleId: epsA } });
         await prisma.paymentSchedule.create({ data: { id: psB, invoiceId, name: "Final", amount: 1000, status: "Pending", sourceScheduleId: epsB } });

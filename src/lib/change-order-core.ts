@@ -2,7 +2,7 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { billableCoItems, coLineCents, coSectionRowError, coSectionRowNames } from "./co-tax";
-import { coCreditCostPlusError, coCreditScheduleRowsError, coZeroSubtotalError, creditTargetError } from "./change-order-credit";
+import { coCreditCostPlusError, coCreditScheduleRowsError, coZeroSubtotalError } from "./change-order-credit";
 
 type ChangeOrderItemInput = {
     id?: string;
@@ -421,10 +421,8 @@ export async function approveChangeOrderCore(
         // co-audit repair. Status, item existence, subtotal validation, and the
         // approval write therefore observe one serialized state and commit as a
         // single invariant-preserving transition.
-        const locked = await tx.$queryRaw<Array<{
-            id: string; code: string; status: string; pricingType: string; totalAmount: unknown; estimateId: string; projectId: string;
-        }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount", "estimateId", "projectId"
+        const locked = await tx.$queryRaw<Array<{ id: string; code: string; status: string; pricingType: string; totalAmount: unknown }>>`
+            SELECT "id", "code", "status", "pricingType", "totalAmount"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
@@ -439,18 +437,6 @@ export async function approveChangeOrderCore(
 
         await assertChangeOrderApprovableInTx(tx, current);
 
-        // A customer-signed credit always lands on the DEFAULT target (the invoice's last
-        // eligible milestone), so refuse the signature now if that target is missing or too
-        // small, rather than approving a credit billing would then refuse. The offline path
-        // skips this: staff pick a target, validated inside the apply under the lock.
-        // Dynamic import: billing-core imports this module, so a static import would cycle.
-        if (current.pricingType !== "COST_PLUS" && Math.round(Number(current.totalAmount) * 100) < 0) {
-            const { loadChangeOrderCreditTargetsInTx } = await import("./billing-core");
-            const targets = await loadChangeOrderCreditTargetsInTx(tx, current);
-            const targetError = creditTargetError(current.code, targets, null);
-            if (targetError) throw new Error(targetError);
-        }
-
         const co = await tx.changeOrder.update({
             where: { id },
             data: {
@@ -460,6 +446,21 @@ export async function approveChangeOrderCore(
                 clientSignatureUrl: approval.clientSignatureUrl,
             },
         });
+
+        // A customer-signed credit lands on the DEFAULT target (the invoice's last eligible
+        // milestone), applied HERE, in the approval's own transaction, under the CO lock this
+        // transaction already holds (the apply then takes Estimate -> Invoice). Checking the
+        // target now and applying it later would let a second credit, a payment, or a send
+        // take the target in between, leaving a signed credit nothing can absorb. If it
+        // doesn't fit, the throw rolls the approval back and the caller discards the
+        // persisted signature. handleChangeOrderApproved then finds the credit already
+        // applied (idempotent marker): no send, no issue.
+        // Dynamic import: billing-core imports this module, so a static import would cycle.
+        if (current.pricingType !== "COST_PLUS" && Math.round(Number(current.totalAmount) * 100) < 0) {
+            const { applyChangeOrderCreditInTx } = await import("./billing-core");
+            const applied = await applyChangeOrderCreditInTx(tx, id, { actor: "Customer signature" });
+            if (!applied.ok) throw new Error(applied.error);
+        }
         return { co, transitioned: true };
     }, { timeout: 15_000 });
 }

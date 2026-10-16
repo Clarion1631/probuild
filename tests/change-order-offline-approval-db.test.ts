@@ -448,29 +448,74 @@ test("credit: two offline approvals racing on different targets apply exactly on
     });
 });
 
-test("credit: the signed path applies onto the default, and a second bill is alreadyBilled with no second change", { skip }, async () => {
+test("credit: portal signing applies the credit onto the default in the same transaction; billing afterwards is alreadyBilled with no second change", { skip }, async () => {
     await withCreditWorld(`cr3${Date.now()}`, async (db, ids) => {
         const { approveChangeOrderCore } = await import("../src/lib/change-order-core");
         const { billChangeOrderCore } = await import("../src/lib/billing-core");
         const approval = await approveChangeOrderCore(ids.changeOrderId, signature());
         assert.equal(approval?.transitioned, true);
-
-        const quietBill = { logActivity: async () => {}, revalidatePath: () => {} };
-        const first = await billChangeOrderCore(ids.changeOrderId, quietBill);
-        assert.equal(first.ok, true, JSON.stringify(first));
-        if (!first.ok) return;
-        assert.equal(first.alreadyBilled, false);
-        assert.equal(first.credit?.milestoneId, ids.final);
+        // Committed together: Approved, the lowered default milestone, the invoice, one marker.
+        assert.equal((await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId } })).status, "Approved");
         assert.equal(cents((await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.final } })).amount), 567936);
         assert.equal(cents((await db.invoice.findUniqueOrThrow({ where: { id: ids.invoiceId! } })).totalAmount), 2635136);
+        const markers = await creditMarkers(db, ids);
+        assert.equal(markers.length, 1);
+        assert.equal(markers[0].createdBy, "Customer signature");
 
-        const second = await billChangeOrderCore(ids.changeOrderId, quietBill);
-        assert.equal(second.ok, true);
-        if (!second.ok) return;
-        assert.equal(second.alreadyBilled, true);
+        const quietBill = { logActivity: async () => {}, revalidatePath: () => {} };
+        for (let i = 0; i < 2; i++) {
+            const bill = await billChangeOrderCore(ids.changeOrderId, quietBill);
+            assert.equal(bill.ok, true, JSON.stringify(bill));
+            if (!bill.ok) return;
+            assert.equal(bill.alreadyBilled, true);
+            assert.equal(bill.credit?.milestoneId, ids.final);
+        }
         assert.equal(cents((await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.final } })).amount), 567936);
         assert.equal(cents((await db.invoice.findUniqueOrThrow({ where: { id: ids.invoiceId! } })).totalAmount), 2635136);
         assert.equal((await creditMarkers(db, ids)).length, 1);
+    });
+});
+
+test("credit: two different credits signed concurrently, each fitting the default alone but not together: exactly one commits", { skip }, async () => {
+    await withCreditWorld(`cr6${Date.now()}`, async (db, ids) => {
+        // A second credit on the same project and estimate: -$6,000.00 at 8.8% = -$6,528.00.
+        // Final is $8,965.12: either credit fits alone (-$3,285.76 or -$6,528.00), both do not.
+        const second = await db.changeOrder.create({
+            data: {
+                projectId: ids.projectId, estimateId: ids.estimateId, code: `CO-CR2-${ids.changeOrderId.slice(-6)}`, title: "Second credit", status: "Sent",
+                pricingType: "FIXED", totalAmount: -6000, balanceDue: -6000,
+                items: { create: [{ name: "Remove second upgrade", type: "Material", quantity: 1, unitCost: -6000, total: -6000 }] },
+            },
+        });
+        const { approveChangeOrderCore } = await import("../src/lib/change-order-core");
+        const results = await Promise.allSettled([
+            approveChangeOrderCore(ids.changeOrderId, signature()),
+            approveChangeOrderCore(second.id, signature()),
+        ]);
+        assert.equal(results.filter((r) => r.status === "fulfilled").length, 1, JSON.stringify(results.map((r) => r.status)));
+        const loser = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+        assert.match(String(loser.reason?.message), /not smaller than Final/);
+
+        const [a, b] = await Promise.all([
+            db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId } }),
+            db.changeOrder.findUniqueOrThrow({ where: { id: second.id } }),
+        ]);
+        assert.deepEqual([a.status, b.status].sort(), ["Approved", "Sent"]);
+        const winner = a.status === "Approved" ? a : b;
+        const refused = a.status === "Approved" ? b : a;
+        assert.equal(refused.approvedBy, null);
+        assert.equal(refused.clientSignatureUrl, null);
+        assert.equal(await db.changeOrderBilling.count({ where: { changeOrderId: refused.id } }), 0, "no marker for the refused credit");
+        assert.equal(await db.changeOrderBilling.count({ where: { changeOrderId: winner.id } }), 1);
+
+        // Only the winner's credit moved Final and the invoice.
+        const winnerTotalCents = winner.id === ids.changeOrderId ? -328576 : -652800;
+        const final = await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.final } });
+        assert.equal(cents(final.amount), 896512 + winnerTotalCents);
+        const invoice = await db.invoice.findUniqueOrThrow({ where: { id: ids.invoiceId! } });
+        assert.equal(cents(invoice.totalAmount), 2963712 + winnerTotalCents);
+        assert.equal(cents((await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.cabinets } })).amount), 979200);
+        assert.equal(cents((await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.deposit } })).amount), 1088000);
     });
 });
 

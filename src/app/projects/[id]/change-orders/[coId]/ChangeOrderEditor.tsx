@@ -871,7 +871,7 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
                                         <option key={row.id} value={row.id}>
                                             {row.fits
                                                 ? `${row.name} (${formatCurrency(row.amount)} → ${formatCurrency(row.newAmount)})`
-                                                : `${row.name} (${formatCurrency(row.amount)}, too small for this credit)`}
+                                                : `${row.name} (${formatCurrency(row.amount)}, can't take this credit)`}
                                         </option>
                                     ))}
                                 </select>

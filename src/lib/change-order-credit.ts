@@ -121,10 +121,10 @@ export type CreditReductionPlan = {
  * legacy row with no split changes only its amount.
  *
  * Refused when the new amount would be zero or less (a credit equal to the
- * milestone is refused too: no $0 milestone), and, on a split row, when either
- * part would go negative. QuickBooks receives the stored split verbatim
- * (milestoneTaxSplit), so a negative tax part would reach QuickBooks as a
- * negative tax line.
+ * milestone is refused too: no $0 milestone), and, on a split row, when the
+ * pre-tax part would reach $0 or less or the tax part would go negative.
+ * QuickBooks receives the stored split verbatim (milestoneTaxSplit), so a
+ * negative tax part would reach QuickBooks as a negative tax line.
  */
 export function planCreditReduction(
     row: { name: string; amount: unknown; pretaxAmount?: unknown; taxAmount?: unknown },
@@ -142,8 +142,10 @@ export function planCreditReduction(
     let reason: string | null = null;
     if (credit.totalCents >= 0) {
         reason = "this change order is not a credit";
-    } else if (newAmountCents <= 0 || (split && after.pretaxCents! <= 0)) {
+    } else if (newAmountCents <= 0) {
         reason = coCreditTooBigError(credit.totalCents, row.name, amountCents);
+    } else if (split && after.pretaxCents! <= 0) {
+        reason = coCreditPretaxTooBigError(credit.pretaxCents, row.name, before.pretaxCents!);
     } else if (split && after.taxCents! < 0) {
         reason = coCreditTaxTooBigError(credit.taxCents, row.name, before.taxCents!);
     }
@@ -160,27 +162,54 @@ export type CreditTargetRow = {
     fits: boolean;
 };
 
+/** The invoice totals a credit moves (subtotal and tax drop by its parts). */
+export type CreditInvoiceTotals = { code: string; subtotalCents: number; taxCents: number };
+
+/**
+ * Why the credit can't come off this invoice at all, or null. Checked for every
+ * target, legacy and split alike: the invoice's subtotal and tax drop by the
+ * credit's own parts, and neither may go below $0. (A legacy milestone carries no
+ * split, so on a tax-exempt invoice reached through the project-invoice fallback
+ * a taxed credit would otherwise pass the milestone check and drive the invoice's
+ * tax negative.)
+ */
+export function creditInvoiceTotalsError(credit: CoCreditCents, invoice: CreditInvoiceTotals | null | undefined): string | null {
+    if (!invoice) return null;
+    if (invoice.subtotalCents + credit.pretaxCents < 0) {
+        return coCreditInvoiceSubtotalError(credit.pretaxCents, invoice.code, invoice.subtotalCents);
+    }
+    if (invoice.taxCents + credit.taxCents < 0) {
+        return coCreditInvoiceTaxError(credit.taxCents, invoice.code, invoice.taxCents);
+    }
+    return null;
+}
+
 /**
  * Eligibility, ranking, and fit for every milestone on the credit's invoice, in
- * ranked order, plus the default target (the last eligible row).
+ * ranked order, plus the default target (the last eligible row). When the
+ * invoice's own totals can't absorb the credit, no row fits and each carries
+ * that reason.
  */
 export function buildCreditTargets(
     milestones: readonly CreditMilestoneInput[],
     scheduleOrder: ReadonlyMap<string, number>,
     credit: CoCreditCents,
+    invoiceTotals?: CreditInvoiceTotals | null,
 ): { rows: CreditTargetRow[]; defaultId: string | null } {
     const ranked = rankCreditMilestones(milestones, scheduleOrder);
+    const invoiceError = creditInvoiceTotalsError(credit, invoiceTotals);
     const rows = ranked.map((row) => {
         const ineligible = creditIneligibleReason(row);
         const plan = planCreditReduction(row, credit);
+        const fits = ineligible === null && plan.fits && invoiceError === null;
         return {
             id: row.id,
             name: row.name,
             amountCents: plan.amountCents,
             eligible: ineligible === null,
-            reason: ineligible ?? plan.reason,
+            reason: ineligible ?? plan.reason ?? invoiceError,
             newAmountCents: plan.newAmountCents,
-            fits: ineligible === null && plan.fits,
+            fits,
         };
     });
     const eligible = rows.filter((row) => row.eligible);
@@ -238,6 +267,18 @@ export function coCreditTooBigError(creditTotalCents: number, milestoneName: str
     return `The credit (${money(creditTotalCents)} incl. tax) is not smaller than ${milestoneName} (${money(milestoneCents)}). Pick a larger unpaid milestone.`;
 }
 
+export function coCreditPretaxTooBigError(creditPretaxCents: number, milestoneName: string, milestonePretaxCents: number): string {
+    return `The credit would take ${milestoneName}'s pre-tax amount to $0 or less (${money(creditPretaxCents)} before tax against ${money(milestonePretaxCents)}). Pick another unpaid milestone.`;
+}
+
+export function coCreditInvoiceSubtotalError(creditPretaxCents: number, invoiceCode: string, invoiceSubtotalCents: number): string {
+    return `The credit (${money(creditPretaxCents)} before tax) is more than invoice ${invoiceCode}'s pre-tax subtotal (${money(invoiceSubtotalCents)}). A credit can't take an invoice's subtotal below $0.`;
+}
+
+export function coCreditInvoiceTaxError(creditTaxCents: number, invoiceCode: string, invoiceTaxCents: number): string {
+    return `The credit's tax (${money(creditTaxCents)}) is more than the tax on invoice ${invoiceCode} (${money(invoiceTaxCents)}). A credit can't take an invoice's tax below $0; check the change order's tax rate against the invoice.`;
+}
+
 export function coCreditTaxTooBigError(creditTaxCents: number, milestoneName: string, milestoneTaxCents: number): string {
     return `The credit's tax (${money(creditTaxCents)}) is more than the tax on ${milestoneName} (${money(milestoneTaxCents)}). Pick another unpaid milestone.`;
 }
@@ -248,6 +289,17 @@ export function coCreditTargetNotOnInvoiceError(invoiceCode: string): string {
 
 export function coCreditTargetIneligibleError(milestoneName: string, reason: string): string {
     return `${milestoneName} can't take this credit: ${reason}. Pick another unpaid milestone.`;
+}
+
+/**
+ * v1 refuses to split or delete a milestone a credit was taken off: a split rewrites its
+ * estimate row to the lowered amount (losing the credit's add-back), and a delete leaves
+ * the credit's marker pointing at a row that no longer exists.
+ */
+export function coCreditedMilestoneError(milestoneName: string, action: "split" | "deleted"): string {
+    return action === "split"
+        ? `"${milestoneName}" has a change-order credit taken off it, so it can't be split. Bill the whole milestone, or bill a different one.`
+        : `"${milestoneName}" has a change-order credit taken off it, so it can't be deleted. The credit would be left pointing at a milestone that no longer exists.`;
 }
 
 export const CO_CREDIT_CHANGED_ERROR = "This milestone changed while applying the credit. Refresh and try again.";

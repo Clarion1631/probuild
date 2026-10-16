@@ -20,6 +20,7 @@ import {
     coCreditTargetNotOnInvoiceError,
     coCreditTooBigError,
     coZeroSubtotalError,
+    creditInvoiceTotalsError,
     creditIneligibleReason,
     creditTargetError,
     planCreditReduction,
@@ -228,12 +229,41 @@ test("a split row refuses a credit that would push its pretax to zero or its tax
     const exempt = planCreditReduction({ name: "Final", amount: 5000, pretaxAmount: 5000, taxAmount: 0 }, credit);
     assert.equal(exempt.fits, false);
     assert.match(exempt.reason!, /credit's tax \(\$100\.00\) is more than the tax on Final \(\$0\.00\)/);
-    // Pretax exactly consumed while tax keeps the amount positive: still refused.
+    // Pretax exactly consumed while tax keeps the amount positive: still refused, with its own message.
     const pretax = planCreditReduction({ name: "Final", amount: 1200, pretaxAmount: 1000, taxAmount: 200 }, credit);
     assert.equal(pretax.fits, false);
-    assert.match(pretax.reason!, /not smaller than Final/);
+    assert.equal(pretax.reason, "The credit would take Final's pre-tax amount to $0 or less ($1,000.00 before tax against $1,000.00). Pick another unpaid milestone.");
+    assert.doesNotMatch(pretax.reason!, /not smaller than/);
     // The same amounts on a legacy row (no split) fit.
     assert.equal(planCreditReduction({ name: "Final", amount: 1200 }, credit).fits, true);
+});
+
+test("a legacy (no split) milestone on a tax-exempt invoice can't take a taxed credit: the invoice's tax would go negative", () => {
+    // Reached through the project-invoice fallback: the CO's estimate charges 10%, the invoice carries no tax.
+    const credit = coCreditCents(-1000, coTaxRate({ taxRatePercent: 10 })); // pretax -100000, tax -10000
+    const legacyFinal = milestone({ id: "ms-final", name: "Final", amount: 5000 });
+    assert.equal(planCreditReduction(legacyFinal, credit).fits, true, "the milestone alone would take it");
+    const invoice = { code: "INV-00009", subtotalCents: 500_000, taxCents: 0 };
+    assert.equal(creditInvoiceTotalsError(credit, invoice),
+        "The credit's tax ($100.00) is more than the tax on invoice INV-00009 ($0.00). A credit can't take an invoice's tax below $0; check the change order's tax rate against the invoice.");
+    const targets = buildCreditTargets([legacyFinal], new Map(), credit, invoice);
+    assert.equal(targets.defaultId, "ms-final", "still eligible, so still the default");
+    assert.equal(targets.rows[0].fits, false);
+    assert.equal(creditTargetError("CO-00001", { invoice, ...targets }, null), creditInvoiceTotalsError(credit, invoice));
+    // Split targets get the same invoice-level floor.
+    const split = buildCreditTargets([milestone({ amount: 5000, pretaxAmount: 4600, taxAmount: 400 })], new Map(), credit, invoice);
+    assert.equal(split.rows[0].fits, false);
+    assert.match(split.rows[0].reason!, /tax on invoice INV-00009/);
+});
+
+test("the invoice's pre-tax subtotal can't go below $0 either; a credit that leaves both at or above $0 fits", () => {
+    const credit = coCreditCents(-1000, 0.1);
+    assert.equal(creditInvoiceTotalsError(credit, { code: "INV-00009", subtotalCents: 99_999, taxCents: 50_000 }),
+        "The credit ($1,000.00 before tax) is more than invoice INV-00009's pre-tax subtotal ($999.99). A credit can't take an invoice's subtotal below $0.");
+    assert.equal(creditInvoiceTotalsError(credit, { code: "INV-00009", subtotalCents: 100_000, taxCents: 10_000 }), null, "exactly to $0 is allowed");
+    assert.equal(creditInvoiceTotalsError(credit, null), null);
+    const targets = buildCreditTargets([milestone({ amount: 5000 })], new Map(), credit, { code: "INV-00009", subtotalCents: 500_000, taxCents: 50_000 });
+    assert.equal(targets.rows[0].fits, true);
 });
 
 // ── Refusal text ─────────────────────────────────────────────────────────────
