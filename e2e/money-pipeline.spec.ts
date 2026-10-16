@@ -756,7 +756,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       approvalInput("Zero Signer"),
       { persistSignature: approvalSignatures.persistSignature },
     ));
-    expect(message).toContain("positive subtotal");
+    expect(message).toContain("$0 subtotal");
     expect(approvalSignatures.objects).toEqual(new Set());
     expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.zeroSent } })).status).toBe("Sent");
   });
@@ -967,7 +967,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     await writer;
 
     const message = await rejectionMessage(approval);
-    expect(message).toMatch(/priced item|positive subtotal/);
+    expect(message).toMatch(/priced item|\$0 subtotal/);
     const co = await coInvariantPrisma.changeOrder.findUniqueOrThrow({
       where: { id: COI.race },
       include: { items: true },

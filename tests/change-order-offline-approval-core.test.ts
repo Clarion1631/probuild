@@ -182,7 +182,8 @@ test("T2: shared validation refusals (section rows, no items, zero or out-of-syn
     fresh({ scheduleAmounts: [] });
     await refuses("INVALID", () => { world.state.items = []; }, /at least one priced item/);
     fresh({ scheduleAmounts: [] });
-    await refuses("INVALID", () => { world.state.co.totalAmount = 0; world.state.items = [{ name: "A", type: "Labor", quantity: 1, unitCost: 0 }]; }, /positive subtotal/);
+    // $0 stays refused (a negative subtotal is now a credit; see change-order-credit-core.test.ts).
+    await refuses("INVALID", () => { world.state.co.totalAmount = 0; world.state.items = [{ name: "A", type: "Labor", quantity: 1, unitCost: 0 }]; }, /\$0 subtotal/);
     fresh({ scheduleAmounts: [] });
     await refuses("INVALID", () => { world.state.co.totalAmount = 999; }, /out of sync/);
 });

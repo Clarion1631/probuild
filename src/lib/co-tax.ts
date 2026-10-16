@@ -102,8 +102,8 @@ const TAX_INFLATED_SLACK_CENTS = 1;
  * reported healthy, refused by the repair POST as already-correct, and hard-blocked from
  * send and approve with no remediation path at all.
  *
- * The guards also skip the subtotal comparison entirely for COST_PLUS and reject nonpositive
- * cents outright, so those get their own verdicts rather than being scored against a
+ * The guards also skip the subtotal comparison entirely for COST_PLUS and reject a $0
+ * subtotal outright, so those get their own verdicts rather than being scored against a
  * subtotal that means nothing for them.
  */
 export function classifyCoTotal(
@@ -126,10 +126,12 @@ export function classifyCoTotal(
     if (itemCount === 0) return "no-items";
     const storedCents = toCents(stored);
     const subtotalCents = toCents(subtotal);
-    // The guards reject nonpositive cents on their own ("no priced items yet"), so equality
+    // The guards reject a $0 subtotal on their own ("no priced items yet"), so equality
     // here would be an "ok" that still cannot send. Repair cannot help either — writing a
-    // zero subtotal back leaves the row just as unsendable.
-    if (storedCents <= 0 || subtotalCents <= 0) return "unpriced";
+    // zero subtotal back leaves the row just as unsendable. A NEGATIVE subtotal is a credit
+    // change order (FIXED only; cost-plus returned above), which send and approve accept,
+    // so a negative row that matches its items is "ok" like any other.
+    if (storedCents === 0 || subtotalCents === 0) return "unpriced";
     if (storedCents === subtotalCents) return "ok";
     const billedCents = toCents(expectedBilled);
     // Only meaningful when tax actually moves the number, and only above the subtotal. On a

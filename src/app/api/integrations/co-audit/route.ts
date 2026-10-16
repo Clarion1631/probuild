@@ -206,7 +206,7 @@ export async function POST(req: Request) {
             return { ok: false as const, error: `${co.code} has no line items — nothing to recompute from; review by hand.` };
         }
         if (verdict === "unpriced") {
-            return { ok: false as const, error: `${co.code} has a nonpositive total ($${stored.toFixed(2)}) or item subtotal ($${subtotal.toFixed(2)}) — send and approve reject it as unpriced, and writing the subtotal back would not change that. Price the items first.` };
+            return { ok: false as const, error: `${co.code} has a $0 stored total or item subtotal (stored $${stored.toFixed(2)}, items $${subtotal.toFixed(2)}) — send and approve reject it as unpriced, and writing the subtotal back would not change that. Price the items first.` };
         }
         if (verdict === "ok") {
             // Cents-exact, so this really is a no-op: send and approve compare the same
