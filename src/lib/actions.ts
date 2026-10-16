@@ -17700,9 +17700,12 @@ export async function unlockPayrollPeriod(
 // Never contacts the customer; all logic lives in approveChangeOrderOfflineCore.
 export async function markChangeOrderApprovedOffline(
     changeOrderId: string,
-    input: { method: string; approvedOn: string; note?: string | null; expectedUpdatedAt: string },
+    input: { method: string; approvedOn: string; note?: string | null; expectedUpdatedAt: string; targetMilestoneId?: string | null },
 ): Promise<
-    | { success: true; code: string; invoiceCode: string | null; milestoneCount: number; awaitingActuals: boolean; warnings: string[] }
+    | {
+        success: true; code: string; invoiceCode: string | null; milestoneCount: number; awaitingActuals: boolean; warnings: string[];
+        credit: { milestoneName: string; invoiceCode: string; beforeAmount: number; afterAmount: number; amount: number } | null;
+    }
     | { success: false; error: string }
 > {
     "use server";
@@ -17720,6 +17723,7 @@ export async function markChangeOrderApprovedOffline(
         note: input?.note,
         expectedUpdatedAt: String(input?.expectedUpdatedAt ?? ""),
         actor: { userId: user.id, name: user.name?.trim() || user.email },
+        targetMilestoneId: typeof input?.targetMilestoneId === "string" && input.targetMilestoneId ? input.targetMilestoneId : null,
     });
     if (!result.ok) return { success: false, error: result.error };
 
@@ -17738,5 +17742,14 @@ export async function markChangeOrderApprovedOffline(
         milestoneCount: result.billing?.milestones.length ?? 0,
         awaitingActuals: result.billing === null,
         warnings: result.warnings,
+        credit: result.billing?.credit
+            ? {
+                milestoneName: result.billing.credit.milestoneName,
+                invoiceCode: result.billing.credit.invoiceCode,
+                beforeAmount: result.billing.credit.beforeAmount,
+                afterAmount: result.billing.credit.afterAmount,
+                amount: result.billing.credit.amount,
+            }
+            : null,
     };
 }

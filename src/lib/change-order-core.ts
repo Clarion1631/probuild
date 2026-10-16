@@ -2,6 +2,7 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { billableCoItems, coLineCents, coSectionRowError, coSectionRowNames } from "./co-tax";
+import { coCreditCostPlusError, coCreditScheduleRowsError, coZeroSubtotalError, creditTargetError } from "./change-order-credit";
 
 type ChangeOrderItemInput = {
     id?: string;
@@ -58,6 +59,9 @@ function normalizeSchedules(
     timeZone: string,
 ): Array<{ id?: string; name: string; amount: number; dueDate: Date | null; order: number }> {
     if (schedules.length === 0) return [];
+    // A credit lowers an existing milestone; it is never split into payments. Say so
+    // instead of the generic "last row must be positive" error below.
+    if (subtotalCents < 0) throw new Error(coCreditScheduleRowsError());
     if (schedules.length < 2) throw new Error("A fixed-price payment schedule requires at least two payments.");
 
     let priorCents = 0;
@@ -387,8 +391,21 @@ export async function assertChangeOrderApprovableInTx(
 
     const storedSubtotalCents = Math.round(Number(current.totalAmount) * 100);
     const renderedSubtotalCents = itemSubtotalCents(items);
-    if (current.pricingType !== "COST_PLUS" && (storedSubtotalCents <= 0 || renderedSubtotalCents <= 0)) {
-        throw new Error(`Change order ${current.code} must have a positive subtotal before it can be approved.`);
+    // A negative subtotal is a credit change order: FIXED only, never split into payments,
+    // and it lowers one existing milestone instead of adding one. These rules do not depend
+    // on WHICH milestone; the caller validates the target (the default on the signed path,
+    // the staff pick inside the offline apply, under the invoice lock).
+    const isCredit = storedSubtotalCents < 0 || renderedSubtotalCents < 0;
+    if (current.pricingType === "COST_PLUS" && isCredit) {
+        throw new Error(coCreditCostPlusError(current.code));
+    }
+    // Cost-plus keeps its $0 exemption: its scope lines are estimates and actuals bill later.
+    if (current.pricingType !== "COST_PLUS" && (storedSubtotalCents === 0 || renderedSubtotalCents === 0)) {
+        throw new Error(coZeroSubtotalError(current.code));
+    }
+    if (current.pricingType !== "COST_PLUS" && isCredit) {
+        const scheduleCount = await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId: id } });
+        if (scheduleCount > 0) throw new Error(coCreditScheduleRowsError(current.code));
     }
     if (current.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
         throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
@@ -404,8 +421,10 @@ export async function approveChangeOrderCore(
         // co-audit repair. Status, item existence, subtotal validation, and the
         // approval write therefore observe one serialized state and commit as a
         // single invariant-preserving transition.
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; status: string; pricingType: string; totalAmount: unknown }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount"
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; status: string; pricingType: string; totalAmount: unknown; estimateId: string; projectId: string;
+        }>>`
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "estimateId", "projectId"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
@@ -419,6 +438,18 @@ export async function approveChangeOrderCore(
         }
 
         await assertChangeOrderApprovableInTx(tx, current);
+
+        // A customer-signed credit always lands on the DEFAULT target (the invoice's last
+        // eligible milestone), so refuse the signature now if that target is missing or too
+        // small, rather than approving a credit billing would then refuse. The offline path
+        // skips this: staff pick a target, validated inside the apply under the lock.
+        // Dynamic import: billing-core imports this module, so a static import would cycle.
+        if (current.pricingType !== "COST_PLUS" && Math.round(Number(current.totalAmount) * 100) < 0) {
+            const { loadChangeOrderCreditTargetsInTx } = await import("./billing-core");
+            const targets = await loadChangeOrderCreditTargetsInTx(tx, current);
+            const targetError = creditTargetError(current.code, targets, null);
+            if (targetError) throw new Error(targetError);
+        }
 
         const co = await tx.changeOrder.update({
             where: { id },

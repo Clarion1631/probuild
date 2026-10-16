@@ -1328,6 +1328,7 @@ function createHandler(actor: RouteMcpActor) {
                         expenses: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { amount: true } },
                         billings: { select: { totalCents: true, laborCents: true, expenseCents: true, markupCents: true, taxCents: true } },
                         paymentSchedules: { orderBy: { order: "asc" }, select: { id: true, name: true, amount: true, dueDate: true } },
+                        estimate: { select: { id: true, code: true } },
                     },
                 });
                 return textResult(orders.map((co) => ({
@@ -1335,6 +1336,8 @@ function createHandler(actor: RouteMcpActor) {
                     code: co.code,
                     title: co.title,
                     status: co.status,
+                    estimateId: co.estimate?.id ?? co.estimateId,
+                    estimateCode: co.estimate?.code ?? null,
                     items: co.items.map((item) => ({
                         id: item.id,
                         name: item.name,

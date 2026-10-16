@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
 import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
+import { coCreditCents } from "@/lib/change-order-credit";
 import { OFFLINE_APPROVAL_METHODS, OFFLINE_APPROVAL_NOTE_MAX } from "@/lib/change-order-offline-approval";
 
 type OfflineApprovalProps = {
@@ -14,6 +15,16 @@ type OfflineApprovalProps = {
     todayKey: string;
     staffName: string;
     summary: string | null;
+    /** Set for a FIXED credit CO: the unpaid milestones the credit can come off. */
+    credit?: {
+        estimateCode: string | null;
+        invoiceCode: string | null;
+        taxLabel: string;
+        creditAmount: number;
+        rows: Array<{ id: string; name: string; amount: number; newAmount: number; fits: boolean; reason: string | null }>;
+        defaultId: string | null;
+        error: string | null;
+    } | null;
 };
 
 export default function ChangeOrderEditor({ context, initialData, offline }: { context: any, initialData: any, offline: OfflineApprovalProps }) {
@@ -40,6 +51,8 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
     const [offlineNote, setOfflineNote] = useState("");
     const [offlineError, setOfflineError] = useState<{ method?: string; date?: string } | null>(null);
     const [isMarkingApproved, setIsMarkingApproved] = useState(false);
+    // Credit COs: the milestone staff picked; "" means the default (the last eligible one).
+    const [creditTargetId, setCreditTargetId] = useState("");
     // Pin for the server's stale check; refreshed from every save so the button
     // approves exactly what the person just saw and saved.
     const [latestUpdatedAt, setLatestUpdatedAt] = useState<string>(new Date(initialData.updatedAt).toISOString());
@@ -68,9 +81,26 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
     // Tax follows the estimate's treatment (tax-exempt customers pay none) — kept
     // in sync with the portal signature page and billChangeOrderCore via lib/co-tax.
     const subtotal = coItemsSubtotal(items);
-    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
+    // `|| 0`: a tax-exempt credit would otherwise show "-$0.00" tax.
+    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100 || 0;
     const total = Math.round((subtotal + tax) * 100) / 100;
     const taxLabel = coTaxLabel(initialData.estimate);
+    // A FIXED change order with a negative total is a credit: approving it lowers one
+    // unpaid milestone on the invoice instead of adding one.
+    const isCredit = pricingType === "FIXED" && Math.round(subtotal * 100) < 0;
+    const creditTargets = offline.credit ?? null;
+    // The server computed the targets for the credit it had on file; after an unsaved edit
+    // (or before the post-save refresh lands) they describe a different credit.
+    const creditTargetsCurrent = !!creditTargets
+        && Math.round(creditTargets.creditAmount * 100) === coCreditCents(subtotal, coTaxRate(initialData.estimate)).totalCents;
+    const selectedCreditId = creditTargetId || creditTargets?.defaultId || "";
+    const selectedCreditRow = creditTargets?.rows.find((row) => row.id === selectedCreditId) ?? null;
+    const creditBlocker = !isCredit ? null
+        : !creditTargetsCurrent ? "Loading the invoice's unpaid milestones. If this doesn't update, refresh the page."
+        : creditTargets!.rows.length === 0 ? (creditTargets!.error ?? "There is no unpaid milestone this credit can come off.")
+        : !selectedCreditRow ? "Pick the milestone the credit comes off."
+        : !selectedCreditRow.fits ? (selectedCreditRow.reason ?? "This credit doesn't fit that milestone. Pick a larger one.")
+        : null;
     const unbilledTime = (initialData.timeEntries || []).filter((row: any) => row.isBillable && !row.invoiceId && !row.invoicedAt);
     const unbilledExpenses = (initialData.expenses || []).filter((row: any) => row.isBillable && !row.invoiceId && !row.invoicedAt);
     const actualHours = unbilledTime.reduce((sum: number, row: any) => sum + Number(row.durationHours || 0), 0);
@@ -159,6 +189,7 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
         setOfflineDate(offline.todayKey);
         setOfflineNote("");
         setOfflineError(null);
+        setCreditTargetId("");
         setShowOfflineModal(true);
     }
 
@@ -168,6 +199,7 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
         if (!offlineDate || offlineDate > offline.todayKey) errors.date = "The approval date can't be in the future.";
         setOfflineError(errors.method || errors.date ? errors : null);
         if (errors.method || errors.date) return;
+        if (creditBlocker) return;
         setIsMarkingApproved(true);
         try {
             const result = await markChangeOrderApprovedOffline(initialData.id, {
@@ -175,12 +207,15 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
                 approvedOn: offlineDate,
                 note: offlineNote.trim() || null,
                 expectedUpdatedAt: latestUpdatedAt,
+                ...(isCredit ? { targetMilestoneId: selectedCreditId } : {}),
             });
             if (!result.success) {
                 toast.error(result.error);
                 return;
             }
-            toast.success(result.awaitingActuals
+            toast.success(result.credit
+                ? `${result.code} marked approved. Took ${formatCurrency(Math.abs(result.credit.amount))} off ${result.credit.milestoneName} on invoice ${result.credit.invoiceCode} (${formatCurrency(result.credit.beforeAmount)} → ${formatCurrency(result.credit.afterAmount)}). The customer was not notified.`
+                : result.awaitingActuals
                 ? `${result.code} marked approved. Bill actuals when the work is done.`
                 : `${result.code} marked approved and added to invoice ${result.invoiceCode}. The customer was not notified.`);
             for (const warning of result.warnings) toast.warning(`Marked approved, but ${warning}.`);
@@ -555,8 +590,8 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
                                         })}
                                     </div>
                                     {paymentSchedules.length > 0 && (
-                                        <p className={`text-xs mt-3 ${paymentSchedules.length < 2 || finalScheduleCents <= 0 ? "text-red-600" : "text-emerald-700"}`}>
-                                            {paymentSchedules.length < 2 ? "Add at least one more payment." : finalScheduleCents <= 0 ? "Earlier payments must total less than the subtotal." : `Final payment remainder: ${formatCurrency(finalScheduleCents / 100)}. Schedule sums to ${formatCurrency(subtotal)}.`}
+                                        <p className={`text-xs mt-3 ${isCredit || paymentSchedules.length < 2 || finalScheduleCents <= 0 ? "text-red-600" : "text-emerald-700"}`}>
+                                            {isCredit ? "A credit can't have a payment schedule. Remove these payments." : paymentSchedules.length < 2 ? "Add at least one more payment." : finalScheduleCents <= 0 ? "Earlier payments must total less than the subtotal." : `Final payment remainder: ${formatCurrency(finalScheduleCents / 100)}. Schedule sums to ${formatCurrency(subtotal)}.`}
                                         </p>
                                     )}
                                 </div>
@@ -575,9 +610,15 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
                                     </div>
                                     <div className="h-px w-full bg-slate-200 my-4 shadow-sm"></div>
                                     <div className="flex justify-between text-xl font-extrabold text-slate-900">
-                                        <span>Revised Amount</span>
+                                        <span>{isCredit ? "Credit Amount" : "Revised Amount"}</span>
                                         <span className="text-amber-600">{formatCurrency(total)}</span>
                                     </div>
+                                    {isCredit && <p className="text-xs text-slate-500">Approving this credit lowers one unpaid milestone on the invoice by this amount.</p>}
+                                    {(initialData.billings?.length || 0) > 0 && <div className="border-t border-slate-200 pt-4 space-y-2">
+                                        <h3 className="text-sm font-semibold text-slate-800">Billing history</h3>
+                                        {/* A credit row lowered an existing milestone: label and amount only, no backup PDF. */}
+                                        {initialData.billings.map((billing: any) => <div key={billing.id} className="flex items-center justify-between text-sm"><span>{billing.label} · {new Date(billing.createdAt).toLocaleDateString()}</span><span className="font-semibold">{formatCurrency(Number(billing.totalCents) / 100)}</span></div>)}
+                                    </div>}
                                     </> : <div className="rounded-lg border border-amber-200 bg-amber-50 p-5">
                                         <p className="text-xs font-semibold uppercase tracking-wider text-amber-700">Approved terms</p>
                                         <p className="text-xl font-extrabold text-slate-900 mt-2">Cost + {markupPercent || 0}% + tax</p>
@@ -790,14 +831,16 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
 
         {showOfflineModal && (
             <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4">
-                <div className="bg-white rounded-xl shadow-xl max-w-md w-full border border-hui-border overflow-hidden">
+                {/* Capped at the viewport with a scrolling body, so the header and the confirm
+                    button stay reachable on a short screen (the credit picker makes it taller). */}
+                <div className="bg-white rounded-xl shadow-xl max-w-md w-full max-h-full flex flex-col border border-hui-border overflow-hidden">
                     <div className="px-6 py-4 border-b border-hui-border flex items-center justify-between">
                         <h2 className="text-lg font-bold text-hui-textMain">Mark approved</h2>
                         <button onClick={() => setShowOfflineModal(false)} disabled={isMarkingApproved} className="text-hui-textMuted hover:text-hui-textMain">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                         </button>
                     </div>
-                    <div className="p-6 space-y-4 text-sm">
+                    <div className="p-6 space-y-4 text-sm overflow-y-auto">
                         <p className="text-hui-textMuted">Use this when the customer approved {initialData.code} outside ProBuild, like on a call or by text.</p>
                         {pricingType === "COST_PLUS" ? (
                             <p className="text-hui-textMain">Terms: cost + {markupPercent || 10}% + tax, billed later from actual time and expenses.</p>
@@ -805,7 +848,34 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
                             <div className="space-y-1 text-hui-textMain">
                                 <div className="flex justify-between"><span>Subtotal</span><strong>{formatCurrency(subtotal)}</strong></div>
                                 <div className="flex justify-between"><span>{taxLabel}</span><strong>{formatCurrency(tax)}</strong></div>
-                                <div className="flex justify-between border-t border-slate-200 pt-1"><span>Total</span><strong>{formatCurrency(total)}</strong></div>
+                                <div className="flex justify-between border-t border-slate-200 pt-1"><span>{isCredit ? "Credit" : "Total"}</span><strong>{formatCurrency(total)}</strong></div>
+                            </div>
+                        )}
+                        {isCredit && (
+                            <div>
+                                <p className="text-xs text-slate-500 mb-2" data-testid="credit-summary">
+                                    Credit {formatCurrency(total)} incl. {taxLabel}
+                                    {creditTargets?.invoiceCode ? ` · Invoice ${creditTargets.invoiceCode}` : ""}
+                                    {initialData.estimate?.code ? ` · Estimate ${initialData.estimate.code}` : ""}
+                                </p>
+                                <label className="block font-medium text-hui-textMain mb-1" htmlFor="offline-credit-target">Take the credit off</label>
+                                <select
+                                    id="offline-credit-target"
+                                    className="hui-input w-full"
+                                    value={selectedCreditId}
+                                    disabled={!creditTargetsCurrent || !creditTargets?.rows.length}
+                                    onChange={(e) => setCreditTargetId(e.target.value)}
+                                >
+                                    {!creditTargets?.rows.length && <option value="">No unpaid milestone available</option>}
+                                    {creditTargets?.rows.map((row) => (
+                                        <option key={row.id} value={row.id}>
+                                            {row.fits
+                                                ? `${row.name} (${formatCurrency(row.amount)} → ${formatCurrency(row.newAmount)})`
+                                                : `${row.name} (${formatCurrency(row.amount)}, too small for this credit)`}
+                                        </option>
+                                    ))}
+                                </select>
+                                {creditBlocker && <p className="text-xs text-red-600 mt-1" data-testid="credit-blocker">{creditBlocker}</p>}
                             </div>
                         )}
                         <div>
@@ -851,6 +921,11 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
                         <div className="bg-amber-50 border border-amber-200 rounded-md p-3 text-amber-900 space-y-1">
                             {pricingType === "COST_PLUS" ? (
                                 <p>The customer will not be notified. Nothing is billed now. Bill the actual time and expenses from this page when the work is done.</p>
+                            ) : isCredit ? (
+                                <>
+                                    <p>The customer will not be notified.</p>
+                                    <p>ProBuild lowers the milestone you pick by the credit now. No payment request is sent, and nothing goes to QuickBooks.</p>
+                                </>
                             ) : (
                                 <>
                                     <p>The customer will not be notified. Send the bill from the invoice when you&apos;re ready.</p>
@@ -862,7 +937,7 @@ export default function ChangeOrderEditor({ context, initialData, offline }: { c
                     </div>
                     <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3">
                         <button className="hui-btn hui-btn-secondary" disabled={isMarkingApproved} onClick={() => setShowOfflineModal(false)}>Cancel</button>
-                        <button className="hui-btn hui-btn-primary disabled:opacity-50" disabled={isMarkingApproved} onClick={handleMarkApproved}>
+                        <button className="hui-btn hui-btn-primary disabled:opacity-50" disabled={isMarkingApproved || !!creditBlocker} onClick={handleMarkApproved}>
                             {isMarkingApproved ? "Marking approved…" : "Mark approved"}
                         </button>
                     </div>

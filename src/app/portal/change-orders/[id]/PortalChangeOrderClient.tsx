@@ -96,10 +96,13 @@ export default function PortalChangeOrderClient({ initialData, companySettings, 
     // customers pay none) — the amount shown here is what the customer signs
     // AND what billing charges, to the cent.
     const subtotal = coItemsSubtotal(items);
-    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
+    // `|| 0`: a tax-exempt credit would otherwise show "-$0.00" tax.
+    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100 || 0;
     const total = Math.round((subtotal + tax) * 100) / 100;
     const taxLabel = coTaxLabel(initialData.estimate);
     const isCostPlus = initialData.pricingType === "COST_PLUS";
+    // A negative fixed-price change order is a credit: it lowers the customer's balance.
+    const isCredit = !isCostPlus && Math.round(subtotal * 100) < 0;
     const schedules = initialData.paymentSchedules || [];
 
     // Split on blank lines so each paragraph can be its own top-level data-pdf-row —
@@ -398,9 +401,10 @@ export default function PortalChangeOrderClient({ initialData, companySettings, 
                                     <span>{formatCurrency(tax)}</span>
                                 </div>
                                 <div className="border-t-2 border-slate-800 mt-1 pt-2 flex justify-between text-lg font-bold text-amber-600">
-                                    <span>Revised Amount</span>
+                                    <span>{isCredit ? "Credit" : "Revised Amount"}</span>
                                     <span>{formatCurrency(total)}</span>
                                 </div>
+                                {isCredit && <p className="pt-2 text-sm text-slate-600">This credit will be taken off your remaining balance.</p>}
                             </div>
                         </div> : <div data-pdf-row="true" className="flex justify-end mt-6"><div className="w-full sm:w-72 border-t-2 border-slate-800 pt-3 text-right"><p className="text-xs text-slate-500 uppercase">Approved terms</p><p className="text-lg font-bold text-amber-600">Cost + {initialData.markupPercent ?? 10}% + tax</p></div></div>}
 

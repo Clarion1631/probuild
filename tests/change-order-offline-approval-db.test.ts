@@ -82,7 +82,7 @@ async function offline(ids: Seeded, db: PrismaClient) {
     const row = await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId }, select: { updatedAt: true } });
     return approveChangeOrderOfflineCore(ids.changeOrderId, {
         method: "PHONE",
-        approvedOn: new Date().toISOString().slice(0, 10),
+        approvedOn: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10),
         note: "internal",
         expectedUpdatedAt: row.updatedAt.toISOString(),
         actor: ACTOR,
@@ -140,7 +140,7 @@ test("two offline approvals racing: one wins, one is ALREADY_APPROVED, one set o
         const { approveChangeOrderOfflineCore } = await import("../src/lib/billing-core");
         const row = await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId }, select: { updatedAt: true } });
         const call = () => approveChangeOrderOfflineCore(ids.changeOrderId, {
-            method: "TEXT", approvedOn: new Date().toISOString().slice(0, 10), expectedUpdatedAt: row.updatedAt.toISOString(), actor: ACTOR,
+            method: "TEXT", approvedOn: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10), expectedUpdatedAt: row.updatedAt.toISOString(), actor: ACTOR,
         }, quiet);
         const results = await Promise.all([call(), call()]);
         assert.equal(results.filter((r) => r.ok).length, 1, JSON.stringify(results));
@@ -157,7 +157,7 @@ test("offline approval racing a portal signature: exactly one Approved outcome",
         const row = await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId }, select: { updatedAt: true } });
         const [offlineResult, portalResult] = await Promise.allSettled([
             approveChangeOrderOfflineCore(ids.changeOrderId, {
-                method: "EMAIL", approvedOn: new Date().toISOString().slice(0, 10), expectedUpdatedAt: row.updatedAt.toISOString(), actor: ACTOR,
+                method: "EMAIL", approvedOn: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10), expectedUpdatedAt: row.updatedAt.toISOString(), actor: ACTOR,
             }, quiet),
             approveChangeOrderCore(ids.changeOrderId, { signatureName: "Customer A", clientSignatureUrl: "https://example.test/sig.png", approvedAt: new Date() }),
         ]);
@@ -323,5 +323,171 @@ test("a hand-made milestone reused by the approval is stamped with the change or
         assert.equal(reused.sourceChangeOrderId, ids.changeOrderId);
         assert.ok(reused.sourceCoScheduleId, "the schedule link was attached too");
         assert.equal(Number(reused.amount), 440);
+    });
+});
+
+// ── Credit change orders, on real SQL ───────────────────────────────────────
+
+type CreditSeeded = Seeded & { deposit: string; cabinets: string; final: string; epsCabinets: string };
+
+/**
+ * A FIXED credit CO (-$3,020.00 at 8.8% = -$3,285.76) on an invoice cloned from its estimate:
+ * Deposit and Cabinets carry a pretax/tax split, Final is a legacy row, and the estimate
+ * order puts Final last (the default target).
+ */
+async function seedCredit(db: PrismaClient, tag: string): Promise<CreditSeeded> {
+    const client = await db.client.create({ data: { name: `Credit CO ${tag}`, initials: "CC" } });
+    const project = await db.project.create({ data: { name: `Credit CO Project ${tag}`, clientId: client.id } });
+    const estimate = await db.estimate.create({
+        data: { title: `Credit CO Est ${tag}`, code: `EST-CR-${tag}`, projectId: project.id, totalAmount: 29637.12, balanceDue: 29637.12, taxRatePercent: 8.8, taxRateName: "Sales tax" },
+    });
+    const eps = async (name: string, amount: number, order: number) =>
+        db.estimatePaymentSchedule.create({ data: { estimateId: estimate.id, name, amount, order } });
+    const epsDeposit = await eps("Deposit", 10880, 0);
+    const epsCabinets = await eps("Cabinets", 9792, 1);
+    const epsFinal = await eps("Final", 8965.12, 2);
+    const invoice = await db.invoice.create({
+        data: {
+            code: `INV-CR-${tag}`, projectId: project.id, clientId: client.id, estimateId: estimate.id,
+            status: "Issued", subtotal: 27240, taxAmount: 2397.12, totalAmount: 29637.12, balanceDue: 29637.12,
+        },
+    });
+    const deposit = await db.paymentSchedule.create({ data: { invoiceId: invoice.id, name: "Deposit", amount: 10880, pretaxAmount: 10000, taxAmount: 880, sourceScheduleId: epsDeposit.id } });
+    const cabinets = await db.paymentSchedule.create({ data: { invoiceId: invoice.id, name: "Cabinets", amount: 9792, pretaxAmount: 9000, taxAmount: 792, sourceScheduleId: epsCabinets.id } });
+    const final = await db.paymentSchedule.create({ data: { invoiceId: invoice.id, name: "Final", amount: 8965.12, sourceScheduleId: epsFinal.id } });
+    const changeOrder = await db.changeOrder.create({
+        data: {
+            projectId: project.id, estimateId: estimate.id, code: `CO-CR-${tag}`, title: "Credit example", status: "Sent",
+            pricingType: "FIXED", totalAmount: -3020, balanceDue: -3020,
+            items: { create: [{ name: "Remove upgrade", type: "Material", quantity: 1, unitCost: -3020, total: -3020 }] },
+        },
+    });
+    return {
+        clientId: client.id, projectId: project.id, estimateId: estimate.id, invoiceId: invoice.id, changeOrderId: changeOrder.id,
+        deposit: deposit.id, cabinets: cabinets.id, final: final.id, epsCabinets: epsCabinets.id,
+    };
+}
+
+async function withCreditWorld(tag: string, body: (db: PrismaClient, ids: CreditSeeded) => Promise<void>) {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl } } });
+    const ids = await seedCredit(db, tag);
+    try {
+        await body(db, ids);
+    } finally {
+        await cleanup(db, ids);
+        await db.$disconnect();
+    }
+}
+
+async function offlineCredit(ids: Seeded, db: PrismaClient, targetMilestoneId: string | null) {
+    const { approveChangeOrderOfflineCore } = await import("../src/lib/billing-core");
+    const row = await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId }, select: { updatedAt: true } });
+    return approveChangeOrderOfflineCore(ids.changeOrderId, {
+        method: "PHONE",
+        // Yesterday by UTC is never in the future in the company zone (UTC-7/-8).
+        approvedOn: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10),
+        expectedUpdatedAt: row.updatedAt.toISOString(),
+        actor: ACTOR,
+        targetMilestoneId,
+    }, quiet);
+}
+
+const cents = (value: unknown) => Math.round(Number(value) * 100);
+const creditMarkers = (db: PrismaClient, ids: Seeded) => db.changeOrderBilling.findMany({ where: { changeOrderId: ids.changeOrderId } });
+const signature = () => ({ signatureName: "Customer A", clientSignatureUrl: "https://example.test/sig.png", approvedAt: new Date() });
+
+test("credit: offline approval lowers the picked milestone and the invoice, writes one marker, and a replay is refused", { skip }, async () => {
+    await withCreditWorld(`cr1${Date.now()}`, async (db, ids) => {
+        const result = await offlineCredit(ids, db, ids.cabinets);
+        assert.equal(result.ok, true, JSON.stringify(result));
+        const co = await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId } });
+        assert.equal(co.status, "Approved");
+        assert.equal(co.approvalSource, "OFFLINE");
+
+        const cabinets = await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.cabinets } });
+        assert.deepEqual([cents(cabinets.amount), cents(cabinets.pretaxAmount), cents(cabinets.taxAmount)], [650624, 598000, 52624]);
+        assert.equal(cabinets.status, "Pending");
+        assert.equal(cabinets.qbInvoiceSentAt, null, "nothing was sent");
+        assert.equal(cabinets.sourceChangeOrderId, null, "no provenance stamped on the contract milestone");
+        assert.equal(cents((await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.final } })).amount), 896512);
+        assert.equal(cents((await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.deposit } })).amount), 1088000);
+        assert.equal(await db.paymentSchedule.count({ where: { invoiceId: ids.invoiceId! } }), 3, "no milestone created");
+
+        const invoice = await db.invoice.findUniqueOrThrow({ where: { id: ids.invoiceId! } });
+        assert.deepEqual([cents(invoice.subtotal), cents(invoice.taxAmount), cents(invoice.totalAmount), cents(invoice.balanceDue)], [2422000, 213136, 2635136, 2635136]);
+        assert.equal(invoice.status, "Issued");
+
+        const eps = await db.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: ids.epsCabinets } });
+        assert.equal(cents(eps.amount), 979200, "the estimate mirror row is not lowered");
+
+        const markers = await creditMarkers(db, ids);
+        assert.equal(markers.length, 1);
+        assert.equal(markers[0].paymentScheduleId, null);
+        assert.equal(markers[0].totalCents, -328576);
+        assert.equal(markers[0].taxCents, -26576);
+        assert.equal((markers[0].snapshot as { kind?: string }).kind, "credit");
+
+        const replay = await offlineCredit(ids, db, ids.final);
+        assert.equal(replay.ok, false);
+        assert.equal((replay as { code: string }).code, "ALREADY_APPROVED");
+        assert.equal((await creditMarkers(db, ids)).length, 1);
+        assert.equal(cents((await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.final } })).amount), 896512);
+        assert.equal(cents((await db.invoice.findUniqueOrThrow({ where: { id: ids.invoiceId! } })).totalAmount), 2635136);
+    });
+});
+
+test("credit: two offline approvals racing on different targets apply exactly one credit", { skip }, async () => {
+    await withCreditWorld(`cr2${Date.now()}`, async (db, ids) => {
+        const results = await Promise.all([offlineCredit(ids, db, ids.cabinets), offlineCredit(ids, db, ids.final)]);
+        assert.equal(results.filter((r) => r.ok).length, 1, JSON.stringify(results));
+        assert.equal((await creditMarkers(db, ids)).length, 1);
+        const invoice = await db.invoice.findUniqueOrThrow({ where: { id: ids.invoiceId! } });
+        assert.equal(cents(invoice.totalAmount), 2635136, "the invoice moved by exactly one credit");
+        const rows = await db.paymentSchedule.findMany({ where: { id: { in: [ids.cabinets, ids.final] } } });
+        assert.equal(rows.filter((row) => cents(row.amount) === 650624 || cents(row.amount) === 567936).length, 1);
+    });
+});
+
+test("credit: the signed path applies onto the default, and a second bill is alreadyBilled with no second change", { skip }, async () => {
+    await withCreditWorld(`cr3${Date.now()}`, async (db, ids) => {
+        const { approveChangeOrderCore } = await import("../src/lib/change-order-core");
+        const { billChangeOrderCore } = await import("../src/lib/billing-core");
+        const approval = await approveChangeOrderCore(ids.changeOrderId, signature());
+        assert.equal(approval?.transitioned, true);
+
+        const quietBill = { logActivity: async () => {}, revalidatePath: () => {} };
+        const first = await billChangeOrderCore(ids.changeOrderId, quietBill);
+        assert.equal(first.ok, true, JSON.stringify(first));
+        if (!first.ok) return;
+        assert.equal(first.alreadyBilled, false);
+        assert.equal(first.credit?.milestoneId, ids.final);
+        assert.equal(cents((await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.final } })).amount), 567936);
+        assert.equal(cents((await db.invoice.findUniqueOrThrow({ where: { id: ids.invoiceId! } })).totalAmount), 2635136);
+
+        const second = await billChangeOrderCore(ids.changeOrderId, quietBill);
+        assert.equal(second.ok, true);
+        if (!second.ok) return;
+        assert.equal(second.alreadyBilled, true);
+        assert.equal(cents((await db.paymentSchedule.findUniqueOrThrow({ where: { id: ids.final } })).amount), 567936);
+        assert.equal(cents((await db.invoice.findUniqueOrThrow({ where: { id: ids.invoiceId! } })).totalAmount), 2635136);
+        assert.equal((await creditMarkers(db, ids)).length, 1);
+    });
+});
+
+test("credit: portal signing is refused when the default target cannot take the credit", { skip }, async () => {
+    await withCreditWorld(`cr4${Date.now()}`, async (db, ids) => {
+        await db.paymentSchedule.update({ where: { id: ids.final }, data: { amount: 1000 } });
+        const { approveChangeOrderCore } = await import("../src/lib/change-order-core");
+        await assert.rejects(approveChangeOrderCore(ids.changeOrderId, signature()), /not smaller than Final/);
+        assert.equal((await db.changeOrder.findUniqueOrThrow({ where: { id: ids.changeOrderId } })).status, "Sent");
+    });
+});
+
+test("credit: an invoice a credit was taken off refuses re-splitting", { skip }, async () => {
+    await withCreditWorld(`cr5${Date.now()}`, async (db, ids) => {
+        assert.equal((await offlineCredit(ids, db, null)).ok, true);
+        const { splitInvoiceMilestonesCore } = await import("../src/lib/billing-core");
+        await assert.rejects(splitInvoiceMilestonesCore(ids.invoiceId!, [{ name: "Replacement", amount: 100 }]), /is a credit that was taken off one of its milestones/);
+        assert.equal(await db.paymentSchedule.count({ where: { invoiceId: ids.invoiceId! } }), 3);
     });
 });

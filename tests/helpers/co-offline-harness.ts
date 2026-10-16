@@ -60,6 +60,12 @@ export function evalWhere(row: Row, where: Row | undefined): Tri {
         else if (RELATIONS.has(key) && typeof cond === "object" && cond !== null && !(cond instanceof Date)) continue;
         else if (cond === null) parts.push(row[key] === null || row[key] === undefined);
         else if (typeof cond !== "object" || cond instanceof Date) parts.push(cmp(row[key], "equals", cond) === null ? false : row[key] === cond || (cond instanceof Date && row[key] instanceof Date && row[key].getTime() === cond.getTime()));
+        // Prisma JSON filter on PostgreSQL: { path: ["a", "b"], equals: value }.
+        else if (Array.isArray((cond as Row).path)) {
+            const { path, ...ops } = cond as Row;
+            const value = (path as string[]).reduce((node: unknown, segment) => (node == null ? undefined : (node as Row)[segment]), row[key] as unknown);
+            parts.push(and3(Object.entries(ops).map(([op, arg]) => cmp(value, op, arg))));
+        }
         else parts.push(and3(Object.entries(cond).map(([op, arg]) => cmp(row[key], op, arg))));
     }
     return and3(parts);
@@ -76,6 +82,7 @@ export type WorldOptions = {
     itemUnitCosts?: number[];
     withInvoice?: boolean;
     signed?: boolean; // customer signed in the portal: approvalSource null, approvedBy set
+    taxRatePercent?: number; // the CO's estimate rate (default 10)
 };
 
 export function makeWorld(options: WorldOptions = {}) {
@@ -83,6 +90,7 @@ export function makeWorld(options: WorldOptions = {}) {
     const subtotal = itemCosts.reduce((sum, value) => sum + value, 0);
     const state: {
         co: Row; items: Row[]; schedules: Row[]; estimate: Row; invoices: Row[]; milestones: Row[]; activity: Row[]; settings: Row;
+        billings: Row[]; estimateSchedules: Row[];
     } = {
         co: {
             id: "co-1", code: "CO-00001", title: "Example change", status: options.status ?? "Sent",
@@ -96,13 +104,15 @@ export function makeWorld(options: WorldOptions = {}) {
         schedules: (options.scheduleAmounts ?? []).map((amount, index) => ({
             id: `cos-${index + 1}`, name: `Payment ${index + 1}`, amount, dueDate: null, order: index, createdAt: new Date(2026, 8, 1, 0, index),
         })),
-        estimate: { taxExempt: false, taxRatePercent: 10, taxRateName: "Sales tax" },
+        estimate: { taxExempt: false, taxRatePercent: options.taxRatePercent ?? 10, taxRateName: "Sales tax" },
         invoices: options.withInvoice === false ? [] : [{
             id: "inv-1", code: "INV-00001", status: "Issued", estimateId: "est-1", projectId: "proj-1",
             subtotal: 5000, taxAmount: 500, totalAmount: 5500, balanceDue: 5500,
         }],
         milestones: [],
         activity: [],
+        billings: [], // ChangeOrderBilling rows
+        estimateSchedules: [], // EstimatePaymentSchedule rows: { id, order, plus name/amount/status when a test mirrors }
         settings: { timeZone: "America/Los_Angeles", notificationEmail: TEAM_EMAIL, email: OFFICE_EMAIL, companyName: "Test Co", notificationToggles: null, phone: null },
     };
 
@@ -119,7 +129,11 @@ export function makeWorld(options: WorldOptions = {}) {
         client: { id: "client-1", name: "Customer A", email: CLIENT_EMAIL },
         payments: state.milestones.filter((m) => m.invoiceId === inv.id),
     });
-    const milestoneView = (m: Row) => ({ ...m, invoice: invoiceView(state.invoices.find((i) => i.id === m.invoiceId) ?? state.invoices[0]) });
+    const milestoneView = (m: Row) => ({
+        ...m,
+        invoice: invoiceView(state.invoices.find((i) => i.id === m.invoiceId) ?? state.invoices[0]),
+        coBilling: state.billings.find((b) => b.paymentScheduleId === m.id) ?? null,
+    });
 
     const applyData = (row: Row, data: Row) => {
         for (const [key, value] of Object.entries(data)) {
@@ -141,9 +155,36 @@ export function makeWorld(options: WorldOptions = {}) {
             findMany: async () => state.schedules.map((row) => ({ ...row })),
         },
         estimate: { findUnique: async () => ({ ...state.estimate }) },
-        estimatePaymentSchedule: { findMany: async () => [] },
+        estimatePaymentSchedule: {
+            findMany: async ({ where }: Row = {}) => state.estimateSchedules.filter((row) => matches(row, where)).map((row) => ({ ...row })),
+            updateMany: async ({ where, data }: Row) => {
+                const hit = state.estimateSchedules.filter((row) => matches(row, where));
+                for (const row of hit) applyData(row, data);
+                return { count: hit.length };
+            },
+        },
+        changeOrderBilling: {
+            findFirst: async ({ where }: Row = {}) => {
+                const row = state.billings.find((b) => matches(b, where));
+                return row ? { ...row, changeOrder: { code: state.co.code } } : null;
+            },
+            findMany: async ({ where }: Row = {}) => state.billings.filter((b) => matches(b, where)).map((row) => ({ ...row })),
+            create: async ({ data }: Row) => {
+                seq += 1;
+                const row = { id: `cob-${seq}`, createdAt: new Date(), ...data };
+                state.billings.push(row);
+                return { ...row };
+            },
+        },
+        project: {
+            findUnique: async () => ({ name: "Example Project", client: { id: "client-1", name: "Customer A", email: CLIENT_EMAIL, additionalEmail: null } }),
+        },
         invoice: {
-            findFirst: async () => (state.invoices[0] ? { id: state.invoices[0].id, code: state.invoices[0].code, status: state.invoices[0].status } : null),
+            // First match in array order (the fixtures list the newest invoice first).
+            findFirst: async ({ where }: Row = {}) => {
+                const inv = state.invoices.find((row) => matches(row, where));
+                return inv ? { id: inv.id, code: inv.code, status: inv.status } : null;
+            },
             findUnique: async ({ where }: Row) => {
                 const inv = state.invoices.find((row) => row.id === where.id);
                 return inv ? invoiceView(inv) : null;
@@ -169,6 +210,7 @@ export function makeWorld(options: WorldOptions = {}) {
                 const row = {
                     id: `ms-${seq}`, qbInvoiceSentAt: null, qbInvoiceId: null, qbInvoiceLink: null, lastReminderAt: null, receiptSentAt: null,
                     sourceScheduleId: null, paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, qbSyncError: null,
+                    createdAt: new Date(NOW.getTime() + seq),
                     ...data,
                 };
                 state.milestones.push(row);
@@ -192,24 +234,23 @@ export function makeWorld(options: WorldOptions = {}) {
         },
     };
 
-    const fakeTx = (): Row => ({
-        ...models,
-        $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
-            const text = strings.join("?");
-            if (text.includes('FROM "PaymentSchedule"')) {
-                const row = state.milestones.find((m) => m.id === values[0]);
-                return row ? [{ sourceChangeOrderId: row.sourceChangeOrderId ?? null, qbInvoiceSentAt: row.qbInvoiceSentAt ?? null }] : [];
-            }
-            if (!text.includes('FROM "ChangeOrder"')) return [];
-            const co = { ...state.co };
-            return [co];
-        },
-    });
+    const queryRaw = async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const text = strings.join("?");
+        if (text.includes('FROM "PaymentSchedule"')) {
+            const row = state.milestones.find((m) => m.id === values[0]);
+            return row ? [{ sourceChangeOrderId: row.sourceChangeOrderId ?? null, qbInvoiceSentAt: row.qbInvoiceSentAt ?? null }] : [];
+        }
+        if (!text.includes('FROM "ChangeOrder"')) return [];
+        const co = { ...state.co };
+        return [co];
+    };
+    const fakeTx = (): Row => ({ ...models, $queryRaw: queryRaw });
 
     const fakePrisma: Row = {
         ...models,
+        $queryRaw: queryRaw,
         $transaction: async (callback: (tx: Row) => Promise<unknown>) => {
-            const snapshot = structuredClone({ co: state.co, milestones: state.milestones, invoices: state.invoices, activity: state.activity });
+            const snapshot = structuredClone({ co: state.co, milestones: state.milestones, invoices: state.invoices, activity: state.activity, billings: state.billings, estimateSchedules: state.estimateSchedules });
             try {
                 return await callback(fakeTx());
             } catch (error) {
@@ -217,6 +258,8 @@ export function makeWorld(options: WorldOptions = {}) {
                 state.milestones = snapshot.milestones;
                 state.invoices = snapshot.invoices;
                 state.activity = snapshot.activity;
+                state.billings = snapshot.billings;
+                state.estimateSchedules = snapshot.estimateSchedules;
                 throw error;
             }
         },

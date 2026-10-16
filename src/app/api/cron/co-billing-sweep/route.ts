@@ -39,6 +39,13 @@ async function handleGET(request: Request) {
 
     const results: Array<{ code: string; action: string }> = [];
     for (const co of candidates) {
+        // A credit change order writes no milestone of its own, only a ChangeOrderBilling
+        // marker, so the name-prefix check below can't see it. Any billing row means billed.
+        const billingRow = await prisma.changeOrderBilling.findFirst({ where: { changeOrderId: co.id }, select: { id: true } });
+        if (billingRow) {
+            results.push({ code: co.code, action: "skipped (already billed)" });
+            continue;
+        }
         const billedAlready = await prisma.paymentSchedule.findFirst({
             where: {
                 name: { startsWith: `${co.code} — ` },
@@ -56,7 +63,13 @@ async function handleGET(request: Request) {
             results.push({ code: co.code, action: "skipped (offline approval)" });
             continue;
         }
-        results.push({ code: co.code, action: outcome.sent ? "billed + sent" : `alerted: ${outcome.issues.join("; ")}` });
+        // Billed with nothing sent and no issue is a credit change order: it lowered an existing
+        // milestone and deliberately sends the customer nothing. That is success, not an alert.
+        const creditApplied = outcome.billed && !outcome.sent && outcome.issues.length === 0;
+        results.push({
+            code: co.code,
+            action: outcome.sent ? "billed + sent" : creditApplied ? "credit applied (nothing to send)" : `alerted: ${outcome.issues.join("; ")}`,
+        });
     }
 
     if (results.some(r => !r.action.startsWith("skipped"))) {

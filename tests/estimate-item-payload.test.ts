@@ -659,12 +659,23 @@ test("a cost-plus CO is reported, never scored against its item subtotal", () =>
     assert.equal(classifyCoTotal(5000, 1000, 1088, 4, 1, "COST_PLUS"), "has-sections");
 });
 
-test("a nonpositive total is unpriced, not ok — the guards reject it either way", () => {
-    // storedCents <= 0 || renderedCents <= 0 is its own rejection in both guards, so equality
-    // at zero is an "ok" that still cannot send, and writing the subtotal back fixes nothing.
+test("a $0 total is unpriced, not ok — the guards reject it either way", () => {
+    // A $0 stored or rendered subtotal is its own rejection in both guards, so equality at zero
+    // is an "ok" that still cannot send, and writing the subtotal back fixes nothing.
     assert.equal(classifyCoTotal(0, 0, 0, 3, 0), "unpriced");
-    assert.equal(classifyCoTotal(-50, -50, -50, 3, 0), "unpriced");
     assert.equal(classifyCoTotal(1000, 0, 0, 3, 0), "unpriced");
+    assert.equal(classifyCoTotal(0, -50, -54.4, 3, 0), "unpriced");
+});
+
+test("a negative total that matches its items is a credit change order, and ok", () => {
+    // Send and approve accept a FIXED credit, so the audit must not call it unpriced.
+    assert.equal(classifyCoTotal(-50, -50, -55, 3, 0), "ok");
+    assert.equal(classifyCoTotal(-3020, -3020, -3285.76, 1, 0), "ok");
+    // A credit out of sync with its items is drift, never tax-inflated (that window is above the subtotal).
+    assert.equal(classifyCoTotal(-3285.76, -3020, -3285.76, 1, 0), "drift");
+    assert.equal(classifyCoTotal(-50, 50, 55, 3, 0), "drift");
+    // Cost-plus is unchanged: reported, never scored.
+    assert.equal(classifyCoTotal(-50, -50, -55, 3, 0, "COST_PLUS"), "cost-plus");
 });
 
 test("an omitted type keeps the stored one, so the persisted total stays reproducible", () => {

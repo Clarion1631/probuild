@@ -6,6 +6,7 @@ import { currentStaffUserOrNull, isAdminOrManager } from "@/lib/permissions";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { isOfflineApproval, offlineApprovalSummary } from "@/lib/change-order-offline-approval";
+import { creditTargetError } from "@/lib/change-order-credit";
 
 export const dynamic = "force-dynamic";
 
@@ -41,11 +42,39 @@ export default async function ChangeOrderPage({
         && isAdminOrManager(staff)
         && (co.status === "Draft" || co.status === "Sent")
         && !hasApprovalOnFile;
+    // A FIXED credit (negative subtotal) lowers one unpaid milestone on the invoice, so
+    // "Mark approved" needs the milestones it can come off. Plain values only.
+    const isCredit = co.pricingType !== "COST_PLUS" && Math.round(Number(co.totalAmount) * 100) < 0;
+    // Loaded lazily (like the server actions do) so the page only pulls billing-core for a credit.
+    const creditTargets = canMarkApproved && isCredit
+        ? await (await import("@/lib/billing-core")).getChangeOrderCreditTargets(co.id)
+        : null;
+    const credit = creditTargets
+        ? {
+            estimateCode: co.estimate?.code ?? null,
+            invoiceCode: creditTargets.invoice?.code ?? null,
+            taxLabel: creditTargets.credit.taxLabel,
+            creditAmount: creditTargets.credit.totalCents / 100,
+            rows: creditTargets.rows
+                .filter((row) => row.eligible)
+                .map((row) => ({
+                    id: row.id,
+                    name: row.name,
+                    amount: row.amountCents / 100,
+                    newAmount: row.newAmountCents / 100,
+                    fits: row.fits,
+                    reason: row.reason,
+                })),
+            defaultId: creditTargets.defaultId,
+            error: creditTargetError(co.code, creditTargets, null),
+        }
+        : null;
     const offline = {
         canMarkApproved,
         todayKey: dayKeyInTimeZone(new Date(), timeZone),
         staffName: (staff?.name?.trim() || staff?.email || "") as string,
         summary: isOfflineApproval(co as any) ? offlineApprovalSummary(co as any, timeZone) : null,
+        credit,
     };
 
     return (

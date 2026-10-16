@@ -1406,7 +1406,8 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     // the same Subtotal / Tax / Revised Amount breakdown the customer signs on the
     // portal page so the PDF and signature page never disagree.
     const coSubtotal = Math.round((Number(co.totalAmount) || 0) * 100) / 100;
-    const coTax = Math.round(coSubtotal * coTaxRate(co.estimate) * 100) / 100;
+    // `|| 0`: a tax-exempt credit would otherwise print "-$0.00" tax.
+    const coTax = Math.round(coSubtotal * coTaxRate(co.estimate) * 100) / 100 || 0;
     const coTotal = Math.round((coSubtotal + coTax) * 100) / 100;
 
     const drawCoTotalRow = (label: string, value: string, size: number, font: PDFFont, color: ReturnType<typeof rgb>) => {
@@ -1423,7 +1424,8 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         drawCoTotalRow(coTaxLabel(co.estimate), formatCurrency(coTax), 10, helvetica, colors.textMain);
         y -= 22;
         checkNewPage(60);
-        drawCoTotalRow('Revised Amount', formatCurrency(coTotal), 14, helveticaBold, colors.primary);
+        // A negative fixed-price total is a credit; the numbers are already signed.
+        drawCoTotalRow(coTotal < 0 ? 'Credit Amount' : 'Revised Amount', formatCurrency(coTotal), 14, helveticaBold, colors.primary);
     }
 
     if (co.pricingType === 'FIXED' && co.paymentSchedules.length > 0) {

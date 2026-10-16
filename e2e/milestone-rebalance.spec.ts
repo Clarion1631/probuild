@@ -4,6 +4,7 @@ import {
     updatePendingMilestoneAmountsCore,
     deleteInvoiceMilestoneCore,
     splitInvoiceMilestonesCore,
+    approveChangeOrderOfflineCore,
 } from "../src/lib/billing-core";
 
 /**
@@ -29,6 +30,8 @@ const num = (v: unknown) => Number(v);
 
 async function afterAllCleanup() {
     try {
+        // Cascades the change order's ChangeOrderBilling (credit marker) rows.
+        await prisma.changeOrder.deleteMany({ where: { id: { startsWith: PFX } } });
         await prisma.paymentSchedule.deleteMany({ where: { id: { startsWith: PFX } } });
         await prisma.invoice.deleteMany({ where: { id: { startsWith: PFX } } });
         await prisma.estimatePaymentSchedule.deleteMany({ where: { id: { startsWith: PFX } } });
@@ -244,6 +247,73 @@ test.describe.serial("updatePendingMilestoneAmountsCore", () => {
         const x = await prisma.paymentSchedule.findUnique({ where: { id: psExtra } });
         expect(num(m!.amount)).toBe(400); // unchanged
         expect(num(x!.amount)).toBe(600); // unchanged
+    });
+
+    test("after a credit change order, rebalancing keeps the credited row's estimate mirror at invoice + credit", async () => {
+        await ensureClientAndProject();
+        const suffix = "credit";
+        const estimateId = `${PFX}-est-${suffix}`;
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const epsA = `${PFX}-eps-a-${suffix}`;
+        const epsB = `${PFX}-eps-b-${suffix}`;
+        const psA = `${PFX}-ps-a-${suffix}`;
+        const psB = `${PFX}-ps-b-${suffix}`;
+        const coId = `${PFX}-co-${suffix}`;
+
+        await prisma.estimate.create({
+            data: { id: estimateId, title: "MR Estimate", code: `EST-MR-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 2000, balanceDue: 2000, taxRatePercent: 10, taxRateName: "Sales tax" },
+        });
+        await prisma.estimatePaymentSchedule.create({ data: { id: epsA, estimateId, name: "Deposit", amount: 1000, status: "Pending", order: 1 } });
+        await prisma.estimatePaymentSchedule.create({ data: { id: epsB, estimateId, name: "Final", amount: 1000, status: "Pending", order: 2 } });
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", subtotal: 2000, totalAmount: 2000, balanceDue: 2000 },
+        });
+        await prisma.paymentSchedule.create({ data: { id: psA, invoiceId, name: "Deposit", amount: 1000, status: "Pending", sourceScheduleId: epsA } });
+        await prisma.paymentSchedule.create({ data: { id: psB, invoiceId, name: "Final", amount: 1000, status: "Pending", sourceScheduleId: epsB } });
+        // A -$100.00 credit at 10% tax: -$110.00 comes off the milestone staff pick.
+        const co = await prisma.changeOrder.create({
+            data: {
+                id: coId, projectId: `${PFX}-project`, estimateId, code: `CO-MR-${suffix}`, title: "Remove upgrade", status: "Sent",
+                pricingType: "FIXED", totalAmount: -100, balanceDue: -100,
+                items: { create: [{ name: "Remove upgrade", type: "Material", quantity: 1, unitCost: -100, total: -100 }] },
+            },
+        });
+
+        const credit = await approveChangeOrderOfflineCore(coId, {
+            method: "PHONE",
+            // Yesterday by UTC is never in the future in the company zone (UTC-7/-8).
+            approvedOn: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10),
+            expectedUpdatedAt: co.updatedAt.toISOString(),
+            actor: { userId: "playwright", name: "Office Manager" },
+            targetMilestoneId: psB,
+        }, { logActivity: async () => {}, applySchedule: async () => {}, notifyTeam: (async () => ({ success: true })) as never, revalidatePath: () => {} });
+        expect(credit.ok).toBe(true);
+        expect(num((await prisma.paymentSchedule.findUnique({ where: { id: psB } }))!.amount)).toBe(890);
+        expect(num((await prisma.estimatePaymentSchedule.findUnique({ where: { id: epsB } }))!.amount)).toBe(1000);
+
+        // Move $100 from Deposit to the credited Final: the mirror is 990 + 110, not 990.
+        const res = await updatePendingMilestoneAmountsCore(invoiceId, [
+            { scheduleId: psA, name: "Deposit", amount: 900 },
+            { scheduleId: psB, name: "Final", amount: 990 },
+        ]);
+        expect(res).toEqual({ success: true, warnings: [] });
+        expect(num((await prisma.paymentSchedule.findUnique({ where: { id: psB } }))!.amount)).toBe(990);
+        expect(num((await prisma.estimatePaymentSchedule.findUnique({ where: { id: epsB } }))!.amount)).toBe(1100);
+        expect(num((await prisma.estimatePaymentSchedule.findUnique({ where: { id: epsA } }))!.amount)).toBe(900);
+
+        // A rebalance that leaves the credited row alone keeps it at invoice + credit too.
+        const again = await updatePendingMilestoneAmountsCore(invoiceId, [
+            { scheduleId: psA, name: "Deposit (revised)", amount: 900 },
+            { scheduleId: psB, name: "Final", amount: 990 },
+        ]);
+        expect(again.success).toBe(true);
+        expect(num((await prisma.estimatePaymentSchedule.findUnique({ where: { id: epsB } }))!.amount)).toBe(1100);
+
+        const eps = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
+        expect(eps.reduce((sum, row) => sum + num(row.amount), 0)).toBe(2000); // still the contract total
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.totalAmount)).toBe(1890);
+        expect(num(invoice!.balanceDue)).toBe(1890);
     });
 });
 

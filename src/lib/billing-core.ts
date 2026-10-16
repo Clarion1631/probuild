@@ -1516,7 +1516,7 @@ export async function sendMilestoneInvoicesCore(
 
 type CoInvoiceTarget = { id: string; code: string; status: string };
 
-async function findChangeOrderInvoice(
+export async function findChangeOrderInvoice(
     tx: Prisma.TransactionClient,
     co: { estimateId: string; projectId: string },
 ): Promise<CoInvoiceTarget | null> {
@@ -1991,8 +1991,17 @@ async function billChangeOrderCoreLegacy(changeOrderId: string) {
  * The billing transaction body, extracted so the offline approval can bill in
  * the SAME transaction that flips the status. Behavior is unchanged: locks the
  * CO row, then estimate -> invoice, and returns the outcome union.
+ *
+ * A credit CO (subtotal < 0) goes to applyChangeOrderCreditInTx instead: it lowers
+ * one existing milestone and returns `credit` with an empty `milestones` list.
+ * `opts` only matters for a credit: the offline path passes the staff-picked
+ * target and its own actor; the signed path takes the default target.
  */
-export async function billChangeOrderInTx(tx: Prisma.TransactionClient, changeOrderId: string) {
+export async function billChangeOrderInTx(
+    tx: Prisma.TransactionClient,
+    changeOrderId: string,
+    opts: { creditTargetMilestoneId?: string | null; creditActor?: string } = {},
+) {
     const locked = await tx.$queryRaw<Array<{
         id: string; code: string; title: string; status: string; pricingType: string;
         totalAmount: unknown; projectId: string; estimateId: string;
@@ -2020,6 +2029,29 @@ export async function billChangeOrderInTx(tx: Prisma.TransactionClient, changeOr
     if (sectionRows.length > 0) return { ok: false as const, error: coSectionRowError(co.code, sectionRows) };
 
     const subtotalCents = Math.round(Number(co.totalAmount) * 100);
+    if (subtotalCents < 0) {
+        // Credit: never a PaymentSchedule row. It lowers one unpaid milestone on the
+        // CO's invoice (idempotent on the ChangeOrderBilling marker it writes).
+        const applied = await applyChangeOrderCreditInTx(tx, co.id, {
+            targetMilestoneId: opts.creditTargetMilestoneId ?? null,
+            actor: opts.creditActor ?? "Customer signature",
+        });
+        if (!applied.ok) return { ok: false as const, error: applied.error };
+        return {
+            ok: true as const,
+            alreadyBilled: applied.alreadyBilled,
+            milestones: [] as BilledCoMilestone[],
+            subtotal: applied.credit.subtotal,
+            taxAmount: applied.credit.taxAmount,
+            amount: applied.credit.amount,
+            taxLabel: applied.credit.taxLabel,
+            invoiceId: applied.credit.invoiceId,
+            invoiceCode: applied.credit.invoiceCode,
+            projectId: co.projectId,
+            coCode: co.code,
+            credit: applied.credit as ChangeOrderCreditApplied | null,
+        };
+    }
     if (subtotalCents <= 0) return { ok: false as const, error: `Change order ${co.code} has a $0 total — nothing to bill.` };
     const estimateTax = await tx.estimate.findUnique({
         where: { id: co.estimateId },
@@ -2148,6 +2180,7 @@ export async function billChangeOrderInTx(tx: Prisma.TransactionClient, changeOr
         invoiceCode: invoice.code,
         projectId: co.projectId,
         coCode: co.code,
+        credit: null as ChangeOrderCreditApplied | null,
     };
 }
 
@@ -2158,6 +2191,7 @@ export async function billChangeOrderCore(
     const outcome = await withTxRetry(() => prisma.$transaction((tx) => billChangeOrderInTx(tx, changeOrderId), { timeout: 15_000 }));
 
     if (!outcome.ok) return outcome;
+    const credit = outcome.credit;
     try {
         await (dependencies.logActivity ?? logActivityLazy)({
             projectId: outcome.projectId,
@@ -2167,12 +2201,36 @@ export async function billChangeOrderCore(
             entityType: "invoice",
             entityId: outcome.invoiceId,
             entityName: `Invoice ${outcome.invoiceCode}`,
-            metadata: { changeOrder: outcome.coCode, milestones: outcome.milestones.map((row) => row.name), amount: outcome.amount },
+            metadata: credit
+                ? { changeOrder: outcome.coCode, credit: true, milestone: credit.milestoneName, beforeAmount: credit.beforeAmount, afterAmount: credit.afterAmount, amount: outcome.amount }
+                : { changeOrder: outcome.coCode, milestones: outcome.milestones.map((row) => row.name), amount: outcome.amount },
         });
     } catch { /* activity feed only */ }
     (dependencies.revalidatePath ?? revalidatePath)(`/projects/${outcome.projectId}/invoices`);
     (dependencies.revalidatePath ?? revalidatePath)(`/projects/${outcome.projectId}/invoices/${outcome.invoiceId}`);
     (dependencies.revalidatePath ?? revalidatePath)("/invoices");
+    if (credit) {
+        // A credit has no milestone of its own: report the milestone it lowered.
+        const move = `${formatCurrency(credit.beforeAmount)} → ${formatCurrency(credit.afterAmount)}`;
+        return {
+            ok: true as const,
+            alreadyBilled: outcome.alreadyBilled,
+            invoiceId: outcome.invoiceId,
+            invoiceCode: outcome.invoiceCode,
+            milestoneId: credit.milestoneId,
+            milestoneName: credit.milestoneName,
+            milestones: outcome.milestones,
+            amount: outcome.amount,
+            subtotal: outcome.subtotal,
+            taxAmount: outcome.taxAmount,
+            taxLabel: outcome.taxLabel,
+            milestoneStatus: "Pending",
+            credit: credit as ChangeOrderCreditApplied | null,
+            note: outcome.alreadyBilled
+                ? `This credit was already taken off ${credit.milestoneName} on ${credit.invoiceCode} (${move}).`
+                : `Credit of ${formatCurrency(Math.abs(credit.amount))} taken off ${credit.milestoneName} on ${credit.invoiceCode} (${move}).`,
+        };
+    }
     const first = outcome.milestones[0];
     return {
         ok: true as const,
@@ -2187,6 +2245,7 @@ export async function billChangeOrderCore(
         taxAmount: outcome.taxAmount,
         taxLabel: outcome.taxLabel,
         milestoneStatus: first.status,
+        credit: null as ChangeOrderCreditApplied | null,
         note: outcome.alreadyBilled
             ? "This change order is already on the invoice — use send_milestone_invoice if it still needs to go out."
             : `Added ${outcome.milestones.length} milestone${outcome.milestones.length === 1 ? "" : "s"} for ${formatCurrency(outcome.amount)}.`,
@@ -2203,6 +2262,290 @@ import {
     offlineApprovalMethodPhrase,
     parseOfflineApprovalInput,
 } from "./change-order-offline-approval";
+import {
+    CO_CREDIT_CHANGED_ERROR,
+    buildCreditTargets,
+    coCreditCents,
+    coCreditCostPlusError,
+    coCreditScheduleRowsError,
+    creditTargetError,
+    planCreditReduction,
+    type CoCreditCents,
+    type CreditTargetRow,
+} from "./change-order-credit";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Credit change orders (FIXED, subtotal < 0). Approving one LOWERS one existing
+// unpaid milestone on the CO's invoice by the credit including tax. No negative
+// milestones, no QuickBooks credit memo, no spreading across milestones, and the
+// customer is never sent a payment email for a credit. The pure rules (cents,
+// eligibility, ranking, fit, refusal text) live in change-order-credit.ts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type BilledCoMilestone = {
+    id: string; name: string; amount: number; pretaxAmount: number; taxAmount: number; status: string; created: boolean;
+};
+
+/** Where a credit landed: the milestone it lowered, before and after, and the credit itself (negative). */
+export type ChangeOrderCreditApplied = {
+    invoiceId: string;
+    invoiceCode: string;
+    milestoneId: string;
+    milestoneName: string;
+    beforeAmount: number;
+    afterAmount: number;
+    subtotal: number;
+    taxAmount: number;
+    amount: number;
+    taxLabel: string;
+};
+
+export type ChangeOrderCreditTargets = {
+    invoice: { id: string; code: string; estimateId: string | null } | null;
+    rows: CreditTargetRow[];
+    defaultId: string | null;
+    credit: CoCreditCents & { rate: number; taxLabel: string };
+};
+
+const CREDIT_MILESTONE_SELECT = {
+    id: true, name: true, invoiceId: true, amount: true, pretaxAmount: true, taxAmount: true, status: true,
+    qbInvoiceId: true, qbSyncError: true, qbInvoiceSentAt: true, lastReminderAt: true,
+    stripeSessionId: true, stripePaymentIntentId: true, paidAt: true,
+    sourceChangeOrderId: true, sourceCoScheduleId: true, sourceScheduleId: true, createdAt: true,
+    coBilling: { select: { id: true } },
+} as const;
+
+/** The credit in cents, taxed at the CO's estimate rate with the display formula. */
+async function creditCentsInTx(tx: Prisma.TransactionClient, co: { estimateId: string; totalAmount: unknown }) {
+    const estimateTax = await tx.estimate.findUnique({
+        where: { id: co.estimateId },
+        select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+    });
+    const rate = coTaxRate(estimateTax);
+    return { ...coCreditCents(co.totalAmount, rate), rate, taxLabel: coTaxLabel(estimateTax) };
+}
+
+/** Every milestone on the invoice, ranked, with eligibility and fit for this credit. */
+async function creditRowsInTx(tx: Prisma.TransactionClient, invoiceId: string, credit: CoCreditCents) {
+    const milestones = await tx.paymentSchedule.findMany({ where: { invoiceId }, select: CREDIT_MILESTONE_SELECT });
+    const sourceIds = [...new Set(milestones.map((row) => row.sourceScheduleId).filter((id): id is string => !!id))];
+    const linked = sourceIds.length > 0
+        ? await tx.estimatePaymentSchedule.findMany({ where: { id: { in: sourceIds } }, select: { id: true, order: true } })
+        : [];
+    const scheduleOrder = new Map(linked.map((row) => [row.id, row.order]));
+    return { milestones, ...buildCreditTargets(milestones, scheduleOrder, credit) };
+}
+
+/**
+ * How much credit (positive cents) credit change orders took off each milestone of this
+ * invoice, keyed by milestone id, from the credit markers (snapshot.kind === "credit").
+ * The estimate mirror of such a milestone is its invoice amount plus this.
+ */
+async function creditCentsByMilestoneInTx(tx: Prisma.TransactionClient, invoiceId: string): Promise<Map<string, number>> {
+    const markers = await tx.changeOrderBilling.findMany({
+        where: { paymentScheduleId: null, snapshot: { path: ["invoiceId"], equals: invoiceId } },
+        select: { totalCents: true, snapshot: true },
+    });
+    const byMilestone = new Map<string, number>();
+    for (const marker of markers) {
+        const snapshot = marker.snapshot as { kind?: unknown; paymentScheduleId?: unknown } | null;
+        if (snapshot?.kind !== "credit" || typeof snapshot.paymentScheduleId !== "string") continue;
+        byMilestone.set(snapshot.paymentScheduleId, (byMilestone.get(snapshot.paymentScheduleId) ?? 0) + Math.abs(marker.totalCents));
+    }
+    return byMilestone;
+}
+
+/**
+ * The credit's invoice (same pick as billing: the CO's estimate's newest invoice,
+ * else the project's newest) and every milestone on it, ranked, with eligibility,
+ * fit, and the default target. Read-only; takes no locks.
+ */
+export async function loadChangeOrderCreditTargetsInTx(
+    tx: Prisma.TransactionClient,
+    co: { id: string; estimateId: string; projectId: string; totalAmount: unknown },
+): Promise<ChangeOrderCreditTargets> {
+    const credit = await creditCentsInTx(tx, co);
+    const found = await findChangeOrderInvoice(tx, co);
+    if (!found) return { invoice: null, rows: [], defaultId: null, credit };
+    const link = await tx.invoice.findUnique({ where: { id: found.id }, select: { estimateId: true } });
+    const { rows, defaultId } = await creditRowsInTx(tx, found.id, credit);
+    return { invoice: { id: found.id, code: found.code, estimateId: link?.estimateId ?? null }, rows, defaultId, credit };
+}
+
+/** Read-only credit targets for the CO editor. Null unless the CO is a FIXED credit. */
+export async function getChangeOrderCreditTargets(changeOrderId: string) {
+    return prisma.$transaction(async (tx) => {
+        const co = await tx.changeOrder.findUnique({
+            where: { id: changeOrderId },
+            select: { id: true, code: true, estimateId: true, projectId: true, totalAmount: true, pricingType: true },
+        });
+        if (!co || co.pricingType === "COST_PLUS" || Math.round(Number(co.totalAmount) * 100) >= 0) return null;
+        return loadChangeOrderCreditTargetsInTx(tx, co);
+    }, { timeout: 15_000 });
+}
+
+function creditFromSnapshot(snapshot: unknown): ChangeOrderCreditApplied {
+    const s = (snapshot ?? {}) as {
+        invoiceId?: unknown; invoiceCode?: unknown; paymentScheduleId?: unknown; milestoneName?: unknown; taxLabel?: unknown;
+        pretaxCents?: unknown; taxCents?: unknown; totalCents?: unknown;
+        before?: { amountCents?: unknown }; after?: { amountCents?: unknown };
+    };
+    return {
+        invoiceId: String(s.invoiceId ?? ""),
+        invoiceCode: String(s.invoiceCode ?? ""),
+        milestoneId: String(s.paymentScheduleId ?? ""),
+        milestoneName: String(s.milestoneName ?? ""),
+        beforeAmount: Number(s.before?.amountCents ?? 0) / 100,
+        afterAmount: Number(s.after?.amountCents ?? 0) / 100,
+        subtotal: Number(s.pretaxCents ?? 0) / 100,
+        taxAmount: Number(s.taxCents ?? 0) / 100,
+        amount: Number(s.totalCents ?? 0) / 100,
+        taxLabel: String(s.taxLabel ?? ""),
+    };
+}
+
+/**
+ * Apply a credit CO to one unpaid milestone. The CALLER holds the CO row lock
+ * (SELECT ... FOR UPDATE), which serializes this with every other apply, approval,
+ * edit and send of the same CO.
+ *
+ * Idempotent on the ChangeOrderBilling marker it writes: a replay returns the
+ * stored result with alreadyBilled and changes nothing.
+ */
+export async function applyChangeOrderCreditInTx(
+    tx: Prisma.TransactionClient,
+    changeOrderId: string,
+    opts: { targetMilestoneId?: string | null; actor: string },
+): Promise<{ ok: true; alreadyBilled: boolean; credit: ChangeOrderCreditApplied } | { ok: false; error: string }> {
+    // Matched on snapshot.kind in code, not with a JSON path filter, so the check reads
+    // the same against PostgreSQL and the in-memory test fake.
+    const prior = await tx.changeOrderBilling.findMany({ where: { changeOrderId }, select: { id: true, snapshot: true } });
+    const priorCredit = prior.find((row) => (row.snapshot as { kind?: unknown } | null)?.kind === "credit");
+    if (priorCredit) return { ok: true, alreadyBilled: true, credit: creditFromSnapshot(priorCredit.snapshot) };
+    if (prior.length > 0) {
+        return { ok: false, error: "This change order already has billing history, so a credit can't be applied to it. Review it in ProBuild." };
+    }
+
+    const co = await tx.changeOrder.findUnique({
+        where: { id: changeOrderId },
+        select: { id: true, code: true, estimateId: true, projectId: true, totalAmount: true, pricingType: true },
+    });
+    if (!co) return { ok: false, error: "Change order not found" };
+    if (co.pricingType === "COST_PLUS") return { ok: false, error: coCreditCostPlusError(co.code) };
+    const credit = await creditCentsInTx(tx, co);
+    if (credit.totalCents >= 0) return { ok: false, error: `Change order ${co.code} is not a credit.` };
+    if (await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId } }) > 0) {
+        return { ok: false, error: coCreditScheduleRowsError(co.code) };
+    }
+
+    const found = await findChangeOrderInvoice(tx, co);
+    if (!found) return { ok: false, error: creditTargetError(co.code, { invoice: null, rows: [], defaultId: null }, null)! };
+    const link = await tx.invoice.findUnique({ where: { id: found.id }, select: { estimateId: true } });
+    // Canonical Estimate -> Invoice order, same as updatePendingMilestoneAmountsCore. Only
+    // the INVOICE's estimate: the milestone and its mirror row belong to it, and the CO's
+    // own estimate can be a different (newer) one; taking both invents a second order.
+    await lockMoneyParents(tx, { estimateId: link?.estimateId ?? null, invoiceId: found.id });
+
+    // Re-read every milestone under the lock; eligibility and fit are decided on this read.
+    const { milestones, rows, defaultId } = await creditRowsInTx(tx, found.id, credit);
+    const targetId = opts.targetMilestoneId ?? defaultId;
+    const refusal = creditTargetError(co.code, { invoice: found, rows, defaultId }, targetId);
+    if (refusal) return { ok: false, error: refusal };
+    const target = milestones.find((row) => row.id === targetId)!;
+    const plan = planCreditReduction(target, credit);
+
+    // CAS on the amount just read and on every eligibility field, so a send, sync,
+    // payment or reminder that lands without the invoice lock can't be overwritten.
+    const updated = await tx.paymentSchedule.updateMany({
+        where: {
+            id: target.id,
+            invoiceId: found.id,
+            amount: target.amount,
+            status: "Pending",
+            qbInvoiceId: null,
+            qbSyncError: null,
+            qbInvoiceSentAt: null,
+            lastReminderAt: null,
+            stripeSessionId: null,
+            stripePaymentIntentId: null,
+            paidAt: null,
+            sourceChangeOrderId: null,
+            sourceCoScheduleId: null,
+        },
+        data: {
+            amount: plan.newAmountCents / 100,
+            // A legacy row with no stored split changes its amount only.
+            ...(plan.after.pretaxCents !== null && plan.after.taxCents !== null
+                ? { pretaxAmount: plan.after.pretaxCents / 100, taxAmount: plan.after.taxCents / 100 }
+                : {}),
+        },
+    });
+    if (updated.count !== 1) return { ok: false, error: CO_CREDIT_CHANGED_ERROR };
+
+    // billChangeOrderInTx's totals math with negative increments. Status is unchanged:
+    // the target was Pending, so the invoice was not Paid and still has a balance.
+    await tx.invoice.update({
+        where: { id: found.id },
+        data: {
+            subtotal: { increment: credit.pretaxCents / 100 },
+            taxAmount: { increment: credit.taxCents / 100 },
+            totalAmount: { increment: credit.totalCents / 100 },
+            balanceDue: { increment: credit.totalCents / 100 },
+        },
+    });
+
+    // The EstimatePaymentSchedule mirror row (target.sourceScheduleId) is deliberately
+    // NOT lowered. When the milestone is paid, its estimate row settles Paid at its own
+    // amount, so the estimate's balance closes to zero: the contract is settled net of
+    // the credit. Lowering the mirror too would leave a permanent phantom balance on the
+    // estimate (the credit counted twice).
+
+    const applied: ChangeOrderCreditApplied = {
+        invoiceId: found.id,
+        invoiceCode: found.code,
+        milestoneId: target.id,
+        milestoneName: target.name,
+        beforeAmount: plan.amountCents / 100,
+        afterAmount: plan.newAmountCents / 100,
+        subtotal: credit.pretaxCents / 100,
+        taxAmount: credit.taxCents / 100,
+        amount: credit.totalCents / 100,
+        taxLabel: credit.taxLabel,
+    };
+    // A NEW kind of ChangeOrderBilling row: fixed COs never wrote one before (only
+    // cost-plus billing runs did). It is the credit's idempotency marker and audit
+    // record. paymentScheduleId stays null on purpose: a linked coBilling marks a
+    // milestone as billing a CO (backup PDF, eligibility), and the lowered milestone
+    // still bills the original contract. snapshot.kind === "credit" tells it apart.
+    await tx.changeOrderBilling.create({
+        data: {
+            changeOrderId: co.id,
+            paymentScheduleId: null,
+            label: `Credit applied to ${target.name}`.slice(0, 300),
+            laborCents: 0,
+            expenseCents: 0,
+            markupCents: 0,
+            taxCents: credit.taxCents,
+            totalCents: credit.totalCents,
+            snapshot: {
+                kind: "credit",
+                invoiceId: found.id,
+                invoiceCode: found.code,
+                paymentScheduleId: target.id,
+                milestoneName: target.name,
+                rate: credit.rate,
+                taxLabel: credit.taxLabel,
+                pretaxCents: credit.pretaxCents,
+                taxCents: credit.taxCents,
+                totalCents: credit.totalCents,
+                before: { amountCents: plan.amountCents, pretaxCents: plan.before.pretaxCents, taxCents: plan.before.taxCents },
+                after: { amountCents: plan.newAmountCents, pretaxCents: plan.after.pretaxCents, taxCents: plan.after.taxCents },
+            },
+            createdBy: opts.actor,
+        },
+    });
+    return { ok: true, alreadyBilled: false, credit: applied };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Office-side "Mark approved": the customer approved outside ProBuild (phone,
@@ -2221,6 +2564,8 @@ export type OfflineApprovalResult =
             | {
                 invoiceId: string; invoiceCode: string; amount: number; subtotal: number; taxAmount: number;
                 milestones: Array<{ id: string; name: string; amount: number; created: boolean }>;
+                /** Set for a credit CO: the milestone it lowered. `milestones` is then empty. */
+                credit?: ChangeOrderCreditApplied;
             }
             | null;
         warnings: string[];
@@ -2237,6 +2582,8 @@ export async function approveChangeOrderOfflineCore(
         note?: unknown;
         expectedUpdatedAt: string;
         actor: { userId: string; name: string };
+        /** Credit COs only: the milestone staff picked. Null/omitted takes the default (last eligible). */
+        targetMilestoneId?: string | null;
     },
     dependencies: {
         now?: () => Date;
@@ -2308,8 +2655,10 @@ export async function approveChangeOrderOfflineCore(
             }
 
             const pricingType = current.pricingType === "COST_PLUS" ? "COST_PLUS" as const : "FIXED" as const;
+            const isCredit = pricingType === "FIXED" && Math.round(Number(current.totalAmount) * 100) < 0;
             if (pricingType === "FIXED") {
                 const schedules = await tx.changeOrderPaymentSchedule.findMany({ where: { changeOrderId }, select: { amount: true } });
+                if (isCredit && schedules.length > 0) return { ok: false, code: "INVALID", error: coCreditScheduleRowsError(current.code) };
                 const scheduleError = "The payment schedule doesn't add up to the subtotal. Fix the schedule, then try again.";
                 if (schedules.length === 1) return { ok: false, code: "INVALID", error: scheduleError };
                 if (schedules.length > 0) {
@@ -2335,14 +2684,25 @@ export async function approveChangeOrderOfflineCore(
 
             let bill: Extract<Awaited<ReturnType<typeof billChangeOrderInTx>>, { ok: true }> | null = null;
             if (pricingType === "FIXED") {
-                const result = await billChangeOrderInTx(tx, changeOrderId);
-                if (!result.ok) throw new OfflineApprovalBillingError(`Couldn't add ${current.code} to the invoice: ${result.error}`);
+                // A credit lands on the milestone staff picked, validated inside the apply under
+                // the invoice lock (never pre-refused by a default-target check).
+                const result = await billChangeOrderInTx(tx, changeOrderId, {
+                    creditTargetMilestoneId: input.targetMilestoneId ?? null,
+                    creditActor: staffName,
+                });
+                if (!result.ok) {
+                    throw new OfflineApprovalBillingError(isCredit
+                        ? `Couldn't apply credit ${current.code}: ${result.error}`
+                        : `Couldn't add ${current.code} to the invoice: ${result.error}`);
+                }
                 bill = result;
                 // billChangeOrderInTx may REUSE a milestone staff created by hand with the CO's
                 // name. Give it the same provenance a new milestone gets, in this same transaction,
                 // so it is held from automatic reminders and receipts exactly like the others. Done
-                // here, not in the shared biller, so the signed path is untouched.
-                const reusedIds = result.milestones.filter((row) => !row.created).map((row) => row.id);
+                // here, not in the shared biller, so the signed path is untouched. Never for a
+                // credit: it lowers one of the estimate's own milestones, and stamping
+                // sourceChangeOrderId on that row would mislabel the contract milestone as CO billing.
+                const reusedIds = result.credit ? [] : result.milestones.filter((row) => !row.created).map((row) => row.id);
                 if (reusedIds.length > 0) {
                     const scheduleRows = await tx.changeOrderPaymentSchedule.findMany({ where: { changeOrderId }, select: { id: true, name: true } });
                     const reusedRows = await tx.paymentSchedule.findMany({
@@ -2379,9 +2739,13 @@ export async function approveChangeOrderOfflineCore(
 
     // Committed. Everything below is best effort and reported as warnings.
     const { co, bill } = outcome;
+    const credit = bill?.credit ?? null;
     const warnings: string[] = [];
     const logActivity = dependencies.logActivity ?? logActivityLazy;
     const revalidate = dependencies.revalidatePath ?? revalidatePath;
+    const creditMeta = credit
+        ? { credit: true, milestone: credit.milestoneName, beforeAmount: credit.beforeAmount, afterAmount: credit.afterAmount }
+        : null;
 
     try {
         await logActivity({
@@ -2397,8 +2761,9 @@ export async function approveChangeOrderOfflineCore(
                 method: parsed.method,
                 approvedOn: parsed.approvedOn,
                 note: parsed.note,
-                billing: bill ? "billed_no_send" : "awaiting_actuals",
+                billing: credit ? "credit_applied" : bill ? "billed_no_send" : "awaiting_actuals",
                 ...(bill ? { invoiceCode: bill.invoiceCode, milestones: bill.milestones.map((row) => row.name), amount: bill.amount } : {}),
+                ...(creditMeta ?? {}),
             },
         });
     } catch {
@@ -2415,15 +2780,22 @@ export async function approveChangeOrderOfflineCore(
                 entityType: "invoice",
                 entityId: bill.invoiceId,
                 entityName: `Invoice ${bill.invoiceCode}`,
-                metadata: { changeOrder: co.code, milestones: bill.milestones.map((row) => row.name), amount: bill.amount },
+                metadata: { changeOrder: co.code, milestones: bill.milestones.map((row) => row.name), amount: bill.amount, ...(creditMeta ?? {}) },
             });
         } catch {
             warnings.push("the billing activity entry could not be written");
         }
     }
 
+    // Credits skip the schedule hook. applyChangeOrderToSchedule would add a 1-day
+    // parent task (pushing the project's work end out for every later CO) plus a
+    // synthesized "payment" milestone task, and the calendar overlay would then
+    // project the credit as negative CO income on that date forever, because a
+    // credit never creates the `CO-xxxxx — ` milestone that marks a CO billed.
     try {
-        if (dependencies.applySchedule) {
+        if (credit) {
+            // Intentionally no schedule change for a credit (see above).
+        } else if (dependencies.applySchedule) {
             await dependencies.applySchedule(co.id);
         } else {
             const { applyChangeOrderToSchedule, CoSchedulePreconditionError } = await import("./schedule-core");
@@ -2446,7 +2818,9 @@ export async function approveChangeOrderOfflineCore(
             const dateLabel = formatOfflineApprovalDate(parsed.approvedAt, timeZone);
             const totalLabel = bill ? formatCurrency(bill.amount) : `cost + ${co.markupPercent ?? 10}% + tax`;
             const subject = `Change order approved by ${staffName} (${phrase}): ${co.code} ${co.title} (${totalLabel})`;
-            const detail = bill
+            const detail = credit
+                ? `Took the credit of ${formatCurrency(Math.abs(credit.amount))} off ${credit.milestoneName} on ${credit.invoiceCode} (${formatCurrency(credit.beforeAmount)} → ${formatCurrency(credit.afterAmount)}). The customer was not notified.`
+                : bill
                 ? `Added to invoice ${bill.invoiceCode} as ${bill.milestones.length} unpaid milestone${bill.milestones.length === 1 ? "" : "s"} for ${formatCurrency(bill.amount)}. The customer was not notified. Send the payment request from the invoice when you're ready.`
                 : "No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.";
             const teamSend = await (dependencies.notifyTeam ?? sendNotification)(
@@ -2494,6 +2868,7 @@ export async function approveChangeOrderOfflineCore(
                 subtotal: bill.subtotal,
                 taxAmount: bill.taxAmount,
                 milestones: bill.milestones.map((row) => ({ id: row.id, name: row.name, amount: row.amount, created: row.created })),
+                ...(credit ? { credit } : {}),
             }
             : null,
         warnings,
@@ -2509,6 +2884,8 @@ export async function handleChangeOrderApproved(
     let amountLabel = "";
     let projectName = "";
     let sentTo = "";
+    let isCredit = false;
+    let credit: ChangeOrderCreditApplied | null = null;
 
     try {
         const co = await prisma.changeOrder.findUnique({
@@ -2525,6 +2902,7 @@ export async function handleChangeOrderApproved(
             coLabel = `${co.code} — ${co.title}`;
             amountLabel = formatCurrency(co.totalAmount);
             projectName = co.project?.name ?? "";
+            isCredit = co.pricingType !== "COST_PLUS" && Math.round(Number(co.totalAmount) * 100) < 0;
         }
 
         if (co?.pricingType === "COST_PLUS") {
@@ -2540,6 +2918,14 @@ export async function handleChangeOrderApproved(
             }
             if (!bill.ok) {
                 summary.issues.push(bill.error);
+            } else if (bill.credit) {
+                // A credit lowered an existing milestone: there is nothing to send, and the
+                // customer never gets a payment email for a credit. sendMilestoneInvoicesCore
+                // is NOT called (an empty list would only come back as "No milestones
+                // selected"), and a replay (alreadyBilled) is not an issue either.
+                summary.billed = true;
+                credit = bill.credit;
+                amountLabel = formatCurrency(bill.credit.amount);
             } else if (bill.alreadyBilled) {
             // Only the call that FRESHLY billed the CO may auto-send — this makes a
             // concurrent/replayed approval a no-op instead of a duplicate payment
@@ -2563,8 +2949,11 @@ export async function handleChangeOrderApproved(
 
     // Only the request that actually transitioned the CO to Approved invokes
     // the schedule hook. It is post-billing and best-effort so money-path state
-    // can never be unwound by scheduling.
-    if (opts?.freshlyApproved) {
+    // can never be unwound by scheduling. Never for a credit: the hook would add a
+    // 1-day parent task and a synthesized payment milestone, and the calendar
+    // overlay would project the credit as negative CO income forever (a credit
+    // never creates the `CO-xxxxx — ` milestone that marks a CO billed).
+    if (opts?.freshlyApproved && !isCredit) {
         let PreconditionError: (new (...args: any[]) => Error) | null = null;
         try {
             const { applyChangeOrderToSchedule, CoSchedulePreconditionError } = await import("./schedule-core");
@@ -2591,13 +2980,19 @@ export async function handleChangeOrderApproved(
             const ok = summary.sent;
             const subject = summary.awaitingActuals
                 ? `Change order approved — awaiting actuals — ${coLabel} (${amountLabel})`
-                : ok
+                : credit
+                    ? `✅ Change order credit applied — ${coLabel} (${amountLabel})`
+                    : ok
                     ? `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`
                     : `⚠️ Change order approved — needs a look — ${coLabel} (${amountLabel})`;
             const detail = summary.awaitingActuals
                 ? `<p>The customer approved the cost-plus scope and markup terms. No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.</p>`
-                : ok
+                : credit
+                    ? `<p>The customer signed. Lowered <strong>${esc(credit.milestoneName)}</strong> on invoice ${esc(credit.invoiceCode)} from ${esc(formatCurrency(credit.beforeAmount))} to ${esc(formatCurrency(credit.afterAmount))}; the customer was not sent a payment link.</p>`
+                    : ok
                     ? `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>`
+                    : isCredit
+                    ? `<p>The customer signed this credit, but it was NOT taken off the invoice:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul><p>Nothing on the invoice changed. The credit still has to come off one of its unpaid milestones; review the invoice in ProBuild.</p>`
                     : `<p>The customer signed, but no payment email went out automatically:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul><p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`;
             await sendNotification(
                 to,
@@ -2675,11 +3070,28 @@ export async function sendChangeOrderToClientCore(
             (sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)),
             0,
         );
-        if (co.pricingType !== "COST_PLUS" && (items.length === 0 || storedSubtotalCents <= 0 || renderedSubtotalCents <= 0)) {
+        if (co.pricingType !== "COST_PLUS" && (items.length === 0 || storedSubtotalCents === 0 || renderedSubtotalCents === 0)) {
             return { kind: "error", error: `Change order ${co.code} has no priced items yet — add pricing before sending it to the client.` };
+        }
+        // A negative subtotal is a credit. Approval refuses a cost-plus credit, so the
+        // customer must not be asked to sign one.
+        const isCredit = storedSubtotalCents < 0 || renderedSubtotalCents < 0;
+        if (co.pricingType === "COST_PLUS" && isCredit) {
+            return { kind: "error", error: coCreditCostPlusError(co.code) };
         }
         if (co.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
             return { kind: "error", error: `Change order ${co.code} pricing is out of sync with its items — save it before sending.` };
+        }
+        if (co.pricingType !== "COST_PLUS" && isCredit) {
+            // The customer's signature always lands the credit on the DEFAULT target, so
+            // the signature request goes out only when that target exists and fits, and
+            // only for a credit with no payment schedule. approveChangeOrderCore re-checks
+            // both under the lock when the customer signs.
+            if (await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId } }) > 0) {
+                return { kind: "error", error: coCreditScheduleRowsError(co.code) };
+            }
+            const targetError = creditTargetError(co.code, await loadChangeOrderCreditTargetsInTx(tx, co), null);
+            if (targetError) return { kind: "error", error: targetError };
         }
 
         const project = await tx.project.findUnique({
@@ -2767,6 +3179,8 @@ export async function sendChangeOrderToClientCore(
                 <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin: 24px 0;">
                     ${pricingType === "COST_PLUS"
                         ? `<div style="font-size: 18px; font-weight: 700; color: #111;">Cost + ${markupPercent}% + tax</div><div style="color:#666;font-size:13px;margin-top:6px;">Billed from actual time and materials. Scope-line amounts are non-binding estimates.</div>`
+                        : coRevisedAmount < 0
+                        ? `<div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Credit</div><div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(coRevisedAmount)}</div>${coTaxAmount !== 0 ? `<div style="color: #999; font-size: 12px; margin-top: 4px;">${formatCurrency(coSubtotal)} and ${formatCurrency(coTaxAmount)} ${escapeHtml(taxLabel)}</div>` : ""}<div style="color:#666;font-size:13px;margin-top:6px;">This credit will be taken off your remaining balance.</div>`
                         : `<div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div><div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(coRevisedAmount)}</div>${coTaxAmount > 0 ? `<div style="color: #999; font-size: 12px; margin-top: 4px;">${formatCurrency(coSubtotal)} + ${formatCurrency(coTaxAmount)} ${escapeHtml(taxLabel)}</div>` : ""}`}
                     ${schedules.length ? `<div style="margin-top:16px;text-align:left;"><strong>Payment schedule</strong>${schedules.map((row) => `<div style="display:flex;justify-content:space-between;margin-top:6px;"><span>${escapeHtml(row.name)}${row.dueDate ? ` (${row.dueDate.toLocaleDateString("en-US")})` : ""}</span><span>${formatCurrency(row.amount)}</span></div>`).join("")}</div>` : ""}
                 </div>
@@ -2892,6 +3306,11 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
     const scheduleTimeZone = await resolveCompanyTimeZone();
     if (pricingType === "COST_PLUS" && requestedSchedules.length > 0) {
         return { ok: false as const, error: "Cost-plus change orders cannot have a fixed payment schedule." };
+    }
+    // A credit lowers an existing milestone; it is never split into payments. Say so
+    // instead of the generic "last row must be positive" error below.
+    if (pricingType === "FIXED" && totalCents < 0 && requestedSchedules.length > 0) {
+        return { ok: false as const, error: coCreditScheduleRowsError() };
     }
     if (pricingType === "FIXED" && requestedSchedules.length === 1) {
         return { ok: false as const, error: "A fixed-price payment schedule requires at least two payments." };
@@ -3084,6 +3503,10 @@ export async function updatePendingMilestoneAmountsCore(
 
         const existing = await tx.paymentSchedule.findMany({ where: { invoiceId } });
         const existingMap = new Map(existing.map((s) => [s.id, s]));
+        // Credits a credit change order took off these milestones, read under the locks
+        // above (a credit apply takes the same Estimate -> Invoice locks, so it is either
+        // fully visible here or waits for this rebalance).
+        const creditCentsByMilestone = await creditCentsByMilestoneInTx(tx, invoiceId);
 
         for (const r of parsed) {
             const row = existingMap.get(r.scheduleId);
@@ -3168,12 +3591,19 @@ export async function updatePendingMilestoneAmountsCore(
             // `percentage` rather than guess one — consistent with saveEstimate's
             // differential upsert, which nulls `percentage` whenever the incoming
             // payload doesn't carry one for the row's new amount.
+            //
+            // A credit change order lowered the INVOICE row only; its estimate row keeps the
+            // contract amount, so it settles the estimate in full when this milestone is paid
+            // (see applyChangeOrderCreditInTx). Mirror it as invoice + credits, never the
+            // lowered invoice amount, or the estimate would show a phantom balance forever.
+            // The per-pool check above compares invoice-side sums only, so it is unaffected.
             if (row.sourceScheduleId) {
+                const creditCents = creditCentsByMilestone.get(row.id) ?? 0;
                 await tx.estimatePaymentSchedule.updateMany({
                     where: { id: row.sourceScheduleId, status: { not: "Paid" } },
                     data: {
                         name: r.name,
-                        amount: r.amount,
+                        amount: creditCents > 0 ? (Math.round(r.amount * 100) + creditCents) / 100 : r.amount,
                         dueDate: r.dueDate ? new Date(r.dueDate) : null,
                         percentage: null,
                     },
@@ -3384,6 +3814,17 @@ export async function assertInvoiceHasNoChangeOrderBilling(
     });
     if (schedule) {
         throw new Error("Cannot " + operation + " an invoice with change-order billing. Void/rebill the change-order billing before trying again.");
+    }
+    // A credit change order lowered a milestone here but links to none (its marker's
+    // paymentScheduleId is null), so the check above can't see it. Deleting or re-splitting
+    // would drop the lowered milestone while the marker stays, and the credit would read
+    // as applied forever with nothing on any invoice.
+    const credit = await tx.changeOrderBilling.findFirst({
+        where: { paymentScheduleId: null, snapshot: { path: ["invoiceId"], equals: invoiceId } },
+        select: { label: true, changeOrder: { select: { code: true } } },
+    });
+    if (credit) {
+        throw new Error("Cannot " + operation + " this invoice: change order " + credit.changeOrder.code + " is a credit that was taken off one of its milestones (" + credit.label + "). Removing the milestones would lose the credit.");
     }
 }
 
