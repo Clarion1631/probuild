@@ -107,8 +107,18 @@ test.describe.serial("Credit change orders", () => {
     const confirm = modal.getByRole("button", { name: "Mark approved", exact: true });
     await expect(confirm).toBeEnabled();
     await confirm.click();
-    await expect(page.locator("[data-sonner-toast][data-type=\"success\"]").last())
-      .toContainText(`Took $3,285.76 off Cabinets on invoice ${INVOICE_CODE} ($9,792.00 → $6,506.24)`);
+    // Match the credit toast by its text, never by position: sonner renders the newest toast
+    // FIRST, so `.last()` is the older "Change Order saved" toast from the pre-approval save,
+    // and in a production build both expire within a few hundred milliseconds of each other.
+    // Wait for the credit toast OR an error toast, and fail with the error's text if that won.
+    const creditToast = page.locator("[data-sonner-toast]", {
+      hasText: `Took $3,285.76 off Cabinets on invoice ${INVOICE_CODE} ($9,792.00 → $6,506.24)`,
+    });
+    const errorToast = page.locator("[data-sonner-toast][data-type=\"error\"]");
+    await expect(creditToast.or(errorToast).first()).toBeVisible();
+    const errors = await errorToast.allTextContents();
+    expect(errors, `Mark approved showed an error toast: ${errors.join(" | ")}`).toEqual([]);
+    await expect(creditToast).toBeVisible();
 
     const co = await prisma.changeOrder.findUniqueOrThrow({ where: { id: IDS.co } });
     expect(co.status).toBe("Approved");
