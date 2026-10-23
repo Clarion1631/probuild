@@ -1394,6 +1394,42 @@ test("a document-level gate short-circuits BOTH nets and claims no key", async (
     }
 });
 
+// ── A check made out TO Golden Touch Remodeling ────────────────────────────
+
+/** A customer's check, read the way the live reader read one (vendor = payee). */
+const customerCheck = {
+    ...goodRead.read,
+    docType: "check",
+    // The alias token in the client part collapses canonicalVendor to "dutch",
+    // so this also proves the worker hands routing the RAW vendor.
+    vendor: "GOLDEN TOUCH REMODELING RE: Dutch Client",
+    invoice: "",
+    checkNumber: "0001418603",
+    totalAmount: "60000.00",
+    taxAmount: "",
+};
+
+test("a customer's check parks as a customer payment BEFORE it claims a key, with or without a job", async () => {
+    for (const [label, row, over] of [
+        ["with a job", workerRow(), {}],
+        ["with no job", workerRow({ projectId: null }), { refreshProjectId: async () => null }],
+    ] as const) {
+        let weakCalls = 0;
+        const h = harness([row], {
+            read: async () => ({ ok: true, read: customerCheck } as ReadOutcome),
+            findWeakGroup: async () => { weakCalls++; return [{ id: "row-twin", refNumber: null }]; },
+            ...over,
+        });
+        const summary = await runIntakeWorker(h.deps);
+        assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 }, `${label}: never NEEDS_JOB, never READ`);
+        assert.equal(h.states[0].reason, "customer-payment", label);
+        assert.equal(h.states[0].patch?.dedupStrongKey, null, `${label}: no key`);
+        assert.equal(weakCalls, 0, `${label}: dedup is not consulted at all`);
+        assert.equal(h.applied.length, 0, `${label}: and applyRead, the claim itself, never ran`);
+        assert.equal(h.books, 0, label);
+    }
+});
+
 // ── A read date that cannot belong to the row ──────────────────────────────
 
 /** The live row: Sunbelt Rentals, $1,597.03, arriving on 2026-09-21 Pacific. */
@@ -3300,6 +3336,32 @@ test("a revived row does not claim the key its routing gates WITHHELD", async ()
     assert.equal(h.bookedRows[0].dedupStrongKey, null);
 });
 
+test("a revived customer check does not claim a key either", async () => {
+    // Set job sends a parked customer-payment row to READ. The heal must refuse
+    // the key exactly as routing did; book.ts then refuses the booking.
+    const h = harness([keylessRead({
+        docType: "check",
+        vendor: "GOLDEN TOUCH REMODELING RE: Dutch Client",
+        refNumber: "Check0001418603",
+        totalCents: 6000000,
+        readJson: '{"doc_type":"check","vendor":"GOLDEN TOUCH REMODELING RE: Dutch Client","date":"2026-08-03","check_number":"0001418603","total_amount":"60000.00"}',
+    })], LIVE);
+    await runIntakeWorker(h.deps);
+    assert.deepEqual(h.strongClaims, [], "no claim was even attempted");
+
+    // Control: the same check made out to a sub IS healed, so the refusal above
+    // is the payee gate and not some other mismatch in the fixture.
+    const sub = harness([keylessRead({
+        docType: "check",
+        vendor: "ERS PAINTING",
+        refNumber: "Check0001418603",
+        totalCents: 6000000,
+        readJson: '{"doc_type":"check","vendor":"ERS PAINTING","date":"2026-08-03","check_number":"0001418603","total_amount":"60000.00"}',
+    })], LIVE);
+    await runIntakeWorker(sub.deps);
+    assert.equal(sub.strongClaims.length, 1, "an ordinary check claims its key");
+});
+
 test("a dry-run row is not healed: it is not about to book", async () => {
     for (const [label, row, over] of [
         ["the row's own flag", keylessRead({ dryRun: true }), LIVE],
@@ -3333,6 +3395,7 @@ test("recoverStrongKey re-derives the key with the SAME rule routing used", () =
         amount: "364.98",
         totalCents: 36498,
         canonicalVendor: "lowes",
+        vendor: "Lowes",
         dateStr: "2026-08-03",
         referenceDay: "2026-08-20",
     });

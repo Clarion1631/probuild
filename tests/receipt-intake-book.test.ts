@@ -27,6 +27,7 @@ import {
 } from "../src/lib/receipt-intake/book";
 // The ONE vendor comparison — the same function the identity check uses.
 import { normalizeVendorName } from "../src/lib/qbo-receipt-push";
+import { canonicalVendor } from "../src/lib/receipt-intake/keys";
 import {
     phaseConfidenceMin,
     phaseSuggestionIsConfident,
@@ -3770,4 +3771,72 @@ test("the reference is the row's ARRIVAL, not now — a paused backlog still boo
 
     assert.equal(result.outcome, "booked");
     assert.equal(r.purchaseCalls[0].date, "2026-02-10", "and it books under its own date");
+});
+
+// ── Customer payments: the booking gate ──────────────────────────────────────
+
+const CUSTOMER_CHECK = {
+    docType: "check",
+    vendor: "GOLDEN TOUCH REMODELING RE:CLIENT NAME",
+    totalCents: 6000000,
+    taxCents: null,
+    refNumber: "Check0001418603",
+};
+
+test("booking refuses a check made out to Golden Touch Remodeling: no Purchase, no Expense", async () => {
+    // Set job sends a NEEDS_REVIEW row to READ and READ never routes again, so
+    // this gate, not routing, is what stands between one click and a customer's
+    // payment booked as job cost.
+    for (const over of [CUSTOMER_CHECK, { docType: "receipt", vendor: "Golden Touch Remodel" }]) {
+        const r = recorder();
+        const result = await bookReceipt(row(over), r.deps);
+        assert.deepEqual(result, { outcome: "needs-review", reason: "customer-payment", releaseStrongKey: false }, over.vendor);
+        assert.equal(r.purchaseCalls.length + r.sendMarks.length + r.expenses.length, 0, over.vendor);
+    }
+});
+
+test("the customer-payment gate covers the native rail too", async () => {
+    const r = recorder(nativeOnly);
+    const result = await bookReceipt(row(CUSTOMER_CHECK), r.deps);
+    assert.deepEqual(result, { outcome: "needs-review", reason: "customer-payment", releaseStrongKey: false });
+    assert.equal(r.expenses.length, 0, "no native Expense either");
+});
+
+test("the customer-payment gate outranks the job gate, and holds for a row that already sent", async () => {
+    // Jobless: the reason a person reads is the one that matters.
+    const jobless = recorder();
+    assert.deepEqual(
+        await bookReceipt(row({ ...CUSTOMER_CHECK, projectId: null }), jobless.deps),
+        { outcome: "needs-review", reason: "customer-payment", releaseStrongKey: false },
+    );
+    // NOT exempt like the date gate: continuing could only write a wrong
+    // Expense. The key stays held because a Purchase may exist, and the reason
+    // says to look in QuickBooks before voiding.
+    const sent = recorder();
+    assert.deepEqual(
+        await bookReceipt(row({ ...CUSTOMER_CHECK, sendAttempted: true }), sent.deps),
+        { outcome: "needs-review", reason: "customer-payment-check-quickbooks", releaseStrongKey: false },
+    );
+    assert.equal(sent.purchaseCalls.length + sent.expenses.length, 0);
+});
+
+test("booking reads the RAW vendor, so a payee line whose alias won canonicalVendor is still caught", async () => {
+    // "dutch" is a VENDOR_ALIASES token. Text after our name can carry one, and
+    // then canonicalVendor collapses the whole payee line to it. A row revived
+    // by Set job reaches booking without routing again, so booking must read
+    // the raw vendor itself.
+    const vendor = "Golden Touch Remodeling RE: Dutch Client";
+    assert.equal(canonicalVendor(vendor), "dutch", "the collapse this test is about");
+    const r = recorder();
+    assert.equal((await bookReceipt(row({ ...CUSTOMER_CHECK, vendor }), r.deps) as any).reason, "customer-payment");
+    assert.equal(r.purchaseCalls.length + r.expenses.length, 0);
+});
+
+test("an ordinary sub check still books", async () => {
+    const r = recorder();
+    const result = await bookReceipt(
+        row({ docType: "check", vendor: "ERS PAINTING", totalCents: 694800, taxCents: null, refNumber: "Check1037" }),
+        r.deps,
+    );
+    assert.equal(result.outcome, "booked");
 });

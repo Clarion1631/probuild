@@ -848,6 +848,7 @@ export function recoverStrongKey(
         // so this is the number routing itself gated on either way.
         totalCents: row.totalCents,
         canonicalVendor: canonicalVendor(read.vendor),
+        vendor: read.vendor || null,
         dateStr: keys.dateReadOffDocument ? keys.dateStr : null,
         referenceDay: arrivalDay,
     };
@@ -1636,6 +1637,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         amount: keys.amount,
         totalCents,
         canonicalVendor: canonicalVendor(read.vendor),
+        vendor: read.vendor || null,
         // ONLY the DOCUMENT's own date is judged. When the reader found none —
         // or produced something malformed, which `dedupKeys` treats the same
         // way — `keys.dateStr` is `arrivalDay` itself, and measuring our own

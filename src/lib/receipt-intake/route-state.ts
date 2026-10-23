@@ -43,6 +43,14 @@ export interface RouteInput {
     /** canonicalVendor() of this document — see the vendor-mismatch rule below. */
     canonicalVendor: string;
     /**
+     * The vendor (the payee, for a check) EXACTLY as read, before
+     * canonicalVendor() collapses it. REQUIRED, so every call site has to pass
+     * it: canonicalVendor() returns an alias token whenever one appears anywhere
+     * in the string, so text after our own name on a payee line (a client's
+     * name, say) could otherwise hide a customer payment from the gate below.
+     */
+    vendor: string | null;
+    /**
      * The date READ OFF THE DOCUMENT, as a YYYY-MM-DD day. Absent (or null)
      * when the reader found none: the keys then fall back to the row's own
      * arrival day, which is OUR value and says nothing about the document.
@@ -103,6 +111,47 @@ export const DATE_IMPLAUSIBLE_REASON = "date-implausible";
  * file.
  */
 export const STRONG_DUP_REASON_PREFIX = "strong-dup:";
+
+/**
+ * The park reason for a document made out TO Golden Touch Remodeling.
+ *
+ * A check or receipt whose payee is GTR itself is money COMING IN, a customer
+ * paying us, never a cost. The read prompt only describes checks the business
+ * WROTE, so a customer's check (or a cashier's check from the customer's
+ * bank) is read as `check` with `vendor` = the payee line, and nothing in the
+ * rail looked: a $60,000.00 cashier's check made out to "GOLDEN TOUCH
+ * REMODELING RE:<client>" booked to a job as an Expense on 2026-10-01, and a
+ * $21,235.50 check made out to "Golden Touch Remodel" booked to another job on
+ * 2026-10-16. Both are customer payments, not costs.
+ *
+ * Routing parks it, and booking refuses it again (book.ts), because Set job
+ * sends a NEEDS_REVIEW row to READ and READ never routes again.
+ */
+export const CUSTOMER_PAYMENT_REASON = "customer-payment";
+/**
+ * The same verdict for a row whose QuickBooks send MAY have started
+ * (`sendAttempted`), written only by book.ts. A Purchase may already sit in
+ * QuickBooks for it, and voiding the row here does not remove that, so the
+ * person reading it has to look in QuickBooks first. A separate code rather
+ * than a note on the first one, because the queue describes only the first
+ * segment of a reason.
+ */
+export const CUSTOMER_PAYMENT_SENT_REASON = "customer-payment-check-quickbooks";
+
+/**
+ * Does this vendor or payee name Golden Touch Remodeling itself?
+ *
+ * Lowercased and stripped to letters and digits first, so "GOLDEN TOUCH
+ * REMODELING RE:<client>", "Golden Touch Remodel" and "Golden Touch
+ * Remodeling LLC" all match. Deliberately NOT the bare initials "GTR": too
+ * short to mean us on its own. Erring wide is the safe direction here: a false
+ * match only parks the row for a person, while a miss books a customer's
+ * payment as a job cost.
+ */
+export function namesGoldenTouch(vendor: string | null | undefined): boolean {
+    const v = String(vendor ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    return v.includes("goldentouch");
+}
 
 const DAY_MS = 86_400_000;
 
@@ -172,6 +221,10 @@ export function isImplausibleReceiptDate(
 /**
  * First match wins. Order is the spec's, and it matters:
  *  - multi/non_receipt are triage answers about the FILE, decided before money.
+ *  - a document made out TO Golden Touch Remodeling is a customer payment, not
+ *    a cost (CUSTOMER_PAYMENT_REASON). It is decided before every money gate,
+ *    so it claims no dedup key, and before the job gate, so a jobless one is
+ *    not offered to the "pick the job" pile.
  *  - a total that is zero OR NEGATIVE never books automatically. A $0.00 is
  *    almost always a misread (:531 — you don't get a $0 receipt or write a $0
  *    check); a negative total is a refund, which is a legitimate document that
@@ -220,6 +273,13 @@ export function routeState(read: RouteInput, dedupHits: DedupHits, hasProject: b
     // human looks instead.
     if (!KNOWN_DOC_TYPES.has(docType)) {
         return { state: "NEEDS_REVIEW", stateReason: "unknown-doc-type", duplicateOfId: null };
+    }
+    // The RAW vendor is the one that counts (see RouteInput.vendor);
+    // `canonicalVendor` is checked as well so a caller that passes a null raw
+    // vendor still gets the gate. book.ts checks the raw vendor again before any
+    // booking, because Set job revives a parked row without routing it.
+    if (namesGoldenTouch(read.vendor) || namesGoldenTouch(read.canonicalVendor)) {
+        return { state: "NEEDS_REVIEW", stateReason: CUSTOMER_PAYMENT_REASON, duplicateOfId: null };
     }
     if (read.totalCents === null || read.totalCents <= 0 || read.amount === "0.00") {
         return { state: "NEEDS_REVIEW", stateReason: "refund-or-zero", duplicateOfId: null };
