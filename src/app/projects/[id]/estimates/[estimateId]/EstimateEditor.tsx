@@ -2493,23 +2493,27 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         >
             {/* Top Navigation / Action Bar */}
             {/* z-30: must beat the sidebar's sticky tab bar (z-10, later in DOM) so the ⋮ dropdown isn't painted under it */}
-            <div className="bg-white border-b border-hui-border px-4 py-3 flex items-center justify-between shadow-sm z-30 sticky top-0">
-                <div className="flex items-center gap-3">
+            <div className="bg-white border-b border-hui-border px-4 py-3 flex flex-wrap items-center justify-between gap-y-1 shadow-sm z-30 sticky top-0">
+                <div className="flex items-center gap-2 sm:gap-3 min-w-0">
                     <button onClick={() => {
                         if (context.type === "project") {
                             router.push(`/projects/${context.id}/estimates`);
                         } else {
                             router.push(`/leads/${context.id}`);
                         }
-                    }} className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm">
-                        ← Back to {context.type === "project" ? "Estimates" : "Lead"}
+                    }}
+                        title={context.type === "project" ? "Back to Estimates" : "Back to Lead"}
+                        aria-label={context.type === "project" ? "Back to Estimates" : "Back to Lead"}
+                        className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-sm font-medium text-hui-textMain bg-white border border-hui-border rounded-md hover:bg-slate-50 transition shadow-sm shrink-0">
+                        ←<span className="hidden sm:inline">Back to {context.type === "project" ? "Estimates" : "Lead"}</span>
                     </button>
-                    <div className="h-4 w-px bg-hui-border"></div>
-                    <span className="text-sm font-medium text-hui-textMain">{code}</span>
+                    <div className="h-4 w-px bg-hui-border hidden sm:block"></div>
+                    <span className="text-sm font-medium text-hui-textMain hidden md:inline">{code}</span>
                     <select
                         value={status}
                         onChange={e => setStatus(e.target.value)}
-                        className={`px-2 py-0.5 rounded text-xs font-semibold border cursor-pointer ${
+                        aria-label="Estimate status"
+                        className={`px-2 py-0.5 rounded text-xs font-semibold border cursor-pointer shrink-0 ${
                             status === "Draft" ? "bg-slate-100 text-slate-600 border-slate-200" :
                             status === "Sent" ? "bg-amber-50 text-amber-700 border-amber-200" :
                             status === "Viewed" ? "bg-blue-50 text-blue-700 border-blue-200" :
@@ -2527,44 +2531,50 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         <button
                             onClick={() => router.push(taxCertFixHref)}
                             title="This estimate is tax-exempt but the client has no valid exemption certificate on file. WA DOR requires one for every exempt sale. Click to open the client record."
-                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-semibold border transition ${taxCertStatus === "expired" ? "bg-red-50 text-red-700 border-red-200 hover:bg-red-100" : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"}`}
+                            aria-label={taxCertStatus === "expired" ? "Tax-exempt cert expired" : "No tax-exempt cert on file"}
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-semibold border transition shrink-0 ${taxCertStatus === "expired" ? "bg-red-50 text-red-700 border-red-200 hover:bg-red-100" : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"}`}
                         >
                             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" /></svg>
-                            {taxCertStatus === "expired" ? "Tax-exempt cert expired" : "No tax-exempt cert on file"}
+                            <span className="hidden lg:inline">{taxCertStatus === "expired" ? "Tax-exempt cert expired" : "No tax-exempt cert on file"}</span>
                         </button>
                     )}
                 </div>
 
-                {/* Tabs Middle */}
-                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg absolute left-1/2 -translate-x-1/2">
-                    <button
-                        onClick={() => setActiveTab("builder")}
-                        className={`px-4 py-1.5 text-sm font-medium rounded-md transition ${activeTab === "builder" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
-                    >
-                        Builder
-                    </button>
-                    <button
-                        onClick={() => setActiveTab("expenses")}
-                        className={`px-4 py-1.5 text-sm font-medium rounded-md transition ${activeTab === "expenses" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
-                    >
-                        Costing & Expenses
-                    </button>
+                {/* Tabs Middle — absolutely centred only once the header is wide enough for all
+                    three clusters (xl+). Below that they drop onto their own centred row so they
+                    can never paint on top of the left/right clusters. */}
+                <div className="order-3 basis-full flex justify-center pt-2 xl:order-none xl:basis-auto xl:pt-0 xl:absolute xl:left-1/2 xl:-translate-x-1/2">
+                    <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
+                        <button
+                            onClick={() => setActiveTab("builder")}
+                            className={`px-3 sm:px-4 py-1.5 text-sm font-medium rounded-md transition ${activeTab === "builder" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                        >
+                            Builder
+                        </button>
+                        <button
+                            onClick={() => setActiveTab("expenses")}
+                            className={`px-3 sm:px-4 py-1.5 text-sm font-medium rounded-md transition ${activeTab === "expenses" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                        >
+                            Costing & Expenses
+                        </button>
+                    </div>
                 </div>
 
-                <div className="flex items-center gap-2">
-                    {/* Internal / Client View Toggle */}
-                    <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-md">
+                <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                    {/* Internal / Client View Toggle — below `sm` it would push the primary CTAs
+                        off-screen, so it collapses into the ⋮ menu (see the sm:hidden entry there). */}
+                    <div className="hidden sm:flex items-center gap-1 bg-slate-100 p-0.5 rounded-md">
                         <button
                             onClick={() => setViewMode("client")}
-                            className={`px-3 py-1 text-xs font-medium rounded transition ${viewMode === "client" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`px-2 sm:px-3 py-1 text-xs font-medium rounded transition ${viewMode === "client" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
                         >Client</button>
                         <button
                             onClick={() => setViewMode("internal")}
-                            className={`px-3 py-1 text-xs font-medium rounded transition ${viewMode === "internal" ? "bg-indigo-50 text-indigo-800 shadow-sm border border-indigo-200" : "text-slate-500 hover:text-slate-700"}`}
+                            className={`px-2 sm:px-3 py-1 text-xs font-medium rounded transition ${viewMode === "internal" ? "bg-indigo-50 text-indigo-800 shadow-sm border border-indigo-200" : "text-slate-500 hover:text-slate-700"}`}
                         >Internal</button>
                     </div>
 
-                    <div className="h-4 w-px bg-hui-border"></div>
+                    <div className="h-4 w-px bg-hui-border hidden sm:block"></div>
 
                     {/* More dropdown for secondary actions */}
                     <div className="relative">
@@ -2572,13 +2582,27 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                             onClick={() => setShowMoreMenu(v => !v)}
                             className="hui-btn hui-btn-secondary px-2.5"
                             title="More actions"
+                            aria-label="More actions"
                         >
                             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="12" cy="19" r="1.5" /></svg>
                         </button>
                         {showMoreMenu && (
                             <>
                                 <div className="fixed inset-0 z-40" onClick={() => setShowMoreMenu(false)} />
-                                <div className="absolute right-0 top-full mt-1 w-56 bg-white rounded-lg shadow-xl border border-hui-border z-50 py-1 text-sm">
+                                <div className="absolute right-0 top-full mt-1 w-56 max-w-[calc(100vw-2rem)] max-h-[70vh] overflow-y-auto bg-white rounded-lg shadow-xl border border-hui-border z-50 py-1 text-sm">
+                                    {/* Small-screen home for the Client/Internal toggle, which is
+                                        hidden from the header below `sm`. Same setViewMode state. */}
+                                    <div className="sm:hidden">
+                                        <div className="px-4 py-1 text-[10px] font-semibold text-hui-textMuted uppercase tracking-wider">View</div>
+                                        <button
+                                            onClick={() => { setViewMode(viewMode === "internal" ? "client" : "internal"); setShowMoreMenu(false); }}
+                                            className="w-full text-left px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2.5 text-hui-textMain"
+                                        >
+                                            <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
+                                            {viewMode === "internal" ? "Switch to Client view" : "Switch to Internal view"}
+                                        </button>
+                                        <div className="border-t border-hui-border my-1" />
+                                    </div>
                                     {/* AI Tools section */}
                                     <div className="px-4 py-1 text-[10px] font-semibold text-hui-textMuted uppercase tracking-wider">AI Tools</div>
                                     <button
@@ -2727,6 +2751,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         )}
                     </div>
 
+                    <div className="h-4 w-px bg-hui-border hidden sm:block"></div>
+
                     {/* Primary Actions */}
                     <button
                         onClick={async () => {
@@ -2758,10 +2784,12 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                             }
                             setShowSendModal(true);
                         }}
-                        className="hui-btn hui-btn-green flex items-center gap-2"
+                        title={initialEstimate.sentAt ? "Resend" : "Send"}
+                        aria-label={initialEstimate.sentAt ? "Resend" : "Send"}
+                        className="hui-btn hui-btn-green flex items-center gap-2 px-2.5 sm:px-4"
                     >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
-                        {initialEstimate.sentAt ? "Resend" : "Send"}
+                        <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                        <span className="hidden sm:inline">{initialEstimate.sentAt ? "Resend" : "Send"}</span>
                     </button>
                     {/* isSyncingQB: the pre-sync save inside handleSyncQB runs silently, so isSaving
                         stays false — without it this button would invite a second save that could
@@ -2769,9 +2797,12 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     <button
                         onClick={() => handleSave()}
                         disabled={isSaving || isSyncingQB}
-                        className="hui-btn hui-btn-primary disabled:opacity-50"
+                        title="Save"
+                        aria-label="Save"
+                        className="hui-btn hui-btn-primary disabled:opacity-50 flex items-center gap-2 px-2.5 sm:px-4"
                     >
-                        {isSaving ? "Saving..." : "Save"}
+                        <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                        <span className="hidden sm:inline">{isSaving ? "Saving..." : "Save"}</span>
                     </button>
                 </div>
             </div>
