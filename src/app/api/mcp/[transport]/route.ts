@@ -250,7 +250,7 @@ const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
 // Args whose VALUE is payload rather than intent — recording even a prefix
 // would turn the activity log into a document store readable by anyone with
 // ADMIN/MANAGER via get_activity_log. Logged as a marker, never the content.
-const AUDIT_REDACTED_ARGS = new Set(["contentBase64", "fileBase64", "bodyHtml", "body", "customMessage"]);
+const AUDIT_REDACTED_ARGS = new Set(["contentBase64", "fileBase64", "bodyHtml", "body", "customMessage", "overviewBody"]);
 
 // Recursive sanitize (depth-capped): drop anything that looks like a
 // confirmation token, redact payload-bearing args outright, and cap remaining
@@ -691,6 +691,8 @@ function createHandler(actor: RouteMcpActor) {
                 annotations: { readOnlyHint: true },
                 description:
                     "Returns an existing estimate's phases, line items (with cost codes, quantities, unit costs) and payment milestones — the editable detail list_project_billing omits. " +
+                    "Also returns the Project Overview / Vision cover page: overviewEnabled (the show/hide toggle), overviewTitle (null = the default heading 'Project Overview'), " +
+                    "overviewBody (the saved text as HTML) and overviewOnCoverPage (true only when it is enabled AND has text, i.e. it actually prints as page 1 of the PDF). " +
                     "Use to REVISE: read it here, then either update_estimate it in place, or create_estimate a new draft from the adjusted items.",
                 inputSchema: {
                     estimate: z.string().min(1).max(50).describe("Estimate code (e.g. 'EST-00145') or id from list_project_billing"),
@@ -741,7 +743,10 @@ function createHandler(actor: RouteMcpActor) {
                     "Workflow: get_estimate to read the current items, adjust, then call this. " +
                     "Pass `phases` to REPLACE all line items (totals + milestone amounts recompute automatically); " +
                     "pass tax fields (taxExempt, or taxRateName + taxRatePercent — e.g. change the tax jurisdiction from Vancouver to Camas) to reprice tax; " +
-                    "pass title / memo / termsAndConditions to edit those. Only the fields you send change. " +
+                    "pass title / memo / termsAndConditions to edit those. " +
+                    "pass overviewEnabled / overviewTitle / overviewBody to edit the Project Overview / Vision cover page (page 1 of the PDF, top of the customer portal, no pricing) on its own: " +
+                    "that never changes prices, line items, milestones, memo, terms, status or sharing and never emails anyone, but if the estimate was already sent the customer's portal shows the new text right away. " +
+                    "Only the fields you send change. " +
                     "paymentMilestones may only be sent together with phases. After editing, send_estimate to (re)deliver it.",
                 inputSchema: {
                     estimate: z.string().min(1).max(50).describe("Estimate code (e.g. 'EST-00317') or id from get_estimate / list_project_billing"),
@@ -753,6 +758,12 @@ function createHandler(actor: RouteMcpActor) {
                     taxRatePercent: z.number().min(0).max(30).nullable().optional().describe("Sales tax percent for that jurisdiction, e.g. 8.4"),
                     memo: z.string().max(5000).optional(),
                     termsAndConditions: z.string().max(20000).optional(),
+                    overviewEnabled: z.boolean().optional().describe("Show (true) or hide (false) the Project Overview / Vision cover page. It only prints when overviewBody also has text."),
+                    overviewTitle: z.string().max(200).nullable().optional().describe("Cover page heading. null or empty resets it to the default 'Project Overview'."),
+                    overviewBody: z.string().max(20000).nullable().optional().describe(
+                        "Cover page text, no pricing. Plain text: a blank line starts a new paragraph, and any < > & are shown literally. " +
+                        "Or the editor's HTML, starting with a block tag: <p>, <h1> to <h3>, <ul>/<ol>/<li>, <strong>, <em>, <br>, <a>. null or empty clears it.",
+                    ),
                 },
             },
             async args => {
@@ -2797,7 +2808,7 @@ function createHandler(actor: RouteMcpActor) {
             "Quantity 0 is valid and is how the user presents OPTIONAL/alternate scope: the line shows at $0 and adds nothing to the total — preserve such lines when revising an estimate. " +
             "All prices are USD sell prices. Estimates arrive as private drafts for review in ProBuild. " +
             "ESTIMATE lifecycle: create_estimate (draft) → [get_estimate to read, update_estimate to revise in place while still Draft/Sent] → send_estimate (preview + user approval; customer signs via portal, which auto-creates the invoice). "
-            + "update_estimate edits an existing unsigned estimate (line items, tax jurisdiction/rate, title, terms); once signed or invoiced, revisions go through a change order. " +
+            + "update_estimate edits an existing unsigned estimate (line items, tax jurisdiction/rate, title, terms, Project Overview / Vision cover page); once signed or invoiced, revisions go through a change order. " +
             "If a project needs an invoice without a signed estimate, create_invoice_from_estimate. list_receivables answers 'who owes us money?' across all projects. " +
             "create_lead captures field prospects. "
             + "To locate a job or estimate you only know by name/number (and don't know if it's still a lead or already a project), use find_job — it searches leads AND projects including closed/won ones, plus estimates by code. " +

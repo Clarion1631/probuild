@@ -286,6 +286,15 @@ jobs:
           PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # The MCP update_estimate / get_estimate Project Overview round trip on a seeded
+      # estimate: create, show, edit, clear, read back, nothing else moves, and the real
+      # estimate PDF puts the overview alone on page 1.
+      - name: Prove connector overview edits touch only the overview and land on PDF page 1
+        run: npx tsx --test tests/estimate-overview-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the apply script is idempotent and --dry-run is read-only
         run: npx tsx --test tests/payroll-apply-idempotent-db.test.ts
         env:

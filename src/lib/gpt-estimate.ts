@@ -1,6 +1,8 @@
 import { randomUUID } from "crypto";
 import { prisma } from "@/lib/prisma";
 import { transformPhasesToItems, toCents, type AiData } from "@/lib/ai-estimate-transform";
+import { normalizeOverviewBody, normalizeOverviewTitle, overviewOnCoverPage } from "@/lib/estimate-overview";
+import { portalVisibleEstimateWhere } from "@/lib/estimate-portal-visibility";
 
 // Persists a phase-grouped estimate payload (the shape ChatGPT emits via the MCP
 // connector) as a real Estimate. Reuses transformPhasesToItems so the MCP path,
@@ -119,6 +121,11 @@ export async function estimateToPhases(codeOrId: string): Promise<
           taxExempt: boolean;
           phases: { phaseName: string; phaseCode?: string; items: { name: string; description?: string; costCode?: string; costType?: string; quantity: number; unitCost: number }[] }[];
           paymentMilestones: { name: string; percentage: number; amount: number }[];
+          // Project Overview / Vision cover page, exactly as stored (null title = default heading).
+          overviewEnabled: boolean;
+          overviewTitle: string | null;
+          overviewBody: string | null;
+          overviewOnCoverPage: boolean;
       }
     | { ok: false; error: string }
 > {
@@ -176,6 +183,10 @@ export async function estimateToPhases(codeOrId: string): Promise<
             percentage: m.percentage != null ? Number(m.percentage) : 0,
             amount: Number(m.amount),
         })),
+        overviewEnabled: !!estimate.overviewEnabled,
+        overviewTitle: estimate.overviewTitle ?? null,
+        overviewBody: estimate.overviewBody ?? null,
+        overviewOnCoverPage: overviewOnCoverPage(estimate),
     };
 }
 
@@ -196,6 +207,11 @@ export type UpdateEstimateInput = {
     taxRatePercent?: number | null;
     memo?: string;
     termsAndConditions?: string;
+    // Project Overview / Vision cover page. null or blank title = default heading; null or
+    // blank body = clear. Plain-text bodies are converted to paragraphs (estimate-overview.ts).
+    overviewEnabled?: boolean;
+    overviewTitle?: string | null;
+    overviewBody?: string | null;
 };
 
 export type UpdateEstimateResult =
@@ -209,6 +225,8 @@ export type UpdateEstimateResult =
           url: string;
           changed: string[];
           warnings: string[];
+          // Only when an overview argument was sent: whether the cover page now renders.
+          overviewOnCoverPage?: boolean;
       }
     | { ok: false; error: string };
 
@@ -270,12 +288,14 @@ function recomputeMilestones(total: number, source: MilestoneSource[]): { name: 
  *      can't slip through.
  *   3. No silent data loss — refuses to rewrite line items that already have
  *      operational links (POs, time entries, schedule tasks, expenses).
- * `phases` replaces all line items; tax / title / memo / terms update
- * independently. A jurisdiction change needs taxRateName + taxRatePercent
+ * `phases` replaces all line items; tax / title / memo / terms / project overview
+ * update independently. A jurisdiction change needs taxRateName + taxRatePercent
  * together. Milestone edits require `phases`.
  */
 export async function updateEstimateFromPhases(input: UpdateEstimateInput): Promise<UpdateEstimateResult> {
-    const { estimate: key, title, phases, paymentMilestones, taxExempt, taxRateName, taxRatePercent, memo, termsAndConditions } = input;
+    const { estimate: key, title, phases, paymentMilestones, taxExempt, taxRateName, taxRatePercent, memo, termsAndConditions, overviewEnabled } = input;
+    const overviewTitle = normalizeOverviewTitle(input.overviewTitle);
+    const overviewBody = normalizeOverviewBody(input.overviewBody);
 
     const wantsItems = Array.isArray(phases) && phases.length > 0;
     const wantsMilestones = Array.isArray(paymentMilestones) && paymentMilestones.length > 0;
@@ -292,8 +312,9 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
     }
     const wantsTax = taxExempt !== undefined || taxRatePercent !== undefined;
     const wantsMeta = title !== undefined || memo !== undefined || termsAndConditions !== undefined;
-    if (!wantsItems && !wantsMilestones && !wantsTax && !wantsMeta) {
-        return { ok: false, error: "Nothing to update — provide phases, paymentMilestones, tax fields (taxExempt or taxRateName+taxRatePercent), title, memo, or termsAndConditions." };
+    const wantsOverview = overviewEnabled !== undefined || overviewTitle !== undefined || overviewBody !== undefined;
+    if (!wantsItems && !wantsMilestones && !wantsTax && !wantsMeta && !wantsOverview) {
+        return { ok: false, error: "Nothing to update: provide phases, paymentMilestones, tax fields (taxExempt or taxRateName+taxRatePercent), title, memo, termsAndConditions, or the project overview (overviewEnabled / overviewTitle / overviewBody)." };
     }
     if (wantsMilestones && !wantsItems) {
         return { ok: false, error: "paymentMilestones can only be changed together with phases (send the full line items so amounts recompute against the new total). To re-split payments only, edit the estimate in ProBuild." };
@@ -399,6 +420,8 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
     // Set inside the item-rewrite branch below, applied to the estimate.update() `data` object
     // once it exists — see the itemsRevision bump comment at the deleteMany/createMany site.
     let bumpItemsRevision = false;
+    // The cover page as it stands after this call, for the result and its warnings.
+    let overviewAfter: { overviewEnabled: boolean; overviewBody: string | null; renderChanged: boolean } | null = null;
     try {
         await prisma.$transaction(async tx => {
             // Lock the estimate row, then re-check editability against the freshest
@@ -408,7 +431,10 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
             await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${existing.id} FOR UPDATE`;
             const fresh = await tx.estimate.findUnique({
                 where: { id: existing.id },
-                select: { status: true, approvedAt: true, signatureUrl: true, _count: { select: { invoices: true } } },
+                select: {
+                    status: true, approvedAt: true, signatureUrl: true, _count: { select: { invoices: true } },
+                    overviewEnabled: true, overviewTitle: true, overviewBody: true,
+                },
             });
             if (!fresh) throw new EstimateInputError("Estimate no longer exists.");
             const stillEditable = editabilityError(fresh);
@@ -498,6 +524,45 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
             if (taxRateName !== undefined) { data.taxRateName = taxRateName; }
             if (taxRatePercent !== undefined) { data.taxRatePercent = taxRatePercent; }
             if (taxRatePercent !== undefined || taxRateName !== undefined) changed.push("tax rate");
+            if (wantsOverview) {
+                // Compared against the row read under the lock, so a call that re-sends the
+                // current values writes nothing and does not trip the revision bump below. A raw
+                // value identical to what is stored (e.g. echoed straight back from get_estimate)
+                // wins over its normalized form, so a legacy plain-text body or an untrimmed title
+                // is never rewritten just because the caller repeated it.
+                const next = {
+                    overviewEnabled: overviewEnabled !== undefined ? overviewEnabled : fresh.overviewEnabled,
+                    overviewTitle: overviewTitle === undefined || input.overviewTitle === fresh.overviewTitle ? fresh.overviewTitle : overviewTitle,
+                    overviewBody: overviewBody === undefined || input.overviewBody === fresh.overviewBody ? fresh.overviewBody : overviewBody,
+                };
+                let overviewChanged = false;
+                if (next.overviewEnabled !== fresh.overviewEnabled) {
+                    data.overviewEnabled = next.overviewEnabled;
+                    changed.push(next.overviewEnabled ? "overview shown" : "overview hidden");
+                    overviewChanged = true;
+                }
+                if (next.overviewTitle !== fresh.overviewTitle) {
+                    data.overviewTitle = next.overviewTitle;
+                    changed.push("overview title");
+                    overviewChanged = true;
+                }
+                if (next.overviewBody !== fresh.overviewBody) {
+                    data.overviewBody = next.overviewBody;
+                    changed.push(next.overviewBody === null ? "overview text cleared" : "overview text");
+                    overviewChanged = true;
+                }
+                // The editor sends every overview field with every save, autosaves included, and
+                // its only conflict check is the itemsRevision CAS. Without this bump an editor tab
+                // opened before this write would silently put the old vision back on its next
+                // blur. With it, that tab gets the "changed by someone else, reload" toast instead.
+                // This widens itemsRevision beyond line items on purpose — see
+                // docs/specs/estimate-item-optimistic-concurrency.md, "Overview writes".
+                if (overviewChanged) bumpItemsRevision = true;
+                // What the customer-facing cover page shows, before and after (null = no cover page).
+                const rendered = (o: { overviewEnabled: boolean; overviewTitle: string | null; overviewBody: string | null }) =>
+                    overviewOnCoverPage(o) ? `${o.overviewTitle ?? ""}\u0000${o.overviewBody}` : null;
+                overviewAfter = { overviewEnabled: next.overviewEnabled, overviewBody: next.overviewBody, renderChanged: rendered(next) !== rendered(fresh) };
+            }
             // balanceDue tracks totalAmount 1:1 here — the has-invoice/paid gate
             // guarantees no payment has been applied, so there is nothing to net out.
             if (recomputeTotal && totalChanged) { data.totalAmount = newTotal; data.balanceDue = newTotal; changed.push("total"); }
@@ -514,6 +579,22 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
         ? `https://probuild.goldentouchremodeling.com/projects/${existing.projectId}/estimates/${existing.id}`
         : `https://probuild.goldentouchremodeling.com/leads/${existing.leadId}/estimates/${existing.id}`;
 
+    const overview = overviewAfter as { overviewEnabled: boolean; overviewBody: string | null; renderChanged: boolean } | null;
+    if (overview) {
+        if (!overview.overviewEnabled && overview.overviewBody) {
+            warnings.push("The project overview text is saved but hidden: overviewEnabled is false, so it is not on the PDF cover page or in the customer portal. Send overviewEnabled: true to show it.");
+        } else if (overview.overviewEnabled && !overview.overviewBody) {
+            warnings.push("overviewEnabled is true but there is no overview text, so no cover page shows until overviewBody is set.");
+        }
+        // Only when the cover page the customer would see actually changed, and only if they can
+        // see the estimate at all: the canonical portal gate, not a status check (status defaults to "Sent").
+        const portalVisible = overview.renderChanged
+            && (await prisma.estimate.count({ where: { AND: [{ id: existing.id }, portalVisibleEstimateWhere()] } })) > 0;
+        if (portalVisible) {
+            warnings.push("The customer can already open this estimate in their portal, so they see the overview change right away. Nothing was emailed; use send_estimate only if you want to send them a fresh copy.");
+        }
+    }
+
     return {
         ok: true,
         estimateId: existing.id,
@@ -524,6 +605,7 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
         url,
         changed: [...new Set(changed)],
         warnings,
+        ...(overview ? { overviewOnCoverPage: overviewOnCoverPage(overview) } : {}),
     };
 }
 

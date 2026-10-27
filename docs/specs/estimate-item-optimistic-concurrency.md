@@ -56,6 +56,16 @@ both insufficient and pointless, and it is right on both counts:
   changed by someone else since you opened it. Your changes were not saved. Reload to get the
   latest version."*
 
+### Overview writes (2026-10-27)
+
+`updateEstimateFromPhases` (the MCP `update_estimate` tool) also bumps `itemsRevision` when it
+actually changes `overviewEnabled`, `overviewTitle` or `overviewBody`, even though no line item
+moved. The editor sends those three fields with every save, autosaves included, and this CAS is its
+only conflict check, so without the bump an editor tab opened before the connector wrote the
+Project Overview would silently put the old text back on its next blur. With it, that tab gets the
+reload toast above. Re-sending unchanged values does not bump. Title, memo and terms written by the
+same tool still do not bump; that is a known gap, not a rule.
+
 Everything below is the round-1 text, kept for the rationale it still carries. Where it says
 per-row `EstimateItem.version`, read estimate-level `Estimate.itemsRevision`; the "Deliberate
 non-goals", the return-don't-throw decision, and Goals 3 and 4 all stand as written.
