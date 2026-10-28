@@ -1,5 +1,6 @@
 import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
+import { HUMAN_COST_CODE_SOURCES } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
 import { logAutomationEventInTx } from "@/lib/automation-events";
 import { isReceiptUrlRef, receiptUrlRef } from "./receipt-url";
@@ -55,14 +56,13 @@ export function isReverseBookingRefusedError(error: unknown): error is ReverseBo
     );
 }
 
-/** A worker claim older than this is a dead run's, and not honoured (same lease as actions.ts). */
-const WORKER_CLAIM_LEASE_MS = 10 * 60_000;
-
 interface ReverseExpenseRow {
     id: string;
     projectId: string | null;
     estimateId: string | null;
     costCodeId: string | null;
+    costCodeSource: string | null;
+    costCodeConfidence: number | null;
     costCode?: { code: string; name: string } | null;
     amount: unknown;
     vendor: string | null;
@@ -121,6 +121,8 @@ const EXPENSE_SELECT = {
     projectId: true,
     estimateId: true,
     costCodeId: true,
+    costCodeSource: true,
+    costCodeConfidence: true,
     costCode: { select: { code: true, name: true } },
     amount: true,
     vendor: true,
@@ -188,9 +190,7 @@ export async function reverseReceiptBookingCore(
         if (expense.invoiceId || expense.invoicedAt) throw new ReverseBookingRefusedError(REVERSE_MESSAGES.billed);
         // Anything that says QuickBooks may hold, or the worker may be touching,
         // this document is for a person (same refusals as Move to job).
-        const claimLive = intake.claimToken !== null
-            && (intake.claimedAt === null || intake.claimedAt.getTime() > now.getTime() - WORKER_CLAIM_LEASE_MS);
-        if (intake.sendAttempted || intake.qbPurchaseId || intake.postVoidQbPurchaseId || claimLive) {
+        if (intake.sendAttempted || intake.qbPurchaseId || intake.postVoidQbPurchaseId || intake.claimToken !== null) {
             throw new ReverseBookingRefusedError(REVERSE_MESSAGES.askJustin);
         }
         return expense;
@@ -262,6 +262,7 @@ export async function reverseReceiptBookingCore(
                 sendAttempted: false,
                 qbPurchaseId: null,
                 postVoidQbPurchaseId: null,
+                claimToken: null,
             },
             // Dedup keys, file hash and bookedAt are deliberately NOT touched.
             data: { state: REVERSED_STATE, stateReason, expenseId: null, lastError: null, nextRetryAt: null },
@@ -287,12 +288,32 @@ export async function reverseReceiptBookingCore(
         let phaseToSet: ReverseBookingResult["phaseToSet"] = null;
         if (kept) {
             if (expense.costCodeId && !kept.costCodeId) {
-                // The same phase proof the PATCH path takes before stamping a code.
-                const verdict = await assertPhaseOfProjectTx(raw, kept.projectId, expense.costCodeId);
+                // NEVER onto a row where a person chose "no phase" ("manual-none":
+                // the no-overwrite rule in expense-attribution.ts), and never onto
+                // one already billed. Those are handed back for a person instead.
+                const keptDecided = kept.costCodeSource === "manual-none";
+                const keptBilled = !!kept.invoiceId || !!kept.invoicedAt;
+                // Provenance travels with the code: a human's pick is stamped
+                // "manual", a machine's guess keeps its own source and confidence.
+                const humanPick = (HUMAN_COST_CODE_SOURCES as readonly string[]).includes(expense.costCodeSource ?? "");
+                const verdict = keptDecided || keptBilled
+                    ? { ok: false as const }
+                    : await assertPhaseOfProjectTx(raw, kept.projectId, expense.costCodeId);
                 if (verdict.ok) {
                     const carried = await tx.expense.updateMany({
-                        where: { id: kept.id, projectId: kept.projectId, costCodeId: null, qbPurchaseId: kept.qbPurchaseId },
-                        data: { costCodeId: expense.costCodeId, costCodeSource: "manual", costCodeConfidence: null },
+                        where: {
+                            id: kept.id,
+                            projectId: kept.projectId,
+                            costCodeId: null,
+                            // So a person choosing "no phase" in the gap cannot be overwritten.
+                            OR: [{ costCodeSource: null }, { costCodeSource: { not: "manual-none" } }],
+                            invoiceId: null,
+                            invoicedAt: null,
+                            qbPurchaseId: kept.qbPurchaseId,
+                        },
+                        data: humanPick
+                            ? { costCodeId: expense.costCodeId, costCodeSource: "manual", costCodeConfidence: null }
+                            : { costCodeId: expense.costCodeId, costCodeSource: expense.costCodeSource, costCodeConfidence: expense.costCodeConfidence },
                     });
                     phaseCarried = carried.count === 1;
                 }

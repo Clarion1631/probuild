@@ -38,9 +38,9 @@ function seed() {
     costCodes = [{ id: "cc-1", code: "03-PLUMB", name: "Plumbing" }];
     expenses = [
         // The receipt-intake copy (to be reversed), phase set.
-        { id: "exp-intake", projectId: "job-1", estimateId: "est-1", costCodeId: "cc-1", amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-15T00:00:00Z"), qbPurchaseId: null, invoiceId: null, invoicedAt: null, receiptUrl: "receipt-intake://receipt-intake/receipts/intake/ri-1.jpg" },
+        { id: "exp-intake", projectId: "job-1", estimateId: "est-1", costCodeId: "cc-1", costCodeSource: "capture", costCodeConfidence: null, amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-15T00:00:00Z"), qbPurchaseId: null, invoiceId: null, invoicedAt: null, receiptUrl: "receipt-intake://receipt-intake/receipts/intake/ri-1.jpg" },
         // The QuickBooks-import twin: QB-linked, no phase.
-        { id: "exp-qbo", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-11T00:00:00Z"), qbPurchaseId: "6879", invoiceId: null, invoicedAt: null, receiptUrl: null, costCodeSource: null },
+        { id: "exp-qbo", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-11T00:00:00Z"), qbPurchaseId: "6879", invoiceId: null, invoicedAt: null, receiptUrl: null, costCodeSource: null, costCodeConfidence: null },
         // Unrelated cost on the same job.
         { id: "exp-other", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "100.00", vendor: "Other", date: null, qbPurchaseId: null, invoiceId: null, invoicedAt: null, receiptUrl: null },
         // QB-linked expense that (wrongly) also has a receipt row.
@@ -59,8 +59,11 @@ const jobCost = (projectId: string) =>
     expenses.filter(e => e.projectId === projectId).reduce((sum, e) => sum + Math.round(Number(e.amount) * 100), 0) / 100;
 
 const matches = (row: Row, where: Row): boolean =>
-    Object.entries(where).every(([k, v]) =>
-        k === "OR" ? (v as Row[]).some(branch => matches(row, branch)) : row[k] === v);
+    Object.entries(where).every(([k, v]) => {
+        if (k === "OR") return (v as Row[]).some(branch => matches(row, branch));
+        if (v !== null && typeof v === "object" && !(v instanceof Date) && "not" in (v as Row)) return row[k] !== (v as Row).not;
+        return row[k] === v;
+    });
 
 let afterReadHook: (() => void) | null = null;
 /** Does the proof query say the removed copy's phase is still a phase of the job? */
@@ -299,6 +302,59 @@ test("an empty-string receiptUrl on the kept copy is treated as empty: carried, 
     assert.equal(JSON.parse(events[0].detail).receiptCarried, true);
 });
 
+test("phase carry-over: a human's pick is stamped manual; a machine's keeps its source and confidence", async () => {
+    await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    assert.equal(expenses.find(e => e.id === "exp-qbo")!.costCodeSource, "manual"); // "capture" is human
+    for (const [source, confidence] of [["machine", null], ["ai", 0.73]] as const) {
+        seed();
+        Object.assign(expenses.find(e => e.id === "exp-intake")!, { costCodeSource: source, costCodeConfidence: confidence });
+        const result = await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+        assert.equal(result.phaseCarried, true, source);
+        const kept = expenses.find(e => e.id === "exp-qbo")!;
+        assert.equal(kept.costCodeId, "cc-1");
+        assert.equal(kept.costCodeSource, source);
+        assert.equal(kept.costCodeConfidence, confidence);
+    }
+});
+
+test("phase carry-over: never onto a kept import where a person chose NO phase (manual-none)", async () => {
+    expenses.find(e => e.id === "exp-qbo")!.costCodeSource = "manual-none";
+    const result = await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    assert.equal(result.phaseCarried, false);
+    assert.deepEqual(result.phaseToSet, { keptExpenseId: "exp-qbo", costCodeId: "cc-1", code: "03-PLUMB", name: "Plumbing" });
+    const kept = expenses.find(e => e.id === "exp-qbo")!;
+    assert.equal(kept.costCodeId, null);
+    assert.equal(kept.costCodeSource, "manual-none");
+});
+
+test("phase carry-over: a person choosing manual-none in the gap wins (the predicate carries costCodeSource)", async () => {
+    const original = tx.expense.updateMany;
+    tx.expense.updateMany = async (args: any) => {
+        if ("costCodeId" in (args.data ?? {})) expenses.find(e => e.id === "exp-qbo")!.costCodeSource = "manual-none";
+        return original(args);
+    };
+    let result;
+    try {
+        result = await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    } finally {
+        tx.expense.updateMany = original;
+    }
+    assert.equal(result.phaseCarried, false);
+    assert.ok(result.phaseToSet);
+    assert.equal(expenses.find(e => e.id === "exp-qbo")!.costCodeId, null);
+});
+
+test("phase carry-over: never onto a kept import that is already invoiced", async () => {
+    for (const field of ["invoiceId", "invoicedAt"] as const) {
+        seed();
+        expenses.find(e => e.id === "exp-qbo")![field] = field === "invoiceId" ? "inv-1" : new Date();
+        const result = await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+        assert.equal(result.phaseCarried, false, field);
+        assert.ok(result.phaseToSet, field);
+        assert.equal(expenses.find(e => e.id === "exp-qbo")!.costCodeId, null, field);
+    }
+});
+
 test("receiptCarried is false when the kept copy already has a receipt (nothing written)", async () => {
     expenses.find(e => e.id === "exp-qbo")!.receiptUrl = "https://drive.google.com/file/d/abc/view";
     await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
@@ -368,13 +424,13 @@ test("refuses a row QuickBooks may hold, a send that started, or a live worker c
         await refusal(reverse(), REVERSE_MESSAGES.askJustin);
         assert.ok(expenses.some(e => e.id === "exp-intake"), field);
     }
-    seed();
-    const now = new Date("2026-10-28T12:00:00Z");
-    Object.assign(intakes.find(i => i.id === "ri-1")!, { claimToken: "tok", claimedAt: new Date(now.getTime() - 60_000) });
-    await refusal(reverse({ now }), REVERSE_MESSAGES.askJustin);
-    // A claim older than the lease belongs to a dead run and does not block.
-    intakes.find(i => i.id === "ri-1")!.claimedAt = new Date(now.getTime() - 3_600_000);
-    assert.equal((await reverse({ now })).removedExpenseId, "exp-intake");
+    // ANY claim blocks, exactly as Move to job does: a booked row carries no claim.
+    for (const claimedAt of [new Date("2026-10-28T11:59:00Z"), new Date("2026-10-28T08:00:00Z"), null]) {
+        seed();
+        Object.assign(intakes.find(i => i.id === "ri-1")!, { claimToken: "tok", claimedAt });
+        await refusal(reverse({ now: new Date("2026-10-28T12:00:00Z") }), REVERSE_MESSAGES.askJustin);
+        assert.ok(expenses.some(e => e.id === "exp-intake"));
+    }
 });
 
 // ── re-sent file is stopped ────────────────────────────────────────────────

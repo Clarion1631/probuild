@@ -70,7 +70,7 @@ before(async () => {
     await cleanup();
     await db!.client.create({ data: { id: CLIENT, name: "Reverse Booking DB", initials: "RB" } });
     await db!.project.create({ data: { id: PROJECT, name: "Reverse Booking DB", clientId: CLIENT, status: "In Progress" } });
-    await db!.costCode.create({ data: { id: CODE, code: "03-PLUMB", name: "Plumbing", isActive: true } });
+    await db!.costCode.create({ data: { id: CODE, code: `${P}-03-PLUMB`, name: "Plumbing", isActive: true } });
     await db!.estimate.create({
         data: { id: ESTIMATE, title: "Reverse Booking DB", code: `EST-${P}`, projectId: PROJECT, status: "Approved", totalAmount: 5000, balanceDue: 5000 },
     });

@@ -8,7 +8,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { WANTED_DEF, WANTED_STATES } from "../scripts/apply-receipt-reversed-state.mjs";
+import { spawnSync } from "node:child_process";
+import { WANTED_DEF, WANTED_STATES, parseGateFlags } from "../scripts/apply-receipt-reversed-state.mjs";
 import { RECEIPT_INTAKE_STATES } from "../src/lib/receipt-intake/route-state";
 
 const migrationSql = readFileSync(
@@ -51,12 +52,44 @@ test("both the script and the migration are additive: no table or column is drop
     }
 });
 
+test("flag handling: no --yes is refused, missing expect flags are refused, the full set is accepted", () => {
+    const full = ["--target", "ci", "--yes", "--expect-db", "d", "--expect-host", "h"];
+    assert.deepEqual(parseGateFlags(full), { ok: true, expectDb: "d", expectHost: "h" });
+    const without = (flag: string) => full.filter((v, i) => !(v === flag || (full[i - 1] === flag && flag !== "--yes")));
+    assert.equal(parseGateFlags(without("--yes")).ok, false);
+    assert.match(String((parseGateFlags(without("--yes")) as { reason?: string }).reason), /without --yes/);
+    assert.equal(parseGateFlags(without("--expect-db")).ok, false);
+    assert.equal(parseGateFlags(without("--expect-host")).ok, false);
+    // A flag with no value (or another flag in its place) does not count.
+    assert.equal(parseGateFlags(["--yes", "--expect-db", "--expect-host", "h"]).ok, false);
+    assert.equal(parseGateFlags(["--yes", "--expect-db", "d", "--expect-host"]).ok, false);
+    assert.equal(parseGateFlags(undefined as unknown as string[]).ok, false);
+});
+
+test("running the script for real without --yes exits non-zero before touching the database", () => {
+    const run = (args: string[]) => spawnSync(process.execPath, ["scripts/apply-receipt-reversed-state.mjs", ...args], {
+        cwd: path.join(__dirname, ".."),
+        // A dead port: if anything tried to connect the failure would be a connection error.
+        env: { ...process.env, DATABASE_URL: "postgresql://u:p@127.0.0.1:1/nope" },
+        encoding: "utf8",
+        timeout: 30_000,
+    });
+    const noYes = run(["--target", "ci", "--expect-db", "nope", "--expect-host", "127.0.0.1"]);
+    assert.notEqual(noYes.status, 0);
+    assert.match(noYes.stderr, /without --yes/);
+    const noExpect = run(["--target", "ci", "--yes"]);
+    assert.notEqual(noExpect.status, 0);
+    assert.match(noExpect.stderr, /--expect-db and --expect-host are required/);
+    // Control: with every flag it gets PAST the flag check (and then fails on the dead database).
+    const all = run(["--target", "ci", "--yes", "--expect-db", "nope", "--expect-host", "127.0.0.1"]);
+    assert.notEqual(all.status, 0);
+    assert.doesNotMatch(all.stderr, /without --yes|are required/);
+});
+
 test("the script carries the shared target gate and a transaction timeout longer than lock_timeout", () => {
     const script = readFileSync(path.join(__dirname, "..", "scripts", "apply-receipt-reversed-state.mjs"), "utf8");
     assert.match(script, /resolveTargetOrRefuse\(process\.argv\)/);
     assert.match(script, /verifyTargetIdentity\(/);
-    assert.match(script, /--expect-db/);
-    assert.match(script, /--expect-host/);
     const lock = Number(/LOCK_TIMEOUT_MS = (\d+)/.exec(script)?.[1]);
     const tx = Number(/TRANSACTION_TIMEOUT_MS = (\d+)/.exec(script)?.[1]);
     assert.ok(lock > 0 && tx > lock, `transaction timeout ${tx} must exceed lock_timeout ${lock}`);

@@ -47,19 +47,39 @@ async function currentDef(client) {
     return rows.length ? rows[0].def : null;
 }
 
+/**
+ * The flags this script needs, as a PURE function so it can be exercised
+ * without a database: --yes is required, and so are --expect-db and
+ * --expect-host, each with a value. (--target is validated by the shared target
+ * guard in main().) Returns { ok: true, expectDb, expectHost } or { ok: false, reason }.
+ */
+export function parseGateFlags(argv) {
+    const args = Array.isArray(argv) ? argv : [];
+    if (!args.includes("--yes")) return { ok: false, reason: "Refusing to run without --yes (and --expect-db / --expect-host)." };
+    const valueOf = flag => {
+        const at = args.indexOf(flag);
+        const value = at === -1 ? undefined : args[at + 1];
+        return typeof value === "string" && value.length > 0 && !value.startsWith("--") ? value : undefined;
+    };
+    const expectDb = valueOf("--expect-db");
+    const expectHost = valueOf("--expect-host");
+    if (!expectDb || !expectHost) return { ok: false, reason: "Both --expect-db and --expect-host are required, each with a value." };
+    return { ok: true, expectDb, expectHost };
+}
+
 async function main() {
+    const flags = parseGateFlags(process.argv.slice(2));
+    if (!flags.ok) throw new Error(flags.reason);
     const targeted = resolveTargetOrRefuse(process.argv);
     if (targeted.error) throw new Error("migration target refused");
-    const argv = process.argv.slice(2);
-    const valueOf = flag => argv[argv.indexOf(flag) + 1];
     const { PrismaClient } = await import("@prisma/client");
     const prisma = new PrismaClient({ datasources: { db: { url: targeted.url } } });
     try {
         await prisma.$connect();
         const identity = await verifyTargetIdentity(prisma, {
             ...targeted,
-            expectDb: valueOf("--expect-db"),
-            expectHost: valueOf("--expect-host"),
+            expectDb: flags.expectDb,
+            expectHost: flags.expectHost,
         });
         if (!identity.ok) throw new Error("migration target identity refused");
 
