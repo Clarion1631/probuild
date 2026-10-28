@@ -11,6 +11,13 @@ export const RECEIPT_INTAKE_STATES = [
     "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING",
     "BOOKED", "ARCHIVED", "DUPLICATE", "VOID", "NON_RECEIPT",
     /**
+     * Terminal. An admin reversed the booking (reverse-booking.ts): the Expense
+     * is gone and expenseId is null. Unlike VOID/DUPLICATE it KEEPS its dedup
+     * keys occupied (the partial unique index excludes only those two), so a
+     * re-sent copy of the same file is stopped instead of booking again.
+     */
+    "REVERSED",
+    /**
      * Terminal. The row arrived while RECEIPT_INTAKE_DRYRUN was on, so v1 (the
      * Apps Script) booked it and v2 never will. See the cutover sequence in
      * docs/plans/PHASE-1-INTAKE-CORE-SPEC.md §7.

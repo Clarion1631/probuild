@@ -115,7 +115,10 @@ function checkSemantics(sql: string) {
 test("both files declare the SAME closed state set, and it matches the runtime one", () => {
     // A state the CHECK constraint rejects but the code can produce is a
     // guaranteed 500 on a document nobody can then see.
-    assert.deepEqual([...RUNTIME_STATES].sort(), [...RECEIPT_INTAKE_STATES].sort());
+    // REVERSED was added later, by its own migration + apply script (see
+    // tests/apply-receipt-reversed-state.test.ts); this original pair predates it.
+    const original = RUNTIME_STATES.filter(state => state !== "REVERSED");
+    assert.deepEqual([...original].sort(), [...RECEIPT_INTAKE_STATES].sort());
     const check = statements.find((s: string) => s.includes("ReceiptIntake_state_check"));
     assert.ok(check, "the script must add the state CHECK constraint");
 
@@ -477,7 +480,9 @@ test("the wanted definition matches the snapshot CI compares against production"
     const recorded = snapshot.checkConstraints.find(
         (r: { name: string }) => r.name === "ReceiptIntake_state_check",
     );
-    assert.equal(wanted, recorded.def);
+    // The snapshot is the post-REVERSED definition (apply-receipt-reversed-state.mjs
+    // widens this constraint); this original script predates that one value.
+    assert.equal(wanted, recorded.def.replace("'REVERSED'::text, ", ""));
 });
 
 test("verification asserts the CHECK ALLOWS every state, not just that it exists", () => {

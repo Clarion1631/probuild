@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { deleteExpense, deleteExpenses, getExpenses, tagExpensesToChangeOrder } from "@/lib/time-expense-actions";
 import TaxPhaseModal, { type PhaseOption, type TaxPhaseExpense } from "./TaxPhaseModal";
 import MoveToJobModal from "./MoveToJobModal";
+import ReverseBookingModal from "./ReverseBookingModal";
 // Never import booked-expense.ts here — it is server-only.
 import { isReceiptBookedExpense } from "@/lib/receipt-intake/booked-expense-rules";
 
@@ -66,6 +67,7 @@ function fmtMoney(v: number): string {
 export default function ExpensesTab({ projectId, expenses: initialExpenses, onAddNew, currentUser, changeOrders, phases = [], canEditTax = false, jobOptions }: Props) {
     const [taxTarget, setTaxTarget] = useState<TaxPhaseExpense | null>(null);
     const [moveTarget, setMoveTarget] = useState<Expense | null>(null);
+    const [reverseTarget, setReverseTarget] = useState<Expense | null>(null);
     const [expenses, setExpenses] = useState<Expense[]>(initialExpenses);
     const [filter, setFilter] = useState("");
     const [statusFilter, setStatusFilter] = useState<"all" | "Pending" | "Reviewed">("all");
@@ -479,6 +481,9 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                             {isReceiptBookedExpense(expense) && !expense.invoiceId && !expense.invoicedAt && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
                                                 <button onClick={() => setMoveTarget(expense)} className="text-xs underline text-slate-400 hover:text-hui-primary transition">Move to job</button>
                                             )}
+                                            {isReceiptBookedExpense(expense) && !expense.invoiceId && !expense.invoicedAt && currentUser.role === "ADMIN" && (
+                                                <button onClick={() => setReverseTarget(expense)} className="ml-3 text-xs underline text-slate-400 hover:text-red-500 transition" title="Remove this expense and close its receipt">Reverse booking</button>
+                                            )}
                                         </td>
                                     </tr>
                                 ))}
@@ -499,6 +504,36 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                         // may have refused part of the change, and a hopeful
                         // local update would show an edit that did not happen.
                         setExpenses(await getExpenses(projectId) as unknown as Expense[]);
+                    }}
+                />
+            )}
+
+            {reverseTarget && reverseTarget.receiptIntake && (
+                <ReverseBookingModal
+                    receiptIntakeId={reverseTarget.receiptIntake.id}
+                    vendor={reverseTarget.vendor}
+                    amountLabel={fmtMoney(num(reverseTarget.amount))}
+                    dateLabel={reverseTarget.date ? new Date(reverseTarget.date).toLocaleDateString() : "—"}
+                    jobLabel={jobOptions.find(job => job.id === projectId)?.name ?? "this job"}
+                    keepCandidates={expenses
+                        .filter(e => e.id !== reverseTarget.id && e.qbPurchaseId && Math.round(num(e.amount) * 100) === Math.round(num(reverseTarget.amount) * 100))
+                        .map(e => ({
+                            id: e.id,
+                            label: `${e.vendor || "Unknown vendor"} · ${fmtMoney(num(e.amount))} · QB ${e.qbPurchaseId}${e.costCode ? "" : " · no phase"}`,
+                        }))}
+                    onClose={() => setReverseTarget(null)}
+                    onReversed={async () => {
+                        const removedId = reverseTarget.id;
+                        setReverseTarget(null);
+                        setExpenses(prev => prev.filter(e => e.id !== removedId));
+                        setSelectedIds(prev => {
+                            if (!prev.has(removedId)) return prev;
+                            const next = new Set(prev);
+                            next.delete(removedId);
+                            return next;
+                        });
+                        const refreshed = await refreshExpenses();
+                        if (!refreshed) toast("Reversed. Refresh the page if the list looks out of date.");
                     }}
                 />
             )}
