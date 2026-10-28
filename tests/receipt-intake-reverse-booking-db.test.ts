@@ -129,7 +129,8 @@ test("reverse a real BOOKED row: expense gone, row REVERSED, phase carried, job 
     // The kept QuickBooks import took the phase and the receipt file, nothing else.
     const kept = await db!.expense.findUniqueOrThrow({ where: { id: QBO_EXPENSE } });
     assert.equal(kept.costCodeId, CODE);
-    assert.equal(kept.receiptUrl, "receipt-intake://x");
+    // Rebuilt from the intake row's current storagePath, not copied.
+    assert.equal(kept.receiptUrl, `receipt-intake://receipt-intake/receipts/intake/${INTAKE}.jpg`);
     assert.equal(Number(kept.amount), 250);
     assert.equal(kept.qbPurchaseId, `${P}-qb-1`);
 

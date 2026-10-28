@@ -23,6 +23,7 @@ import {
     type ReverseBookingDbClient,
 } from "../src/lib/receipt-intake/reverse-booking";
 import { RECEIPT_INTAKE_STATES, routeState } from "../src/lib/receipt-intake/route-state";
+import { receiptUrlRef, resolveReceiptUrl } from "../src/lib/receipt-intake/receipt-url";
 
 // ── in-memory database ─────────────────────────────────────────────────────
 type Row = Record<string, any>;
@@ -37,7 +38,7 @@ function seed() {
     costCodes = [{ id: "cc-1", code: "03-PLUMB", name: "Plumbing" }];
     expenses = [
         // The receipt-intake copy (to be reversed), phase set.
-        { id: "exp-intake", projectId: "job-1", estimateId: "est-1", costCodeId: "cc-1", amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-15T00:00:00Z"), qbPurchaseId: null, invoiceId: null, invoicedAt: null, receiptUrl: "receipt-intake://ri-1" },
+        { id: "exp-intake", projectId: "job-1", estimateId: "est-1", costCodeId: "cc-1", amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-15T00:00:00Z"), qbPurchaseId: null, invoiceId: null, invoicedAt: null, receiptUrl: "receipt-intake://receipt-intake/receipts/intake/ri-1.jpg" },
         // The QuickBooks-import twin: QB-linked, no phase.
         { id: "exp-qbo", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-11T00:00:00Z"), qbPurchaseId: "6879", invoiceId: null, invoicedAt: null, receiptUrl: null, costCodeSource: null },
         // Unrelated cost on the same job.
@@ -47,7 +48,7 @@ function seed() {
         { id: "exp-other-job", projectId: "job-2", estimateId: "est-2", costCodeId: null, amount: "2008.60", vendor: "Lowe's", date: null, qbPurchaseId: "6880", invoiceId: null, invoicedAt: null, receiptUrl: null },
     ];
     intakes = [
-        { id: "ri-1", state: "BOOKED", expenseId: "exp-intake", qbPurchaseId: null, postVoidQbPurchaseId: null, sendAttempted: false, claimToken: null, claimedAt: null, refNumber: "12584", dedupStrongKey: "S1", dedupWeakKey: "W1", fileSha256: "sha-1", vendor: "Lowe's", totalCents: 200860, bookedAt: new Date("2026-09-21T00:00:00Z"), stateReason: null },
+        { id: "ri-1", storagePath: "receipts/intake/sealed-ri-1.jpg", state: "BOOKED", expenseId: "exp-intake", qbPurchaseId: null, postVoidQbPurchaseId: null, sendAttempted: false, claimToken: null, claimedAt: null, refNumber: "12584", dedupStrongKey: "S1", dedupWeakKey: "W1", fileSha256: "sha-1", vendor: "Lowe's", totalCents: 200860, bookedAt: new Date("2026-09-21T00:00:00Z"), stateReason: null },
         { id: "ri-qb", state: "BOOKED", expenseId: "exp-qb-receipt", qbPurchaseId: null, postVoidQbPurchaseId: null, sendAttempted: false, claimToken: null, claimedAt: null, refNumber: null, dedupStrongKey: "S2", dedupWeakKey: "W2", fileSha256: "sha-2", vendor: "X", totalCents: 5000, bookedAt: null, stateReason: null },
         { id: "ri-read", state: "READ", expenseId: null, qbPurchaseId: null, postVoidQbPurchaseId: null, sendAttempted: false, claimToken: null, claimedAt: null, refNumber: null, dedupStrongKey: null, dedupWeakKey: null, fileSha256: "sha-3", vendor: null, totalCents: null, bookedAt: null, stateReason: null },
     ];
@@ -57,8 +58,9 @@ function seed() {
 const jobCost = (projectId: string) =>
     expenses.filter(e => e.projectId === projectId).reduce((sum, e) => sum + Math.round(Number(e.amount) * 100), 0) / 100;
 
-const matches = (row: Row, where: Row) =>
-    Object.entries(where).every(([k, v]) => row[k] === v);
+const matches = (row: Row, where: Row): boolean =>
+    Object.entries(where).every(([k, v]) =>
+        k === "OR" ? (v as Row[]).some(branch => matches(row, branch)) : row[k] === v);
 
 let afterReadHook: (() => void) | null = null;
 /** Does the proof query say the removed copy's phase is still a phase of the job? */
@@ -261,8 +263,63 @@ test("carry-over: the phase moves onto the kept QuickBooks import through costCo
         assert.ok(Object.keys(update.data).every(k => ["costCodeId", "costCodeSource", "costCodeConfidence", "receiptUrl"].includes(k)), JSON.stringify(update.data));
     }
     // The receipt file follows, so the kept copy still counts as evidence for its bank line.
-    assert.equal(kept.receiptUrl, "receipt-intake://ri-1");
+    assert.equal(kept.receiptUrl, "receipt-intake://receipt-intake/receipts/intake/sealed-ri-1.jpg");
     assert.equal(JSON.parse(events[0].detail).phaseCarried, true);
+});
+
+test("the carried receipt resolves after reversal even though the copied reference was stale", async () => {
+    // The booked reference points at the upload path; the object was later sealed to
+    // the intake row's current storagePath. Only the current path signs.
+    const signed = (p: string) => (p === "receipts/intake/sealed-ri-1.jpg" ? `https://signed.example/${p}` : null);
+    // The default fallback finds the intake THROUGH its linked Expense receiptUrl.
+    const deps = {
+        sign: async (p: string) => signed(p),
+        currentPath: async (p: string) => {
+            const row = intakes.find(i => {
+                const linked = i.expenseId ? expenses.find(e => e.id === i.expenseId) : null;
+                return linked?.receiptUrl === receiptUrlRef(p);
+            });
+            return row?.storagePath ?? null;
+        },
+    };
+    const staleRef = expenses.find(e => e.id === "exp-intake")!.receiptUrl as string;
+    // Control: before reversal the stale reference resolves only via the fallback.
+    assert.equal(await resolveReceiptUrl(staleRef, 600, deps), "https://signed.example/receipts/intake/sealed-ri-1.jpg");
+    await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    // Control: a plain copy of the stale reference has lost its fallback (the link is cut).
+    assert.equal(await resolveReceiptUrl(staleRef, 600, deps), null);
+    const kept = expenses.find(e => e.id === "exp-qbo")!;
+    assert.equal(await resolveReceiptUrl(kept.receiptUrl, 600, deps), "https://signed.example/receipts/intake/sealed-ri-1.jpg");
+});
+
+test("an empty-string receiptUrl on the kept copy is treated as empty: carried, and receiptCarried reflects the write", async () => {
+    expenses.find(e => e.id === "exp-qbo")!.receiptUrl = "";
+    await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    assert.ok(expenses.find(e => e.id === "exp-qbo")!.receiptUrl);
+    assert.equal(JSON.parse(events[0].detail).receiptCarried, true);
+});
+
+test("receiptCarried is false when the kept copy already has a receipt (nothing written)", async () => {
+    expenses.find(e => e.id === "exp-qbo")!.receiptUrl = "https://drive.google.com/file/d/abc/view";
+    await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    assert.equal(expenses.find(e => e.id === "exp-qbo")!.receiptUrl, "https://drive.google.com/file/d/abc/view");
+    assert.equal(JSON.parse(events[0].detail).receiptCarried, false);
+});
+
+test("receiptCarried comes from the update count: a lost race reports false", async () => {
+    // The kept copy gains a receipt between the locked read and the write.
+    const original = tx.expense.updateMany;
+    tx.expense.updateMany = async (args: any) => {
+        if ("receiptUrl" in (args.data ?? {})) { expenses.find(e => e.id === "exp-qbo")!.receiptUrl = "https://x.example/r"; }
+        return original(args);
+    };
+    try {
+        await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    } finally {
+        tx.expense.updateMany = original;
+    }
+    assert.equal(expenses.find(e => e.id === "exp-qbo")!.receiptUrl, "https://x.example/r");
+    assert.equal(JSON.parse(events[0].detail).receiptCarried, false);
 });
 
 test("carry-over: not done when the kept copy already has a phase, or for a customer payment", async () => {

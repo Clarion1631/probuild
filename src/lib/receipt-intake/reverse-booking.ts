@@ -2,6 +2,7 @@ import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evi
 import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
 import { lockExpense } from "@/lib/expense-lock";
 import { logAutomationEventInTx } from "@/lib/automation-events";
+import { isReceiptUrlRef, receiptUrlRef } from "./receipt-url";
 
 /**
  * Reverse booking: the one sanctioned way to take a receipt-booked Expense OUT
@@ -82,6 +83,7 @@ interface ReverseIntakeRow {
     claimToken: string | null;
     claimedAt: Date | null;
     refNumber: string | null;
+    storagePath: string;
     expense: ReverseExpenseRow | null;
 }
 
@@ -139,6 +141,7 @@ const INTAKE_SELECT = {
     claimToken: true,
     claimedAt: true,
     refNumber: true,
+    storagePath: true,
     expense: { select: EXPENSE_SELECT },
 } as const;
 
@@ -280,6 +283,7 @@ export async function reverseReceiptBookingCore(
         // QuickBooks-linked expense stays read-only, and
         // assertExpenseMutableOutsideQbo is untouched.
         let phaseCarried = false;
+        let receiptCarried = false;
         let phaseToSet: ReverseBookingResult["phaseToSet"] = null;
         if (kept) {
             if (expense.costCodeId && !kept.costCodeId) {
@@ -305,10 +309,27 @@ export async function reverseReceiptBookingCore(
                 // The receipt file keeps counting as evidence for the bank line:
                 // the reversed receipt row is a dead state, so without this the
                 // chaser would ask for a receipt we already hold.
-                await tx.expense.updateMany({
-                    where: { id: kept.id, projectId: kept.projectId, receiptUrl: null, qbPurchaseId: kept.qbPurchaseId },
-                    data: { receiptUrl: expense.receiptUrl },
+                //
+                // A pipeline reference is rebuilt from the intake row's CURRENT
+                // storagePath, not copied: the copied one may be stale (the object
+                // is sealed and archived after booking), and resolveReceiptUrl's
+                // moved-file fallback finds the intake THROUGH its linked Expense,
+                // a link this reversal has just cut. A reference to where the bytes
+                // are now resolves directly. An absolute URL (Drive) is copied as is.
+                const carriedUrl = isReceiptUrlRef(expense.receiptUrl) && intake?.storagePath
+                    ? receiptUrlRef(intake.storagePath)
+                    : expense.receiptUrl;
+                // "" counts as empty here exactly as in the check above.
+                const wrote = await tx.expense.updateMany({
+                    where: {
+                        id: kept.id,
+                        projectId: kept.projectId,
+                        qbPurchaseId: kept.qbPurchaseId,
+                        OR: [{ receiptUrl: null }, { receiptUrl: "" }],
+                    },
+                    data: { receiptUrl: carriedUrl },
                 });
+                receiptCarried = wrote.count === 1;
             }
         }
 
@@ -333,7 +354,7 @@ export async function reverseReceiptBookingCore(
                 refNumber: intake?.refNumber ?? null,
                 phaseCarried,
                 phaseToSet,
-                receiptCarried: !!kept && !!expense.receiptUrl && !kept.receiptUrl,
+                receiptCarried,
                 actor: actor.email,
                 actorId: actor.id,
                 at: now.toISOString(),
