@@ -37,19 +37,19 @@ function seed() {
     costCodes = [{ id: "cc-1", code: "03-PLUMB", name: "Plumbing" }];
     expenses = [
         // The receipt-intake copy (to be reversed), phase set.
-        { id: "exp-intake", projectId: "job-1", estimateId: "est-1", costCodeId: "cc-1", amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-15T00:00:00Z"), qbPurchaseId: null, invoiceId: null, invoicedAt: null },
+        { id: "exp-intake", projectId: "job-1", estimateId: "est-1", costCodeId: "cc-1", amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-15T00:00:00Z"), qbPurchaseId: null, invoiceId: null, invoicedAt: null, receiptUrl: "receipt-intake://ri-1" },
         // The QuickBooks-import twin: QB-linked, no phase.
-        { id: "exp-qbo", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-11T00:00:00Z"), qbPurchaseId: "6879", invoiceId: null, invoicedAt: null },
+        { id: "exp-qbo", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "2008.60", vendor: "Lowe's", date: new Date("2026-09-11T00:00:00Z"), qbPurchaseId: "6879", invoiceId: null, invoicedAt: null, receiptUrl: null, costCodeSource: null },
         // Unrelated cost on the same job.
-        { id: "exp-other", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "100.00", vendor: "Other", date: null, qbPurchaseId: null, invoiceId: null, invoicedAt: null },
+        { id: "exp-other", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "100.00", vendor: "Other", date: null, qbPurchaseId: null, invoiceId: null, invoicedAt: null, receiptUrl: null },
         // QB-linked expense that (wrongly) also has a receipt row.
-        { id: "exp-qb-receipt", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "50.00", vendor: "X", date: null, qbPurchaseId: "7000", invoiceId: null, invoicedAt: null },
-        { id: "exp-other-job", projectId: "job-2", estimateId: "est-2", costCodeId: null, amount: "2008.60", vendor: "Lowe's", date: null, qbPurchaseId: "6880", invoiceId: null, invoicedAt: null },
+        { id: "exp-qb-receipt", projectId: "job-1", estimateId: "est-1", costCodeId: null, amount: "50.00", vendor: "X", date: null, qbPurchaseId: "7000", invoiceId: null, invoicedAt: null, receiptUrl: null },
+        { id: "exp-other-job", projectId: "job-2", estimateId: "est-2", costCodeId: null, amount: "2008.60", vendor: "Lowe's", date: null, qbPurchaseId: "6880", invoiceId: null, invoicedAt: null, receiptUrl: null },
     ];
     intakes = [
-        { id: "ri-1", state: "BOOKED", expenseId: "exp-intake", qbPurchaseId: null, refNumber: "12584", dedupStrongKey: "S1", dedupWeakKey: "W1", fileSha256: "sha-1", vendor: "Lowe's", totalCents: 200860, bookedAt: new Date("2026-09-21T00:00:00Z"), stateReason: null },
-        { id: "ri-qb", state: "BOOKED", expenseId: "exp-qb-receipt", qbPurchaseId: null, refNumber: null, dedupStrongKey: "S2", dedupWeakKey: "W2", fileSha256: "sha-2", vendor: "X", totalCents: 5000, bookedAt: null, stateReason: null },
-        { id: "ri-read", state: "READ", expenseId: null, qbPurchaseId: null, refNumber: null, dedupStrongKey: null, dedupWeakKey: null, fileSha256: "sha-3", vendor: null, totalCents: null, bookedAt: null, stateReason: null },
+        { id: "ri-1", state: "BOOKED", expenseId: "exp-intake", qbPurchaseId: null, postVoidQbPurchaseId: null, sendAttempted: false, claimToken: null, claimedAt: null, refNumber: "12584", dedupStrongKey: "S1", dedupWeakKey: "W1", fileSha256: "sha-1", vendor: "Lowe's", totalCents: 200860, bookedAt: new Date("2026-09-21T00:00:00Z"), stateReason: null },
+        { id: "ri-qb", state: "BOOKED", expenseId: "exp-qb-receipt", qbPurchaseId: null, postVoidQbPurchaseId: null, sendAttempted: false, claimToken: null, claimedAt: null, refNumber: null, dedupStrongKey: "S2", dedupWeakKey: "W2", fileSha256: "sha-2", vendor: "X", totalCents: 5000, bookedAt: null, stateReason: null },
+        { id: "ri-read", state: "READ", expenseId: null, qbPurchaseId: null, postVoidQbPurchaseId: null, sendAttempted: false, claimToken: null, claimedAt: null, refNumber: null, dedupStrongKey: null, dedupWeakKey: null, fileSha256: "sha-3", vendor: null, totalCents: null, bookedAt: null, stateReason: null },
     ];
     events = [];
 }
@@ -61,11 +61,20 @@ const matches = (row: Row, where: Row) =>
     Object.entries(where).every(([k, v]) => row[k] === v);
 
 let afterReadHook: (() => void) | null = null;
+/** Does the proof query say the removed copy's phase is still a phase of the job? */
+let phaseIsOnJob = true;
+let expenseUpdates: Row[] = [];
 
 const tx: any = {
     $executeRaw: async () => 1,
     $queryRaw: async () => [{ value: "1" }],
-    $queryRawUnsafe: async () => [{}],
+    $queryRawUnsafe: async (query: string) => {
+        // assertPhaseOfProjectTx: project, cost code, and the membership proof.
+        if (/^SELECT id, status FROM "Project"/.test(query)) return [{ id: "job-1", status: "In Progress" }];
+        if (/^SELECT id, code, "isActive" FROM "CostCode"/.test(query)) return [{ id: "cc-1", code: "03-PLUMB", isActive: true }];
+        if (/FOR SHARE OF ei, e/.test(query)) return phaseIsOnJob ? [{ ok: 1 }] : [];
+        return [{}];
+    },
     receiptIntake: {
         findUnique: async ({ where }: any) => {
             const row = intakes.find(i => i.id === where.id);
@@ -85,6 +94,12 @@ const tx: any = {
         findUnique: async ({ where }: any) => {
             const e = expenses.find(x => x.id === where.id);
             return e ? { ...e, costCode: costCodes.find(c => c.id === e.costCodeId) ?? null } : null;
+        },
+        updateMany: async ({ where, data }: any) => {
+            const hits = expenses.filter(e => matches(e, where));
+            hits.forEach(e => Object.assign(e, data));
+            expenseUpdates.push({ where, data });
+            return { count: hits.length };
         },
         deleteMany: async ({ where }: any) => {
             const before = expenses.length;
@@ -109,7 +124,7 @@ const db: ReverseBookingDbClient = {
 };
 
 const reverse = (over: Partial<Parameters<typeof reverseReceiptBookingCore>[1]> = {}) =>
-    reverseReceiptBookingCore(db, { receiptIntakeId: "ri-1", reasonKind: "customer-payment", actor, ...over });
+    reverseReceiptBookingCore(db, { receiptIntakeId: "ri-1", expectedExpenseId: "exp-intake", expectedProjectId: "job-1", reasonKind: "customer-payment", actor, ...over });
 
 const refusal = async (promise: Promise<unknown>, message: string) => {
     await assert.rejects(promise, (error: unknown) => {
@@ -119,7 +134,7 @@ const refusal = async (promise: Promise<unknown>, message: string) => {
     });
 };
 
-beforeEach(seed);
+beforeEach(() => { seed(); phaseIsOnJob = true; expenseUpdates = []; afterReadHook = null; });
 
 // ── core ───────────────────────────────────────────────────────────────────
 test("removes exactly the expense, job cost drops by that amount, row ends REVERSED with expenseId null", async () => {
@@ -141,14 +156,17 @@ test("removes exactly the expense, job cost drops by that amount, row ends REVER
     assert.equal(row.fileSha256, "sha-1");
 });
 
-test("the kept QuickBooks import is never modified", async () => {
-    const keptBefore = structuredClone(expenses.find(e => e.id === "exp-qbo"));
+test("the kept QuickBooks import keeps its amount, vendor, date and QuickBooks link", async () => {
+    const before = structuredClone(expenses.find(e => e.id === "exp-qbo")!);
     await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
-    assert.deepEqual(expenses.find(e => e.id === "exp-qbo"), keptBefore);
+    const after = expenses.find(e => e.id === "exp-qbo")!;
+    for (const field of ["id", "projectId", "estimateId", "amount", "vendor", "date", "qbPurchaseId", "invoiceId", "invoicedAt"]) {
+        assert.deepEqual(after[field], before[field], field);
+    }
 });
 
 test("refuses any row that is not BOOKED", async () => {
-    await refusal(reverse({ receiptIntakeId: "ri-read" }), REVERSE_MESSAGES.notBooked);
+    await refusal(reverse({ receiptIntakeId: "ri-read", expectedExpenseId: "x" }), REVERSE_MESSAGES.notBooked);
     intakes.find(i => i.id === "ri-1")!.state = "ARCHIVED";
     await refusal(reverse(), REVERSE_MESSAGES.notBooked);
     await refusal(reverse({ receiptIntakeId: "nope" }), REVERSE_MESSAGES.gone);
@@ -161,7 +179,7 @@ test("refuses a BOOKED row with no expense", async () => {
 });
 
 test("refuses an expense linked to a QuickBooks purchase and changes nothing", async () => {
-    await refusal(reverse({ receiptIntakeId: "ri-qb" }), REVERSE_MESSAGES.qboLinked);
+    await refusal(reverse({ receiptIntakeId: "ri-qb", expectedExpenseId: "exp-qb-receipt" }), REVERSE_MESSAGES.qboLinked);
     assert.equal(expenses.length, 5);
     assert.equal(intakes.find(i => i.id === "ri-qb")!.state, "BOOKED");
     assert.equal(events.length, 0);
@@ -180,7 +198,7 @@ test("a second reversal of the same row is refused", async () => {
 
 test("a concurrent change between the read and the write is refused and rolls back", async () => {
     afterReadHook = () => { intakes.find(i => i.id === "ri-1")!.state = "NEEDS_REVIEW"; };
-    await refusal(reverse(), REVERSE_MESSAGES.changed);
+    await refusal(reverse(), REVERSE_MESSAGES.notBooked);
     assert.ok(expenses.some(e => e.id === "exp-intake"));
     assert.equal(events.length, 0);
 });
@@ -225,17 +243,81 @@ test("writes an audit event with the old values", async () => {
     assert.equal(intakes.find(i => i.id === "ri-1")!.stateReason, "reversed: duplicate of QuickBooks import exp-qbo");
 });
 
-test("carry-over: the phase is returned for a person, never written to the QuickBooks-linked expense", async () => {
+test("carry-over: the phase moves onto the kept QuickBooks import through costCodeId only", async () => {
     const result = await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    assert.equal(result.phaseCarried, true);
+    assert.equal(result.phaseToSet, null);
+    const kept = expenses.find(e => e.id === "exp-qbo")!;
+    assert.equal(kept.costCodeId, "cc-1");
+    assert.equal(kept.costCodeSource, "manual");
+    // Nothing else on the QuickBooks-linked row changed: amount, vendor, date, link.
+    assert.equal(kept.amount, "2008.60");
+    assert.equal(kept.qbPurchaseId, "6879");
+    assert.equal(kept.vendor, "Lowe's");
+    // The only writes to it were the phase and the receipt file, each pinned to the QuickBooks link.
+    for (const update of expenseUpdates) {
+        assert.equal(update.where.id, "exp-qbo");
+        assert.equal(update.where.qbPurchaseId, "6879");
+        assert.ok(Object.keys(update.data).every(k => ["costCodeId", "costCodeSource", "costCodeConfidence", "receiptUrl"].includes(k)), JSON.stringify(update.data));
+    }
+    // The receipt file follows, so the kept copy still counts as evidence for its bank line.
+    assert.equal(kept.receiptUrl, "receipt-intake://ri-1");
+    assert.equal(JSON.parse(events[0].detail).phaseCarried, true);
+});
+
+test("carry-over: not done when the kept copy already has a phase, or for a customer payment", async () => {
+    expenses.find(e => e.id === "exp-qbo")!.costCodeId = "cc-9";
+    const result = await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    assert.equal(result.phaseCarried, false);
+    assert.equal(result.phaseToSet, null);
+    assert.equal(expenses.find(e => e.id === "exp-qbo")!.costCodeId, "cc-9");
+    seed();
+    expenseUpdates = [];
+    const customer = await reverse();
+    assert.equal(customer.phaseCarried, false);
+    assert.equal(customer.phaseToSet, null);
+    assert.equal(expenseUpdates.length, 0);
+});
+
+test("carry-over: when the phase is no longer a phase of the job it is returned for a person, never forced", async () => {
+    phaseIsOnJob = false;
+    const result = await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" });
+    assert.equal(result.phaseCarried, false);
     assert.deepEqual(result.phaseToSet, { keptExpenseId: "exp-qbo", costCodeId: "cc-1", code: "03-PLUMB", name: "Plumbing" });
     assert.equal(expenses.find(e => e.id === "exp-qbo")!.costCodeId, null);
 });
 
-test("carry-over: nothing returned when the kept copy already has a phase, or for a customer payment", async () => {
-    expenses.find(e => e.id === "exp-qbo")!.costCodeId = "cc-9";
-    assert.equal((await reverse({ reasonKind: "duplicate-of-qbo", keptExpenseId: "exp-qbo" })).phaseToSet, null);
+test("server pins what the dialog showed: a different expense or job than expected is refused", async () => {
+    await refusal(reverse({ expectedExpenseId: "exp-other" }), REVERSE_MESSAGES.changed);
+    await refusal(reverse({ expectedProjectId: "job-2" }), REVERSE_MESSAGES.changed);
+    // Move to job after the page loaded: the expense is on another job now.
+    expenses.find(e => e.id === "exp-intake")!.projectId = "job-2";
+    await refusal(reverse(), REVERSE_MESSAGES.changed);
+    assert.ok(expenses.some(e => e.id === "exp-intake"));
+});
+
+test("the audit row uses the values re-read UNDER the locks, not the first unlocked read", async () => {
+    // Between the unlocked read and the locked re-read the vendor is corrected.
+    afterReadHook = () => { expenses.find(e => e.id === "exp-intake")!.vendor = "Lowe's Home Centers"; };
+    await reverse();
+    assert.equal(events[0].vendor, "Lowe's Home Centers");
+    assert.equal(JSON.parse(events[0].detail).vendor, "Lowe's Home Centers");
+});
+
+test("refuses a row QuickBooks may hold, a send that started, or a live worker claim", async () => {
+    for (const [field, value] of [["sendAttempted", true], ["qbPurchaseId", "99"], ["postVoidQbPurchaseId", "98"]] as const) {
+        seed();
+        intakes.find(i => i.id === "ri-1")![field] = value;
+        await refusal(reverse(), REVERSE_MESSAGES.askJustin);
+        assert.ok(expenses.some(e => e.id === "exp-intake"), field);
+    }
     seed();
-    assert.equal((await reverse()).phaseToSet, null);
+    const now = new Date("2026-10-28T12:00:00Z");
+    Object.assign(intakes.find(i => i.id === "ri-1")!, { claimToken: "tok", claimedAt: new Date(now.getTime() - 60_000) });
+    await refusal(reverse({ now }), REVERSE_MESSAGES.askJustin);
+    // A claim older than the lease belongs to a dead run and does not block.
+    intakes.find(i => i.id === "ri-1")!.claimedAt = new Date(now.getTime() - 3_600_000);
+    assert.equal((await reverse({ now })).removedExpenseId, "exp-intake");
 });
 
 // ── re-sent file is stopped ────────────────────────────────────────────────
@@ -284,12 +366,12 @@ test("gate: only ADMIN may reverse (MANAGER, FINANCE, FIELD_CREW are refused bef
     let opened = 0;
     const counting: ReverseBookingDbClient = { $transaction: fn => { opened++; return db.$transaction(fn); } };
     for (const role of ["MANAGER", "FINANCE", "FIELD_CREW", ""]) {
-        const res = await reverseReceiptBookingForUser(counting, { id: "u", role, email: "x@example.test" }, { receiptIntakeId: "ri-1", reasonKind: "customer-payment" });
+        const res = await reverseReceiptBookingForUser(counting, { id: "u", role, email: "x@example.test" }, { receiptIntakeId: "ri-1", expectedExpenseId: "exp-intake", expectedProjectId: "job-1", reasonKind: "customer-payment" });
         assert.deepEqual(res, { ok: false, message: REVERSE_MESSAGES.notAllowed });
     }
     assert.equal(opened, 0);
     assert.equal(intakes.find(i => i.id === "ri-1")!.state, "BOOKED");
-    const ok = await reverseReceiptBookingForUser(counting, { id: "u-admin", role: "ADMIN", email: "admin@example.test" }, { receiptIntakeId: "ri-1", reasonKind: "customer-payment" });
+    const ok = await reverseReceiptBookingForUser(counting, { id: "u-admin", role: "ADMIN", email: "admin@example.test" }, { receiptIntakeId: "ri-1", expectedExpenseId: "exp-intake", expectedProjectId: "job-1", reasonKind: "customer-payment" });
     assert.equal(ok.ok, true);
     assert.equal(opened, 1);
     assert.equal(intakes.find(i => i.id === "ri-1")!.state, REVERSED_STATE);
@@ -297,10 +379,10 @@ test("gate: only ADMIN may reverse (MANAGER, FINANCE, FIELD_CREW are refused bef
 
 test("gate: a refusal comes back as a value, and the audit row records the admin", async () => {
     const admin = { id: "u-admin", role: "ADMIN", email: "admin@example.test" };
-    const first = await reverseReceiptBookingForUser(db, admin, { receiptIntakeId: "ri-1", reasonKind: "customer-payment" });
+    const first = await reverseReceiptBookingForUser(db, admin, { receiptIntakeId: "ri-1", expectedExpenseId: "exp-intake", expectedProjectId: "job-1", reasonKind: "customer-payment" });
     assert.equal(first.ok, true);
     assert.equal(JSON.parse(events[0].detail).actorId, "u-admin");
-    const second = await reverseReceiptBookingForUser(db, admin, { receiptIntakeId: "ri-1", reasonKind: "customer-payment" });
+    const second = await reverseReceiptBookingForUser(db, admin, { receiptIntakeId: "ri-1", expectedExpenseId: "exp-intake", expectedProjectId: "job-1", reasonKind: "customer-payment" });
     assert.deepEqual(second, { ok: false, message: REVERSE_MESSAGES.notBooked });
 });
 

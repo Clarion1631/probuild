@@ -15,6 +15,8 @@ export type KeepCandidate = { id: string; label: string };
 
 export default function ReverseBookingModal({
     receiptIntakeId,
+    expenseId,
+    projectId,
     vendor,
     amountLabel,
     dateLabel,
@@ -24,6 +26,9 @@ export default function ReverseBookingModal({
     onReversed,
 }: {
     receiptIntakeId: string;
+    /** The expense and job this dialog shows; the server refuses if either has changed. */
+    expenseId: string;
+    projectId: string;
     vendor: string | null;
     amountLabel: string;
     dateLabel: string;
@@ -41,14 +46,16 @@ export default function ReverseBookingModal({
         if (reason === "duplicate-of-qbo" && !keptId) return;
         setBusy(true);
         try {
-            const res = await reverseReceiptBooking(receiptIntakeId, reason, reason === "duplicate-of-qbo" ? keptId : null);
+            const res = await reverseReceiptBooking(receiptIntakeId, expenseId, projectId, reason, reason === "duplicate-of-qbo" ? keptId : null);
             if (!res.ok) {
                 toast.error(res.message);
                 return;
             }
             toast.success(res.phaseToSet
                 ? `Reversed ${amountLabel}. Set the phase ${res.phaseToSet.code ?? ""} ${res.phaseToSet.name ?? ""} on the QuickBooks copy.`.replace(/\s+/g, " ")
-                : `Reversed ${amountLabel}.`);
+                : res.phaseCarried
+                    ? `Reversed ${amountLabel}. Its phase moved to the QuickBooks copy.`
+                    : `Reversed ${amountLabel}.`);
             await onReversed();
         } catch {
             toast.error("Could not reverse it. Refresh the page and try again.");

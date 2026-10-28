@@ -152,13 +152,26 @@ test("a live ReceiptIntake satisfies a line the same way an Expense does", () =>
     assert.deepEqual(result.close, ["bl-1"]);
 });
 
-test("DUPLICATE / VOID / NON_RECEIPT intakes never satisfy a line", async t => {
-    for (const state of ["DUPLICATE", "VOID", "NON_RECEIPT"]) {
+test("DUPLICATE / VOID / NON_RECEIPT / REVERSED intakes never satisfy a line", async t => {
+    for (const state of ["DUPLICATE", "VOID", "NON_RECEIPT", "REVERSED"]) {
         await t.test(state, () => {
             const result = plan({ intakes: [intake({ state })] });
             assert.equal(result.open.length, 1);
         });
     }
+});
+
+test("a reversed double: the kept QuickBooks import carries the receipt, so the line stays satisfied and is not chased", () => {
+    // Reverse booking removed the receipt-intake copy and carried its receipt file
+    // onto the kept QuickBooks-import expense (hasReceipt true). The REVERSED row is dead.
+    const kept = expense({ id: "exp-qbo", hasReceipt: true });
+    const reversed = intake({ state: "REVERSED" });
+    const result = plan({ expenses: [kept], intakes: [reversed], openIssueKeys: ["bl-1"] });
+    assert.deepEqual(result.open, []);
+    assert.deepEqual(result.close, ["bl-1"]);
+    // Control: had the file NOT followed, the reversed row alone would not close it.
+    const without = plan({ expenses: [expense({ id: "exp-qbo", hasReceipt: false })], intakes: [reversed] });
+    assert.equal(without.open.length, 1);
 });
 
 test("a null-total intake is not evidence", () => {

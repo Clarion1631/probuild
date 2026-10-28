@@ -578,7 +578,7 @@ export async function getExpenses(projectId: string) {
             costType: { select: { id: true, name: true } },
             item: { select: { id: true, name: true } },
             changeOrder: { select: { id: true, code: true, title: true } },
-            receiptIntake: { select: { id: true } },
+            receiptIntake: { select: { id: true, state: true } },
         },
         orderBy: { createdAt: "desc" },
     });
@@ -611,7 +611,7 @@ export async function getTimeExpenseData(projectId: string) {
             costType: { select: { id: true, name: true } },
             item: { select: { id: true, name: true } },
             changeOrder: { select: { id: true, code: true, title: true } },
-            receiptIntake: { select: { id: true } },
+            receiptIntake: { select: { id: true, state: true } },
         },
         orderBy: { createdAt: "desc" },
     });

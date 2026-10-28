@@ -8,11 +8,20 @@
 -- (the same convergence the original receipt_intake migration uses). The new
 -- CHECK is validated against existing rows by the ADD itself; every current
 -- state is still in the set, so it cannot fail on live data.
+--
+-- A no-op when the table does not exist yet: the Phase 1 apply-script harness
+-- (scripts/ci-apply-receipt-intake-e2e.mjs) deploys every migration except Phase 1
+-- and then builds the table with scripts/apply-receipt-intake.mjs, which already
+-- allows REVERSED.
 DO $$
 DECLARE
     current_def TEXT;
     wanted_def  TEXT := 'CHECK ((state = ANY (ARRAY[''STAGING''::text, ''RECEIVED''::text, ''READ''::text, ''NEEDS_JOB''::text, ''NEEDS_REVIEW''::text, ''BOOKING''::text, ''BOOKED''::text, ''ARCHIVED''::text, ''DUPLICATE''::text, ''VOID''::text, ''NON_RECEIPT''::text, ''REVERSED''::text, ''SHADOW_DONE''::text, ''SHADOW_QUARANTINE''::text])))';
 BEGIN
+    IF to_regclass('"ReceiptIntake"') IS NULL THEN
+        RETURN;
+    END IF;
+
     SELECT pg_get_constraintdef(oid) INTO current_def
       FROM pg_constraint
      WHERE conname = 'ReceiptIntake_state_check'

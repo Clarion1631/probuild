@@ -50,3 +50,20 @@ test("both the script and the migration are additive: no table or column is drop
         assert.ok(!/\bDELETE\s+FROM\b/i.test(text));
     }
 });
+
+test("the script carries the shared target gate and a transaction timeout longer than lock_timeout", () => {
+    const script = readFileSync(path.join(__dirname, "..", "scripts", "apply-receipt-reversed-state.mjs"), "utf8");
+    assert.match(script, /resolveTargetOrRefuse\(process\.argv\)/);
+    assert.match(script, /verifyTargetIdentity\(/);
+    assert.match(script, /--expect-db/);
+    assert.match(script, /--expect-host/);
+    const lock = Number(/LOCK_TIMEOUT_MS = (\d+)/.exec(script)?.[1]);
+    const tx = Number(/TRANSACTION_TIMEOUT_MS = (\d+)/.exec(script)?.[1]);
+    assert.ok(lock > 0 && tx > lock, `transaction timeout ${tx} must exceed lock_timeout ${lock}`);
+    assert.ok(!/matching every sibling|matches every sibling/i.test(script));
+});
+
+test("rerunning the ORIGINAL apply script can no longer reset the CHECK: it allows REVERSED too", async () => {
+    const { RECEIPT_INTAKE_STATES: original } = await import("../scripts/apply-receipt-intake.mjs");
+    assert.deepEqual([...original].sort(), [...WANTED_STATES].sort());
+});

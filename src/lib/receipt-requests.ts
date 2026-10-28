@@ -54,8 +54,16 @@ export class ReceiptOutreachHeldError extends Error {
     }
 }
 
-/** ReceiptIntake states that can never satisfy a bank line. */
-export const DEAD_INTAKE_STATES: ReadonlySet<string> = new Set(["DUPLICATE", "VOID", "NON_RECEIPT"]);
+/**
+ * ReceiptIntake states that can never satisfy a bank line.
+ *
+ * REVERSED is dead for evidence (the booking was taken out, so the row no longer
+ * stands behind a purchase) but is NOT dead for dedup: it keeps its strong key
+ * (the partial unique index releases only DUPLICATE and VOID). Reverse booking
+ * carries the receipt file onto the kept QuickBooks import so that expense
+ * still counts as evidence.
+ */
+export const DEAD_INTAKE_STATES: ReadonlySet<string> = new Set(["DUPLICATE", "VOID", "NON_RECEIPT", "REVERSED"]);
 
 export interface ReceiptRequestBankLine {
     account?: string;

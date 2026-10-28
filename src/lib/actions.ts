@@ -17719,6 +17719,8 @@ import { reverseReceiptBookingForUser, type ReverseBookingDbClient, type Reverse
  */
 export async function reverseReceiptBooking(
     receiptIntakeId: string,
+    expectedExpenseId: string,
+    expectedProjectId: string,
     reasonKind: ReverseReasonKind,
     keptExpenseId?: string | null,
 ): Promise<ReverseBookingOutcome> {
@@ -17727,6 +17729,8 @@ export async function reverseReceiptBooking(
     const user = await assertReceiptQueueAccess();
     const outcome = await reverseReceiptBookingForUser(prisma as unknown as ReverseBookingDbClient, user, {
         receiptIntakeId,
+        expectedExpenseId,
+        expectedProjectId,
         reasonKind,
         keptExpenseId,
     });

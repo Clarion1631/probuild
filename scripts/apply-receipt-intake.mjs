@@ -424,6 +424,11 @@ export async function targetHostMatches(actualHost, expectHost, resolve = lookup
 export const RECEIPT_INTAKE_STATES = [
     "STAGING", "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING",
     "BOOKED", "ARCHIVED", "DUPLICATE", "VOID", "NON_RECEIPT",
+    // An admin reversed the booking (src/lib/receipt-intake/reverse-booking.ts).
+    // Terminal; keeps its dedup keys. Added later by migration
+    // 20261028000000_receipt_intake_reversed_state, mirrored here so a rerun of
+    // this script never resets the CHECK to the older set.
+    "REVERSED",
     // Received during the shadow week, therefore booked by v1 and NEVER by v2.
     "SHADOW_DONE",
     // Pre-boundary, no v1 evidence, and no Drive identity to make a v2 booking
@@ -589,7 +594,7 @@ export const statements = [
     // set that would orphan live data fails loudly here rather than later.
     `DO $$
      DECLARE current_def TEXT;
-             wanted_def  TEXT := 'CHECK ((state = ANY (ARRAY[''STAGING''::text, ''RECEIVED''::text, ''READ''::text, ''NEEDS_JOB''::text, ''NEEDS_REVIEW''::text, ''BOOKING''::text, ''BOOKED''::text, ''ARCHIVED''::text, ''DUPLICATE''::text, ''VOID''::text, ''NON_RECEIPT''::text, ''SHADOW_DONE''::text, ''SHADOW_QUARANTINE''::text])))';
+             wanted_def  TEXT := 'CHECK ((state = ANY (ARRAY[''STAGING''::text, ''RECEIVED''::text, ''READ''::text, ''NEEDS_JOB''::text, ''NEEDS_REVIEW''::text, ''BOOKING''::text, ''BOOKED''::text, ''ARCHIVED''::text, ''DUPLICATE''::text, ''VOID''::text, ''NON_RECEIPT''::text, ''REVERSED''::text, ''SHADOW_DONE''::text, ''SHADOW_QUARANTINE''::text])))';
      BEGIN
        SELECT pg_get_constraintdef(oid) INTO current_def
          FROM pg_constraint
@@ -599,7 +604,7 @@ export const statements = [
        IF current_def IS NULL THEN
          ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
            CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
-                              'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',
+                              'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT', 'REVERSED',
                               'SHADOW_DONE', 'SHADOW_QUARANTINE'));
        ELSIF current_def IS DISTINCT FROM wanted_def THEN
          -- One statement each, in the SAME transaction as everything else this
@@ -607,7 +612,7 @@ export const statements = [
          ALTER TABLE "ReceiptIntake" DROP CONSTRAINT "ReceiptIntake_state_check";
          ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
            CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
-                              'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',
+                              'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT', 'REVERSED',
                               'SHADOW_DONE', 'SHADOW_QUARANTINE'));
        END IF;
      END $$`,

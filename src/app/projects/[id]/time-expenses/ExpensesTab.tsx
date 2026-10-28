@@ -35,7 +35,7 @@ interface Expense {
     needsTaxReview?: boolean;
     taxSource?: string | null;
     /** Set for a native row the receipt pipeline booked — see isReceiptBookedExpense. */
-    receiptIntake?: { id: string } | null;
+    receiptIntake?: { id: string; state?: string } | null;
 }
 
 interface Props {
@@ -481,7 +481,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                             {isReceiptBookedExpense(expense) && !expense.invoiceId && !expense.invoicedAt && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
                                                 <button onClick={() => setMoveTarget(expense)} className="text-xs underline text-slate-400 hover:text-hui-primary transition">Move to job</button>
                                             )}
-                                            {isReceiptBookedExpense(expense) && !expense.invoiceId && !expense.invoicedAt && currentUser.role === "ADMIN" && (
+                                            {isReceiptBookedExpense(expense) && expense.receiptIntake?.state === "BOOKED" && !expense.invoiceId && !expense.invoicedAt && currentUser.role === "ADMIN" && (
                                                 <button onClick={() => setReverseTarget(expense)} className="ml-3 text-xs underline text-slate-400 hover:text-red-500 transition" title="Remove this expense and close its receipt">Reverse booking</button>
                                             )}
                                         </td>
@@ -511,6 +511,8 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
             {reverseTarget && reverseTarget.receiptIntake && (
                 <ReverseBookingModal
                     receiptIntakeId={reverseTarget.receiptIntake.id}
+                    expenseId={reverseTarget.id}
+                    projectId={projectId}
                     vendor={reverseTarget.vendor}
                     amountLabel={fmtMoney(num(reverseTarget.amount))}
                     dateLabel={reverseTarget.date ? new Date(reverseTarget.date).toLocaleDateString() : "—"}

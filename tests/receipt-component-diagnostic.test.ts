@@ -158,7 +158,7 @@ test('happy path: bounded reads, global claims, closure over all accounts, compl
     assert.deepEqual((claimLine?.args.where as Record<string, unknown>).OR, [{ qbTxnId: QB_ID }, { probuildExpenseId: 'exp-1' }]);
     // Range reads exclude dead intakes and are capped.
     const rangeIntake = calls.find(c => c.model === 'receiptIntake' && !(c.args.where as Record<string, unknown>).OR);
-    assert.deepEqual((rangeIntake?.args.where as Record<string, unknown>).state, { notIn: ['DUPLICATE', 'VOID', 'NON_RECEIPT'] });
+    assert.deepEqual((rangeIntake?.args.where as Record<string, unknown>).state, { notIn: ['DUPLICATE', 'VOID', 'NON_RECEIPT', 'REVERSED'] });
     assert.equal(rangeIntake?.args.take, EVIDENCE_CAP + 1);
     // Never selects every field.
     for (const c of calls) assert.ok(c.args.select, `${c.model} must use select`);
