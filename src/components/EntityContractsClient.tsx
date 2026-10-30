@@ -336,7 +336,12 @@ export default function EntityContractsClient({
     // including during a preceding await — are what gets saved.
     const saveEdits = async (): Promise<any | null> => {
         if (!editingContract) return null;
-        if (savingRef.current) return null;
+        if (savingRef.current) {
+            // Held by another save or by a contractor signature in flight — say so rather
+            // than letting Save Changes silently do nothing.
+            toast.info("Still saving your changes — try again in a moment.");
+            return null;
+        }
         savingRef.current = true;
         setSaving(true);
         try {
@@ -663,16 +668,30 @@ export default function EntityContractsClient({
 
     const handleContractorSign = async (dataUrl: string, name: string) => {
         if (!contractorSignModal) return;
+        // Signing and saving share savingRef as one mutation lock: if they overlapped, a save
+        // could clear the signature server-side and the late sign response would then merge
+        // that now-invalid signature back into the editor.
+        if (savingRef.current) {
+            toast.info("Still saving your changes — try again in a moment.");
+            return;
+        }
+        savingRef.current = true;
         setSigningAsContractor(true);
         try {
             // Pass the title/body this modal was opened with so the server CAS-rejects the
             // signature if the document was edited after the signer last saw it.
-            await signContractAsContractor(contractorSignModal.id, name, dataUrl, contractorSignModal.title ?? "", contractorSignModal.body ?? "");
+            const signed = await signContractAsContractor(contractorSignModal.id, name, dataUrl, contractorSignModal.title ?? "", contractorSignModal.body ?? "");
+            // router.refresh() only updates the list props; the open editor keeps its own copy,
+            // so mirror the signature into it or Send would ask for the signature again.
+            const signedId = contractorSignModal.id;
+            setEditingContract((prev: any) => prev?.id === signedId
+                ? { ...prev, contractorSignedBy: signed.contractorSignedBy, contractorSignedAt: signed.contractorSignedAt, contractorSignatureUrl: signed.contractorSignatureUrl }
+                : prev);
             toast.success("Contractor signature saved!");
             setContractorSignModal(null);
             router.refresh();
         } catch (e: any) { toast.error(e.message || "Failed to save signature"); }
-        finally { setSigningAsContractor(false); }
+        finally { savingRef.current = false; setSigningAsContractor(false); }
     };
 
     const renderSharedModals = () => {

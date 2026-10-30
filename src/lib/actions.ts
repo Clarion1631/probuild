@@ -7044,7 +7044,7 @@ export async function signContractAsContractor(contractId: string, signerName: s
 
     revalidatePath(`/projects/[id]/contracts`, "page");
     revalidatePath(`/leads/[id]/contracts`, "page");
-    return { success: true };
+    return { success: true, contractorSignedBy: signerName, contractorSignedAt: signedAt, contractorSignatureUrl };
 }
 
 async function updateExecutedPdfIfFinalized(contractId: string, ip: string | null) {
