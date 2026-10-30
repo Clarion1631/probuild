@@ -7044,8 +7044,6 @@ export async function signContractAsContractor(contractId: string, signerName: s
 
     revalidatePath(`/projects/[id]/contracts`, "page");
     revalidatePath(`/leads/[id]/contracts`, "page");
-    // Return what was written so an open editor can update its local copy — otherwise its
-    // stale contractorSignedAt=null re-triggers the sign-first prompt on Send.
     return { success: true, contractorSignedBy: signerName, contractorSignedAt: signedAt, contractorSignatureUrl };
 }
 
