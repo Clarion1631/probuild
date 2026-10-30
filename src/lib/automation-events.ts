@@ -43,7 +43,12 @@ export interface AutomationEventInput {
          * A person moved a receipt-booked Expense to another job with Move to
          * job: who, from where, to where, and whether the phase survived.
          */
-        | "receipt-moved";
+        | "receipt-moved"
+        /**
+         * An admin reversed a receipt booking: the Expense was removed and the
+         * receipt row closed as REVERSED. `detail` holds the old values.
+         */
+        | "receipt-reversed";
     stage?: string;
     status: string;
     reason?: string;

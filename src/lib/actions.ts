@@ -17704,6 +17704,46 @@ export async function unlockPayrollPeriod(
     return { success: true as const };
 }
 
+// ============ Receipt reverse booking (admin only) ============
+// Placed just before the LAST export (markChangeOrderApprovedOffline, pinned last by
+// tests/change-order-offline-approval.test.ts), with its import beside it: the writer manifests
+// (tests/payroll-writer-manifest and friends) key on line numbers of this file, so
+// any line added above existing writers would need every entry re-classified.
+import { reverseReceiptBookingForUser, type ReverseBookingDbClient, type ReverseBookingOutcome, type ReverseReasonKind } from "./receipt-intake/reverse-booking";
+
+/**
+ * Reverse booking (admin only): remove a receipt-booked Expense and close its
+ * receipt row as REVERSED, keeping its dedup keys. See
+ * receipt-intake/reverse-booking.ts. Refusals come back as VALUES so the plain
+ * message reaches the browser.
+ */
+export async function reverseReceiptBooking(
+    receiptIntakeId: string,
+    expectedExpenseId: string,
+    expectedProjectId: string,
+    reasonKind: ReverseReasonKind,
+    keptExpenseId?: string | null,
+): Promise<ReverseBookingOutcome> {
+    // The queue's own gate first (signed in + financialReports); the ADMIN-only
+    // rule is then enforced inside reverseReceiptBookingForUser.
+    const user = await assertReceiptQueueAccess();
+    const outcome = await reverseReceiptBookingForUser(prisma as unknown as ReverseBookingDbClient, user, {
+        receiptIntakeId,
+        expectedExpenseId,
+        expectedProjectId,
+        reasonKind,
+        keptExpenseId,
+    });
+    if (outcome.ok) {
+        if (outcome.projectId) {
+            revalidatePath(`/projects/${outcome.projectId}/time-expenses`);
+            revalidatePath(`/projects/${outcome.projectId}/budget`);
+        }
+        revalidateReceiptQueue();
+    }
+    return outcome;
+}
+
 // ============ Change order offline approval (not payroll) ============
 // Office-side "Mark approved": the customer approved a change order outside
 // ProBuild (phone, text, email, in person). ADMIN/MANAGER only, same gate as the

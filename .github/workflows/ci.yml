@@ -122,6 +122,14 @@ jobs:
         env:
           RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # Reverse booking against the migrated schema: the state CHECK accepts
+      # REVERSED, the expense is really deleted, and the partial unique index
+      # still holds the reversed row's dedup key against a re-sent copy.
+      - name: Reverse booking against real Postgres
+        run: npx tsx --test tests/receipt-intake-reverse-booking-db.test.ts
+        env:
+          RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # The phase invariant's PHANTOM hole. Everything else in that suite runs
       # against a scripted fake, which has no lock manager and so cannot tell a
       # verdict that holds its rows from one that merely read them.

@@ -175,7 +175,8 @@ export interface PipelineHealth {
          * STAGING/RECEIVED/READ/BOOKING are working states (`stuck` covers
          * them); BOOKED and ARCHIVED reached QuickBooks; SHADOW_DONE was
          * booked by v1; DUPLICATE and NON_RECEIPT are decided answers that
-         * deliberately never book; NEEDS_REVIEW and NEEDS_JOB have their own
+         * deliberately never book; REVERSED is an admin's decision to take a
+         * booking back out (reverse-booking.ts), also terminal and decided; NEEDS_REVIEW and NEEDS_JOB have their own
          * probes above; VOID has no writer anywhere in the codebase. That
          * leaves SHADOW_QUARANTINE, which the cutover creates for a
          * pre-boundary row with no evidence v1 booked it and no Drive identity

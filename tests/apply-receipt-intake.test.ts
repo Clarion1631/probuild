@@ -49,6 +49,16 @@ import {
 } from "../scripts/apply-receipt-intake.mjs";
 import { RECEIPT_INTAKE_STATES as RUNTIME_STATES } from "../src/lib/receipt-intake/route-state";
 
+/**
+ * REVERSED joined the state CHECK in a LATER migration (the original is applied
+ * in prod and must not change). The script mirrors the final set, so the CHECK
+ * comparisons below read the migration that converges to it.
+ */
+const reversedMigrationSql = readFileSync(
+    path.join(__dirname, "..", "prisma", "migrations", "20261028000000_receipt_intake_reversed_state", "migration.sql"),
+    "utf8",
+);
+
 const migrationSql = readFileSync(
     path.join(__dirname, "..", "prisma", "migrations", "20260901000000_receipt_intake", "migration.sql"),
     "utf8",
@@ -120,15 +130,25 @@ test("both files declare the SAME closed state set, and it matches the runtime o
     assert.ok(check, "the script must add the state CHECK constraint");
 
     const fromScript = checkSemantics(check!);
-    const fromMigration = checkSemantics(migrationSql);
+    const fromMigration = checkSemantics(reversedMigrationSql);
 
     // SEMANTIC PARITY, not "both mention the word".
-    assert.deepEqual(fromScript.states, fromMigration.states, "the same states, in the same order");
+    // De-duplicated: the script and the original migration list the set in two places
+    // (create and converge); the later migration lists it once.
+    assert.deepEqual([...new Set(fromScript.states)], [...new Set(fromMigration.states)], "the same states, in the same order");
     assert.deepEqual(
         [...new Set(fromScript.states)].sort(),
         [...RECEIPT_INTAKE_STATES].sort(),
         "and it is the whole closed set",
     );
+});
+
+test("the original migration is the 13-state set; the later one adds exactly REVERSED", () => {
+    const original = [...new Set(checkSemantics(migrationSql).states)];
+    assert.ok(!original.includes("REVERSED"));
+    const later = [...new Set(checkSemantics(reversedMigrationSql).states)];
+    assert.deepEqual([...later].sort(), [...RUNTIME_STATES].sort());
+    assert.deepEqual(later.filter(state => state !== "REVERSED"), original);
 });
 
 test("BOTH paths converge on the wanted definition; neither only creates-if-absent", () => {
@@ -140,6 +160,7 @@ test("BOTH paths converge on the wanted definition; neither only creates-if-abse
     for (const [label, semantics] of [
         ["apply script", checkSemantics(check)],
         ["migration.sql", checkSemantics(migrationSql)],
+        ["reversed-state migration.sql", checkSemantics(reversedMigrationSql)],
     ] as const) {
         assert.equal(semantics.converges, true, `${label} replaces a stale definition`);
         assert.equal(semantics.scoped, true, `${label} scopes the lookup to this table`);
@@ -150,7 +171,7 @@ test("BOTH paths converge on the wanted definition; neither only creates-if-abse
     // run while the other leaves it alone.
     const wanted = (sql: string) => /wanted_def\s+TEXT\s*:=\s*('(?:[^']|'')*')/.exec(sql)?.[1] ?? null;
     assert.ok(wanted(check), "the apply script declares a wanted definition");
-    assert.equal(wanted(check), wanted(migrationSql));
+    assert.equal(wanted(check), wanted(reversedMigrationSql));
 });
 
 test("every FK and index in the script also exists in the migration", () => {

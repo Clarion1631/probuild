@@ -915,7 +915,7 @@ test("getExpenses selects receiptIntake, so the tab's refresh path can see a rec
     await getExpenses("job-1");
     assert.deepEqual(
         findManyArgs?.include?.receiptIntake,
-        { select: { id: true } },
+        { select: { id: true, state: true } },
         "getExpenses must include receiptIntake or isReceiptBookedExpense is always false on refresh",
     );
 });
@@ -940,7 +940,7 @@ test("getTimeExpenseData selects receiptIntake too (source check — five more m
     const expenseQueryEnd = body.indexOf("const costCodes");
     assert.ok(expenseQueryStart > -1 && expenseQueryEnd > expenseQueryStart, "the expense query moved");
     const expenseQuery = body.slice(expenseQueryStart, expenseQueryEnd);
-    assert.match(expenseQuery, /receiptIntake:\s*\{\s*select:\s*\{\s*id:\s*true\s*\}\s*\}/);
+    assert.match(expenseQuery, /receiptIntake:\s*\{\s*select:\s*\{\s*id:\s*true,\s*state:\s*true\s*\}\s*\}/);
 
     // The control: the SAME body's timeEntry query — which precedes the
     // expense query and has no receipt to select — must not match, so the
