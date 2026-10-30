@@ -10,11 +10,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
     backoffMs,
+    CUSTOMER_PAYMENT_REASON,
     DATE_IMPLAUSIBLE_REASON,
     isImplausibleReceiptDate,
     MAX_BOOK_ATTEMPTS,
     MAX_RECEIPT_AGE_DAYS,
     MAX_RECEIPT_FUTURE_DAYS,
+    namesGoldenTouch,
     NO_ARTIFACT_STATE_REASONS,
     parkReleasesStrongKey,
     preservedTaxWarning,
@@ -23,21 +25,21 @@ import {
 } from "../src/lib/receipt-intake/route-state";
 // Imported ONLY to pin the deliberate divergence documented below — the
 // predicate no longer uses it.
-import { isValidDate } from "../src/lib/receipt-intake/keys";
+import { canonicalVendor, isValidDate } from "../src/lib/receipt-intake/keys";
 
 const NO_HITS = { strong: null, weak: null };
-const clean = { docType: "receipt", amount: "364.98", totalCents: 36498, canonicalVendor: "lowes" };
+const clean = { docType: "receipt", amount: "364.98", totalCents: 36498, canonicalVendor: "lowes", vendor: "Lowe's" };
 /** The strong key is vendor-LESS, so an owner has to carry its vendor separately. */
 const owner = (over: Partial<{ id: string; totalCents: number | null; canonicalVendor: string | null }> = {}) =>
     ({ id: "row-a", totalCents: 36498, canonicalVendor: "lowes", ...over });
 
 test("multi outranks everything, including a missing project", () => {
-    const d = routeState({ docType: "multi", amount: "0.00", totalCents: null, canonicalVendor: "" }, NO_HITS, false);
+    const d = routeState({ docType: "multi", amount: "0.00", totalCents: null, canonicalVendor: "", vendor: null }, NO_HITS, false);
     assert.deepEqual(d, { state: "NEEDS_REVIEW", stateReason: "multi-doc", duplicateOfId: null });
 });
 
 test("a non-receipt is its own terminal state, not a review item", () => {
-    const d = routeState({ docType: "non_receipt", amount: "0.00", totalCents: null, canonicalVendor: "" }, NO_HITS, true);
+    const d = routeState({ docType: "non_receipt", amount: "0.00", totalCents: null, canonicalVendor: "", vendor: null }, NO_HITS, true);
     assert.deepEqual(d, { state: "NON_RECEIPT", stateReason: null, duplicateOfId: null });
 });
 
@@ -45,7 +47,7 @@ test("a $0.00 total is a misread and is parked BEFORE any dedup or job check", (
     // :531 — you don't get a $0 receipt or write a $0 check. Letting this reach
     // a key would poison it for the real document.
     const d = routeState(
-        { docType: "receipt", amount: "0.00", totalCents: 0, canonicalVendor: "lowes" },
+        { docType: "receipt", amount: "0.00", totalCents: 0, canonicalVendor: "lowes", vendor: "Lowe's" },
         { strong: owner({ id: "owner", totalCents: 0 }), weak: { id: "other" } },
         true,
     );
@@ -58,7 +60,7 @@ test("a NEGATIVE total is a refund: reviewed, and it claims no dedup key", () =>
     // purchase automatically, and it must not hold a key the original needs.
     for (const [amount, cents] of [["-22.57", -2257], ["-1200.00", -120000]] as const) {
         const d = routeState(
-            { docType: "receipt", amount, totalCents: cents, canonicalVendor: "lowes" },
+            { docType: "receipt", amount, totalCents: cents, canonicalVendor: "lowes", vendor: "Lowe's" },
             NO_HITS,
             true,
         );
@@ -68,7 +70,7 @@ test("a NEGATIVE total is a refund: reviewed, and it claims no dedup key", () =>
 
 test("an unreadable total (null cents) is reviewed, not booked", () => {
     const d = routeState(
-        { docType: "receipt", amount: "abc", totalCents: null, canonicalVendor: "lowes" },
+        { docType: "receipt", amount: "abc", totalCents: null, canonicalVendor: "lowes", vendor: "Lowe's" },
         NO_HITS,
         true,
     );
@@ -209,7 +211,7 @@ test("an implausible date parks the row BEFORE any dedup key is claimed", () => 
 });
 
 test("the document facts ABOVE it keep their priority", () => {
-    const blank = { amount: "0.00", totalCents: null, canonicalVendor: "" } as const;
+    const blank = { amount: "0.00", totalCents: null, canonicalVendor: "", vendor: null } as const;
     assert.equal(
         routeState({ docType: "multi", ...blank, ...badDate }, NO_HITS, true).stateReason,
         "multi-doc",
@@ -547,4 +549,88 @@ test("only transient FAILURES are retryable — never a document verdict", async
         assert.equal(retryTargetFor("NEEDS_REVIEW", "not-ai-unavailable"), null);
         assert.equal(retryTargetFor("NEEDS_REVIEW", "max-retries-exceeded"), null);
     });
+});
+
+// ── Customer payments (a check made out TO Golden Touch Remodeling) ─────────
+
+/** The two payee lines the reader actually wrote on the rows that booked in prod. */
+const GTR_PAYEES = [
+    "GOLDEN TOUCH REMODELING RE:CLIENT NAME",
+    "Golden Touch Remodel",
+];
+const PARKED_AS_PAYMENT = { state: "NEEDS_REVIEW", stateReason: CUSTOMER_PAYMENT_REASON, duplicateOfId: null };
+const payment = (
+    vendor: string,
+    over: Partial<{ docType: string; amount: string; totalCents: number | null; dateStr: string; referenceDay: string }> = {},
+) => ({ docType: "check", amount: "21235.50", totalCents: 2123550, canonicalVendor: canonicalVendor(vendor), vendor, ...over });
+
+test("namesGoldenTouch: our own name in any spelling the reader writes, and nothing shorter", () => {
+    for (const name of [...GTR_PAYEES, "Golden Touch Remodeling LLC", "golden-touch remodeling", "GOLDENTOUCH"]) {
+        assert.equal(namesGoldenTouch(name), true, name);
+    }
+    // Bare initials are too short to mean us on their own; real vendors that
+    // merely share a word are not us; an absent vendor is not us.
+    for (const name of ["GTR", "Golden Hammer Supply", "Touchstone Tile", "ERS PAINTING", "", null, undefined]) {
+        assert.equal(namesGoldenTouch(name), false, String(name));
+    }
+});
+
+test("a check made out to Golden Touch Remodeling parks as a customer payment, not a cost", () => {
+    for (const vendor of GTR_PAYEES) {
+        assert.deepEqual(routeState(payment(vendor), NO_HITS, true), PARKED_AS_PAYMENT, vendor);
+        // The reader can call a check a receipt; the payee still decides it.
+        assert.deepEqual(routeState(payment(vendor, { docType: "receipt" }), NO_HITS, true), PARKED_AS_PAYMENT, vendor);
+    }
+});
+
+test("a customer payment is decided BEFORE dedup: it claims no key and points at no twin", () => {
+    // A held strong key or a weak twin must not turn a customer's check into a
+    // DUPLICATE of some purchase, or into a review that points at a twin.
+    const sameTotal = owner({ id: "owner", totalCents: 2123550, canonicalVendor: canonicalVendor(GTR_PAYEES[1]) });
+    const d = routeState(payment(GTR_PAYEES[1]), { strong: sameTotal, weak: { id: "twin" } }, true);
+    assert.deepEqual(d, PARKED_AS_PAYMENT);
+});
+
+test("a jobless customer payment goes to review, not to the pick-the-job pile", () => {
+    assert.deepEqual(routeState(payment(GTR_PAYEES[0]), NO_HITS, false), PARKED_AS_PAYMENT);
+});
+
+test("customer payment outranks the money gates, so its reason is the one a person reads", () => {
+    for (const over of [
+        { amount: "0.00", totalCents: 0 },
+        { amount: "-60.00", totalCents: -6000 },
+        { dateStr: "2023-10-01", referenceDay: "2026-10-01" },
+    ]) {
+        assert.deepEqual(routeState(payment(GTR_PAYEES[0], over), NO_HITS, true), PARKED_AS_PAYMENT, JSON.stringify(over));
+    }
+    // The file triage still comes first: a multi-receipt scan is a scan.
+    assert.equal(routeState(payment(GTR_PAYEES[0], { docType: "multi" }), NO_HITS, true).stateReason, "multi-doc");
+});
+
+test("checks GTR wrote to a sub still route normally", () => {
+    // Payees of real subcontractor checks that booked correctly in prod.
+    for (const vendor of ["ERS PAINTING", "K & S CounterTops", "United Building Contractors", "Red Point Electric"]) {
+        const d = routeState(payment(vendor), NO_HITS, true);
+        assert.deepEqual(d, { state: "READ", stateReason: null, duplicateOfId: null }, vendor);
+    }
+});
+
+test("a customer payment cannot be retried: it needs a decision, not another attempt", () => {
+    assert.equal(retryTargetFor("NEEDS_REVIEW", CUSTOMER_PAYMENT_REASON), null);
+});
+
+test("the RAW vendor decides: an alias later on the payee line cannot hide a customer payment", () => {
+    // "dutch" is a VENDOR_ALIASES token, so canonicalVendor collapses this whole
+    // payee line to it. Routing reads the raw vendor, so it still parks: with no
+    // job (not the pick-the-job pile), and with dedup hits (no key, no twin).
+    const vendor = "Golden Touch Remodeling RE: Dutch Client";
+    assert.equal(canonicalVendor(vendor), "dutch", "the collapse this test is about");
+    const input = payment(vendor);
+    assert.deepEqual(routeState(input, NO_HITS, false), PARKED_AS_PAYMENT);
+    assert.deepEqual(
+        routeState(input, { strong: owner({ totalCents: 2123550, canonicalVendor: "dutch" }), weak: { id: "twin" } }, true),
+        PARKED_AS_PAYMENT,
+    );
+    // And a caller with no raw vendor still gets the gate from canonicalVendor.
+    assert.deepEqual(routeState({ ...payment(GTR_PAYEES[0]), vendor: null }, NO_HITS, true), PARKED_AS_PAYMENT);
 });

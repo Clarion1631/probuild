@@ -29,6 +29,8 @@ const KNOWN: Array<[string, string]> = [
     ["multi-doc:one-page", "A separate photo of each would let me read them."],
     ["refund-or-zero", "The total reads as $1,597.03."],
     ["no-estimate", "No job on this one yet."],
+    ["customer-payment", "a customer payment, not a cost. Void it here."],
+    ["customer-payment-check-quickbooks", "look in QuickBooks first, then void it here."],
     ["unreadable", "I could not read this file."],
     ["ai-unavailable", "The reader was down when this one came through."],
     ["file-missing", "there is nothing here to read."],
