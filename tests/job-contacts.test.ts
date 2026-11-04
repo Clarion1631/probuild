@@ -292,6 +292,88 @@ test("MCP audit owner for update_job_contact resolves the contact's project/lead
     });
 });
 
+const leadOnlyUser: any = { id: "u2", role: "FIELD_CREW", permissions: { leadAccess: true }, projectAccess: [], assignedProjects: [] };
+
+test("help-agent: a converted lead's id is authorized against its project, not just leadAccess (list and add)", async () => {
+    process.env.NEXTAUTH_SECRET ??= "test-only-secret";
+    const { projectScopeDenial } = await import("../src/lib/help-agent");
+    projects.push({ id: "proj-9", leadId: "lead-1", client: CLIENT });
+    for (const tool of ["list_job_contacts", "add_job_contact"]) {
+        assert.match((await projectScopeDenial(leadOnlyUser, tool, { leadId: "lead-1" })) ?? "", /access to that project/, tool);
+        const assigned = { ...leadOnlyUser, projectAccess: [{ projectId: "proj-9" }] };
+        assert.equal(await projectScopeDenial(assigned, tool, { leadId: "lead-1" }), null, tool);
+    }
+    // An unconverted lead still needs only leadAccess.
+    projects.length = 0;
+    assert.equal(await projectScopeDenial(leadOnlyUser, "list_job_contacts", { leadId: "lead-1" }), null);
+});
+
+async function authorizerFor(user: any) {
+    const { canAccessJobScope } = await import("../src/lib/access-rules");
+    return (scope: { projectId: string | null; leadId: string | null }) => {
+        if (!canAccessJobScope(user, scope)) throw new Error("Forbidden");
+    };
+}
+
+test("authorization runs inside the transaction on the canonical owner: denied writes change nothing", async () => {
+    projects.push({ id: "proj-9", leadId: "lead-1", client: CLIENT });
+    const admin: any = { id: "a", role: "ADMIN" };
+    const seeded = await core.addJobContactCore({ projectId: "proj-9" }, { name: "A", isPrimaryContact: true }, fakeDb, await authorizerFor(admin));
+    const denyUser = await authorizerFor(leadOnlyUser);
+    const snapshot = JSON.stringify(contacts);
+
+    // The caller names the LEAD; the canonical owner is the project the user cannot reach.
+    await assert.rejects(core.addJobContactCore({ leadId: "lead-1" }, { name: "B", isPrimaryContact: true }, fakeDb, denyUser), /Forbidden/);
+    await assert.rejects(core.updateJobContactCore(seeded.id, { name: "Hacked", isPrimaryContact: false }, fakeDb, denyUser), /Forbidden/);
+    await assert.rejects(core.removeJobContactCore(seeded.id, fakeDb, denyUser), /Forbidden/);
+    assert.equal(JSON.stringify(contacts), snapshot);
+
+    // The authorizer was consulted AFTER the lock was taken.
+    log.length = 0;
+    await assert.rejects(core.addJobContactCore({ leadId: "lead-1" }, { name: "C" }, fakeDb, (scope) => {
+        assert.ok(log.some(l => l.startsWith("lock:")), "lock held before authorize");
+        assert.equal(scope.projectId, "proj-9");
+        throw new Error("Forbidden");
+    }), /Forbidden/);
+
+    // An allowed user succeeds.
+    const ok = await core.updateJobContactCore(seeded.id, { name: "A2" }, fakeDb, await authorizerFor({ ...leadOnlyUser, projectAccess: [{ projectId: "proj-9" }] }));
+    assert.equal(ok.contact.name, "A2");
+});
+
+test("lock-key mismatch throws a retryable error and the WHOLE transaction is retried once (no second lock in one tx)", async () => {
+    projects.push({ id: "p-a", leadId: null, client: CLIENT });
+    const c = await core.addJobContactCore({ projectId: "p-a" }, { name: "Mover" }, fakeDb);
+    let transactions = 0;
+    const counting: any = { ...fakeDb, $transaction: async (fn: any) => { transactions++; return fakeDb.$transaction(fn); } };
+    log.length = 0;
+    // While the first transaction waits for the project lock, the contact moves to a lead-owned job.
+    onFirstLock = () => {
+        const row = contacts.find(x => x.id === c.id)!;
+        row.projectId = null; row.leadId = "lead-1";
+    };
+    const { contact, owner } = await core.updateJobContactCore(c.id, { name: "Moved" }, counting);
+    assert.equal(transactions, 2);
+    assert.equal(contact.name, "Moved");
+    assert.deepEqual(owner, { leadId: "lead-1" });
+    assert.deepEqual(log.filter(l => l.startsWith("lock:")), ["lock:project:p-a", "lock:lead:lead-1"]);
+});
+
+test("a contact that keeps moving fails after the single retry", async () => {
+    projects.push({ id: "p-a", leadId: null, client: CLIENT });
+    const c = await core.addJobContactCore({ projectId: "p-a" }, { name: "Mover" }, fakeDb);
+    let transactions = 0;
+    const counting: any = { ...fakeDb, $transaction: async (fn: any) => { transactions++; return fakeDb.$transaction(fn); } };
+    const flip = () => {
+        const row = contacts.find(x => x.id === c.id)!;
+        if (row.projectId) { row.projectId = null; row.leadId = "lead-1"; } else { row.leadId = null; row.projectId = "p-a"; }
+        onFirstLock = flip;
+    };
+    onFirstLock = flip;
+    await assert.rejects(core.updateJobContactCore(c.id, { name: "X" }, counting), /try again/);
+    assert.equal(transactions, 2);
+});
+
 test("MCP tools are registered, audited, permissioned, and remove is not exposed", () => {
     const route = readFileSync("src/app/api/mcp/[transport]/route.ts", "utf8");
     for (const tool of ["list_job_contacts", "add_job_contact", "update_job_contact"]) {

@@ -418,6 +418,14 @@ export async function projectScopeDenial(
   ) {
     return "Permission denied: you don't have lead access.";
   }
+  // A lead that has become a project is that project: authorize against it
+  // (canonical scope), not only leadAccess.
+  if (!hasProjectIdArg && typeof args.leadId === "string" && args.leadId) {
+    const converted = await prisma.project.findUnique({ where: { leadId: args.leadId }, select: { id: true } });
+    if (converted && !canAccessProject(user, converted.id)) {
+      return "Permission denied: you don't have access to that project.";
+    }
+  }
 
   for (const [argName, lookup] of Object.entries(ENTITY_PROJECT_LOOKUPS)) {
     const id = args[argName];

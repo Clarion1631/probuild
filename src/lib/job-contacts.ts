@@ -162,11 +162,48 @@ export async function listJobContactsCore(ownerInput: JobOwner, db: any = prisma
     };
 }
 
-export async function addJobContactCore(ownerInput: JobOwner, input: JobContactInput, db: any = prisma) {
+/**
+ * Runs inside the transaction AFTER the shared lock is held and the canonical
+ * owner is resolved from fresh reads. Throw to deny; nothing has been written.
+ */
+export type JobContactAuthorize = (canonical: CanonicalJob) => void | Promise<void>;
+
+export class RetryableJobContactError extends Error {
+    constructor() {
+        super("Contact moved while updating; try again.");
+        this.name = "RetryableJobContactError";
+    }
+}
+
+// Re-runs the WHOLE transaction once if the contact's lock key changed between
+// the unlocked read (which picks the lock) and the fresh read under the lock.
+// A transaction never holds one lock while taking another.
+async function withRetry<T>(run: () => Promise<T>): Promise<T> {
+    try {
+        return await run();
+    } catch (err) {
+        if (err instanceof RetryableJobContactError) return run();
+        throw err;
+    }
+}
+
+// Lock the contact's job, then trust only a fresh read of the contact.
+async function lockContactJob(tx: any, contactId: string): Promise<{ fresh: any; canonical: CanonicalJob }> {
+    const guess = await tx.jobContact.findUnique({ where: { id: contactId } });
+    if (!guess) throw new Error("Contact not found");
+    const { canonical, lockKey } = await lockAndResolve(tx, rowOwner(guess));
+    const fresh = await tx.jobContact.findUnique({ where: { id: contactId } });
+    if (!fresh) throw new Error("Contact not found");
+    if ((await lockKeyFor(tx, rowOwner(fresh))) !== lockKey) throw new RetryableJobContactError();
+    return { fresh, canonical };
+}
+
+export async function addJobContactCore(ownerInput: JobOwner, input: JobContactInput, db: any = prisma, authorize?: JobContactAuthorize) {
     const owner = resolveJobOwner(ownerInput);
     const fields = contactFields({ ...input, name: input.name });
     return db.$transaction(async (tx: any) => {
         const { canonical } = await lockAndResolve(tx, owner);
+        if (authorize) await authorize(canonical);
         if (fields.isPrimaryContact === true) {
             await tx.jobContact.updateMany({ where: scopeWhere(canonical), data: { isPrimaryContact: false } });
         }
@@ -176,38 +213,30 @@ export async function addJobContactCore(ownerInput: JobOwner, input: JobContactI
     });
 }
 
-export async function updateJobContactCore(contactId: string, patch: JobContactPatch, db: any = prisma) {
+export async function updateJobContactCore(contactId: string, patch: JobContactPatch, db: any = prisma, authorize?: JobContactAuthorize): Promise<{ contact: any; owner: { leadId: string } | { projectId: string } }> {
     const fields = contactFields(patch);
-    return db.$transaction(async (tx: any) => {
-        // Lock first, then trust only a fresh read. The unlocked read only tells
-        // us WHICH lock to take; if the contact's job moved before we held it,
-        // retry once with the new lock, then give up.
-        let guess = await tx.jobContact.findUnique({ where: { id: contactId } });
-        for (let attempt = 0; attempt < 2; attempt++) {
-            if (!guess) throw new Error("Contact not found");
-            const { canonical, lockKey } = await lockAndResolve(tx, rowOwner(guess));
-            const fresh = await tx.jobContact.findUnique({ where: { id: contactId } });
-            if (!fresh) throw new Error("Contact not found");
-            if ((await lockKeyFor(tx, rowOwner(fresh))) !== lockKey) { guess = fresh; continue; }
-            if (fields.isPrimaryContact === true) {
-                await tx.jobContact.updateMany({
-                    where: { AND: [scopeWhere(canonical), { id: { not: contactId } }] },
-                    data: { isPrimaryContact: false },
-                });
-            }
-            const updated = await tx.jobContact.update({ where: { id: contactId }, data: fields });
-            const owner: { leadId: string } | { projectId: string } = canonical.projectId
-                ? { projectId: canonical.projectId }
-                : { leadId: canonical.leadId as string };
-            return { contact: updated, owner };
+    return withRetry(() => db.$transaction(async (tx: any) => {
+        const { canonical } = await lockContactJob(tx, contactId);
+        if (authorize) await authorize(canonical);
+        if (fields.isPrimaryContact === true) {
+            await tx.jobContact.updateMany({
+                where: { AND: [scopeWhere(canonical), { id: { not: contactId } }] },
+                data: { isPrimaryContact: false },
+            });
         }
-        throw new Error("Contact moved while updating; try again.");
-    });
+        const updated = await tx.jobContact.update({ where: { id: contactId }, data: fields });
+        const owner: { leadId: string } | { projectId: string } = canonical.projectId
+            ? { projectId: canonical.projectId }
+            : { leadId: canonical.leadId as string };
+        return { contact: updated, owner };
+    }));
 }
 
-export async function removeJobContactCore(contactId: string, db: any = prisma) {
-    const existing = await db.jobContact.findUnique({ where: { id: contactId } });
-    if (!existing) throw new Error("Contact not found");
-    await db.jobContact.delete({ where: { id: contactId } });
-    return { leadId: existing.leadId as string | null, projectId: existing.projectId as string | null };
+export async function removeJobContactCore(contactId: string, db: any = prisma, authorize?: JobContactAuthorize): Promise<{ leadId: string | null; projectId: string | null }> {
+    return withRetry(() => db.$transaction(async (tx: any) => {
+        const { fresh, canonical } = await lockContactJob(tx, contactId);
+        if (authorize) await authorize(canonical);
+        await tx.jobContact.delete({ where: { id: contactId } });
+        return { leadId: fresh.leadId as string | null, projectId: fresh.projectId as string | null };
+    }));
 }
