@@ -3,7 +3,9 @@ import ClientMessaging from "@/components/ClientMessaging";
 import LeadMessagingHeader from "./LeadMessagingHeader";
 import LeadDetailsSidebar from "./LeadDetailsSidebar";
 import { resolveDocUrl } from "@/lib/secure-storage";
-import { listJobContactsCore } from "@/lib/job-contacts";
+import { listJobContactsCore, resolveJobScope } from "@/lib/job-contacts";
+import { assertActiveStaff } from "@/lib/permissions";
+import { canAccessJobScope } from "@/lib/access-rules";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -18,7 +20,13 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
 
     const estimates = lead.estimates || [];
     const initialMessage = lead.message || null;
-    const jobContacts = (await listJobContactsCore({ leadId: lead.id })).contacts;
+    // A converted lead resolves to its project; only show those contacts to
+    // users who can access that project (same rule as the help agent).
+    const viewer = await assertActiveStaff();
+    const contactScope = await resolveJobScope({ leadId: lead.id });
+    const jobContacts = canAccessJobScope(viewer, contactScope)
+        ? (await listJobContactsCore({ leadId: lead.id })).contacts
+        : [];
 
     return (
         <>
