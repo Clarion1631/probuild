@@ -15,6 +15,8 @@ type Row = Record<string, any>;
 
 let contacts: Row[];
 let seq: number;
+let log: string[];
+let onFirstLock: (() => void) | null;
 
 function matches(row: Row, where: Row | undefined): boolean {
     if (!where) return true;
@@ -36,6 +38,7 @@ const jobContact = {
     },
     findMany: async ({ where }: Row) => contacts.filter(c => matches(c, where)).map(c => ({ ...c })),
     findUnique: async ({ where }: Row) => {
+        log.push(`read:${where.id}`);
         const c = contacts.find(x => x.id === where.id);
         return c ? { ...c } : null;
     },
@@ -85,7 +88,18 @@ const fakeDb: any = {
     clientMessage: { updateMany: async () => ({ count: 0 }) },
     userPermission: { findMany: async () => [] },
     projectAccess: { createMany: async () => ({ count: 0 }) },
-    $queryRaw: async () => [],
+    // Row locks: FOR NO KEY UPDATE on the Lead (or a lead-less Project). Answers
+    // with the row when it exists, [] when it does not.
+    $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const text = strings.join("?");
+        assert.match(text, /FOR NO KEY UPDATE/);
+        const id = String(values[0]);
+        const table = /"Lead"/.test(text) ? "lead" : "project";
+        log.push(`lock:${table}:${id}`);
+        if (onFirstLock) { const f = onFirstLock; onFirstLock = null; f(); }
+        if (table === "lead") return id === "lead-1" ? [{ id }] : [];
+        return projects.some(p => p.id === id) ? [{ id }] : [];
+    },
     $queryRawUnsafe: async () => [],
     $transaction: async (fn: any) => fn(fakeDb),
 };
@@ -120,6 +134,8 @@ beforeEach(() => {
     contacts = [];
     projects = [];
     seq = 0;
+    log = [];
+    onFirstLock = null;
 });
 
 test("exactly one of leadId / projectId is required", async () => {
@@ -206,6 +222,76 @@ test("project reads also see rows still pointing at the converted lead, without 
     assert.deepEqual(listed.contacts.map((c: any) => c.name).sort(), ["Left on lead", "On project"]);
 });
 
+test("alias regression: primary A on the project, primary B via the OLD leadId -> one primary, B, on the project", async () => {
+    projects.push({ id: "proj-9", leadId: "lead-1", client: CLIENT });
+    const a = await core.addJobContactCore({ projectId: "proj-9" }, { name: "A", isPrimaryContact: true }, fakeDb);
+    const b = await core.addJobContactCore({ leadId: "lead-1" }, { name: "B", isPrimaryContact: true }, fakeDb);
+    const primaries = contacts.filter(c => c.isPrimaryContact);
+    assert.deepEqual(primaries.map(c => c.id), [b.id]);
+    assert.equal(contacts.find(c => c.id === a.id)!.isPrimaryContact, false);
+    assert.equal(b.projectId, "proj-9");
+    assert.ok(!b.leadId);
+});
+
+test("add on a converted lead lands on the project; the lead page shows the project's contacts", async () => {
+    projects.push({ id: "proj-9", leadId: "lead-1", client: CLIENT });
+    const c = await core.addJobContactCore({ leadId: "lead-1" }, { name: "Wayne" }, fakeDb);
+    assert.equal(c.projectId, "proj-9");
+    assert.ok(!c.leadId);
+    const viaLead = await core.listJobContactsCore({ leadId: "lead-1" }, fakeDb);
+    assert.deepEqual(viaLead.contacts.map((x: any) => x.name), ["Wayne"]);
+});
+
+test("locks the LEAD row when the job has a lead (also via the project), the project row only without one", async () => {
+    projects.push({ id: "proj-9", leadId: "lead-1", client: CLIENT }, { id: "proj-nolead", leadId: null, client: CLIENT });
+    await core.addJobContactCore({ projectId: "proj-9" }, { name: "A" }, fakeDb);
+    await core.addJobContactCore({ leadId: "lead-1" }, { name: "B" }, fakeDb);
+    await core.addJobContactCore({ projectId: "proj-nolead" }, { name: "C" }, fakeDb);
+    assert.deepEqual(log.filter(l => l.startsWith("lock:")), ["lock:lead:lead-1", "lock:lead:lead-1", "lock:project:proj-nolead"]);
+});
+
+test("update takes the lock FIRST, re-reads the contact, and uses the fresh owner (conversion between read and lock)", async () => {
+    const c = await core.addJobContactCore({ leadId: "lead-1" }, { name: "Pamela", isPrimaryContact: true }, fakeDb);
+    const other = await core.addJobContactCore({ leadId: "lead-1" }, { name: "Wayne" }, fakeDb);
+    log.length = 0;
+    // The conversion commits while update waits for the lead lock.
+    onFirstLock = () => {
+        projects.push({ id: "proj-9", leadId: "lead-1", client: CLIENT });
+        contacts.forEach(x => { x.projectId = "proj-9"; x.leadId = null; });
+    };
+    const { contact, owner } = await core.updateJobContactCore(other.id, { isPrimaryContact: true }, fakeDb);
+    assert.deepEqual(owner, { projectId: "proj-9" });
+    assert.equal(contact.isPrimaryContact, true);
+    assert.equal(contacts.find(x => x.id === c.id)!.isPrimaryContact, false);
+    const lockAt = log.findIndex(l => l.startsWith("lock:"));
+    const reads = log.map((l, i) => (l === `read:${other.id}` ? i : -1)).filter(i => i >= 0);
+    assert.ok(reads.length >= 2 && reads[0] < lockAt && reads[reads.length - 1] > lockAt, "fresh read happens after the lock");
+});
+
+test("help-agent: update_job_contact is scoped through contactId (project assignment / lead access)", async () => {
+    process.env.NEXTAUTH_SECRET ??= "test-only-secret"; // help-agent pulls in mobile-auth, which requires one at load
+    const { projectScopeDenial } = await import("../src/lib/help-agent");
+    projects.push({ id: "proj-9", leadId: "lead-1", client: CLIENT });
+    contacts.push({ id: "jc-proj", projectId: "proj-9", leadId: null }, { id: "jc-lead", projectId: null, leadId: "lead-1" });
+    const crew: any = { id: "u1", role: "FIELD_CREW", projectAccess: [], assignedProjects: [], permissions: {} };
+    const assigned: any = { ...crew, projectAccess: [{ projectId: "proj-9" }] };
+    const denied = await projectScopeDenial(crew, "update_job_contact", { contactId: "jc-proj" });
+    assert.match(denied ?? "", /access to that project/);
+    assert.equal(await projectScopeDenial(assigned, "update_job_contact", { contactId: "jc-proj" }), null);
+    // A lead-owned row on a converted lead is gated as the project.
+    assert.match((await projectScopeDenial(crew, "update_job_contact", { contactId: "jc-lead" })) ?? "", /access to that project/);
+    assert.equal(await projectScopeDenial(assigned, "update_job_contact", { contactId: "jc-lead" }), null);
+    assert.equal(await projectScopeDenial({ ...crew, role: "ADMIN" }, "update_job_contact", { contactId: "jc-proj" }), null);
+});
+
+test("MCP audit owner for update_job_contact resolves the contact's project/lead, id and name", async () => {
+    const { resolveAuditOwner } = await import("../src/app/api/mcp/[transport]/route");
+    contacts.push({ id: "jc-1", projectId: "proj-9", leadId: null, name: "Pamela Ann England" });
+    assert.deepEqual(await resolveAuditOwner("update_job_contact", { contactId: "jc-1" }), {
+        projectId: "proj-9", leadId: null, entityId: "jc-1", entityName: "Pamela Ann England",
+    });
+});
+
 test("MCP tools are registered, audited, permissioned, and remove is not exposed", () => {
     const route = readFileSync("src/app/api/mcp/[transport]/route.ts", "utf8");
     for (const tool of ["list_job_contacts", "add_job_contact", "update_job_contact"]) {
@@ -216,6 +302,6 @@ test("MCP tools are registered, audited, permissioned, and remove is not exposed
     assert.ok(!route.includes("remove_job_contact") && !route.includes("delete_job_contact"));
     const help = readFileSync("src/lib/help-agent.ts", "utf8");
     for (const tool of ["list_job_contacts", "add_job_contact", "update_job_contact"]) {
-        assert.match(help, new RegExp(`${tool}: "createLead"`));
+        assert.match(help, new RegExp(`${tool}: "${tool === "list_job_contacts" ? "leadAccess" : "createLead"}"`));
     }
 });

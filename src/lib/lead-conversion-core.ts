@@ -49,6 +49,11 @@ export async function convertLeadToProjectCore(leadId: string) {
 
     // Wrap entire conversion in a transaction for atomicity
     const project = await prisma.$transaction(async (tx) => {
+        // Same lock job-contacts.ts takes before any contact write on this job
+        // (lead row, FOR NO KEY UPDATE), so a contact add/update cannot slip
+        // between the relink below and the project becoming the canonical owner.
+        await tx.$queryRaw`SELECT id FROM "Lead" WHERE id = ${leadId} FOR NO KEY UPDATE`;
+
         const project = await tx.project.create({
             data: {
                 name: lead.name,

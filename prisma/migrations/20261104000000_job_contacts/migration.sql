@@ -23,10 +23,10 @@ CREATE INDEX IF NOT EXISTS "JobContact_leadId_idx" ON "JobContact"("leadId");
 CREATE INDEX IF NOT EXISTS "JobContact_projectId_idx" ON "JobContact"("projectId");
 
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'JobContact_leadId_fkey') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'JobContact_leadId_fkey' AND conrelid = '"JobContact"'::regclass) THEN
     ALTER TABLE "JobContact" ADD CONSTRAINT "JobContact_leadId_fkey" FOREIGN KEY ("leadId") REFERENCES "Lead"("id") ON DELETE CASCADE ON UPDATE CASCADE;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'JobContact_projectId_fkey') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'JobContact_projectId_fkey' AND conrelid = '"JobContact"'::regclass) THEN
     ALTER TABLE "JobContact" ADD CONSTRAINT "JobContact_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE;
   END IF;
 END $$;

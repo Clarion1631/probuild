@@ -184,7 +184,7 @@ export const TOOL_PERMISSIONS: Record<string, PermissionKey | null> = {
 
   list_leads: "leadAccess",
   create_lead: "createLead",
-  list_job_contacts: "createLead",
+  list_job_contacts: "leadAccess",
   add_job_contact: "createLead",
   update_job_contact: "createLead",
 
@@ -375,6 +375,14 @@ const ENTITY_PROJECT_LOOKUPS: Record<string, (id: string) => Promise<EntityOwner
   },
   taskId: async (id) =>
     prisma.scheduleTask.findUnique({ where: { id }, select: { projectId: true, leadId: true } }),
+  contactId: async (id) => {
+    const contact = await prisma.jobContact.findUnique({ where: { id }, select: { projectId: true, leadId: true } });
+    if (!contact) return null;
+    if (contact.projectId || !contact.leadId) return { projectId: contact.projectId, leadId: contact.leadId };
+    // A lead-owned row on a lead that has since become a project is gated as that project.
+    const project = await prisma.project.findUnique({ where: { leadId: contact.leadId }, select: { id: true } });
+    return project ? { projectId: project.id, leadId: contact.leadId } : { projectId: null, leadId: contact.leadId };
+  },
   fileId: async (id) =>
     prisma.projectFile.findUnique({
       where: { id },
@@ -388,7 +396,8 @@ const ENTITY_PROJECT_LOOKUPS: Record<string, (id: string) => Promise<EntityOwner
 // - an entity owned by a lead (no project) when the user lacks leadAccess
 // - a file in a financial folder, read via read_file/get_file_link, when the
 //   user lacks financialReports
-async function projectScopeDenial(
+// Exported for testing only.
+export async function projectScopeDenial(
   user: HelpAgentUser,
   toolName: string,
   args: Record<string, unknown>

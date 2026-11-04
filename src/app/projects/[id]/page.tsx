@@ -106,9 +106,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         },
     });
 
-    const jobContactsPromise = listJobContactsCore({ projectId: id });
-
-    const [project, tasks, portalVisibility, recentActivity, recentFiles, permitStatuses, inspections, jobContacts] = await Promise.all([
+    const [project, tasks, portalVisibility, recentActivity, recentFiles, permitStatuses, inspections] = await Promise.all([
         projectPromise,
         tasksPromise,
         portalVisibilityPromise,
@@ -116,12 +114,14 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         filesPromise,
         permitsPromise,
         inspectionsPromise,
-        jobContactsPromise,
     ]);
 
     console.log(`[DASHBOARD] TOTAL QUERY RESOLUTION TIME: ${Date.now() - t0}ms`);
 
     if (!project) notFound();
+    // After notFound() so a bad id 404s cleanly. A missing table is NOT swallowed:
+    // the apply script runs before the deploy.
+    const jobContacts = await listJobContactsCore({ projectId: id });
     const estimates = project.estimates || [];
     const permitCount = permitStatuses.length;
     const permitSummary = buildPermitSummary(permitStatuses);

@@ -17708,23 +17708,25 @@ export async function unlockPayrollPeriod(
 // Extra named people on a lead/project. Informational only:
 // no portal access, signing or billing; the main Client still receives
 // estimates, contracts and invoices. Logic lives in job-contacts.ts.
+// Each write needs an active staff user AND reach into the job (the same
+// canAccessJobScope rule estimates and contracts use). A converted lead is
+// checked as its project.
+
+async function assertJobContactScope(user: any, scope: { projectId: string | null; leadId: string | null }) {
+    const { canAccessJobScope } = await import("./access-rules");
+    if (!canAccessJobScope(user, scope)) throw new Error("Forbidden");
+}
 
 function revalidateJobContactPaths(owner: { leadId?: string | null; projectId?: string | null }) {
     if (owner.leadId) revalidatePath(`/leads/${owner.leadId}`);
     if (owner.projectId) revalidatePath(`/projects/${owner.projectId}`);
 }
 
-export async function listJobContacts(owner: { leadId?: string; projectId?: string }) {
-    "use server";
-    await assertActiveStaff();
-    const { listJobContactsCore } = await import("./job-contacts");
-    return JSON.parse(JSON.stringify(await listJobContactsCore(owner)));
-}
-
 export async function addJobContact(owner: { leadId?: string; projectId?: string }, data: { name: string; email?: string; phone?: string; isOwner?: boolean; isPrimaryContact?: boolean; roleNote?: string }) {
     "use server";
-    await assertActiveStaff();
-    const { addJobContactCore } = await import("./job-contacts");
+    const user = await assertActiveStaff();
+    const { addJobContactCore, resolveJobScope } = await import("./job-contacts");
+    await assertJobContactScope(user, await resolveJobScope(owner));
     const contact = await addJobContactCore(owner, data);
     revalidateJobContactPaths(contact);
     return JSON.parse(JSON.stringify(contact));
@@ -17732,8 +17734,9 @@ export async function addJobContact(owner: { leadId?: string; projectId?: string
 
 export async function updateJobContact(contactId: string, data: { name?: string; email?: string | null; phone?: string | null; isOwner?: boolean; isPrimaryContact?: boolean; roleNote?: string | null }) {
     "use server";
-    await assertActiveStaff();
-    const { updateJobContactCore } = await import("./job-contacts");
+    const user = await assertActiveStaff();
+    const { updateJobContactCore, jobScopeOfContact } = await import("./job-contacts");
+    await assertJobContactScope(user, await jobScopeOfContact(contactId));
     const { contact, owner } = await updateJobContactCore(contactId, data);
     revalidateJobContactPaths(owner);
     return JSON.parse(JSON.stringify(contact));
@@ -17741,8 +17744,9 @@ export async function updateJobContact(contactId: string, data: { name?: string;
 
 export async function removeJobContact(contactId: string) {
     "use server";
-    await assertActiveStaff();
-    const { removeJobContactCore } = await import("./job-contacts");
+    const user = await assertActiveStaff();
+    const { removeJobContactCore, jobScopeOfContact } = await import("./job-contacts");
+    await assertJobContactScope(user, await jobScopeOfContact(contactId));
     const owner = await removeJobContactCore(contactId);
     revalidateJobContactPaths(owner);
     return { success: true };

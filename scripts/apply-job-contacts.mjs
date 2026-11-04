@@ -20,10 +20,10 @@ export const statements = [
   'CREATE INDEX IF NOT EXISTS "JobContact_leadId_idx" ON "JobContact"("leadId")',
   'CREATE INDEX IF NOT EXISTS "JobContact_projectId_idx" ON "JobContact"("projectId")',
   `DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'JobContact_leadId_fkey') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'JobContact_leadId_fkey' AND conrelid = '"JobContact"'::regclass) THEN
       ALTER TABLE "JobContact" ADD CONSTRAINT "JobContact_leadId_fkey" FOREIGN KEY ("leadId") REFERENCES "Lead"("id") ON DELETE CASCADE ON UPDATE CASCADE;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'JobContact_projectId_fkey') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'JobContact_projectId_fkey' AND conrelid = '"JobContact"'::regclass) THEN
       ALTER TABLE "JobContact" ADD CONSTRAINT "JobContact_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE;
     END IF;
   END $$`,
@@ -121,11 +121,34 @@ async function verifyColumns(tx) {
     if (col.is_nullable !== nullable) throw new Error('column nullability mismatch');
   }
   const fks = await tx.$queryRaw`
-    SELECT conname FROM pg_constraint
-    WHERE conrelid = '"JobContact"'::regclass AND contype = 'f'
+    SELECT c.conname, a.attname AS col, ref.relname AS ref_table, c.confdeltype AS on_delete
+    FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    JOIN pg_class ref ON ref.oid = c.confrelid
+    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+    WHERE n.nspname = current_schema() AND t.relname = 'JobContact' AND c.contype = 'f'
   `;
-  for (const name of ['JobContact_leadId_fkey', 'JobContact_projectId_fkey']) {
-    if (!fks.some((row) => row.conname === name)) throw new Error('foreign key missing');
+  const expectedFks = [
+    ['JobContact_leadId_fkey', 'leadId', 'Lead'],
+    ['JobContact_projectId_fkey', 'projectId', 'Project'],
+  ];
+  for (const [name, col, target] of expectedFks) {
+    const fk = fks.find((row) => row.conname === name);
+    if (!fk) throw new Error('foreign key missing');
+    if (fk.col !== col || fk.ref_table !== target) throw new Error('foreign key target mismatch');
+    if (fk.on_delete !== 'c') throw new Error('foreign key delete rule mismatch');
+  }
+  const indexes = await tx.$queryRaw`
+    SELECT indexname, indexdef FROM pg_indexes
+    WHERE schemaname = current_schema() AND tablename = 'JobContact'
+  `;
+  for (const [name, col] of [['JobContact_leadId_idx', 'leadId'], ['JobContact_projectId_idx', 'projectId']]) {
+    const idx = indexes.find((row) => row.indexname === name);
+    if (!idx) throw new Error('index missing');
+    if (!new RegExp(`^CREATE INDEX "${name}" ON (\\S+\\.)?"JobContact" USING btree \\("${col}"\\)$`).test(idx.indexdef)) {
+      throw new Error('index definition mismatch');
+    }
   }
 }
 

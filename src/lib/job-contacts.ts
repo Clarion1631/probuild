@@ -3,9 +3,9 @@ import { normalizeE164 } from "./phone";
 
 // Session-free core for JobContact (extra named people on a lead/project).
 // Callers authorize first: the staff server actions in actions.ts
-// (assertActiveStaff) and the MCP tools (machine/actor auth). This file
-// deliberately carries no server-action directive, so nothing here is a
-// remotely invokable endpoint.
+// (assertActiveStaff + per-job scope) and the MCP tools (machine/actor auth).
+// This file deliberately carries no server-action directive, so nothing here
+// is a remotely invokable endpoint.
 //
 // Contacts are informational only. They get no portal access, no signing and
 // no billing, and nothing here sends a message. The main Client stays the
@@ -73,61 +73,84 @@ function contactFields(input: JobContactPatch) {
     return out;
 }
 
-// Rows that belong to the same job as `owner`. For a project that also covers
-// rows still pointing at the lead it was converted from, so nothing is lost if
-// a conversion ever leaves leadId in place.
-async function jobScope(tx: any, owner: { leadId: string } | { projectId: string }) {
-    if ("leadId" in owner) return { where: { leadId: owner.leadId } };
-    const project = await tx.project.findUnique({
-        where: { id: owner.projectId },
-        select: { id: true, leadId: true },
-    });
-    if (!project) throw new Error("Project not found");
-    return {
-        where: project.leadId
-            ? { OR: [{ projectId: project.id }, { leadId: project.leadId }] }
-            : { projectId: project.id },
-    };
+// ONE canonical owner per job. A lead that has been converted IS its project:
+// reads, locks and new rows all use the project, so a stale lead URL or an old
+// leadId from a caller can never create a second, divergent contact list.
+export type CanonicalJob = { projectId: string | null; leadId: string | null };
+
+// Rows that belong to this job. A project that came from a lead also matches
+// rows still carrying that leadId (e.g. added in the instant before a
+// conversion committed), so nothing is lost and primary clearing sees them.
+function scopeWhere(c: CanonicalJob): Record<string, unknown> {
+    if (!c.projectId) return { leadId: c.leadId };
+    return c.leadId ? { OR: [{ projectId: c.projectId }, { leadId: c.leadId }] } : { projectId: c.projectId };
 }
 
-async function assertOwnerExists(tx: any, owner: { leadId: string } | { projectId: string }) {
-    if ("leadId" in owner) {
-        const lead = await tx.lead.findUnique({ where: { id: owner.leadId }, select: { id: true } });
-        if (!lead) throw new Error("Lead not found");
-    } else {
-        const project = await tx.project.findUnique({ where: { id: owner.projectId }, select: { id: true } });
+async function resolveCanonical(tx: any, owner: { leadId: string } | { projectId: string }): Promise<CanonicalJob> {
+    if ("projectId" in owner) {
+        const project = await tx.project.findUnique({ where: { id: owner.projectId }, select: { id: true, leadId: true } });
         if (!project) throw new Error("Project not found");
+        return { projectId: project.id, leadId: project.leadId ?? null };
     }
+    const project = await tx.project.findUnique({ where: { leadId: owner.leadId }, select: { id: true, leadId: true } });
+    if (project) return { projectId: project.id, leadId: owner.leadId };
+    const lead = await tx.lead.findUnique({ where: { id: owner.leadId }, select: { id: true } });
+    if (!lead) throw new Error("Lead not found");
+    return { projectId: null, leadId: owner.leadId };
 }
 
-// Serializes concurrent primary-contact changes on one job so "at most one
-// primary" holds without a partial unique index (Prisma cannot express one and
-// check-migrations-match would flag the drift).
-async function lockOwnerRow(tx: any, owner: { leadId: string } | { projectId: string }) {
-    if ("leadId" in owner) await tx.$queryRaw`SELECT id FROM "Lead" WHERE id = ${owner.leadId} FOR UPDATE`;
-    else await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${owner.projectId} FOR UPDATE`;
+function rowOwner(row: { leadId: string | null; projectId: string | null }): { leadId: string } | { projectId: string } {
+    return row.projectId ? { projectId: row.projectId } : { leadId: row.leadId as string };
 }
 
-function dedupeById<T extends { id: string }>(rows: T[]): T[] {
-    const seen = new Set<string>();
-    return rows.filter(row => (seen.has(row.id) ? false : (seen.add(row.id), true)));
+// The lock a job needs, derived without taking it.
+async function lockKeyFor(tx: any, owner: { leadId: string } | { projectId: string }): Promise<string> {
+    if ("leadId" in owner) return `lead:${owner.leadId}`;
+    const project = await tx.project.findUnique({ where: { id: owner.projectId }, select: { leadId: true } });
+    if (!project) throw new Error("Project not found");
+    return project.leadId ? `lead:${project.leadId}` : `project:${owner.projectId}`;
+}
+
+// Lock protocol shared with convertLeadToProjectCore: whenever the job has a
+// lead, serialize on the LEAD row (FOR NO KEY UPDATE); only a project with no
+// lead locks its own row. The conversion takes the same lead lock first, so a
+// contact write and a conversion cannot interleave. The canonical owner is
+// resolved AFTER the lock, from fresh reads.
+async function lockAndResolve(tx: any, owner: { leadId: string } | { projectId: string }): Promise<{ canonical: CanonicalJob; lockKey: string }> {
+    const lockKey = await lockKeyFor(tx, owner);
+    const id = lockKey.slice(lockKey.indexOf(":") + 1);
+    const rows = lockKey.startsWith("lead:")
+        ? await tx.$queryRaw`SELECT id FROM "Lead" WHERE id = ${id} FOR NO KEY UPDATE`
+        : await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${id} FOR NO KEY UPDATE`;
+    if (!rows.length) throw new Error(lockKey.startsWith("lead:") ? "Lead not found" : "Project not found");
+    return { canonical: await resolveCanonical(tx, owner), lockKey };
+}
+
+/** Canonical job for access checks (no lock). */
+export async function resolveJobScope(owner: JobOwner, db: any = prisma): Promise<CanonicalJob> {
+    return resolveCanonical(db, resolveJobOwner(owner));
+}
+
+/** Canonical job of an existing contact, for access checks (no lock). */
+export async function jobScopeOfContact(contactId: string, db: any = prisma): Promise<CanonicalJob> {
+    const row = await db.jobContact.findUnique({ where: { id: contactId } });
+    if (!row) throw new Error("Contact not found");
+    return resolveCanonical(db, rowOwner(row));
 }
 
 export async function listJobContactsCore(ownerInput: JobOwner, db: any = prisma) {
-    const owner = resolveJobOwner(ownerInput);
-    const scope = await jobScope(db, owner);
-    const rows = await db.jobContact.findMany({
-        where: scope.where,
+    const canonical = await resolveCanonical(db, resolveJobOwner(ownerInput));
+    const contacts: any[] = await db.jobContact.findMany({
+        where: scopeWhere(canonical),
         orderBy: { createdAt: "asc" },
     });
 
     const clientSelect = { select: { id: true, name: true, email: true, primaryPhone: true } };
-    const job = "leadId" in owner
-        ? await db.lead.findUnique({ where: { id: owner.leadId }, select: { client: clientSelect } })
-        : await db.project.findUnique({ where: { id: owner.projectId }, select: { client: clientSelect } });
-    if (!job) throw new Error("leadId" in owner ? "Lead not found" : "Project not found");
+    const job = canonical.projectId
+        ? await db.project.findUnique({ where: { id: canonical.projectId }, select: { client: clientSelect } })
+        : await db.lead.findUnique({ where: { id: canonical.leadId }, select: { client: clientSelect } });
+    if (!job) throw new Error(canonical.projectId ? "Project not found" : "Lead not found");
 
-    const contacts = dedupeById<any>(rows);
     return {
         // The main client is shown first and is read-only here. It is the implied
         // primary contact when no JobContact is marked primary.
@@ -143,32 +166,42 @@ export async function addJobContactCore(ownerInput: JobOwner, input: JobContactI
     const owner = resolveJobOwner(ownerInput);
     const fields = contactFields({ ...input, name: input.name });
     return db.$transaction(async (tx: any) => {
-        await assertOwnerExists(tx, owner);
-        await lockOwnerRow(tx, owner);
+        const { canonical } = await lockAndResolve(tx, owner);
         if (fields.isPrimaryContact === true) {
-            const scope = await jobScope(tx, owner);
-            await tx.jobContact.updateMany({ where: scope.where, data: { isPrimaryContact: false } });
+            await tx.jobContact.updateMany({ where: scopeWhere(canonical), data: { isPrimaryContact: false } });
         }
-        return tx.jobContact.create({ data: { ...fields, ...owner } });
+        // A converted lead writes to its project, never to the lead.
+        const ownerData = canonical.projectId ? { projectId: canonical.projectId } : { leadId: canonical.leadId };
+        return tx.jobContact.create({ data: { ...fields, ...ownerData } });
     });
 }
 
 export async function updateJobContactCore(contactId: string, patch: JobContactPatch, db: any = prisma) {
     const fields = contactFields(patch);
     return db.$transaction(async (tx: any) => {
-        const existing = await tx.jobContact.findUnique({ where: { id: contactId } });
-        if (!existing) throw new Error("Contact not found");
-        const owner = existing.leadId ? { leadId: existing.leadId as string } : { projectId: existing.projectId as string };
-        await lockOwnerRow(tx, owner);
-        if (fields.isPrimaryContact === true) {
-            const scope = await jobScope(tx, owner);
-            await tx.jobContact.updateMany({
-                where: { AND: [scope.where, { id: { not: contactId } }] },
-                data: { isPrimaryContact: false },
-            });
+        // Lock first, then trust only a fresh read. The unlocked read only tells
+        // us WHICH lock to take; if the contact's job moved before we held it,
+        // retry once with the new lock, then give up.
+        let guess = await tx.jobContact.findUnique({ where: { id: contactId } });
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (!guess) throw new Error("Contact not found");
+            const { canonical, lockKey } = await lockAndResolve(tx, rowOwner(guess));
+            const fresh = await tx.jobContact.findUnique({ where: { id: contactId } });
+            if (!fresh) throw new Error("Contact not found");
+            if ((await lockKeyFor(tx, rowOwner(fresh))) !== lockKey) { guess = fresh; continue; }
+            if (fields.isPrimaryContact === true) {
+                await tx.jobContact.updateMany({
+                    where: { AND: [scopeWhere(canonical), { id: { not: contactId } }] },
+                    data: { isPrimaryContact: false },
+                });
+            }
+            const updated = await tx.jobContact.update({ where: { id: contactId }, data: fields });
+            const owner: { leadId: string } | { projectId: string } = canonical.projectId
+                ? { projectId: canonical.projectId }
+                : { leadId: canonical.leadId as string };
+            return { contact: updated, owner };
         }
-        const updated = await tx.jobContact.update({ where: { id: contactId }, data: fields });
-        return { contact: updated, owner };
+        throw new Error("Contact moved while updating; try again.");
     });
 }
 

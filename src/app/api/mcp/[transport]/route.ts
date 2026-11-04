@@ -343,7 +343,8 @@ type AuditOwner = { projectId: string | null; leadId: string | null; entityId?: 
 // only the owner columns it actually has (Invoice/ChangeOrder: projectId only;
 // Estimate/Contract/ScheduleTask/ProjectFile: both). Never throws — a failed
 // lookup degrades to nulls rather than breaking the tool call or the audit write.
-async function resolveAuditOwner(toolName: string, args: Record<string, unknown>): Promise<AuditOwner> {
+// Exported for testing only — see tests/job-contacts.test.ts.
+export async function resolveAuditOwner(toolName: string, args: Record<string, unknown>): Promise<AuditOwner> {
     const projectIdArg = typeof args.projectId === "string" && args.projectId ? args.projectId : null;
     const leadIdArg = typeof args.leadId === "string" && args.leadId ? args.leadId : null;
     if (projectIdArg || leadIdArg) {
@@ -351,7 +352,13 @@ async function resolveAuditOwner(toolName: string, args: Record<string, unknown>
     }
 
     try {
-        if (typeof args.fileId === "string" && args.fileId) {
+        if (typeof args.contactId === "string" && args.contactId) {
+            const contact = await prisma.jobContact.findUnique({
+                where: { id: args.contactId },
+                select: { projectId: true, leadId: true, name: true },
+            });
+            if (contact) return { projectId: contact.projectId ?? null, leadId: contact.leadId ?? null, entityId: args.contactId, entityName: contact.name };
+        } else if (typeof args.fileId === "string" && args.fileId) {
             const file = await prisma.projectFile.findUnique({
                 where: { id: args.fileId },
                 select: { projectId: true, leadId: true, name: true },

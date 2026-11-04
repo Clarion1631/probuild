@@ -55,6 +55,8 @@ const tx: any = {
     jobContact: noopMany,
     // The FOR UPDATE locks lockMoneyParentsMany takes, in the order it takes them.
     $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        // The lead-row lock job-contacts.ts shares with the conversion (not an estimate lock).
+        if (/"Lead"[\s\S]*FOR NO KEY UPDATE/.test(strings.join("?"))) return [{ id: values[0] }];
         assert.match(strings.join("?"), /FOR UPDATE/);
         locked.push(String(values[0]));
         return [];
