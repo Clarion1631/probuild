@@ -17704,6 +17704,56 @@ export async function unlockPayrollPeriod(
     return { success: true as const };
 }
 
+// ============ Job contacts (not payroll) ============
+// Extra named people on a lead/project. Informational only:
+// no portal access, signing or billing; the main Client still receives
+// estimates, contracts and invoices. Logic lives in job-contacts.ts.
+// Each write needs an active staff user AND reach into the job (the same
+// canAccessJobScope rule estimates and contracts use), decided inside the
+// core transaction once the job is locked and its canonical owner resolved.
+
+// Returns the callback the core runs INSIDE its transaction, after the shared
+// lead lock is held and the canonical owner is resolved, so the access decision
+// is made on the locked, fresh owner (a converted lead is checked as its project).
+function jobContactAuthorizer(user: any) {
+    return async (scope: { projectId: string | null; leadId: string | null }) => {
+        const { canAccessJobScope } = await import("./access-rules");
+        if (!canAccessJobScope(user, scope)) throw new Error("Forbidden");
+    };
+}
+
+function revalidateJobContactPaths(owner: { leadId?: string | null; projectId?: string | null }) {
+    if (owner.leadId) revalidatePath(`/leads/${owner.leadId}`);
+    if (owner.projectId) revalidatePath(`/projects/${owner.projectId}`);
+}
+
+export async function addJobContact(owner: { leadId?: string; projectId?: string }, data: { name: string; email?: string; phone?: string; isOwner?: boolean; isPrimaryContact?: boolean; roleNote?: string }) {
+    "use server";
+    const user = await assertActiveStaff();
+    const { addJobContactCore } = await import("./job-contacts");
+    const contact = await addJobContactCore(owner, data, undefined, jobContactAuthorizer(user));
+    revalidateJobContactPaths(contact);
+    return JSON.parse(JSON.stringify(contact));
+}
+
+export async function updateJobContact(contactId: string, data: { name?: string; email?: string | null; phone?: string | null; isOwner?: boolean; isPrimaryContact?: boolean; roleNote?: string | null }) {
+    "use server";
+    const user = await assertActiveStaff();
+    const { updateJobContactCore } = await import("./job-contacts");
+    const { contact, owner } = await updateJobContactCore(contactId, data, undefined, jobContactAuthorizer(user));
+    revalidateJobContactPaths(owner);
+    return JSON.parse(JSON.stringify(contact));
+}
+
+export async function removeJobContact(contactId: string) {
+    "use server";
+    const user = await assertActiveStaff();
+    const { removeJobContactCore } = await import("./job-contacts");
+    const owner = await removeJobContactCore(contactId, undefined, jobContactAuthorizer(user));
+    revalidateJobContactPaths(owner);
+    return { success: true };
+}
+
 // ============ Change order offline approval (not payroll) ============
 // Office-side "Mark approved": the customer approved a change order outside
 // ProBuild (phone, text, email, in person). ADMIN/MANAGER only, same gate as the

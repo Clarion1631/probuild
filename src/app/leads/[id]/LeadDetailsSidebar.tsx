@@ -11,6 +11,7 @@ import GoogleMapPreview from "@/components/GoogleMapPreview";
 import GoogleMapsAutocomplete from "@/components/GoogleMapsAutocomplete";
 import ManagerAssignRow from "@/components/ManagerAssignRow";
 import TaxExemptCertCard from "@/components/TaxExemptCertCard";
+import JobContactsSection, { type JobContactRow } from "@/components/JobContactsSection";
 
 interface LeadDetailsSidebarProps {
     leadId: string;
@@ -36,13 +37,14 @@ interface LeadDetailsSidebarProps {
     initialMessage: string | null;
     managerId?: string | null;
     managerName?: string | null;
+    jobContacts?: JobContactRow[];
 }
 
 export default function LeadDetailsSidebar({
     leadId, leadName, leadSource, leadStage, expectedStartDate, targetRevenue, location, projectType,
     clientId, clientName, clientEmail, clientAdditionalEmail, clientPhone, clientAddress, clientCity, clientState, clientZip,
     clientTaxExemptCertUrl = null, clientTaxExemptCertExpiresAt = null, clientTaxExemptCertNote = null,
-    initialMessage, managerId, managerName,
+    initialMessage, managerId, managerName, jobContacts = [],
 }: LeadDetailsSidebarProps) {
     const router = useRouter();
 
@@ -355,6 +357,15 @@ export default function LeadDetailsSidebar({
                     certUrl={clientTaxExemptCertUrl}
                     certExpiresAt={clientTaxExemptCertExpiresAt}
                     certNote={clientTaxExemptCertNote}
+                />
+            </div>
+
+            {/* Job contacts (owners, co-owners, etc.) */}
+            <div className="p-5 border-b border-hui-border">
+                <JobContactsSection
+                    leadId={leadId}
+                    mainClient={{ name: clientName, email: clientEmail, phone: clientPhone }}
+                    contacts={jobContacts}
                 />
             </div>
 

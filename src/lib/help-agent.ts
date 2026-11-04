@@ -184,6 +184,9 @@ export const TOOL_PERMISSIONS: Record<string, PermissionKey | null> = {
 
   list_leads: "leadAccess",
   create_lead: "createLead",
+  list_job_contacts: "leadAccess",
+  add_job_contact: "createLead",
+  update_job_contact: "createLead",
 
   get_estimating_codes: "estimates",
   list_templates: "estimates",
@@ -372,6 +375,14 @@ const ENTITY_PROJECT_LOOKUPS: Record<string, (id: string) => Promise<EntityOwner
   },
   taskId: async (id) =>
     prisma.scheduleTask.findUnique({ where: { id }, select: { projectId: true, leadId: true } }),
+  contactId: async (id) => {
+    const contact = await prisma.jobContact.findUnique({ where: { id }, select: { projectId: true, leadId: true } });
+    if (!contact) return null;
+    if (contact.projectId || !contact.leadId) return { projectId: contact.projectId, leadId: contact.leadId };
+    // A lead-owned row on a lead that has since become a project is gated as that project.
+    const project = await prisma.project.findUnique({ where: { leadId: contact.leadId }, select: { id: true } });
+    return project ? { projectId: project.id, leadId: contact.leadId } : { projectId: null, leadId: contact.leadId };
+  },
   fileId: async (id) =>
     prisma.projectFile.findUnique({
       where: { id },
@@ -385,26 +396,33 @@ const ENTITY_PROJECT_LOOKUPS: Record<string, (id: string) => Promise<EntityOwner
 // - an entity owned by a lead (no project) when the user lacks leadAccess
 // - a file in a financial folder, read via read_file/get_file_link, when the
 //   user lacks financialReports
-async function projectScopeDenial(
+// Exported for testing only.
+export async function projectScopeDenial(
   user: HelpAgentUser,
   toolName: string,
   args: Record<string, unknown>
 ): Promise<string | null> {
   if (ADMIN_ROLES.includes(user.role)) return null;
 
-  const hasProjectIdArg = typeof args.projectId === "string" && !!args.projectId;
-  if (hasProjectIdArg && !canAccessProject(user, args.projectId as string)) {
+  // Trim like resolveJobOwner does, so " lead-1 " can't dodge the checks below.
+  const projectIdArg = typeof args.projectId === "string" ? args.projectId.trim() : "";
+  const leadIdArg = typeof args.leadId === "string" ? args.leadId.trim() : "";
+  const hasProjectIdArg = !!projectIdArg;
+  if (hasProjectIdArg && !canAccessProject(user, projectIdArg)) {
     return "Permission denied: you don't have access to that project.";
   }
   // A tool called directly with a leadId (no projectId) targets a lead-owned
   // entity — gated by leadAccess, not per-project assignment.
-  if (
-    !hasProjectIdArg &&
-    typeof args.leadId === "string" &&
-    args.leadId &&
-    !hasPermission(user, "leadAccess")
-  ) {
+  if (!hasProjectIdArg && leadIdArg && !hasPermission(user, "leadAccess")) {
     return "Permission denied: you don't have lead access.";
+  }
+  // A lead that has become a project is that project: authorize against it
+  // (canonical scope), not only leadAccess.
+  if (!hasProjectIdArg && leadIdArg) {
+    const converted = await prisma.project.findUnique({ where: { leadId: leadIdArg }, select: { id: true } });
+    if (converted && !canAccessProject(user, converted.id)) {
+      return "Permission denied: you don't have access to that project.";
+    }
   }
 
   for (const [argName, lookup] of Object.entries(ENTITY_PROJECT_LOOKUPS)) {
