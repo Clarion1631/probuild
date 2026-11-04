@@ -108,6 +108,8 @@ export async function convertLeadToProjectCore(leadId: string) {
         await tx.scheduleTask.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.takeoff.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.clientMessage.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        // Extra job contacts follow the job (cascade FK on lead, so clear leadId like the rest).
+        await tx.jobContact.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
 
         await tx.lead.update({ where: { id: leadId }, data: { stage: "Won" } });
 

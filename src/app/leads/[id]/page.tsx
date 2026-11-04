@@ -3,6 +3,7 @@ import ClientMessaging from "@/components/ClientMessaging";
 import LeadMessagingHeader from "./LeadMessagingHeader";
 import LeadDetailsSidebar from "./LeadDetailsSidebar";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { listJobContactsCore } from "@/lib/job-contacts";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -17,6 +18,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
 
     const estimates = lead.estimates || [];
     const initialMessage = lead.message || null;
+    const jobContacts = (await listJobContactsCore({ leadId: lead.id })).contacts;
 
     return (
         <>
@@ -64,6 +66,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 initialMessage={initialMessage}
                 managerId={(lead as any).manager?.id || null}
                 managerName={(lead as any).manager?.name || null}
+                jobContacts={jobContacts}
             />
         </>
     );

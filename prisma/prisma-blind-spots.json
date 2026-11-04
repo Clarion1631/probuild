@@ -296,6 +296,10 @@
       "forced": false
     },
     {
+      "name": "JobContact",
+      "forced": false
+    },
+    {
       "name": "McpConfirmation",
       "forced": false
     },

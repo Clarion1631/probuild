@@ -6,6 +6,8 @@ import ProjectHeader from "./ProjectHeader";
 import ProjectDashboardsWidget from "@/components/ProjectDashboardsWidget";
 import JobInfoCard from "./JobInfoCard";
 import InspectionsPanel from "./InspectionsPanel";
+import JobContactsSection from "@/components/JobContactsSection";
+import { listJobContactsCore } from "@/lib/job-contacts";
 import { formatCurrency } from "@/lib/utils";
 import { resolveDocUrl } from "@/lib/secure-storage";
 
@@ -104,7 +106,9 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         },
     });
 
-    const [project, tasks, portalVisibility, recentActivity, recentFiles, permitStatuses, inspections] = await Promise.all([
+    const jobContactsPromise = listJobContactsCore({ projectId: id });
+
+    const [project, tasks, portalVisibility, recentActivity, recentFiles, permitStatuses, inspections, jobContacts] = await Promise.all([
         projectPromise,
         tasksPromise,
         portalVisibilityPromise,
@@ -112,6 +116,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         filesPromise,
         permitsPromise,
         inspectionsPromise,
+        jobContactsPromise,
     ]);
 
     console.log(`[DASHBOARD] TOTAL QUERY RESOLUTION TIME: ${Date.now() - t0}ms`);
@@ -193,6 +198,14 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
             </div>
 
             <InspectionsPanel projectId={id} initialInspections={inspections} />
+
+            <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm p-5 mb-6">
+                <JobContactsSection
+                    projectId={id}
+                    mainClient={jobContacts.mainClient ? { name: jobContacts.mainClient.name, email: jobContacts.mainClient.email, phone: jobContacts.mainClient.phone } : null}
+                    contacts={jobContacts.contacts}
+                />
+            </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
 

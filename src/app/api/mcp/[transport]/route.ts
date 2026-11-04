@@ -192,7 +192,7 @@ export const WRITE_TOOLS = new Set([
     "create_estimate", "update_estimate", "send_estimate",
     "send_milestone_invoice", "resend_invoice", "create_invoice_from_estimate",
     "create_change_order", "update_change_order", "send_change_order", "bill_change_order",
-    "create_lead", "log_time", "log_expense",
+    "create_lead", "add_job_contact", "update_job_contact", "log_time", "log_expense",
     "upload_file", "upload_files", "import_google_drive_file", "create_folder", "move_file",
     "create_daily_log", "add_punch_items", "record_inspection",
     "create_contract", "update_contract", "send_contract",
@@ -239,6 +239,7 @@ const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
     create_change_order: "change_order", update_change_order: "change_order", send_change_order: "change_order", bill_change_order: "change_order",
     apply_change_order_to_schedule: "change_order",
     create_lead: "lead",
+    add_job_contact: "job_contact", update_job_contact: "job_contact",
     plan_schedule: "task", update_task_dates: "task", set_task_status: "task", assign_task_crew: "task",
     upload_file: "file", upload_files: "file", import_google_drive_file: "file", read_file: "file", get_file_link: "file",
     create_folder: "folder", move_file: "file",
@@ -1318,6 +1319,93 @@ function createHandler(actor: RouteMcpActor) {
                     warnings,
                     note: "Lead created (or matched to an identical lead from the last 24h).",
                 });
+            },
+        );
+
+        server.registerTool(
+            "list_job_contacts",
+            {
+                title: "List a job's contacts",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Lists the people on a lead or project: the main client first (read-only), then the extra contacts (owners, primary contact, role notes). Pass exactly one of leadId or projectId. " +
+                    "Contacts get no portal access, signing or billing: estimates, contracts and invoices still go to the main client.",
+                inputSchema: {
+                    leadId: z.string().max(50).optional(),
+                    projectId: z.string().max(50).optional(),
+                },
+            },
+            async args => {
+                try {
+                    const { listJobContactsCore } = await import("@/lib/job-contacts");
+                    return textResult(await listJobContactsCore(args));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to list contacts" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "add_job_contact",
+            {
+                title: "Add a contact to a job",
+                annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+                description:
+                    "Adds a named person (e.g. a co-owner) to a lead or project. Pass exactly one of leadId or projectId. " +
+                    "Contacts get no portal access, signing or billing and are NOT emailed or texted; estimates, contracts and invoices still go to the main client. " +
+                    "Marking isPrimaryContact clears that flag on the job's other contacts.",
+                inputSchema: {
+                    leadId: z.string().max(50).optional(),
+                    projectId: z.string().max(50).optional(),
+                    name: z.string().min(1).max(200),
+                    email: z.string().max(254).optional(),
+                    phone: z.string().max(40).optional(),
+                    isOwner: z.boolean().optional(),
+                    isPrimaryContact: z.boolean().optional(),
+                    roleNote: z.string().max(500).optional(),
+                },
+            },
+            async ({ leadId, projectId, ...data }) => {
+                try {
+                    const { addJobContactCore } = await import("@/lib/job-contacts");
+                    const contact = await addJobContactCore({ leadId, projectId }, data);
+                    if (contact.leadId) revalidatePath(`/leads/${contact.leadId}`);
+                    if (contact.projectId) revalidatePath(`/projects/${contact.projectId}`);
+                    return textResult({ contact, note: "Contact added. It has no portal access, signing or billing, and nothing was sent." });
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to add contact" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "update_job_contact",
+            {
+                title: "Update a job contact",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description:
+                    "Updates a contact's name, email, phone, owner/primary flags or role note (id from list_job_contacts). Only the fields provided change; pass an empty string to clear email, phone or roleNote. " +
+                    "Contacts get no portal access, signing or billing and nothing is sent. There is no delete over MCP.",
+                inputSchema: {
+                    contactId: z.string().max(50),
+                    name: z.string().min(1).max(200).optional(),
+                    email: z.string().max(254).optional(),
+                    phone: z.string().max(40).optional(),
+                    isOwner: z.boolean().optional(),
+                    isPrimaryContact: z.boolean().optional(),
+                    roleNote: z.string().max(500).optional(),
+                },
+            },
+            async ({ contactId, ...patch }) => {
+                try {
+                    const { updateJobContactCore } = await import("@/lib/job-contacts");
+                    const { contact, owner } = await updateJobContactCore(contactId, patch);
+                    if ("leadId" in owner) revalidatePath(`/leads/${owner.leadId}`);
+                    else revalidatePath(`/projects/${owner.projectId}`);
+                    return textResult({ contact });
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to update contact" }), isError: true };
+                }
             },
         );
 

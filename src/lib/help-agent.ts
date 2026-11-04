@@ -184,6 +184,9 @@ export const TOOL_PERMISSIONS: Record<string, PermissionKey | null> = {
 
   list_leads: "leadAccess",
   create_lead: "createLead",
+  list_job_contacts: "createLead",
+  add_job_contact: "createLead",
+  update_job_contact: "createLead",
 
   get_estimating_codes: "estimates",
   list_templates: "estimates",

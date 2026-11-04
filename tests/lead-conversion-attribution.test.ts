@@ -52,6 +52,7 @@ const tx: any = {
     scheduleTask: noopMany,
     takeoff: noopMany,
     clientMessage: noopMany,
+    jobContact: noopMany,
     // The FOR UPDATE locks lockMoneyParentsMany takes, in the order it takes them.
     $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
         assert.match(strings.join("?"), /FOR UPDATE/);
