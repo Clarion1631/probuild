@@ -404,24 +404,22 @@ export async function projectScopeDenial(
 ): Promise<string | null> {
   if (ADMIN_ROLES.includes(user.role)) return null;
 
-  const hasProjectIdArg = typeof args.projectId === "string" && !!args.projectId;
-  if (hasProjectIdArg && !canAccessProject(user, args.projectId as string)) {
+  // Trim like resolveJobOwner does, so " lead-1 " can't dodge the checks below.
+  const projectIdArg = typeof args.projectId === "string" ? args.projectId.trim() : "";
+  const leadIdArg = typeof args.leadId === "string" ? args.leadId.trim() : "";
+  const hasProjectIdArg = !!projectIdArg;
+  if (hasProjectIdArg && !canAccessProject(user, projectIdArg)) {
     return "Permission denied: you don't have access to that project.";
   }
   // A tool called directly with a leadId (no projectId) targets a lead-owned
   // entity — gated by leadAccess, not per-project assignment.
-  if (
-    !hasProjectIdArg &&
-    typeof args.leadId === "string" &&
-    args.leadId &&
-    !hasPermission(user, "leadAccess")
-  ) {
+  if (!hasProjectIdArg && leadIdArg && !hasPermission(user, "leadAccess")) {
     return "Permission denied: you don't have lead access.";
   }
   // A lead that has become a project is that project: authorize against it
   // (canonical scope), not only leadAccess.
-  if (!hasProjectIdArg && typeof args.leadId === "string" && args.leadId) {
-    const converted = await prisma.project.findUnique({ where: { leadId: args.leadId }, select: { id: true } });
+  if (!hasProjectIdArg && leadIdArg) {
+    const converted = await prisma.project.findUnique({ where: { leadId: leadIdArg }, select: { id: true } });
     if (converted && !canAccessProject(user, converted.id)) {
       return "Permission denied: you don't have access to that project.";
     }

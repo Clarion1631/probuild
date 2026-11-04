@@ -300,6 +300,8 @@ test("help-agent: a converted lead's id is authorized against its project, not j
     projects.push({ id: "proj-9", leadId: "lead-1", client: CLIENT });
     for (const tool of ["list_job_contacts", "add_job_contact"]) {
         assert.match((await projectScopeDenial(leadOnlyUser, tool, { leadId: "lead-1" })) ?? "", /access to that project/, tool);
+        // Padded id is trimmed before the lookup, so it can't dodge the project check.
+        assert.match((await projectScopeDenial(leadOnlyUser, tool, { leadId: " lead-1 " })) ?? "", /access to that project/, tool);
         const assigned = { ...leadOnlyUser, projectAccess: [{ projectId: "proj-9" }] };
         assert.equal(await projectScopeDenial(assigned, tool, { leadId: "lead-1" }), null, tool);
     }
