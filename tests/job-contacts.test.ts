@@ -338,6 +338,9 @@ test("authorization runs inside the transaction on the canonical owner: denied w
         throw new Error("Forbidden");
     }), /Forbidden/);
 
+    // Reads authorize against the scope actually queried: a converted lead's id reads the project.
+    await assert.rejects(core.listJobContactsCore({ leadId: "lead-1" }, fakeDb, denyUser), /Forbidden/);
+
     // An allowed user succeeds.
     const ok = await core.updateJobContactCore(seeded.id, { name: "A2" }, fakeDb, await authorizerFor({ ...leadOnlyUser, projectAccess: [{ projectId: "proj-9" }] }));
     assert.equal(ok.contact.name, "A2");

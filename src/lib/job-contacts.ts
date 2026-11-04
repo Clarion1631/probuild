@@ -138,8 +138,10 @@ export async function jobScopeOfContact(contactId: string, db: any = prisma): Pr
     return resolveCanonical(db, rowOwner(row));
 }
 
-export async function listJobContactsCore(ownerInput: JobOwner, db: any = prisma) {
+export async function listJobContactsCore(ownerInput: JobOwner, db: any = prisma, authorize?: JobContactAuthorize) {
     const canonical = await resolveCanonical(db, resolveJobOwner(ownerInput));
+    // Authorize against the scope actually queried (a converted lead reads its project).
+    if (authorize) await authorize(canonical);
     const contacts: any[] = await db.jobContact.findMany({
         where: scopeWhere(canonical),
         orderBy: { createdAt: "asc" },

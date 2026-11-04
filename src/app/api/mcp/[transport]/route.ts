@@ -16,6 +16,8 @@ import { createExpenseCore, createTimeEntryFromStoredRatesCore, findCrewMatches 
 import { resolveExpenseProjectId } from "@/lib/expense-attribution";
 import { downloadDocBytes, resolveDocUrl, isSecureRef, secureRefPath } from "@/lib/secure-storage";
 import { logActivity } from "@/lib/activity-log";
+import { getUserWithPermissionsByEmail } from "@/lib/permissions";
+import { canAccessJobScope } from "@/lib/access-rules";
 import {
     MAX_UPLOAD_BASE64_CHARS,
     uploadProjectFileCore,
@@ -126,6 +128,8 @@ type RouteMcpActor = {
     // trusted onBehalfOf query param — see guarded() below), so the audit
     // trail can credit the actual person instead of just the connector.
     resolveOnBehalfOf: () => Promise<{ id: string; name: string } | null>;
+    // Raw onBehalfOf id, so access checks can fail closed when it doesn't resolve.
+    onBehalfOfId?: string | null;
 };
 
 // The secret for the key that authenticated THIS request. Passing it to a send
@@ -152,6 +156,7 @@ function createRouteMcpActor(actorLabel: McpActorLabel, onBehalfOfId?: string | 
     let onBehalfOf: Promise<{ id: string; name: string } | null> | null = null;
     return {
         actorLabel,
+        onBehalfOfId: onBehalfOfId ?? null,
         resolveActorUserId: () => {
             actorUserId ??= prisma.user.findUnique({
                 where: { email: MCP_ACTOR_EMAILS[actorLabel] },
@@ -168,6 +173,19 @@ function createRouteMcpActor(actorLabel: McpActorLabel, onBehalfOfId?: string | 
                 .catch(() => null);
             return onBehalfOf;
         },
+    };
+}
+
+// When help-agent.ts acts for a signed-in person, job-contact reads and writes
+// must pass that person's job access, checked against the canonical job inside
+// the core (after the shared lead lock for writes), not only the pre-call
+// scope check. External machine callers keep their key-level access.
+async function jobContactAuthorizer(actor: RouteMcpActor) {
+    if (!actor.onBehalfOfId) return undefined;
+    const row = await prisma.user.findUnique({ where: { id: actor.onBehalfOfId }, select: { email: true } });
+    const user = row?.email ? await getUserWithPermissionsByEmail(row.email) : null;
+    return (scope: { projectId: string | null; leadId: string | null }) => {
+        if (!user || !canAccessJobScope(user, scope)) throw new Error("Forbidden");
     };
 }
 
@@ -1345,7 +1363,7 @@ function createHandler(actor: RouteMcpActor) {
             async args => {
                 try {
                     const { listJobContactsCore } = await import("@/lib/job-contacts");
-                    return textResult(await listJobContactsCore(args));
+                    return textResult(await listJobContactsCore(args, undefined, await jobContactAuthorizer(actor)));
                 } catch (error) {
                     return { ...textResult({ error: error instanceof Error ? error.message : "Failed to list contacts" }), isError: true };
                 }
@@ -1375,7 +1393,7 @@ function createHandler(actor: RouteMcpActor) {
             async ({ leadId, projectId, ...data }) => {
                 try {
                     const { addJobContactCore } = await import("@/lib/job-contacts");
-                    const contact = await addJobContactCore({ leadId, projectId }, data);
+                    const contact = await addJobContactCore({ leadId, projectId }, data, undefined, await jobContactAuthorizer(actor));
                     if (contact.leadId) revalidatePath(`/leads/${contact.leadId}`);
                     if (contact.projectId) revalidatePath(`/projects/${contact.projectId}`);
                     return textResult({ contact, note: "Contact added. It has no portal access, signing or billing, and nothing was sent." });
@@ -1406,7 +1424,7 @@ function createHandler(actor: RouteMcpActor) {
             async ({ contactId, ...patch }) => {
                 try {
                     const { updateJobContactCore } = await import("@/lib/job-contacts");
-                    const { contact, owner } = await updateJobContactCore(contactId, patch);
+                    const { contact, owner } = await updateJobContactCore(contactId, patch, undefined, await jobContactAuthorizer(actor));
                     if ("leadId" in owner) revalidatePath(`/leads/${owner.leadId}`);
                     else revalidatePath(`/projects/${owner.projectId}`);
                     return textResult({ contact });
