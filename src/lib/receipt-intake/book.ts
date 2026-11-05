@@ -58,9 +58,12 @@ import type { AutomationEventInput } from "@/lib/automation-events";
 import type { VerifiedBytes } from "./stored-object";
 import {
     backoffMs,
+    CUSTOMER_PAYMENT_REASON,
+    CUSTOMER_PAYMENT_SENT_REASON,
     DATE_IMPLAUSIBLE_REASON,
     isImplausibleReceiptDate,
     MAX_BOOK_ATTEMPTS,
+    namesGoldenTouch,
     NO_ARTIFACT_PARK_REASONS,
     parkReleasesStrongKey,
     preservedTaxWarning,
@@ -574,6 +577,22 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // is not permission to create a merchant Purchase.
     if (!["receipt", "check"].includes(String(row.docType ?? "").trim().toLowerCase())) {
         return parkedBeforeSend(row, "source-document-review");
+    }
+    // Made out TO Golden Touch Remodeling: a customer payment, never a cost.
+    // Routing parks it too (route-state.ts), but Set job sends a NEEDS_REVIEW
+    // row straight to READ and READ never routes again, so without this check
+    // one click would book a customer's check as job cost. It reads the RAW
+    // vendor, as routing does.
+    //
+    // NOT exempted for `row.sendAttempted`, unlike the date gate below. That
+    // gate lets a sent row continue because its document IS a real cost and a
+    // wrong date is a smaller harm than a Purchase stranded in QuickBooks. Here
+    // the document is not a cost at all, so continuing could only write a
+    // wrong Expense. A sent row parks under its own reason instead, which tells
+    // the person to look in QuickBooks before voiding, because a Purchase may
+    // already be there; `parkedBeforeSend` keeps the strong key for it.
+    if (namesGoldenTouch(row.vendor)) {
+        return parkedBeforeSend(row, row.sendAttempted ? CUSTOMER_PAYMENT_SENT_REASON : CUSTOMER_PAYMENT_REASON);
     }
     if (!row.projectId) return parkedBeforeSend(row, "no-estimate");
     if (row.totalCents === null || row.totalCents <= 0) return parkedBeforeSend(row, "refund-or-zero");
@@ -2457,7 +2476,8 @@ async function resolvePhase(
  * that used to be checked alone. The reason has to say the row has outlived its
  * document too — `receipt-bytes-missing` or `content-changed`. Every other
  * refusal here (`no-estimate`, `refund-or-zero`, `invalid-date`,
- * `date-implausible`, `source-document-review`, `unsupported-attachment:*`)
+ * `date-implausible`, `source-document-review`, the two `customer-payment`
+ * codes, `unsupported-attachment:*`)
  * leaves a row that still IS its receipt and that a human revives with Set job
  * or Retry — neither of which routes it again, so the key would never come
  * back. `mayReleaseStrongKey` holds both conditions.

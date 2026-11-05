@@ -153,6 +153,18 @@ const REASON_TEXTS: Array<{ test: RegExp; text: (row: ReasonTextRow) => string }
             : `The total reads as ${money(row.totalCents)}. A refund or a zero needs a person to place it.`),
     },
     { test: /^no-estimate$/, text: () => "No job on this one yet." },
+    // route-state.ts's CUSTOMER_PAYMENT_REASON (routing and booking) and
+    // CUSTOMER_PAYMENT_SENT_REASON (booking, for a row whose QuickBooks send may
+    // have started). Matched as literals for the same reason as the book.ts
+    // codes below: this module is a pure leaf.
+    {
+        test: /^customer-payment$/,
+        text: () => "Made out to Golden Touch Remodeling, so this is a customer payment, not a cost. Void it here.",
+    },
+    {
+        test: /^customer-payment-check-quickbooks$/,
+        text: () => "Made out to Golden Touch Remodeling, so this is a customer payment, not a cost. A send to QuickBooks may have started for it, so look in QuickBooks first, then void it here.",
+    },
     { test: /^unreadable$/, text: () => "I could not read this file. It is usually a blurry photo or a bad scan. A clearer photo of the same receipt can be sent in." },
     { test: /^ai-unavailable$/, text: () => "The reader was down when this one came through. Retry gives it another go." },
     // NOT "upload it again and this one clears": a re-upload is a NEW row, and
