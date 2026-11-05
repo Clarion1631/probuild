@@ -14,8 +14,11 @@ export default async function LeadRoomEditorPage(
 
     const initialDoc = fromRoomRecord(room);
 
+    // The lead layout already cancels the shell padding (-mx-6 -my-6) and,
+    // unlike the project layout, has no inner p-6, so fill it as-is. A -m-6
+    // here pulled the studio under the header and clipped every edge.
     return (
-        <div className="flex flex-grow flex-1 w-full h-[calc(100%+48px)] -m-6 overflow-hidden">
+        <div className="flex flex-1 w-full h-full min-h-0 overflow-hidden">
             <StudioClient
                 roomId={roomId}
                 roomName={room.name}
