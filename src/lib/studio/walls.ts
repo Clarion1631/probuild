@@ -165,6 +165,6 @@ export function lengthKeyEdit(text: string, key: string): { text: string; action
   if (key === "Enter") return { text, action: "submit" };
   if (key === "Escape") return { text, action: "cancel" };
   if (key === "Backspace") return { text: text.slice(0, -1), action: "none" };
-  if (key.length === 1 && /[0-9.'" ftin]/i.test(key)) return { text: text + key, action: "none" };
+  if (key.length === 1 && /[0-9.'" ftin/-]/i.test(key)) return { text: text + key, action: "none" };
   return { text, action: "none" };
 }

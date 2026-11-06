@@ -92,6 +92,17 @@ test("lengthKeyEdit collects keys, backspace, submit and cancel", () => {
   assert.deepEqual(lengthKeyEdit("6", "Shift"), { text: "6", action: "none" });
 });
 
+test("lengthKeyEdit + parseLength: fast-typed fractions and dashes reach the parser intact", () => {
+  const typeAll = (keys: string) => [...keys].reduce((t, k) => lengthKeyEdit(t, k).text, "");
+  const IN = 0.0254;
+  for (const [keys, inches] of [["1/2", 0.5], ["54 1/2", 54.5], ["4'-6\"", 54], ["4'6 1/2\"", 54.5], ["4' - 6\"", 54]] as const) {
+    const text = typeAll(keys);
+    assert.equal(text, keys);
+    const m = parseLength(text);
+    assert.ok(m !== null && Math.abs(m - inches * IN) < 1e-9, `${keys} -> ${m}`);
+  }
+});
+
 test("parseLength accepts fractions and carpenter dashes", () => {
   const cases: Array<[string, number]> = [
     ["54 1/2", 54.5], ["1/2", 0.5], ["3/4\"", 0.75], ["4'6 1/2\"", 54.5],
