@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseLength, wallItemPose, wallEndpoints, snapDrawPoint } from "../src/lib/studio/walls";
+import { parseLength, wallItemPose, wallEndpoints, snapDrawPoint, lengthKeyEdit } from "../src/lib/studio/walls";
 import { inches } from "../src/lib/studio/units";
 
 const close = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) < eps, `${a} !~ ${b}`);
@@ -77,4 +77,17 @@ test("snapDrawPoint: Shift (angleSnap off) keeps a free angle on the 1 inch grid
 test("snapDrawPoint: no start point uses the grid", () => {
   const p = snapDrawPoint({ x: inches(12.4), z: inches(-7.6) }, null, ctx());
   close(p.x, inches(12)); close(p.z, inches(-8));
+});
+
+test("lengthKeyEdit collects keys, backspace, submit and cancel", () => {
+  let t = "";
+  for (const k of ["5", "4"]) t = lengthKeyEdit(t, k).text;
+  assert.equal(t, "54");
+  assert.equal(lengthKeyEdit(t, "Backspace").text, "5");
+  assert.equal(lengthKeyEdit("4", "'").text, "4'");
+  assert.equal(lengthKeyEdit("4", " ").text, "4 ");
+  assert.equal(lengthKeyEdit("6", "Enter").action, "submit");
+  assert.equal(lengthKeyEdit("6", "Escape").action, "cancel");
+  assert.deepEqual(lengthKeyEdit("6", "x"), { text: "6", action: "none" });
+  assert.deepEqual(lengthKeyEdit("6", "Shift"), { text: "6", action: "none" });
 });

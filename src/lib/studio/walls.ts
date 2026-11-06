@@ -123,3 +123,17 @@ export function drawAnchors(roomPoints: Pt[], items: PlacedItem[], widthOf: (it:
   }
   return out;
 }
+
+export type LengthKeyAction = "none" | "submit" | "cancel";
+
+/**
+ * Apply one keystroke to the typed-length text. Lets the draw tool keep
+ * collecting keys before the length input has focus (fast typing).
+ */
+export function lengthKeyEdit(text: string, key: string): { text: string; action: LengthKeyAction } {
+  if (key === "Enter") return { text, action: "submit" };
+  if (key === "Escape") return { text, action: "cancel" };
+  if (key === "Backspace") return { text: text.slice(0, -1), action: "none" };
+  if (key.length === 1 && /[0-9.'" ftin]/i.test(key)) return { text: text + key, action: "none" };
+  return { text, action: "none" };
+}

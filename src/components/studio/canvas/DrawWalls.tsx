@@ -13,7 +13,7 @@ import { toast } from "sonner";
 import type { DesignDoc, Pt } from "@/lib/studio/doc";
 import { getItemDef } from "@/lib/studio/catalog";
 import { inches, formatFtIn } from "@/lib/studio/units";
-import { parseLength, snapDrawPoint, drawAnchors } from "@/lib/studio/walls";
+import { parseLength, snapDrawPoint, drawAnchors, lengthKeyEdit } from "@/lib/studio/walls";
 import { useStudio } from "../store";
 import { resolveItem } from "./Items";
 
@@ -42,11 +42,17 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
   const cursorRef = useRef(cursor);
   const typingRef = useRef(typing);
   const shiftRef = useRef(false);
+  const applyTypedRef = useRef<(text: string) => void>(() => {});
   useEffect(() => {
     startRef.current = start;
     cursorRef.current = cursor;
-    typingRef.current = typing;
-  }, [start, cursor, typing]);
+  }, [start, cursor]);
+  /** Set the typed-length text; the ref updates synchronously so keys that
+      arrive before React re-renders (fast typing) are never lost. */
+  const setTypingText = useCallback((next: string | null) => {
+    typingRef.current = next;
+    setTyping(next);
+  }, []);
 
   const anchors = useMemo(
     () => drawAnchors(doc.room.points, doc.items, (it) => resolveItem(it)?.w ?? 0),
@@ -62,14 +68,33 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
   const endChain = useCallback(() => {
     setStart(null);
     setCursor(null);
-    setTyping(null);
-  }, []);
+    setTypingText(null);
+  }, [setTypingText]);
 
   // Esc ends the chain; Esc with no chain leaves draw mode. Digits open the length box.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      // Length box is open but not focused yet: collect the keys here.
+      if (typingRef.current !== null && startRef.current && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const r = lengthKeyEdit(typingRef.current, e.key);
+        if (r.action === "submit") {
+          e.preventDefault();
+          applyTypedRef.current(typingRef.current);
+          return;
+        }
+        if (r.action === "cancel") {
+          e.preventDefault();
+          setTypingText(null);
+          return;
+        }
+        if (r.text !== typingRef.current || e.key === "Backspace") {
+          e.preventDefault();
+          setTypingText(r.text);
+          return;
+        }
+      }
       if (e.key === "Escape") {
         if (startRef.current) endChain();
         else setDrawingWalls(false);
@@ -77,12 +102,12 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
       }
       if (startRef.current && typingRef.current === null && !e.ctrlKey && !e.metaKey && !e.altKey && /^[0-9.]$/.test(e.key)) {
         e.preventDefault();
-        setTyping(e.key);
+        setTypingText(e.key);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [endChain, setDrawingWalls]);
+  }, [endChain, setDrawingWalls, setTypingText]);
 
   const commit = (a: Pt, b: Pt) => {
     if (Math.hypot(b.x - a.x, b.z - a.z) < MIN_LEN) return false;
@@ -134,9 +159,13 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
       dx /= d;
       dz /= d;
     }
-    setTyping(null);
+    setTypingText(null);
     commit(s, { x: s.x + dx * len, z: s.z + dz * len });
   };
+
+  useEffect(() => {
+    applyTypedRef.current = applyTyped;
+  });
 
   const a = start;
   const b = cursor;
@@ -201,7 +230,7 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
               {formatFtIn(len)}
             </div>
           ) : (
-            <LengthBox initial={typing} onSubmit={applyTyped} onCancel={() => setTyping(null)} />
+            <LengthBox text={typing} setText={setTypingText} onSubmit={applyTyped} onCancel={() => setTypingText(null)} />
           )}
         </Html>
       )}
@@ -209,17 +238,19 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
   );
 }
 
-function LengthBox({ initial, onSubmit, onCancel }: {
-  initial: string;
+function LengthBox({ text, setText, onSubmit, onCancel }: {
+  text: string;
+  setText: (t: string) => void;
   onSubmit: (text: string) => void;
   onCancel: () => void;
 }) {
-  const [text, setText] = useState(initial);
   const ref = useRef<HTMLInputElement>(null);
+  const focused = useRef(false);
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
     el.focus();
+    focused.current = true;
     el.setSelectionRange(el.value.length, el.value.length);
   }, []);
   return (
@@ -237,7 +268,10 @@ function LengthBox({ initial, onSubmit, onCancel }: {
           if (e.key === "Enter") onSubmit(text);
           else if (e.key === "Escape") onCancel();
         }}
-        onBlur={onCancel}
+        onBlur={() => {
+          // ignore any blur before the box has ever held focus
+          if (focused.current) onCancel();
+        }}
         placeholder={"4'6\""}
         className="w-20 text-right text-xs text-slate-800 outline-none"
       />
