@@ -8,7 +8,9 @@
 
 import { create } from "zustand";
 import type { DesignDoc, PlacedItem } from "@/lib/studio/doc";
-import { emptyDoc, newItemId } from "@/lib/studio/doc";
+import { emptyDoc, newItemId, type Pt } from "@/lib/studio/doc";
+import { wallItemPose, wallLengthProblem } from "@/lib/studio/walls";
+import { inches } from "@/lib/studio/units";
 import { getItemDef, type CatalogItem } from "@/lib/studio/catalog";
 import { deckTopYAt, isDeckPlatform, restackFloorItems } from "@/lib/studio/stacking";
 
@@ -31,6 +33,10 @@ interface StudioState {
     | { kind: "floor" }
     | { kind: "corner"; index: number }
     | null;
+  /** Plan-view "Draw walls" tool is on (UI only, no undo). */
+  drawingWalls: boolean;
+  /** Which wall the Draw walls tool places. */
+  drawWallKind: "full" | "pony";
   /** True while an item drag is in progress (disables camera controls; no autosave). */
   dragging: boolean;
   saveState: SaveState;
@@ -54,6 +60,8 @@ interface StudioState {
   // -- edits (each = undo step) --
   commitDoc: (next: DesignDoc) => void;
   addItem: (defId: string, pos: { x: number; z: number; rotation?: number; y?: number }) => string | null;
+  /** Add one straight wall from a to b as a single undo step (does not select it). */
+  addWall: (a: Pt, b: Pt, kind: "full" | "pony") => string | null;
   updateItem: (id: string, patch: Partial<PlacedItem>) => void;
   removeItem: (id: string) => void;
   duplicateItem: (id: string) => string | null;
@@ -72,6 +80,8 @@ interface StudioState {
   // -- UI state (no undo) --
   select: (id: string | null) => void;
   setPlacing: (item: CatalogItem | null) => void;
+  setDrawingWalls: (on: boolean) => void;
+  setDrawWallKind: (kind: "full" | "pony") => void;
   setView: (view: ViewMode) => void;
   setLightsOn: (on: boolean) => void;
   setPresentMode: (on: boolean) => void;
@@ -87,6 +97,8 @@ export const useStudio = create<StudioState>((set, get) => ({
   lightsOn: true,
   presentMode: false,
   activeSurface: null,
+  drawingWalls: false,
+  drawWallKind: "full",
   dragging: false,
   saveState: "saved",
   dirty: false,
@@ -101,6 +113,8 @@ export const useStudio = create<StudioState>((set, get) => ({
       undoStack: [],
       redoStack: [],
       selectedId: null,
+      drawingWalls: false,
+      placing: null,
       dirty: false,
       saveState: "saved",
       docRev: s.docRev + 1,
@@ -144,6 +158,27 @@ export const useStudio = create<StudioState>((set, get) => ({
     if (isDeckPlatform(def.id)) items = restackFloorItems(items);
     s.commitDoc({ ...s.doc, items });
     set({ selectedId: id });
+    return id;
+  },
+
+  addWall: (a, b, kind) => {
+    const defId = kind === "pony" ? "pony-wall" : "interior-wall";
+    const def = getItemDef(defId);
+    if (!def) return null;
+    const pose = wallItemPose(a, b);
+    if (wallLengthProblem(pose.w)) return null;
+    const id = newItemId();
+    const item: PlacedItem = {
+      id,
+      defId,
+      x: pose.x,
+      z: pose.z,
+      rotation: pose.rotation,
+      w: pose.w,
+      ...(kind === "pony" ? { h: inches(42) } : {}),
+    };
+    const s = get();
+    s.commitDoc({ ...s.doc, items: [...s.doc.items, item] });
     return id;
   },
 
@@ -263,10 +298,17 @@ export const useStudio = create<StudioState>((set, get) => ({
     }),
 
   select: (id) => set({ selectedId: id, activeSurface: id ? null : get().activeSurface }),
-  setPlacing: (item) => set({ placing: item, selectedId: item ? null : get().selectedId }),
-  setView: (view) => set({ view }),
+  setPlacing: (item) =>
+    set({ placing: item, selectedId: item ? null : get().selectedId, drawingWalls: item ? false : get().drawingWalls }),
+  setDrawingWalls: (on) =>
+    set(on
+      ? { drawingWalls: true, placing: null, selectedId: null, activeSurface: null }
+      : { drawingWalls: false }),
+  setDrawWallKind: (drawWallKind) => set({ drawWallKind }),
+  // Draw mode only exists in Plan view.
+  setView: (view) => set({ view, drawingWalls: view === "plan" ? get().drawingWalls : false }),
   setLightsOn: (on) => set({ lightsOn: on }),
-  setPresentMode: (on) => set({ presentMode: on, selectedId: null, placing: null }),
+  setPresentMode: (on) => set({ presentMode: on, selectedId: null, placing: null, drawingWalls: on ? false : get().drawingWalls }),
   setActiveSurface: (activeSurface) => set({ activeSurface, selectedId: activeSurface ? null : get().selectedId }),
   setDragging: (dragging) => set({ dragging }),
 }));

@@ -238,7 +238,7 @@ export function Room({ doc }: { doc: DesignDoc }) {
   const onWallClick = (e: ThreeEvent<MouseEvent>, wallIndex: number) => {
     if (e.delta > CLICK_SLOP_PX) return;
     const s = useStudio.getState();
-    if (s.presentMode || s.placing) return; // placing: fall through to the capture plane
+    if (s.presentMode || s.placing || s.drawingWalls) return; // placing/drawing: fall through to the capture plane
     e.stopPropagation();
     setActiveSurface({ kind: "wall", wallIndex });
   };
@@ -246,7 +246,7 @@ export function Room({ doc }: { doc: DesignDoc }) {
   const onFloorClick = (e: ThreeEvent<MouseEvent>) => {
     if (e.delta > CLICK_SLOP_PX) return;
     const s = useStudio.getState();
-    if (s.presentMode || s.placing) return;
+    if (s.presentMode || s.placing || s.drawingWalls) return;
     e.stopPropagation();
     setActiveSurface({ kind: "floor" });
   };

@@ -2,7 +2,7 @@
 
 // Room Studio - right panel: properties for the selected item or surface.
 
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef } from "react";
 import { RotateCw, Copy, Trash2, ArrowUpDown } from "lucide-react";
 import { toast } from "sonner";
 import { getItemDef } from "@/lib/studio/catalog";
@@ -12,6 +12,7 @@ import {
 } from "@/lib/studio/materials";
 import { formatFtIn, inches, toInches, parseFtIn } from "@/lib/studio/units";
 import { wallSegments, signedArea, removeCornerFromPolygon } from "@/lib/studio/geometry";
+import { parseLength, wallEndpoints, isWallDef } from "@/lib/studio/walls";
 import { useStudio, useSelectedItem } from "../store";
 import { useLibrary } from "../useLibrary";
 import { Swatch, PaintSections } from "./CatalogPanel";
@@ -83,16 +84,32 @@ function ItemInspector() {
   const finishes = { ...def.finishes, ...item.finishes };
   const slots = Object.keys(def.finishes ?? {});
 
-  const stepW = (dir: 1 | -1) => {
-    if (!def.resizable) return;
-    const step = def.resizable.step ?? inches(3);
-    const next = Math.min(def.resizable.max, Math.max(def.resizable.min, w + dir * step));
-    if (def.resizable.axis === "wd") {
-      const ratio = (item.d ?? def.d) / w;
-      updateItem(item.id, { w: next, d: next * ratio });
+  const isWall = isWallDef(def.id);
+  const d = item.d ?? def.d;
+
+  /** Set the width/length (meters, already clamped). Walls keep their START end fixed. */
+  const setW = (next: number) => {
+    if (!def.resizable || Math.abs(next - w) < 1e-9) return;
+    if (isWall) {
+      const { a } = wallEndpoints(item, w);
+      const cx = a.x + Math.cos(item.rotation) * (next / 2);
+      const cz = a.z - Math.sin(item.rotation) * (next / 2);
+      updateItem(item.id, { w: next, x: cx, z: cz });
+    } else if (def.resizable.axis === "wd") {
+      updateItem(item.id, { w: next, d: next * (d / w) });
     } else {
       updateItem(item.id, { w: next });
     }
+  };
+  const clampW = (v: number) => Math.min(def.resizable!.max, Math.max(def.resizable!.min, v));
+  const stepW = (dir: 1 | -1) => {
+    if (!def.resizable) return;
+    setW(clampW(w + dir * (def.resizable.step ?? inches(3))));
+  };
+  const setD = (next: number) => {
+    if (!def.resizable) return;
+    const v = Math.min(def.resizable.max, Math.max(def.resizable.min, next));
+    if (Math.abs(v - d) > 1e-9) updateItem(item.id, { d: v });
   };
 
   return (
@@ -119,12 +136,17 @@ function ItemInspector() {
       </div>
 
       {def.resizable && (
-        <Row label="Width">
+        <Row label={isWall ? "Length" : "Width"}>
           <div className="flex items-center gap-1">
             <Stepper onClick={() => stepW(-1)}>-</Stepper>
-            <span className="min-w-[64px] text-center text-xs font-semibold text-slate-700">{formatFtIn(w)}</span>
+            <SizeInput key={`${item.id}:w:${w}`} value={w} onCommit={(v) => setW(clampW(v))} />
             <Stepper onClick={() => stepW(1)}>+</Stepper>
           </div>
+        </Row>
+      )}
+      {def.resizable?.axis === "wd" && (
+        <Row label="Depth">
+          <SizeInput key={`${item.id}:d:${d}`} value={d} onCommit={setD} />
         </Row>
       )}
 
@@ -361,6 +383,53 @@ function WallLengthEditor({ wallIdx }: { wallIdx: number }) {
         }}
         className="w-24 rounded-md border border-slate-200 px-2 py-1.5 text-right text-xs outline-none focus:border-blue-400"
       />
+    </div>
+  );
+}
+
+/** Typed length input: accepts 54, 4'6", 4.5' ... commits on Enter or blur. */
+function SizeInput({ value, onCommit }: { value: number; onCommit: (meters: number) => void }) {
+  const [text, setText] = useState(() => formatFtIn(value));
+  const cancelled = useRef(false);
+  const commit = () => {
+    if (cancelled.current) {
+      cancelled.current = false;
+      setText(formatFtIn(value));
+      return;
+    }
+    // Untouched field: re-parsing the 1/4"-rounded text would nudge the item.
+    if (text === formatFtIn(value)) return;
+    const parsed = parseLength(text);
+    if (parsed === null) {
+      toast.error("Type a size like 54 (inches), 4'6\" or 10'");
+      setText(formatFtIn(value));
+      return;
+    }
+    onCommit(parsed);
+    // The parent re-keys us when the value changes; if it was clamped back to
+    // the same value, reset the text so it shows what actually applied.
+    setText(formatFtIn(value));
+  };
+  return (
+    <div className="flex items-center gap-1">
+    <input
+      value={text}
+      placeholder={"54 or 4'6\""}
+      onChange={(e) => setText(e.target.value)}
+      onFocus={(e) => e.target.select()}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        else if (e.key === "Escape") {
+          cancelled.current = true;
+          (e.target as HTMLInputElement).blur();
+        }
+      }}
+      aria-label="Size"
+      className="w-[64px] rounded-md border border-slate-200 px-1.5 py-1 text-center text-xs font-semibold text-slate-700 outline-none focus:border-blue-400"
+    />
+    <span className="text-[10px] text-slate-400">in</span>
     </div>
   );
 }

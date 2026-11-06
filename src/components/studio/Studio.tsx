@@ -81,12 +81,14 @@ function HintBar() {
   const selectedId = useStudio((s) => s.selectedId);
   const placing = useStudio((s) => s.placing);
   const view = useStudio((s) => s.view);
+  const drawingWalls = useStudio((s) => s.drawingWalls);
 
   let hint: string;
-  if (placing) hint = "Click to place - Shift keeps placing - Esc cancels";
+  if (drawingWalls) hint = "Click to start a wall - click again to end it (snaps to 45/90, Shift = any angle) - type a length + Enter for an exact size - Esc to stop";
+  else if (placing) hint = "Click to place - Shift keeps placing - Esc cancels";
   else if (selectedId) hint = "Drag to move - blue dot spins - R rotates 90 - Ctrl+D duplicates - Del removes";
   else if (view === "walk") hint = "Drag to look around - W A S D to walk";
-  else if (view === "plan") hint = "Drag blue dots to reshape (they snap square) - click a corner or wall for more options - double-click a wall dot adds a corner";
+  else if (view === "plan") hint = "Drag blue dots to reshape the room (they snap square) - double-click a wall dot adds a corner - Draw walls (top bar) or Fixtures > Interior Wall adds inside walls";
   else hint = "Drag to orbit - right-drag to pan - scroll to zoom - click walls or floor to change colors";
 
   return (
@@ -239,7 +241,9 @@ function useKeyboardShortcuts() {
       }
       if (e.key === "Escape") {
         if (s.placing) s.setPlacing(null);
-        else if (s.presentMode) s.setPresentMode(false);
+        else if (s.drawingWalls) {
+          // DrawWalls owns Esc: ends the chain, or exits draw mode when no chain is active.
+        } else if (s.presentMode) s.setPresentMode(false);
         else {
           s.select(null);
           s.setActiveSurface(null);

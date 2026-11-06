@@ -230,7 +230,7 @@ function ItemNode({
   const onPointerDown = (e: ThreeEvent<PointerEvent>) => {
     if (presentMode || view === "walk") return;
     if (e.button !== 0) return;
-    if (useStudio.getState().placing) return;
+    if (useStudio.getState().placing || useStudio.getState().drawingWalls) return;
     e.stopPropagation();
     try {
       (e.target as Element).setPointerCapture(e.pointerId);
@@ -335,7 +335,7 @@ function ItemNode({
         onPointerCancel={endDrag}
         onClick={(e) => {
           // While placing, stay transparent so the capture plane gets the click.
-          if (useStudio.getState().placing) return;
+          if (useStudio.getState().placing || useStudio.getState().drawingWalls) return;
           if (e.delta > CLICK_SLOP_PX) return;
           e.stopPropagation();
         }}

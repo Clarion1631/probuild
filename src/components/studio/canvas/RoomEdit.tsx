@@ -43,8 +43,9 @@ export function RoomEdit({ doc }: { doc: DesignDoc }) {
   const view = useStudio((s) => s.view);
   const presentMode = useStudio((s) => s.presentMode);
   const placing = useStudio((s) => s.placing);
+  const drawingWalls = useStudio((s) => s.drawingWalls);
 
-  if (view !== "plan" || presentMode || placing) return null;
+  if (view !== "plan" || presentMode || placing || drawingWalls) return null;
   return <RoomEditInner doc={doc} />;
 }
 
