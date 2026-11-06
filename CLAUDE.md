@@ -35,6 +35,7 @@
 - Document model: `RoomDesign.layoutJson` holds a v2 `DesignDoc` (`lib/studio/doc.ts`); placed items mirror into `RoomAsset` rows. v1 layouts upgrade on load.
 - Catalog/finishes/templates are code-seeded (`lib/studio/catalog.ts`, `materials.ts`, `templates.ts`) — no GLTF downloads, all meshes procedural (`components/studio/canvas/builders-*.tsx`).
 - Perf contract: nothing writes to the zustand store per-frame; drags mutate three.js objects and commit on pointerup. No postprocessing. Keep it that way.
+- AI build tools: MCP `build_room_design` / `get_room_design` / `update_room_design` (`api/mcp/[transport]/route.ts`) convert a plain-inches spec <-> DesignDoc via `lib/studio/room-spec.ts`; `update_room_design` needs `expectedUpdatedAt` (an open Studio tab autosaves over MCP writes). Doors/windows snap to interior walls too and `openingsOnWall` (`lib/studio/walls.ts`) cuts real openings in `interior-wall` / `pony-wall` at render, from committed state only. See `docs/STUDIO-WALLS-SPEC.md`.
 - LiDAR intake: `POST /api/rooms/scan-import` (RoomPlan JSON or simplified corners). Mobile capture screen: gtr-probuild-mobile `apps/mobile/app/room-scan.tsx`.
 - Client sharing: `/share/room/[token]` (public route in AppLayout) + portal Designs tab lists share-enabled rooms.
 

@@ -6,6 +6,7 @@ import type { ComponentType } from "react";
 import * as K from "./builders-kitchen";
 import * as L from "./builders-living";
 import * as O from "./builders-outdoor";
+import type { WallOpening } from "@/lib/studio/walls";
 
 export interface BuilderProps {
   /** Resolved dimensions (item overrides applied), meters. */
@@ -18,6 +19,8 @@ export interface BuilderProps {
   lightsOn?: boolean;
   /** Per-item LED strip toggle (defs with ledOption). */
   led?: boolean;
+  /** Interior/pony walls: door/window openings in this wall (from openingsOnWall). */
+  openings?: WallOpening[];
 }
 
 export const BUILDERS: Record<string, ComponentType<BuilderProps>> = {

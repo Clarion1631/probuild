@@ -5,6 +5,8 @@
 // atan2(-(b.z - a.z), b.x - a.x). The item's local +X maps to (cos r, -sin r).
 
 import type { Pt, PlacedItem } from "./doc";
+import { getItemDef } from "./catalog";
+import { nearestWall, wallFacingRotation, type WallHit, type WallSeg } from "./geometry";
 import { inches } from "./units";
 
 export interface WallPose {
@@ -167,4 +169,122 @@ export function lengthKeyEdit(text: string, key: string): { text: string; action
   if (key === "Backspace") return { text: text.slice(0, -1), action: "none" };
   if (key.length === 1 && /[0-9.'" ftin/-]/i.test(key)) return { text: text + key, action: "none" };
   return { text, action: "none" };
+}
+
+// ---------------------------------------------------------------------------
+// Openings (doors/windows in freestanding walls) and wall-mount hosting
+// ---------------------------------------------------------------------------
+
+/** Wall items that can host doors/windows (the doorway variant has its own opening). */
+export const OPENING_HOST_IDS = ["interior-wall", "pony-wall"] as const;
+
+export function isOpeningHost(defId: string): boolean {
+  return (OPENING_HOST_IDS as readonly string[]).includes(defId);
+}
+
+export interface WallOpening {
+  /** Offset of the opening's center from the wall's midpoint along the wall (item local +X, toward end b), meters. */
+  center: number;
+  width: number;
+  /** Height of the opening's bottom / top above the floor, meters. */
+  bottom: number;
+  top: number;
+}
+
+/** A door/window/opening within this much of the wall face counts as in the wall. */
+const OPENING_FACE_SLOP = inches(1);
+/** Max angle (radians) between a door's rotation and the wall's to count as parallel. */
+const OPENING_PARALLEL_TOL = 0.05;
+const MIN_OPENING = inches(0.5);
+
+/**
+ * Openings cut into a straight wall item by door/window items. A door counts
+ * when its center is within (half the wall thickness + 1") of the wall SEGMENT
+ * (the projection is clamped to the wall's own length, never the infinite
+ * line, so short stubs that line up with a door get no phantom opening) and it
+ * is parallel to the wall (either face). Openings are clipped to the wall.
+ * Pure function of committed doc state.
+ */
+export function openingsOnWall(wall: PlacedItem, items: PlacedItem[]): WallOpening[] {
+  const wdef = getItemDef(wall.defId);
+  if (!wdef) return [];
+  const L = wall.w ?? wdef.w;
+  const T = wall.d ?? wdef.d;
+  const ux = Math.cos(wall.rotation);
+  const uz = -Math.sin(wall.rotation);
+  const out: WallOpening[] = [];
+  for (const it of items) {
+    if (it.id === wall.id) continue;
+    const def = getItemDef(it.defId);
+    if (!def || def.category !== "doors-windows") continue;
+    const dx = it.x - wall.x;
+    const dz = it.z - wall.z;
+    const s = dx * ux + dz * uz;
+    const sc = Math.max(-L / 2, Math.min(L / 2, s));
+    if (Math.hypot(dx - ux * sc, dz - uz * sc) > T / 2 + OPENING_FACE_SLOP) continue;
+    let diff = (it.rotation - wall.rotation) % Math.PI;
+    if (diff > Math.PI / 2) diff -= Math.PI;
+    if (diff < -Math.PI / 2) diff += Math.PI;
+    if (Math.abs(diff) > OPENING_PARALLEL_TOL) continue;
+    const ow = it.w ?? def.w;
+    const lo = Math.max(-L / 2, s - ow / 2);
+    const hi = Math.min(L / 2, s + ow / 2);
+    if (hi - lo < MIN_OPENING) continue;
+    const bottom = it.y ?? def.elevation ?? 0;
+    out.push({ center: (lo + hi) / 2, width: hi - lo, bottom, top: bottom + (it.h ?? def.h) });
+  }
+  return out.sort((a, b) => a.center - b.center);
+}
+
+/** Wall segments for every freestanding wall item (both faces usable). index is -1. */
+export function interiorWallSegs(items: PlacedItem[]): WallSeg[] {
+  const out: WallSeg[] = [];
+  for (const it of items) {
+    if (!isOpeningHost(it.defId)) continue;
+    const def = getItemDef(it.defId);
+    if (!def) continue;
+    const length = it.w ?? def.w;
+    const { a, b } = wallEndpoints(it, length);
+    const dir = { x: Math.cos(it.rotation), z: -Math.sin(it.rotation) };
+    out.push({ index: -1, a, b, dir, normal: { x: -dir.z, z: dir.x }, length });
+  }
+  return out;
+}
+
+/** Interior walls must be this much closer than the outline to win a snap. */
+const INTERIOR_SNAP_BIAS = 0.02;
+
+/**
+ * Nearest wall for wall-mount snapping, considering the room outline and
+ * freestanding walls. For an interior wall the normal is flipped to the side
+ * the point is on (or the side `facing` points to, when the point is on the
+ * wall line). With no interior walls this is exactly nearestWall(outline).
+ */
+export function nearestHostWall(p: Pt, outline: WallSeg[], interior: WallSeg[], facing?: Pt): WallHit | null {
+  const base = nearestWall(p, outline);
+  if (interior.length === 0) return base;
+  const ih = nearestWall(p, interior);
+  if (!ih) return base;
+  if (base && ih.distance + INTERIOR_SNAP_BIAS >= base.distance) return base;
+  const w = ih.wall;
+  let side = (p.x - ih.point.x) * w.normal.x + (p.z - ih.point.z) * w.normal.z;
+  if (Math.abs(side) < 1e-6 && facing) side = facing.x * w.normal.x + facing.z * w.normal.z;
+  const wall = side < 0 ? { ...w, normal: { x: -w.normal.x, z: -w.normal.z } } : w;
+  return { ...ih, wall };
+}
+
+/** Pose of a wall-mount item snapped onto a wall hit; `off` = offset along the wall normal. */
+export function wallMountPose(hit: WallHit, w: number, off: number): { x: number; z: number; rotation: number } {
+  const halfFrac = w / 2 / hit.wall.length;
+  const t = Math.min(1 - halfFrac, Math.max(halfFrac, hit.t));
+  return {
+    x: hit.wall.a.x + hit.wall.dir.x * hit.wall.length * t + hit.wall.normal.x * off,
+    z: hit.wall.a.z + hit.wall.dir.z * hit.wall.length * t + hit.wall.normal.z * off,
+    rotation: wallFacingRotation(hit.wall),
+  };
+}
+
+/** Whether a wall-mount def snaps to freestanding walls (doors/windows and niches only). */
+export function snapsToInteriorWalls(def: { category: string; cutsWall?: boolean }): boolean {
+  return def.category === "doors-windows" || !!def.cutsWall;
 }

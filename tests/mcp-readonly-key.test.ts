@@ -219,7 +219,7 @@ function makeStubServer() {
 // Representative write tools — deliberately NOT in READONLY_TOOLS — covering
 // a plain write (create_change_order), a customer-facing send
 // (send_milestone_invoice), and a money-logging write (log_expense).
-const REPRESENTATIVE_WRITE_TOOLS = ["create_change_order", "send_milestone_invoice", "log_expense"];
+const REPRESENTATIVE_WRITE_TOOLS = ["create_change_order", "send_milestone_invoice", "log_expense", "build_room_design", "update_room_design"];
 for (const name of REPRESENTATIVE_WRITE_TOOLS) {
     assert.ok(WRITE_TOOLS.has(name), `test setup: "${name}" is expected to be a real WRITE_TOOLS entry`);
     assert.ok(!READONLY_TOOLS.has(name), `test setup: "${name}" is expected to be absent from READONLY_TOOLS`);
@@ -295,7 +295,7 @@ test("wrapReadOnlyMode composed with wrapWriteTools, same order, registers every
 
 // ── Allowlist composition (real Sets, not regex) ────────────────────────────
 
-test("READONLY_TOOLS is exactly the expected 20-tool allowlist (snapshot — a new tool needs a deliberate change here)", () => {
+test("READONLY_TOOLS is exactly the expected 21-tool allowlist (snapshot — a new tool needs a deliberate change here)", () => {
     const expected = new Set([
         "list_projects", "list_leads", "find_job", "get_estimating_codes",
         "list_templates", "get_template", "get_estimate",
@@ -303,7 +303,7 @@ test("READONLY_TOOLS is exactly the expected 20-tool allowlist (snapshot — a n
         "list_daily_logs", "list_inspections", "list_punch_items", "get_project_contacts",
         "list_contract_templates", "list_contracts",
         "get_company_schedule", "get_project_schedule", "list_crew_availability",
-        "get_activity_log",
+        "get_activity_log", "get_room_design",
     ]);
     assert.deepStrictEqual(READONLY_TOOLS, expected);
 });
@@ -378,4 +378,18 @@ test("MCP_SECRET / MCP_SECRET_RICHARD behavior is untouched: guarded() only 503s
         /if \(!process\.env\.MCP_SECRET && !process\.env\.MCP_SECRET_RICHARD && !process\.env\.MCP_READONLY_SECRET\)/,
         "the 'not configured' gate must treat a read-only-only deployment as configured",
     );
+});
+
+test("Room Studio tools: the two writes are audited and hidden from read-only keys; get_room_design is the only room tool a read-only key sees", () => {
+    for (const name of ["build_room_design", "update_room_design"]) {
+        assert.ok(WRITE_TOOLS.has(name), `${name} must be in WRITE_TOOLS`);
+        assert.ok(!READONLY_TOOLS.has(name), `${name} must not be read-only`);
+        assert.match(routeSource, new RegExp(`${name}: "room_design"`), `${name} needs an ENTITY_TYPE_BY_TOOL entry`);
+    }
+    assert.ok(READONLY_TOOLS.has("get_room_design"));
+    assert.ok(!WRITE_TOOLS.has("get_room_design"));
+    const { server, registered } = makeStubServer();
+    wrapReadOnlyMode(server, stubActor("readonly-ai"));
+    for (const name of ["get_room_design", "build_room_design", "update_room_design"]) server.registerTool(name, {}, () => "ran");
+    assert.deepStrictEqual([...registered.keys()], ["get_room_design"]);
 });

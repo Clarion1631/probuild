@@ -18,6 +18,9 @@ import { downloadDocBytes, resolveDocUrl, isSecureRef, secureRefPath } from "@/l
 import { logActivity } from "@/lib/activity-log";
 import { getUserWithPermissionsByEmail } from "@/lib/permissions";
 import { canAccessJobScope } from "@/lib/access-rules";
+import { fromRoomRecord, toApiPayload, type ApiRoomAsset, type DesignDoc } from "@/lib/studio/doc";
+import { RoomSpecSchema, ROOM_SPEC_FORMAT, ROOM_SPEC_HELP, docToSpec, specToDoc } from "@/lib/studio/room-spec";
+import { getItemDef } from "@/lib/studio/catalog";
 import {
     MAX_UPLOAD_BASE64_CHARS,
     uploadProjectFileCore,
@@ -189,6 +192,59 @@ async function jobContactAuthorizer(actor: RouteMcpActor) {
     };
 }
 
+// ── Room Studio helpers (build_room_design / get_room_design / update_room_design)
+const ROOM_DESIGN_TYPES = ["kitchen", "bathroom", "laundry", "bedroom", "outdoor", "other"] as const;
+const PROBUILD_BASE_URL = "https://probuild.goldentouchremodeling.com";
+
+// Same job-access rule as the job-contact tools: key-level access for external
+// callers, the signed-in person's own job access when acting onBehalfOf.
+async function assertRoomJobAccess(actor: RouteMcpActor, scope: { projectId: string | null; leadId: string | null }) {
+    (await jobContactAuthorizer(actor))?.(scope);
+}
+
+function roomStudioUrl(room: { id: string; projectId: string | null; leadId: string | null }) {
+    return room.projectId
+        ? `${PROBUILD_BASE_URL}/projects/${room.projectId}/room-designer/${room.id}`
+        : `${PROBUILD_BASE_URL}/leads/${room.leadId}/room-designer/${room.id}`;
+}
+
+// RoomAsset createMany row (same mapping POST /api/rooms uses).
+function roomAssetRow(a: ApiRoomAsset) {
+    return {
+        assetType: a.assetType,
+        assetId: a.assetId,
+        positionX: a.positionX,
+        positionY: a.positionY,
+        positionZ: a.positionZ,
+        rotationY: a.rotationY,
+        scaleX: a.scaleX,
+        scaleY: a.scaleY,
+        scaleZ: a.scaleZ,
+        metadata: (a.metadata ?? undefined) as any,
+    };
+}
+
+function roomDocCounts(doc: DesignDoc) {
+    const walls = doc.items.filter(i => i.defId === "interior-wall" || i.defId === "pony-wall").length;
+    return { outlineCorners: doc.room.points.length, interiorWalls: walls, items: doc.items.length - walls };
+}
+
+// What a spec round trip cannot carry, so a caller knows what an update would drop.
+function roomDocLosses(doc: DesignDoc): string[] {
+    const out: string[] = [];
+    if (doc.room.slope) out.push("sloped ceiling");
+    if (doc.room.crown) out.push("crown molding");
+    if (doc.room.outdoor) out.push("outdoor room settings");
+    if (doc.room.noWalls) out.push("open (no-wall) outdoor boundary");
+    if (doc.camera) out.push("saved camera");
+    const wallKeys = Object.keys(doc.surfaces.walls).filter(k => k !== "all");
+    if (wallKeys.length) out.push("per-wall paint");
+    if (doc.items.some(i => i.led)) out.push("LED strips");
+    const unknown = doc.items.filter(i => !getItemDef(i.defId)).length;
+    if (unknown) out.push(`${unknown} item(s) with catalog ids this spec cannot express`);
+    return out;
+}
+
 // Same convention as FileBrowser.tsx's formatBytes — human-readable size for
 // read_file / get_file_link output and error messages.
 function formatBytes(bytes: number): string {
@@ -217,6 +273,7 @@ export const WRITE_TOOLS = new Set([
     "plan_schedule", "update_task_dates", "set_task_status", "assign_task_crew",
     "set_project_start_date", "generate_project_schedule", "assign_project_crew",
     "apply_change_order_to_schedule", "read_file", "get_file_link",
+    "build_room_design", "update_room_design",
 ]);
 // bill_change_order is deliberately NOT here: fixed-price orders bill without
 // emailing anyone, so "mcp_send_bill_change_order" would misreport a plain
@@ -244,7 +301,7 @@ export const READONLY_TOOLS = new Set([
     "list_daily_logs", "list_inspections", "list_punch_items", "get_project_contacts",
     "list_contract_templates", "list_contracts",
     "get_company_schedule", "get_project_schedule", "list_crew_availability",
-    "get_activity_log",
+    "get_activity_log", "get_room_design",
 ]);
 const SEND_TOOLS = new Set([
     "send_estimate", "send_contract", "send_change_order",
@@ -264,6 +321,7 @@ const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
     create_daily_log: "daily_log",
     add_punch_items: "punch_item",
     record_inspection: "inspection",
+    build_room_design: "room_design", update_room_design: "room_design",
 };
 
 // Args whose VALUE is payload rather than intent — recording even a prefix
@@ -412,6 +470,12 @@ export async function resolveAuditOwner(toolName: string, args: Record<string, u
                 select: { projectId: true, leadId: true },
             });
             if (task) return { projectId: task.projectId ?? null, leadId: task.leadId ?? null, entityId: args.taskId };
+        } else if (typeof args.roomId === "string" && args.roomId) {
+            const room = await prisma.roomDesign.findUnique({
+                where: { id: args.roomId },
+                select: { projectId: true, leadId: true, name: true },
+            });
+            if (room) return { projectId: room.projectId ?? null, leadId: room.leadId ?? null, entityId: args.roomId, entityName: room.name };
         } else if (typeof args.estimate === "string" && args.estimate) {
             // update_estimate names its arg `estimate` and accepts either the
             // code ("EST-00317") or the id — without this branch those writes
@@ -1344,6 +1408,185 @@ function createHandler(actor: RouteMcpActor) {
                     warnings,
                     note: "Lead created (or matched to an identical lead from the last 24h).",
                 });
+            },
+        );
+
+        server.registerTool(
+            "build_room_design",
+            {
+                title: "Build a Room Studio design from a spec",
+                annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+                description:
+                    "Creates a NEW Room Studio design (3D room designer) on a lead or project from a plain-inches spec: room outline, interior walls, doors, windows, fixtures, cabinets. " +
+                    "Pass exactly one of leadId or projectId. Nothing is sent to anyone. Returns roomId, the Studio URL, counts, `updatedAt` (needed later as update_room_design's expectedUpdatedAt) and `warnings` " +
+                    "(unknown item types are skipped, items outside the room or wall items not near a wall are reported): read the warnings and fix the spec with update_room_design if needed.\n\n" +
+                    ROOM_SPEC_HELP,
+                inputSchema: {
+                    leadId: z.string().max(50).optional().describe("Exactly one of leadId / projectId"),
+                    projectId: z.string().max(50).optional(),
+                    name: z.string().min(1).max(120).describe("e.g. 'Kalca master bath'"),
+                    roomType: z.enum(ROOM_DESIGN_TYPES).describe("kitchen | bathroom | laundry | bedroom | outdoor | other"),
+                    spec: RoomSpecSchema.describe("The room spec, in inches (see the format above)"),
+                },
+            },
+            async ({ leadId, projectId, name, roomType, spec }) => {
+                try {
+                    if (!!leadId === !!projectId) throw new Error("Provide exactly one of leadId or projectId");
+                    const job = projectId
+                        ? await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } })
+                        : await prisma.lead.findUnique({ where: { id: leadId! }, select: { id: true } });
+                    if (!job) throw new Error(projectId ? "Project not found" : "Lead not found");
+                    await assertRoomJobAccess(actor, { projectId: projectId ?? null, leadId: leadId ?? null });
+
+                    const { doc, warnings } = specToDoc(spec);
+                    const payload = toApiPayload(doc);
+                    // Mirrors POST /api/rooms: layoutJson + RoomAsset mirror in one nested create.
+                    const room = await prisma.roomDesign.create({
+                        data: {
+                            name: name.slice(0, 120),
+                            roomType,
+                            projectId: projectId ?? null,
+                            leadId: leadId ?? null,
+                            layoutJson: payload.layoutJson as any,
+                            assets: payload.assets.length > 0
+                                ? { createMany: { data: payload.assets.map(roomAssetRow) } }
+                                : undefined,
+                        },
+                    });
+                    return textResult({
+                        roomId: room.id,
+                        url: roomStudioUrl(room),
+                        updatedAt: room.updatedAt.toISOString(),
+                        counts: roomDocCounts(doc),
+                        warnings,
+                        note: "Room created. Nothing was sent to anyone. Open the URL to review it in the Studio.",
+                    });
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to build room design" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "get_room_design",
+            {
+                title: "Read a Room Studio design as a spec",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Reads an existing Room Studio design back as a plain-inches spec (same format build_room_design takes) so you can review or revise it. " +
+                    "Returns `updatedAt`: pass it as update_room_design's expectedUpdatedAt. The spec covers outline, interior walls, items, floor and wall paint; " +
+                    "sloped ceilings, crown molding, LED strips, per-wall paint and the saved camera are not represented (listed in `notRepresented`).",
+                inputSchema: {
+                    roomId: z.string().min(1).max(50),
+                },
+            },
+            async ({ roomId }) => {
+                try {
+                    const room = await prisma.roomDesign.findUnique({ where: { id: roomId }, include: { assets: true } });
+                    if (!room) throw new Error("Room design not found");
+                    await assertRoomJobAccess(actor, { projectId: room.projectId, leadId: room.leadId });
+                    const doc = fromRoomRecord({
+                        id: room.id,
+                        name: room.name,
+                        roomType: room.roomType,
+                        layoutJson: room.layoutJson,
+                        assets: room.assets as any,
+                    });
+                    return textResult({
+                        roomId: room.id,
+                        name: room.name,
+                        roomType: room.roomType,
+                        url: roomStudioUrl(room),
+                        updatedAt: room.updatedAt.toISOString(),
+                        spec: docToSpec(doc),
+                        notRepresented: roomDocLosses(doc),
+                    });
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to read room design" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "update_room_design",
+            {
+                title: "Replace a Room Studio design's layout from a spec",
+                annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+                description:
+                    "REPLACES an existing Room Studio design's whole layout with the given spec (same format as build_room_design; use get_room_design first, edit the spec, send it back). " +
+                    "Requires expectedUpdatedAt (from get_room_design or build_room_design): if the room changed since, the call is refused and nothing is written. " +
+                    "This guard matters because an open Studio browser tab autosaves the whole scene and would silently overwrite this update (or vice versa): close the room's Studio tab first, or re-read after the user is done. " +
+                    "Anything the spec does not represent (sloped ceiling, crown, LED strips, per-wall paint, camera) is dropped and listed in `droppedFeatures`. Nothing is sent to anyone.\n\n" +
+                    ROOM_SPEC_FORMAT,
+                inputSchema: {
+                    roomId: z.string().min(1).max(50),
+                    expectedUpdatedAt: z.string().min(1).max(40).describe("ISO timestamp: the `updatedAt` you last read"),
+                    spec: RoomSpecSchema.describe("The full new room spec, in inches"),
+                    name: z.string().min(1).max(120).optional().describe("Rename the room (optional)"),
+                },
+            },
+            async ({ roomId, expectedUpdatedAt, spec, name }) => {
+                try {
+                    const expected = new Date(expectedUpdatedAt);
+                    if (Number.isNaN(expected.getTime())) throw new Error("expectedUpdatedAt must be an ISO timestamp");
+                    const room = await prisma.roomDesign.findUnique({ where: { id: roomId } });
+                    if (!room) throw new Error("Room design not found");
+                    await assertRoomJobAccess(actor, { projectId: room.projectId, leadId: room.leadId });
+                    const stale = () => new Error(
+                        "The room changed since you read it (someone saved in the Studio, or another update ran). Nothing was written. Call get_room_design again, re-apply your edits, and retry with the new updatedAt.",
+                    );
+                    if (room.updatedAt.getTime() !== expected.getTime()) throw stale();
+
+                    const { doc, warnings } = specToDoc(spec);
+                    const payload = toApiPayload(doc);
+                    const droppedFeatures = roomDocLosses(fromRoomRecord({
+                        id: room.id, name: room.name, roomType: room.roomType, layoutJson: room.layoutJson, assets: [],
+                    }));
+
+                    // Compare-and-set on updatedAt inside the transaction, so a Studio autosave
+                    // landing between the check above and the write still wins the race safely.
+                    const updated = await prisma.$transaction(async (tx) => {
+                        const res = await tx.roomDesign.updateMany({
+                            where: { id: roomId, updatedAt: room.updatedAt },
+                            data: { layoutJson: payload.layoutJson as any, ...(name ? { name: name.slice(0, 120) } : {}) },
+                        });
+                        if (res.count !== 1) throw stale();
+                        await tx.roomAsset.deleteMany({ where: { roomDesignId: roomId } });
+                        if (payload.assets.length > 0) {
+                            await tx.roomAsset.createMany({
+                                data: payload.assets.map((a) => ({ roomDesignId: roomId, ...roomAssetRow(a) })),
+                            });
+                        }
+                        return tx.roomDesign.findUniqueOrThrow({ where: { id: roomId } });
+                    });
+
+                    // Keep the AR walkthrough fresh, like the Studio's own save does.
+                    try {
+                        const { after } = await import("next/server");
+                        after(async () => {
+                            try {
+                                const { generateUsdzForRoom } = await import("@/lib/studio/usdz-generator");
+                                await generateUsdzForRoom(roomId);
+                            } catch (e) {
+                                console.error("USDZ auto-generation failed after MCP room update:", e);
+                            }
+                        });
+                    } catch {
+                        // no request scope (tests): skip
+                    }
+
+                    return textResult({
+                        roomId,
+                        url: roomStudioUrl(updated),
+                        updatedAt: updated.updatedAt.toISOString(),
+                        counts: roomDocCounts(doc),
+                        warnings,
+                        droppedFeatures,
+                        note: "Layout replaced. Nothing was sent to anyone.",
+                    });
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to update room design" }), isError: true };
+                }
             },
         );
 

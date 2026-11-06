@@ -11,6 +11,7 @@ import {
   ceramicMat, fixedMat, flameMat, bulbMat,
 } from "./parts";
 import type { BuilderProps } from "./builders";
+import type { WallOpening } from "@/lib/studio/walls";
 import * as THREE from "three";
 import { RectAreaLightUniformsLib } from "three/examples/jsm/lights/RectAreaLightUniformsLib.js";
 
@@ -633,19 +634,82 @@ export function ShowerNiche({ w, d, h, finishes, lightsOn, led }: BuilderProps) 
   );
 }
 
+const WALL_EPS = 0.002;
+
+/** Complement of the cut x-ranges within [-w/2, w/2]: the solid spans left over. */
+function solidSpans(w: number, cuts: Array<[number, number]>): Array<[number, number]> {
+  const sorted = [...cuts].sort((p, q) => p[0] - q[0]);
+  const out: Array<[number, number]> = [];
+  let cursor = -w / 2;
+  for (const [lo, hi] of sorted) {
+    if (lo - cursor > WALL_EPS) out.push([cursor, lo]);
+    cursor = Math.max(cursor, hi);
+  }
+  if (w / 2 - cursor > WALL_EPS) out.push([cursor, w / 2]);
+  return out;
+}
+
+/**
+ * Wall body split around door/window openings: solid spans between openings,
+ * plus a sill piece under and a header piece over each opening. With no
+ * openings it is the single full box it always was.
+ */
+function WallBody({ w, d, h, openings, m }: { w: number; d: number; h: number; openings: WallOpening[]; m: THREE.Material }) {
+  const cuts = openings.map((o): [number, number] => [o.center - o.width / 2, o.center + o.width / 2]);
+  return (
+    <>
+      {solidSpans(w, cuts).map(([lo, hi]) => (
+        <Box key={`s${lo}`} s={[hi - lo, h, d]} p={[(lo + hi) / 2, h / 2, 0]} m={m} />
+      ))}
+      {openings.map((o, i) => {
+        const bottom = Math.max(0, o.bottom);
+        const top = Math.min(h, o.top);
+        if (bottom >= h - WALL_EPS || top <= WALL_EPS) return null;
+        return (
+          <group key={`o${i}`}>
+            {bottom > WALL_EPS && <Box s={[o.width, bottom, d]} p={[o.center, bottom / 2, 0]} m={m} />}
+            {h - top > WALL_EPS && <Box s={[o.width, h - top, d]} p={[o.center, top + (h - top) / 2, 0]} m={m} />}
+          </group>
+        );
+      })}
+    </>
+  );
+}
+
+/** Spans of the wall that touch the floor (everything except door-style openings). */
+function floorSpans(w: number, openings: WallOpening[]): Array<[number, number]> {
+  const cuts = openings
+    .filter((o) => o.bottom <= WALL_EPS)
+    .map((o): [number, number] => [o.center - o.width / 2, o.center + o.width / 2]);
+  return solidSpans(w, cuts);
+}
+
 /**
  * Pony / knee wall - a freestanding half-height wall stub with a cap. Place
  * against walls or in the open to split spaces (tub surrounds, stair edges,
  * room dividers).
  */
-export function PonyWall({ w, d, h, finishes }: BuilderProps) {
+export function PonyWall({ w, d, h, finishes, openings = [] }: BuilderProps) {
+  const base = fixedMat("pony-base", () => new THREE.MeshStandardMaterial({ color: "#eceae3", roughness: 0.7 }));
+  const hb = h - IN(1.2);
   return (
     <group>
-      <Box s={[w, h - IN(1.2), d]} p={[0, (h - IN(1.2)) / 2, 0]} m={mat(finishes.paint, "paint-soft-chalk")} />
-      {/* cap with a slight overhang */}
-      <Box s={[w + IN(1.5), IN(1.2), d + IN(1.5)]} p={[0, h - IN(0.6), 0]} m={mat(finishes.cap, "wood-oak")} />
-      {/* baseboard wrap */}
-      <Box s={[w + IN(0.6), IN(4.5), d + IN(0.6)]} p={[0, IN(2.25), 0]} m={fixedMat("pony-base", () => new THREE.MeshStandardMaterial({ color: "#eceae3", roughness: 0.7 }))} castShadow={false} />
+      <WallBody w={w} d={d} h={hb} openings={openings} m={mat(finishes.paint, "paint-soft-chalk")} />
+      {floorSpans(w, openings).map(([lo, hi]) => {
+        // cap and baseboard wrap overhang only at the wall's real ends
+        const l = lo - (lo <= -w / 2 + WALL_EPS ? IN(0.75) : 0);
+        const r = hi + (hi >= w / 2 - WALL_EPS ? IN(0.75) : 0);
+        const lb = lo - (lo <= -w / 2 + WALL_EPS ? IN(0.3) : 0);
+        const rb = hi + (hi >= w / 2 - WALL_EPS ? IN(0.3) : 0);
+        return (
+          <group key={lo}>
+            {/* cap with a slight overhang */}
+            <Box s={[r - l, IN(1.2), d + IN(1.5)]} p={[(l + r) / 2, h - IN(0.6), 0]} m={mat(finishes.cap, "wood-oak")} />
+            {/* baseboard wrap */}
+            <Box s={[rb - lb, IN(4.5), d + IN(0.6)]} p={[(lb + rb) / 2, IN(2.25), 0]} m={base} castShadow={false} />
+          </group>
+        );
+      })}
     </group>
   );
 }
@@ -653,16 +717,22 @@ export function PonyWall({ w, d, h, finishes }: BuilderProps) {
 /**
  * Full-height interior partition wall. The wrapper stretches `h` to the
  * ceiling at the item's position (fullHeight catalog flag), so it always
- * meets the ceiling - flat or sloped. Painted both sides, baseboards both sides.
+ * meets the ceiling - flat or sloped. Painted both sides, baseboards both
+ * sides. Door/window items sitting in it cut real openings (header above
+ * doors, sill below windows).
  */
-export function InteriorWall({ w, d, h, finishes }: BuilderProps) {
+export function InteriorWall({ w, d, h, finishes, openings = [] }: BuilderProps) {
   const paint = mat(finishes.paint, "paint-soft-chalk");
   const base = fixedMat("pony-base", () => new THREE.MeshStandardMaterial({ color: "#eceae3", roughness: 0.7 }));
   return (
     <group>
-      <Box s={[w, h, d]} p={[0, h / 2, 0]} m={paint} />
-      <Box s={[w, IN(4.5), IN(0.9)]} p={[0, IN(2.25), d / 2 + IN(0.4)]} m={base} castShadow={false} />
-      <Box s={[w, IN(4.5), IN(0.9)]} p={[0, IN(2.25), -d / 2 - IN(0.4)]} m={base} castShadow={false} />
+      <WallBody w={w} d={d} h={h} openings={openings} m={paint} />
+      {floorSpans(w, openings).map(([lo, hi]) => (
+        <group key={lo}>
+          <Box s={[hi - lo, IN(4.5), IN(0.9)]} p={[(lo + hi) / 2, IN(2.25), d / 2 + IN(0.4)]} m={base} castShadow={false} />
+          <Box s={[hi - lo, IN(4.5), IN(0.9)]} p={[(lo + hi) / 2, IN(2.25), -d / 2 - IN(0.4)]} m={base} castShadow={false} />
+        </group>
+      ))}
     </group>
   );
 }
