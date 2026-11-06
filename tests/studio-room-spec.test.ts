@@ -9,7 +9,7 @@ const KALCA: RoomSpec = {
   outline: [[0, 0], [205, 0], [205, 169], [0, 169]],
   walls: [
     { from: [79, 0], to: [79, 54] },
-    { from: [0, 54], to: [51, 54] },
+    { from: [0, 54], to: [79, 54] },
     { from: [125, 0], to: [125, 45.8] },
     { from: [125, 45.8], to: [151, 80] },
     { from: [151, 80], to: [205, 80] },
@@ -73,9 +73,9 @@ test("Kalca spec validates and converts: outline, walls and fixtures within 0.5i
 
   const doors = byType("door-single");
   assert.equal(doors.length, 3);
-  // WC door sits in the gap between two wall ends: not on a wall, stays put (and says so)
+  // WC door is hosted in the WC south wall: snapped onto it, no warning
   near(doors[0].x, ex(65), "wc door x"); near(doors[0].z, ez(54), "wc door z");
-  assert.ok(warnings.some((w) => /items\[4\]/.test(w) && /freestanding/.test(w)), "gap door is reported");
+  assert.deepEqual(warnings, [], "Kalca spec converts with no warnings");
   near(doors[1].x, ex(138), "closet door x"); near(doors[1].z, ez(62.9), "closet door z");
   near(doors[2].x, ex(205), "east door x"); near(doors[2].z, ez(117), "east door z");
   const windows = byType("window-single");
@@ -84,16 +84,20 @@ test("Kalca spec validates and converts: outline, walls and fixtures within 0.5i
   assert.ok(Math.abs(toInches(windows[0].y!) - 42) < 1e-9);
 });
 
-test("closet door cuts a 28in opening centered on the angled wall; no phantom openings elsewhere", () => {
+test("closet and WC doors each cut a 28in opening centered on their wall; no phantom openings elsewhere", () => {
   const { doc } = specToDoc(KALCA);
-  const ops = openingsOnWall(doc.items[3], doc.items); // closet angled wall
-  assert.equal(ops.length, 1);
-  assert.ok(Math.abs(toInches(ops[0].width) - 28) < 0.01, "28in wide");
-  assert.ok(Math.abs(toInches(ops[0].center)) < 0.01, "centered");
-  assert.ok(Math.abs(ops[0].top - inches(80)) < 1e-9 && ops[0].bottom === 0);
-  // WC door sits between the WC stubs' ends (14in away): neither stub gets an opening
+  // wall 3 = closet angled wall (door at its midpoint), wall 1 = WC south wall (door at x=65 of 0..79)
+  const closet = openingsOnWall(doc.items[3], doc.items);
+  assert.equal(closet.length, 1);
+  assert.ok(Math.abs(toInches(closet[0].width) - 28) < 0.01, "closet 28in wide");
+  assert.ok(Math.abs(toInches(closet[0].center)) < 0.01, "closet centered");
+  assert.ok(Math.abs(closet[0].top - inches(80)) < 1e-9 && closet[0].bottom === 0);
+  const wc = openingsOnWall(doc.items[1], doc.items);
+  assert.equal(wc.length, 1);
+  assert.ok(Math.abs(toInches(wc[0].width) - 28) < 0.01, "wc 28in wide");
+  assert.ok(Math.abs(toInches(wc[0].center) - (65 - 39.5)) < 0.01, "wc door 25.5in right of the wall midpoint");
   doc.items.slice(0, 7).forEach((w, i) => {
-    if (i !== 3) assert.equal(openingsOnWall(w, doc.items).length, 0, `wall ${i}`);
+    if (i !== 1 && i !== 3) assert.equal(openingsOnWall(w, doc.items).length, 0, `wall ${i}`);
   });
 });
 

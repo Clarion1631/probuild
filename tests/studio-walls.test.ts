@@ -123,6 +123,7 @@ test("wallLengthProblem: exact 4 and 288 inches pass, outside fails", () => {
   assert.equal(wallLengthProblem(parseLength("24'")!), null);
   assert.equal(wallLengthProblem(inches(3.9)), "short");
   assert.equal(wallLengthProblem(inches(288.5)), "long");
+});
 
 // ---- openingsOnWall ----
 
