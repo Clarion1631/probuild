@@ -293,6 +293,8 @@ export const WRITE_TOOLS = new Set([
 // get_file_link both return signed/permanent document URLs; get_contract
 // returns a contract's full HTML body. None of that belongs in a surface
 // meant for billing/receivables/change-order/lead/schedule data only.
+// get_room_design is the one deliberate exception outside that list: a pure read of a
+// Studio room as a spec (no URLs beyond the in-app path, no writes, no USDZ generation).
 // Exported for testing only — see tests/mcp-readonly-key.test.ts.
 export const READONLY_TOOLS = new Set([
     "list_projects", "list_leads", "find_job", "get_estimating_codes",

@@ -21,7 +21,8 @@ import { feet, inches, toInches } from "./units";
 // ---------------------------------------------------------------------------
 
 const inch = z.number().finite().min(-20000).max(20000);
-const point = z.tuple([inch, inch]);
+// [x, y] as a plain 2-element array: serializes to simple JSON Schema (no tuple/prefixItems).
+const point = z.array(inch).length(2);
 const dim = z.number().finite().positive().max(1200);
 
 export const RoomSpecSchema = z.object({
@@ -102,7 +103,7 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
   const ys = spec.outline.map((p) => p[1]);
   const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
   const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-  const toPt = (p: readonly [number, number]): Pt => ({ x: inches(p[0] - cx), z: inches(p[1] - cy) });
+  const toPt = (p: readonly number[]): Pt => ({ x: inches(p[0] - cx), z: inches(p[1] - cy) });
 
   let points = spec.outline.map(toPt);
   const area = signedArea(points);
@@ -189,7 +190,7 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
         const off = def.category === "doors-windows" || def.cutsWall ? 0 : d / 2;
         ({ x, z, rotation } = wallMountPose(hit, w, off));
       } else {
-        warnings.push(`${tag} at [${fmt(s.at[0])}, ${fmt(s.at[1])}] is not within 8" of a wall; left freestanding facing ${s.facing ?? "S"}.`);
+        warnings.push(`${tag} at [${fmt(s.at[0])}, ${fmt(s.at[1])}] is not within 8" of a wall; left freestanding facing ${s.facing ?? "S"} (fine for a door in a gap between wall ends; set facing to orient it).`);
       }
     }
 
@@ -305,15 +306,15 @@ export const ROOM_SPEC_EXAMPLE: RoomSpec = {
 };
 
 export const ROOM_SPEC_FORMAT =
-  "SPEC FORMAT (all lengths in INCHES; sketch frame: x grows to the right, y grows DOWN the page, so north is up; the origin is arbitrary, the room is centered for you):\n" +
-  "{ outline: [[x,y],...] (closed polygon, 3+ corners, do not repeat the first point), heightIn?: ceiling height (default 108), " +
+  "SPEC FORMAT (all lengths in INCHES; sketch frame: x grows to the right, y grows DOWN the page, so north is up; the origin is arbitrary, the room is centered for you).\n" +
+  "EXAMPLE (8x5 ft half bath): " + JSON.stringify(ROOM_SPEC_EXAMPLE) + "\n" +
+  "FIELDS: { outline: [[x,y],...] (closed polygon, 3+ corners, do not repeat the first point), heightIn?: ceiling height (default 108), " +
   "walls?: [{ from:[x,y], to:[x,y], kind?: 'full'|'pony', heightIn? }] (freestanding interior walls drawn center-line to center-line, ~4.5in thick; pony = 42in half wall unless heightIn; a doorway is a wall with a door/doorway-open item in it, or two shorter walls with a gap), " +
   "items?: [{ type: <catalog id>, at:[x,y] (item CENTER), facing?: 'N'|'S'|'E'|'W' or compass degrees (0=N,90=E,180=S,270=W) = the direction the item's FRONT points (a toilet against the west wall faces E), widthIn?, depthIn?, heightIn?, elevationIn? (bottom above floor, e.g. a window sill), label?, finishes?: {slot: finishId} }], " +
   "floor?: floor finish id, wallPaint?: paint finish id }.\n" +
   "Doors, windows, doorway-open and niches (wall-mount items) snap onto the nearest wall (room outline or an interior wall) when their `at` is within 8in of it, aligned and flush; their `at` only needs to be near the wall. They face into the room (for an interior wall, the side that `at` or `facing` is on). A door in an interior wall cuts a real opening. A wall-mount item farther than 8in from any wall is left freestanding and reported as a warning. " +
   "All other items are placed exactly at `at` with their center there; they do NOT auto-snap, so compute the center (e.g. a 28in-deep toilet whose back touches the west wall at x=0 has center x=14 and faces E). " +
-  "Unknown types or items outside the outline come back in `warnings` (unknown types are skipped).\n" +
-  "EXAMPLE (8x5 ft half bath): " + JSON.stringify(ROOM_SPEC_EXAMPLE) + "\n";
+  "Unknown types or items outside the outline come back in `warnings` (unknown types are skipped).\n";
 
 /** Format + the full catalog id list (for build_room_design's description). */
 export const ROOM_SPEC_HELP = ROOM_SPEC_FORMAT + "CATALOG IDS (widthxdepth in inches): \n" + catalogHelp();
