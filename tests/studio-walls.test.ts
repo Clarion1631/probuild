@@ -310,12 +310,12 @@ test("hostedByInteriorWall: outline renderer skips doors hosted by a wall 0.9in 
   const inWall: PlacedItem = { id: "d", defId: "door-single", x: 0.2, z: wall.z, rotation: Math.PI };
   const onOutline: PlacedItem = { id: "w", defId: "window-single", x: -0.8, z: -2, rotation: Math.PI };
   const segs = interiorWallSegs([wall]);
-  assert.equal(hostedByInteriorWall(inWall, outline, segs), true);
-  assert.equal(hostedByInteriorWall(onOutline, outline, segs), false);
+  assert.equal(hostedByInteriorWall(inWall, outline, [wall]), true);
+  assert.equal(hostedByInteriorWall(onOutline, outline, [wall]), false);
   assert.equal(hostedByInteriorWall(inWall, outline, []), false); // no interior walls: nothing changes
   // niches never ride on freestanding walls
   const niche: PlacedItem = { id: "n", defId: "shower-niche", x: 0.2, z: wall.z, rotation: Math.PI };
-  assert.equal(hostedByInteriorWall(niche, outline, segs), false);
+  assert.equal(hostedByInteriorWall(niche, outline, [wall]), false);
 });
 
 test("T-junction: a door clamped to a perpendicular wall's centerline is still hosted by its own wall", () => {
@@ -328,4 +328,21 @@ test("T-junction: a door clamped to a perpendicular wall's centerline is still h
   const items = [horizontal, vertical, d];
   assert.equal(openingsOnWall(horizontal, items, outline).length, 1);
   assert.equal(openingsOnWall(vertical, items, outline).length, 0);
+});
+
+// ---- review round 4 ----
+
+test("outline keeps its hole when a perpendicular door only sits near a parallel interior wall", () => {
+  const outline = wallSegments([
+    { x: -2, z: -2 }, { x: 2, z: -2 }, { x: 2, z: 2 }, { x: -2, z: 2 },
+  ]);
+  const wall: PlacedItem = { id: "p", defId: "interior-wall", x: 0, z: -2 + inches(6), rotation: 0, w: 3 };
+  // door centered on the north outline but rotated perpendicular to it (reachable by manual rotation)
+  const door: PlacedItem = { id: "d", defId: "door-single", x: 0, z: -2, rotation: Math.PI / 2 };
+  assert.equal(hostedByInteriorWall(door, outline, [wall]), false, "outline must keep cutting its hole");
+  assert.equal(openingsOnWall(wall, [wall, door], outline).length, 0, "and the interior wall gets none");
+  // the two decisions always agree: a qualifying door is cut by the wall AND suppressed on the outline
+  const good: PlacedItem = { id: "g", defId: "door-single", x: 0.3, z: wall.z, rotation: Math.PI };
+  assert.equal(openingsOnWall(wall, [wall, good], outline).length, 1);
+  assert.equal(hostedByInteriorWall(good, outline, [wall]), true);
 });

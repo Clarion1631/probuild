@@ -209,37 +209,64 @@ const MIN_OPENING = inches(0.5);
  * Pure function of committed doc state.
  */
 export function openingsOnWall(wall: PlacedItem, items: PlacedItem[], outline: WallSeg[] = []): WallOpening[] {
-  const wdef = getItemDef(wall.defId);
-  if (!wdef) return [];
+  const wallItems = items.some((i) => i.id === wall.id) ? items : [...items, wall];
+  const out: WallOpening[] = [];
+  for (const it of items) {
+    if (it.id === wall.id) continue;
+    const found = interiorOpeningFor(it, wallItems, outline);
+    if (found && found.wall.id === wall.id) out.push(found.opening);
+  }
+  return out.sort((a, b) => a.center - b.center);
+}
+
+export interface InteriorOpening {
+  /** The freestanding wall item that hosts the door/window. */
+  wall: PlacedItem;
+  /** The opening it cuts, clipped to that wall. */
+  opening: WallOpening;
+}
+
+/**
+ * THE eligibility rule for a door/window cutting a freestanding wall, shared
+ * by wall rendering (openingsOnWall) and the room outline (which must not cut
+ * a second hole): the item must be a door/window, be hosted by a freestanding
+ * wall under the same rule that snaps it (nearestHostWall over the outline
+ * and every wall, parallel walls only), lie within half the wall thickness +
+ * 1" of that wall's segment, be parallel to it, and clip to a real opening.
+ * Returns null when the item does not cut any freestanding wall.
+ */
+export function interiorOpeningFor(item: PlacedItem, wallItems: PlacedItem[], outline: WallSeg[]): InteriorOpening | null {
+  const def = getItemDef(item.defId);
+  if (!def || def.category !== "doors-windows") return null;
+  const hosts = interiorWallSegs(wallItems);
+  if (hosts.length === 0) return null;
+  const host = nearestHostWall({ x: item.x, z: item.z }, outline, hosts, {
+    w: item.w ?? def.w, d: item.d ?? def.d, rotation: item.rotation,
+  });
+  const wallId = host ? (host.wall as HostSeg).itemId : undefined;
+  const wall = wallId === undefined ? undefined : wallItems.find((i) => i.id === wallId);
+  const wdef = wall && getItemDef(wall.defId);
+  if (!wall || !wdef) return null;
+
   const L = wall.w ?? wdef.w;
   const T = wall.d ?? wdef.d;
   const ux = Math.cos(wall.rotation);
   const uz = -Math.sin(wall.rotation);
-  const out: WallOpening[] = [];
-  const hosts = interiorWallSegs(items.some((i) => i.id === wall.id) ? items : [...items, wall]);
-  for (const it of items) {
-    if (it.id === wall.id) continue;
-    const def = getItemDef(it.defId);
-    if (!def || def.category !== "doors-windows") continue;
-    const dx = it.x - wall.x;
-    const dz = it.z - wall.z;
-    const s = dx * ux + dz * uz;
-    const sc = Math.max(-L / 2, Math.min(L / 2, s));
-    if (!(Math.hypot(dx - ux * sc, dz - uz * sc) <= T / 2 + OPENING_FACE_SLOP)) continue;
-    const host = nearestHostWall({ x: it.x, z: it.z }, outline, hosts, { w: it.w ?? def.w, d: it.d ?? def.d, rotation: it.rotation });
-    if (!host || (host.wall as HostSeg).itemId !== wall.id) continue;
-    let diff = (it.rotation - wall.rotation) % Math.PI;
-    if (diff > Math.PI / 2) diff -= Math.PI;
-    if (diff < -Math.PI / 2) diff += Math.PI;
-    if (!(Math.abs(diff) <= OPENING_PARALLEL_TOL)) continue;
-    const ow = it.w ?? def.w;
-    const lo = Math.max(-L / 2, s - ow / 2);
-    const hi = Math.min(L / 2, s + ow / 2);
-    if (!(hi - lo >= MIN_OPENING)) continue;
-    const bottom = it.y ?? def.elevation ?? 0;
-    out.push({ center: (lo + hi) / 2, width: hi - lo, bottom, top: bottom + (it.h ?? def.h) });
-  }
-  return out.sort((a, b) => a.center - b.center);
+  const dx = item.x - wall.x;
+  const dz = item.z - wall.z;
+  const s = dx * ux + dz * uz;
+  const sc = Math.max(-L / 2, Math.min(L / 2, s));
+  if (!(Math.hypot(dx - ux * sc, dz - uz * sc) <= T / 2 + OPENING_FACE_SLOP)) return null;
+  let diff = (item.rotation - wall.rotation) % Math.PI;
+  if (diff > Math.PI / 2) diff -= Math.PI;
+  if (diff < -Math.PI / 2) diff += Math.PI;
+  if (!(Math.abs(diff) <= OPENING_PARALLEL_TOL)) return null;
+  const ow = item.w ?? def.w;
+  const lo = Math.max(-L / 2, s - ow / 2);
+  const hi = Math.min(L / 2, s + ow / 2);
+  if (!(hi - lo >= MIN_OPENING)) return null;
+  const bottom = item.y ?? def.elevation ?? 0;
+  return { wall, opening: { center: (lo + hi) / 2, width: hi - lo, bottom, top: bottom + (item.h ?? def.h) } };
 }
 
 /** A freestanding wall's segment, tagged with the item it came from. */
@@ -345,16 +372,10 @@ export function snapsToInteriorWalls(def: { category: string; cutsWall?: boolean
 }
 
 /**
- * True when a door/window is hosted by a freestanding wall (per the same host
- * rule that snaps and cuts), so the room outline must not also cut a hole for
- * it. Always false when the room has no freestanding walls.
+ * True when a door/window really cuts a freestanding wall (interiorOpeningFor),
+ * so the room outline must not also cut a hole for it. False when the room has
+ * no freestanding walls, and for anything that does not qualify as an opening.
  */
-export function hostedByInteriorWall(item: PlacedItem, outline: WallSeg[], interior: HostSeg[]): boolean {
-  if (interior.length === 0) return false;
-  const def = getItemDef(item.defId);
-  if (!def || !snapsToInteriorWalls(def)) return false;
-  const host = nearestHostWall({ x: item.x, z: item.z }, outline, interior, {
-    w: item.w ?? def.w, d: item.d ?? def.d, rotation: item.rotation,
-  });
-  return !!host && (host.wall as HostSeg).itemId !== undefined;
+export function hostedByInteriorWall(item: PlacedItem, outline: WallSeg[], wallItems: PlacedItem[]): boolean {
+  return interiorOpeningFor(item, wallItems, outline) !== null;
 }

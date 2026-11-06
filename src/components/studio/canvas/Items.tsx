@@ -151,7 +151,7 @@ function ItemNode({
   const hostWallIndex = useMemo(() => {
     if (def.category !== "doors-windows" && !def.cutsWall) return undefined;
     // a door/window hosted by a freestanding wall is not tied to an outline wall
-    if (def.category === "doors-windows" && hostedByInteriorWall(item, walls, interiorWallSegs(allItems))) return undefined;
+    if (def.category === "doors-windows" && hostedByInteriorWall(item, walls, allItems)) return undefined;
     const hit = nearestWall({ x: item.x, z: item.z }, walls);
     return hit && hit.distance < 0.4 ? hit.wall.index : undefined;
   }, [def, item, allItems, walls]);

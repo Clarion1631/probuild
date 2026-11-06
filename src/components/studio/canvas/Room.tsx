@@ -12,7 +12,7 @@ import {
 } from "@/lib/studio/geometry";
 import { getFinish } from "@/lib/studio/materials";
 import { getItemDef } from "@/lib/studio/catalog";
-import { hostedByInteriorWall, interiorWallSegs } from "@/lib/studio/walls";
+import { hostedByInteriorWall } from "@/lib/studio/walls";
 import { useStudio } from "../store";
 
 const WALL_FALLBACK = "paint-soft-chalk";
@@ -130,12 +130,11 @@ interface Opening {
 /** Match wall-mounted door/window/niche items to their nearest wall. */
 function openingsByWall(items: PlacedItem[], walls: WallSeg[], wallThickness: number): Map<number, Opening[]> {
   const map = new Map<number, Opening[]>();
-  const interior = interiorWallSegs(items);
   for (const it of items) {
     const def = getItemDef(it.defId);
     if (!def || (def.category !== "doors-windows" && !def.cutsWall)) continue;
     // hosted by a freestanding wall (same rule that snaps/cuts it): the outline must not cut too
-    if (hostedByInteriorWall(it, walls, interior)) continue;
+    if (hostedByInteriorWall(it, walls, items)) continue;
     let best: { wall: WallSeg; dist: number; t: number } | null = null;
     for (const w of walls) {
       const apx = it.x - w.a.x;
