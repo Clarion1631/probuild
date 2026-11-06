@@ -286,8 +286,19 @@ function LengthBox({ text, setText, onSubmit, onCancel }: {
     const stop = (e: Event) => e.stopPropagation();
     const names = ["pointerdown", "pointermove", "pointerup", "click", "dblclick", "contextmenu", "wheel"];
     for (const n of names) root.addEventListener(n, stop);
+    // A press on the label/padding must not blur the input (blur cancels the
+    // box and would throw away what was typed); keep focus where it is.
+    const keepFocus = (e: MouseEvent) => {
+      e.stopPropagation();
+      if (e.target !== ref.current) {
+        e.preventDefault();
+        ref.current?.focus();
+      }
+    };
+    root.addEventListener("mousedown", keepFocus);
     return () => {
       for (const n of names) root.removeEventListener(n, stop);
+      root.removeEventListener("mousedown", keepFocus);
     };
   }, []);
   useEffect(() => {
