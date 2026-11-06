@@ -229,3 +229,37 @@ test("niches are outline-only: a niche near an interior wall does not snap onto 
   // stays near the interior wall (not snapped onto its centerline) - it is left alone as freestanding
   assert.ok(Math.abs(toInches(niche.z - doc.items[0].z) - 2) < 0.5);
 });
+
+// ---- review round 2 ----
+
+test("an exact 4in wall at 45 degrees survives get -> update (rounded endpoints re-import)", () => {
+  const e = 4 / Math.SQRT2;
+  const { doc } = specToDoc({ outline: BOX, walls: [{ from: [20, 20], to: [20 + e, 20 + e] }] });
+  const back = docToSpec(doc);
+  const again = specToDoc(RoomSpecSchema.parse(JSON.parse(JSON.stringify(back))));
+  assert.equal(again.doc.items.length, 1);
+  // 2-decimal rounding that lands at 3.988in is tolerated, 3.5in is not
+  specToDoc({ outline: BOX, walls: [{ from: [20, 20], to: [22.82, 22.82] }] });
+  assert.throws(() => specToDoc({ outline: BOX, walls: [{ from: [20, 20], to: [22.5, 22.5] }] }), /too short/);
+});
+
+test("a door 8.5in from an interior wall (2in deep) snaps to it; 10.5in stays freestanding", () => {
+  const spec = (y: number): RoomSpec => ({
+    outline: [[0, 0], [200, 0], [200, 160], [0, 160]],
+    walls: [{ from: [50, 80], to: [150, 80] }],
+    items: [{ type: "door-single", at: [100, y], widthIn: 28 }],
+  });
+  const snapped = specToDoc(spec(88.5));
+  assert.ok(Math.abs(snapped.doc.items[1].z - snapped.doc.items[0].z) < 1e-9, "centered on the wall");
+  assert.deepEqual(snapped.warnings, []);
+  const far = specToDoc(spec(90.5));
+  assert.ok(far.warnings.some((w) => /not within 8"/.test(w)));
+});
+
+test("wall-type items obey the wall length bounds", () => {
+  assert.throws(() => specToDoc({ outline: BOX, items: [{ type: "interior-wall", at: [60, 48], widthIn: 1 }] }), /between 4" and 288"/);
+  assert.throws(() => specToDoc({ outline: BOX, items: [{ type: "pony-wall", at: [60, 48], widthIn: 400 }] }), /between 4" and 288"/);
+  assert.throws(() => specToDoc({ outline: BOX, items: [{ type: "interior-wall-doorway", at: [60, 48], widthIn: 40 }] }), /between 72" and 288"/);
+  specToDoc({ outline: BOX, items: [{ type: "interior-wall", at: [60, 48], widthIn: 60 }, { type: "interior-wall-doorway", at: [60, 20], widthIn: 100 }] });
+  assert.match(ROOM_SPEC_HELP, /walls\[\], not items\[\]/);
+});

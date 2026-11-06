@@ -193,8 +193,6 @@ export interface WallOpening {
 
 /** A door/window/opening within this much of the wall face counts as in the wall. */
 const OPENING_FACE_SLOP = inches(1);
-/** A door/window whose center is this close to an outline segment is hosted by the outline, not by a freestanding wall. */
-const OUTLINE_HOST_TOL = inches(1);
 /** Max angle (radians) between a door's rotation and the wall's to count as parallel. */
 const OPENING_PARALLEL_TOL = 0.05;
 const MIN_OPENING = inches(0.5);
@@ -205,8 +203,9 @@ const MIN_OPENING = inches(0.5);
  * (the projection is clamped to the wall's own length, never the infinite
  * line, so short stubs that line up with a door get no phantom opening) and it
  * is parallel to the wall (either face). Openings are clipped to the wall.
- * Items hosted on the room OUTLINE (center within 1" of an outline segment)
- * never cut a freestanding wall, even one drawn right beside that face.
+ * Which wall hosts an item is decided by the SAME rule that snaps it
+ * (nearestHostWall over the outline and every freestanding wall), so an item
+ * hosted by the outline, or by a different wall, never cuts this one.
  * Pure function of committed doc state.
  */
 export function openingsOnWall(wall: PlacedItem, items: PlacedItem[], outline: WallSeg[] = []): WallOpening[] {
@@ -217,6 +216,7 @@ export function openingsOnWall(wall: PlacedItem, items: PlacedItem[], outline: W
   const ux = Math.cos(wall.rotation);
   const uz = -Math.sin(wall.rotation);
   const out: WallOpening[] = [];
+  const hosts = interiorWallSegs(items.some((i) => i.id === wall.id) ? items : [...items, wall]);
   for (const it of items) {
     if (it.id === wall.id) continue;
     const def = getItemDef(it.defId);
@@ -226,10 +226,8 @@ export function openingsOnWall(wall: PlacedItem, items: PlacedItem[], outline: W
     const s = dx * ux + dz * uz;
     const sc = Math.max(-L / 2, Math.min(L / 2, s));
     if (!(Math.hypot(dx - ux * sc, dz - uz * sc) <= T / 2 + OPENING_FACE_SLOP)) continue;
-    if (outline.length > 0) {
-      const onOutline = nearestWall({ x: it.x, z: it.z }, outline);
-      if (onOutline && onOutline.distance <= OUTLINE_HOST_TOL) continue;
-    }
+    const host = nearestHostWall({ x: it.x, z: it.z }, outline, hosts, { w: it.w ?? def.w, d: it.d ?? def.d });
+    if (!host || (host.wall as HostSeg).itemId !== wall.id) continue;
     let diff = (it.rotation - wall.rotation) % Math.PI;
     if (diff > Math.PI / 2) diff -= Math.PI;
     if (diff < -Math.PI / 2) diff += Math.PI;
@@ -244,9 +242,14 @@ export function openingsOnWall(wall: PlacedItem, items: PlacedItem[], outline: W
   return out.sort((a, b) => a.center - b.center);
 }
 
+/** A freestanding wall's segment, tagged with the item it came from. */
+export interface HostSeg extends WallSeg {
+  itemId?: string;
+}
+
 /** Wall segments for every freestanding wall item (both faces usable). index is -1. */
-export function interiorWallSegs(items: PlacedItem[]): WallSeg[] {
-  const out: WallSeg[] = [];
+export function interiorWallSegs(items: PlacedItem[]): HostSeg[] {
+  const out: HostSeg[] = [];
   for (const it of items) {
     if (!isOpeningHost(it.defId)) continue;
     const def = getItemDef(it.defId);
@@ -254,7 +257,7 @@ export function interiorWallSegs(items: PlacedItem[]): WallSeg[] {
     const length = it.w ?? def.w;
     const { a, b } = wallEndpoints(it, length);
     const dir = { x: Math.cos(it.rotation), z: -Math.sin(it.rotation) };
-    out.push({ index: -1, a, b, dir, normal: { x: -dir.z, z: dir.x }, length });
+    out.push({ index: -1, a, b, dir, normal: { x: -dir.z, z: dir.x }, length, itemId: it.id });
   }
   return out;
 }
@@ -271,6 +274,12 @@ export interface HostOpts {
   w?: number;
   /** Item depth: reach is measured from the back face (center - d/2). */
   d?: number;
+  /**
+   * When set, return null unless the chosen wall (outline or freestanding) is
+   * within this reach of the item's back face. Unset = always snap to the
+   * outline, like the Studio's drag/place.
+   */
+  reach?: number;
 }
 
 /**
@@ -281,6 +290,12 @@ export interface HostOpts {
  * point is on the wall line). Otherwise this is exactly nearestWall(outline).
  */
 export function nearestHostWall(p: Pt, outline: WallSeg[], interior: WallSeg[], opts: HostOpts = {}): WallHit | null {
+  const hit = pickHostWall(p, outline, interior, opts);
+  if (hit && opts.reach !== undefined && !(Math.max(0, hit.distance - (opts.d ?? 0) / 2) <= opts.reach)) return null;
+  return hit;
+}
+
+function pickHostWall(p: Pt, outline: WallSeg[], interior: WallSeg[], opts: HostOpts): WallHit | null {
   const base = nearestWall(p, outline);
   const { facing, w = 0, d = 0 } = opts;
   const usable = interior.filter((seg) => seg.length >= w);

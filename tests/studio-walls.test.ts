@@ -270,3 +270,32 @@ test("snapsToInteriorWalls: doors and windows only, never niches", () => {
   assert.equal(snapsToInteriorWalls({ category: "fixtures", cutsWall: true }), false);
   assert.equal(snapsToInteriorWalls({ category: "doors-windows", cutsWall: true }), false);
 });
+
+// ---- review round 2 ----
+
+test("one host rule for snap and cut: a wall 0.9in inside the outline still gets its door's opening", () => {
+  const outline = wallSegments([
+    { x: -2, z: -2 }, { x: 2, z: -2 }, { x: 2, z: 2 }, { x: -2, z: 2 },
+  ]);
+  const pony: PlacedItem = { id: "p", defId: "interior-wall", x: 0, z: -2 + inches(0.9), rotation: 0, w: 3 };
+  // door snapped onto the wall centerline (what nearestHostWall picks for a drop on it)
+  const hosted: PlacedItem = { id: "d", defId: "door-single", x: 0.2, z: pony.z, rotation: Math.PI };
+  const segs = interiorWallSegs([pony]);
+  const hit = nearestHostWall({ x: hosted.x, z: hosted.z }, outline, segs, { w: inches(32), d: inches(2) })!;
+  assert.equal(hit.wall.index, -1, "snap picks the interior wall");
+  assert.equal(openingsOnWall(pony, [pony, hosted], outline).length, 1, "and so the wall is cut");
+  // a window really on the outline does not cut it
+  const onOutline: PlacedItem = { id: "w", defId: "window-single", x: -0.8, z: -2, rotation: Math.PI };
+  assert.equal(openingsOnWall(pony, [pony, onOutline], outline).length, 0);
+});
+
+test("nearestHostWall reach: decided in the helper, from the back face", () => {
+  const outline = wallSegments([
+    { x: -3, z: -3 }, { x: 3, z: -3 }, { x: 3, z: 3 }, { x: -3, z: 3 }]);
+  const wall = interiorWallSegs([wallItem({ z: 0, w: 2 })]);
+  // 2in deep door centered 8.5in off the wall: back face 7.5in away -> hosted
+  const near = nearestHostWall({ x: 0, z: inches(8.5) }, outline, wall, { w: inches(28), d: inches(2), reach: inches(8) });
+  assert.equal(near?.wall.index, -1);
+  // 10.5in off: back face 9.5in -> nothing in reach (outline is far too)
+  assert.equal(nearestHostWall({ x: 0, z: inches(10.5) }, outline, wall, { w: inches(28), d: inches(2), reach: inches(8) }), null);
+});

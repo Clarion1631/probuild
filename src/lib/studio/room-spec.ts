@@ -12,8 +12,8 @@ import { DEFAULT_SURFACES, ALL_FINISHES } from "./materials";
 import { newItemId, type DesignDoc, type PlacedItem, type Pt } from "./doc";
 import { nearestWall, pointInPolygon, signedArea, wallSegments } from "./geometry";
 import {
-  HOST_REACH, interiorWallSegs, nearestHostWall, snapsToInteriorWalls, wallEndpoints, wallItemPose, wallLengthProblem,
-  wallMountPose,
+  HOST_REACH, WALL_MAX, WALL_MIN, interiorWallSegs, isWallDef, nearestHostWall, snapsToInteriorWalls, wallEndpoints,
+  wallItemPose, wallLengthProblem, wallMountPose,
 } from "./walls";
 import { feet, inches, toInches } from "./units";
 
@@ -86,6 +86,9 @@ const PAINT_IDS = new Set(ALL_FINISHES.filter((f) => f.kind === "paint").map((f)
 const FINISH_IDS = new Set(ALL_FINISHES.map((f) => f.id));
 
 const r2 = (n: number) => Math.round(n * 100) / 100;
+const r4 = (n: number) => Math.round(n * 10000) / 10000;
+/** Length checks tolerate this much (rounded exports of exact-minimum walls must re-import). */
+const LEN_SLOP = inches(0.05);
 const fmt = (n: number) => String(r2(n));
 
 // ---------------------------------------------------------------------------
@@ -225,7 +228,8 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
     const a = toPt(w.from);
     const b = toPt(w.to);
     const pose = wallItemPose(a, b);
-    const problem = wallLengthProblem(pose.w);
+    const effLen = pose.w < WALL_MIN && pose.w >= WALL_MIN - LEN_SLOP ? WALL_MIN : pose.w > WALL_MAX && pose.w <= WALL_MAX + LEN_SLOP ? WALL_MAX : pose.w;
+    const problem = wallLengthProblem(effLen);
     if (problem) {
       throw new Error(`walls[${i}] is ${fmt(toInches(pose.w))}" long; walls must be between 4" and 288" (${problem === "short" ? "too short" : "too long"})`);
     }
@@ -267,6 +271,15 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
       warnings.push(`${tag} at [${fmt(s.at[0])}, ${fmt(s.at[1])}] is outside the room outline; placed anyway.`);
     }
 
+    if (isWallDef(def.id)) {
+      // wall-type items obey the same length bounds as walls[] (the doorway wall has its own catalog minimum)
+      const lo = def.resizable?.min ?? WALL_MIN;
+      const hi = def.resizable?.max ?? WALL_MAX;
+      if (w < lo - LEN_SLOP || w > hi + LEN_SLOP) {
+        throw new Error(`${tag}: a ${def.id} must be between ${fmt(toInches(lo))}" and ${fmt(toInches(hi))}" long (widthIn ${fmt(toInches(w))}")`);
+      }
+    }
+
     const rot = facingRotation(s.facing);
     let x = at.x;
     let z = at.z;
@@ -274,8 +287,8 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
 
     if (def.mount === "wall") {
       const facingVec = rot === null ? undefined : { x: Math.sin(rot), z: Math.cos(rot) };
-      const hit = nearestHostWall(at, outlineWalls, snapsToInteriorWalls(def) ? interior : [], { facing: facingVec, w, d });
-      if (hit && hit.distance <= HOST_REACH) {
+      const hit = nearestHostWall(at, outlineWalls, snapsToInteriorWalls(def) ? interior : [], { facing: facingVec, w, d, reach: HOST_REACH });
+      if (hit) {
         const off = def.category === "doors-windows" || def.cutsWall ? 0 : d / 2;
         ({ x, z, rotation } = wallMountPose(hit, w, off));
       } else {
@@ -318,6 +331,8 @@ export function docToSpec(doc: DesignDoc): RoomSpec {
   const minX = Math.min(...xs);
   const minZ = Math.min(...zs);
   const toSketch = (p: Pt): [number, number] => [r2(toInches(p.x - minX)), r2(toInches(p.z - minZ))];
+  // wall endpoints keep 4 decimals so an exact-minimum angled wall still re-imports at length
+  const toSketchWall = (p: Pt): [number, number] => [r4(toInches(p.x - minX)), r4(toInches(p.z - minZ))];
 
   const walls: RoomSpecWall[] = [];
   const items: RoomSpecItem[] = [];
@@ -328,7 +343,7 @@ export function docToSpec(doc: DesignDoc): RoomSpec {
     if (it.defId === "interior-wall" || it.defId === "pony-wall") {
       const { a, b } = wallEndpoints(it, it.w ?? def.w);
       const pony = it.defId === "pony-wall";
-      const wall: RoomSpecWall = { from: toSketch(a), to: toSketch(b), kind: pony ? "pony" : "full" };
+      const wall: RoomSpecWall = { from: toSketchWall(a), to: toSketchWall(b), kind: pony ? "pony" : "full" };
       // pony walls always state their height (catalog default 36", spec default 42"); full walls only when overridden
       const h = it.h ?? (pony ? def.h : undefined);
       if (h !== undefined) wall.heightIn = r2(toInches(h));
@@ -402,6 +417,7 @@ export const ROOM_SPEC_FORMAT =
   "floor?: floor finish id, wallPaint?: paint finish id, ceiling?: paint id, wallThicknessIn? (outer walls, default 5) }.\n" +
   "Doors, windows and doorway-open (wall-mount items; niches snap to the outline only) snap onto the nearest wall (room outline or an interior wall) when their `at` is within 8in of it, aligned and flush; their `at` only needs to be near the wall. They face into the room (for an interior wall, the side that `at` or `facing` is on). A door in an interior wall cuts a real opening. A wall-mount item farther than 8in from any wall is left freestanding and reported as a warning. " +
   "All other items are placed exactly at `at` with their center there; they do NOT auto-snap, so compute the center (e.g. a 28in-deep toilet whose back touches the west wall at x=0 has center x=14 and faces E). " +
+  "Draw interior and pony walls in walls[], not items[] (wall types in items[] must still be 4in to 288in long; interior-wall-doorway 72in to 288in). " +
   "Unknown types or items outside the outline come back in `warnings` (unknown types are skipped).\n";
 
 /** Format + the full catalog id list (for build_room_design's description). */
