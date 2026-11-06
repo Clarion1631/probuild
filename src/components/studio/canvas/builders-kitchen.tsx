@@ -649,36 +649,61 @@ function solidSpans(w: number, cuts: Array<[number, number]>): Array<[number, nu
   return out;
 }
 
+/** Openings clipped to the wall's box; ones that miss it vertically or horizontally are dropped. */
+function clipOpenings(w: number, h: number, openings: WallOpening[]): WallOpening[] {
+  const out: WallOpening[] = [];
+  for (const o of openings) {
+    const lo = Math.max(-w / 2, o.center - o.width / 2);
+    const hi = Math.min(w / 2, o.center + o.width / 2);
+    const bottom = Math.max(0, o.bottom);
+    const top = Math.min(h, o.top);
+    if (!(hi - lo > WALL_EPS) || !(top - bottom > WALL_EPS)) continue;
+    out.push({ center: (lo + hi) / 2, width: hi - lo, bottom, top });
+  }
+  return out;
+}
+
 /**
- * Wall body split around door/window openings: solid spans between openings,
- * plus a sill piece under and a header piece over each opening. With no
+ * Wall body cut by door/window openings. The wall is split at every opening
+ * boundary; each span is filled with the solid vertical intervals left after
+ * removing the union of the openings that cover it, so a window sill never
+ * fills a door opening and overlapping openings never double-draw. With no
  * openings it is the single full box it always was.
  */
 function WallBody({ w, d, h, openings, m }: { w: number; d: number; h: number; openings: WallOpening[]; m: THREE.Material }) {
-  const cuts = openings.map((o): [number, number] => [o.center - o.width / 2, o.center + o.width / 2]);
+  const ops = clipOpenings(w, h, openings);
+  const xs = [-w / 2, w / 2];
+  for (const o of ops) xs.push(o.center - o.width / 2, o.center + o.width / 2);
+  xs.sort((p, q) => p - q);
+  const boxes: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
+  for (let i = 0; i + 1 < xs.length; i++) {
+    const x0 = xs[i];
+    const x1 = xs[i + 1];
+    if (!(x1 - x0 > WALL_EPS)) continue;
+    const mid = (x0 + x1) / 2;
+    const cuts = ops
+      .filter((o) => mid > o.center - o.width / 2 && mid < o.center + o.width / 2)
+      .map((o): [number, number] => [o.bottom, o.top])
+      .sort((p, q) => p[0] - q[0]);
+    let cursor = 0;
+    for (const [lo, hi] of cuts) {
+      if (lo - cursor > WALL_EPS) boxes.push({ x0, x1, y0: cursor, y1: lo });
+      cursor = Math.max(cursor, hi);
+    }
+    if (h - cursor > WALL_EPS) boxes.push({ x0, x1, y0: cursor, y1: h });
+  }
   return (
     <>
-      {solidSpans(w, cuts).map(([lo, hi]) => (
-        <Box key={`s${lo}`} s={[hi - lo, h, d]} p={[(lo + hi) / 2, h / 2, 0]} m={m} />
+      {boxes.map((b, i) => (
+        <Box key={i} s={[b.x1 - b.x0, b.y1 - b.y0, d]} p={[(b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, 0]} m={m} />
       ))}
-      {openings.map((o, i) => {
-        const bottom = Math.max(0, o.bottom);
-        const top = Math.min(h, o.top);
-        if (bottom >= h - WALL_EPS || top <= WALL_EPS) return null;
-        return (
-          <group key={`o${i}`}>
-            {bottom > WALL_EPS && <Box s={[o.width, bottom, d]} p={[o.center, bottom / 2, 0]} m={m} />}
-            {h - top > WALL_EPS && <Box s={[o.width, h - top, d]} p={[o.center, top + (h - top) / 2, 0]} m={m} />}
-          </group>
-        );
-      })}
     </>
   );
 }
 
 /** Spans of the wall that touch the floor (everything except door-style openings). */
-function floorSpans(w: number, openings: WallOpening[]): Array<[number, number]> {
-  const cuts = openings
+function floorSpans(w: number, h: number, openings: WallOpening[]): Array<[number, number]> {
+  const cuts = clipOpenings(w, h, openings)
     .filter((o) => o.bottom <= WALL_EPS)
     .map((o): [number, number] => [o.center - o.width / 2, o.center + o.width / 2]);
   return solidSpans(w, cuts);
@@ -695,7 +720,7 @@ export function PonyWall({ w, d, h, finishes, openings = [] }: BuilderProps) {
   return (
     <group>
       <WallBody w={w} d={d} h={hb} openings={openings} m={mat(finishes.paint, "paint-soft-chalk")} />
-      {floorSpans(w, openings).map(([lo, hi]) => {
+      {floorSpans(w, h, openings).map(([lo, hi]) => {
         // cap and baseboard wrap overhang only at the wall's real ends
         const l = lo - (lo <= -w / 2 + WALL_EPS ? IN(0.75) : 0);
         const r = hi + (hi >= w / 2 - WALL_EPS ? IN(0.75) : 0);
@@ -727,7 +752,7 @@ export function InteriorWall({ w, d, h, finishes, openings = [] }: BuilderProps)
   return (
     <group>
       <WallBody w={w} d={d} h={h} openings={openings} m={paint} />
-      {floorSpans(w, openings).map(([lo, hi]) => (
+      {floorSpans(w, h, openings).map(([lo, hi]) => (
         <group key={lo}>
           <Box s={[hi - lo, IN(4.5), IN(0.9)]} p={[(lo + hi) / 2, IN(2.25), d / 2 + IN(0.4)]} m={base} castShadow={false} />
           <Box s={[hi - lo, IN(4.5), IN(0.9)]} p={[(lo + hi) / 2, IN(2.25), -d / 2 - IN(0.4)]} m={base} castShadow={false} />

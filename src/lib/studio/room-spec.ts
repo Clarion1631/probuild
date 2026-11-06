@@ -12,7 +12,8 @@ import { DEFAULT_SURFACES, ALL_FINISHES } from "./materials";
 import { newItemId, type DesignDoc, type PlacedItem, type Pt } from "./doc";
 import { nearestWall, pointInPolygon, signedArea, wallSegments } from "./geometry";
 import {
-  interiorWallSegs, nearestHostWall, snapsToInteriorWalls, wallEndpoints, wallItemPose, wallMountPose,
+  HOST_REACH, interiorWallSegs, nearestHostWall, snapsToInteriorWalls, wallEndpoints, wallItemPose, wallLengthProblem,
+  wallMountPose,
 } from "./walls";
 import { feet, inches, toInches } from "./units";
 
@@ -35,6 +36,9 @@ export const RoomSpecSchema = z.object({
         to: point,
         kind: z.enum(["full", "pony"]).optional(),
         heightIn: dim.optional(),
+        thicknessIn: z.number().finite().min(2).max(24).optional(),
+        label: z.string().max(120).optional(),
+        finishes: z.record(z.string().max(40), z.string().max(80)).optional(),
       }),
     )
     .max(300)
@@ -57,6 +61,8 @@ export const RoomSpecSchema = z.object({
     .optional(),
   floor: z.string().max(80).optional(),
   wallPaint: z.string().max(80).optional(),
+  ceiling: z.string().max(80).optional(),
+  wallThicknessIn: z.number().finite().min(2).max(24).optional(),
 });
 
 export type RoomSpec = z.infer<typeof RoomSpecSchema>;
@@ -68,12 +74,11 @@ export interface SpecConversion {
   warnings: string[];
 }
 
-/** A wall-mount item farther than this from any wall is left freestanding (with a warning). */
-const WALL_MOUNT_REACH = inches(8);
+/** Largest outline span (either axis): 100 ft. */
+const MAX_SPAN = 1200;
+const DEFAULT_WALL_THICKNESS = inches(5);
 /** An item's `at` this close to the outline still counts as in the room. */
 const OUTSIDE_SLOP = inches(6);
-const MIN_WALL = inches(1);
-const SHORT_WALL = inches(4);
 const PONY_DEFAULT_H = inches(42);
 
 const FLOOR_IDS = new Set(ALL_FINISHES.filter((f) => f.kind === "floor").map((f) => f.id));
@@ -87,16 +92,91 @@ const fmt = (n: number) => String(r2(n));
 // spec -> doc
 // ---------------------------------------------------------------------------
 
+function allFinite(v: unknown): boolean {
+  if (typeof v === "number") return Number.isFinite(v);
+  if (Array.isArray(v)) return v.every(allFinite);
+  if (v && typeof v === "object") return Object.values(v as Record<string, unknown>).every(allFinite);
+  return true;
+}
+
+/** Throws if any number anywhere in the doc is NaN/Infinity (JSON would silently store null). */
+export function assertDocFinite(doc: DesignDoc): void {
+  if (!allFinite(doc)) throw new Error("the converted room contains a non-finite number; check the spec's numbers");
+}
+
+const cross = (o: readonly number[], a: readonly number[], b: readonly number[]) =>
+  (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+
+function onSegment(a: readonly number[], b: readonly number[], p: readonly number[]): boolean {
+  return Math.min(a[0], b[0]) <= p[0] && p[0] <= Math.max(a[0], b[0]) && Math.min(a[1], b[1]) <= p[1] && p[1] <= Math.max(a[1], b[1]);
+}
+
+/** Closed-segment intersection (touching and collinear overlap count). */
+function segmentsIntersect(a: readonly number[], b: readonly number[], c: readonly number[], d: readonly number[]): boolean {
+  const o1 = cross(a, b, c);
+  const o2 = cross(a, b, d);
+  const o3 = cross(c, d, a);
+  const o4 = cross(c, d, b);
+  if (((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) && ((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0))) return true;
+  return (o1 === 0 && onSegment(a, b, c)) || (o2 === 0 && onSegment(a, b, d)) ||
+    (o3 === 0 && onSegment(c, d, a)) || (o4 === 0 && onSegment(c, d, b));
+}
+
+/** Rejects outlines the Studio cannot represent: repeated points, self-crossing, spikes, oversize. */
+function assertSimpleOutline(pts: readonly (readonly number[])[]): void {
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    const p = pts[i];
+    const q = pts[(i + 1) % n];
+    if (p[0] === q[0] && p[1] === q[1]) throw new Error(`outline corners ${i} and ${(i + 1) % n} are the same point (zero-length edge; do not repeat the first point at the end)`);
+  }
+  const xs = pts.map((p) => p[0]);
+  const ys = pts.map((p) => p[1]);
+  if (Math.max(...xs) - Math.min(...xs) > MAX_SPAN || Math.max(...ys) - Math.min(...ys) > MAX_SPAN) {
+    throw new Error(`outline is larger than ${MAX_SPAN / 12} ft in one direction; check the units (inches)`);
+  }
+  for (let i = 0; i < n; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % n];
+    const c = pts[(i + 2) % n];
+    // adjacent edges folding back on themselves (a spike)
+    if (cross(a, b, c) === 0 && (b[0] - a[0]) * (c[0] - b[0]) + (b[1] - a[1]) * (c[1] - b[1]) < 0) {
+      throw new Error(`outline doubles back on itself at corner ${(i + 1) % n}`);
+    }
+    for (let j = i + 2; j < n; j++) {
+      if (i === 0 && j === n - 1) continue; // adjacent through the wrap
+      if (segmentsIntersect(a, b, pts[j], pts[(j + 1) % n])) {
+        throw new Error(`outline edges ${i} and ${j} cross or touch; the outline must be a simple closed shape`);
+      }
+    }
+  }
+}
+
+function cleanFinishes(finishes: Record<string, string> | undefined, tag: string, warnings: string[]): Record<string, string> | undefined {
+  if (!finishes) return undefined;
+  const out: Record<string, string> = {};
+  for (const [slot, id] of Object.entries(finishes)) {
+    if (FINISH_IDS.has(id)) out[slot] = id;
+    else warnings.push(`${tag}: finish "${id}" for slot "${slot}" is unknown; ignored.`);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 function facingRotation(facing: RoomSpecItem["facing"]): number | null {
   if (facing === undefined) return null;
   // Compass on the sketch: 0 = N (up the page), 90 = E, 180 = S, 270 = W.
   // An item's front is local +Z, rotation r puts the front along (sin r, cos r) in (x, z).
   const deg = facing === "N" ? 0 : facing === "E" ? 90 : facing === "S" ? 180 : facing === "W" ? 270 : facing;
-  return Math.PI - (deg * Math.PI) / 180;
+  if (!Number.isFinite(deg)) throw new Error("facing must be N, S, E, W or a finite number of degrees");
+  // compass degrees wrap: 450 == 90, -90 == 270
+  const norm = ((deg % 360) + 360) % 360;
+  return Math.PI - (norm * Math.PI) / 180;
 }
 
 export function specToDoc(spec: RoomSpec): SpecConversion {
   const warnings: string[] = [];
+  if (!allFinite(spec)) throw new Error("spec contains a non-finite number");
+  assertSimpleOutline(spec.outline);
 
   // Sketch inches -> centered meters (x right, z = sketch y down).
   const xs = spec.outline.map((p) => p[0]);
@@ -116,7 +196,7 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
     room: {
       points,
       height: spec.heightIn ? inches(spec.heightIn) : feet(9),
-      wallThickness: inches(5),
+      wallThickness: spec.wallThicknessIn ? inches(spec.wallThicknessIn) : DEFAULT_WALL_THICKNESS,
     },
     surfaces: {
       floor: DEFAULT_SURFACES.floor,
@@ -135,18 +215,22 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
     else warnings.push(`wallPaint "${spec.wallPaint}" is not a known paint; kept the default (${DEFAULT_SURFACES.wall}).`);
   }
 
+  if (spec.ceiling) {
+    if (PAINT_IDS.has(spec.ceiling)) doc.surfaces.ceiling = spec.ceiling;
+    else warnings.push(`ceiling "${spec.ceiling}" is not a known paint; kept the default (${DEFAULT_SURFACES.ceiling}).`);
+  }
+
   // Freestanding walls.
   (spec.walls ?? []).forEach((w, i) => {
     const a = toPt(w.from);
     const b = toPt(w.to);
     const pose = wallItemPose(a, b);
-    if (pose.w < MIN_WALL) {
-      warnings.push(`walls[${i}] is shorter than 1" and was skipped.`);
-      return;
+    const problem = wallLengthProblem(pose.w);
+    if (problem) {
+      throw new Error(`walls[${i}] is ${fmt(toInches(pose.w))}" long; walls must be between 4" and 288" (${problem === "short" ? "too short" : "too long"})`);
     }
-    if (pose.w < SHORT_WALL) warnings.push(`walls[${i}] is only ${fmt(toInches(pose.w))}" long (the Studio minimum is 4").`);
     const pony = w.kind === "pony";
-    doc.items.push({
+    const wallItem: PlacedItem = {
       id: newItemId(),
       defId: pony ? "pony-wall" : "interior-wall",
       x: pose.x,
@@ -154,7 +238,12 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
       rotation: pose.rotation,
       w: pose.w,
       ...(pony ? { h: w.heightIn ? inches(w.heightIn) : PONY_DEFAULT_H } : w.heightIn ? { h: inches(w.heightIn) } : {}),
-    });
+      ...(w.thicknessIn ? { d: inches(w.thicknessIn) } : {}),
+      ...(w.label ? { label: w.label } : {}),
+    };
+    const wallFinishes = cleanFinishes(w.finishes, `walls[${i}]`, warnings);
+    if (wallFinishes) wallItem.finishes = wallFinishes;
+    doc.items.push(wallItem);
   });
 
   // Items. Interior walls above are already in doc.items, so door/window
@@ -185,8 +274,8 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
 
     if (def.mount === "wall") {
       const facingVec = rot === null ? undefined : { x: Math.sin(rot), z: Math.cos(rot) };
-      const hit = nearestHostWall(at, outlineWalls, snapsToInteriorWalls(def) ? interior : [], facingVec);
-      if (hit && hit.distance <= WALL_MOUNT_REACH) {
+      const hit = nearestHostWall(at, outlineWalls, snapsToInteriorWalls(def) ? interior : [], { facing: facingVec, w, d });
+      if (hit && hit.distance <= HOST_REACH) {
         const off = def.category === "doors-windows" || def.cutsWall ? 0 : d / 2;
         ({ x, z, rotation } = wallMountPose(hit, w, off));
       } else {
@@ -194,15 +283,7 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
       }
     }
 
-    let finishes: Record<string, string> | undefined;
-    if (s.finishes) {
-      finishes = {};
-      for (const [slot, id] of Object.entries(s.finishes)) {
-        if (FINISH_IDS.has(id)) finishes[slot] = id;
-        else warnings.push(`${tag}: finish "${id}" for slot "${slot}" is unknown; ignored.`);
-      }
-      if (Object.keys(finishes).length === 0) finishes = undefined;
-    }
+    const finishes = cleanFinishes(s.finishes, tag, warnings);
 
     const item: PlacedItem = { id: newItemId(), defId: def.id, x, z, rotation };
     if (s.elevationIn !== undefined) item.y = inches(s.elevationIn);
@@ -214,6 +295,7 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
     doc.items.push(item);
   });
 
+  assertDocFinite(doc);
   return { doc, warnings };
 }
 
@@ -247,8 +329,12 @@ export function docToSpec(doc: DesignDoc): RoomSpec {
       const { a, b } = wallEndpoints(it, it.w ?? def.w);
       const pony = it.defId === "pony-wall";
       const wall: RoomSpecWall = { from: toSketch(a), to: toSketch(b), kind: pony ? "pony" : "full" };
-      const h = it.h ?? (pony ? PONY_DEFAULT_H : undefined);
-      if (h !== undefined && !(pony && Math.abs(h - PONY_DEFAULT_H) < 1e-6)) wall.heightIn = r2(toInches(h));
+      // pony walls always state their height (catalog default 36", spec default 42"); full walls only when overridden
+      const h = it.h ?? (pony ? def.h : undefined);
+      if (h !== undefined) wall.heightIn = r2(toInches(h));
+      if (it.d !== undefined) wall.thicknessIn = r2(toInches(it.d));
+      if (it.label) wall.label = it.label;
+      if (it.finishes && Object.keys(it.finishes).length) wall.finishes = it.finishes;
       walls.push(wall);
       continue;
     }
@@ -268,6 +354,8 @@ export function docToSpec(doc: DesignDoc): RoomSpec {
     floor: doc.surfaces.floor,
     wallPaint: doc.surfaces.walls.all,
   };
+  if (doc.surfaces.ceiling !== DEFAULT_SURFACES.ceiling) spec.ceiling = doc.surfaces.ceiling;
+  if (Math.abs(doc.room.wallThickness - DEFAULT_WALL_THICKNESS) > 1e-9) spec.wallThicknessIn = r2(toInches(doc.room.wallThickness));
   if (walls.length) spec.walls = walls;
   if (items.length) spec.items = items;
   return spec;
@@ -309,10 +397,10 @@ export const ROOM_SPEC_FORMAT =
   "SPEC FORMAT (all lengths in INCHES; sketch frame: x grows to the right, y grows DOWN the page, so north is up; the origin is arbitrary, the room is centered for you).\n" +
   "EXAMPLE (8x5 ft half bath): " + JSON.stringify(ROOM_SPEC_EXAMPLE) + "\n" +
   "FIELDS: { outline: [[x,y],...] (closed polygon, 3+ corners, do not repeat the first point), heightIn?: ceiling height (default 108), " +
-  "walls?: [{ from:[x,y], to:[x,y], kind?: 'full'|'pony', heightIn? }] (freestanding interior walls drawn center-line to center-line, ~4.5in thick; pony = 42in half wall unless heightIn; a doorway is a wall with a door/doorway-open item in it, or two shorter walls with a gap), " +
+  "walls?: [{ from:[x,y], to:[x,y], kind?: 'full'|'pony', heightIn?, thicknessIn?, label?, finishes? }] (freestanding interior walls drawn center-line to center-line, 4in to 288in long, ~4.5in thick; pony = 42in half wall unless heightIn; a doorway is a wall with a door/doorway-open item in it, or two shorter walls with a gap), " +
   "items?: [{ type: <catalog id>, at:[x,y] (item CENTER), facing?: 'N'|'S'|'E'|'W' or compass degrees (0=N,90=E,180=S,270=W) = the direction the item's FRONT points (a toilet against the west wall faces E), widthIn?, depthIn?, heightIn?, elevationIn? (bottom above floor, e.g. a window sill), label?, finishes?: {slot: finishId} }], " +
-  "floor?: floor finish id, wallPaint?: paint finish id }.\n" +
-  "Doors, windows, doorway-open and niches (wall-mount items) snap onto the nearest wall (room outline or an interior wall) when their `at` is within 8in of it, aligned and flush; their `at` only needs to be near the wall. They face into the room (for an interior wall, the side that `at` or `facing` is on). A door in an interior wall cuts a real opening. A wall-mount item farther than 8in from any wall is left freestanding and reported as a warning. " +
+  "floor?: floor finish id, wallPaint?: paint finish id, ceiling?: paint id, wallThicknessIn? (outer walls, default 5) }.\n" +
+  "Doors, windows and doorway-open (wall-mount items; niches snap to the outline only) snap onto the nearest wall (room outline or an interior wall) when their `at` is within 8in of it, aligned and flush; their `at` only needs to be near the wall. They face into the room (for an interior wall, the side that `at` or `facing` is on). A door in an interior wall cuts a real opening. A wall-mount item farther than 8in from any wall is left freestanding and reported as a warning. " +
   "All other items are placed exactly at `at` with their center there; they do NOT auto-snap, so compute the center (e.g. a 28in-deep toilet whose back touches the west wall at x=0 has center x=14 and faces E). " +
   "Unknown types or items outside the outline come back in `warnings` (unknown types are skipped).\n";
 

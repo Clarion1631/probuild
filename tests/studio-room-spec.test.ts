@@ -162,3 +162,70 @@ test("tool help teaches the format, lists catalog ids, and its example is a vali
   const { warnings } = specToDoc(RoomSpecSchema.parse(ROOM_SPEC_EXAMPLE));
   assert.deepEqual(warnings, []);
 });
+
+// ---- review round 1 ----
+
+const BOX: RoomSpec["outline"] = [[0, 0], [120, 0], [120, 96], [0, 96]];
+
+test("outline validation: self-crossing, repeated points, spikes and oversize are rejected", () => {
+  assert.throws(() => specToDoc({ outline: [[0, 0], [100, 100], [100, 0], [0, 100]] }), /cross or touch/);
+  assert.throws(() => specToDoc({ outline: [[0, 0], [100, 0], [100, 0], [100, 80], [0, 80]] }), /same point/);
+  assert.throws(() => specToDoc({ outline: [[0, 0], [100, 0], [100, 80], [0, 80], [0, 0]] }), /same point/);
+  assert.throws(() => specToDoc({ outline: [[0, 0], [100, 0], [50, 0], [50, 80]] }), /doubles back|cross or touch/);
+  assert.throws(() => specToDoc({ outline: [[0, 0], [1300, 0], [1300, 80], [0, 80]] }), /larger than/);
+  assert.throws(() => specToDoc({ outline: [[0, 0], [NaN, 0], [100, 80]] }), /non-finite/);
+  // an L shape is fine
+  specToDoc({ outline: [[0, 0], [100, 0], [100, 40], [50, 40], [50, 80], [0, 80]] });
+});
+
+test("facing degrees wrap modulo 360 and non-finite facing is rejected", () => {
+  const rot = (facing: number | "E") => specToDoc({ outline: BOX, items: [{ type: "sofa", at: [60, 48], facing }] }).doc.items[0].rotation;
+  assert.ok(Math.abs(rot(450) - rot("E")) < 1e-9);
+  assert.ok(Number.isFinite(rot(1e308)));
+  assert.ok(Math.abs(rot(-90) - rot(270)) < 1e-9);
+  assert.throws(() => specToDoc({ outline: BOX, items: [{ type: "sofa", at: [60, 48], facing: Infinity }] }), /non-finite|facing/);
+});
+
+test("spec walls obey the Studio 4in-288in bounds", () => {
+  assert.throws(() => specToDoc({ outline: BOX, walls: [{ from: [10, 10], to: [12, 10] }] }), /too short/);
+  assert.throws(() => specToDoc({ outline: [[0, 0], [400, 0], [400, 80], [0, 80]], walls: [{ from: [0, 40], to: [300, 40] }] }), /too long/);
+  specToDoc({ outline: BOX, walls: [{ from: [10, 10], to: [14, 10] }] });
+});
+
+test("pony wall height round trips (catalog default 36in is stated, not mistaken for 42in)", () => {
+  const { doc } = specToDoc({ outline: BOX, walls: [{ from: [10, 10], to: [60, 10], kind: "pony" }] });
+  assert.ok(Math.abs(toInches(doc.items[0].h!) - 42) < 1e-9);
+  // a doc whose pony wall has no explicit height renders at the catalog 36in
+  const bare = { ...doc, items: [{ ...doc.items[0], h: undefined }] };
+  assert.equal(docToSpec(bare).walls![0].heightIn, 36);
+  assert.equal(docToSpec(doc).walls![0].heightIn, 42);
+});
+
+test("wall label, finishes, thickness, ceiling and room wall thickness round trip", () => {
+  const { doc, warnings } = specToDoc({
+    outline: BOX,
+    wallThicknessIn: 6,
+    ceiling: "paint-swiss-coffee",
+    walls: [{ from: [10, 10], to: [60, 10], label: "Chase wall", thicknessIn: 6, finishes: { paint: "paint-naval" } }],
+  });
+  assert.deepEqual(warnings, []);
+  assert.ok(Math.abs(toInches(doc.room.wallThickness) - 6) < 1e-9);
+  assert.equal(doc.surfaces.ceiling, "paint-swiss-coffee");
+  const back = docToSpec(doc);
+  assert.equal(back.ceiling, "paint-swiss-coffee");
+  assert.equal(back.wallThicknessIn, 6);
+  assert.equal(back.walls![0].label, "Chase wall");
+  assert.equal(back.walls![0].thicknessIn, 6);
+  assert.deepEqual(back.walls![0].finishes, { paint: "paint-naval" });
+});
+
+test("niches are outline-only: a niche near an interior wall does not snap onto it", () => {
+  const { doc } = specToDoc({
+    outline: [[0, 0], [200, 0], [200, 160], [0, 160]],
+    walls: [{ from: [60, 20], to: [140, 20] }],
+    items: [{ type: "shower-niche", at: [100, 22] }],
+  });
+  const niche = doc.items[1];
+  // stays near the interior wall (not snapped onto its centerline) - it is left alone as freestanding
+  assert.ok(Math.abs(toInches(niche.z - doc.items[0].z) - 2) < 0.5);
+});

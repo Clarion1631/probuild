@@ -176,8 +176,8 @@ function ItemNode({
   // Computed from committed state only, so it updates on drop/delete and
   // never during a drag frame.
   const openings = useMemo(
-    () => (isOpeningHost(def.id) ? openingsOnWall(item, allItems) : undefined),
-    [def.id, item, allItems],
+    () => (isOpeningHost(def.id) ? openingsOnWall(item, allItems, walls) : undefined),
+    [def.id, item, allItems, walls],
   );
 
   const planeY = def.mount === "wall" || def.mount === "ceiling" ? 0 : baseY;
@@ -199,7 +199,7 @@ function ItemNode({
       // Wall items slide along the nearest wall, always flush. Items that cut
       // into the wall (doors, windows, niches) center on the wall face.
       // Doors/windows/niches also snap to freestanding interior walls (both faces).
-      const hit = nearestHostWall({ x, z }, walls, interiorSegs);
+      const hit = nearestHostWall({ x, z }, walls, interiorSegs, { w, d });
       if (hit) {
         const off = def.category === "doors-windows" || def.cutsWall ? 0 : d / 2;
         // wallMountPose clamps t so the item stays within the wall span.

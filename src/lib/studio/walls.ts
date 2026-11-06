@@ -193,6 +193,8 @@ export interface WallOpening {
 
 /** A door/window/opening within this much of the wall face counts as in the wall. */
 const OPENING_FACE_SLOP = inches(1);
+/** A door/window whose center is this close to an outline segment is hosted by the outline, not by a freestanding wall. */
+const OUTLINE_HOST_TOL = inches(1);
 /** Max angle (radians) between a door's rotation and the wall's to count as parallel. */
 const OPENING_PARALLEL_TOL = 0.05;
 const MIN_OPENING = inches(0.5);
@@ -203,9 +205,11 @@ const MIN_OPENING = inches(0.5);
  * (the projection is clamped to the wall's own length, never the infinite
  * line, so short stubs that line up with a door get no phantom opening) and it
  * is parallel to the wall (either face). Openings are clipped to the wall.
+ * Items hosted on the room OUTLINE (center within 1" of an outline segment)
+ * never cut a freestanding wall, even one drawn right beside that face.
  * Pure function of committed doc state.
  */
-export function openingsOnWall(wall: PlacedItem, items: PlacedItem[]): WallOpening[] {
+export function openingsOnWall(wall: PlacedItem, items: PlacedItem[], outline: WallSeg[] = []): WallOpening[] {
   const wdef = getItemDef(wall.defId);
   if (!wdef) return [];
   const L = wall.w ?? wdef.w;
@@ -221,15 +225,19 @@ export function openingsOnWall(wall: PlacedItem, items: PlacedItem[]): WallOpeni
     const dz = it.z - wall.z;
     const s = dx * ux + dz * uz;
     const sc = Math.max(-L / 2, Math.min(L / 2, s));
-    if (Math.hypot(dx - ux * sc, dz - uz * sc) > T / 2 + OPENING_FACE_SLOP) continue;
+    if (!(Math.hypot(dx - ux * sc, dz - uz * sc) <= T / 2 + OPENING_FACE_SLOP)) continue;
+    if (outline.length > 0) {
+      const onOutline = nearestWall({ x: it.x, z: it.z }, outline);
+      if (onOutline && onOutline.distance <= OUTLINE_HOST_TOL) continue;
+    }
     let diff = (it.rotation - wall.rotation) % Math.PI;
     if (diff > Math.PI / 2) diff -= Math.PI;
     if (diff < -Math.PI / 2) diff += Math.PI;
-    if (Math.abs(diff) > OPENING_PARALLEL_TOL) continue;
+    if (!(Math.abs(diff) <= OPENING_PARALLEL_TOL)) continue;
     const ow = it.w ?? def.w;
     const lo = Math.max(-L / 2, s - ow / 2);
     const hi = Math.min(L / 2, s + ow / 2);
-    if (hi - lo < MIN_OPENING) continue;
+    if (!(hi - lo >= MIN_OPENING)) continue;
     const bottom = it.y ?? def.elevation ?? 0;
     out.push({ center: (lo + hi) / 2, width: hi - lo, bottom, top: bottom + (it.h ?? def.h) });
   }
@@ -253,29 +261,45 @@ export function interiorWallSegs(items: PlacedItem[]): WallSeg[] {
 
 /** Interior walls must be this much closer than the outline to win a snap. */
 const INTERIOR_SNAP_BIAS = 0.02;
+/** A freestanding wall only hosts an item within this reach (measured from the item's back face). */
+export const HOST_REACH = inches(8);
+
+export interface HostOpts {
+  /** Direction the item faces; picks the wall side when the point is on the wall line. */
+  facing?: Pt;
+  /** Item width: walls shorter than this cannot host it. */
+  w?: number;
+  /** Item depth: reach is measured from the back face (center - d/2). */
+  d?: number;
+}
 
 /**
  * Nearest wall for wall-mount snapping, considering the room outline and
- * freestanding walls. For an interior wall the normal is flipped to the side
- * the point is on (or the side `facing` points to, when the point is on the
- * wall line). With no interior walls this is exactly nearestWall(outline).
+ * freestanding walls. A freestanding wall only wins when it is long enough
+ * for the item and within HOST_REACH of it, and closer than the outline; for
+ * it the normal is flipped to the side the point is on (or `facing`, when the
+ * point is on the wall line). Otherwise this is exactly nearestWall(outline).
  */
-export function nearestHostWall(p: Pt, outline: WallSeg[], interior: WallSeg[], facing?: Pt): WallHit | null {
+export function nearestHostWall(p: Pt, outline: WallSeg[], interior: WallSeg[], opts: HostOpts = {}): WallHit | null {
   const base = nearestWall(p, outline);
-  if (interior.length === 0) return base;
-  const ih = nearestWall(p, interior);
+  const { facing, w = 0, d = 0 } = opts;
+  const usable = interior.filter((seg) => seg.length >= w);
+  if (usable.length === 0) return base;
+  const ih = nearestWall(p, usable);
   if (!ih) return base;
+  if (!(Math.max(0, ih.distance - d / 2) <= HOST_REACH)) return base;
   if (base && ih.distance + INTERIOR_SNAP_BIAS >= base.distance) return base;
-  const w = ih.wall;
-  let side = (p.x - ih.point.x) * w.normal.x + (p.z - ih.point.z) * w.normal.z;
-  if (Math.abs(side) < 1e-6 && facing) side = facing.x * w.normal.x + facing.z * w.normal.z;
-  const wall = side < 0 ? { ...w, normal: { x: -w.normal.x, z: -w.normal.z } } : w;
+  const wl = ih.wall;
+  let side = (p.x - ih.point.x) * wl.normal.x + (p.z - ih.point.z) * wl.normal.z;
+  if (Math.abs(side) < 1e-6 && facing) side = facing.x * wl.normal.x + facing.z * wl.normal.z;
+  const wall = side < 0 ? { ...wl, normal: { x: -wl.normal.x, z: -wl.normal.z } } : wl;
   return { ...ih, wall };
 }
 
 /** Pose of a wall-mount item snapped onto a wall hit; `off` = offset along the wall normal. */
 export function wallMountPose(hit: WallHit, w: number, off: number): { x: number; z: number; rotation: number } {
-  const halfFrac = w / 2 / hit.wall.length;
+  // An item wider than the wall centers on it (never an inverted clamp).
+  const halfFrac = Math.min(0.5, w / 2 / hit.wall.length);
   const t = Math.min(1 - halfFrac, Math.max(halfFrac, hit.t));
   return {
     x: hit.wall.a.x + hit.wall.dir.x * hit.wall.length * t + hit.wall.normal.x * off,
@@ -284,7 +308,10 @@ export function wallMountPose(hit: WallHit, w: number, off: number): { x: number
   };
 }
 
-/** Whether a wall-mount def snaps to freestanding walls (doors/windows and niches only). */
+/**
+ * Whether a wall-mount def snaps to freestanding walls: doors and windows only.
+ * Niches stay outline-only until they can cut a pocket in a freestanding wall.
+ */
 export function snapsToInteriorWalls(def: { category: string; cutsWall?: boolean }): boolean {
-  return def.category === "doors-windows" || !!def.cutsWall;
+  return def.category === "doors-windows" && !def.cutsWall;
 }

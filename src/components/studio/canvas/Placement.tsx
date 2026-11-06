@@ -69,10 +69,9 @@ function PlacementInner({ doc, placing }: { doc: DesignDoc; placing: CatalogItem
 
     if (placing.mount === "wall") {
       // Doors/windows/niches also snap to freestanding interior walls (both faces).
-      const hit = nearestHostWall({ x, z }, walls, interiorSegs);
+      const hit = nearestHostWall({ x, z }, walls, interiorSegs, { w: placing.w, d: placing.d });
       if (hit) {
-        // (outline offsets are unchanged; a niche in a freestanding wall centers on it)
-        const off = placing.category === "doors-windows" || (placing.cutsWall && hit.wall.index === -1) ? 0 : placing.d / 2;
+        const off = placing.category === "doors-windows" ? 0 : placing.d / 2;
         return wallMountPose(hit, placing.w, off);
       }
     }

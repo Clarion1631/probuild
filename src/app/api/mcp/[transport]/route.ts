@@ -19,7 +19,7 @@ import { logActivity } from "@/lib/activity-log";
 import { getUserWithPermissionsByEmail } from "@/lib/permissions";
 import { canAccessJobScope } from "@/lib/access-rules";
 import { fromRoomRecord, toApiPayload, type ApiRoomAsset, type DesignDoc } from "@/lib/studio/doc";
-import { RoomSpecSchema, ROOM_SPEC_FORMAT, ROOM_SPEC_HELP, docToSpec, specToDoc } from "@/lib/studio/room-spec";
+import { RoomSpecSchema, ROOM_SPEC_FORMAT, ROOM_SPEC_HELP, assertDocFinite, docToSpec, specToDoc } from "@/lib/studio/room-spec";
 import { getItemDef } from "@/lib/studio/catalog";
 import {
     MAX_UPLOAD_BASE64_CHARS,
@@ -240,6 +240,8 @@ function roomDocLosses(doc: DesignDoc): string[] {
     const wallKeys = Object.keys(doc.surfaces.walls).filter(k => k !== "all");
     if (wallKeys.length) out.push("per-wall paint");
     if (doc.items.some(i => i.led)) out.push("LED strips");
+    if (doc.items.some(i => (i.defId === "interior-wall" || i.defId === "pony-wall") && i.y !== undefined)) out.push("interior/pony wall elevation");
+    if (doc.items.length) out.push("item ids (regenerated on update, so anything referring to an item id by value is reset)");
     const unknown = doc.items.filter(i => !getItemDef(i.defId)).length;
     if (unknown) out.push(`${unknown} item(s) with catalog ids this spec cannot express`);
     return out;
@@ -1441,6 +1443,7 @@ function createHandler(actor: RouteMcpActor) {
                     await assertRoomJobAccess(actor, { projectId: projectId ?? null, leadId: leadId ?? null });
 
                     const { doc, warnings } = specToDoc(spec);
+                    assertDocFinite(doc);
                     const payload = toApiPayload(doc);
                     // Mirrors POST /api/rooms: layoutJson + RoomAsset mirror in one nested create.
                     const room = await prisma.roomDesign.create({
@@ -1540,6 +1543,7 @@ function createHandler(actor: RouteMcpActor) {
                     if (room.updatedAt.getTime() !== expected.getTime()) throw stale();
 
                     const { doc, warnings } = specToDoc(spec);
+                    assertDocFinite(doc);
                     const payload = toApiPayload(doc);
                     const droppedFeatures = roomDocLosses(fromRoomRecord({
                         id: room.id, name: room.name, roomType: room.roomType, layoutJson: room.layoutJson, assets: [],
