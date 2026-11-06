@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { specToDoc, docToSpec, RoomSpecSchema, ROOM_SPEC_HELP, ROOM_SPEC_EXAMPLE, type RoomSpec } from "../src/lib/studio/room-spec";
 import { openingsOnWall, wallItemPose } from "../src/lib/studio/walls";
+import { wallSegments } from "../src/lib/studio/geometry";
 import { inches, toInches } from "../src/lib/studio/units";
 
 // Kalca master bath reference spec (docs/STUDIO-WALLS-SPEC.md). Inches, x right, y down.
@@ -262,4 +263,29 @@ test("wall-type items obey the wall length bounds", () => {
   assert.throws(() => specToDoc({ outline: BOX, items: [{ type: "interior-wall-doorway", at: [60, 48], widthIn: 40 }] }), /between 72" and 288"/);
   specToDoc({ outline: BOX, items: [{ type: "interior-wall", at: [60, 48], widthIn: 60 }, { type: "interior-wall-doorway", at: [60, 20], widthIn: 100 }] });
   assert.match(ROOM_SPEC_HELP, /walls\[\], not items\[\]/);
+});
+
+// ---- review round 3 ----
+
+test("T-junction repro: door snapped to the horizontal wall at a perpendicular wall's line cuts only the horizontal wall", () => {
+  const { doc, warnings } = specToDoc({
+    outline: [[0, 0], [200, 0], [200, 160], [0, 160]],
+    walls: [{ from: [66, 30], to: [66, 130] }, { from: [50, 80], to: [150, 80] }],
+    items: [{ type: "door-single", at: [50, 81], widthIn: 32 }],
+  });
+  assert.deepEqual(warnings, []);
+  const [vertical, horizontal] = doc.items;
+  const h = openingsOnWall(horizontal, doc.items, wallSegments(doc.room.points));
+  assert.equal(h.length, 1);
+  assert.ok(Math.abs(toInches(h[0].width) - 32) < 0.01);
+  assert.equal(openingsOnWall(vertical, doc.items, wallSegments(doc.room.points)).length, 0);
+});
+
+test("stored wall length is clamped to 4in-288in after the tolerance check", () => {
+  const short = specToDoc({ outline: BOX, walls: [{ from: [20, 20], to: [22.82, 22.82] }] }).doc.items[0];
+  assert.ok(toInches(short.w!) >= 4 - 1e-9, `short wall stored at ${toInches(short.w!)}`);
+  const long = specToDoc({ outline: [[0, 0], [400, 0], [400, 80], [0, 80]], walls: [{ from: [0, 40], to: [288.04, 40] }] }).doc.items[0];
+  assert.ok(toInches(long.w!) <= 288 + 1e-9);
+  const asItem = specToDoc({ outline: BOX, items: [{ type: "interior-wall", at: [60, 48], widthIn: 3.97 }] }).doc.items[0];
+  assert.ok(toInches(asItem.w!) >= 4 - 1e-9);
 });

@@ -240,7 +240,8 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
       x: pose.x,
       z: pose.z,
       rotation: pose.rotation,
-      w: pose.w,
+      // stored length is always inside the strict 4"-288" range (inputs within the slop are clamped)
+      w: Math.min(WALL_MAX, Math.max(WALL_MIN, pose.w)),
       ...(pony ? { h: w.heightIn ? inches(w.heightIn) : PONY_DEFAULT_H } : w.heightIn ? { h: inches(w.heightIn) } : {}),
       ...(w.thicknessIn ? { d: inches(w.thicknessIn) } : {}),
       ...(w.label ? { label: w.label } : {}),
@@ -271,10 +272,12 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
       warnings.push(`${tag} at [${fmt(s.at[0])}, ${fmt(s.at[1])}] is outside the room outline; placed anyway.`);
     }
 
+    let storedW = w;
     if (isWallDef(def.id)) {
       // wall-type items obey the same length bounds as walls[] (the doorway wall has its own catalog minimum)
       const lo = def.resizable?.min ?? WALL_MIN;
       const hi = def.resizable?.max ?? WALL_MAX;
+      storedW = Math.min(hi, Math.max(lo, w));
       if (w < lo - LEN_SLOP || w > hi + LEN_SLOP) {
         throw new Error(`${tag}: a ${def.id} must be between ${fmt(toInches(lo))}" and ${fmt(toInches(hi))}" long (widthIn ${fmt(toInches(w))}")`);
       }
@@ -300,7 +303,7 @@ export function specToDoc(spec: RoomSpec): SpecConversion {
 
     const item: PlacedItem = { id: newItemId(), defId: def.id, x, z, rotation };
     if (s.elevationIn !== undefined) item.y = inches(s.elevationIn);
-    if (s.widthIn) item.w = w;
+    if (s.widthIn) item.w = storedW;
     if (s.depthIn) item.d = d;
     if (s.heightIn) item.h = inches(s.heightIn);
     if (finishes) item.finishes = finishes;

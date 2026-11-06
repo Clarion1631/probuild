@@ -226,7 +226,7 @@ export function openingsOnWall(wall: PlacedItem, items: PlacedItem[], outline: W
     const s = dx * ux + dz * uz;
     const sc = Math.max(-L / 2, Math.min(L / 2, s));
     if (!(Math.hypot(dx - ux * sc, dz - uz * sc) <= T / 2 + OPENING_FACE_SLOP)) continue;
-    const host = nearestHostWall({ x: it.x, z: it.z }, outline, hosts, { w: it.w ?? def.w, d: it.d ?? def.d });
+    const host = nearestHostWall({ x: it.x, z: it.z }, outline, hosts, { w: it.w ?? def.w, d: it.d ?? def.d, rotation: it.rotation });
     if (!host || (host.wall as HostSeg).itemId !== wall.id) continue;
     let diff = (it.rotation - wall.rotation) % Math.PI;
     if (diff > Math.PI / 2) diff -= Math.PI;
@@ -280,6 +280,12 @@ export interface HostOpts {
    * outline, like the Studio's drag/place.
    */
   reach?: number;
+  /**
+   * The item's own rotation. When set, only walls the item is parallel to
+   * (either face, within tolerance) are candidates, so a perpendicular wall
+   * at a T-junction can never steal the host from the wall that really holds it.
+   */
+  rotation?: number;
 }
 
 /**
@@ -290,6 +296,13 @@ export interface HostOpts {
  * point is on the wall line). Otherwise this is exactly nearestWall(outline).
  */
 export function nearestHostWall(p: Pt, outline: WallSeg[], interior: WallSeg[], opts: HostOpts = {}): WallHit | null {
+  if (opts.rotation !== undefined) {
+    const ux = Math.cos(opts.rotation);
+    const uz = -Math.sin(opts.rotation);
+    const parallel = (seg: WallSeg) => Math.abs(ux * seg.dir.z - uz * seg.dir.x) <= Math.sin(OPENING_PARALLEL_TOL);
+    outline = outline.filter(parallel);
+    interior = interior.filter(parallel);
+  }
   const hit = pickHostWall(p, outline, interior, opts);
   if (hit && opts.reach !== undefined && !(Math.max(0, hit.distance - (opts.d ?? 0) / 2) <= opts.reach)) return null;
   return hit;
@@ -329,4 +342,19 @@ export function wallMountPose(hit: WallHit, w: number, off: number): { x: number
  */
 export function snapsToInteriorWalls(def: { category: string; cutsWall?: boolean }): boolean {
   return def.category === "doors-windows" && !def.cutsWall;
+}
+
+/**
+ * True when a door/window is hosted by a freestanding wall (per the same host
+ * rule that snaps and cuts), so the room outline must not also cut a hole for
+ * it. Always false when the room has no freestanding walls.
+ */
+export function hostedByInteriorWall(item: PlacedItem, outline: WallSeg[], interior: HostSeg[]): boolean {
+  if (interior.length === 0) return false;
+  const def = getItemDef(item.defId);
+  if (!def || !snapsToInteriorWalls(def)) return false;
+  const host = nearestHostWall({ x: item.x, z: item.z }, outline, interior, {
+    w: item.w ?? def.w, d: item.d ?? def.d, rotation: item.rotation,
+  });
+  return !!host && (host.wall as HostSeg).itemId !== undefined;
 }

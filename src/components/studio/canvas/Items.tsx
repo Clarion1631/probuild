@@ -16,7 +16,7 @@ import {
 } from "@/lib/studio/geometry";
 import { inches, formatFtIn } from "@/lib/studio/units";
 import {
-  interiorWallSegs, isOpeningHost, nearestHostWall, openingsOnWall, snapsToInteriorWalls, wallMountPose,
+  hostedByInteriorWall, interiorWallSegs, isOpeningHost, nearestHostWall, openingsOnWall, snapsToInteriorWalls, wallMountPose,
 } from "@/lib/studio/walls";
 import { deckTopYAt, isDeckPlatform } from "@/lib/studio/stacking";
 import { useStudio } from "../store";
@@ -150,9 +150,11 @@ function ItemNode({
   // them together with the wall they sit in.
   const hostWallIndex = useMemo(() => {
     if (def.category !== "doors-windows" && !def.cutsWall) return undefined;
+    // a door/window hosted by a freestanding wall is not tied to an outline wall
+    if (def.category === "doors-windows" && hostedByInteriorWall(item, walls, interiorWallSegs(allItems))) return undefined;
     const hit = nearestWall({ x: item.x, z: item.z }, walls);
     return hit && hit.distance < 0.4 ? hit.wall.index : undefined;
-  }, [def, item.x, item.z, walls]);
+  }, [def, item, allItems, walls]);
 
   const obbOthers = useMemo(() => {
     if (!def.wallSnap && def.category !== "cabinets") return [];
