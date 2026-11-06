@@ -9,7 +9,7 @@
 import { create } from "zustand";
 import type { DesignDoc, PlacedItem } from "@/lib/studio/doc";
 import { emptyDoc, newItemId, type Pt } from "@/lib/studio/doc";
-import { wallItemPose } from "@/lib/studio/walls";
+import { wallItemPose, wallLengthProblem } from "@/lib/studio/walls";
 import { inches } from "@/lib/studio/units";
 import { getItemDef, type CatalogItem } from "@/lib/studio/catalog";
 import { deckTopYAt, isDeckPlatform, restackFloorItems } from "@/lib/studio/stacking";
@@ -113,6 +113,8 @@ export const useStudio = create<StudioState>((set, get) => ({
       undoStack: [],
       redoStack: [],
       selectedId: null,
+      drawingWalls: false,
+      placing: null,
       dirty: false,
       saveState: "saved",
       docRev: s.docRev + 1,
@@ -164,6 +166,7 @@ export const useStudio = create<StudioState>((set, get) => ({
     const def = getItemDef(defId);
     if (!def) return null;
     const pose = wallItemPose(a, b);
+    if (wallLengthProblem(pose.w)) return null;
     const id = newItemId();
     const item: PlacedItem = {
       id,

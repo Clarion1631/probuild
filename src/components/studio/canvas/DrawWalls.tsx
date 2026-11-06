@@ -13,12 +13,10 @@ import { toast } from "sonner";
 import type { DesignDoc, Pt } from "@/lib/studio/doc";
 import { getItemDef } from "@/lib/studio/catalog";
 import { inches, formatFtIn } from "@/lib/studio/units";
-import { parseLength, snapDrawPoint, drawAnchors, lengthKeyEdit } from "@/lib/studio/walls";
+import { parseLength, snapDrawPoint, drawAnchors, lengthKeyEdit, wallLengthProblem, WALL_MIN, WALL_MAX } from "@/lib/studio/walls";
 import { useStudio } from "../store";
 import { resolveItem } from "./Items";
 
-const MIN_LEN = inches(4);
-const MAX_TYPED = inches(288);
 const CLICK_SLOP_PX = 5;
 const PREVIEW_Y = 0.05;
 
@@ -42,6 +40,10 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
   const cursorRef = useRef(cursor);
   const typingRef = useRef(typing);
   const shiftRef = useRef(false);
+  /** Direction of the last committed segment (unit x/z); fallback for typed lengths. */
+  const lastDirRef = useRef<Pt | null>(null);
+  const docEpoch = useStudio((s) => s.docEpoch);
+  const epochRef = useRef(docEpoch);
   const applyTypedRef = useRef<(text: string) => void>(() => {});
   // Refs update synchronously with state so a click or key that lands before
   // React re-renders (fast double-click, click-then-type) sees the latest points.
@@ -75,7 +77,15 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
     setStartPt(null);
     setCursorPt(null);
     setTypingText(null);
+    lastDirRef.current = null;
   }, [setStartPt, setCursorPt, setTypingText]);
+
+  // Undo / redo / load replaced the doc: the chain's start point is stale.
+  useEffect(() => {
+    if (epochRef.current === docEpoch) return;
+    epochRef.current = docEpoch;
+    endChain();
+  }, [docEpoch, endChain]);
 
   // Esc ends the chain; Esc with no chain leaves draw mode. Digits open the length box.
   useEffect(() => {
@@ -115,9 +125,17 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [endChain, setDrawingWalls, setTypingText]);
 
-  const commit = (a: Pt, b: Pt) => {
-    if (Math.hypot(b.x - a.x, b.z - a.z) < MIN_LEN) return false;
-    addWall(a, b, kind);
+  const commit = (a: Pt, b: Pt, quietShort = false): boolean => {
+    const len = Math.hypot(b.x - a.x, b.z - a.z);
+    const problem = wallLengthProblem(len);
+    if (problem) {
+      if (problem === "long" || !quietShort) {
+        toast.error(`Walls run from ${formatFtIn(WALL_MIN)} to ${formatFtIn(WALL_MAX)}`);
+      }
+      return false;
+    }
+    if (!addWall(a, b, kind)) return false;
+    lastDirRef.current = { x: (b.x - a.x) / len, z: (b.z - a.z) / len };
     setStartPt(b);
     setCursorPt(b);
     return true;
@@ -145,7 +163,7 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
       setCursorPt(p);
       return;
     }
-    commit(s, p);
+    commit(s, p, true); // a too-short click is usually a stray double-click: ignore quietly
   };
 
   const applyTyped = (text: string) => {
@@ -153,26 +171,25 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
     if (!s) return;
     const len = parseLength(text);
     if (len === null) {
-      toast.error("Type a length like 54, 4'6\" or 10'");
-      return;
-    }
-    if (len < MIN_LEN || len > MAX_TYPED) {
-      toast.error(`Walls run from ${formatFtIn(MIN_LEN)} to ${formatFtIn(MAX_TYPED)}`);
+      toast.error("Type a length like 54 (inches), 4'6\" or 10'");
       return;
     }
     const c = cursorRef.current ?? s;
     let dx = c.x - s.x;
     let dz = c.z - s.z;
     const d = Math.hypot(dx, dz);
-    if (d < 1e-6) {
-      dx = 1;
-      dz = 0;
-    } else {
+    if (d >= 1e-6) {
       dx /= d;
       dz /= d;
+    } else if (lastDirRef.current) {
+      dx = lastDirRef.current.x;
+      dz = lastDirRef.current.z;
+    } else {
+      dx = 1;
+      dz = 0;
     }
-    setTypingText(null);
-    commit(s, { x: s.x + dx * len, z: s.z + dz * len });
+    // Close the box only when the wall was actually added.
+    if (commit(s, { x: s.x + dx * len, z: s.z + dz * len })) setTypingText(null);
   };
 
   useEffect(() => {
@@ -222,28 +239,30 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
           <meshBasicMaterial color="#2563eb" transparent opacity={0.45} depthTest={false} side={THREE.DoubleSide} />
         </mesh>
       )}
-      {/* live length label, or the typed-length box */}
-      {a && (hasSegment || typing !== null) && (
+      {/* live length label: pointer-events none on the Html wrapper itself so it
+          never becomes the event target (R3F derives the ray from the target) */}
+      {a && hasSegment && typing === null && mid && (
+        <Html position={[mid.x, PREVIEW_Y, mid.z]} center zIndexRange={[30, 0]} style={{ pointerEvents: "none" }}>
+          <div
+            style={{
+              background: "rgba(15,23,42,0.85)",
+              color: "#fff",
+              padding: "2px 8px",
+              borderRadius: 6,
+              fontSize: 12,
+              fontFamily: "system-ui, sans-serif",
+              whiteSpace: "nowrap",
+              pointerEvents: "none",
+              transform: "translateY(-18px)",
+            }}
+          >
+            {formatFtIn(len)}
+          </div>
+        </Html>
+      )}
+      {a && typing !== null && (
         <Html position={[mid && hasSegment ? mid.x : a.x, PREVIEW_Y, mid && hasSegment ? mid.z : a.z]} center zIndexRange={[30, 0]}>
-          {typing === null ? (
-            <div
-              style={{
-                background: "rgba(15,23,42,0.85)",
-                color: "#fff",
-                padding: "2px 8px",
-                borderRadius: 6,
-                fontSize: 12,
-                fontFamily: "system-ui, sans-serif",
-                whiteSpace: "nowrap",
-                pointerEvents: "none",
-                transform: "translateY(-18px)",
-              }}
-            >
-              {formatFtIn(len)}
-            </div>
-          ) : (
-            <LengthBox text={typing} setText={setTypingText} onSubmit={applyTyped} onCancel={() => setTypingText(null)} />
-          )}
+          <LengthBox text={typing} setText={setTypingText} onSubmit={applyTyped} onCancel={() => setTypingText(null)} />
         </Html>
       )}
     </group>
@@ -257,7 +276,20 @@ function LengthBox({ text, setText, onSubmit, onCancel }: {
   onCancel: () => void;
 }) {
   const ref = useRef<HTMLInputElement>(null);
+  const rootRef = useRef<HTMLLabelElement>(null);
   const focused = useRef(false);
+  // Keep pointer/wheel events inside the box away from the canvas (R3F would
+  // turn them into a ray from the overlay's own offsetX/Y and draw a wall).
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const stop = (e: Event) => e.stopPropagation();
+    const names = ["pointerdown", "pointermove", "pointerup", "click", "dblclick", "contextmenu", "wheel"];
+    for (const n of names) root.addEventListener(n, stop);
+    return () => {
+      for (const n of names) root.removeEventListener(n, stop);
+    };
+  }, []);
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -267,6 +299,7 @@ function LengthBox({ text, setText, onSubmit, onCancel }: {
   }, []);
   return (
     <label
+      ref={rootRef}
       className="flex items-center gap-1.5 rounded-md border border-blue-400 bg-white px-2 py-1 shadow-lg"
       style={{ transform: "translateY(-22px)" }}
     >
@@ -284,9 +317,10 @@ function LengthBox({ text, setText, onSubmit, onCancel }: {
           // ignore any blur before the box has ever held focus
           if (focused.current) onCancel();
         }}
-        placeholder={"4'6\""}
-        className="w-20 text-right text-xs text-slate-800 outline-none"
+        placeholder={"54 or 4'6\""}
+        className="w-24 text-right text-xs text-slate-800 outline-none"
       />
+      <span className="text-[10px] text-slate-400">in</span>
     </label>
   );
 }

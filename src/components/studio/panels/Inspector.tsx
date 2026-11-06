@@ -139,14 +139,14 @@ function ItemInspector() {
         <Row label={isWall ? "Length" : "Width"}>
           <div className="flex items-center gap-1">
             <Stepper onClick={() => stepW(-1)}>-</Stepper>
-            <SizeInput key={`w${w}`} value={w} onCommit={(v) => setW(clampW(v))} />
+            <SizeInput key={`${item.id}:w:${w}`} value={w} onCommit={(v) => setW(clampW(v))} />
             <Stepper onClick={() => stepW(1)}>+</Stepper>
           </div>
         </Row>
       )}
       {def.resizable?.axis === "wd" && (
         <Row label="Depth">
-          <SizeInput key={`d${d}`} value={d} onCommit={setD} />
+          <SizeInput key={`${item.id}:d:${d}`} value={d} onCommit={setD} />
         </Row>
       )}
 
@@ -397,9 +397,11 @@ function SizeInput({ value, onCommit }: { value: number; onCommit: (meters: numb
       setText(formatFtIn(value));
       return;
     }
+    // Untouched field: re-parsing the 1/4"-rounded text would nudge the item.
+    if (text === formatFtIn(value)) return;
     const parsed = parseLength(text);
     if (parsed === null) {
-      toast.error("Type a size like 54, 4'6\" or 10'");
+      toast.error("Type a size like 54 (inches), 4'6\" or 10'");
       setText(formatFtIn(value));
       return;
     }
@@ -409,8 +411,10 @@ function SizeInput({ value, onCommit }: { value: number; onCommit: (meters: numb
     setText(formatFtIn(value));
   };
   return (
+    <div className="flex items-center gap-1">
     <input
       value={text}
+      placeholder={"54 or 4'6\""}
       onChange={(e) => setText(e.target.value)}
       onFocus={(e) => e.target.select()}
       onBlur={commit}
@@ -423,8 +427,10 @@ function SizeInput({ value, onCommit }: { value: number; onCommit: (meters: numb
         }
       }}
       aria-label="Size"
-      className="w-[72px] rounded-md border border-slate-200 px-1.5 py-1 text-center text-xs font-semibold text-slate-700 outline-none focus:border-blue-400"
+      className="w-[64px] rounded-md border border-slate-200 px-1.5 py-1 text-center text-xs font-semibold text-slate-700 outline-none focus:border-blue-400"
     />
+    <span className="text-[10px] text-slate-400">in</span>
+    </div>
   );
 }
 

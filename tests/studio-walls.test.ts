@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseLength, wallItemPose, wallEndpoints, snapDrawPoint, lengthKeyEdit } from "../src/lib/studio/walls";
+import { parseLength, wallItemPose, wallEndpoints, snapDrawPoint, lengthKeyEdit, wallLengthProblem } from "../src/lib/studio/walls";
 import { inches } from "../src/lib/studio/units";
 
 const close = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) < eps, `${a} !~ ${b}`);
@@ -18,7 +18,7 @@ test("parseLength accepts every documented format", () => {
 });
 
 test("parseLength rejects empty, zero, negative, junk", () => {
-  for (const bad of ["", "   ", "0", "0'", "-5", "-4'6", "abc", "4'6\"x", "4 5 6", "1/2", "ft"]) {
+  for (const bad of ["", "   ", "0", "0'", "-5", "-4'6", "abc", "4'6\"x", "4 5 6", "1/0", "ft"]) {
     assert.equal(parseLength(bad), null, bad);
   }
 });
@@ -90,4 +90,24 @@ test("lengthKeyEdit collects keys, backspace, submit and cancel", () => {
   assert.equal(lengthKeyEdit("6", "Escape").action, "cancel");
   assert.deepEqual(lengthKeyEdit("6", "x"), { text: "6", action: "none" });
   assert.deepEqual(lengthKeyEdit("6", "Shift"), { text: "6", action: "none" });
+});
+
+test("parseLength accepts fractions and carpenter dashes", () => {
+  const cases: Array<[string, number]> = [
+    ["54 1/2", 54.5], ["1/2", 0.5], ["3/4\"", 0.75], ["4'6 1/2\"", 54.5],
+    ["4'-6\"", 54], ["4' - 6\"", 54], ["4'-6 1/2\"", 54.5], ["10'-0\"", 120], ["54.5", 54.5],
+  ];
+  for (const [text, inch] of cases) {
+    const m = parseLength(text);
+    assert.notEqual(m, null, text);
+    close(m!, inches(inch));
+  }
+  for (const bad of ["1/0x", "4'-", "-6\"", "1/2/3", "4' -- 6"]) assert.equal(parseLength(bad), null, bad);
+});
+
+test("wallLengthProblem: exact 4 and 288 inches pass, outside fails", () => {
+  assert.equal(wallLengthProblem(parseLength("4")!), null);
+  assert.equal(wallLengthProblem(parseLength("24'")!), null);
+  assert.equal(wallLengthProblem(inches(3.9)), "short");
+  assert.equal(wallLengthProblem(inches(288.5)), "long");
 });

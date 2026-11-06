@@ -21,12 +21,31 @@ export function isWallDef(defId: string): boolean {
   return (WALL_DEF_IDS as readonly string[]).includes(defId);
 }
 
-const FT_IN = /^(\d+(?:\.\d+)?|\.\d+)\s*(?:'|ft|feet|foot)\s*(?:(\d+(?:\.\d+)?|\.\d+)\s*(?:"|in|inch|inches)?)?$/;
-const IN_ONLY = /^(\d+(?:\.\d+)?|\.\d+)\s*(?:"|in|inch|inches)?$/;
+// A number of inches: 54, 54.5, .5, 1/2, or 54 1/2.
+const INCH_NUM = String.raw`(?:\d+(?:\.\d+)?\s+\d+\/\d+|\d+\/\d+|\d+(?:\.\d+)?|\.\d+)`;
+const FT_NUM = String.raw`(\d+(?:\.\d+)?|\.\d+)`;
+const UNIT_IN = String.raw`(?:"|in|inch|inches)`;
+const FT_IN = new RegExp(String.raw`^${FT_NUM}\s*(?:'|ft|feet|foot)\s*(?:(?:-\s*)?(${INCH_NUM})\s*${UNIT_IN}?)?$`);
+const IN_ONLY = new RegExp(String.raw`^(${INCH_NUM})\s*${UNIT_IN}?$`);
+
+function inchNumber(t: string): number {
+  const parts = t.trim().split(/\s+/);
+  let total = 0;
+  for (const part of parts) {
+    if (part.includes("/")) {
+      const [n, d] = part.split("/");
+      total += parseFloat(n) / parseFloat(d);
+    } else {
+      total += parseFloat(part);
+    }
+  }
+  return total;
+}
 
 /**
  * Parse a typed length into meters. Accepts `54`, `54"`, `54 in`, `4'6"`,
- * `4' 6`, `4'6`, `4.5'`, `4 ft 6 in`, `10'`. Bare numbers are inches.
+ * `4' 6`, `4'6`, `4.5'`, `4 ft 6 in`, `10'`, fractions (`54 1/2`, `1/2`,
+ * `4'6 1/2"`) and carpenter dashes (`4'-6"`, `4' - 6"`). Bare numbers are inches.
  * Returns null for empty, negative, zero, or unparseable input.
  */
 export function parseLength(text: string): number | null {
@@ -40,14 +59,26 @@ export function parseLength(text: string): number | null {
   let totalIn: number;
   let m = s.match(FT_IN);
   if (m) {
-    totalIn = parseFloat(m[1]) * 12 + (m[2] ? parseFloat(m[2]) : 0);
+    totalIn = parseFloat(m[1]) * 12 + (m[2] ? inchNumber(m[2]) : 0);
   } else {
     m = s.match(IN_ONLY);
     if (!m) return null;
-    totalIn = parseFloat(m[1]);
+    totalIn = inchNumber(m[1]);
   }
   if (!Number.isFinite(totalIn) || totalIn <= 0) return null;
   return inches(totalIn);
+}
+
+/** Allowed straight-wall length range (matches the catalog resizable bounds). */
+export const WALL_MIN = inches(4);
+export const WALL_MAX = inches(288);
+const LEN_TOL = 1e-6;
+
+/** One shared bound check for drawn, typed and stored wall lengths. */
+export function wallLengthProblem(len: number): "short" | "long" | null {
+  if (len < WALL_MIN - LEN_TOL) return "short";
+  if (len > WALL_MAX + LEN_TOL) return "long";
+  return null;
 }
 
 /** Wall from a to b -> the item pose that renders it. */
