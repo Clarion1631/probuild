@@ -17,6 +17,7 @@ import { useStudio } from "../store";
 import { BUILDERS } from "./builders";
 import { deckTopYAt, isDeckPlatform } from "@/lib/studio/stacking";
 import { resolveItem } from "./Items";
+import { interiorWallSegs, nearestHostWall, snapsToInteriorWalls, wallMountPose } from "@/lib/studio/walls";
 
 const GRID = inches(1);
 
@@ -33,6 +34,10 @@ function PlacementInner({ doc, placing }: { doc: DesignDoc; placing: CatalogItem
   const lightsOn = useStudio((s) => s.lightsOn);
 
   const walls = useMemo(() => wallSegments(doc.room.points), [doc.room.points]);
+  const interiorSegs = useMemo(
+    () => (placing.mount === "wall" && snapsToInteriorWalls(placing) ? interiorWallSegs(doc.items) : []),
+    [placing, doc.items],
+  );
   const [pose, setPose] = useState<{ x: number; z: number; rotation: number } | null>(null);
   const poseRef = useRef(pose);
   useEffect(() => {
@@ -63,15 +68,11 @@ function PlacementInner({ doc, placing }: { doc: DesignDoc; placing: CatalogItem
     let rotation = poseRef.current?.rotation ?? 0;
 
     if (placing.mount === "wall") {
-      const hit = nearestWall({ x, z }, walls);
+      // Doors/windows/niches also snap to freestanding interior walls (both faces).
+      const hit = nearestHostWall({ x, z }, walls, interiorSegs, { w: placing.w, d: placing.d });
       if (hit) {
-        rotation = wallFacingRotation(hit.wall);
         const off = placing.category === "doors-windows" ? 0 : placing.d / 2;
-        const halfFrac = (placing.w / 2) / hit.wall.length;
-        const t = Math.min(1 - halfFrac, Math.max(halfFrac, hit.t));
-        x = hit.wall.a.x + hit.wall.dir.x * hit.wall.length * t + hit.wall.normal.x * off;
-        z = hit.wall.a.z + hit.wall.dir.z * hit.wall.length * t + hit.wall.normal.z * off;
-        return { x, z, rotation };
+        return wallMountPose(hit, placing.w, off);
       }
     }
 
@@ -103,7 +104,7 @@ function PlacementInner({ doc, placing }: { doc: DesignDoc; placing: CatalogItem
 
     if (!pointInPolygon({ x, z }, doc.room.points)) return poseRef.current;
     return { x, z, rotation };
-  }, [placing, walls, obbOthers, doc.room.points]);
+  }, [placing, walls, interiorSegs, obbOthers, doc.room.points]);
 
   const Builder = BUILDERS[placing.mesh];
   const baseY = placing.mount === "ceiling"

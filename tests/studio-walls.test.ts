@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseLength, wallItemPose, wallEndpoints, snapDrawPoint, lengthKeyEdit, wallLengthProblem } from "../src/lib/studio/walls";
+import { parseLength, wallItemPose, wallEndpoints, snapDrawPoint, lengthKeyEdit, wallLengthProblem, openingsOnWall, interiorWallSegs, nearestHostWall, snapsToInteriorWalls, wallMountPose, hostedByInteriorWall } from "../src/lib/studio/walls";
+import { wallSegments } from "../src/lib/studio/geometry";
+import type { PlacedItem } from "../src/lib/studio/doc";
 import { inches } from "../src/lib/studio/units";
 
 const close = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) < eps, `${a} !~ ${b}`);
@@ -121,4 +123,226 @@ test("wallLengthProblem: exact 4 and 288 inches pass, outside fails", () => {
   assert.equal(wallLengthProblem(parseLength("24'")!), null);
   assert.equal(wallLengthProblem(inches(3.9)), "short");
   assert.equal(wallLengthProblem(inches(288.5)), "long");
+});
+
+// ---- openingsOnWall ----
+
+// 100" horizontal interior wall centered at the origin (rotation 0 = +x).
+const wallItem = (over: Partial<PlacedItem> = {}): PlacedItem => ({
+  id: "w1", defId: "interior-wall", x: 0, z: 0, rotation: 0, w: inches(100), ...over,
+});
+const door = (x: number, z: number, over: Partial<PlacedItem> = {}): PlacedItem => ({
+  id: `d-${x}-${z}`, defId: "door-single", x: inches(x), z: inches(z), rotation: 0, ...over,
+});
+
+test("openingsOnWall: a door in the wall yields one opening, centered, with door height", () => {
+  const w = wallItem();
+  const ops = openingsOnWall(w, [w, door(10, 0)]);
+  assert.equal(ops.length, 1);
+  close(ops[0].center, inches(10)); close(ops[0].width, inches(32));
+  close(ops[0].bottom, 0); close(ops[0].top, inches(80));
+});
+
+test("openingsOnWall: either face (rotation + PI) counts, window sill elevation is kept", () => {
+  const w = wallItem();
+  const win: PlacedItem = { id: "win", defId: "window-single", x: inches(-20), z: 0, rotation: Math.PI, y: inches(42) };
+  const ops = openingsOnWall(w, [win]);
+  assert.equal(ops.length, 1);
+  close(ops[0].center, inches(-20)); close(ops[0].bottom, inches(42)); close(ops[0].top, inches(42 + 48));
+});
+
+test("openingsOnWall: a door straddling the wall end is clipped to the wall", () => {
+  const w = wallItem();
+  // door center 40" from the wall midpoint, 32" wide: spans 24..56, wall ends at 50
+  const ops = openingsOnWall(w, [door(40, 0)]);
+  assert.equal(ops.length, 1);
+  close(ops[0].width, inches(26)); // 24..50
+  close(ops[0].center, inches(37));
+});
+
+test("openingsOnWall: perpendicular and far-off doors are ignored", () => {
+  const w = wallItem();
+  assert.equal(openingsOnWall(w, [door(0, 0, { rotation: Math.PI / 2 })]).length, 0);
+  assert.equal(openingsOnWall(w, [door(0, 10)]).length, 0); // 10" off the wall face
+});
+
+test("openingsOnWall: short stubs lined up with a door get no phantom opening", () => {
+  // two 7.5" stubs either side of a 28" door gap on the same line
+  const stubL = wallItem({ id: "l", x: inches(-17.75), w: inches(7.5) });
+  const stubR = wallItem({ id: "r", x: inches(17.75), w: inches(7.5) });
+  const d = door(0, 0, { w: inches(28) });
+  assert.equal(openingsOnWall(stubL, [stubL, stubR, d]).length, 0);
+  assert.equal(openingsOnWall(stubR, [stubL, stubR, d]).length, 0);
+});
+
+test("openingsOnWall: works on an angled wall", () => {
+  const pose = wallItemPose({ x: 0, z: 0 }, { x: 1, z: 1 });
+  const w: PlacedItem = { id: "a", defId: "interior-wall", ...pose };
+  const d: PlacedItem = { id: "d", defId: "door-single", x: pose.x, z: pose.z, rotation: pose.rotation };
+  const ops = openingsOnWall(w, [d]);
+  assert.equal(ops.length, 1);
+  close(ops[0].center, 0, 1e-9); close(ops[0].width, inches(32));
+});
+
+test("nearestHostWall: no interior walls == outline nearestWall; interior wins when closer, faces the pointer side", () => {
+  const outline = wallSegments([
+    { x: -2, z: -2 }, { x: 2, z: -2 }, { x: 2, z: 2 }, { x: -2, z: 2 },
+  ]);
+  assert.equal(nearestHostWall({ x: 0, z: -1.9 }, outline, [])!.wall.index, 0);
+  const w = wallItem({ z: 0, w: 2, x: 0 });
+  const segs = interiorWallSegs([w]);
+  assert.equal(segs.length, 1);
+  const north = nearestHostWall({ x: 0, z: -0.1 }, outline, segs)!;
+  const south = nearestHostWall({ x: 0, z: 0.1 }, outline, segs)!;
+  assert.equal(north.wall.index, -1);
+  assert.ok(north.wall.normal.z < 0 && south.wall.normal.z > 0);
+  // near the outline, the outline still wins
+  assert.equal(nearestHostWall({ x: 0, z: -1.9 }, outline, segs)!.wall.index, 0);
+});
+
+// ---- review round 1 ----
+
+test("openingsOnWall: outline-hosted doors/windows never cut a pony wall drawn beside that face", () => {
+  const outline = wallSegments([
+    { x: -2, z: -2 }, { x: 2, z: -2 }, { x: 2, z: 2 }, { x: -2, z: 2 },
+  ]);
+  // pony wall running along the north outline, 2.25" inside it (z = -2 + 0.0572)
+  const pony: PlacedItem = { id: "p", defId: "pony-wall", x: 0, z: -2 + inches(2.25), rotation: 0, w: 3 };
+  const outlineWindow: PlacedItem = { id: "ow", defId: "window-single", x: 0.3, z: -2, rotation: Math.PI };
+  const outlineDoor: PlacedItem = { id: "od", defId: "door-single", x: -0.5, z: -2, rotation: Math.PI };
+  assert.equal(openingsOnWall(pony, [pony, outlineWindow, outlineDoor], outline).length, 0);
+  // same wall 2.5" in, still hosted by the outline
+  const pony2 = { ...pony, z: -2 + inches(2.5) };
+  assert.equal(openingsOnWall(pony2, [outlineWindow, outlineDoor], outline).length, 0);
+  // a wall drawn exactly along the outline
+  const along = { ...pony, z: -2 };
+  assert.equal(openingsOnWall(along, [outlineWindow], outline).length, 0);
+  // without outline info the old behavior applies (guards the parameter, not the room)
+  assert.equal(openingsOnWall(pony, [outlineWindow], []).length, 1);
+  // a door centered in a wall that is well inside the room still cuts it
+  const inner = { ...pony, z: 0 };
+  const innerDoor: PlacedItem = { id: "id", defId: "door-single", x: 0, z: 0, rotation: 0 };
+  assert.equal(openingsOnWall(inner, [innerDoor], outline).length, 1);
+});
+
+test("openingsOnWall: NaN positions never produce an opening", () => {
+  const w = wallItem();
+  assert.equal(openingsOnWall(w, [door(NaN, 0)]).length, 0);
+  assert.equal(openingsOnWall(w, [door(0, 0, { rotation: NaN })]).length, 0);
+});
+
+test("nearestHostWall: walls shorter than the item are skipped; the outline behavior is kept", () => {
+  const outline = wallSegments([
+    { x: -2, z: -2 }, { x: 2, z: -2 }, { x: 2, z: 2 }, { x: -2, z: 2 },
+  ]);
+  // two 7.5" stubs and a 28" door nudged between them, 14" from each end
+  const stubs = interiorWallSegs([
+    wallItem({ id: "l", x: -inches(17.75), z: 0.5, w: inches(7.5) }),
+    wallItem({ id: "r", x: inches(17.75), z: 0.5, w: inches(7.5) }),
+  ]);
+  const hit = nearestHostWall({ x: inches(2), z: 0.5 + inches(1) }, outline, stubs, { w: inches(28), d: inches(2) })!;
+  assert.notEqual(hit.wall.index, -1);
+  // a long enough wall does host it
+  const long = interiorWallSegs([wallItem({ z: 0.5, w: inches(60) })]);
+  assert.equal(nearestHostWall({ x: 0, z: 0.5 + inches(1) }, outline, long, { w: inches(28), d: inches(2) })!.wall.index, -1);
+});
+
+test("nearestHostWall: interior walls only host within ~8in of the back face; farther falls back to the outline", () => {
+  const outline = wallSegments([
+    { x: -3, z: -3 }, { x: 3, z: -3 }, { x: 3, z: 3 }, { x: -3, z: 3 }]);
+  const long = interiorWallSegs([wallItem({ z: 0, w: 2 })]);
+  const opts = { w: inches(30), d: inches(2) };
+  assert.equal(nearestHostWall({ x: 0, z: inches(7) }, outline, long, opts)!.wall.index, -1);
+  assert.notEqual(nearestHostWall({ x: 0, z: inches(14) }, outline, long, opts)!.wall.index, -1);
+});
+
+test("wallMountPose: an item wider than the wall centers on it (no inverted clamp)", () => {
+  const outline = wallSegments([
+    { x: -3, z: -3 }, { x: 3, z: -3 }, { x: 3, z: 3 }, { x: -3, z: 3 }]);
+  const seg = interiorWallSegs([wallItem({ z: 0, w: inches(20) })]);
+  const hit = nearestHostWall({ x: inches(9), z: inches(2) }, outline, seg, { w: 0, d: 0 })!;
+  const pose = wallMountPose(hit, inches(40), 0);
+  close(pose.x, 0, 1e-9);
+});
+
+test("snapsToInteriorWalls: doors and windows only, never niches", () => {
+  assert.equal(snapsToInteriorWalls({ category: "doors-windows" }), true);
+  assert.equal(snapsToInteriorWalls({ category: "fixtures", cutsWall: true }), false);
+  assert.equal(snapsToInteriorWalls({ category: "doors-windows", cutsWall: true }), false);
+});
+
+// ---- review round 2 ----
+
+test("one host rule for snap and cut: a wall 0.9in inside the outline still gets its door's opening", () => {
+  const outline = wallSegments([
+    { x: -2, z: -2 }, { x: 2, z: -2 }, { x: 2, z: 2 }, { x: -2, z: 2 },
+  ]);
+  const pony: PlacedItem = { id: "p", defId: "interior-wall", x: 0, z: -2 + inches(0.9), rotation: 0, w: 3 };
+  // door snapped onto the wall centerline (what nearestHostWall picks for a drop on it)
+  const hosted: PlacedItem = { id: "d", defId: "door-single", x: 0.2, z: pony.z, rotation: Math.PI };
+  const segs = interiorWallSegs([pony]);
+  const hit = nearestHostWall({ x: hosted.x, z: hosted.z }, outline, segs, { w: inches(32), d: inches(2) })!;
+  assert.equal(hit.wall.index, -1, "snap picks the interior wall");
+  assert.equal(openingsOnWall(pony, [pony, hosted], outline).length, 1, "and so the wall is cut");
+  // a window really on the outline does not cut it
+  const onOutline: PlacedItem = { id: "w", defId: "window-single", x: -0.8, z: -2, rotation: Math.PI };
+  assert.equal(openingsOnWall(pony, [pony, onOutline], outline).length, 0);
+});
+
+test("nearestHostWall reach: decided in the helper, from the back face", () => {
+  const outline = wallSegments([
+    { x: -3, z: -3 }, { x: 3, z: -3 }, { x: 3, z: 3 }, { x: -3, z: 3 }]);
+  const wall = interiorWallSegs([wallItem({ z: 0, w: 2 })]);
+  // 2in deep door centered 8.5in off the wall: back face 7.5in away -> hosted
+  const near = nearestHostWall({ x: 0, z: inches(8.5) }, outline, wall, { w: inches(28), d: inches(2), reach: inches(8) });
+  assert.equal(near?.wall.index, -1);
+  // 10.5in off: back face 9.5in -> nothing in reach (outline is far too)
+  assert.equal(nearestHostWall({ x: 0, z: inches(10.5) }, outline, wall, { w: inches(28), d: inches(2), reach: inches(8) }), null);
+});
+
+// ---- review round 3 ----
+
+test("hostedByInteriorWall: outline renderer skips doors hosted by a wall 0.9in inside the outline; no-interior rooms unchanged", () => {
+  const outline = wallSegments([
+    { x: -2, z: -2 }, { x: 2, z: -2 }, { x: 2, z: 2 }, { x: -2, z: 2 },
+  ]);
+  const wall: PlacedItem = { id: "p", defId: "interior-wall", x: 0, z: -2 + inches(0.9), rotation: 0, w: 3 };
+  const inWall: PlacedItem = { id: "d", defId: "door-single", x: 0.2, z: wall.z, rotation: Math.PI };
+  const onOutline: PlacedItem = { id: "w", defId: "window-single", x: -0.8, z: -2, rotation: Math.PI };
+  const segs = interiorWallSegs([wall]);
+  assert.equal(hostedByInteriorWall(inWall, outline, [wall]), true);
+  assert.equal(hostedByInteriorWall(onOutline, outline, [wall]), false);
+  assert.equal(hostedByInteriorWall(inWall, outline, []), false); // no interior walls: nothing changes
+  // niches never ride on freestanding walls
+  const niche: PlacedItem = { id: "n", defId: "shower-niche", x: 0.2, z: wall.z, rotation: Math.PI };
+  assert.equal(hostedByInteriorWall(niche, outline, [wall]), false);
+});
+
+test("T-junction: a door clamped to a perpendicular wall's centerline is still hosted by its own wall", () => {
+  const outline = wallSegments([
+    { x: -3, z: -3 }, { x: 3, z: -3 }, { x: 3, z: 3 }, { x: -3, z: 3 }]);
+  const horizontal: PlacedItem = { id: "h", defId: "interior-wall", x: 0, z: 0, rotation: 0, w: inches(100) };
+  const vertical: PlacedItem = { id: "v", defId: "interior-wall", x: -inches(34), z: 0, rotation: Math.PI / 2, w: inches(100) };
+  // door at the T (x = vertical wall, z = horizontal wall) facing the horizontal wall's normal
+  const d: PlacedItem = { id: "d", defId: "door-single", x: -inches(34), z: 0, rotation: Math.PI };
+  const items = [horizontal, vertical, d];
+  assert.equal(openingsOnWall(horizontal, items, outline).length, 1);
+  assert.equal(openingsOnWall(vertical, items, outline).length, 0);
+});
+
+// ---- review round 4 ----
+
+test("outline keeps its hole when a perpendicular door only sits near a parallel interior wall", () => {
+  const outline = wallSegments([
+    { x: -2, z: -2 }, { x: 2, z: -2 }, { x: 2, z: 2 }, { x: -2, z: 2 },
+  ]);
+  const wall: PlacedItem = { id: "p", defId: "interior-wall", x: 0, z: -2 + inches(6), rotation: 0, w: 3 };
+  // door centered on the north outline but rotated perpendicular to it (reachable by manual rotation)
+  const door: PlacedItem = { id: "d", defId: "door-single", x: 0, z: -2, rotation: Math.PI / 2 };
+  assert.equal(hostedByInteriorWall(door, outline, [wall]), false, "outline must keep cutting its hole");
+  assert.equal(openingsOnWall(wall, [wall, door], outline).length, 0, "and the interior wall gets none");
+  // the two decisions always agree: a qualifying door is cut by the wall AND suppressed on the outline
+  const good: PlacedItem = { id: "g", defId: "door-single", x: 0.3, z: wall.z, rotation: Math.PI };
+  assert.equal(openingsOnWall(wall, [wall, good], outline).length, 1);
+  assert.equal(hostedByInteriorWall(good, outline, [wall]), true);
 });

@@ -15,6 +15,9 @@ import {
   pointInPolygon, roomHeightAt, type WallSeg, type OBB, type RoomShellInfo,
 } from "@/lib/studio/geometry";
 import { inches, formatFtIn } from "@/lib/studio/units";
+import {
+  hostedByInteriorWall, interiorWallSegs, isOpeningHost, nearestHostWall, openingsOnWall, snapsToInteriorWalls, wallMountPose,
+} from "@/lib/studio/walls";
 import { deckTopYAt, isDeckPlatform } from "@/lib/studio/stacking";
 import { useStudio } from "../store";
 import { useLibrary } from "../useLibrary";
@@ -147,9 +150,11 @@ function ItemNode({
   // them together with the wall they sit in.
   const hostWallIndex = useMemo(() => {
     if (def.category !== "doors-windows" && !def.cutsWall) return undefined;
+    // a door/window hosted by a freestanding wall is not tied to an outline wall
+    if (def.category === "doors-windows" && hostedByInteriorWall(item, walls, allItems)) return undefined;
     const hit = nearestWall({ x: item.x, z: item.z }, walls);
     return hit && hit.distance < 0.4 ? hit.wall.index : undefined;
-  }, [def, item.x, item.z, walls]);
+  }, [def, item, allItems, walls]);
 
   const obbOthers = useMemo(() => {
     if (!def.wallSnap && def.category !== "cabinets") return [];
@@ -162,6 +167,20 @@ function ItemNode({
       })
       .filter(Boolean) as OBB[];
   }, [allItems, item.id, def]);
+
+  // Freestanding walls a door/window/niche may snap onto (committed doc state).
+  const interiorSegs = useMemo(
+    () => (def.mount === "wall" && snapsToInteriorWalls(def) ? interiorWallSegs(allItems) : []),
+    [def, allItems],
+  );
+
+  // Real openings for door/window items sitting in this interior/pony wall.
+  // Computed from committed state only, so it updates on drop/delete and
+  // never during a drag frame.
+  const openings = useMemo(
+    () => (isOpeningHost(def.id) ? openingsOnWall(item, allItems, walls) : undefined),
+    [def.id, item, allItems, walls],
+  );
 
   const planeY = def.mount === "wall" || def.mount === "ceiling" ? 0 : baseY;
 
@@ -181,16 +200,12 @@ function ItemNode({
     if (def.mount === "wall") {
       // Wall items slide along the nearest wall, always flush. Items that cut
       // into the wall (doors, windows, niches) center on the wall face.
-      const hit = nearestWall({ x, z }, walls);
+      // Doors/windows/niches also snap to freestanding interior walls (both faces).
+      const hit = nearestHostWall({ x, z }, walls, interiorSegs, { w, d });
       if (hit) {
-        rotation = wallFacingRotation(hit.wall);
         const off = def.category === "doors-windows" || def.cutsWall ? 0 : d / 2;
-        // Clamp t so the item stays within the wall span.
-        const halfFrac = (w / 2) / hit.wall.length;
-        const t = Math.min(1 - halfFrac, Math.max(halfFrac, hit.t));
-        x = hit.wall.a.x + hit.wall.dir.x * hit.wall.length * t + hit.wall.normal.x * off;
-        z = hit.wall.a.z + hit.wall.dir.z * hit.wall.length * t + hit.wall.normal.z * off;
-        return { x, z, rotation };
+        // wallMountPose clamps t so the item stays within the wall span.
+        return wallMountPose(hit, w, off);
       }
     }
 
@@ -225,7 +240,7 @@ function ItemNode({
     }
 
     return { x, z, rotation };
-  }, [def, w, d, walls, obbOthers, roomPoints, item.rotation, item.x, item.z]);
+  }, [def, w, d, walls, interiorSegs, obbOthers, roomPoints, item.rotation, item.x, item.z]);
 
   const onPointerDown = (e: ThreeEvent<PointerEvent>) => {
     if (presentMode || view === "walk") return;
@@ -348,6 +363,7 @@ function ItemNode({
           finishes={finishes}
           lightsOn={lightsOn}
           led={!!item.led}
+          openings={openings}
         />
       </group>
 
