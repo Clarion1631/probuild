@@ -7,7 +7,7 @@ import { useState, useRef, useEffect } from "react";
 import {
   ArrowLeft, Undo2, Redo2, Camera, Share2, Lightbulb, LightbulbOff,
   Presentation, Map as MapIcon, Box as BoxIcon, Footprints, Ruler, Check, Loader2, AlertTriangle,
-  Square, Sparkles,
+  Square, Sparkles, PencilRuler,
 } from "lucide-react";
 import { toast } from "sonner";
 import { feet, parseFtIn, formatFtIn } from "@/lib/studio/units";
@@ -85,6 +85,8 @@ export function TopBar({
       <ViewToggle view={view} setView={setView} />
 
       <RoomSizeButton />
+
+      {view === "plan" && <DrawWallsControls />}
 
       <div className="mx-2 h-6 w-px bg-slate-200" />
 
@@ -170,6 +172,43 @@ function ViewToggle({ view, setView, floating }: { view: ViewMode; setView: (v: 
         </button>
       ))}
     </div>
+  );
+}
+
+function DrawWallsControls() {
+  const drawing = useStudio((s) => s.drawingWalls);
+  const setDrawing = useStudio((s) => s.setDrawingWalls);
+  const kind = useStudio((s) => s.drawWallKind);
+  const setKind = useStudio((s) => s.setDrawWallKind);
+  return (
+    <>
+      <button
+        onClick={() => setDrawing(!drawing)}
+        aria-pressed={drawing}
+        title="Draw inside walls: click to start, click again to end (Esc to stop)"
+        className={`hui-btn gap-1.5 !px-3 !py-1.5 !text-xs ${drawing ? "hui-btn-primary" : "hui-btn-secondary"}`}
+      >
+        <PencilRuler className="h-3.5 w-3.5" />
+        Draw walls
+      </button>
+      {drawing && (
+        <div role="radiogroup" aria-label="Wall type" className="flex rounded-lg bg-slate-100 p-0.5">
+          {([["full", "Full height"], ["pony", "Pony 42\""]] as const).map(([k, label]) => (
+            <button
+              key={k}
+              role="radio"
+              aria-checked={kind === k}
+              onClick={() => setKind(k)}
+              className={`rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors ${
+                kind === k ? "bg-white text-blue-700 shadow-sm" : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 

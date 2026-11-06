@@ -13,6 +13,7 @@ import { useStudio } from "../store";
 import { Room } from "./Room";
 import { Items } from "./Items";
 import { Placement } from "./Placement";
+import { DrawWalls } from "./DrawWalls";
 import { Controls } from "./Controls";
 import { RoomEdit } from "./RoomEdit";
 
@@ -203,6 +204,7 @@ export function StudioCanvas() {
       <Room doc={doc} />
       <Items doc={doc} />
       <Placement doc={doc} />
+      <DrawWalls doc={doc} />
       <RoomEdit doc={doc} />
       <DollhouseSync doc={doc} />
 
