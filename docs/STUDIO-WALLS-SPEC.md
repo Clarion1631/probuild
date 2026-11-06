@@ -68,5 +68,5 @@ Changing the room outline editor, multi-room plans, auto-splitting walls, new ca
 2. Click **Draw walls** in the top bar (choose Full height or Pony 42" next to it).
 3. Click where a wall starts, then click where it ends. Each click after that continues from the last end. Walls snap to corners and other wall ends, to 45 and 90 degrees, and to the nearest half inch. Hold **Shift** for any angle.
 4. For an exact length, after the first click just type it (`54`, `4'6"`, `10'`) and press **Enter**.
-5. **Esc** or right-click ends the chain; **Esc** again leaves Draw walls. Ctrl+Z undoes one wall at a time.
+5. **Esc**, right-click or a double-click ends the chain; **Esc** again leaves Draw walls. Ctrl+Z undoes one wall at a time.
 6. To resize a wall later, select it and type a new **Length** in the right panel. The start end stays put.

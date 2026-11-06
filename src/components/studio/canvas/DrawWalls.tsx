@@ -43,10 +43,16 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
   const typingRef = useRef(typing);
   const shiftRef = useRef(false);
   const applyTypedRef = useRef<(text: string) => void>(() => {});
-  useEffect(() => {
-    startRef.current = start;
-    cursorRef.current = cursor;
-  }, [start, cursor]);
+  // Refs update synchronously with state so a click or key that lands before
+  // React re-renders (fast double-click, click-then-type) sees the latest points.
+  const setStartPt = useCallback((p: Pt | null) => {
+    startRef.current = p;
+    setStart(p);
+  }, []);
+  const setCursorPt = useCallback((p: Pt | null) => {
+    cursorRef.current = p;
+    setCursor(p);
+  }, []);
   /** Set the typed-length text; the ref updates synchronously so keys that
       arrive before React re-renders (fast typing) are never lost. */
   const setTypingText = useCallback((next: string | null) => {
@@ -66,10 +72,10 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
   );
 
   const endChain = useCallback(() => {
-    setStart(null);
-    setCursor(null);
+    setStartPt(null);
+    setCursorPt(null);
     setTypingText(null);
-  }, [setTypingText]);
+  }, [setStartPt, setCursorPt, setTypingText]);
 
   // Esc ends the chain; Esc with no chain leaves draw mode. Digits open the length box.
   useEffect(() => {
@@ -112,25 +118,31 @@ function DrawWallsInner({ doc }: { doc: DesignDoc }) {
   const commit = (a: Pt, b: Pt) => {
     if (Math.hypot(b.x - a.x, b.z - a.z) < MIN_LEN) return false;
     addWall(a, b, kind);
-    setStart(b);
-    setCursor(b);
+    setStartPt(b);
+    setCursorPt(b);
     return true;
   };
 
   const onMove = (e: ThreeEvent<PointerEvent>) => {
     shiftRef.current = e.nativeEvent.shiftKey;
-    setCursor(snap({ x: e.point.x, z: e.point.z }));
+    setCursorPt(snap({ x: e.point.x, z: e.point.z }));
   };
 
   const onClick = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
     if (e.delta > CLICK_SLOP_PX) return; // was a pan, not a click
+    // Second click of a double-click: the first click already placed the wall,
+    // so just stop the chain instead of adding a stub from the snapped end.
+    if (e.nativeEvent.detail >= 2) {
+      endChain();
+      return;
+    }
     shiftRef.current = e.nativeEvent.shiftKey;
     const p = snap({ x: e.point.x, z: e.point.z });
     const s = startRef.current;
     if (!s) {
-      setStart(p);
-      setCursor(p);
+      setStartPt(p);
+      setCursorPt(p);
       return;
     }
     commit(s, p);
