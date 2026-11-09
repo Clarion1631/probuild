@@ -18,7 +18,7 @@ import type { IntakeRow, MissingReceiptRow, ReceiptQueue } from "../src/app/auto
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 const NOTICE_TEXT =
-    "Automatic crew messages are not going out right now, so these charges are not being sent to anyone. Justin decides when they go back on. Until then, ask for a receipt by hand.";
+    "Automatic weekday crew messages are not going out right now. Justin decides when they go back on. Until then, ask for a receipt by hand.";
 
 function intake(id: string): IntakeRow {
     return {

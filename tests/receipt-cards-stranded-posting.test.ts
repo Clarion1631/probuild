@@ -57,7 +57,7 @@ function matches(r: Row, where: any): boolean {
     return true;
 }
 
-function fakeDb(rows: Row[], opts: { loseCas?: boolean } = {}) {
+function fakeDb(rows: Row[], opts: { loseCas?: boolean; throwOnId?: string; throwFind?: boolean } = {}) {
     const updates: Array<{ where: any; data: any }> = [];
     return {
         rows,
@@ -65,10 +65,12 @@ function fakeDb(rows: Row[], opts: { loseCas?: boolean } = {}) {
         db: {
             receiptRequestCard: {
                 async findMany(args: { where: any }) {
+                    if (opts.throwFind) throw new Error("find boom");
                     return rows.filter(r => matches(r, args.where)).map(r => ({ id: r.id, owner: r.owner, pacificDate: r.pacificDate }));
                 },
                 async updateMany(args: { where: any; data: any }) {
                     updates.push(args);
+                    if (opts.throwOnId !== undefined && args.where.id === opts.throwOnId) throw new Error("update boom");
                     if (opts.loseCas) return { count: 0 };
                     let count = 0;
                     for (const r of rows) {
@@ -84,7 +86,7 @@ function fakeDb(rows: Row[], opts: { loseCas?: boolean } = {}) {
 test("an earlier day's POSTING row with a dead claim becomes UNCERTAIN and is returned", async () => {
     const f = fakeDb([row({ id: "old", pacificDate: "2026-11-06" })]);
     const out = await convertStrandedPostingCards(f.db as never, NOW);
-    assert.deepEqual(out, [{ id: "old", owner: "CJ", pacificDate: "2026-11-06" }]);
+    assert.deepEqual(out, { converted: [{ id: "old", owner: "CJ", pacificDate: "2026-11-06" }], failed: 0 });
     assert.equal(f.rows[0].status, "UNCERTAIN");
     assert.equal(f.rows[0].lastError, "uncertain-delivery");
     assert.equal(f.rows[0].claimedAt, null);
@@ -94,14 +96,14 @@ test("an earlier day's POSTING row with a dead claim becomes UNCERTAIN and is re
 test("today's POSTING row with a dead claim is converted (the same-day case the owner loop skips)", async () => {
     const f = fakeDb([row({ id: "today", claimedAt: null })]);
     const out = await convertStrandedPostingCards(f.db as never, NOW);
-    assert.deepEqual(out.map(r => r.id), ["today"]);
+    assert.deepEqual(out.converted.map(r => r.id), ["today"]);
     assert.equal(f.rows[0].status, "UNCERTAIN");
 });
 
 test("a POSTING row whose claim is inside the lease is left alone", async () => {
     const f = fakeDb([row({ id: "live", claimedAt: new Date(NOW.getTime() - CLAIM_LEASE_MS + 1_000) })]);
     const out = await convertStrandedPostingCards(f.db as never, NOW);
-    assert.deepEqual(out, []);
+    assert.deepEqual(out, { converted: [], failed: 0 });
     assert.equal(f.rows[0].status, "POSTING");
     assert.equal(f.rows[0].claimToken, "tok");
     assert.equal(f.updates.length, 0);
@@ -115,7 +117,7 @@ test("PENDING, UNCERTAIN and POSTED rows are never touched, nor is a POSTING row
         row({ id: "ps", status: "POSTING", postedAt: NOW }),
     ]);
     const out = await convertStrandedPostingCards(f.db as never, NOW);
-    assert.deepEqual(out, []);
+    assert.deepEqual(out, { converted: [], failed: 0 });
     assert.deepEqual(f.rows.map(r => r.status), ["PENDING", "UNCERTAIN", "POSTED", "POSTING"]);
     assert.equal(f.updates.length, 0);
 });
@@ -123,7 +125,7 @@ test("PENDING, UNCERTAIN and POSTED rows are never touched, nor is a POSTING row
 test("a lost compare-and-set is not returned", async () => {
     const f = fakeDb([row({ id: "race" })], { loseCas: true });
     const out = await convertStrandedPostingCards(f.db as never, NOW);
-    assert.deepEqual(out, []);
+    assert.deepEqual(out, { converted: [], failed: 0 });
     assert.equal(f.updates.length, 1);
     assert.equal(f.updates[0].where.status, "POSTING");
     assert.equal(f.updates[0].where.postedAt, null);
@@ -132,17 +134,17 @@ test("a lost compare-and-set is not returned", async () => {
 test("an on-demand row (owner Justin) with a dead claim is NOT converted", async () => {
     const f = fakeDb([row({ id: "od", owner: "Justin" })]);
     const out = await convertStrandedPostingCards(f.db as never, NOW);
-    assert.deepEqual(out, []);
+    assert.deepEqual(out, { converted: [], failed: 0 });
     assert.equal(f.rows[0].status, "POSTING");
     assert.equal(f.updates.length, 0);
 });
 
 test("the lease boundary: exactly now - lease is left alone, 1 ms older is converted", async () => {
     const edge = fakeDb([row({ id: "edge", claimedAt: new Date(NOW.getTime() - CLAIM_LEASE_MS) })]);
-    assert.deepEqual(await convertStrandedPostingCards(edge.db as never, NOW), []);
+    assert.deepEqual(await convertStrandedPostingCards(edge.db as never, NOW), { converted: [], failed: 0 });
     assert.equal(edge.rows[0].status, "POSTING");
     const past = fakeDb([row({ id: "past", claimedAt: new Date(NOW.getTime() - CLAIM_LEASE_MS - 1) })]);
-    assert.deepEqual((await convertStrandedPostingCards(past.db as never, NOW)).map(r => r.id), ["past"]);
+    assert.deepEqual((await convertStrandedPostingCards(past.db as never, NOW)).converted.map(r => r.id), ["past"]);
     assert.equal(past.rows[0].status, "UNCERTAIN");
 });
 
@@ -166,4 +168,27 @@ test("handleGET sweeps after the enabled gate and before the weekday check, and 
     assert.ok(call < weekday, "the sweep must come before the weekday check");
     assert.match(source, /\[cron\/receipt-request-cards\] stranded-posting/);
     assert.ok(source.split("...strandedBody").length - 1 >= 6, "every early return after the sweep spreads strandedBody");
+});
+
+test("a failing updateMany for the second row does not lose the first and third conversions", async () => {
+    const f = fakeDb([row({ id: "a" }), row({ id: "b" }), row({ id: "c" })], { throwOnId: "b" });
+    const out = await convertStrandedPostingCards(f.db as never, NOW);
+    assert.deepEqual(out.converted.map(r => r.id), ["a", "c"]);
+    assert.equal(out.failed, 1);
+    assert.deepEqual(f.rows.map(r => r.status), ["UNCERTAIN", "POSTING", "UNCERTAIN"]);
+});
+
+test("a failing findMany rejects (the caller handles it)", async () => {
+    const f = fakeDb([row({ id: "a" })], { throwFind: true });
+    await assert.rejects(convertStrandedPostingCards(f.db as never, NOW));
+});
+
+test("source pins: strandedSweepFailed reaches the heartbeat predicate, strandedBody and the final summary", () => {
+    const source = readFileSync(routePath, "utf8");
+    const isFailure = source.slice(source.indexOf("isFailure: body =>"));
+    assert.match(isFailure.split(/\r?\n/)[0], /body\.strandedSweepFailed === true/);
+    const strandedBody = source.slice(source.indexOf("const strandedBody"), source.indexOf("const strandedBody") + 900);
+    assert.match(strandedBody, /strandedSweepFailed: true/);
+    const summary = source.slice(source.indexOf("ok: failures.length === 0"));
+    assert.match(summary.slice(0, 400), /strandedSweepFailed \? \{ strandedSweepFailed: true \} : \{\}/);
 });

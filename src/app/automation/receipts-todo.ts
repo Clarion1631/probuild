@@ -208,7 +208,7 @@ export const TODO_COPY = {
     // should be.
     noReason: "No reason recorded.",
     // Shown above missing-receipt requests while the weekday crew messages are off or not set up.
-    crewRequestsOff: "Automatic crew messages are not going out right now, so these charges are not being sent to anyone. Justin decides when they go back on. Until then, ask for a receipt by hand.",
+    crewRequestsOff: "Automatic weekday crew messages are not going out right now. Justin decides when they go back on. Until then, ask for a receipt by hand.",
 } as const;
 
 export const CREW_REQUESTS_OFF_NOTICE: string = TODO_COPY.crewRequestsOff;

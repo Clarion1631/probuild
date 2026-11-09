@@ -677,21 +677,27 @@ const UNCERTAIN_DELIVERY_DATA = { status: "UNCERTAIN", lastError: "uncertain-del
 export async function convertStrandedPostingCards(
     db: Pick<PrismaClient, "receiptRequestCard">,
     now: Date,
-): Promise<Array<{ id: string; owner: string; pacificDate: string }>> {
+): Promise<{ converted: Array<{ id: string; owner: string; pacificDate: string }>; failed: number }> {
     const deadClaim = [{ claimedAt: null }, { claimedAt: { lt: new Date(now.getTime() - CLAIM_LEASE_MS) } }];
     const stranded = await db.receiptRequestCard.findMany({
         where: { status: "POSTING", postedAt: null, owner: { in: CARD_OWNERS_ASKED }, OR: deadClaim },
         select: { id: true, owner: true, pacificDate: true },
     });
     const converted: Array<{ id: string; owner: string; pacificDate: string }> = [];
+    let failed = 0;
     for (const row of stranded) {
-        const result = await db.receiptRequestCard.updateMany({
-            where: { id: row.id, status: "POSTING", postedAt: null, owner: { in: CARD_OWNERS_ASKED }, OR: deadClaim },
-            data: UNCERTAIN_DELIVERY_DATA,
-        });
-        if (result.count > 0) converted.push({ id: row.id, owner: row.owner, pacificDate: row.pacificDate });
+        try {
+            const result = await db.receiptRequestCard.updateMany({
+                where: { id: row.id, status: "POSTING", postedAt: null, owner: { in: CARD_OWNERS_ASKED }, OR: deadClaim },
+                data: UNCERTAIN_DELIVERY_DATA,
+            });
+            if (result.count > 0) converted.push({ id: row.id, owner: row.owner, pacificDate: row.pacificDate });
+        } catch (error) {
+            failed += 1;
+            console.error("[cron/receipt-request-cards] stranded-posting-row-failed", JSON.stringify({ id: row.id, error: error instanceof Error ? error.name : "UnknownError" }));
+        }
     }
-    return converted;
+    return { converted, failed };
 }
 
 async function handleGET(request: Request) {
@@ -708,18 +714,25 @@ async function handleGET(request: Request) {
     // return below: not gated on weekday, webhook, lock, selection, retry or
     // deliveredToday. Compare-and-set, so it does not need the lock. The early
     // returns below carry its conversions in their body (`strandedBody`).
-    let strandedConverted: Awaited<ReturnType<typeof convertStrandedPostingCards>> = [];
+    let strandedConverted: Awaited<ReturnType<typeof convertStrandedPostingCards>>["converted"] = [];
+    let strandedSweepFailed = false;
     try {
-        strandedConverted = await convertStrandedPostingCards(prisma, now);
+        const sweep = await convertStrandedPostingCards(prisma, now);
+        strandedConverted = sweep.converted;
+        if (sweep.failed > 0) strandedSweepFailed = true;
     } catch (error) {
+        strandedSweepFailed = true;
         console.error("[cron/receipt-request-cards] stranded-posting-sweep-failed", error instanceof Error ? error.name : "UnknownError");
     }
     for (const row of strandedConverted) {
         console.error("[cron/receipt-request-cards] stranded-posting", JSON.stringify({ id: row.id, owner: row.owner, pacificDate: row.pacificDate }));
     }
-    const strandedBody = strandedConverted.length > 0
-        ? { uncertainTransitions: strandedConverted.map(row => row.owner), strandedPosting: strandedConverted.map(row => `${row.owner}:${row.pacificDate}`) }
-        : {};
+    const strandedBody = {
+        ...(strandedConverted.length > 0
+            ? { uncertainTransitions: strandedConverted.map(row => row.owner), strandedPosting: strandedConverted.map(row => `${row.owner}:${row.pacificDate}`) }
+            : {}),
+        ...(strandedSweepFailed ? { strandedSweepFailed: true } : {}),
+    };
     if (!isPacificWeekday(now)) {
         return NextResponse.json({ ok: true, skipped: "weekend", ...strandedBody });
     }
@@ -1661,6 +1674,7 @@ async function handleGET(request: Request) {
         // as a crashed invocation and re-run it.
         ok: failures.length === 0 && uncertainTransitions.length === 0 && !scanIncomplete,
         partial: failures.length === 0 && uncertainTransitions.length > 0,
+        ...(strandedSweepFailed ? { strandedSweepFailed: true } : {}),
         failedOwners: failures,
         uncertainOwners: uncertain,
         // Only what THIS run moved. An old uncertain row is somebody's to
@@ -1743,7 +1757,8 @@ async function handleGET(request: Request) {
 // with no proof it arrived, which this heartbeat treats as a failed run.
 // scanIncomplete (cards-complete-scan-spec.md) is the same story: still 200,
 // but a run whose read was partial claimed no owner's day, and that is worth
-// the same escalation as an unconfirmed delivery.
+// the same escalation as an unconfirmed delivery. A stranded-POSTING sweep
+// that failed is escalated the same way.
 export const GET = withCronHeartbeat("RECEIPT_REQUEST_CARDS", handleGET, {
-    isFailure: body => isRecord(body) && ((Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0) || body.scanIncomplete === true),
+    isFailure: body => isRecord(body) && ((Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0) || body.scanIncomplete === true || body.strandedSweepFailed === true),
 });
