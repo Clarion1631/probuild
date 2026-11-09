@@ -18,7 +18,7 @@ import type { IntakeRow, MissingReceiptRow, ReceiptQueue } from "../src/app/auto
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 const NOTICE_TEXT =
-    "Crew messages are switched off. Nobody is being messaged about these charges. Justin decides when they go back on. Until then, ask for a receipt by hand.";
+    "Automatic crew messages are not going out right now, so these charges are not being sent to anyone. Justin decides when they go back on. Until then, ask for a receipt by hand.";
 
 function intake(id: string): IntakeRow {
     return {
@@ -119,6 +119,7 @@ test("the held existing-evidence row names who checks it", async () => {
 test("page.tsx passes crewRequestsEnabled from the existing delivery projection", () => {
     const src = readFileSync(join(HERE, "..", "src", "app", "automation", "page.tsx"), "utf8");
     assert.match(src, /crewRequestsEnabled=\{/);
-    assert.match(src, /projectCardDeliveryConfig\(\)\.reminderEnabled/);
+    assert.match(src, /const crewDelivery = projectCardDeliveryConfig\(\);/);
+    assert.match(src, /crewRequestsEnabled=\{crewDelivery\.reminderEnabled && crewDelivery\.webhookPresent && crewDelivery\.webhookValid\}/);
     assert.match(src, /from "@\/lib\/receipt-chaser-completion"/);
 });

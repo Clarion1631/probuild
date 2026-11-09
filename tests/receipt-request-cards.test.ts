@@ -14,6 +14,7 @@ import {
     CARD_RATE_CEILING,
     MAX_ITEMS_PER_CARD,
     RECENT_CHARGE_WINDOW_DAYS,
+    BACKLOG_RESERVED_SLOTS,
     buildCardFromItems,
     buildOwnerCards,
     centsToAmount,
@@ -100,7 +101,8 @@ test("never-carded items outrank carded ones, however old the carded ones are", 
 test("yesterday's overflow is today's first candidate", () => {
     const many = Array.from({ length: 12 }, (_, i) => issue({
         id: `ri-${i}`, targetKey: `bl-${i}`,
-        postedDate: `2026-08-${String(i + 1).padStart(2, "0")}`,
+        // All well outside the 10-day recent window, so only everCarded decides.
+        postedDate: `2026-06-${String(i + 1).padStart(2, "0")}`,
         // The ten oldest were carded yesterday; two never were.
         everCarded: i < 10,
     }));
@@ -715,6 +717,51 @@ test("an empty or malformed postedDate is never recent and does not throw", () =
     const r = selectOwnerItems([bad, empty, recent], "CJ", TODAY);
     assert.equal(r.items[0].issueId, "recent");
     assert.equal(r.items.length, 3);
+});
+
+test("BACKLOG_RESERVED_SLOTS is 3", () => {
+    assert.equal(BACKLOG_RESERVED_SLOTS, 3);
+});
+
+const recentSet = (n: number): CardCandidateIssue[] =>
+    Array.from({ length: n }, (_, i) => issue({ id: `r-${String(i).padStart(2, "0")}`, targetKey: `bl-r-${String(i).padStart(2, "0")}`, postedDate: dayBefore(9 - (i % 7)) }));
+const oldSet = (n: number): CardCandidateIssue[] =>
+    Array.from({ length: n }, (_, i) => issue({ id: `o-${String(i).padStart(2, "0")}`, targetKey: `bl-o-${String(i).padStart(2, "0")}`, postedDate: dayBefore(100 - i) }));
+
+test("12 recent + 5 old never-carded: 7 oldest recent, then 3 oldest old, overflow 7", () => {
+    const cands = [...recentSet(12), ...oldSet(5)];
+    const r = selectOwnerItems(cands, "CJ", TODAY);
+    const recentOrder = recentSet(12).sort((a, b) => (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1 : a.targetKey < b.targetKey ? -1 : 1)).map(i => i.id);
+    assert.deepEqual(ids(r), [...recentOrder.slice(0, 7), "o-00", "o-01", "o-02"]);
+    assert.equal(r.overflow, 7);
+});
+
+test("12 recent + 0 old: the 10 oldest recent", () => {
+    const r = selectOwnerItems(recentSet(12), "CJ", TODAY);
+    assert.equal(r.items.length, 10);
+    assert.equal(r.overflow, 2);
+});
+
+test("2 recent + 12 old: 2 recent, then the 8 oldest old", () => {
+    const r = selectOwnerItems([...recentSet(2), ...oldSet(12)], "CJ", TODAY);
+    assert.equal(r.items.length, 10);
+    assert.deepEqual(ids(r).slice(2), ["o-00", "o-01", "o-02", "o-03", "o-04", "o-05", "o-06", "o-07"]);
+    assert.ok(ids(r).slice(0, 2).every(id => id.startsWith("r-")));
+    assert.equal(r.overflow, 4);
+});
+
+test("9 recent + 1 old: 9 recent then the 1 old", () => {
+    const r = selectOwnerItems([...recentSet(9), ...oldSet(1)], "CJ", TODAY);
+    assert.equal(r.items.length, 10);
+    assert.ok(ids(r).slice(0, 9).every(id => id.startsWith("r-")));
+    assert.equal(ids(r)[9], "o-00");
+    assert.equal(r.overflow, 0);
+});
+
+test("a charge dated after today is not recent", () => {
+    const future = issue({ id: "future", targetKey: "bl-a-future", postedDate: "2026-08-25" });
+    const oldFresh = issue({ id: "old-fresh", targetKey: "bl-z-old", postedDate: "2026-06-01" });
+    assert.deepEqual(ids(selectOwnerItems([future, oldFresh], "CJ", TODAY)), ["old-fresh", "future"]);
 });
 
 test("buildOwnerCards puts a recent never-carded charge ahead of an older one", () => {

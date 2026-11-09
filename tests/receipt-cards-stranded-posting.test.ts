@@ -12,9 +12,9 @@ import { dirname, join } from "node:path";
 process.env.DATABASE_URL ??= "postgresql://fiction:fiction@127.0.0.1:9/test?pgbouncer=true";
 process.env.NEXTAUTH_SECRET ??= "fiction-not-a-real-secret";
 
-import { convertStrandedPostingCards } from "../src/app/api/cron/receipt-request-cards/route";
+import { CLAIM_LEASE_MS, convertStrandedPostingCards } from "../src/app/api/cron/receipt-request-cards/route";
+import { CARD_OWNERS_ASKED } from "../src/lib/receipt-request-cards";
 
-const CLAIM_LEASE_MS = 10 * 60_000;
 const NOW = new Date("2026-11-10T14:30:00Z");
 const routePath = join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-request-cards/route.ts");
 
@@ -44,6 +44,7 @@ const row = (over: Partial<Row> & { id: string }): Row => ({
 function matches(r: Row, where: any): boolean {
     if (where.id !== undefined && r.id !== where.id) return false;
     if (where.status !== undefined && r.status !== where.status) return false;
+    if (where.owner?.in && !where.owner.in.includes(r.owner)) return false;
     if (where.postedAt === null && r.postedAt !== null) return false;
     if (where.OR) {
         const ok = where.OR.some((c: any) => {
@@ -128,12 +129,41 @@ test("a lost compare-and-set is not returned", async () => {
     assert.equal(f.updates[0].where.postedAt, null);
 });
 
-test("handleGET runs the sweep before the per-owner loop", () => {
+test("an on-demand row (owner Justin) with a dead claim is NOT converted", async () => {
+    const f = fakeDb([row({ id: "od", owner: "Justin" })]);
+    const out = await convertStrandedPostingCards(f.db as never, NOW);
+    assert.deepEqual(out, []);
+    assert.equal(f.rows[0].status, "POSTING");
+    assert.equal(f.updates.length, 0);
+});
+
+test("the lease boundary: exactly now - lease is left alone, 1 ms older is converted", async () => {
+    const edge = fakeDb([row({ id: "edge", claimedAt: new Date(NOW.getTime() - CLAIM_LEASE_MS) })]);
+    assert.deepEqual(await convertStrandedPostingCards(edge.db as never, NOW), []);
+    assert.equal(edge.rows[0].status, "POSTING");
+    const past = fakeDb([row({ id: "past", claimedAt: new Date(NOW.getTime() - CLAIM_LEASE_MS - 1) })]);
+    assert.deepEqual((await convertStrandedPostingCards(past.db as never, NOW)).map(r => r.id), ["past"]);
+    assert.equal(past.rows[0].status, "UNCERTAIN");
+});
+
+test("the compare-and-set where carries the dead-claim OR and the owner filter", async () => {
+    const f = fakeDb([row({ id: "cas" })]);
+    await convertStrandedPostingCards(f.db as never, NOW);
+    assert.equal(f.updates.length, 1);
+    const where = f.updates[0].where;
+    assert.equal(where.id, "cas");
+    assert.deepEqual(where.owner, { in: CARD_OWNERS_ASKED });
+    assert.deepEqual(where.OR, [{ claimedAt: null }, { claimedAt: { lt: new Date(NOW.getTime() - CLAIM_LEASE_MS) } }]);
+});
+
+test("handleGET sweeps after the enabled gate and before the weekday check, and every early return carries it", () => {
     const source = readFileSync(routePath, "utf8");
+    const gate = source.indexOf('RECEIPT_REQUEST_CARDS_ENABLED !== "true"');
     const call = source.indexOf("await convertStrandedPostingCards(");
-    const loop = source.indexOf("for (const owner of CARD_OWNERS_ASKED)");
-    assert.ok(call > 0, "handleGET must call convertStrandedPostingCards");
-    assert.ok(loop > 0);
-    assert.ok(call < loop, "the sweep must precede the per-owner loop");
+    const weekday = source.indexOf("isPacificWeekday(now)");
+    assert.ok(gate > 0 && call > 0 && weekday > 0);
+    assert.ok(gate < call, "the sweep must come after the enabled gate");
+    assert.ok(call < weekday, "the sweep must come before the weekday check");
     assert.match(source, /\[cron\/receipt-request-cards\] stranded-posting/);
+    assert.ok(source.split("...strandedBody").length - 1 >= 6, "every early return after the sweep spreads strandedBody");
 });

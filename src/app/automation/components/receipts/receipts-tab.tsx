@@ -711,11 +711,7 @@ export async function ReceiptsTab({
     );
 }
 
-/**
- * One pile of Marge's work: a title, one plain sentence saying what to do, and
- * the rows. Piles are drawn in the planner's order, which is "how few people
- * could possibly do this" rather than how big the pile is.
- */
+/** Yellow note shown while the weekday crew messages are off or not set up. */
 function CrewRequestsOffNotice() {
     return (
         <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
@@ -724,6 +720,11 @@ function CrewRequestsOffNotice() {
     );
 }
 
+/**
+ * One pile of Marge's work: a title, one plain sentence saying what to do, and
+ * the rows. Piles are drawn in the planner's order, which is "how few people
+ * could possibly do this" rather than how big the pile is.
+ */
 function TodoPileCard({ pile, jobs, links }: {
     pile: TodoPile;
     jobs: Array<{ id: string; name: string }>;

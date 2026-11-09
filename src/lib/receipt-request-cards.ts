@@ -54,10 +54,16 @@ export const MAX_ITEMS_PER_CARD = 10;
 /**
  * How far back a never-carded charge still counts as "recent" for ordering. A
  * charge becomes askable at 3 days old; 10 days leaves room for a weekend plus
- * a missed morning, so a new charge is asked inside its first week instead of
- * queueing behind an old backlog.
+ * a missed morning, so a new charge sits near the top of the next card instead
+ * of queueing behind an old backlog.
  */
 export const RECENT_CHARGE_WINDOW_DAYS = 10;
+
+/**
+ * When older never-carded charges are waiting, at least this many of the card's
+ * slots go to them, so a steady stream of new charges can never starve the backlog.
+ */
+export const BACKLOG_RESERVED_SLOTS = 3;
 
 export interface CardCandidateIssue {
     outreachHold?: ReceiptOutreachHold | null;
@@ -225,13 +231,13 @@ function isoDayNumber(value: string): number | null {
  * and nothing new ever moved. So an item that has never appeared on a card
  * outranks every item that has, and within each group the oldest charge wins
  * (the lowest targetKey breaks a tie, so the order is stable across runs).
- * Yesterday's overflow is by construction tomorrow's first candidate.
+ * Without `today`, yesterday's overflow is by construction tomorrow's first candidate.
  *
- * When `today` (Pacific YYYY-MM-DD) is given, a never-carded charge posted in
- * the last RECENT_CHARGE_WINDOW_DAYS days goes ahead of the older never-carded
- * ones, so a new charge is asked about this week while the backlog still
- * drains ten a day. Ever-carded items are not re-tiered, and without `today`
- * the order is exactly the one above.
+ * When `today` (Pacific YYYY-MM-DD) is given, never-carded charges posted in
+ * the last RECENT_CHARGE_WINDOW_DAYS days lead (up to 10 minus the reserve
+ * when older never-carded ones are waiting, see BACKLOG_RESERVED_SLOTS); then
+ * the older never-carded ones, oldest first; then any remaining recent ones;
+ * then ever-carded ones. Without `today` the order is exactly the one above.
  */
 export function selectOwnerItems(
     candidates: readonly CardCandidateIssue[],
@@ -243,23 +249,31 @@ export function selectOwnerItems(
     const isRecent = (issue: CardCandidateIssue): boolean => {
         if (recentCutoff === null || issue.everCarded) return false;
         const day = isoDayNumber(issue.postedDate);
-        return day !== null && day >= recentCutoff;
+        return day !== null && day >= recentCutoff && day <= (todayDay as number);
     };
-    const mine = candidates
+    const eligible = candidates
         .filter(issue => issue.owner === owner && !issue.acknowledged && !issue.outreachHold
-            && isCrewReceiptRequest({ amountCents: issue.amountCents, rawDescriptor: issue.payee }))
-        .sort((a, b) => {
+            && isCrewReceiptRequest({ amountCents: issue.amountCents, rawDescriptor: issue.payee }));
+    const byAge = (a: CardCandidateIssue, b: CardCandidateIssue): number => {
+        if (a.postedDate !== b.postedDate) return a.postedDate < b.postedDate ? -1 : 1;
+        return a.targetKey < b.targetKey ? -1 : a.targetKey > b.targetKey ? 1 : 0;
+    };
+    let ordered: CardCandidateIssue[];
+    if (recentCutoff === null) {
+        ordered = eligible.sort((a, b) => {
             if (a.everCarded !== b.everCarded) return a.everCarded ? 1 : -1;
-            if (recentCutoff !== null) {
-                const ra = isRecent(a);
-                const rb = isRecent(b);
-                if (ra !== rb) return ra ? -1 : 1;
-            }
-            if (a.postedDate !== b.postedDate) return a.postedDate < b.postedDate ? -1 : 1;
-            return a.targetKey < b.targetKey ? -1 : a.targetKey > b.targetKey ? 1 : 0;
+            return byAge(a, b);
         });
-    const listed = mine.slice(0, MAX_ITEMS_PER_CARD);
-    return { items: listed.map(toCardItem), overflow: mine.length - listed.length };
+    } else {
+        const recentNever = eligible.filter(issue => !issue.everCarded && isRecent(issue)).sort(byAge);
+        const oldNever = eligible.filter(issue => !issue.everCarded && !isRecent(issue)).sort(byAge);
+        const carded = eligible.filter(issue => issue.everCarded).sort(byAge);
+        const reserved = Math.min(BACKLOG_RESERVED_SLOTS, oldNever.length);
+        const lead = recentNever.slice(0, MAX_ITEMS_PER_CARD - reserved);
+        ordered = [...lead, ...oldNever, ...recentNever.slice(lead.length), ...carded];
+    }
+    const listed = ordered.slice(0, MAX_ITEMS_PER_CARD);
+    return { items: listed.map(toCardItem), overflow: ordered.length - listed.length };
 }
 
 /** Rebuild a card's text and request id from an already-claimed selection. */

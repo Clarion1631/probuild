@@ -207,8 +207,8 @@ export const TODO_COPY = {
     // has no code to send. Saying so beats an empty space where a sentence
     // should be.
     noReason: "No reason recorded.",
-    // Shown above missing-receipt requests while the weekday crew messages are off.
-    crewRequestsOff: "Crew messages are switched off. Nobody is being messaged about these charges. Justin decides when they go back on. Until then, ask for a receipt by hand.",
+    // Shown above missing-receipt requests while the weekday crew messages are off or not set up.
+    crewRequestsOff: "Automatic crew messages are not going out right now, so these charges are not being sent to anyone. Justin decides when they go back on. Until then, ask for a receipt by hand.",
 } as const;
 
 export const CREW_REQUESTS_OFF_NOTICE: string = TODO_COPY.crewRequestsOff;
