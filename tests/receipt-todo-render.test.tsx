@@ -182,6 +182,13 @@ const APPROVED_DIFFERENCES: Array<{ why: string; apply: (base: string) => string
         why: "a row with no read date fell back to the UTC calendar day, so an evening receipt read as tomorrow.",
         apply: base => base.replace(">2026-09-19 · chat<", ">2026-09-18 · chat<"),
     },
+    {
+        why: "the held-row line for an existing document named no owner. It now says Justin checks it.",
+        apply: base => base.replaceAll(
+            "Existing document needs reconciliation. Crew request held.",
+            "Existing document needs reconciliation. Crew request held. Justin checks this one.",
+        ),
+    },
 ];
 
 test("the process is in UTC, or these pins prove nothing", () => {
@@ -510,7 +517,7 @@ test("a hold this page has no words for is named as such, not as an evidence hol
         "THIS row must not carry a sentence about a document nobody has seen");
 
     // The two it does have words for keep their existing wording, untouched.
-    assert.match(rowContaining(html, "KNOWN ONE"), /Existing document needs reconciliation\. Crew request held\./);
+    assert.match(rowContaining(html, "KNOWN ONE"), /Existing document needs reconciliation\. Crew request held\. Justin checks this one\./);
     assert.match(rowContaining(html, "OFFICE ONE"), /Office invoice/);
     assert.match(
         rowContaining(html, "ANSWERED ONE"),

@@ -173,15 +173,16 @@ const SEND_COMPLETION_MARGIN_MS = 4_000;
  * phase then flipped a row to POSTING and called Chat, which starts a FRESH
  * 10-second timeout of its own, and the completion writes followed that. A run
  * that reached the send phase near its wall clock was killed between the
- * POSTING write and the response — and a row stranded that way stays stuck.
+ * POSTING write and the response — and a row stranded that way is stuck.
  * The delivery-day reservation is written in the SAME transaction as the
  * POSTING write, so `deliveredToday` already carries this owner by the time
  * any later run looks: a same-day run skips the owner before it ever reaches
  * the POSTING-to-UNCERTAIN check below, and a later day's run keys its lookup
- * on a different (owner, date) and never finds this row at all. So a card
- * nobody had ever sent stays stuck in POSTING — never converted, never
- * resent, never surfaced for an operator to resolve (a known gap, tracked as
- * a must-fix before cards go live).
+ * on a different (owner, date) and never finds this row at all. That gap is
+ * closed by `convertStrandedPostingCards`: every enabled run, on any day,
+ * finds POSTING rows with an expired claim by status and converts them to
+ * UNCERTAIN (reported as a transition, never resent), so the operator sees
+ * them under "Uncertain deliveries".
  *
  * A run refuses to enter POSTING without this much budget left. The claim is
  * released instead, so the row is picked up again rather than lost: a plain
@@ -656,6 +657,38 @@ export async function claimOwnerDay(
     }
 }
 
+/** What an expired-POSTING row becomes. Same payload as the in-loop conversion in handleGET. */
+const UNCERTAIN_DELIVERY_DATA = { status: "UNCERTAIN", lastError: "uncertain-delivery", claimedAt: null, claimToken: null };
+
+/**
+ * STRANDED-POSTING SWEEP. A row left in POSTING whose claim lease has expired
+ * belongs to a run that died between the POSTING write and the Chat response.
+ * It is found by status, for ANY pacificDate, because the per-owner loop can
+ * never reach it (same-day runs skip the owner via `deliveredToday`; a later
+ * day's run keys its lookup on a different date). Converted to UNCERTAIN with a
+ * compare-and-set, never resent. A live claim means a healthy run is mid-send:
+ * left completely alone. Returns only the rows this call actually converted.
+ */
+export async function convertStrandedPostingCards(
+    db: Pick<PrismaClient, "receiptRequestCard">,
+    now: Date,
+): Promise<Array<{ id: string; owner: string; pacificDate: string }>> {
+    const deadClaim = [{ claimedAt: null }, { claimedAt: { lt: new Date(now.getTime() - CLAIM_LEASE_MS) } }];
+    const stranded = await db.receiptRequestCard.findMany({
+        where: { status: "POSTING", postedAt: null, OR: deadClaim },
+        select: { id: true, owner: true, pacificDate: true },
+    });
+    const converted: Array<{ id: string; owner: string; pacificDate: string }> = [];
+    for (const row of stranded) {
+        const result = await db.receiptRequestCard.updateMany({
+            where: { id: row.id, status: "POSTING", postedAt: null, OR: deadClaim },
+            data: UNCERTAIN_DELIVERY_DATA,
+        });
+        if (result.count > 0) converted.push({ id: row.id, owner: row.owner, pacificDate: row.pacificDate });
+    }
+    return converted;
+}
+
 async function handleGET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -686,6 +719,14 @@ async function handleGET(request: Request) {
     // turns true during this pass, it scans and selects too (see "THE RETRY
     // PASS SELECTS TOO" below).
     const retryOnly = new URL(request.url).searchParams.get("retry") === "1";
+
+    // STRANDED-POSTING SWEEP, once per enabled run, before every early return
+    // and the per-owner loop, and not gated on selection, retry or
+    // deliveredToday. Reported into the run summary below.
+    const strandedConverted = await convertStrandedPostingCards(prisma, now);
+    for (const row of strandedConverted) {
+        console.error("[cron/receipt-request-cards] stranded-posting", JSON.stringify({ id: row.id, owner: row.owner, pacificDate: row.pacificDate }));
+    }
 
     /**
      * NO SELECTION UNTIL TONIGHT'S CHASE HAS FINISHED.
@@ -830,6 +871,10 @@ async function handleGET(request: Request) {
     // one must not make every subsequent run look partial, and a NEW one must
     // not be lost in the noise of the old ones.
     const uncertainTransitions: string[] = [];
+    for (const row of strandedConverted) {
+        uncertainTransitions.push(row.owner);
+        if (!uncertain.includes(row.owner)) uncertain.push(row.owner);
+    }
     // A healthy run is mid-send on this owner's card. Left strictly alone.
     const inFlight: string[] = [];
     // A claimed row whose itemsJson parsed to nothing (bad JSON, or an empty
@@ -1088,7 +1133,7 @@ async function handleGET(request: Request) {
         if (!selectionAllowed) continue;
         // A partial read may be missing this owner's items (scanIncomplete).
         if (scanIncomplete) continue;
-        const { items, overflow } = selectOwnerItems(scan.candidates, owner);
+        const { items, overflow } = selectOwnerItems(scan.candidates, owner, date);
         if (items.length === 0) continue;
         const token = randomUUID();
         // THE DAY-CLAIM and the POST-CLAIM in one insert, under a lock that

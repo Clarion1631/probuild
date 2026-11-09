@@ -51,6 +51,14 @@ export const CARD_RATE_CEILING = 10;
 /** Max ITEMS listed on one card. A list nobody can finish gets muted. */
 export const MAX_ITEMS_PER_CARD = 10;
 
+/**
+ * How far back a never-carded charge still counts as "recent" for ordering. A
+ * charge becomes askable at 3 days old; 10 days leaves room for a weekend plus
+ * a missed morning, so a new charge is asked inside its first week instead of
+ * queueing behind an old backlog.
+ */
+export const RECENT_CHARGE_WINDOW_DAYS = 10;
+
 export interface CardCandidateIssue {
     outreachHold?: ReceiptOutreachHold | null;
     /** ReviewIssue id. */
@@ -198,6 +206,16 @@ function toCardItem(issue: CardCandidateIssue, index: number): CardItem {
     };
 }
 
+/** UTC day number of a strict YYYY-MM-DD string, or null if it is not a real date. */
+function isoDayNumber(value: string): number | null {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!m) return null;
+    const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    const d = new Date(ms);
+    if (d.getUTCFullYear() !== Number(m[1]) || d.getUTCMonth() !== Number(m[2]) - 1 || d.getUTCDate() !== Number(m[3])) return null;
+    return Math.floor(ms / 86_400_000);
+}
+
 /**
  * The selection order for ONE owner. PURE.
  *
@@ -208,16 +226,35 @@ function toCardItem(issue: CardCandidateIssue, index: number): CardItem {
  * outranks every item that has, and within each group the oldest charge wins
  * (the lowest targetKey breaks a tie, so the order is stable across runs).
  * Yesterday's overflow is by construction tomorrow's first candidate.
+ *
+ * When `today` (Pacific YYYY-MM-DD) is given, a never-carded charge posted in
+ * the last RECENT_CHARGE_WINDOW_DAYS days goes ahead of the older never-carded
+ * ones, so a new charge is asked about this week while the backlog still
+ * drains ten a day. Ever-carded items are not re-tiered, and without `today`
+ * the order is exactly the one above.
  */
 export function selectOwnerItems(
     candidates: readonly CardCandidateIssue[],
     owner: string,
+    today?: string,
 ): { items: CardItem[]; overflow: number } {
+    const todayDay = today === undefined ? null : isoDayNumber(today);
+    const recentCutoff = todayDay === null ? null : todayDay - RECENT_CHARGE_WINDOW_DAYS;
+    const isRecent = (issue: CardCandidateIssue): boolean => {
+        if (recentCutoff === null || issue.everCarded) return false;
+        const day = isoDayNumber(issue.postedDate);
+        return day !== null && day >= recentCutoff;
+    };
     const mine = candidates
         .filter(issue => issue.owner === owner && !issue.acknowledged && !issue.outreachHold
             && isCrewReceiptRequest({ amountCents: issue.amountCents, rawDescriptor: issue.payee }))
         .sort((a, b) => {
             if (a.everCarded !== b.everCarded) return a.everCarded ? 1 : -1;
+            if (recentCutoff !== null) {
+                const ra = isRecent(a);
+                const rb = isRecent(b);
+                if (ra !== rb) return ra ? -1 : 1;
+            }
             if (a.postedDate !== b.postedDate) return a.postedDate < b.postedDate ? -1 : 1;
             return a.targetKey < b.targetKey ? -1 : a.targetKey > b.targetKey ? 1 : 0;
         });
@@ -262,7 +299,7 @@ export function buildOwnerCards(
     const date = pacificDate(now);
     const cards: OwnerCard[] = [];
     for (const owner of CARD_OWNERS_ASKED) {
-        const { items, overflow } = selectOwnerItems(candidates, owner);
+        const { items, overflow } = selectOwnerItems(candidates, owner, date);
         if (items.length === 0) continue;
         cards.push(buildCardFromItems(owner, date, items, overflow, overflowExact));
     }

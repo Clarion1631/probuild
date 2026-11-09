@@ -13,6 +13,7 @@ import {
 import {
     CARD_RATE_CEILING,
     MAX_ITEMS_PER_CARD,
+    RECENT_CHARGE_WINDOW_DAYS,
     buildCardFromItems,
     buildOwnerCards,
     centsToAmount,
@@ -473,7 +474,7 @@ test("the cards cron reports partial — ok:false, HTTP 200 — for an uncertain
     // every later run look partial.
     assert.match(source, /const uncertainTransitions: string\[\] = \[\];/);
     const pushes = source.match(/uncertainTransitions\.push\(/g) ?? [];
-    assert.equal(pushes.length, 3, "the expired-POSTING conversion, an unknown post, and a lost completion");
+    assert.equal(pushes.length, 4, "the stranded-POSTING sweep, the expired-POSTING conversion, an unknown post, and a lost completion");
     // The expired-POSTING conversion only counts when it actually wrote.
     assert.match(source, /if \(converted\.count > 0\) uncertainTransitions\.push\(owner\);/);
 });
@@ -642,4 +643,92 @@ test("the cron commits delivery+history together and repairs old gaps", () => {
     assert.match(source, /"report",/, "the repair reports a lost race rather than throwing");
     assert.match(source, /history repair failed/, "and never fails the run");
     assert.match(source, /repairedHistory: repaired,/);
+});
+
+// ---- recent never-carded charges jump the backlog -------------------------
+
+const TODAY = "2026-08-20";
+const dayBefore = (n: number): string => {
+    const d = new Date(Date.UTC(2026, 7, 20) - n * 86_400_000);
+    return d.toISOString().slice(0, 10);
+};
+const ids = (r: { items: CardItem[] }): string[] => r.items.map(i => i.issueId);
+
+function backlogFixture(): CardCandidateIssue[] {
+    const cands: CardCandidateIssue[] = [];
+    for (let i = 0; i < 12; i++) {
+        cands.push(issue({ id: `old-${i}`, targetKey: `bl-old-${String(i).padStart(2, "0")}`, postedDate: dayBefore(100 - i) }));
+    }
+    cands.push(issue({ id: "recent-4", targetKey: "bl-r4", postedDate: dayBefore(4) }));
+    cands.push(issue({ id: "recent-5", targetKey: "bl-r5", postedDate: dayBefore(5) }));
+    return cands;
+}
+
+test("RECENT_CHARGE_WINDOW_DAYS is 10", () => {
+    assert.equal(RECENT_CHARGE_WINDOW_DAYS, 10);
+});
+
+test("recent never-carded charges go first, then the oldest backlog", () => {
+    const r = selectOwnerItems(backlogFixture(), "CJ", TODAY);
+    assert.equal(r.items.length, 10);
+    assert.deepEqual(ids(r), ["recent-5", "recent-4", "old-0", "old-1", "old-2", "old-3", "old-4", "old-5", "old-6", "old-7"]);
+    assert.equal(r.overflow, 4);
+});
+
+test("omitting today gives exactly the old order", () => {
+    const r = selectOwnerItems(backlogFixture(), "CJ");
+    assert.deepEqual(ids(r), ["old-0", "old-1", "old-2", "old-3", "old-4", "old-5", "old-6", "old-7", "old-8", "old-9"]);
+    assert.equal(r.overflow, 4);
+    assert.deepEqual(ids(selectOwnerItems(backlogFixture(), "CJ", "not-a-date")), ids(r));
+});
+
+test("the window edge: exactly RECENT_CHARGE_WINDOW_DAYS old is recent, one day older is not", () => {
+    const edge = issue({ id: "edge", targetKey: "bl-z-edge", postedDate: dayBefore(RECENT_CHARGE_WINDOW_DAYS) });
+    const past = issue({ id: "past", targetKey: "bl-a-past", postedDate: dayBefore(RECENT_CHARGE_WINDOW_DAYS + 1) });
+    assert.deepEqual(ids(selectOwnerItems([past, edge], "CJ", TODAY)), ["edge", "past"]);
+});
+
+test("an ever-carded item is not promoted by being recent", () => {
+    const oldFresh = issue({ id: "old-fresh", targetKey: "bl-old", postedDate: "2026-06-01" });
+    const recentCarded = issue({ id: "recent-carded", targetKey: "bl-rc", postedDate: dayBefore(4), everCarded: true });
+    assert.deepEqual(ids(selectOwnerItems([recentCarded, oldFresh], "CJ", TODAY)), ["old-fresh", "recent-carded"]);
+});
+
+test("more than 10 recent never-carded: the 10 oldest recent are listed", () => {
+    const cands: CardCandidateIssue[] = [];
+    for (let i = 0; i < 12; i++) {
+        cands.push(issue({ id: `r-${i}`, targetKey: `bl-r-${String(i).padStart(2, "0")}`, postedDate: dayBefore(3 + (i % 8)) }));
+    }
+    const r = selectOwnerItems(cands, "CJ", TODAY);
+    assert.equal(r.items.length, 10);
+    assert.equal(r.overflow, 2);
+    const listedDates = r.items.map(i => i.date);
+    assert.deepEqual(listedDates, [...listedDates].sort());
+    const dropped = cands.filter(c => !ids(r).includes(c.id)).map(c => c.postedDate);
+    assert.ok(dropped.every(d => d >= listedDates[listedDates.length - 1]), "only the newest recent ones wait");
+});
+
+test("an empty or malformed postedDate is never recent and does not throw", () => {
+    const bad = issue({ id: "bad", targetKey: "bl-bad", postedDate: "garbage" });
+    const empty = issue({ id: "empty", targetKey: "bl-empty", postedDate: "" });
+    const recent = issue({ id: "recent", targetKey: "bl-z", postedDate: dayBefore(2) });
+    const r = selectOwnerItems([bad, empty, recent], "CJ", TODAY);
+    assert.equal(r.items[0].issueId, "recent");
+    assert.equal(r.items.length, 3);
+});
+
+test("buildOwnerCards puts a recent never-carded charge ahead of an older one", () => {
+    const cards = buildOwnerCards([
+        issue({ id: "old", targetKey: "bl-old", postedDate: "2026-06-01", payee: "OLD VENDOR" }),
+        issue({ id: "new", targetKey: "bl-new", postedDate: "2026-08-17", payee: "NEW VENDOR" }),
+    ], NOW);
+    assert.deepEqual(cards[0].items.map(i => i.vendor), ["NEW VENDOR", "OLD VENDOR"]);
+});
+
+test("the route passes the run's Pacific date to selectOwnerItems", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-request-cards/route.ts"),
+        "utf8",
+    );
+    assert.ok(source.includes("selectOwnerItems(scan.candidates, owner, date)"));
 });

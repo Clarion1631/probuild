@@ -56,6 +56,7 @@ import { CheckImagesPanel } from "./components/check-images-panel";
 import { fetchReceiptQueue, fetchJobOptions } from "./receipts-data";
 import { parseReceiptFilters, receiptFilterHref } from "./receipts-filters";
 import { ReceiptsTab } from "./components/receipts/receipts-tab";
+import { projectCardDeliveryConfig } from "@/lib/receipt-chaser-completion";
 
 export const dynamic = "force-dynamic";
 
@@ -884,7 +885,7 @@ async function ReceiptsTabBranch({ sp }: { sp: Record<string, string | string[] 
         && process.env.RECEIPT_BOOK_NATIVE === "true";
 
     const body: ReactNode = queue
-        ? <ReceiptsTab queue={queue} filters={filters} jobs={jobs} filterHref={filterHref} nativeActive={nativeActive} />
+        ? <ReceiptsTab queue={queue} filters={filters} jobs={jobs} filterHref={filterHref} nativeActive={nativeActive} crewRequestsEnabled={projectCardDeliveryConfig().reminderEnabled} />
         : (
             <div className="hui-card p-5 text-sm text-hui-textMuted">
                 The receipt queue couldn&apos;t be loaded right now — the register is still available.
