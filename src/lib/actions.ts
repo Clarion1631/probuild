@@ -5100,6 +5100,36 @@ export async function splitInvoiceMilestones(
 }
 
 /**
+ * Split ONE pending milestone into two (first part + remainder) so a partial payment can be
+ * recorded against the first part. See `splitPendingMilestoneCore` for the guards. Never
+ * notifies the client, calls QuickBooks, or changes the invoice total.
+ */
+export async function splitPendingMilestone(
+    scheduleId: string,
+    input: { firstAmount: number; remainderAmount: number; remainderName?: string | null },
+) {
+    await assertMilestoneAccess(scheduleId);
+
+    // Guard failures return { error } instead of throwing: production masks
+    // thrown server-action messages, so the client would never see the reason.
+    let result;
+    try {
+        const { splitPendingMilestoneCore } = await import("./billing-core");
+        result = await splitPendingMilestoneCore(scheduleId, input);
+    } catch (e: any) {
+        return { success: false as const, error: e?.message || "Failed to split milestone" };
+    }
+
+    revalidatePath(`/projects/${result.projectId}/invoices`);
+    revalidatePath(`/projects/${result.projectId}/invoices/${result.invoiceId}`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+    revalidatePath(`/reports/open-invoices`);
+
+    return { success: true as const, firstId: result.firstId, remainderId: result.remainderId };
+}
+
+/**
  * Re-price the Pending milestones on an invoice without changing the invoice
  * total ("Edit amounts"). See `updatePendingMilestoneAmountsCore` for the
  * validation, mirror-sync, and QuickBooks re-stage details.

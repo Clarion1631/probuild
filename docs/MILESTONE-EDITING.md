@@ -57,6 +57,7 @@ which fires on *payments*, never on edits.
 | Send estimate | `sendEstimateToClient`, `src/lib/actions.ts` | Sends the estimate email deliberately. Since #362 it does **not** rewrite milestones — a schedule whose unpaid sum differs from balance due by more than one cent **blocks the send** with an error (the 1¢ tolerance absorbs rounding). |
 | Invoice "Edit amounts" | `updatePendingMilestoneAmountsCore`, `src/lib/billing-core.ts` | No (QB re-staging only) |
 | Split invoice milestones | `splitInvoiceMilestonesCore`, `src/lib/billing-core.ts` | No |
+| Split one pending milestone (partial payment) | `splitPendingMilestoneCore`, `src/lib/billing-core.ts` | No |
 | Add invoice milestone | `addInvoiceMilestone`, `src/lib/actions.ts` | No |
 | Delete invoice milestone | `deleteInvoiceMilestoneCore`, `src/lib/billing-core.ts` | No |
 | Offline CO approval | `approveChangeOrderOfflineCore`, `src/lib/billing-core.ts` (creates the CO milestones via `billChangeOrderInTx`, in the same transaction as the approval) | No. Never emails or texts the customer and never touches QuickBooks; the new milestones stay unrequested (`qbInvoiceSentAt` NULL) until staff sends them. Reminders and the automatic paid receipt skip such milestones until then. |
@@ -66,6 +67,22 @@ which fires on *payments*, never on edits.
 If you add a new milestone-mutating path: it must not notify, it must respect the
 mirror invariant (`PaymentSchedule.sourceScheduleId` pairs update together), and it
 gets a row in this table.
+
+**Client paid only part of a milestone?** Use the "Partial payment" button on the pending row
+(`splitPendingMilestoneCore`). It cuts that ONE row into the amount received plus a "(remaining)"
+row, keeps the estimate mirror paired, and leaves the invoice total alone; then Record Payment
+settles the first part. "Edit amounts" only re-prices existing rows (it cannot create one), and
+"Split payments" replaces every non-Paid row and drops mirror links. It refuses QuickBooks-linked,
+in-payment, change-order, credited, progress-billed and deposit-held milestones, and any whose
+estimate mirror does not match the invoice amount (save "Edit amounts" once to resync, then split),
+and older unlinked milestones that match the estimate schedule by name.
+
+Do the Record Payment right after the split. The two rows cannot be merged back, only re-priced
+with "Edit amounts"; until the first part is recorded it is an ordinary pending, already-requested
+milestone (reminders and the portal treat it like the original). The deposit-hold check is
+best-effort: the deposit pipeline reserves a milestone under its own advisory lock, not the Invoice
+lock, so a deposit that starts applying in the same instant is not fenced (the same exposure
+"Edit amounts" has today).
 
 ## History of the editor traps (why this exists)
 
