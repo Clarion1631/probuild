@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { stripe } from "@/lib/stripe";
+import { attachCheckoutSessionIfUnchanged } from "@/lib/stripe-session-attach";
 
 export async function POST(req: Request) {
     const requestId = Math.random().toString(36).slice(2, 10);
@@ -150,10 +151,14 @@ export async function POST(req: Request) {
                 },
             }, { idempotencyKey });
 
-            await prisma.estimatePaymentSchedule.update({
-                where: { id: schedule.id },
-                data: { stripeSessionId: stripeSession.id },
-            });
+            // Only attach if the amount the session was created for is still the row's amount: a split
+            // or re-price committing since the read above would otherwise leave this session (old amount)
+            // on the changed row.
+            if (!(await attachCheckoutSessionIfUnchanged(prisma, "estimate", schedule, stripeSession.id))) {
+                await stripe.checkout.sessions.expire(stripeSession.id).catch(() => {});
+                console.warn("[create-session] milestone changed during checkout creation", { requestId, branch: "estimate", paymentScheduleId });
+                return new NextResponse("This payment was just updated. Please refresh the page and try again.", { status: 409 });
+            }
 
             console.info("[create-session] success", { requestId, branch: "estimate", sessionId: stripeSession.id, paymentScheduleId });
             return NextResponse.json({ url: stripeSession.url });
@@ -243,10 +248,12 @@ export async function POST(req: Request) {
             },
         }, { idempotencyKey });
 
-        await prisma.paymentSchedule.update({
-            where: { id: paymentSchedule.id },
-            data: { stripeSessionId: stripeSession.id },
-        });
+        // Same guard as the estimate branch above.
+        if (!(await attachCheckoutSessionIfUnchanged(prisma, "invoice", paymentSchedule, stripeSession.id))) {
+            await stripe.checkout.sessions.expire(stripeSession.id).catch(() => {});
+            console.warn("[create-session] milestone changed during checkout creation", { requestId, branch: "invoice", paymentScheduleId });
+            return new NextResponse("This payment was just updated. Please refresh the page and try again.", { status: 409 });
+        }
 
         console.info("[create-session] success", { requestId, branch: "invoice", sessionId: stripeSession.id, paymentScheduleId });
         return NextResponse.json({ url: stripeSession.url });

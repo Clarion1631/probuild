@@ -10,6 +10,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { partialSplitCents } from "../src/lib/milestone-split";
+import { attachCheckoutSessionIfUnchanged } from "../src/lib/stripe-session-attach";
 import { loadModules, makeWorld, setWorld, type Row, type World } from "./helpers/co-offline-harness";
 
 let billing: Row;
@@ -557,4 +558,24 @@ test("partialSplitCents: everything else is null", () => {
     for (const bad of ["30000.004", "0", "-5", "37000", "37000.01", "", "   ", "abc", "NaN", "Infinity"]) {
         assert.equal(partialSplitCents(bad, 37000), null, `"${bad}" must be refused`);
     }
+});
+
+// ── Interleaving with a Stripe Checkout session attach ───────────────────────
+
+test("split lands between the checkout's amount read and its attach: the attach misses", async () => {
+    freshWorld();
+    const read = { id: "ms-a", amount: ms().amount }; // what create-session read before calling Stripe
+    await split(30000, 7000);
+    const attached = await attachCheckoutSessionIfUnchanged(world.prisma as never, "invoice", read, "cs_test_old");
+    assert.equal(attached, false);
+    assert.equal(ms().stripeSessionId ?? null, null);
+    assert.equal(ms().amount, 30000);
+});
+
+test("attach first, then the split is refused as payment in progress with nothing changed", async () => {
+    freshWorld();
+    const read = { id: "ms-a", amount: ms().amount };
+    assert.equal(await attachCheckoutSessionIfUnchanged(world.prisma as never, "invoice", read, "cs_test_new"), true);
+    assert.equal(ms().stripeSessionId, "cs_test_new");
+    await assertRefusal("after attach", () => split(30000, 7000), /payment is in progress/i);
 });

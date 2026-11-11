@@ -82,7 +82,9 @@ with "Edit amounts"; until the first part is recorded it is an ordinary pending,
 milestone (reminders and the portal treat it like the original). The deposit-hold check is
 best-effort: the deposit pipeline reserves a milestone under its own advisory lock, not the Invoice
 lock, so a deposit that starts applying in the same instant is not fenced (the same exposure
-"Edit amounts" has today).
+"Edit amounts" has today). A card checkout that starts at the same moment is fenced: the checkout
+only attaches to the milestone if its amount is unchanged, otherwise it expires the session and asks
+the client to refresh.
 
 ## History of the editor traps (why this exists)
 
