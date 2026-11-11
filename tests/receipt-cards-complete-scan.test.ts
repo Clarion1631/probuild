@@ -464,10 +464,10 @@ test("source pin: selection waits for a complete read", () => {
     );
     const selectionAllowedIdx = source.indexOf("if (!selectionAllowed) continue;");
     const scanIncompleteContinueIdx = source.indexOf("if (scanIncomplete) continue;");
-    const selectOwnerItemsIdx = source.indexOf("selectOwnerItems(scan.candidates, owner)");
+    const selectOwnerItemsIdx = source.indexOf("selectOwnerItems(scan.candidates, owner, date)");
     assert.ok(selectionAllowedIdx >= 0, "if (!selectionAllowed) continue; not found");
     assert.ok(scanIncompleteContinueIdx >= 0, "if (scanIncomplete) continue; not found");
-    assert.ok(selectOwnerItemsIdx >= 0, "selectOwnerItems(scan.candidates, owner) not found");
+    assert.ok(selectOwnerItemsIdx >= 0, "selectOwnerItems(scan.candidates, owner, date) not found");
     assert.ok(selectionAllowedIdx < scanIncompleteContinueIdx, "the selectionAllowed check must come first");
     assert.ok(scanIncompleteContinueIdx < selectOwnerItemsIdx, "scanIncomplete must be checked before selection");
 

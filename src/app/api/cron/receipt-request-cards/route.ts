@@ -68,7 +68,9 @@ export const maxDuration = 60;
  * still-open items are replanned into a fresh card by a later day's run (see
  * "Yesterday's unposted card" below). A SEPARATE, WORSE window exists once
  * the POSTING write itself has committed — see "WHAT ENTERING `POSTING`
- * COSTS, WORST CASE" below, where a crash leaves the row stuck, not resumed.
+ * COSTS, WORST CASE" below, where a crash strands the row in POSTING;
+ * `convertStrandedPostingCards` turns it into UNCERTAIN on a later enabled
+ * run, never resumed and never resent.
  *
  * NEVER emails anything. The whole point is a reply-in-thread chase.
  */
@@ -123,7 +125,7 @@ const SCAN_MAX_PAGES = 200;
  */
 const QUEUED_RESEND_DRAIN_LIMIT = 3;
 
-const CLAIM_LEASE_MS = 10 * 60_000;
+export const CLAIM_LEASE_MS = 10 * 60_000;
 
 /**
  * The pre-send REVALIDATION budget (Codex PR #443 gate, finding 3), measured
@@ -173,15 +175,16 @@ const SEND_COMPLETION_MARGIN_MS = 4_000;
  * phase then flipped a row to POSTING and called Chat, which starts a FRESH
  * 10-second timeout of its own, and the completion writes followed that. A run
  * that reached the send phase near its wall clock was killed between the
- * POSTING write and the response — and a row stranded that way stays stuck.
+ * POSTING write and the response — and a row stranded that way is stuck.
  * The delivery-day reservation is written in the SAME transaction as the
  * POSTING write, so `deliveredToday` already carries this owner by the time
  * any later run looks: a same-day run skips the owner before it ever reaches
  * the POSTING-to-UNCERTAIN check below, and a later day's run keys its lookup
- * on a different (owner, date) and never finds this row at all. So a card
- * nobody had ever sent stays stuck in POSTING — never converted, never
- * resent, never surfaced for an operator to resolve (a known gap, tracked as
- * a must-fix before cards go live).
+ * on a different (owner, date) and never finds this row at all. That gap is
+ * closed by `convertStrandedPostingCards`: every enabled run
+ * finds POSTING rows with an expired claim by status and converts them to
+ * UNCERTAIN (reported as a transition, never resent), so the operator sees
+ * them under "Uncertain deliveries".
  *
  * A run refuses to enter POSTING without this much budget left. The claim is
  * released instead, so the row is picked up again rather than lost: a plain
@@ -656,6 +659,47 @@ export async function claimOwnerDay(
     }
 }
 
+/** What an expired-POSTING row becomes. Same payload as the in-loop conversion in handleGET. */
+const UNCERTAIN_DELIVERY_DATA = { status: "UNCERTAIN", lastError: "uncertain-delivery", claimedAt: null, claimToken: null };
+
+/**
+ * STRANDED-POSTING SWEEP. A row left in POSTING whose claim lease has expired
+ * belongs to a run that died between the POSTING write and the Chat response.
+ * It is found by status, for ANY pacificDate, because the per-owner loop can
+ * never reach it (same-day runs skip the owner via `deliveredToday`; a later
+ * day's run keys its lookup on a different date). Converted to UNCERTAIN with a
+ * compare-and-set, never resent. A live claim means a healthy run is mid-send:
+ * left completely alone. Returns only the rows this call actually converted.
+ * Only the cron's own owners are touched: on-demand rows (owner Justin) are
+ * written by `receipt-on-demand-store.ts`, which labels its own uncertain rows,
+ * so this sweep leaves them alone.
+ */
+export async function convertStrandedPostingCards(
+    db: Pick<PrismaClient, "receiptRequestCard">,
+    now: Date,
+): Promise<{ converted: Array<{ id: string; owner: string; pacificDate: string }>; failed: number }> {
+    const deadClaim = [{ claimedAt: null }, { claimedAt: { lt: new Date(now.getTime() - CLAIM_LEASE_MS) } }];
+    const stranded = await db.receiptRequestCard.findMany({
+        where: { status: "POSTING", postedAt: null, owner: { in: CARD_OWNERS_ASKED }, OR: deadClaim },
+        select: { id: true, owner: true, pacificDate: true },
+    });
+    const converted: Array<{ id: string; owner: string; pacificDate: string }> = [];
+    let failed = 0;
+    for (const row of stranded) {
+        try {
+            const result = await db.receiptRequestCard.updateMany({
+                where: { id: row.id, status: "POSTING", postedAt: null, owner: { in: CARD_OWNERS_ASKED }, OR: deadClaim },
+                data: UNCERTAIN_DELIVERY_DATA,
+            });
+            if (result.count > 0) converted.push({ id: row.id, owner: row.owner, pacificDate: row.pacificDate });
+        } catch (error) {
+            failed += 1;
+            console.error("[cron/receipt-request-cards] stranded-posting-row-failed", JSON.stringify({ id: row.id, error: error instanceof Error ? error.name : "UnknownError" }));
+        }
+    }
+    return { converted, failed };
+}
+
 async function handleGET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -666,16 +710,39 @@ async function handleGET(request: Request) {
     // The revalidation budget's own clock — see REVALIDATION_DEADLINE_MS.
     const runStartedAt = Date.now();
     const now = new Date();
+    // STRANDED-POSTING SWEEP. Runs on every enabled run, before every early
+    // return below: not gated on weekday, webhook, lock, selection, retry or
+    // deliveredToday. Compare-and-set, so it does not need the lock. The early
+    // returns below carry its conversions in their body (`strandedBody`).
+    let strandedConverted: Awaited<ReturnType<typeof convertStrandedPostingCards>>["converted"] = [];
+    let strandedSweepFailed = false;
+    try {
+        const sweep = await convertStrandedPostingCards(prisma, now);
+        strandedConverted = sweep.converted;
+        if (sweep.failed > 0) strandedSweepFailed = true;
+    } catch (error) {
+        strandedSweepFailed = true;
+        console.error("[cron/receipt-request-cards] stranded-posting-sweep-failed", error instanceof Error ? error.name : "UnknownError");
+    }
+    for (const row of strandedConverted) {
+        console.error("[cron/receipt-request-cards] stranded-posting", JSON.stringify({ id: row.id, owner: row.owner, pacificDate: row.pacificDate }));
+    }
+    const strandedBody = {
+        ...(strandedConverted.length > 0
+            ? { uncertainTransitions: strandedConverted.map(row => row.owner), strandedPosting: strandedConverted.map(row => `${row.owner}:${row.pacificDate}`) }
+            : {}),
+        ...(strandedSweepFailed ? { strandedSweepFailed: true } : {}),
+    };
     if (!isPacificWeekday(now)) {
-        return NextResponse.json({ ok: true, skipped: "weekend" });
+        return NextResponse.json({ ok: true, skipped: "weekend", ...strandedBody });
     }
     const webhookUrl = process.env.RECEIPTS_CHAT_WEBHOOK;
     if (!webhookUrl) {
         // Fail soft: the queue page still shows every one of these.
-        return NextResponse.json({ ok: true, skipped: "no-webhook" });
+        return NextResponse.json({ ok: true, skipped: "no-webhook", ...strandedBody });
     }
     if (!(await claim())) {
-        return NextResponse.json({ ok: true, skipped: "locked" });
+        return NextResponse.json({ ok: true, skipped: "locked", ...strandedBody });
     }
 
     const date = pacificDate(now);
@@ -739,7 +806,7 @@ async function handleGET(request: Request) {
     const recognitionPolicy = receiptRecognitionPolicy(process.env.RECEIPT_SOURCE_RECOGNITION_ENABLED === "true", reviewedReceiptFactsFingerprint, reviewedReceiptPairsFingerprint);
     // A flag change invalidates selection AND retry certification until a fresh cycle finishes.
     if (!cycleRecognitionPolicyMatches(currentCycle, recognitionPolicy)) {
-        return NextResponse.json({ ok: false, skipped: "chaser-policy-changed", date });
+        return NextResponse.json({ ok: false, skipped: "chaser-policy-changed", date, ...strandedBody });
     }
     const selectionAllowed = chaserCompletedFor(marker, date, "America/Los_Angeles", currentCycleId);
     // ONCE PER RUN, before any of the early returns below — so a run that then
@@ -749,7 +816,7 @@ async function handleGET(request: Request) {
     // Creating a cycle under the new policy is not completion: retries must
     // also wait for its certified finish, rather than replay an old pending card.
     if (currentCycle?.recognitionPolicy !== undefined && !selectionAllowed) {
-        return NextResponse.json({ ok: false, skipped: "chaser-incomplete", date });
+        return NextResponse.json({ ok: false, skipped: "chaser-incomplete", date, ...strandedBody });
     }
     if (!retryOnly) {
         if (!selectionAllowed) {
@@ -759,6 +826,7 @@ async function handleGET(request: Request) {
                 date,
                 phase: marker.phase,
                 chaserCompletedAt: marker.chaserCompletedAt,
+                ...strandedBody,
             };
             console.error("[cron/receipt-request-cards] refusing to select — tonight's chase has not completed", JSON.stringify(summary));
             // 200: nothing failed here, and a retry of THIS invocation would
@@ -830,6 +898,10 @@ async function handleGET(request: Request) {
     // one must not make every subsequent run look partial, and a NEW one must
     // not be lost in the noise of the old ones.
     const uncertainTransitions: string[] = [];
+    for (const row of strandedConverted) {
+        uncertainTransitions.push(row.owner);
+        if (!uncertain.includes(row.owner)) uncertain.push(row.owner);
+    }
     // A healthy run is mid-send on this owner's card. Left strictly alone.
     const inFlight: string[] = [];
     // A claimed row whose itemsJson parsed to nothing (bad JSON, or an empty
@@ -1088,7 +1160,7 @@ async function handleGET(request: Request) {
         if (!selectionAllowed) continue;
         // A partial read may be missing this owner's items (scanIncomplete).
         if (scanIncomplete) continue;
-        const { items, overflow } = selectOwnerItems(scan.candidates, owner);
+        const { items, overflow } = selectOwnerItems(scan.candidates, owner, date);
         if (items.length === 0) continue;
         const token = randomUUID();
         // THE DAY-CLAIM and the POST-CLAIM in one insert, under a lock that
@@ -1180,8 +1252,8 @@ async function handleGET(request: Request) {
          * before it can reach the `uncertain-delivery` conversion, and a later
          * day's run looks up a different (owner, date) and never finds the row
          * at all — so a card that was never sent stays a card nobody will ever
-         * send or surface (a known gap, tracked as a must-fix before cards go
-         * live).
+         * send or surface (the sweep converts it to UNCERTAIN on the next
+         * enabled run, so it does get surfaced).
          *
          * Checked BEFORE the revalidation, not just before the POSTING write:
          * revalidation is itself several real queries, and spending them only
@@ -1602,6 +1674,7 @@ async function handleGET(request: Request) {
         // as a crashed invocation and re-run it.
         ok: failures.length === 0 && uncertainTransitions.length === 0 && !scanIncomplete,
         partial: failures.length === 0 && uncertainTransitions.length > 0,
+        ...(strandedSweepFailed ? { strandedSweepFailed: true } : {}),
         failedOwners: failures,
         uncertainOwners: uncertain,
         // Only what THIS run moved. An old uncertain row is somebody's to
@@ -1684,7 +1757,8 @@ async function handleGET(request: Request) {
 // with no proof it arrived, which this heartbeat treats as a failed run.
 // scanIncomplete (cards-complete-scan-spec.md) is the same story: still 200,
 // but a run whose read was partial claimed no owner's day, and that is worth
-// the same escalation as an unconfirmed delivery.
+// the same escalation as an unconfirmed delivery. A stranded-POSTING sweep
+// that failed is escalated the same way.
 export const GET = withCronHeartbeat("RECEIPT_REQUEST_CARDS", handleGET, {
-    isFailure: body => isRecord(body) && ((Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0) || body.scanIncomplete === true),
+    isFailure: body => isRecord(body) && ((Array.isArray(body.uncertainTransitions) && body.uncertainTransitions.length > 0) || body.scanIncomplete === true || body.strandedSweepFailed === true),
 });
