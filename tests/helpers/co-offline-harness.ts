@@ -90,7 +90,7 @@ export function makeWorld(options: WorldOptions = {}) {
     const subtotal = itemCosts.reduce((sum, value) => sum + value, 0);
     const state: {
         co: Row; items: Row[]; schedules: Row[]; estimate: Row; invoices: Row[]; milestones: Row[]; activity: Row[]; settings: Row;
-        billings: Row[]; estimateSchedules: Row[];
+        billings: Row[]; estimateSchedules: Row[]; progressLines: Row[]; depositIngests: Row[];
     } = {
         co: {
             id: "co-1", code: "CO-00001", title: "Example change", status: options.status ?? "Sent",
@@ -113,6 +113,8 @@ export function makeWorld(options: WorldOptions = {}) {
         activity: [],
         billings: [], // ChangeOrderBilling rows
         estimateSchedules: [], // EstimatePaymentSchedule rows: { id, order, plus name/amount/status when a test mirrors }
+        progressLines: [], // ProgressBillingLine rows: { scheduleId, billing: { code, status } }
+        depositIngests: [], // DepositIngest rows: { paymentScheduleId, status }
         settings: { timeZone: "America/Los_Angeles", notificationEmail: TEAM_EMAIL, email: OFFICE_EMAIL, companyName: "Test Co", notificationToggles: null, phone: null },
     };
 
@@ -120,6 +122,7 @@ export function makeWorld(options: WorldOptions = {}) {
     const sms: Array<{ to: string; body: string }> = [];
     const qbCalls: string[] = [];
     const fetchCalls: string[] = [];
+    const enqueues: Row[] = []; // enqueueMilestonePaid calls recorded by the faked ./payment-outbox
     const revalidated: string[] = [];
     let seq = 0;
 
@@ -154,17 +157,36 @@ export function makeWorld(options: WorldOptions = {}) {
             count: async () => state.schedules.length,
             findMany: async () => state.schedules.map((row) => ({ ...row })),
         },
-        estimate: { findUnique: async () => ({ ...state.estimate }) },
+        estimate: {
+            findUnique: async () => ({ ...state.estimate }),
+            update: async ({ data }: Row) => { applyData(state.estimate, data); return { ...state.estimate }; },
+        },
         estimatePaymentSchedule: {
             findUnique: async ({ where }: Row) => {
                 const row = state.estimateSchedules.find((eps) => eps.id === where.id);
                 return row ? { ...row } : null;
             },
             findMany: async ({ where }: Row = {}) => state.estimateSchedules.filter((row) => matches(row, where)).map((row) => ({ ...row })),
+            findFirst: async ({ where }: Row = {}) => {
+                const row = state.estimateSchedules.find((eps) => matches(eps, where));
+                return row ? { ...row } : null;
+            },
+            create: async ({ data }: Row) => {
+                seq += 1;
+                const row = { id: `eps-new-${seq}`, stripeSessionId: null, stripePaymentIntentId: null, paymentDate: null, paidAt: null, ...data };
+                state.estimateSchedules.push(row);
+                return { ...row };
+            },
             updateMany: async ({ where, data }: Row) => {
                 const hit = state.estimateSchedules.filter((row) => matches(row, where));
                 for (const row of hit) applyData(row, data);
                 return { count: hit.length };
+            },
+        },
+        depositIngest: {
+            findFirst: async ({ where }: Row = {}) => {
+                const row = state.depositIngests.find((d) => matches(d, where));
+                return row ? { ...row } : null;
             },
         },
         changeOrderBilling: {
@@ -237,7 +259,12 @@ export function makeWorld(options: WorldOptions = {}) {
             },
         },
         // Progress billing reads earlier billing lines per milestone; this world has none.
-        progressBillingLine: { findMany: async () => [] },
+        progressBillingLine: {
+            findMany: async ({ where }: Row = {}) => state.progressLines
+                .filter((line) => (where?.scheduleId === undefined || line.scheduleId === where.scheduleId)
+                    && (where?.billing?.status?.not === undefined || line.billing.status !== where.billing.status.not))
+                .map((line) => structuredClone(line)),
+        },
         companySettings: { findUnique: async () => ({ ...state.settings }) },
         activityLog: {
             findFirst: async () => null,
@@ -261,7 +288,7 @@ export function makeWorld(options: WorldOptions = {}) {
         ...models,
         $queryRaw: queryRaw,
         $transaction: async (callback: (tx: Row) => Promise<unknown>) => {
-            const snapshot = structuredClone({ co: state.co, milestones: state.milestones, invoices: state.invoices, activity: state.activity, billings: state.billings, estimateSchedules: state.estimateSchedules });
+            const snapshot = structuredClone({ co: state.co, milestones: state.milestones, invoices: state.invoices, activity: state.activity, billings: state.billings, estimateSchedules: state.estimateSchedules, estimate: state.estimate });
             try {
                 return await callback(fakeTx());
             } catch (error) {
@@ -271,6 +298,7 @@ export function makeWorld(options: WorldOptions = {}) {
                 state.activity = snapshot.activity;
                 state.billings = snapshot.billings;
                 state.estimateSchedules = snapshot.estimateSchedules;
+                state.estimate = snapshot.estimate;
                 throw error;
             }
         },
@@ -300,7 +328,7 @@ export function makeWorld(options: WorldOptions = {}) {
         },
     });
 
-    return { state, prisma: guardedPrisma, emails, sms, qbCalls, fetchCalls, revalidated, sendNotification, customerEmails };
+    return { state, prisma: guardedPrisma, emails, sms, qbCalls, fetchCalls, enqueues, revalidated, sendNotification, customerEmails };
 }
 
 export type World = ReturnType<typeof makeWorld>;
@@ -308,7 +336,7 @@ export type World = ReturnType<typeof makeWorld>;
 // ── Module loading under the require patch ─────────────────────────────────
 
 type Loaded = {
-    billing: Row; reminders: Row; notifications: Row; sweep: Row; restore: () => void;
+    billing: Row; reminders: Row; notifications: Row; sweep: Row; paymentRecord: Row; restore: () => void;
 };
 
 let current: World | null = null;
@@ -345,6 +373,11 @@ export async function loadModules(): Promise<Loaded> {
         "./sms": { sendSMS: async (to: string, body: string) => { (current as World).sms.push({ to, body }); return { success: true }; } },
         "@/lib/sms": { sendSMS: async (to: string, body: string) => { (current as World).sms.push({ to, body }); return { success: true }; } },
         "next/cache": { revalidatePath: (path: string) => { current?.revalidated.push(path); } },
+        // Only payment-record-core requires this; the real outbox needs a PaymentNotification table.
+        "./payment-outbox": {
+            enqueueMilestonePaid: async (_tx: unknown, input: Row) => { (current as World).enqueues.push(input); },
+            drainPaymentNotifications: async () => ({}),
+        },
         "./quickbooks-payments": qbProxy("quickbooks-payments"),
         "@/lib/quickbooks-payments": qbProxy("quickbooks-payments"),
     };
@@ -363,13 +396,14 @@ export async function loadModules(): Promise<Loaded> {
         globalThis.fetch = originalFetch;
     };
     try {
-        const [billing, reminders, notifications, sweep] = await Promise.all([
+        const [billing, reminders, notifications, sweep, paymentRecord] = await Promise.all([
             import("../../src/lib/billing-core"),
             import("../../src/lib/payment-reminders"),
             import("../../src/lib/payment-notifications"),
             import("../../src/app/api/cron/co-billing-sweep/route"),
+            import("../../src/lib/payment-record-core"),
         ]);
-        return { billing, reminders, notifications, sweep, restore };
+        return { billing, reminders, notifications, sweep, paymentRecord, restore };
     } catch (error) {
         restore();
         throw error;

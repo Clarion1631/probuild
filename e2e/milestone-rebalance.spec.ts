@@ -4,8 +4,11 @@ import {
     updatePendingMilestoneAmountsCore,
     deleteInvoiceMilestoneCore,
     splitInvoiceMilestonesCore,
+    splitPendingMilestoneCore,
     approveChangeOrderOfflineCore,
 } from "../src/lib/billing-core";
+import { claimMilestonePreCreateUnderLock } from "../src/lib/quickbooks-payments";
+import { CREATE_IN_FLIGHT_MARKER } from "../src/lib/qbo-create-markers";
 
 /**
  * Milestone rebalance + QBO resync regression net.
@@ -451,5 +454,153 @@ test.describe.serial("splitInvoiceMilestonesCore partially-paid total fix", () =
         const remaining = await prisma.paymentSchedule.findMany({ where: { invoiceId, status: "Pending" } });
         expect(remaining.length).toBe(2);
         expect(remaining.reduce((sum, r) => sum + num(r.amount), 0)).toBe(700);
+    });
+});
+
+test.describe.serial("splitPendingMilestoneCore", () => {
+    test.afterAll(afterAllCleanup);
+
+    async function seed(suffix: string) {
+        await ensureClientAndProject();
+        const estimateId = `${PFX}-est-${suffix}`;
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const epsA = `${PFX}-eps-a-${suffix}`;
+        const psA = `${PFX}-ps-a-${suffix}`;
+        await prisma.estimate.create({
+            data: { id: estimateId, title: "MR Estimate", code: `EST-MR-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 1000, balanceDue: 1000 },
+        });
+        await prisma.estimatePaymentSchedule.create({
+            data: { id: epsA, estimateId, name: "Cabinets", percentage: 100, amount: 1000, status: "Pending", order: 1 },
+        });
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", totalAmount: 1000, balanceDue: 1000 },
+        });
+        await prisma.paymentSchedule.create({
+            data: { id: psA, invoiceId, name: "Cabinets", amount: 1000, status: "Pending", sourceScheduleId: epsA },
+        });
+        return { estimateId, invoiceId, epsA, psA };
+    }
+
+    test("splits a mirrored pending milestone and leaves invoice and estimate totals alone", async () => {
+        const { estimateId, invoiceId, epsA, psA } = await seed("split");
+        const before = await prisma.estimate.findUnique({ where: { id: estimateId } });
+
+        const res = await splitPendingMilestoneCore(psA, { firstAmount: 300, remainderAmount: 700 });
+        expect(res.firstId).toBe(psA);
+
+        const first = await prisma.paymentSchedule.findUnique({ where: { id: psA } });
+        const rest = await prisma.paymentSchedule.findUnique({ where: { id: res.remainderId } });
+        expect(num(first!.amount)).toBe(300);
+        expect(first!.sourceScheduleId).toBe(epsA);
+        expect(num(rest!.amount)).toBe(700);
+        expect(rest!.status).toBe("Pending");
+        expect(rest!.name).toBe("Cabinets (remaining)");
+        expect(rest!.sourceScheduleId).not.toBeNull();
+        expect(rest!.sourceScheduleId).not.toBe(epsA);
+
+        const estRows = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
+        expect(estRows.length).toBe(2);
+        expect(estRows.reduce((sum, r) => sum + num(r.amount), 0)).toBe(1000);
+        expect(num(estRows.find((r) => r.id === epsA)!.amount)).toBe(300);
+        expect(num(estRows.find((r) => r.id === rest!.sourceScheduleId)!.amount)).toBe(700);
+
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.totalAmount)).toBe(1000);
+        expect(num(invoice!.balanceDue)).toBe(1000);
+        expect(invoice!.status).toBe("Issued");
+        const after = await prisma.estimate.findUnique({ where: { id: estimateId } });
+        expect(num(after!.totalAmount)).toBe(num(before!.totalAmount));
+        expect(num(after!.balanceDue)).toBe(num(before!.balanceDue));
+        expect(after!.itemsRevision).toBe(before!.itemsRevision + 1);
+    });
+
+    test("two concurrent splits of the same row: exactly one wins and nothing double-counts", async () => {
+        const { estimateId, invoiceId, psA } = await seed("race");
+        const before = await prisma.estimate.findUnique({ where: { id: estimateId } });
+
+        const results = await Promise.allSettled([
+            splitPendingMilestoneCore(psA, { firstAmount: 600, remainderAmount: 400 }),
+            splitPendingMilestoneCore(psA, { firstAmount: 700, remainderAmount: 300 }),
+        ]);
+        expect(results.filter((r) => r.status === "fulfilled").length).toBe(1);
+        expect(results.filter((r) => r.status === "rejected").length).toBe(1);
+
+        const rows = await prisma.paymentSchedule.findMany({ where: { invoiceId } });
+        expect(rows.filter((r) => r.name === "Cabinets (remaining)").length).toBe(1);
+        expect(rows.length).toBe(2);
+        expect(rows.reduce((sum, r) => sum + num(r.amount), 0)).toBe(1000);
+        const estRows = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
+        expect(estRows.length).toBe(2);
+        expect(estRows.reduce((sum, r) => sum + num(r.amount), 0)).toBe(1000);
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.totalAmount)).toBe(1000);
+        expect(num(invoice!.balanceDue)).toBe(1000);
+        const after = await prisma.estimate.findUnique({ where: { id: estimateId } });
+        expect(after!.itemsRevision).toBe(before!.itemsRevision + 1);
+    });
+
+    test("a QuickBooks pre-create claim taken on the OLD snapshot loses to a split that landed first", async () => {
+        const { psA } = await seed("qbclaim-a");
+        const stale = await prisma.paymentSchedule.findUnique({ where: { id: psA } });
+
+        await splitPendingMilestoneCore(psA, { firstAmount: 600, remainderAmount: 400 });
+        const claim = await claimMilestonePreCreateUnderLock(stale!, CREATE_IN_FLIGHT_MARKER);
+        expect(claim.count).toBe(0);
+        const row = await prisma.paymentSchedule.findUnique({ where: { id: psA } });
+        expect(row!.qbSyncError).toBeNull();
+        expect(num(row!.amount)).toBe(600);
+    });
+
+    test("a split attempted after the QuickBooks pre-create claim is refused and changes nothing", async () => {
+        const { estimateId, invoiceId, epsA, psA } = await seed("qbclaim-b");
+        const before = await prisma.estimate.findUnique({ where: { id: estimateId } });
+        const snapshot = await prisma.paymentSchedule.findUnique({ where: { id: psA } });
+
+        const claim = await claimMilestonePreCreateUnderLock(snapshot!, CREATE_IN_FLIGHT_MARKER);
+        expect(claim.count).toBe(1);
+        expect((await prisma.paymentSchedule.findUnique({ where: { id: psA } }))!.qbSyncError).toBe(CREATE_IN_FLIGHT_MARKER);
+
+        await expect(splitPendingMilestoneCore(psA, { firstAmount: 600, remainderAmount: 400 })).rejects.toThrow();
+        expect((await prisma.paymentSchedule.findMany({ where: { invoiceId } })).length).toBe(1);
+        expect(num((await prisma.paymentSchedule.findUnique({ where: { id: psA } }))!.amount)).toBe(1000);
+        const estRows = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
+        expect(estRows.length).toBe(1);
+        expect(num(estRows.find((r) => r.id === epsA)!.amount)).toBe(1000);
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.totalAmount)).toBe(1000);
+        expect(num(invoice!.balanceDue)).toBe(1000);
+        const after = await prisma.estimate.findUnique({ where: { id: estimateId } });
+        expect(after!.itemsRevision).toBe(before!.itemsRevision);
+    });
+
+    test("rolls back the invoice-row claim when the estimate-side claim misses (payment in progress on the estimate row)", async () => {
+        const { estimateId, invoiceId, epsA, psA } = await seed("rollback");
+        // The invoice row is clean, so its claim succeeds inside the transaction; only the estimate row is held.
+        await prisma.estimatePaymentSchedule.update({ where: { id: epsA }, data: { stripeSessionId: "cs_test_e2e_rollback" } });
+        const before = await prisma.estimate.findUnique({ where: { id: estimateId } });
+
+        await expect(splitPendingMilestoneCore(psA, { firstAmount: 600, remainderAmount: 400 })).rejects.toThrow();
+
+        const rows = await prisma.paymentSchedule.findMany({ where: { invoiceId } });
+        expect(rows.length).toBe(1);
+        expect(rows.some((r) => r.name === "Cabinets (remaining)")).toBe(false);
+        expect(num(rows[0].amount)).toBe(1000);
+        const estRows = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } });
+        expect(estRows.length).toBe(1);
+        expect(num(estRows[0].amount)).toBe(1000);
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.totalAmount)).toBe(1000);
+        expect(num(invoice!.balanceDue)).toBe(1000);
+        const after = await prisma.estimate.findUnique({ where: { id: estimateId } });
+        expect(after!.itemsRevision).toBe(before!.itemsRevision);
+    });
+
+    test("refuses parts that do not add up and changes nothing", async () => {
+        const { estimateId, invoiceId, epsA, psA } = await seed("nosum");
+        await expect(splitPendingMilestoneCore(psA, { firstAmount: 300, remainderAmount: 600 })).rejects.toThrow(/must add up/);
+        expect((await prisma.paymentSchedule.findMany({ where: { invoiceId } })).length).toBe(1);
+        expect(num((await prisma.paymentSchedule.findUnique({ where: { id: psA } }))!.amount)).toBe(1000);
+        expect(num((await prisma.estimatePaymentSchedule.findUnique({ where: { id: epsA } }))!.amount)).toBe(1000);
+        expect((await prisma.estimatePaymentSchedule.findMany({ where: { estimateId } })).length).toBe(1);
     });
 });

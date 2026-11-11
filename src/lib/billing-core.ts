@@ -2275,6 +2275,7 @@ import {
     type CreditTargetRow,
 } from "./change-order-credit";
 import { creditCentsByMilestoneInTx } from "./change-order-credit-markers";
+import { RESERVATION_RETAINING_STATUSES } from "./deposit-sweep";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Credit change orders (FIXED, subtotal < 0). Approving one LOWERS one existing
@@ -3936,4 +3937,242 @@ export async function splitInvoiceMilestonesCore(
     }));
 
     return projectId;
+}
+
+/**
+ * Split ONE Pending milestone into two that sum to the original, so the normal
+ * Record Payment flow can settle the part the client actually paid ("partial payment").
+ * The ORIGINAL row is reduced in place (keeps id, name and estimate mirror link) to
+ * `firstAmount`; a NEW Pending row holds `remainderAmount`. Invoice `totalAmount` /
+ * `balanceDue` / `status` and the estimate totals are never written, and nothing is sent
+ * to the client or QuickBooks — a milestone EDIT must never notify.
+ *
+ * Unlike `splitInvoiceMilestonesCore` it looks at THIS row only: another row being
+ * QuickBooks-linked, or the invoice carrying change-order billing, does not block it.
+ * Same carve pattern as AUTO-SPLIT in progress-billing.ts (claim, then mirror).
+ */
+export async function splitPendingMilestoneCore(
+    scheduleId: string,
+    input: { firstAmount: number; remainderAmount: number; remainderName?: string | null },
+): Promise<{ success: true; projectId: string; invoiceId: string; firstId: string; remainderId: string }> {
+    const firstCents = Math.round(Number(input.firstAmount) * 100);
+    const remainderCents = Math.round(Number(input.remainderAmount) * 100);
+    if (!Number.isFinite(firstCents) || !Number.isFinite(remainderCents) || firstCents <= 0 || remainderCents <= 0) {
+        throw new Error("Each part must be greater than zero");
+    }
+    // Reject, never silently round: 100.004 would otherwise become 100.00 and hide a typo.
+    const hasSubCent = (n: number) => Math.abs(n * 100 - Math.round(n * 100)) > 1e-6;
+    if (hasSubCent(Number(input.firstAmount)) || hasSubCent(Number(input.remainderAmount))) {
+        throw new Error("Each part must be a whole number of cents (no fractions of a cent)");
+    }
+    const first = firstCents / 100;
+    const remainder = remainderCents / 100;
+
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        const peek = await tx.paymentSchedule.findUnique({ where: { id: scheduleId }, select: { id: true, invoiceId: true } });
+        if (!peek) throw new Error("Milestone not found");
+        const preLock = await tx.invoice.findUnique({ where: { id: peek.invoiceId }, select: { estimateId: true } });
+        // Canonical lock order: Estimate -> Invoice (the mirror write below touches the estimate side).
+        await lockMoneyParents(tx, { estimateId: preLock?.estimateId, invoiceId: peek.invoiceId });
+
+        // Re-read under the locks — everything below is judged on this row only. If the row moved
+        // to another invoice or the invoice was re-pointed at another estimate since the peek, the
+        // locks we hold are the wrong ones.
+        const row = await tx.paymentSchedule.findUnique({ where: { id: scheduleId } });
+        const invLink = await tx.invoice.findUnique({ where: { id: peek.invoiceId }, select: { id: true, estimateId: true, projectId: true } });
+        if (!row || !invLink) throw new Error("Milestone not found");
+        if (row.invoiceId !== peek.invoiceId || (invLink.estimateId ?? null) !== (preLock?.estimateId ?? null)) {
+            throw new Error("This milestone changed while being split — refresh and try again.");
+        }
+        if (row.status !== "Pending") throw new Error(`"${row.name}" is not Pending — only pending milestones can be split`);
+        if (row.stripeSessionId || row.stripePaymentIntentId) {
+            throw new Error(`A payment is in progress on "${row.name}". Wait for it to finish or void it before splitting.`);
+        }
+        if (row.qbInvoiceId) {
+            throw new Error(`"${row.name}" has a QuickBooks invoice staged — use "Break QB Link" first, then split.`);
+        }
+        // A parked create may already be a live invoice in QuickBooks for the OLD amount.
+        if (isBlockedByAmbiguousCreate(row)) throw new QBResolveRequiredError(row.name);
+        if (row.qbSyncError) {
+            throw new Error(`"${row.name}" has a QuickBooks flag on it (${row.qbSyncError}) — clear it before splitting.`);
+        }
+        const coBilling = await tx.changeOrderBilling.findFirst({ where: { paymentScheduleId: row.id }, select: { id: true } });
+        if (row.sourceChangeOrderId || row.sourceCoScheduleId || coBilling) {
+            throw new Error(`"${row.name}" is change-order billing — change-order milestones can't be split.`);
+        }
+        if ((await creditCentsByMilestoneInTx(tx, row.invoiceId)).has(row.id)) {
+            throw new Error(coCreditedMilestoneError(row.name, "split"));
+        }
+        // Splitting a milestone a progress billing already references would break that billing's
+        // consumption guard (it sums what was billed against the milestone's current amount).
+        const billedLines = await tx.progressBillingLine.findMany({
+            where: { scheduleId: row.id, billing: { status: { not: "Void" } } },
+            select: { billing: { select: { code: true } } },
+        });
+        if (billedLines.length > 0) {
+            const codes = [...new Set(billedLines.map((l) => l.billing.code))].join(", ");
+            throw new Error(`"${row.name}" is on progress billing ${codes} — it can't be split.`);
+        }
+        const heldDeposit = await tx.depositIngest.findFirst({
+            where: { paymentScheduleId: row.id, status: { in: [...RESERVATION_RETAINING_STATUSES] } },
+            select: { id: true },
+        });
+        if (heldDeposit) {
+            throw new Error(`A deposit is being applied to "${row.name}" — wait for it to finish before splitting.`);
+        }
+        if (hasSubCent(toNum(row.amount))) {
+            throw new Error(`"${row.name}" has an amount with fractions of a cent — fix it with Edit amounts first, then split.`);
+        }
+        // Doubles as the stale-screen check: the amount the user saw must still be the amount here.
+        const amountCents = Math.round(toNum(row.amount) * 100);
+        if (firstCents + remainderCents !== amountCents) {
+            throw new Error(
+                `The two parts must add up to ${formatCurrency(amountCents / 100)} (the milestone's current amount), ` +
+                `but you entered ${formatCurrency((firstCents + remainderCents) / 100)}. Refresh the page if the amount changed.`
+            );
+        }
+
+        const remainderName = (input.remainderName || "").trim() || `${row.name} (remaining)`;
+
+        // Older invoices pair an UNLINKED row with its estimate row by a unique unpaid name+amount
+        // match (recordPaymentCore, findUnpaidEstimateMirror, unrecordPayment). Splitting changes
+        // this row's amount, the fallback stops matching, and the estimate row would never be
+        // settled. Name-only on purpose: at least as broad as that fallback.
+        if (!row.sourceScheduleId && invLink.estimateId) {
+            const nameMatched = await tx.estimatePaymentSchedule.findFirst({
+                where: { estimateId: invLink.estimateId, status: { not: "Paid" }, name: { in: [row.name, remainderName] } },
+                select: { id: true },
+            });
+            if (nameMatched) {
+                throw new Error(`"${row.name}" is matched to the estimate's payment schedule by name only (older invoice), so it can't be split safely.`);
+            }
+        }
+
+        // Keep both tax columns summing to the originals; legacy rows (either null) stay null.
+        let pretax1: number | null = null, tax1: number | null = null, pretax2: number | null = null, tax2: number | null = null;
+        const hasPretax = row.pretaxAmount !== null && row.pretaxAmount !== undefined;
+        const hasTax = row.taxAmount !== null && row.taxAmount !== undefined;
+        if ((hasPretax && hasSubCent(toNum(row.pretaxAmount))) || (hasTax && hasSubCent(toNum(row.taxAmount)))) {
+            throw new Error(`The tax split on "${row.name}" has fractions of a cent — fix it before splitting.`);
+        }
+        if (hasPretax !== hasTax) {
+            throw new Error(`The tax split on "${row.name}" is inconsistent (only one of pretax/tax is set) — fix it before splitting.`);
+        }
+        if (hasPretax && hasTax) {
+            const pretaxCents = Math.round(toNum(row.pretaxAmount) * 100);
+            const taxCents = Math.round(toNum(row.taxAmount) * 100);
+            if (pretaxCents + taxCents !== amountCents) {
+                throw new Error(`The tax split on "${row.name}" is inconsistent (pretax plus tax is not the milestone amount) — fix it before splitting.`);
+            }
+            const pretax1Cents = Math.round((pretaxCents * firstCents) / amountCents);
+            const tax1Cents = firstCents - pretax1Cents;
+            pretax1 = pretax1Cents / 100;
+            tax1 = tax1Cents / 100;
+            pretax2 = (pretaxCents - pretax1Cents) / 100;
+            tax2 = (taxCents - tax1Cents) / 100;
+        }
+
+        // Mirror integrity, checked before anything is written: the estimate schedule total must
+        // never move, so the mirror has to be this row's one-to-one, same-amount twin.
+        const originalEst = row.sourceScheduleId
+            ? await tx.estimatePaymentSchedule.findUnique({ where: { id: row.sourceScheduleId } })
+            : null;
+        if (row.sourceScheduleId) {
+            if (!originalEst) {
+                throw new Error(
+                    `"${row.name}" points at an estimate milestone that no longer exists — fix the estimate's payment schedule before splitting this.`
+                );
+            }
+            if (!invLink.estimateId || originalEst.estimateId !== invLink.estimateId) {
+                throw new Error(`"${row.name}" is linked to a milestone on a different estimate — it can't be split.`);
+            }
+            const sharedBy = await tx.paymentSchedule.findFirst({
+                where: { sourceScheduleId: row.sourceScheduleId, id: { not: row.id } },
+                select: { id: true },
+            });
+            if (sharedBy) {
+                throw new Error(`The estimate milestone behind "${row.name}" is shared by more than one invoice milestone — it can't be split.`);
+            }
+            if (hasSubCent(toNum(originalEst.amount))) {
+                throw new Error(`The estimate schedule amount for "${row.name}" has fractions of a cent — fix the estimate's payment schedule first, then split.`);
+            }
+            const mirrorCents = Math.round(toNum(originalEst.amount) * 100);
+            if (mirrorCents !== amountCents) {
+                throw new Error(
+                    `The estimate schedule shows ${formatCurrency(mirrorCents / 100)} but the invoice milestone is ${formatCurrency(amountCents / 100)} — ` +
+                    `save "Edit amounts" once to resync them, then split.`
+                );
+            }
+        }
+
+        // Claim pinned to the exact state read above: the QuickBooks push writes `qbSyncError`
+        // outside these locks, so a bare update could overwrite a create that just started.
+        const claim = await tx.paymentSchedule.updateMany({
+            where: {
+                id: row.id, invoiceId: row.invoiceId, status: "Pending", qbInvoiceId: null, qbSyncError: null,
+                stripeSessionId: null, stripePaymentIntentId: null, amount: row.amount, sourceScheduleId: row.sourceScheduleId,
+            },
+            data: { amount: first, pretaxAmount: pretax1, taxAmount: tax1 },
+        });
+        if (claim.count !== 1) throw new Error("This milestone changed while being split — refresh and try again.");
+
+        // The mirror equalled the invoice row above, so the two new rows keep the estimate
+        // schedule total exactly where it was.
+        let newSourceScheduleId: string | null = null;
+        if (originalEst) {
+            const estClaim = await tx.estimatePaymentSchedule.updateMany({
+                where: {
+                    id: originalEst.id, estimateId: originalEst.estimateId, status: "Pending",
+                    stripeSessionId: null, stripePaymentIntentId: null, amount: originalEst.amount,
+                },
+                data: { amount: first, percentage: null },
+            });
+            if (estClaim.count !== 1) {
+                throw new Error(`"${originalEst.name}" changed, is not pending, or has a payment in progress on the estimate — refresh and try again.`);
+            }
+            const newEst = await tx.estimatePaymentSchedule.create({
+                data: {
+                    estimateId: originalEst.estimateId,
+                    name: remainderName,
+                    amount: remainder,
+                    dueDate: originalEst.dueDate || null,
+                    status: "Pending",
+                    order: originalEst.order,
+                    percentage: null,
+                    scheduleTaskId: originalEst.scheduleTaskId ?? null,
+                },
+            });
+            newSourceScheduleId = newEst.id;
+            // saveEstimate's only conflict check is the itemsRevision CAS (under this same Estimate
+            // lock). Without this bump an editor tab opened before the split would put the old
+            // single row back, or delete the new one, on its next save. With it, that tab gets the
+            // "changed by someone else, reload" error instead. The ONLY Estimate column written here.
+            await tx.estimate.update({ where: { id: originalEst.estimateId }, data: { itemsRevision: { increment: 1 } } });
+        }
+        // No sourceScheduleId: guaranteed above that no unpaid estimate row shares this row's (or the
+        // remainder's) name, so there is no estimate-side row to mirror or to lose its pairing. The
+        // split stays invoice-only and both rows remain unlinked extras (as in progress billing).
+
+        // qbInvoiceSentAt / lastReminderAt are copied on purpose: the client was already asked
+        // for the whole amount, so the remainder stays "billed" in receivables
+        // (receivables.ts treats qbInvoiceSentAt as "requested") and keeps its reminder cadence
+        // instead of looking brand new. No qb*/stripe*/payment fields are copied.
+        const created = await tx.paymentSchedule.create({
+            data: {
+                invoiceId: row.invoiceId,
+                name: remainderName,
+                amount: remainder,
+                pretaxAmount: pretax2,
+                taxAmount: tax2,
+                status: "Pending",
+                dueDate: row.dueDate,
+                sourceScheduleId: newSourceScheduleId,
+                scheduleTaskId: row.scheduleTaskId ?? null,
+                qbInvoiceSentAt: row.qbInvoiceSentAt,
+                lastReminderAt: row.lastReminderAt,
+            },
+        });
+
+        return { success: true as const, projectId: invLink.projectId, invoiceId: row.invoiceId, firstId: row.id, remainderId: created.id };
+    }));
 }

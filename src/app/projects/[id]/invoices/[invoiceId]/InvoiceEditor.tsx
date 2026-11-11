@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, breakQBInvoiceLink, emailInvoiceCopyToMe, updatePendingMilestoneAmounts, deleteInvoiceMilestone, resolveAmbiguousInvoiceCreate } from "@/lib/actions";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, breakQBInvoiceLink, emailInvoiceCopyToMe, updatePendingMilestoneAmounts, deleteInvoiceMilestone, splitPendingMilestone, resolveAmbiguousInvoiceCreate } from "@/lib/actions";
 // Pure module (no Prisma) so the marker vocabulary is shared with the server
 // rather than restated here — a second copy of these strings is how a UI stops
 // recognising the state the money guards act on.
@@ -16,6 +16,7 @@ import UndoPaymentModal from "@/components/UndoPaymentModal";
 import DocumentComments from "@/components/DocumentComments";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
+import { partialSplitCents } from "@/lib/milestone-split";
 import { formatMoneyDate } from "@/lib/payment-date";
 import type { CheckEvidence } from "@/lib/check-evidence";
 
@@ -96,6 +97,11 @@ export default function InvoiceEditor({
     // Delete a non-mirrored, non-QB-linked Pending milestone
     const [deleteMilestoneTarget, setDeleteMilestoneTarget] = useState<{ id: string; name: string } | null>(null);
     const [isDeletingMilestone, setIsDeletingMilestone] = useState(false);
+
+    // Partial payment: split one Pending milestone into "received" + "stays open"
+    const [partialTarget, setPartialTarget] = useState<{ id: string; name: string; amount: number } | null>(null);
+    const [partialReceived, setPartialReceived] = useState("");
+    const [isSplittingPartial, setIsSplittingPartial] = useState(false);
 
     // On view: if any pending milestone is on the QuickBooks rail, pull settled
     // payments right now (the hourly cron is the backstop, this is the fast path).
@@ -418,6 +424,32 @@ export default function InvoiceEditor({
             toast.error(e?.message || "Failed to delete milestone");
         } finally {
             setIsDeletingMilestone(false);
+        }
+    }
+
+    async function handleSplitPartial() {
+        if (!partialTarget) return;
+        // No silent rounding: a typed 100.004 is refused, not turned into 100.00.
+        const parts = partialSplitCents(partialReceived, partialTarget.amount);
+        if (!parts) return;
+        const firstAmount = parts.firstCents / 100;
+        setIsSplittingPartial(true);
+        try {
+            const res = await splitPendingMilestone(partialTarget.id, { firstAmount, remainderAmount: parts.remainderCents / 100 });
+            if (!res.success) {
+                toast.error(res.error);
+                return;
+            }
+            toast.success("Milestone split. Now record the payment you received.");
+            const target = partialTarget;
+            setPartialTarget(null);
+            setPartialReceived("");
+            router.refresh();
+            setRecordingFor({ id: target.id, name: target.name, amount: firstAmount });
+        } catch (e) {
+            toast.error(e instanceof Error && e.message ? e.message : "Failed to split milestone");
+        } finally {
+            setIsSplittingPartial(false);
         }
     }
 
@@ -1102,6 +1134,17 @@ export default function InvoiceEditor({
                                                         >
                                                             Record Payment
                                                         </button>
+                                                        {payment.status === 'Pending' && !payment.qbInvoiceId && !payment.qbSyncError
+                                                            && !payment.stripeSessionId && !payment.stripePaymentIntentId
+                                                            && !payment.sourceChangeOrderId && !payment.sourceCoScheduleId && (
+                                                            <button
+                                                                onClick={() => { setPartialReceived(""); setPartialTarget({ id: payment.id, name: payment.name, amount: Number(payment.amount) }); }}
+                                                                title="Client paid only part of this milestone? Split it so you can record what was received."
+                                                                className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap"
+                                                            >
+                                                                Partial payment
+                                                            </button>
+                                                        )}
                                                         {payment.qbInvoiceId && (
                                                             <button
                                                                 onClick={() => handleBreakQBLink(payment)}
@@ -1250,6 +1293,60 @@ export default function InvoiceEditor({
                     </div>
                 </div>
             )}
+
+            {/* Partial payment: split one pending milestone */}
+            {partialTarget && (() => {
+                const parts = partialSplitCents(partialReceived, partialTarget.amount);
+                const valid = parts !== null;
+                const staysOpen = parts ? parts.remainderCents / 100 : null;
+                return (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => !isSplittingPartial && setPartialTarget(null)}>
+                        <div className="bg-white rounded-xl shadow-2xl w-full max-w-md" onClick={e => e.stopPropagation()}>
+                            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between rounded-t-xl">
+                                <h3 className="text-lg font-semibold text-slate-900">Partial payment</h3>
+                                <button type="button" onClick={() => setPartialTarget(null)} disabled={isSplittingPartial} className="text-slate-400 hover:text-slate-600 transition rounded-lg p-1 hover:bg-slate-100">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                </button>
+                            </div>
+                            <div className="px-6 py-4 space-y-3">
+                                <p className="text-sm text-slate-700">
+                                    <strong>&quot;{partialTarget.name}&quot;</strong> is {formatCurrency(partialTarget.amount)}.
+                                </p>
+                                <div>
+                                    <label className="block text-xs font-medium text-slate-600 mb-1">Amount received</label>
+                                    <input
+                                        type="number"
+                                        step="0.01"
+                                        min="0"
+                                        autoFocus
+                                        value={partialReceived}
+                                        onChange={(e) => setPartialReceived(e.target.value)}
+                                        className="hui-input w-full"
+                                        placeholder="0.00"
+                                    />
+                                </div>
+                                {staysOpen !== null && (
+                                    <p className="text-sm text-slate-700">Stays open: <strong>{formatCurrency(staysOpen)}</strong></p>
+                                )}
+                                <p className="text-xs text-slate-500">This does not email the client or change the invoice total.</p>
+                            </div>
+                            <div className="px-6 py-4 border-t border-slate-200 flex items-center justify-end gap-2 bg-slate-50/50 rounded-b-xl">
+                                <button type="button" onClick={() => setPartialTarget(null)} disabled={isSplittingPartial} className="hui-btn hui-btn-secondary">
+                                    Cancel
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleSplitPartial}
+                                    disabled={!valid || isSplittingPartial}
+                                    className="hui-btn hui-btn-primary disabled:opacity-40 disabled:cursor-not-allowed"
+                                >
+                                    {isSplittingPartial ? "Splitting…" : "Split milestone"}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            })()}
 
             {/* Send Invoice Modal */}
             {showSendModal && (
