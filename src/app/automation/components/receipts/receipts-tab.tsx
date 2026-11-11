@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import { formatCurrency } from "@/lib/utils";
 import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 import { signReceiptDownloadUrls } from "@/lib/receipt-intake/bucket";
@@ -333,6 +333,7 @@ export async function ReceiptsTab({
     jobs,
     filterHref,
     nativeActive,
+    crewRequestsEnabled,
     sign,
 }: {
     queue: ReceiptQueue;
@@ -346,6 +347,12 @@ export async function ReceiptsTab({
      * rails. With it on, nothing in this queue goes to QuickBooks.
      */
     nativeActive: boolean;
+    /**
+     * Are the weekday crew messages on? Computed by page.tsx from the delivery
+     * projection. Only an explicit `false` shows the notice, so callers that do
+     * not pass it render as before.
+     */
+    crewRequestsEnabled?: boolean;
     /** Injected only by tests: a production render takes the real signer. */
     sign?: ReceiptBatchSigner;
 }) {
@@ -398,7 +405,12 @@ export async function ReceiptsTab({
                     ? <TodoDone plan={todo} />
                     : todo.piles
                         .filter(pile => pile.items.length > 0)
-                        .map(pile => <TodoPileCard key={pile.key} pile={pile} jobs={jobs} links={links} />)}
+                        .map(pile => (
+                            <Fragment key={pile.key}>
+                                {pile.key === "ask-for-these" && crewRequestsEnabled === false && <CrewRequestsOffNotice />}
+                                <TodoPileCard pile={pile} jobs={jobs} links={links} />
+                            </Fragment>
+                        ))}
                 {todo.notLoadedCount > 0 && (
                     <TodoCoverageNote
                         shown={queue.counts.missingReceiptsShown}
@@ -616,6 +628,7 @@ export async function ReceiptsTab({
 
             {groupIsVisible("missing-receipts", filters) && (
                 <GroupCard title={RECEIPT_GROUP_LABELS["missing-receipts"]} count={counts["missing-receipts"]}>
+                    {crewRequestsEnabled === false && queue.missingReceipts.length > 0 && <CrewRequestsOffNotice />}
                     {/* Owner filter — always rendered, so a filtered-to-empty
                         view still offers a way back out. */}
                     <div className="flex gap-2 flex-wrap items-center px-4 py-2 border-b border-slate-100">
@@ -695,6 +708,15 @@ export async function ReceiptsTab({
                 </GroupCard>
             )}
         </div>
+    );
+}
+
+/** Yellow note shown while the weekday crew messages are off or not set up. */
+function CrewRequestsOffNotice() {
+    return (
+        <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            {TODO_COPY.crewRequestsOff}
+        </p>
     );
 }
 
@@ -992,7 +1014,7 @@ function MissingReceiptRowView({ row }: { row: MissingReceiptRow }) {
                         {row.outreachHold === "office-invoice"
                             ? "Office invoice — collect from billing email. Crew request held."
                             : row.outreachHold === "existing-evidence-review"
-                                ? "Existing document needs reconciliation. Crew request held."
+                                ? "Existing document needs reconciliation. Crew request held. Justin checks this one."
                                 : `Held for a reason this page has no words for: ${row.outreachHold}. Crew request held.`}
                     </p>
                 )}
