@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import DOMPurify from "isomorphic-dompurify";
-import { approveEstimate, markEstimateViewed, generatePdfUploadToken } from "@/lib/actions";
+import { approveEstimate, markEstimateViewed, generatePdfUploadToken, getEstimatePdfForPortal, canUseServerEstimatePdf } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
 import PortalPayButton from "@/components/PortalPayButton";
 import PortalPayInFullButton from "@/components/PortalPayInFullButton";
@@ -11,8 +11,10 @@ import { formatCurrency } from "@/lib/utils";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
 import { buildPdf } from "@/lib/build-pdf";
+import { shouldUseServerPdf } from "@/lib/pdf-capture-policy";
 import { getTaxCertStatus } from "@/lib/tax-cert";
 import { formatMoneyDate } from "@/lib/payment-date";
+import { computeEstimateDisplayTotals, parseSalesTaxes } from "@/lib/estimate-display-totals";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -119,6 +121,30 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         if (!element) return;
         setIsDownloading(true);
         try {
+            // Narrow (phone) screens: a screenshot would be magnified, so save the server-made PDF.
+            // Same access rule as this page (getEstimateForPortal); on any miss, fall through to the screenshot.
+            // The server decides: when its render altered any text (letters the PDF fonts cannot print, ...)
+            // the complete screenshot is saved instead. The saved signer name is covered by that check.
+            if (shouldUseServerPdf(element.getBoundingClientRect().width)) {
+                try {
+                    // getEstimatePdfForPortal renders, audits and returns null when the render altered anything.
+                    const b64 = await getEstimatePdfForPortal(initialEstimate.id);
+                    if (b64) {
+                        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+                        const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = `Estimate_${initialEstimate.code || initialEstimate.id}.pdf`;
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        setTimeout(() => URL.revokeObjectURL(url), 10000);
+                        return;
+                    }
+                } catch (serverPdfErr) {
+                    console.error("Server PDF download failed, falling back to screenshot:", serverPdfErr);
+                }
+            }
             const prevShadow = element.style.boxShadow;
             const prevBorder = element.style.border;
             element.style.boxShadow = "none";
@@ -155,38 +181,56 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
         try {
             const userAgent = window.navigator.userAgent;
 
-            // Step 1: Temporarily show "Approved" badge and signature block in the DOM so the
-            // captured PDF reflects the final signed state (C5/C6)
-            setSignatureBlockOverride({ approvedBy: signature.trim(), signatureUrl: signatureDataUrl!, approvedAt: new Date() });
-            setApprovedOverride(true);
-            // Give React one frame to re-render the badge before capturing
-            await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
-
-            // Step 2: Capture the portal view with the signature drawn and "Approved" badge
-            let capturedPdfUrl: string | undefined;
-            const element = document.getElementById("estimate-document-wrapper");
-            if (element) {
+            // Narrow (phone) screens skip the screenshot entirely: the server makes the signed PDF
+            // (approveEstimate does that whenever no capturedPdfUrl is passed), after saving the signature.
+            // No C5/C6 overrides are needed because nothing is captured.
+            // Unless the server's dry run says its copy would alter any text (including the typed name):
+            // then the original screenshot path keeps the record complete. Any error counts as "no".
+            let useServerPdf = shouldUseServerPdf(
+                document.getElementById("estimate-document-wrapper")?.getBoundingClientRect().width ?? 0,
+            );
+            if (useServerPdf) {
                 try {
-                    const pdf = await buildPdf(element, { bannerText: estimateBannerText });
-                    const blob = pdf.output("blob");
-                    const fd = new FormData();
-                    fd.append("pdf", blob, `Signed_Estimate_${initialEstimate.code || initialEstimate.id}.pdf`);
+                    useServerPdf = await canUseServerEstimatePdf(initialEstimate.id, signature.trim());
+                } catch {
+                    useServerPdf = false;
+                }
+            }
 
-                    // Generate a fresh upload token for this request (C1)
-                    let token = "";
-                    try { token = await generatePdfUploadToken(initialEstimate.id); } catch { /* fallback: no token */ }
+            let capturedPdfUrl: string | undefined;
+            if (!useServerPdf) {
+                // Step 1: Temporarily show "Approved" badge and signature block in the DOM so the
+                // captured PDF reflects the final signed state (C5/C6)
+                setSignatureBlockOverride({ approvedBy: signature.trim(), signatureUrl: signatureDataUrl!, approvedAt: new Date() });
+                setApprovedOverride(true);
+                // Give React one frame to re-render the badge before capturing
+                await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
 
-                    const res = await fetch(`/api/portal/estimates/${initialEstimate.id}/pdf-upload`, {
-                        method: "POST",
-                        headers: token ? { "x-upload-token": token } : {},
-                        body: fd,
-                    });
-                    if (res.ok) {
-                        const json = await res.json();
-                        capturedPdfUrl = json.url;
+                // Step 2: Capture the portal view with the signature drawn and "Approved" badge
+                const element = document.getElementById("estimate-document-wrapper");
+                if (element) {
+                    try {
+                        const pdf = await buildPdf(element, { bannerText: estimateBannerText });
+                        const blob = pdf.output("blob");
+                        const fd = new FormData();
+                        fd.append("pdf", blob, `Signed_Estimate_${initialEstimate.code || initialEstimate.id}.pdf`);
+
+                        // Generate a fresh upload token for this request (C1)
+                        let token = "";
+                        try { token = await generatePdfUploadToken(initialEstimate.id); } catch { /* fallback: no token */ }
+
+                        const res = await fetch(`/api/portal/estimates/${initialEstimate.id}/pdf-upload`, {
+                            method: "POST",
+                            headers: token ? { "x-upload-token": token } : {},
+                            body: fd,
+                        });
+                        if (res.ok) {
+                            const json = await res.json();
+                            capturedPdfUrl = json.url;
+                        }
+                    } catch (captureErr) {
+                        console.error("PDF capture failed, falling back to server-side generation:", captureErr);
                     }
-                } catch (captureErr) {
-                    console.error("PDF capture failed, falling back to server-side generation:", captureErr);
                 }
             }
 
@@ -219,18 +263,15 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
     const subtotal = items.reduce((sum: number, item: any) => sum + calculateTotal(item), 0);
     const taxExempt = !!initialEstimate.taxExempt;
-    let salesTaxes: { name: string; rate: number; isDefault: boolean }[] = [];
-    try { salesTaxes = companySettings?.salesTaxes ? JSON.parse(companySettings.salesTaxes) : []; } catch { /* ignore */ }
-    const defaultTax = salesTaxes.find((t: any) => t.isDefault) || salesTaxes[0] || null;
-    const savedRate = initialEstimate.taxRatePercent != null ? Number(initialEstimate.taxRatePercent) : null;
-    const savedName = initialEstimate.taxRateName || null;
-    const effectiveRate = savedRate ?? (defaultTax ? defaultTax.rate : 8.8);
-    const effectiveRateDisplay = Number(parseFloat(String(effectiveRate)).toFixed(4));
-    const effectiveName = savedName ?? (defaultTax ? defaultTax.name : "Tax");
-    const taxRate = taxExempt ? 0 : effectiveRate / 100;
-    const taxLabel = taxExempt ? null : `${effectiveName} (${effectiveRateDisplay}%)`;
-    const tax = Math.round(subtotal * taxRate * 100) / 100;
-    const total = subtotal + tax;
+    // Shared with the server-made PDF (src/lib/estimate-display-totals.ts) so the two cannot drift.
+    // The portal shows no processing fee; the shared function takes no fee input.
+    const { taxLabel, tax, total } = computeEstimateDisplayTotals({
+        subtotal,
+        taxExempt,
+        savedRate: initialEstimate.taxRatePercent != null ? Number(initialEstimate.taxRatePercent) : null,
+        savedName: initialEstimate.taxRateName || null,
+        salesTaxes: parseSalesTaxes(companySettings?.salesTaxes),
+    });
     // C5 — approvedOverride lets us temporarily show "Approved" in the badge before the actual DB update.
     // Signing auto-invoices the estimate, so post-approval statuses (Invoiced/Partially Paid/Paid)
     // and a stored signature all count as approved.
