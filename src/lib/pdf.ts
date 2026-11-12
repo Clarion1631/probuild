@@ -5,8 +5,13 @@ import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
 import { isSecureRef, downloadDocBytes } from './secure-storage';
 import { coTaxRate, coTaxLabel, billableCoItems } from './co-tax';
+import { cleanPdfTextAudited } from './pdf-text-encoding';
+import { sanitizePortalHtml, isPortalHtmlFaithful } from './pdf-sanitize';
 import { drawRichHtml, drawWrappedText, measureWrappedLines, type RichTextCtx } from './pdf-richtext';
 import { isEstimateSectionRow, rm } from './estimate-item-payload';
+import { computeEstimateDisplayTotals, parseSalesTaxes } from './estimate-display-totals';
+import { DEFAULT_COMPANY_TIME_ZONE, formatCompanyDateTime, validTimeZone } from './tz-date';
+import { resolveCompanyTimeZone } from './company-timezone';
 
 /** pdf-lib only supports PNG/JPG; SignaturePad always emits PNG, so a failed PNG embed
  *  falls through to a JPG attempt (no content-type header is available once bytes come
@@ -156,7 +161,7 @@ function formatCurrency(amount: number): string {
  *  and hard-breaking any single word wider than maxWidth by character. Used for table cells and
  *  the letterhead, which need the wrapped lines themselves (for manual per-line column alignment)
  *  rather than pdf-richtext's flow-and-paginate drawWrappedText/measureWrappedLines. */
-function wrapPlainText(text: string, font: PDFFont, size: number, maxWidth: number): string[] {
+export function wrapPlainText(text: string, font: PDFFont, size: number, maxWidth: number): string[] {
     const normalized = (text ?? '').replace(/\r\n/g, '\n');
     const lines: string[] = [];
     for (const rawLine of normalized.split('\n')) {
@@ -297,7 +302,584 @@ function drawBuiltInHeader(
     return y;
 }
 
-export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
+/** Make a PLAIN field safe for the standard (WinAnsi) PDF fonts. The portal renders these fields as literal text
+ *  (React text: "<client selection>" and "R&amp;D" show exactly as typed), so the PDF prints the string as typed:
+ *  no tag stripping, no entity decoding, only the encoding clean (pdf-text-encoding.ts: plain-equivalent mappings,
+ *  invisible characters removed, any other unprintable character becomes "?" and marks the audit lossy). */
+export function pdfSafeText(text: unknown, audit?: { lossy: boolean }): string {
+    return cleanPdfTextAudited(String(text ?? '').replace(/\r\n?/g, '\n').replace(/\t/g, ' '), audit);
+}
+
+/** The estimate fields the customer-copy PDF reads (a prisma estimate with its relations fits). */
+export interface EstimatePdfData {
+    code?: string | null;
+    title?: string | null;
+    status?: string | null;
+    createdAt: Date | string;
+    items: Array<{
+        id?: string | null; parentId?: string | null; type?: string | null;
+        name?: string | null; description?: string | null;
+        quantity?: unknown; unitCost?: unknown; total?: unknown;
+    }>;
+    paymentSchedules: Array<{ name?: string | null; percentage?: unknown; amount?: unknown; dueDate?: Date | string | null }>;
+    project?: { name?: string | null; location?: string | null; client?: { name?: string | null; email?: string | null } | null } | null;
+    lead?: { name?: string | null; location?: string | null; client?: { name?: string | null; email?: string | null } | null } | null;
+    overviewEnabled?: boolean | null; overviewTitle?: string | null; overviewBody?: string | null;
+    notesEnabled?: boolean | null; notesTitle?: string | null; notesBody?: string | null; notesPlacement?: string | null;
+    taxRatePercent?: unknown; taxExempt?: boolean | null; taxRateName?: string | null;
+    processingFeeMarkup?: unknown; hideProcessingFee?: boolean | null;
+    approvedBy?: string | null; approvedAt?: Date | string | null; approvalIp?: string | null; signatureUrl?: string | null;
+    /** The terms snapshot taken when the estimate was sent; the portal prints it when set. */
+    termsAndConditions?: string | null;
+}
+
+/** Draws the customer-copy estimate PDF from plain data (no database). Images are optional
+ *  pre-fetched bytes so the caller owns all I/O. */
+interface PreparedRich { body: string; plain: boolean }
+
+/** The portal's own test: editor HTML starts with a block tag; legacy plain text does not. */
+function isPortalRichHtml(html: string): boolean {
+    const t = html.trimStart();
+    return ['<p', '<h', '<ul', '<ol', '<div'].some(tag => t.startsWith(tag));
+}
+
+/** The portal's leading "Terms & Conditions" heading de-duplication (PortalEstimateClient TermsAndConditions). */
+const TERMS_HEADING_RE = /^\s*<(h[1-6]|p)[^>]*>(?:\s*<(?!\/)[^>]*>)*\s*Terms\s*(?:&amp;|&|and)\s*Conditions\s*(?:\s*<\/[^>]+>)*\s*<\/\1>\s*/i;
+
+/** Max wrapped lines for any label in the totals block; bounds the block so it always fits one page. */
+const TOTALS_LABEL_MAX_LINES = 3;
+
+/** Keep at most maxLines lines; when clamped, the last kept line ends with "..." and still fits maxWidth.
+ *  Truncating shortens what the customer sees on screen, so it marks the audit lossy. */
+export function clampLines(lines: string[], maxLines: number, font: PDFFont, size: number, maxWidth: number, audit?: { lossy: boolean }): string[] {
+    if (lines.length <= maxLines) return lines;
+    if (audit) audit.lossy = true;
+    const kept = lines.slice(0, maxLines);
+    let last = kept[maxLines - 1].replace(/\s+$/, '');
+    while (last && font.widthOfTextAtSize(`${last}...`, size) > maxWidth) last = last.slice(0, -1).replace(/\s+$/, '');
+    kept[maxLines - 1] = `${last}...`;
+    return kept;
+}
+
+export async function buildEstimatePdf(
+    estimate: EstimatePdfData,
+    company: Record<string, unknown> | null | undefined,
+    images: { logo?: Uint8Array | null; letterhead?: Uint8Array | null } = {},
+    opts: { timeZone?: string | null; audit?: { lossy: boolean }; dryRun?: boolean } = {},
+): Promise<Buffer> {
+    const audit = opts.audit ?? { lossy: false };
+    // Every plain field is printed literally, like the portal's React text (pdfSafeText).
+    const safe = (v: unknown) => pdfSafeText(v, audit);
+    const timeZone = validTimeZone(opts.timeZone) ? opts.timeZone : DEFAULT_COMPANY_TIME_ZONE;
+    const doc = await PDFDocument.create();
+    const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+    const helveticaOblique = await doc.embedFont(StandardFonts.HelveticaOblique);
+    const helveticaBoldOblique = await doc.embedFont(StandardFonts.HelveticaBoldOblique);
+
+    const pageWidth = 612; // Letter width in points
+    const pageHeight = 792; // Letter height in points
+    const margin = 50;
+    const contentWidth = pageWidth - margin * 2;
+    const bottom = 60; // lowest y body content may reach (footer sits at y=30)
+    const band = rgb(241 / 255, 245 / 255, 249 / 255); // slate-100
+
+    let page = doc.addPage([pageWidth, pageHeight]);
+    let y = pageHeight - margin;
+
+    function newPage() {
+        page = doc.addPage([pageWidth, pageHeight]);
+        y = pageHeight - margin;
+    }
+    function checkNewPage(needed: number = 80) {
+        if (y < needed) newPage();
+    }
+    // Every text drawn on ONE line without wrapping is measured against the space available to it (the right
+    // margin of the page by default, or the column it sits in). A text wider than that space is clipped or runs
+    // into its neighbour, so the audit is marked lossy and the layout is left as it is.
+    const rightLimit = pageWidth - margin;
+    const text = (s: string, x: number, yy: number, size: number, font: PDFFont, color = colors.textMain, maxX = rightLimit) => {
+        if (x + font.widthOfTextAtSize(s, size) > maxX + 0.01) audit.lossy = true;
+        page.drawText(s, { x, y: yy, size, font, color });
+    };
+    const textRight = (s: string, xRight: number, yy: number, size: number, font: PDFFont, color = colors.textMain, minX = margin) => {
+        const w = font.widthOfTextAtSize(s, size);
+        if (xRight - w < minX - 0.01) audit.lossy = true;
+        page.drawText(s, { x: xRight - w, y: yy, size, font, color });
+    };
+    const wrap = (s: unknown, font: PDFFont, size: number, width: number) => wrapPlainText(safe(s), font, size, width);
+
+    // Same rich-HTML test and the same DOMPurify call as the portal (PortalEstimateClient): the parser only
+    // ever sees what a browser would display. Plain text is drawn literally. If the sanitiser cannot run the
+    // field is left out and the PDF is marked lossy, so the caller never treats it as the complete record.
+    const prepareRich = async (raw: string, dropLeadingTermsHeading = false): Promise<PreparedRich> => {
+        if (!isPortalRichHtml(raw)) return { body: raw, plain: true };
+        let html = await sanitizePortalHtml(raw);
+        if (html === null) { audit.lossy = true; return { body: '', plain: true }; }
+        // Same de-duplication as the portal (applied to the sanitised output): drop a leading "Terms & Conditions" heading.
+        if (dropLeadingTermsHeading) html = html.replace(TERMS_HEADING_RE, '');
+        // Strict allowlist on the markup the renderer will parse: anything it cannot print as the same text.
+        if (!(await isPortalHtmlFaithful(html))) audit.lossy = true;
+        return { body: html, plain: false };
+    };
+    const overviewPrepared = estimate.overviewEnabled && estimate.overviewBody ? await prepareRich(estimate.overviewBody) : null;
+    const notesPrepared = estimate.notesEnabled && estimate.notesBody ? await prepareRich(estimate.notesBody) : null;
+    const termsPrepared = estimate.termsAndConditions ? await prepareRich(estimate.termsAndConditions, true) : null;
+
+    // Render a titled rich-text section (Project Overview / Notes & Assumptions) using
+    // the shared HTML-subset renderer, keeping the closure's page/y cursor in sync.
+    const richFonts = { regular: helvetica, bold: helveticaBold, italic: helveticaOblique, boldItalic: helveticaBoldOblique };
+    function drawRichSection(title: string, prepared: PreparedRich, titleSize: number) {
+        checkNewPage(140);
+        // The title comes from data: wrap it to the content width instead of letting it run off the page.
+        const titleLines = wrap(title, helveticaBold, titleSize, contentWidth);
+        titleLines.forEach((ln, i) => {
+            checkNewPage(bottom + titleSize);
+            page.drawText(ln, { x: margin, y, size: titleSize, font: helveticaBold, color: colors.textMain });
+            y -= i < titleLines.length - 1 ? titleSize + 4 : titleSize + 10;
+        });
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: richFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted, audit,
+        };
+        // Plain text is drawn literally (typed line breaks kept, "<" and "&" untouched).
+        const res = prepared.plain
+            ? drawWrappedText(prepared.body, ctx, { x: margin, maxWidth: contentWidth, size: 10, color: colors.textMuted, lineHeight: 14 })
+            : drawRichHtml(prepared.body, ctx);
+        page = res.page;
+        y = res.y;
+    }
+
+    // --- Header: accent bar, logo + company details left, ESTIMATE block right ---
+    const lh = buildLetterheadConfig(company);
+    const accent = hexToRgb(lh.accentColor);
+    if (lh.showDivider) {
+        page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: accent });
+    }
+    y = pageHeight - 40;
+    const headerTop = y;
+    const leftWidth = contentWidth * 0.55;
+
+    let letterheadImg: PDFImage | null = null;
+    let logoImg: PDFImage | null = null;
+    try {
+        if (lh.mode === 'custom_image' && images.letterhead) letterheadImg = await embedImageBytes(doc, images.letterhead);
+        else if (images.logo) logoImg = await embedImageBytes(doc, images.logo);
+    } catch { /* fall back to the company name */ }
+
+    let ly = headerTop;
+    if (letterheadImg) {
+        // Staff-uploaded letterhead banner replaces the typed company details.
+        const scale = Math.min(leftWidth / letterheadImg.width, 70 / letterheadImg.height, 1);
+        const w = letterheadImg.width * scale, h = letterheadImg.height * scale;
+        page.drawImage(letterheadImg, { x: margin, y: ly - h + 10, width: w, height: h });
+        ly -= h;
+    } else {
+        if (logoImg) {
+            const scale = Math.min(150 / logoImg.width, 44 / logoImg.height, 1);
+            const w = logoImg.width * scale, h = logoImg.height * scale;
+            page.drawImage(logoImg, { x: margin, y: ly - h + 10, width: w, height: h });
+            ly -= h + 6;
+        }
+        const values: string[] = [];
+        for (const f of lh.fields) {
+            const v = f === 'name' ? lh.companyName : f === 'address' ? lh.address : f === 'phone' ? lh.phone
+                : f === 'email' ? lh.email : f === 'license' ? (lh.licenseNumber ? `Lic# ${lh.licenseNumber}` : null)
+                : f === 'website' ? lh.website : null;
+            if (v) values.push(f === 'name' ? `\u0001${v}` : v);
+        }
+        for (const raw of values) {
+            const isName = raw.startsWith('\u0001');
+            const font = isName ? helveticaBold : helvetica;
+            const size = isName ? 12 : 8.5;
+            for (const line of wrap(isName ? raw.slice(1) : raw, font, size, leftWidth)) {
+                text(line, margin, ly, size, font, isName ? colors.textMain : colors.textMuted);
+                ly -= isName ? 15 : 11.5;
+            }
+        }
+    }
+
+    // Same rule as the portal: later statuses (Invoiced after the deposit invoice is created, Paid...) are still signed.
+    const isApproved = ['Approved', 'Invoiced', 'Partially Paid', 'Paid'].includes(estimate.status ?? '') || !!estimate.approvedAt;
+    const dateStr = new Date(estimate.createdAt).toLocaleDateString('en-US', { timeZone, year: 'numeric', month: 'short', day: 'numeric' });
+    const rightX = pageWidth - margin;
+    let ry = headerTop - 6;
+    // The right column may not reach into the left (company) column.
+    const rightColMin = margin + leftWidth;
+    textRight('ESTIMATE', rightX, ry, 20, helveticaBold, colors.textMain, rightColMin);
+    ry -= 18;
+    if (estimate.code) { textRight(`Estimate # ${safe(estimate.code)}`, rightX, ry, 9.5, helveticaBold, colors.textMain, rightColMin); ry -= 13; }
+    textRight(dateStr, rightX, ry, 9, helvetica, colors.textMuted, rightColMin);
+    ry -= 13;
+    if (isApproved) { textRight('Approved', rightX, ry, 9, helveticaBold, colors.primary, rightColMin); ry -= 13; }
+
+    y = Math.min(ly, ry) - 22;
+
+    // --- Title (wrapped to the page width, never over the header) ---
+    for (const line of wrap(estimate.title || 'Estimate', helveticaBold, 18, contentWidth)) {
+        checkNewPage(bottom + 30);
+        text(line, margin, y, 18, helveticaBold);
+        y -= 23;
+    }
+    y -= 4;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 18;
+
+    // --- PREPARED FOR / PROJECT / JOBSITE ADDRESS ---
+    // Same order as the portal (actions.ts: project client, then the lead's client). A lead's own name is not a client name.
+    // getEstimateForPortal (actions.ts) supplies "Unknown Client" when the name is blank; the portal prints that.
+    const clientName = estimate.project?.client?.name || estimate.lead?.client?.name || 'Unknown Client';
+    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || '';
+    const projectName = estimate.project?.name || estimate.lead?.name || '';
+    const jobsite = estimate.project?.location || estimate.lead?.location || '';
+    const colGap = 18;
+    const colW = (contentWidth - colGap * 2) / 3;
+    // Each value is clamped (name 2, email 2, project 3, address 4 lines; "..." on the last kept line)
+    // so the row has a known height and always fits one page.
+    const clampCol = (s: unknown, font: PDFFont, size: number, maxLines: number) =>
+        clampLines(wrap(s, font, size, colW), maxLines, font, size, colW, audit);
+    const infoCols: Array<{ label: string; lines: Array<{ s: string; bold?: boolean }> }> = [
+        { label: 'PREPARED FOR', lines: [
+            ...clampCol(clientName, helveticaBold, 9.5, 2).map(s => ({ s, bold: true })),
+            ...clampCol(clientEmail, helvetica, 9, 2).map(s => ({ s })),
+        ] },
+        { label: 'PROJECT', lines: clampCol(projectName, helveticaBold, 9.5, 3).map(s => ({ s, bold: true })) },
+        { label: 'JOBSITE ADDRESS', lines: clampCol(jobsite, helvetica, 9.5, 4).map(s => ({ s })) },
+    ];
+    // Measure the tallest column (label 14 + 12.5 per line), plus the rule and gap drawn after it.
+    const infoH = 14 + Math.max(...infoCols.map(c => c.lines.length)) * 12.5 + 10 + 22;
+    if (y - infoH < bottom) newPage();
+    let infoBottom = y;
+    infoCols.forEach((col, i) => {
+        const x = margin + i * (colW + colGap);
+        text(col.label, x, y, 7.5, helveticaBold, colors.textMuted);
+        let cy = y - 14;
+        for (const ln of col.lines) {
+            text(ln.s, x, cy, ln.bold ? 9.5 : 9, ln.bold ? helveticaBold : helvetica, ln.bold ? colors.textMain : colors.textMuted);
+            cy -= 12.5;
+        }
+        infoBottom = Math.min(infoBottom, cy);
+    });
+    y = infoBottom - 10;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 22;
+
+    // --- Project Overview / Vision (client-facing, no pricing) ---
+    // Rendered after the header/client block, then the estimate details are forced
+    // onto a fresh page so pricing begins on the following page.
+    if (overviewPrepared) {
+        drawRichSection(estimate.overviewTitle || 'Project Overview', overviewPrepared, 15);
+        newPage();
+    }
+
+    // --- Estimate Notes & Assumptions (placed before the line items) ---
+    if (notesPrepared && estimate.notesPlacement === 'before') {
+        drawRichSection(estimate.notesTitle || 'Estimate Notes & Assumptions', notesPrepared, 12);
+        y -= 12;
+    }
+
+    // --- Table Header ---
+    const cols = {
+        name: margin,
+        qty: margin + contentWidth * 0.62,
+        unitCost: margin + contentWidth * 0.80,
+        total: pageWidth - margin,
+    };
+
+    const nameColEnd = margin + contentWidth * 0.55; // the item name/description column ends here
+
+    function drawTableHeader() {
+        text('ITEM DESCRIPTION', cols.name, y, 7.5, helveticaBold, colors.textMuted);
+        textRight('QTY', cols.qty, y, 7.5, helveticaBold, colors.textMuted);
+        textRight('UNIT PRICE', cols.unitCost, y, 7.5, helveticaBold, colors.textMuted);
+        textRight('AMOUNT', cols.total, y, 7.5, helveticaBold, colors.textMuted);
+        y -= 8;
+        page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+        y -= 16;
+    }
+
+    // Keep the table header with at least the first row instead of stranding it at the page bottom.
+    checkNewPage(150);
+    drawTableHeader();
+
+    // --- Table Rows ---
+    const nameLead = 12;
+    const descLead = 10.5;
+    for (const item of estimate.items) {
+        // Shared with serializeEstimateItemsForSave: a row is a section if it is typed as one
+        // or has children. Keying off children alone rendered an emptied section (and any
+        // nested section) as a billable line with qty/unit-cost columns, even though its
+        // stored total is a rolled-up figure that does not equal qty * unitCost.
+        const isSection = isEstimateSectionRow(item, estimate.items);
+        const isSubItem = !!item.parentId;
+        const indent = isSubItem ? 16 : 0;
+        const nameFont = isSection || !isSubItem ? helveticaBold : helvetica;
+
+        // Wrap the name/description to the column width instead of truncating it.
+        const nameWidth = contentWidth * 0.55 - indent;
+        const wrappedName = wrap(item.name || '', nameFont, 10, nameWidth);
+        const nameLines = Math.max(wrappedName.length, 1);
+        const descLines = isSection ? [] : wrap(item.description || '', helvetica, 8.5, nameWidth);
+        const rowHeight = nameLines * nameLead + (descLines.length ? 2 + descLines.length * descLead : 0) + 14;
+
+        // A row taller than a page (a very long description) flows line by line across pages.
+        if (rowHeight > pageHeight - margin - bottom - 40) {
+            if (y < bottom + 60) { newPage(); drawTableHeader(); }
+            if (!isSection) {
+                textRight(String(item.quantity || 0), cols.qty, y, 10, helvetica, colors.textMuted, nameColEnd);
+                textRight(formatCurrency(toNum(item.unitCost)), cols.unitCost, y, 10, helvetica, colors.textMuted, cols.qty);
+            }
+            textRight(formatCurrency(toNum(item.total)), cols.total, y, 10, helveticaBold, colors.textMain, cols.unitCost);
+            const flow = [
+                ...wrappedName.map(line => ({ line, font: nameFont, size: 10, lead: nameLead, color: colors.textMain })),
+                ...descLines.map(line => ({ line, font: helvetica, size: 8.5, lead: descLead, color: colors.textMuted })),
+            ];
+            for (const f of flow) {
+                if (y < bottom + 8) { newPage(); drawTableHeader(); }
+                text(f.line, cols.name + indent, y, f.size, f.font, f.color);
+                y -= f.lead;
+            }
+            y -= 6;
+            page.drawLine({ start: { x: margin, y: y + 10 }, end: { x: pageWidth - margin, y: y + 10 }, thickness: 0.4, color: colors.border });
+            y -= 8;
+            continue;
+        }
+
+        // A row never splits across pages; a section header also keeps room for its first child.
+        const needed = rowHeight + (isSection ? 34 : 0);
+        if (y + 10 - needed < bottom) {
+            newPage();
+            drawTableHeader();
+        }
+
+        if (isSection) {
+            page.drawRectangle({ x: margin - 6, y: y + 14 - rowHeight, width: contentWidth + 12, height: rowHeight - 2, color: band });
+        }
+
+        wrappedName.forEach((line, i) => text(line, cols.name + indent, y - i * nameLead, 10, nameFont));
+        descLines.forEach((line, i) =>
+            text(line, cols.name + indent, y - (nameLines - 1) * nameLead - 13 - i * descLead, 8.5, helvetica, colors.textMuted));
+
+        if (!isSection) {
+            textRight(String(item.quantity || 0), cols.qty, y, 10, helvetica, colors.textMuted, nameColEnd);
+            textRight(formatCurrency(toNum(item.unitCost)), cols.unitCost, y, 10, helvetica, colors.textMuted, cols.qty);
+        }
+        textRight(formatCurrency(toNum(item.total)), cols.total, y, 10, helveticaBold, isSection ? colors.primary : colors.textMain, cols.unitCost);
+
+        if (!isSection) {
+            page.drawLine({ start: { x: margin, y: y + 12 - rowHeight }, end: { x: pageWidth - margin, y: y + 12 - rowHeight }, thickness: 0.4, color: colors.border });
+        }
+        y -= rowHeight;
+    }
+
+    // --- Totals Section ---
+    y -= 16;
+
+    // Leaf rows only, using the same predicate as the rows above. Keying off `parentId`
+    // added a nested section's rolled-up total on top of the child totals it already
+    // contains, inflating the subtotal (and therefore tax and the grand total).
+    // `rm` on the accumulated sum matches computeEstimateSubtotal: without it the raw float
+    // sum can land a hair under the canonical figure and drag tax, the processing fee and
+    // the grand total a cent below what the editor showed.
+    const subtotal = rm(
+        estimate.items.reduce(
+            (acc, item) => (isEstimateSectionRow(item, estimate.items) ? acc : acc + toNum(item.total)),
+            0,
+        ),
+    );
+
+    // Tax and the grand total come from the same function the portal page uses, so a copy downloaded
+    // before signing (no saved rate yet) shows the company default rate like the screen does.
+    // The processing fee is added here exactly as before (whenever the markup is above 0, so the Total
+    // matches the payment schedule and Estimate.totalAmount); hideProcessingFee only hides its row.
+    const taxExempt = !!estimate.taxExempt;
+    const processingFeeMarkup = toNum(estimate.processingFeeMarkup);
+    const hideProcessingFee = estimate.hideProcessingFee ?? true;
+    const shown = computeEstimateDisplayTotals({
+        subtotal,
+        taxExempt,
+        savedRate: estimate.taxRatePercent != null ? toNum(estimate.taxRatePercent) : null,
+        savedName: estimate.taxRateName || null,
+        salesTaxes: parseSalesTaxes(company?.salesTaxes),
+    });
+    const tax = shown.tax;
+    const processingFee = processingFeeMarkup > 0 ? Math.round(subtotal * (processingFeeMarkup / 100) * 100) / 100 : 0;
+    const taxName = taxExempt ? "Tax Exempt" : shown.taxLabel!;
+
+    const total = Math.round((subtotal + tax + processingFee) * 100) / 100;
+
+    const labelX = margin + contentWidth * 0.55;
+    const labelWidth = cols.total - 80 - labelX;
+    const totalRows = [
+        { label: 'Subtotal', value: formatCurrency(subtotal) },
+        { label: taxName, value: formatCurrency(tax) },
+        ...(!hideProcessingFee && processingFee > 0
+            ? [{ label: `Processing Fee (${processingFeeMarkup}%)`, value: formatCurrency(processingFee) }]
+            : []),
+    ].map(r => ({ lines: clampLines(wrap(r.label, helvetica, 10, labelWidth), TOTALS_LABEL_MAX_LINES, helvetica, 10, labelWidth, audit), value: r.value }));
+    // Measure the whole block (same wrap widths as drawn) and keep it together on one page.
+    const totalsBlockH = totalRows.reduce((acc, r) => acc + Math.max(r.lines.length, 1) * 12 + 6, 0) + 6;
+    if (y - totalsBlockH < bottom) newPage();
+    for (const r of totalRows) {
+        r.lines.forEach((ln, i) => text(ln, labelX, y - i * 12, 10, helvetica, colors.textMuted));
+        textRight(r.value, cols.total, y, 10, helvetica, colors.textMain, cols.total - 80);
+        y -= Math.max(r.lines.length, 1) * 12 + 6;
+    }
+    page.drawLine({ start: { x: labelX, y: y + 12 }, end: { x: pageWidth - margin, y: y + 12 }, thickness: 0.5, color: colors.border });
+    y -= 6;
+    text('Total', labelX, y, 14, helveticaBold, colors.primary);
+    textRight(formatCurrency(total), cols.total, y, 14, helveticaBold, colors.primary, labelX + helveticaBold.widthOfTextAtSize('Total', 14) + 8);
+    y -= 14;
+
+    // --- Estimate Notes & Assumptions (placed immediately after the line items/totals) ---
+    if (notesPrepared && estimate.notesPlacement !== 'before') {
+        y -= 30;
+        drawRichSection(estimate.notesTitle || 'Estimate Notes & Assumptions', notesPrepared, 12);
+    }
+
+    // --- Payment Schedule ---
+    // The portal hides the automatic "Payment in Full" row (and the whole section when it is the only one).
+    const scheduleRows = estimate.paymentSchedules.filter(s => s.name !== 'Payment in Full');
+    if (scheduleRows.length > 0) {
+        y -= 36;
+        checkNewPage(150);
+        text('Payment Schedule', margin, y, 11, helveticaBold);
+        y -= 20;
+
+        const pc = { pct: margin + contentWidth * 0.62, amt: margin + contentWidth * 0.80, due: pageWidth - margin };
+        const drawSchedHeader = () => {
+            text('PAYMENT', margin, y, 7.5, helveticaBold, colors.textMuted);
+            textRight('PERCENT', pc.pct, y, 7.5, helveticaBold, colors.textMuted);
+            textRight('AMOUNT', pc.amt, y, 7.5, helveticaBold, colors.textMuted);
+            textRight('DUE', pc.due, y, 7.5, helveticaBold, colors.textMuted);
+            y -= 8;
+            page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+            y -= 15;
+        };
+        drawSchedHeader();
+
+        for (const sched of scheduleRows) {
+            const lines = wrap(sched.name || '', helveticaBold, 9.5, contentWidth * 0.55);
+            const rowH = Math.max(lines.length, 1) * 12 + 8;
+            const drawSchedCells = () => {
+                if (sched.percentage) textRight(`${sched.percentage}%`, pc.pct, y, 9.5, helvetica, colors.textMuted, nameColEnd);
+                if (sched.amount) textRight(formatCurrency(toNum(sched.amount)), pc.amt, y, 9.5, helvetica, colors.textMuted, pc.pct);
+                if (sched.dueDate) textRight(new Date(sched.dueDate).toLocaleDateString(), pc.due, y, 9.5, helvetica, colors.textMuted, pc.amt);
+            };
+            // A row taller than a page flows line by line like the item rows do.
+            if (rowH > pageHeight - margin - bottom - 40) {
+                if (y < bottom + 60) { newPage(); drawSchedHeader(); }
+                drawSchedCells();
+                for (const ln of lines) {
+                    if (y < bottom + 8) { newPage(); drawSchedHeader(); }
+                    text(ln, margin, y, 9.5, helveticaBold);
+                    y -= 12;
+                }
+                y -= 6;
+                page.drawLine({ start: { x: margin, y: y + 10 }, end: { x: pageWidth - margin, y: y + 10 }, thickness: 0.4, color: colors.border });
+                y -= 8;
+                continue;
+            }
+            if (y + 10 - rowH < bottom) { newPage(); drawSchedHeader(); }
+            lines.forEach((ln, i) => text(ln, margin, y - i * 12, 9.5, helveticaBold));
+            drawSchedCells();
+            page.drawLine({ start: { x: margin, y: y + 10 - rowH }, end: { x: pageWidth - margin, y: y + 10 - rowH }, thickness: 0.4, color: colors.border });
+            y -= rowH;
+        }
+    }
+
+    // --- Terms & Conditions: the same snapshot, under the same condition, as the portal page ---
+    if (termsPrepared) {
+        y -= 36;
+        drawRichSection('Terms & Conditions', termsPrepared, 11);
+    }
+
+    // --- Signature Section ---
+    if (isApproved && estimate.approvedBy) {
+        // Fit the drawn signature into a fixed box (never upscaled). SignaturePad output is 500*DPR x 200*DPR px,
+        // so sizing from the pixel dimensions made phone signatures wider than the page.
+        // A dry run (the audit) is about text: it never loads the saved signature from storage.
+        const sigImage = estimate.signatureUrl && !opts.dryRun ? await embedSignatureImage(doc, estimate.signatureUrl) : null;
+        const sigScale = sigImage ? Math.min(180 / sigImage.width, 60 / sigImage.height, 1) : 0;
+        const sigW = sigImage ? sigImage.width * sigScale : 0;
+        const sigH = sigImage ? sigImage.height * sigScale : 0;
+
+        // Whole block, measured from the heading baseline: rule 20, first line 25 more, 15 per extra
+        // metadata line, then the image box (10 gap) and 6 of padding.
+        const signedByLabel = 'Signed By:';
+        const signedByFull = `${signedByLabel}  ${safe(estimate.approvedBy)}`;
+        const signedByInline = helveticaBold.widthOfTextAtSize(signedByFull, 10) <= contentWidth;
+        // A name too long for the line goes under the label, wrapped to the content width.
+        const signerLines = signedByInline ? [] : wrap(estimate.approvedBy, helveticaBold, 10, contentWidth);
+        const sigMetaLines = (estimate.approvalIp ? 3 : 2) + signerLines.length;
+        const sigBlockH = 45 + (sigMetaLines - 1) * 15 + (sigImage ? 10 + sigH : 0) + 6;
+        y -= 40;
+        if (y - sigBlockH < bottom) newPage();
+
+        text('Electronic Signature / Approval', margin, y, 11, helveticaBold);
+        y -= 20;
+        page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+
+        y -= 25;
+        // Signature metadata
+        if (signedByInline) {
+            text(signedByFull, margin, y, 10, helveticaBold);
+            y -= 15;
+        } else {
+            text(signedByLabel, margin, y, 10, helveticaBold);
+            y -= 15;
+            for (const ln of signerLines) { checkNewPage(bottom + 15); text(ln, margin, y, 10, helveticaBold); y -= 15; }
+        }
+        const signedAt = estimate.approvedAt ? new Date(estimate.approvedAt) : new Date();
+        text(`Date:          ${formatCompanyDateTime(signedAt, timeZone)}`, margin, y, 10, helvetica);
+        if (estimate.approvalIp) {
+            y -= 15;
+            text(`IP Address:  ${safe(estimate.approvalIp)}`, margin, y, 9, helvetica, colors.textMuted);
+        }
+
+        // Signature image: inside the block, below the heading and metadata.
+        if (sigImage) {
+            page.drawImage(sigImage, { x: margin, y: y - 10 - sigH, width: sigW, height: sigH });
+            y -= 10 + sigH;
+        }
+        y -= 6;
+    }
+
+    // --- Footer on every page ---
+    const footerY = 30;
+    const footerLeft = `${safe(lh.companyName)}  •  Estimate ${safe(estimate.code || '')}`.trim();
+    const pages = doc.getPages();
+    pages.forEach((p, i) => {
+        const pageLabelW = helvetica.widthOfTextAtSize(`Page ${i + 1} of ${pages.length}`, 7.5);
+        if (margin + helvetica.widthOfTextAtSize(footerLeft, 7.5) > pageWidth - margin - pageLabelW - 8) audit.lossy = true;
+        p.drawText(footerLeft, { x: margin, y: footerY, size: 7.5, font: helvetica, color: colors.textMuted });
+        const label = `Page ${i + 1} of ${pages.length}`;
+        p.drawText(label, { x: pageWidth - margin - helvetica.widthOfTextAtSize(label, 7.5), y: footerY, size: 7.5, font: helvetica, color: colors.textMuted });
+    });
+
+    const pdfBytes = await doc.save();
+    return Buffer.from(pdfBytes);
+}
+
+/** Fetch image bytes with a short timeout; null on any failure. */
+async function fetchImageBytes(url: string): Promise<Uint8Array | null> {
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 4000);
+        try {
+            const res = await fetch(url, { signal: controller.signal });
+            if (!res.ok) return null;
+            return new Uint8Array(await res.arrayBuffer());
+        } finally {
+            clearTimeout(timeoutId);
+        }
+    } catch {
+        return null;
+    }
+}
+
+async function loadEstimateForPdf(estimateId: string) {
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -315,437 +897,59 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     if (!estimate) throw new Error('Estimate not found');
 
     const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
-
-    const doc = await PDFDocument.create();
-    const helvetica = await doc.embedFont(StandardFonts.Helvetica);
-    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
-    const helveticaOblique = await doc.embedFont(StandardFonts.HelveticaOblique);
-    const helveticaBoldOblique = await doc.embedFont(StandardFonts.HelveticaBoldOblique);
-
-    const pageWidth = 612; // Letter width in points
-    const pageHeight = 792; // Letter height in points
-    const margin = 50;
-    const contentWidth = pageWidth - margin * 2;
-
-    let page = doc.addPage([pageWidth, pageHeight]);
-    let y = pageHeight - margin;
-
-    function checkNewPage(needed: number = 80) {
-        if (y < needed) {
-            page = doc.addPage([pageWidth, pageHeight]);
-            y = pageHeight - margin;
-        }
-    }
-
-    // Render a titled rich-text section (Project Overview / Notes & Assumptions) using
-    // the shared HTML-subset renderer, keeping the closure's page/y cursor in sync.
-    const richFonts = { regular: helvetica, bold: helveticaBold, italic: helveticaOblique, boldItalic: helveticaBoldOblique };
-    function drawRichSection(title: string, body: string, titleSize: number) {
-        checkNewPage(140);
-        page.drawText(title, { x: margin, y, size: titleSize, font: helveticaBold, color: colors.textMain });
-        y -= titleSize + 10;
-        const ctx: RichTextCtx = {
-            doc, page, y, fonts: richFonts,
-            layout: { pageWidth, pageHeight, margin, contentWidth },
-            color: colors.textMain, mutedColor: colors.textMuted,
-        };
-        const res = drawRichHtml(body, ctx);
-        page = res.page;
-        y = res.y;
-    }
-
-    // --- Letterhead ---
-    const lhConfig = buildLetterheadConfig(company);
-    y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
-
-    // --- Title ---
-    page.drawText(estimate.title || 'Estimate', {
-        x: margin, y, size: 26, font: helveticaBold, color: colors.textMain,
-    });
-
-    // --- Estimate Info ---
-    y -= 30;
-
-    // Left: Client info
-    const clientName = estimate.project?.client?.name || estimate.lead?.name || '';
-    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || '';
-
-    page.drawText('ESTIMATE TO', {
-        x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted,
-    });
-
-    if (clientName) {
-        y -= 16;
-        page.drawText(clientName, {
-            x: margin, y, size: 11, font: helvetica, color: colors.textMain,
-        });
-    }
-    if (clientEmail) {
-        y -= 14;
-        page.drawText(clientEmail, {
-            x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
-        });
-    }
-
-    // Right side: Estimate # / Date / Status
-    const rightX = pageWidth - margin;
-    let ry = y + (clientEmail ? 30 : 16);
-
-    const drawRightLabel = (label: string, value: string, yPos: number) => {
-        page.drawText(label, {
-            x: rightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted,
-        });
-        const valueWidth = helveticaBold.widthOfTextAtSize(value, 9);
-        page.drawText(value, {
-            x: rightX - valueWidth, y: yPos, size: 9, font: helveticaBold, color: colors.textMain,
-        });
-    };
-
-    drawRightLabel('Estimate No.', estimate.code || '', ry);
-    ry -= 16;
-    drawRightLabel('Date', new Date(estimate.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), ry);
-    ry -= 16;
-    drawRightLabel('Status', estimate.status || 'Draft', ry);
-
-    // --- Separator ---
-    y -= 20;
-    page.drawLine({
-        start: { x: margin, y }, end: { x: pageWidth - margin, y },
-        thickness: 0.5, color: colors.border,
-    });
-    y -= 20;
-
-    // --- Project Overview / Vision (client-facing, no pricing) ---
-    // Rendered after the header/client block, then the estimate details are forced
-    // onto a fresh page so pricing begins on the following page.
-    if (estimate.overviewEnabled && estimate.overviewBody) {
-        drawRichSection(estimate.overviewTitle || 'Project Overview', estimate.overviewBody, 15);
-        page = doc.addPage([pageWidth, pageHeight]);
-        y = pageHeight - margin;
-    }
-
-    // --- Estimate Notes & Assumptions (placed before the line items) ---
-    if (estimate.notesEnabled && estimate.notesBody && estimate.notesPlacement === 'before') {
-        drawRichSection(estimate.notesTitle || 'Estimate Notes & Assumptions', estimate.notesBody, 12);
-        y -= 12;
-    }
-
-    // --- Table Header ---
-    const cols = {
-        name: margin,
-        qty: margin + contentWidth * 0.55,
-        unitCost: margin + contentWidth * 0.75,
-        total: pageWidth - margin,
-    };
-
-    function drawTableHeader() {
-        page.drawText('ITEM DESCRIPTION', {
-            x: cols.name, y, size: 8, font: helveticaBold, color: colors.textMuted,
-        });
-        const qtyLabel = 'QTY';
-        const qtyWidth = helveticaBold.widthOfTextAtSize(qtyLabel, 8);
-        page.drawText(qtyLabel, {
-            x: cols.qty - qtyWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
-        });
-        const ucLabel = 'UNIT COST';
-        const ucWidth = helveticaBold.widthOfTextAtSize(ucLabel, 8);
-        page.drawText(ucLabel, {
-            x: cols.unitCost - ucWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
-        });
-        const totalLabel = 'TOTAL';
-        const totalWidth = helveticaBold.widthOfTextAtSize(totalLabel, 8);
-        page.drawText(totalLabel, {
-            x: cols.total - totalWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
-        });
-
-        y -= 8;
-        page.drawLine({
-            start: { x: margin, y }, end: { x: pageWidth - margin, y },
-            thickness: 0.5, color: colors.border,
-        });
-        y -= 14;
-    }
-
-    // Guard against a before-placement Notes section leaving no room: keep the table
-    // header with at least the first row instead of stranding it at the page bottom.
-    checkNewPage(120);
-    drawTableHeader();
-
-    // --- Table Rows ---
-    const rowLeading = 12;
-    for (const item of estimate.items) {
-        // Shared with serializeEstimateItemsForSave: a row is a section if it is typed as one
-        // or has children. Keying off children alone rendered an emptied section (and any
-        // nested section) as a billable line with qty/unit-cost columns, even though its
-        // stored total is a rolled-up figure that does not equal qty * unitCost.
-        const isSection = isEstimateSectionRow(item, estimate.items);
-        const isSubItem = !!item.parentId;
-        const nameX = isSubItem ? cols.name + 16 : cols.name;
-        const nameFont = isSection || !isSubItem ? helveticaBold : helvetica;
-
-        // Wrap the name/description to the column width instead of truncating it.
-        const displayName = item.name || '';
-        const maxNameWidth = contentWidth * 0.5;
-        const wrappedName = wrapPlainText(displayName, nameFont, 10, maxNameWidth);
-        const lineCount = Math.max(wrappedName.length, 1);
-        const rowHeight = lineCount * rowLeading + 8;
-
-        // Page-break BEFORE the row if the whole (possibly multi-line) row doesn't fit,
-        // re-drawing the table header on the new page.
-        if (y - rowHeight < margin) {
-            page = doc.addPage([pageWidth, pageHeight]);
-            y = pageHeight - margin;
-            drawTableHeader();
-        }
-
-        if (isSection) {
-            // Draw a subtle slate background banner for the section header, sized to
-            // the (possibly multi-line) row height.
-            page.drawRectangle({
-                x: margin - 6,
-                y: y - rowHeight + 16,
-                width: contentWidth + 12,
-                height: rowHeight - 2,
-                color: colors.bgLight,
-            });
-        }
-
-        wrappedName.forEach((line, idx) => {
-            page.drawText(line, {
-                x: nameX, y: y - idx * rowLeading, size: 10, font: nameFont, color: colors.textMain,
-            });
-        });
-
-        if (!isSection) {
-            // Qty — aligned with the first line of the wrapped name
-            const qtyStr = String(item.quantity || 0);
-            const qtyWidth = helvetica.widthOfTextAtSize(qtyStr, 10);
-            page.drawText(qtyStr, {
-                x: cols.qty - qtyWidth, y, size: 10, font: helvetica, color: colors.textMuted,
-            });
-
-            // Unit cost — aligned with the first line of the wrapped name
-            const ucStr = formatCurrency(toNum(item.unitCost));
-            const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
-            page.drawText(ucStr, {
-                x: cols.unitCost - ucWidth, y, size: 10, font: helvetica, color: colors.textMuted,
-            });
-        }
-
-        // Total — aligned with the first line of the wrapped name
-        const totalStr = formatCurrency(toNum(item.total));
-        const totalWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
-        page.drawText(totalStr, {
-            x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: isSection ? colors.primary : colors.textMain,
-        });
-
-        y -= rowHeight;
-    }
-
-    // --- Totals Section ---
-    y -= 10;
-    // 135 (not 120): the Total row below draws at y-8, and with Subtotal/Tax/Fee all
-    // shown that chain can eat 74pt — keep the offset Total-row draw comfortably clear
-    // of the footer rather than relying on the footer's own guard.
-    checkNewPage(135);
-    page.drawLine({
-        start: { x: margin + contentWidth * 0.5, y },
-        end: { x: pageWidth - margin, y },
-        thickness: 0.5, color: colors.border,
-    });
-    y -= 20;
-
-    // Leaf rows only, using the same predicate as the rows above. Keying off `parentId`
-    // added a nested section's rolled-up total on top of the child totals it already
-    // contains, inflating the subtotal (and therefore tax and the grand total).
-    // `rm` on the accumulated sum matches computeEstimateSubtotal: without it the raw float
-    // sum can land a hair under the canonical figure and drag tax, the processing fee and
-    // the grand total a cent below what the editor showed.
-    const subtotal = rm(
-        estimate.items.reduce(
-            (acc, item) => (isEstimateSectionRow(item, estimate.items) ? acc : acc + toNum(item.total)),
-            0,
-        ),
-    );
-
-    const taxRatePercent = toNum(estimate.taxRatePercent);
-    const taxExempt = !!estimate.taxExempt;
-    const taxRate = taxExempt ? 0 : taxRatePercent / 100;
-    const tax = Math.round(subtotal * taxRate * 100) / 100;
-
-    const taxRateDisplay = Number(taxRatePercent.toFixed(4));
-    const taxName = taxExempt
-        ? "Tax Exempt"
-        : (estimate.taxRateName ? `${estimate.taxRateName} (${taxRateDisplay}%)` : `Estimated Tax (${taxRateDisplay}%)`);
-
-    const processingFeeMarkup = toNum(estimate.processingFeeMarkup);
-    const hideProcessingFee = estimate.hideProcessingFee ?? true;
-    const processingFee = processingFeeMarkup > 0 ? Math.round(subtotal * (processingFeeMarkup / 100) * 100) / 100 : 0;
-
-    const total = Math.round((subtotal + tax + processingFee) * 100) / 100;
-
-    // Subtotal
-    const labelX = cols.unitCost - 60;
-    page.drawText('Subtotal', {
-        x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
-    });
-    const subtotalStr = formatCurrency(subtotal);
-    const subtotalWidth = helvetica.widthOfTextAtSize(subtotalStr, 10);
-    page.drawText(subtotalStr, {
-        x: cols.total - subtotalWidth, y, size: 10, font: helvetica, color: colors.textMain,
-    });
-    y -= 18;
-
-    // Tax
-    page.drawText(taxName, {
-        x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
-    });
-    const taxStr = formatCurrency(tax);
-    const taxWidth = helvetica.widthOfTextAtSize(taxStr, 10);
-    page.drawText(taxStr, {
-        x: cols.total - taxWidth, y, size: 10, font: helvetica, color: colors.textMain,
-    });
-    y -= 18;
-
-    // Processing Fee (only if not hidden)
-    if (!hideProcessingFee && processingFee > 0) {
-        page.drawText(`Processing Fee (${processingFeeMarkup}%)`, {
-            x: labelX, y, size: 10, font: helvetica, color: colors.textMuted,
-        });
-        const feeStr = formatCurrency(processingFee);
-        const feeWidth = helvetica.widthOfTextAtSize(feeStr, 10);
-        page.drawText(feeStr, {
-            x: cols.total - feeWidth, y, size: 10, font: helvetica, color: colors.textMain,
-        });
-        y -= 18;
-    }
-
-    // Total line
-    page.drawLine({
-        start: { x: labelX - 10, y: y + 6 },
-        end: { x: pageWidth - margin, y: y + 6 },
-        thickness: 0.5, color: colors.border,
-    });
-
-    page.drawText('Total', {
-        x: labelX, y: y - 8, size: 14, font: helveticaBold, color: colors.primary,
-    });
-    const totalStr2 = formatCurrency(total);
-    const totalWidth2 = helveticaBold.widthOfTextAtSize(totalStr2, 14);
-    page.drawText(totalStr2, {
-        x: cols.total - totalWidth2, y: y - 8, size: 14, font: helveticaBold, color: colors.primary,
-    });
-
-    // --- Estimate Notes & Assumptions (placed immediately after the line items/totals) ---
-    if (estimate.notesEnabled && estimate.notesBody && estimate.notesPlacement !== 'before') {
-        y -= 30;
-        drawRichSection(estimate.notesTitle || 'Estimate Notes & Assumptions', estimate.notesBody, 12);
-    }
-
-    // --- Payment Schedule ---
-    if (estimate.paymentSchedules.length > 0) {
-        y -= 50;
-        checkNewPage(120);
-
-        page.drawText('Payment Schedule', {
-            x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
-        });
-        y -= 20;
-
-        for (const sched of estimate.paymentSchedules) {
-            checkNewPage(60);
-
-            page.drawText(sched.name || '', {
-                x: margin, y, size: 9, font: helveticaBold, color: colors.textMain,
-            });
-
-            const schedInfo: string[] = [];
-            if (sched.percentage) schedInfo.push(`${sched.percentage}%`);
-            if (sched.amount) schedInfo.push(formatCurrency(toNum(sched.amount)));
-            const schedText = schedInfo.join('  ');
-
-            page.drawText(schedText, {
-                x: margin + contentWidth * 0.5, y, size: 9, font: helvetica, color: colors.textMuted,
-            });
-
-            if (sched.dueDate) {
-                const dateStr = new Date(sched.dueDate).toLocaleDateString();
-                const dateWidth = helvetica.widthOfTextAtSize(dateStr, 9);
-                page.drawText(dateStr, {
-                    x: cols.total - dateWidth, y, size: 9, font: helvetica, color: colors.textMuted,
-                });
-            }
-            y -= 18;
-        }
-    }
-
-    // --- Signature Section ---
-    if (estimate.status === 'Approved' && estimate.approvedBy) {
-        y -= 60;
-        checkNewPage(150);
-
-        page.drawText('Electronic Signature / Approval', {
-            x: margin, y, size: 11, font: helveticaBold, color: colors.textMain,
-        });
-
-        y -= 20;
-        page.drawLine({
-            start: { x: margin, y }, end: { x: pageWidth - margin, y },
-            thickness: 0.5, color: colors.border,
-        });
-
-        y -= 25;
-        // Signature metadata
-        page.drawText(`Signed By:  ${estimate.approvedBy}`, {
-            x: margin, y, size: 10, font: helveticaBold, color: colors.textMain,
-        });
-        y -= 15;
-        page.drawText(`Date:          ${estimate.approvedAt ? new Date(estimate.approvedAt).toLocaleString() : new Date().toLocaleString()}`, {
-            x: margin, y, size: 10, font: helvetica, color: colors.textMain,
-        });
-        if (estimate.approvalIp) {
-            y -= 15;
-            page.drawText(`IP Address:  ${estimate.approvalIp}`, {
-                x: margin, y, size: 9, font: helvetica, color: colors.textMuted,
-            });
-        }
-
-        // Signature Image — handles legacy inline data-URLs and migrated Storage URLs.
-        if (estimate.signatureUrl) {
-            const embeddedSig = await embedSignatureImage(doc, estimate.signatureUrl);
-            if (embeddedSig) {
-                // Scale signature down so it fits nicely
-                const sigDims = embeddedSig.scale(0.35);
-                page.drawImage(embeddedSig, {
-                    x: pageWidth - margin - sigDims.width,
-                    y: y, // draw next to metadata
-                    width: sigDims.width,
-                    height: sigDims.height,
-                });
-            }
-        }
-        
-        y -= 40;
-    }
-
-    // --- Footer ---
-    // No pre-footer page-break guard here: every content path above already page-breaks
-    // (or is bounded, see the checkNewPage(135) totals guard) well clear of the footer's
-    // y=30, so this can't collide — and a guard here would emit a footer-only blank page.
-    const footerY = 30;
-    const footerText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
-    page.drawText(footerText, {
-        x: margin, y: footerY, size: 7, font: helvetica, color: colors.textMuted,
-    });
-    const pageLabel = 'Page 1';
-    const pageLabelWidth = helvetica.widthOfTextAtSize(pageLabel, 7);
-    page.drawText(pageLabel, {
-        x: pageWidth - margin - pageLabelWidth, y: footerY, size: 7, font: helvetica, color: colors.textMuted,
-    });
-
-    const pdfBytes = await doc.save();
-    return Buffer.from(pdfBytes);
+    return { estimate, company };
 }
+
+/** The signer-name length the dry run accepts; anything longer is treated as "cannot vouch" by the caller. */
+export const MAX_AUDIT_SIGNER_NAME_LENGTH = 200;
+
+/**
+ * Dry-run render of an estimate from plain data: reports whether ANY printed text had to be altered
+ * ("?" for a character the PDF fonts cannot encode, or a rich field that could not be sanitised).
+ * When a signer name is given, the "Signed By" block is included as if the estimate were signed now,
+ * so a name such as "Nguyen" with diacritics the fonts cannot print is caught before anything is saved.
+ * Writes nothing and sends nothing.
+ */
+export async function auditEstimatePdfText(
+    estimate: EstimatePdfData,
+    company: Record<string, unknown> | null | undefined,
+    signerName?: string | null,
+): Promise<{ lossy: boolean }> {
+    const audit = { lossy: false };
+    const signer = typeof signerName === 'string' && signerName.trim() ? signerName.trim() : null;
+    const subject: EstimatePdfData = signer
+        ? { ...estimate, approvedBy: signer, approvedAt: estimate.approvedAt ?? new Date() }
+        : estimate;
+    await buildEstimatePdf(subject, company, {}, { audit, dryRun: true });
+    return { lossy: audit.lossy };
+}
+
+/** The server PDF plus whether any text in it was altered (see auditEstimatePdfText). */
+export async function generateEstimatePdfWithAudit(estimateId: string): Promise<{ bytes: Buffer; lossy: boolean }> {
+    const { estimate, company } = await loadEstimateForPdf(estimateId);
+
+    const lh = buildLetterheadConfig(company);
+    const images = lh.mode === 'custom_image' && lh.customImageUrl
+        ? { letterhead: await fetchImageBytes(lh.customImageUrl) }
+        : { logo: lh.logoUrl ? await fetchImageBytes(lh.logoUrl) : null };
+
+    // The server runs in UTC; dates on the document are shown in the company's zone, like the approval emails.
+    const timeZone = await resolveCompanyTimeZone().catch(() => DEFAULT_COMPANY_TIME_ZONE);
+    const audit = { lossy: false };
+    const bytes = await buildEstimatePdf(estimate, company, images, { timeZone, audit });
+    return { bytes, lossy: audit.lossy };
+}
+
+export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
+    return (await generateEstimatePdfWithAudit(estimateId)).bytes;
+}
+
+/** Dry-run audit for a stored estimate (no images fetched, nothing written). */
+export async function auditEstimatePdfById(estimateId: string, signerName?: string | null): Promise<{ lossy: boolean }> {
+    const { estimate, company } = await loadEstimateForPdf(estimateId);
+    return auditEstimatePdfText(estimate, company, signerName);
+}
+
 
 export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
     const po = await prisma.purchaseOrder.findUnique({
