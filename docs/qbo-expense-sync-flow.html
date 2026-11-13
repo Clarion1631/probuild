@@ -103,7 +103,7 @@
 <div class="wrap">
   <h1>GTR Expense Pipeline</h1>
   <p class="sub">From a swipe of the Washington Trust debit card to job-cost visibility in ProBuild — who touches what, where the money data lives, and what runs by itself. Goal: answer "are we profitable, is cash flow good" daily.</p>
-  <p class="stamp">Updated November 9, 2026. Receipts are read and booked to job costing in ProBuild. <b>Nothing is sent to QuickBooks.</b> Vanessa books QuickBooks from the bank feed. The automatic receipts-needed lists are switched off for now. Affidavit requests are handled by hand.</p>
+  <p class="stamp">Updated November 12, 2026. Receipts are read and booked to job costing in ProBuild. <b>Nothing is sent to QuickBooks.</b> Vanessa books QuickBooks from the bank feed. The automatic receipts-needed lists are on again since November 11, 2026. Affidavit requests are handled by hand.</p>
 
   <div class="glance" aria-label="The pipeline at a glance">
     <svg class="logo" viewBox="0 0 49.4 37.25" aria-label="Gmail"><path fill="#4285f4" d="M3.37 37.25h7.87V18.14L0 9.71v24.17c0 1.86 1.51 3.37 3.37 3.37z"/><path fill="#34a853" d="M38.16 37.25h7.87c1.86 0 3.37-1.51 3.37-3.37V9.71L38.16 18.14z"/><path fill="#fbbc04" d="M38.16 3.37v14.77L49.4 9.71V5.06c0-4.17-4.76-6.55-8.1-4.05z"/><path fill="#ea4335" d="M11.24 18.14V3.37L24.7 13.47 38.16 3.37v14.77L24.7 28.24z"/><path fill="#c5221f" d="M0 5.06v4.65l11.24 8.43V3.37L8.1 1.01C4.76-1.49 0 .89 0 5.06z"/></svg>
@@ -201,7 +201,7 @@
     <tr><td>QuickBooks → ProBuild sync</td><td>Every 4 hours <span class="pill">paused since September 18, 2026</span></td><td>Used to import finalized purchases into job costs. Paused on purpose now that receipts book directly</td></tr>
     <tr><td>Bank register pull</td><td>Nightly, 2:00&nbsp;AM&nbsp;UTC</td><td>Reads the QuickBooks register for the Washington Trust account and records the last 7 days as bank charges, so the missing-receipt check has fresh truth to work from instead of waiting for the monthly statement. When the statement does arrive it attaches to those same charges rather than creating duplicates. Read-only — it never writes to QuickBooks</td></tr>
     <tr><td>Missing-receipt check</td><td>Daily, 3:00&nbsp;AM&nbsp;Pacific (2:00&nbsp;AM in winter). Runs again after receipts or bank charges change</td><td>Compares every bank charge older than 3 days against the receipts and expenses we hold. Anything with no match opens on the <b>Receipts</b> tab; anything that gets matched closes itself</td></tr>
-    <tr><td>Receipt chase card</td><td>Weekday mornings <span class="pill">switched off since September 14, 2026</span></td><td>Posts ONE Chat message per person (CJ, Richard) listing their missing receipts. Reply in the thread with a photo, a job name, or "sign N" for a memo. Never emails anything</td></tr>
+    <tr><td>Receipt chase card</td><td>Weekday mornings <span class="pill">on since November 11, 2026, about 6:30 AM Pacific in winter, 7:30 in summer</span></td><td>Posts ONE Chat message per person (CJ, Richard) listing their missing receipts. Reply in the thread with a photo, a job name, or "sign N" for a memo. Never emails anything</td></tr>
   </table>
   </div>
 
@@ -233,8 +233,9 @@
     <h3>Missing receipts — how the chase works</h3>
     <p>A bank charge more than 3 days old with no receipt or expense behind it opens a <b>missing receipt</b> item on the Receipts tab. Loan payments, insurance, bank fees, tax payments and owner transfers are exempt by rule — there is no merchant receipt to find, and the reason is shown rather than hidden. Items are grouped by whose card was used (…8516 CJ, …6098 Richard, …4297 Justin); charges with no card are the office's to chase and the crew never sees them. Checks and sub bills are Marge's.</p>
     <ul>
-      <li>These lists are switched off right now. This is how they work when they are on.</li>
-      <li>While they are off, the Receipts tab says so in a yellow note.</li>
+      <li>These lists are on. They have been on again since November 11, 2026. They were off from September 14, 2026 to November 11, 2026.</li>
+      <li>They go out on weekday mornings, about 6:30 AM Pacific in winter (7:30 AM in summer). If a list was held back on the first try, ProBuild tries again about 4 and 12 minutes later, and once more two hours later. A later try only sends if the latest missing-receipt check is complete and up to date. If ProBuild cannot confirm whether Chat received a list, it does not resend it automatically. The list shows on the Receipts tab under Uncertain deliveries for someone to check.</li>
+      <li>If they are ever turned off, the Receipts tab shows a yellow note.</li>
       <li>Each list holds up to 10 charges. Charges nobody has been asked about yet come first. Among those, charges from the last 10 days lead, and 3 spots are kept for older ones when any are waiting. Charges already asked about come last.</li>
       <li><b>It closes itself.</b> When matching evidence turns up — same amount to the cent, within 2 days, same merchant — the item disappears, usually within one worker tick (a few minutes) of the receipt booking; otherwise it clears on the next nightly run. If that evidence is later deleted, the item comes back.</li>
       <li><b>Some are held back on purpose.</b> When ProBuild already holds a document for the same amount inside a month, the item is held and nobody is asked for it. That document may not be the right one, so it is Justin's to reconcile, not yours to chase. Your list counts these under "have a possible document already".</li>
@@ -251,7 +252,7 @@
   <div class="stage g">
     <span class="tag">Your job in short</span>
     <div class="h3row"><h3>The pipeline does the chasing. You check it's working.</h3></div>
-    <p>ProBuild reads receipts and books most of them straight to job costing by itself. Nothing is sent to QuickBooks. Some need a person and show up under <i>Needs job</i>, <i>Needs review</i>, or <i>Exceptions</i>. The automatic "receipts needed" lists to CJ and Richard are switched off right now (last sent September 14, 2026), so nobody is being auto-asked until they are turned back on. The Receipts tab shows a yellow note while they are off. Your part: get receipts in, do the quick daily look, and flag what is stuck.</p>
+    <p>ProBuild reads receipts and books most of them straight to job costing by itself. Nothing is sent to QuickBooks. Some need a person and show up under <i>Needs job</i>, <i>Needs review</i>, or <i>Exceptions</i>. The automatic "receipts needed" lists to CJ and Richard are on again since November 11, 2026. They go out on weekday mornings, about 6:30 AM Pacific in winter (7:30 AM in summer). If they are ever turned off, the Receipts tab shows a yellow note. Your part: get receipts in, do the quick daily look, and flag what is stuck.</p>
   </div>
   <div class="arrow">▼</div>
 
@@ -376,7 +377,7 @@
     <h3>What changed recently</h3>
     <ul>
       <li>September 23, 2026: expenses that came from a receipt can't be deleted any more. Use <b>Move to job</b> on the job's Time &amp; Expenses tab instead. If one is a double, tell Justin.</li>
-      <li>Lists switched off since September 14, 2026, while old receipts get reconciled. Nobody is auto-asked until they are turned back on.</li>
+      <li>The lists were off from September 14 to November 11, 2026. They are on again.</li>
       <li>The old affidavit processor was retired September 4, 2026. Requests wait for Justin.</li>
       <li>September 18, 2026: receipts now book into ProBuild job costing. Nothing is sent to QuickBooks. Vanessa books QuickBooks from the bank feed.</li>
       <li>September 18, 2026: when you write a check, post a photo of the check and the bill it pays.</li>
