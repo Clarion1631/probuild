@@ -4,7 +4,8 @@ import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
 import { isSecureRef, downloadDocBytes } from './secure-storage';
-import { coTaxRate, coTaxLabel, billableCoItems } from './co-tax';
+import { coTaxRate, coTaxLabel, billableCoItems, coLineCents, coItemsSubtotal } from './co-tax';
+import { isDateOnly } from './payment-date';
 import { cleanPdfTextAudited } from './pdf-text-encoding';
 import { sanitizePortalHtml, isPortalHtmlFaithful } from './pdf-sanitize';
 import { drawRichHtml, drawWrappedText, measureWrappedLines, type RichTextCtx } from './pdf-richtext';
@@ -221,6 +222,8 @@ async function drawLetterhead(
     config: LetterheadConfig,
     opts: { pageWidth: number; pageHeight: number; margin: number },
     fonts: { regular: PDFFont; bold: PDFFont },
+    audit?: { lossy: boolean },
+    logo?: HeaderLogo,
 ): Promise<number> {
     const { pageWidth, pageHeight, margin } = opts;
     let y: number;
@@ -246,12 +249,41 @@ async function drawLetterhead(
             y = pageHeight - imgHeight - 20;
         } catch {
             // Fall back to built-in if image fetch fails
-            return drawBuiltInHeader(page, config, opts, fonts);
+            if (audit) audit.lossy = true;
+            const fallbackLogo = await embedHeaderLogo(doc, config, logo, audit);
+            return drawBuiltInHeader(page, config, opts, fonts, audit, fallbackLogo);
         }
         return y;
     }
 
-    return drawBuiltInHeader(page, config, opts, fonts);
+    const headerLogo = await embedHeaderLogo(doc, config, logo, audit);
+    return drawBuiltInHeader(page, config, opts, fonts, audit, headerLogo);
+}
+
+/** The company logo for a built-in letterhead. `bytes` are the fetched file (null when the fetch failed);
+ *  `drawn` is set when the logo was drawn. Purchase orders pass no HeaderLogo and draw none. */
+interface HeaderLogo { bytes: Uint8Array | null; drawn: boolean }
+
+/** Embeds the configured logo; a logo that is configured but cannot be fetched or embedded marks the audit lossy. */
+async function embedHeaderLogo(doc: PDFDocument, config: LetterheadConfig, logo: HeaderLogo | undefined, audit?: { lossy: boolean }): Promise<PDFImage | null> {
+    if (!logo || !config.logoUrl) return null;
+    try {
+        if (!logo.bytes) throw new Error('logo not fetched');
+        const img = await embedImageBytes(doc, logo.bytes);
+        logo.drawn = true;
+        return img;
+    } catch {
+        if (audit) audit.lossy = true;
+        return null;
+    }
+}
+
+/** True when the page shows one of these company values (non-empty) but the PDF header does not print it.
+ *  A custom letterhead image prints none of them; a built-in header prints exactly its configured fields. */
+function headerLeavesOut(config: LetterheadConfig, needed: Array<'phone' | 'email' | 'license'>): boolean {
+    const printed = new Set<string>(config.mode === 'custom_image' && config.customImageUrl ? [] : config.fields);
+    const value = { phone: config.phone, email: config.email, license: config.licenseNumber };
+    return needed.some(f => Boolean((value[f] || '').trim()) && !printed.has(f));
 }
 
 function drawBuiltInHeader(
@@ -259,6 +291,8 @@ function drawBuiltInHeader(
     config: LetterheadConfig,
     opts: { pageWidth: number; pageHeight: number; margin: number },
     fonts: { regular: PDFFont; bold: PDFFont },
+    audit?: { lossy: boolean },
+    logoImg?: PDFImage | null,
 ): number {
     const { pageWidth, pageHeight, margin } = opts;
     const contentWidth = pageWidth - margin * 2;
@@ -269,6 +303,13 @@ function drawBuiltInHeader(
         page.drawRectangle({ x: 0, y: pageHeight - 6, width: pageWidth, height: 6, color: barColor });
     }
     y = pageHeight - 40;
+    if (logoImg) {
+        // Same sizing and placement as the estimate PDF's logo.
+        const scale = Math.min(150 / logoImg.width, 44 / logoImg.height, 1);
+        const w = logoImg.width * scale, h = logoImg.height * scale;
+        page.drawImage(logoImg, { x: margin, y: y - h + 10, width: w, height: h });
+        y -= h + 6;
+    }
 
     const fieldValues: string[] = [];
     for (const f of config.fields) {
@@ -290,9 +331,10 @@ function drawBuiltInHeader(
     outer:
     for (let i = 0; i < fieldValues.length; i++) {
         const size = i === 0 ? 11 : 9;
-        const value = i === 0 ? fieldValues[i].toUpperCase() : fieldValues[i];
+        const cleaned = audit ? pdfSafeText(fieldValues[i], audit) : fieldValues[i];
+        const value = i === 0 ? cleaned.toUpperCase() : cleaned;
         for (const line of wrapPlainText(value, fonts.regular, size, contentWidth)) {
-            if (y < margin + 250) break outer;
+            if (y < margin + 250) { if (audit) audit.lossy = true; break outer; }
             page.drawText(line, { x: margin, y, size, font: fonts.regular, color: colors.textMuted });
             y -= 14;
         }
@@ -1193,13 +1235,314 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
     return Buffer.from(pdfBytes);
 }
 
-export async function generateInvoicePdf(
+const PDF_DAY_OPTS: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'short', day: 'numeric' };
+
+/** A calendar day (stored as midnight UTC) prints from its UTC fields; any other instant prints in the company time zone. */
+export function formatPdfDay(value: Date | string | null | undefined, timeZone: string): string {
+    if (!value) return '';
+    const d = typeof value === 'string' ? new Date(value) : value;
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleDateString('en-US', { ...PDF_DAY_OPTS, timeZone: isDateOnly(d) ? 'UTC' : timeZone });
+}
+
+/** A real instant (created, issued, signed): always the company time zone. */
+function formatPdfInstant(value: Date | string | null | undefined, timeZone: string): string {
+    if (!value) return '';
+    const d = typeof value === 'string' ? new Date(value) : value;
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleDateString('en-US', { ...PDF_DAY_OPTS, timeZone });
+}
+
+/** Footer on every page: left text, "Page i of n" right. Marks the audit lossy when the left text would reach the page label. */
+function drawCompanyFooters(doc: PDFDocument, font: PDFFont, leftText: string, audit: { lossy: boolean }, margin: number, pageWidth: number) {
+    const pages = doc.getPages();
+    pages.forEach((p, i) => {
+        const label = `Page ${i + 1} of ${pages.length}`;
+        const labelW = font.widthOfTextAtSize(label, 7);
+        if (margin + font.widthOfTextAtSize(leftText, 7) > pageWidth - margin - labelW - 8) audit.lossy = true;
+        p.drawText(leftText, { x: margin, y: 30, size: 7, font, color: colors.textMuted });
+        p.drawText(label, { x: pageWidth - margin - labelW, y: 30, size: 7, font, color: colors.textMuted });
+    });
+}
+
+/** The invoice fields the PDF reads (a prisma invoice with its relations fits). */
+export interface InvoicePdfData {
+    code?: string | null;
+    status?: string | null;
+    createdAt: Date | string;
+    issueDate?: Date | string | null;
+    totalAmount?: unknown;
+    balanceDue?: unknown;
+    notes?: string | null;
+    client?: { name?: string | null; email?: string | null } | null;
+    project?: { name?: string | null; location?: string | null; client?: { name?: string | null; email?: string | null } | null } | null;
+    payments: Array<{
+        id: string; name?: string | null; amount?: unknown; status?: string | null;
+        dueDate?: Date | string | null; paymentDate?: Date | string | null; qbInvoiceSentAt?: Date | string | null;
+    }>;
+}
+
+/** Draws the invoice PDF from plain data (no database). When requestedMilestoneIds is set the PDF mirrors the
+ *  client's milestone-scoped view. Anything that could not be printed exactly marks opts.audit lossy. */
+export async function buildInvoicePdf(
+    invoice: InvoicePdfData,
+    company: Record<string, unknown> | null | undefined,
+    opts: {
+        requestedMilestoneIds?: string[]; timeZone?: string | null; audit?: { lossy: boolean }; now?: Date;
+        /** The fetched company logo file (null when it could not be fetched). */
+        logoBytes?: Uint8Array | null;
+        /** Only the portal route's exact path sets this: the page hides the full-invoice Total Amount in focus mode. */
+        omitFocusedTotal?: boolean;
+    } = {},
+): Promise<Buffer> {
+    const audit = opts.audit ?? { lossy: false };
+    const safe = (v: unknown) => pdfSafeText(v, audit);
+    const timeZone = validTimeZone(opts.timeZone) ? opts.timeZone : DEFAULT_COMPANY_TIME_ZONE;
+    const now = opts.now ?? new Date();
+
+    const requestedIds = new Set(opts.requestedMilestoneIds ?? []);
+    // Pending-only: same predicate as the portal's focus mode and markInvoiceViewed.
+    const requestedPayments = invoice.payments.filter(p => requestedIds.has(p.id) && p.status === 'Pending');
+    const focusedIds = new Set(requestedPayments.map(p => p.id));
+    const hasFocus = requestedPayments.length > 0;
+
+    const doc = await PDFDocument.create();
+    const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+
+    const pageWidth = 612;
+    const pageHeight = 792;
+    const margin = 50;
+    const contentWidth = pageWidth - margin * 2;
+    const bottom = 60; // lowest y body content may reach (footer sits at y=30)
+
+    let page = doc.addPage([pageWidth, pageHeight]);
+    let y = pageHeight - margin;
+
+    function newPage() {
+        page = doc.addPage([pageWidth, pageHeight]);
+        y = pageHeight - margin;
+    }
+    function checkNewPage(needed: number = 80) {
+        if (y < needed) newPage();
+    }
+    // Every single-line text is measured against the room it has; overflow marks the audit lossy.
+    const rightLimit = pageWidth - margin;
+    const text = (s: string, x: number, yy: number, size: number, font: PDFFont, color = colors.textMain, maxX = rightLimit) => {
+        if (x + font.widthOfTextAtSize(s, size) > maxX + 0.01) audit.lossy = true;
+        page.drawText(s, { x, y: yy, size, font, color });
+    };
+    const textRight = (s: string, xRight: number, yy: number, size: number, font: PDFFont, color = colors.textMain, minX = margin) => {
+        const w = font.widthOfTextAtSize(s, size);
+        if (xRight - w < minX - 0.01) audit.lossy = true;
+        page.drawText(s, { x: xRight - w, y: yy, size, font, color });
+    };
+    const wrap = (s: unknown, font: PDFFont, size: number, width: number) => wrapPlainText(safe(s), font, size, width);
+
+    // Notes can be long: flow them and sync the local page/y cursor (drawWrappedText paginates on its own).
+    const invFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
+    function flowText(t: string, o: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: invFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted, audit,
+        };
+        const res = drawWrappedText(t, ctx, o);
+        page = res.page;
+        y = res.y;
+    }
+
+    // --- Letterhead ---
+    const lhConfig = buildLetterheadConfig(company);
+    y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold }, audit, { bytes: opts.logoBytes ?? null, drawn: false });
+    // The page footer shows the company phone, email and license ("prepared by ..."): the header must print them too.
+    if (headerLeavesOut(lhConfig, ['phone', 'email', 'license'])) audit.lossy = true;
+
+    // The letterhead leaves y on its last line's baseline: clear it before the 26pt title.
+    y -= 24;
+    text('INVOICE', margin, y, 26, helveticaBold);
+    y -= 30;
+
+    // BILL TO: the invoice's own client, else the project's client (same fallback as the portal page).
+    const clientName = invoice.client?.name || invoice.project?.client?.name || '';
+    const clientEmail = invoice.client?.email || invoice.project?.client?.email || '';
+    const billToY = y;
+    page.drawText('BILL TO', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
+    let ly = y;
+    if (clientName) {
+        clampLines(wrap(clientName, helvetica, 11, 260), 2, helvetica, 11, 260, audit).forEach((ln, i) => {
+            ly -= i === 0 ? 16 : 14;
+            text(ln, margin, ly, 11, helvetica, colors.textMain, margin + 260);
+        });
+    }
+    if (clientEmail) {
+        clampLines(wrap(clientEmail, helvetica, 9, 260), 2, helvetica, 9, 260, audit).forEach((ln, i) => {
+            ly -= i === 0 ? 14 : 12;
+            text(ln, margin, ly, 9, helvetica, colors.textMuted, margin + 260);
+        });
+    }
+
+    // Right column, anchored to the BILL TO baseline: Invoice No., Date, Status.
+    const rightX = pageWidth - margin;
+    let ry = billToY;
+    const drawRL = (label: string, value: string, yPos: number) => {
+        const labelW = helvetica.widthOfTextAtSize(label, 9);
+        text(label, rightX - 160, yPos, 9, helvetica, colors.textMuted, rightX);
+        textRight(safe(value), rightX, yPos, 9, helveticaBold, colors.textMain, rightX - 160 + labelW + 6);
+    };
+    const requestedDueNow = invoice.payments
+        .filter(p => p.status === 'Pending' && p.qbInvoiceSentAt)
+        .reduce((sum, p) => sum + Number(p.amount), 0);
+    const statusBadge = invoice.status === 'Paid' ? 'Paid'
+        : (requestedDueNow > 0 || hasFocus) ? 'Payment Due' : 'No Payment Due';
+    drawRL('Invoice No.', invoice.code || '', ry);
+    ry -= 16;
+    drawRL('Date', formatPdfInstant(invoice.issueDate ?? invoice.createdAt, timeZone), ry);
+    ry -= 16;
+    drawRL('Status', statusBadge, ry);
+
+    // Left column continues: PROJECT, then JOB SITE (the customer's property, not the company address).
+    const projectName = (invoice.project?.name || '').trim();
+    if (projectName) {
+        ly -= 18;
+        page.drawText('PROJECT', { x: margin, y: ly, size: 9, font: helveticaBold, color: colors.textMuted });
+        for (const line of clampLines(wrap(projectName, helvetica, 10, 260), 3, helvetica, 10, 260, audit)) {
+            ly -= 14;
+            text(line, margin, ly, 10, helvetica, colors.textMain, margin + 260);
+        }
+    }
+    const jobSite = (invoice.project?.location || '').trim();
+    if (jobSite) {
+        ly -= 18;
+        page.drawText('JOB SITE', { x: margin, y: ly, size: 9, font: helveticaBold, color: colors.textMuted });
+        for (const line of clampLines(wrap(jobSite, helvetica, 10, 260), 4, helvetica, 10, 260, audit)) {
+            ly -= 14;
+            text(line, margin, ly, 10, helvetica, colors.textMain, margin + 260);
+        }
+    }
+
+    // Divider clears whichever column ran longer.
+    y = Math.min(ly, ry) - 20;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 20;
+
+    // Payment schedule table. STATUS is left-aligned in its own band so it can never sit on a full-width name.
+    const cw = contentWidth;
+    const col = {
+        name: margin, nameW: cw * 0.40,
+        status: margin + cw * 0.42, statusMax: margin + cw * 0.62,
+        due: margin + cw * 0.80, amount: pageWidth - margin,
+    };
+
+    function drawInvoiceTableHeader() {
+        text('PAYMENT', col.name, y, 8, helveticaBold, colors.textMuted);
+        text('STATUS', col.status, y, 8, helveticaBold, colors.textMuted);
+        textRight('DUE DATE', col.due, y, 8, helveticaBold, colors.textMuted, col.statusMax + 6);
+        textRight('AMOUNT', col.amount, y, 8, helveticaBold, colors.textMuted, col.due + 6);
+        y -= 8;
+        page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+        y -= 14;
+    }
+    // Keep the header with the first row.
+    if (invoice.payments.length > 0 && y - 60 < bottom) newPage();
+    drawInvoiceTableHeader();
+
+    const rowLeading = 12;
+    for (const payment of invoice.payments) {
+        const wrappedName = wrap(payment.name || '', helvetica, 10, col.nameW);
+        const lineCount = Math.max(wrappedName.length, 1);
+        const isPaidRow = payment.status === 'Paid';
+        const paidOn = isPaidRow && payment.paymentDate ? formatPdfDay(payment.paymentDate, timeZone) : '';
+        const rowHeight = lineCount * rowLeading + (paidOn ? 11 : 0) + 8;
+
+        // Page-break BEFORE the row if the whole (possibly multi-line) row doesn't fit; repeat the header.
+        if (y - rowHeight < bottom) {
+            newPage();
+            drawInvoiceTableHeader();
+        }
+        // A row taller than an empty page cannot be drawn whole: it would run off the page.
+        if (y - rowHeight < bottom) audit.lossy = true;
+
+        wrappedName.forEach((line, idx) => {
+            text(line, col.name, y - idx * rowLeading, 10, helvetica, colors.textMain, col.name + col.nameW);
+        });
+        if (paidOn) text(`Paid ${paidOn}`, col.name, y - lineCount * rowLeading + 1, 8.5, helvetica, colors.textMuted, col.name + col.nameW);
+
+        // Row label: same rules as the page's badges.
+        const isFocused = focusedIds.has(payment.id);
+        const sent = Boolean(payment.qbInvoiceSentAt);
+        const pastDue = Boolean(payment.dueDate && new Date(payment.dueDate) < now && payment.status === 'Pending' && sent);
+        let statusStr: string;
+        let statusFont = helvetica;
+        let statusColor = colors.textMuted;
+        if (isPaidRow) { statusStr = 'Paid'; statusColor = colors.primary; }
+        else if (isFocused) { statusStr = pastDue ? 'Requested, Overdue' : 'Requested'; statusFont = helveticaBold; statusColor = colors.primary; }
+        else if (pastDue) { statusStr = 'Overdue'; statusFont = helveticaBold; statusColor = colors.textMain; }
+        else if (payment.status === 'Pending' && sent) { statusStr = 'Due'; }
+        else if (payment.status === 'Pending') { statusStr = 'Not yet due'; }
+        else { statusStr = safe(payment.status || 'Pending'); }
+        text(statusStr, col.status, y, 9, statusFont, statusColor, col.statusMax);
+
+        const dueDateStr = payment.dueDate ? formatPdfDay(payment.dueDate, timeZone) : 'Due upon receipt';
+        textRight(dueDateStr, col.due, y, 10, helvetica, colors.textMuted, col.statusMax + 6);
+
+        textRight(formatCurrency(Number(payment.amount) || 0), col.amount, y, 10, helveticaBold, colors.textMain, col.due + 6);
+
+        y -= rowHeight;
+    }
+
+    // Totals. Paid and Due Now use the page's own expressions; Remaining Balance is the stored balance.
+    const totalAmt = Number(invoice.totalAmount) || 0;
+    const balanceDue = Number(invoice.balanceDue) || 0;
+    const totalPaid = Number(invoice.totalAmount || 0) - Number(invoice.balanceDue || 0);
+    const requestedTotal = requestedPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+    const totalRows: Array<{ label: string; value: string; size: number; font: PDFFont; color: ReturnType<typeof rgb>; step: number }> = hasFocus
+        ? [
+            // The portal page hides the full-invoice Total Amount in focus mode; the email copies keep it.
+            ...(opts.omitFocusedTotal ? [] : [{ label: 'Total Amount', value: formatCurrency(totalAmt), size: 10, font: helvetica, color: colors.textMain, step: 22 }]),
+            { label: 'Amount Requested', value: formatCurrency(requestedTotal), size: 14, font: helveticaBold, color: colors.primary, step: 0 },
+        ]
+        : [
+            { label: 'Total Amount', value: formatCurrency(totalAmt), size: 10, font: helvetica, color: colors.textMain, step: 18 },
+            { label: 'Paid', value: formatCurrency(totalPaid), size: 10, font: helvetica, color: colors.textMain, step: 22 },
+            { label: 'Due Now', value: formatCurrency(requestedDueNow), size: 14, font: helveticaBold, color: colors.primary, step: 20 },
+            { label: 'Remaining Balance', value: formatCurrency(balanceDue), size: 9, font: helvetica, color: colors.textMuted, step: 0 },
+        ];
+    // Measure the whole block and keep it on one page.
+    y -= 10;
+    const invTotalsH = 25 + totalRows.reduce((acc, r) => acc + r.step, 0);
+    if (y - invTotalsH < bottom) newPage();
+    const invLabelX = margin + contentWidth * 0.5;
+    page.drawLine({ start: { x: invLabelX, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 25;
+    for (const r of totalRows) {
+        const labelW = r.font.widthOfTextAtSize(r.label, r.size);
+        text(r.label, invLabelX, y, r.size, r.font, r.size === 10 || r.size === 9 ? colors.textMuted : r.color, pageWidth - margin);
+        textRight(r.value, col.amount, y, r.size, r.font, r.color, invLabelX + labelW + 8);
+        y -= r.step;
+    }
+
+    if (invoice.notes) {
+        y -= 40;
+        checkNewPage(80);
+        page.drawText('Notes:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 14;
+        flowText(invoice.notes, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
+    }
+
+    drawCompanyFooters(doc, helvetica, `Generated ${formatPdfInstant(now, timeZone)}  •  ${safe(company?.companyName || 'ProBuild')}`.trim(), audit, margin, pageWidth);
+
+    const pdfBytes = await doc.save();
+    return Buffer.from(pdfBytes);
+}
+
+/** Loads the invoice and company time zone, builds the PDF and reports whether anything was altered. */
+export async function generateInvoicePdfWithAudit(
     invoiceId: string,
     // When set, the PDF mirrors the client's milestone-scoped view: the listed
-    // milestones are marked "Requested" and the headline figure is the requested
-    // total, not the full invoice balance.
-    opts?: { requestedMilestoneIds?: string[] },
-): Promise<Buffer> {
+    // milestones are marked "Requested" and the headline figure is the requested total.
+    opts?: { requestedMilestoneIds?: string[]; omitFocusedTotal?: boolean },
+): Promise<{ bytes: Buffer; lossy: boolean }> {
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
         include: {
@@ -1214,11 +1557,59 @@ export async function generateInvoicePdf(
 
     if (!invoice) throw new Error('Invoice not found');
 
-    const requestedIds = new Set(opts?.requestedMilestoneIds ?? []);
-    // Pending-only — same predicate as the portal's focus mode and markInvoiceViewed.
-    const requestedPayments = invoice.payments.filter(p => requestedIds.has(p.id) && p.status === 'Pending');
-
     const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
+    const timeZone = await resolveCompanyTimeZone().catch(() => DEFAULT_COMPANY_TIME_ZONE);
+    const audit = { lossy: false };
+    const lh = buildLetterheadConfig(company);
+    const logoBytes = lh.mode === 'built_in' && lh.logoUrl ? await fetchImageBytes(lh.logoUrl) : null;
+    const bytes = await buildInvoicePdf(invoice, company, { requestedMilestoneIds: opts?.requestedMilestoneIds, omitFocusedTotal: opts?.omitFocusedTotal, timeZone, audit, logoBytes });
+    return { bytes, lossy: audit.lossy };
+}
+
+export async function generateInvoicePdf(
+    invoiceId: string,
+    opts?: { requestedMilestoneIds?: string[] },
+): Promise<Buffer> {
+    return (await generateInvoicePdfWithAudit(invoiceId, opts)).bytes;
+}
+
+/** The change order fields the PDF reads (a prisma change order with its relations fits). */
+export interface ChangeOrderPdfData {
+    code?: string | null;
+    title?: string | null;
+    description?: string | null;
+    status?: string | null;
+    createdAt: Date | string;
+    pricingType?: string | null;
+    markupPercent?: unknown;
+    totalAmount?: unknown;
+    approvedBy?: string | null;
+    approvedAt?: Date | string | null;
+    approvalSource?: string | null;
+    approvalMethod?: string | null;
+    clientSignatureUrl?: string | null;
+    companySignedBy?: string | null;
+    companySignedAt?: Date | string | null;
+    companySignatureUrl?: string | null;
+    project?: { name?: string | null; location?: string | null; client?: { name?: string | null; email?: string | null } | null } | null;
+    estimate?: { code?: string | null; taxExempt?: boolean | null; taxRatePercent?: number | string | { toString(): string } | null; taxRateName?: string | null } | null;
+    items: Array<{ type?: string | null; name?: string | null; description?: string | null; quantity?: unknown; unitCost?: unknown; total?: unknown }>;
+    paymentSchedules: Array<{ name?: string | null; amount?: unknown; dueDate?: Date | string | null }>;
+}
+
+const CO_COST_PLUS_SENTENCE = 'This approval covers the scope and markup terms. Work is billed from actual time and materials; scope-line prices are non-binding estimates.';
+const CO_CREDIT_SENTENCE = 'This credit will be taken off your remaining balance.';
+
+/** Draws the change order PDF from plain data (no database). Anything that could not be printed exactly marks opts.audit lossy. */
+export async function buildChangeOrderPdf(
+    co: ChangeOrderPdfData,
+    company: Record<string, unknown> | null | undefined,
+    opts: { timeZone?: string | null; audit?: { lossy: boolean }; now?: Date; logoBytes?: Uint8Array | null } = {},
+): Promise<Buffer> {
+    const audit = opts.audit ?? { lossy: false };
+    const safe = (v: unknown) => pdfSafeText(v, audit);
+    const timeZone = validTimeZone(opts.timeZone) ? opts.timeZone : DEFAULT_COMPANY_TIME_ZONE;
+    const now = opts.now ?? new Date();
 
     const doc = await PDFDocument.create();
     const helvetica = await doc.embedFont(StandardFonts.Helvetica);
@@ -1228,188 +1619,346 @@ export async function generateInvoicePdf(
     const pageHeight = 792;
     const margin = 50;
     const contentWidth = pageWidth - margin * 2;
+    const bottom = 60;
+    // Tallest a single row can be and still fit on one empty page.
+    const usablePageH = pageHeight - margin - bottom;
 
     let page = doc.addPage([pageWidth, pageHeight]);
     let y = pageHeight - margin;
 
-    function checkNewPage(needed: number = 80) {
-        if (y < needed) {
-            page = doc.addPage([pageWidth, pageHeight]);
-            y = pageHeight - margin;
-        }
+    function newPage() {
+        page = doc.addPage([pageWidth, pageHeight]);
+        y = pageHeight - margin;
     }
+    function checkNewPage(needed: number = 80) {
+        if (y < needed) newPage();
+    }
+    const rightLimit = pageWidth - margin;
+    const text = (s: string, x: number, yy: number, size: number, font: PDFFont, color = colors.textMain, maxX = rightLimit) => {
+        if (x + font.widthOfTextAtSize(s, size) > maxX + 0.01) audit.lossy = true;
+        page.drawText(s, { x, y: yy, size, font, color });
+    };
+    const textRight = (s: string, xRight: number, yy: number, size: number, font: PDFFont, color = colors.textMain, minX = margin) => {
+        const w = font.widthOfTextAtSize(s, size);
+        if (xRight - w < minX - 0.01) audit.lossy = true;
+        page.drawText(s, { x: xRight - w, y: yy, size, font, color });
+    };
+    const wrap = (s: unknown, font: PDFFont, size: number, width: number) => wrapPlainText(safe(s), font, size, width);
 
-    // Flow wrapped multi-line plain text (notes can be long) and sync the local
-    // page/y cursor — drawWrappedText paginates on its own when it runs out of room.
-    const invFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
-    function flowText(text: string, opts: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
+    // Flow wrapped multi-line text (descriptions can be long) and sync the local page/y cursor.
+    const coFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
+    function flowText(t: string, o: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
         const ctx: RichTextCtx = {
-            doc, page, y, fonts: invFonts,
+            doc, page, y, fonts: coFonts,
             layout: { pageWidth, pageHeight, margin, contentWidth },
-            color: colors.textMain, mutedColor: colors.textMuted,
+            color: colors.textMain, mutedColor: colors.textMuted, audit,
         };
-        const res = drawWrappedText(text, ctx, opts);
+        const res = drawWrappedText(t, ctx, o);
         page = res.page;
         y = res.y;
     }
 
     // --- Letterhead ---
-    const lhConfig = buildLetterheadConfig(company);
-    y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
+    const coLhConfig = buildLetterheadConfig(company);
+    const coLogo: HeaderLogo = { bytes: opts.logoBytes ?? null, drawn: false };
+    y = await drawLetterhead(doc, page, coLhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold }, audit, coLogo);
+    // The page header always shows a logo (the configured one, else the bundled /logo.png), plus the company phone
+    // and email. A PDF that did not draw the logo (none configured, custom letterhead image, fetch or embed failure)
+    // or leaves out the phone or email cannot show exactly what the page shows.
+    if (!coLogo.drawn || headerLeavesOut(coLhConfig, ['phone', 'email'])) audit.lossy = true;
 
-    page.drawText('INVOICE', { x: margin, y, size: 26, font: helveticaBold, color: colors.textMain });
+    // Header mirrors the invoice PDF: 26pt title, BILL TO block, right-aligned meta column, divider clear of both.
+    y -= 24;
+    text('CHANGE ORDER', margin, y, 26, helveticaBold);
 
+    if (co.title) {
+        const titleLines = clampLines(wrap(co.title, helvetica, 11, contentWidth), 4, helvetica, 11, contentWidth, audit);
+        titleLines.forEach((ln, i) => {
+            y -= i === 0 ? 22 : 14;
+            text(ln, margin, y, 11, helvetica, colors.textMuted);
+        });
+    }
     y -= 30;
-    const clientName = invoice.client?.name || '';
-    const clientEmail = invoice.client?.email || '';
 
+    const coClientName = co.project?.client?.name || '';
+    const coClientEmail = co.project?.client?.email || '';
+    const coBillToY = y; // meta column anchors to the BILL TO baseline
     page.drawText('BILL TO', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
-    if (clientName) { y -= 16; page.drawText(clientName, { x: margin, y, size: 11, font: helvetica, color: colors.textMain }); }
-    if (clientEmail) { y -= 14; page.drawText(clientEmail, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted }); }
+    let ly = y;
+    if (coClientName) {
+        clampLines(wrap(coClientName, helvetica, 11, 260), 2, helvetica, 11, 260, audit).forEach((ln, i) => {
+            ly -= i === 0 ? 16 : 14;
+            text(ln, margin, ly, 11, helvetica, colors.textMain, margin + 260);
+        });
+    }
+    if (coClientEmail) {
+        clampLines(wrap(coClientEmail, helvetica, 9, 260), 2, helvetica, 9, 260, audit).forEach((ln, i) => {
+            ly -= i === 0 ? 14 : 12;
+            text(ln, margin, ly, 9, helvetica, colors.textMuted, margin + 260);
+        });
+    }
 
-    const rightX = pageWidth - margin;
-    let ry = y + (clientEmail ? 30 : 16);
-
-    const drawRL = (label: string, value: string, yPos: number) => {
-        page.drawText(label, { x: rightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted });
-        const vw = helveticaBold.widthOfTextAtSize(value, 9);
-        page.drawText(value, { x: rightX - vw, y: yPos, size: 9, font: helveticaBold, color: colors.textMain });
+    const coRightX = pageWidth - margin;
+    let coRy = coBillToY;
+    const drawCORL = (label: string, value: string, yPos: number) => {
+        const labelW = helvetica.widthOfTextAtSize(label, 9);
+        text(label, coRightX - 160, yPos, 9, helvetica, colors.textMuted, coRightX);
+        textRight(safe(value), coRightX, yPos, 9, helveticaBold, colors.textMain, coRightX - 160 + labelW + 6);
     };
+    // Same labels as the portal page's badge.
+    const coStatusLabel = co.status === 'Approved' ? 'Approved'
+        : co.status === 'Sent' ? 'Sent - Awaiting Approval'
+        : co.status === 'Declined' ? 'Declined'
+        : 'Under Revision';
+    drawCORL('C.O. No.', co.code || '', coRy);
+    coRy -= 16;
+    drawCORL('Date', formatPdfInstant(co.createdAt, timeZone), coRy);
+    coRy -= 16;
+    drawCORL('Status', coStatusLabel, coRy);
+    if (co.estimate?.code) {
+        coRy -= 16;
+        drawCORL('Original Est.', co.estimate.code, coRy);
+    }
 
-    drawRL('Invoice No.', invoice.code || '', ry);
-    ry -= 16;
-    drawRL('Date', new Date(invoice.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), ry);
-    ry -= 16;
-    drawRL('Status', invoice.status || 'Draft', ry);
-    ry -= 16;
-    drawRL('Project', invoice.project?.name || '', ry);
-
-    // Job site address, under BILL TO on the left — property managers bill for
-    // several buildings and need the site to tell the invoices apart. Deliberately
-    // NOT falling back to the client's address (a manager's office is not the job
-    // site); blank location renders nothing at all. It lives here rather than in the
-    // right column because a full street address doesn't fit that 160px block.
-    const jobSite = (invoice.project?.location || '').trim();
-    if (jobSite) {
-        y -= 18;
-        page.drawText('JOB SITE', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
-        for (const line of wrapPlainText(jobSite, helvetica, 10, 260)) {
-            y -= 14;
-            page.drawText(line, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
+    // Left column continues: PROJECT, then JOB SITE (the project's location, not the company address).
+    const coProjectName = (co.project?.name || '').trim();
+    if (coProjectName) {
+        ly -= 18;
+        page.drawText('PROJECT', { x: margin, y: ly, size: 9, font: helveticaBold, color: colors.textMuted });
+        for (const line of clampLines(wrap(coProjectName, helvetica, 10, 260), 3, helvetica, 10, 260, audit)) {
+            ly -= 14;
+            text(line, margin, ly, 10, helvetica, colors.textMain, margin + 260);
+        }
+    }
+    const coJobSite = (co.project?.location || '').trim();
+    if (coJobSite) {
+        ly -= 18;
+        page.drawText('JOB SITE', { x: margin, y: ly, size: 9, font: helveticaBold, color: colors.textMuted });
+        for (const line of clampLines(wrap(coJobSite, helvetica, 10, 260), 4, helvetica, 10, 260, audit)) {
+            ly -= 14;
+            text(line, margin, ly, 10, helvetica, colors.textMain, margin + 260);
         }
     }
 
-    // Divider clears whichever column ran longer (the job-site block can push the
-    // left column past the right one, and a client-less invoice does the reverse).
-    y = Math.min(y, ry) - 20;
+    // Divider below whichever column ends lower.
+    y = Math.min(ly, coRy) - 20;
     page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 20;
 
-    // Payment schedule table
-    const invCols = { name: margin, status: margin + contentWidth * 0.45, dueDate: margin + contentWidth * 0.65, amount: pageWidth - margin };
-
-    function drawInvoiceTableHeader() {
-        page.drawText('PAYMENT', { x: invCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
-        const sLabel = 'STATUS'; const sW = helveticaBold.widthOfTextAtSize(sLabel, 8);
-        page.drawText(sLabel, { x: invCols.status - sW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-        const dLabel = 'DUE DATE'; const dW = helveticaBold.widthOfTextAtSize(dLabel, 8);
-        page.drawText(dLabel, { x: invCols.dueDate - dW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-        const aLabel = 'AMOUNT'; const aW = helveticaBold.widthOfTextAtSize(aLabel, 8);
-        page.drawText(aLabel, { x: invCols.amount - aW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-
-        y -= 8;
-        page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    if (co.description) {
+        checkNewPage(bottom + 40);
+        page.drawText('Reason for Change', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
+        flowText(co.description, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
+        y -= 10;
     }
 
-    drawInvoiceTableHeader();
+    // Full name and description render wrapped (no truncation). Items are pre-measured so short items never
+    // split across a page break; very long ones flow and paginate on their own.
+    const coNameWidth = contentWidth * 0.45;
+    const coDescWidth = contentWidth * 0.78;
+    const coItemEstHeight = (item: { name?: string | null; description?: string | null }) => {
+        const nameLines = measureWrappedLines(item.name || '', helvetica, 10, coNameWidth);
+        const descLines = item.description ? measureWrappedLines(item.description, helvetica, 8.5, coDescWidth) : 0;
+        return Math.max(1, nameLines) * 13 + (descLines ? 4 + descLines * 11.5 : 0) + 16;
+    };
+    // Section headers are excluded before the empty-row filter (see the portal page): a header mirrors the
+    // total of the lines beneath it. Fully empty placeholder rows would render as orphan "$0.00" lines.
+    const coBillableItems = billableCoItems(co.items);
+    const coVisibleItems = coBillableItems.filter(it =>
+        (it.name || '').trim() || (it.description || '').trim() || Number(it.total) || Number(it.unitCost));
+    // The page renders every non-header row, blank ones included: a row dropped here is a row the page shows.
+    if (coVisibleItems.length !== coBillableItems.length) audit.lossy = true;
+    // A row taller than an empty page cannot be drawn whole.
+    if (coVisibleItems.some(it => coItemEstHeight(it) > usablePageH)) audit.lossy = true;
+    const coFirstItemH = coVisibleItems.length ? coItemEstHeight(coVisibleItems[0]) : 30;
+    const isCostPlus = co.pricingType === 'COST_PLUS';
 
-    const rowLeading = 12;
-    for (const payment of invoice.payments) {
-        // Wrap the payment label to the column width instead of truncating it.
-        const displayName = payment.name || '';
-        const maxNameWidth = contentWidth * 0.4;
-        const wrappedName = wrapPlainText(displayName, helvetica, 10, maxNameWidth);
-        const lineCount = Math.max(wrappedName.length, 1);
-        const rowHeight = lineCount * rowLeading + 8;
+    // Money the page shows must equal what the PDF prints; where it would differ the PDF is flagged lossy
+    // (the printed figures are not "corrected").
+    for (const it of coVisibleItems) {
+        const pageCents = coLineCents(Number(it.quantity) || 0, Number(it.unitCost) || 0);
+        if (pageCents !== Math.round((Number(it.total) || 0) * 100)) audit.lossy = true;
+    }
+    if (!isCostPlus) {
+        const pageSubtotal = coItemsSubtotal(co.items.map(it => ({ type: it.type, quantity: Number(it.quantity) || 0, unitCost: Number(it.unitCost) || 0 })));
+        if (Math.round((Number(co.totalAmount) || 0) * 100) !== Math.round(pageSubtotal * 100)) audit.lossy = true;
+    }
 
-        // Page-break BEFORE the row if the whole (possibly multi-line) row doesn't fit,
-        // re-drawing the table header on the new page.
-        if (y - rowHeight < margin) {
-            page = doc.addPage([pageWidth, pageHeight]);
-            y = pageHeight - margin;
-            drawInvoiceTableHeader();
+    if (isCostPlus) {
+        // Terms block + table header + first item stay together.
+        checkNewPage(Math.min(margin + 62 + 24 + coFirstItemH, 500));
+        text(`COST + ${co.markupPercent ?? 10}% + TAX`, margin, y, 12, helveticaBold, colors.primary);
+        y -= 16;
+        flowText(CO_COST_PLUS_SENTENCE, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 12 });
+        y -= 12;
+    }
+
+    // Items table: keep the column header (22pt) with the complete first item.
+    checkNewPage(Math.min(margin + 22 + coFirstItemH, 500));
+    // QTY gets ~45pt (the name column ends 4pt before it) so quantities such as 1250 or 12.75 print inside it.
+    const coCols = { name: margin, qty: margin + contentWidth * 0.55, unitCost: margin + contentWidth * 0.75, total: pageWidth - margin };
+
+    text(isCostPlus ? 'SCOPE ESTIMATE (NOT A FIXED PRICE)' : 'ITEM DESCRIPTION', coCols.name, y, 8, helveticaBold, colors.textMuted, coCols.qty - 40);
+    textRight('QTY', coCols.qty, y, 8, helveticaBold, colors.textMuted, coCols.name + coNameWidth + 4);
+    textRight('UNIT PRICE', coCols.unitCost, y, 8, helveticaBold, colors.textMuted, coCols.qty + 4);
+    textRight('AMOUNT', coCols.total, y, 8, helveticaBold, colors.textMuted, coCols.unitCost + 4);
+
+    y -= 8;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 14;
+
+    if (co.items.length === 0) {
+        text('No items specified for this Change Order.', margin, y, 9.5, helvetica, colors.textMuted);
+        y -= 20;
+    }
+
+    for (let itemIdx = 0; itemIdx < coVisibleItems.length; itemIdx++) {
+        const item = coVisibleItems[itemIdx];
+        const itemName = item.name || '';
+        const itemDesc = item.description || '';
+        const nameLines = measureWrappedLines(itemName, helvetica, 10, coNameWidth);
+        checkNewPage(Math.min(margin + coItemEstHeight(item), 500));
+
+        textRight(String(item.quantity || 0), coCols.qty, y, 10, helvetica, colors.textMuted, coCols.name + coNameWidth + 4);
+        textRight(formatCurrency(Number(item.unitCost) || 0), coCols.unitCost, y, 10, helvetica, colors.textMuted, coCols.qty + 4);
+        textRight(formatCurrency(Number(item.total) || 0), coCols.total, y, 10, helveticaBold, colors.textMain, coCols.unitCost + 4);
+
+        if (nameLines > 0) flowText(itemName, { x: coCols.name, maxWidth: coNameWidth, size: 10, color: colors.textMain, lineHeight: 13 });
+        else y -= 13;
+        if (itemDesc) {
+            y -= 4;
+            flowText(itemDesc, { x: coCols.name, maxWidth: coDescWidth, size: 8.5, color: colors.textMuted, lineHeight: 11.5 });
         }
-
-        wrappedName.forEach((line, idx) => {
-            page.drawText(line, { x: invCols.name, y: y - idx * rowLeading, size: 10, font: helvetica, color: colors.textMain });
-        });
-
-        const isRequested = requestedIds.has(payment.id) && payment.status === 'Pending';
-        const statusStr = isRequested ? 'Requested' : (payment.status || 'Pending');
-        const statusFont = isRequested ? helveticaBold : helvetica;
-        const statusW = statusFont.widthOfTextAtSize(statusStr, 10);
-        page.drawText(statusStr, { x: invCols.status - statusW, y, size: 10, font: statusFont, color: payment.status === 'Paid' || isRequested ? colors.primary : colors.textMuted });
-
-        const dueDateStr = payment.dueDate ? new Date(payment.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
-        const dueDateW = helvetica.widthOfTextAtSize(dueDateStr, 10);
-        page.drawText(dueDateStr, { x: invCols.dueDate - dueDateW, y, size: 10, font: helvetica, color: colors.textMuted });
-
-        const amtStr = formatCurrency(Number(payment.amount) || 0);
-        const amtW = helveticaBold.widthOfTextAtSize(amtStr, 10);
-        page.drawText(amtStr, { x: invCols.amount - amtW, y, size: 10, font: helveticaBold, color: colors.textMain });
-
-        y -= rowHeight;
+        // Hairline between items; the totals rule already follows the last item.
+        if (itemIdx < coVisibleItems.length - 1) {
+            const ruleY = y + 5;
+            page.drawLine({ start: { x: margin, y: ruleY }, end: { x: pageWidth - margin, y: ruleY }, thickness: 0.5, color: colors.border });
+            y = ruleY - 16;
+        } else {
+            y -= 7;
+        }
     }
 
-    // Totals
+    // co.totalAmount is the PRE-TAX subtotal (billChangeOrderCore semantic): same Subtotal / Tax / Revised Amount
+    // breakdown the customer signs on the portal page.
+    const coSubtotal = Math.round((Number(co.totalAmount) || 0) * 100) / 100;
+    // `|| 0`: a tax-exempt credit would otherwise print "-$0.00" tax.
+    const coTax = Math.round(coSubtotal * coTaxRate(co.estimate) * 100) / 100 || 0;
+    const coTotal = Math.round((coSubtotal + coTax) * 100) / 100;
+
+    const labelX = margin + contentWidth * 0.5;
+    const labelWidth = coCols.total - 80 - labelX;
+    const coIsCredit = !isCostPlus && coTotal < 0;
+    const headlineLabel = isCostPlus ? 'Approved terms' : (coIsCredit ? 'Credit' : 'Revised Amount');
+    const headlineValue = isCostPlus ? `Cost + ${co.markupPercent ?? 10}% + tax` : formatCurrency(coTotal);
+    const headlineSize = isCostPlus ? 12 : 14;
+    const headlineLabelW = helveticaBold.widthOfTextAtSize(headlineLabel, headlineSize);
+    const bodyRows = isCostPlus ? [] : [
+        { label: 'Subtotal', value: formatCurrency(coSubtotal) },
+        { label: coTaxLabel(co.estimate), value: formatCurrency(coTax) },
+    ].map(r => ({ lines: clampLines(wrap(r.label, helvetica, 10, labelWidth), TOTALS_LABEL_MAX_LINES, helvetica, 10, labelWidth, audit), value: r.value }));
+    const creditLines = coIsCredit ? wrap(CO_CREDIT_SENTENCE, helvetica, 9, coCols.total - labelX) : [];
+
+    // Measure the whole block (rule, rows, headline, optional credit sentence) and keep it together.
     y -= 10;
-    // 110 (not 80): the headline (Balance Due / Amount Requested) row below draws at
-    // plain y after two more 20-ish-pt decrements — keep it comfortably clear of the
-    // footer rather than relying on the footer's own guard.
-    checkNewPage(110);
-    page.drawLine({ start: { x: margin + contentWidth * 0.5, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    const coTotalsH = 25 + bodyRows.reduce((acc, r) => acc + Math.max(r.lines.length, 1) * 12 + 6, 0) + 4 + 14
+        + (creditLines.length ? 8 + creditLines.length * 11 : 0);
+    if (y - coTotalsH < bottom) newPage();
+    page.drawLine({ start: { x: labelX, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 25;
-
-    const invLabelX = margin + contentWidth * 0.5;
-    const totalAmt = Number(invoice.totalAmount) || 0;
-    const balanceDue = Number(invoice.balanceDue) || 0;
-
-    page.drawText('Total Amount', { x: invLabelX, y, size: 10, font: helvetica, color: colors.textMuted });
-    const totalStr = formatCurrency(totalAmt);
-    const totalW = helvetica.widthOfTextAtSize(totalStr, 10);
-    page.drawText(totalStr, { x: invCols.amount - totalW, y, size: 10, font: helvetica, color: colors.textMain });
-    y -= 22;
-
-    // Milestone-scoped view: the headline is what was requested of the client,
-    // not the whole outstanding balance.
-    const requestedTotal = requestedPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-    const headlineLabel = requestedPayments.length > 0 ? 'Amount Requested' : 'Balance Due';
-    const headlineAmt = requestedPayments.length > 0 ? requestedTotal : balanceDue;
-    page.drawText(headlineLabel, { x: invLabelX, y, size: 14, font: helveticaBold, color: colors.primary });
-    const balStr = formatCurrency(headlineAmt);
-    const balW = helveticaBold.widthOfTextAtSize(balStr, 14);
-    page.drawText(balStr, { x: invCols.amount - balW, y, size: 14, font: helveticaBold, color: colors.primary });
-
-    if (invoice.notes) {
-        y -= 40;
-        checkNewPage(80);
-        page.drawText('Notes:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
-        y -= 14;
-        flowText(invoice.notes, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
+    for (const r of bodyRows) {
+        r.lines.forEach((ln, i) => text(ln, labelX, y - i * 12, 10, helvetica, colors.textMain, labelX + labelWidth));
+        textRight(r.value, coCols.total, y, 10, helvetica, colors.textMain, coCols.total - 80);
+        y -= Math.max(r.lines.length, 1) * 12 + 6;
+    }
+    y -= 4;
+    text(headlineLabel, labelX, y, headlineSize, helveticaBold, colors.primary, coCols.total);
+    textRight(headlineValue, coCols.total, y, headlineSize, helveticaBold, colors.primary, labelX + headlineLabelW + 8);
+    y -= 14;
+    if (creditLines.length) {
+        y -= 8;
+        creditLines.forEach((ln, i) => text(ln, labelX, y - i * 11, 9, helvetica, colors.textMuted, coCols.total));
+        y -= creditLines.length * 11;
     }
 
-    // No pre-footer page-break guard here: every content path above already page-breaks
-    // (or is bounded, see the checkNewPage(110) totals guard) well clear of the footer's
-    // y=30, so this can't collide — and a guard here would emit a footer-only blank page.
-    const footerText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
-    page.drawText(footerText, { x: margin, y: 30, size: 7, font: helvetica, color: colors.textMuted });
+    // Payment schedule (the page shows it for anything that is not cost-plus).
+    if (!isCostPlus && co.paymentSchedules.length > 0) {
+        const schedWidth = contentWidth - 110;
+        const schedRows = co.paymentSchedules.map(s => {
+            const due = formatPdfDay(s.dueDate, timeZone);
+            const lines = wrap(`${s.name ?? ''}${due ? ` · ${due}` : ''}`, helvetica, 9, schedWidth);
+            return { lines, amount: formatCurrency(Number(s.amount)), h: Math.max(lines.length, 1) * 12 + 6 };
+        });
+        y -= 38;
+        // Keep the heading with the first row.
+        if (y - (18 + schedRows[0].h) < bottom) newPage();
+        page.drawText('PAYMENT SCHEDULE', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 18;
+        for (const r of schedRows) {
+            if (y + 12 - r.h < bottom) newPage();
+            if (y + 12 - r.h < bottom) audit.lossy = true; // taller than an empty page
+            r.lines.forEach((ln, i) => text(ln, margin, y - i * 12, 9, helvetica, colors.textMain, margin + schedWidth));
+            textRight(r.amount, pageWidth - margin, y, 9, helveticaBold, colors.textMain, margin + contentWidth - 102);
+            y -= r.h;
+        }
+    }
+
+    // Signature blocks: each is measured and moved whole to the next page when it does not fit.
+    type SigRow = { text: string; font: PDFFont; size: number };
+    const drawSigBlock = async (gap: number, heading: string, rows: SigRow[], sigValue?: string | null) => {
+        const sigImage = sigValue ? await embedSignatureImage(doc, sigValue) : null;
+        if (sigValue && !sigImage) audit.lossy = true; // a saved signature that cannot be shown
+        const sigScale = sigImage ? Math.min(180 / sigImage.width, 60 / sigImage.height, 1) : 0;
+        const sigW = sigImage ? sigImage.width * sigScale : 0;
+        const sigH = sigImage ? sigImage.height * sigScale : 0;
+        const blockH = 11 + 20 + rows.length * 15 + (sigImage ? 10 + sigH : 0) + 6;
+        y -= gap;
+        if (y - blockH < bottom) newPage();
+        text(heading, margin, y, 11, helveticaBold);
+        y -= 20;
+        for (const r of rows) {
+            text(r.text, margin, y, r.size, r.font);
+            y -= 15;
+        }
+        if (sigImage) {
+            page.drawImage(sigImage, { x: margin, y: y + 15 - 10 - sigH, width: sigW, height: sigH });
+            y -= 10 + sigH - 15;
+        }
+        y -= 6;
+    };
+    const signedByRows = (name: string): SigRow[] => {
+        const label = 'Signed by:';
+        const full = `${label} ${safe(name)}`;
+        if (helveticaBold.widthOfTextAtSize(full, 10) <= contentWidth) return [{ text: full, font: helveticaBold, size: 10 }];
+        return [{ text: label, font: helveticaBold, size: 10 }, ...wrap(name, helveticaBold, 10, contentWidth).map(t => ({ text: t, font: helveticaBold, size: 10 }))];
+    };
+
+    if (co.status === 'Approved' && co.approvalSource === 'OFFLINE') {
+        // Office-recorded approval: no signature exists, so say so. The staff-only approvalNote is never printed.
+        const { offlineApprovalSummary } = await import('./change-order-offline-approval');
+        const summaryRows: SigRow[] = wrap(offlineApprovalSummary(co, timeZone), helveticaBold, 10, contentWidth).map(t => ({ text: t, font: helveticaBold, size: 10 }));
+        await drawSigBlock(50, 'Client Approval', [...summaryRows, { text: 'Recorded by the office. Not signed electronically.', font: helvetica, size: 10 }]);
+    } else if (co.status === 'Approved' && co.approvedBy) {
+        const when = co.approvedAt ? formatCompanyDateTime(new Date(co.approvedAt), timeZone) : '—';
+        await drawSigBlock(50, 'Electronically Signed and Approved',
+            [...signedByRows(co.approvedBy), { text: `Date: ${when}`, font: helvetica, size: 10 }], co.clientSignatureUrl);
+    }
+
+    if (co.companySignedBy) {
+        const rows: SigRow[] = signedByRows(co.companySignedBy);
+        if (co.companySignedAt) rows.push({ text: `Date: ${formatCompanyDateTime(new Date(co.companySignedAt), timeZone)}`, font: helvetica, size: 10 });
+        await drawSigBlock(30, 'Company Countersignature', rows, co.companySignatureUrl);
+    }
+
+    drawCompanyFooters(doc, helvetica, `Generated ${formatPdfInstant(now, timeZone)}  •  ${safe(company?.companyName || 'ProBuild')}`.trim(), audit, margin, pageWidth);
 
     const pdfBytes = await doc.save();
     return Buffer.from(pdfBytes);
 }
 
-export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
+/** Loads the change order and company time zone, builds the PDF and reports whether anything was altered. */
+export async function generateChangeOrderPdfWithAudit(coId: string): Promise<{ bytes: Buffer; lossy: boolean }> {
     const co = await prisma.changeOrder.findUnique({
         where: { id: coId },
         include: {
@@ -1423,264 +1972,16 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     if (!co) throw new Error('Change Order not found');
 
     const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
+    const timeZone = await resolveCompanyTimeZone().catch(() => DEFAULT_COMPANY_TIME_ZONE);
+    const audit = { lossy: false };
+    const lh = buildLetterheadConfig(company);
+    const logoBytes = lh.mode === 'built_in' && lh.logoUrl ? await fetchImageBytes(lh.logoUrl) : null;
+    const bytes = await buildChangeOrderPdf(co, company, { timeZone, audit, logoBytes });
+    return { bytes, lossy: audit.lossy };
+}
 
-    const doc = await PDFDocument.create();
-    const helvetica = await doc.embedFont(StandardFonts.Helvetica);
-    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
-
-    const pageWidth = 612;
-    const pageHeight = 792;
-    const margin = 50;
-    const contentWidth = pageWidth - margin * 2;
-
-    let page = doc.addPage([pageWidth, pageHeight]);
-    let y = pageHeight - margin;
-
-    function checkNewPage(needed: number = 80) {
-        if (y < needed) {
-            page = doc.addPage([pageWidth, pageHeight]);
-            y = pageHeight - margin;
-        }
-    }
-
-    // Flow wrapped multi-line text (descriptions can be long) and sync the local
-    // page/y cursor — drawWrappedText paginates on its own when it runs out of room.
-    const coFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
-    function flowText(text: string, opts: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
-        const ctx: RichTextCtx = {
-            doc, page, y, fonts: coFonts,
-            layout: { pageWidth, pageHeight, margin, contentWidth },
-            color: colors.textMain, mutedColor: colors.textMuted,
-        };
-        const res = drawWrappedText(text, ctx, opts);
-        page = res.page;
-        y = res.y;
-    }
-
-    // --- Letterhead ---
-    const coLhConfig = buildLetterheadConfig(company);
-    y = await drawLetterhead(doc, page, coLhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
-
-    // Header mirrors the invoice PDF: 26pt title, BILL TO block (name + email),
-    // right-aligned meta column, then a divider clear of both columns.
-    y -= 24;
-    page.drawText('CHANGE ORDER', { x: margin, y, size: 26, font: helveticaBold, color: colors.textMain });
-
-    if (co.title) {
-        y -= 22;
-        page.drawText(co.title, { x: margin, y, size: 11, font: helvetica, color: colors.textMuted });
-    }
-    y -= 30;
-
-    const coClientName = co.project?.client?.name || '';
-    const coClientEmail = co.project?.client?.email || '';
-    const coBillToY = y; // meta column anchors to the BILL TO baseline
-    page.drawText('BILL TO', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
-    if (coClientName) { y -= 16; page.drawText(coClientName, { x: margin, y, size: 11, font: helvetica, color: colors.textMain }); }
-    if (coClientEmail) { y -= 14; page.drawText(coClientEmail, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted }); }
-
-    const coRightX = pageWidth - margin;
-    let coRy = coBillToY;
-
-    const drawCORL = (label: string, value: string, yPos: number) => {
-        page.drawText(label, { x: coRightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted });
-        const vw = helveticaBold.widthOfTextAtSize(value, 9);
-        page.drawText(value, { x: coRightX - vw, y: yPos, size: 9, font: helveticaBold, color: colors.textMain });
-    };
-
-    drawCORL('C.O. No.', co.code || '', coRy);
-    coRy -= 16;
-    drawCORL('Date', new Date(co.createdAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }), coRy);
-    coRy -= 16;
-    drawCORL('Status', co.status || 'Draft', coRy);
-    coRy -= 16;
-    drawCORL('Project', co.project?.name || '', coRy);
-
-    // The meta column is 4 rows tall; the client block can be shorter. Drop the
-    // divider below whichever column ends lower so it never crosses a meta row.
-    y = Math.min(y, coRy) - 20;
-    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
-    y -= 20;
-
-    if (co.description) {
-        page.drawText('Description:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
-        y -= 14;
-        flowText(co.description, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
-        y -= 10;
-    }
-
-    // Full name and description render wrapped (no truncation — the client must
-    // see the entire scope text). Items are pre-measured so short items never
-    // split across a page break; very long ones flow and paginate on their own.
-    // An empty name still consumes one 13pt row (the money columns' baseline).
-    // The name shares its first row with the QTY/UNIT COST/TOTAL figures so it
-    // stays inside its column; description lines sit below that row and can run
-    // wider without colliding with the money columns.
-    const coNameWidth = contentWidth * 0.5;
-    const coDescWidth = contentWidth * 0.78;
-    const coItemEstHeight = (item: { name?: string | null; description?: string | null }) => {
-        const nameLines = measureWrappedLines(item.name || '', helvetica, 10, coNameWidth);
-        const descLines = item.description ? measureWrappedLines(item.description, helvetica, 8.5, coDescWidth) : 0;
-        return Math.max(1, nameLines) * 13 + (descLines ? 4 + descLines * 11.5 : 0) + 16;
-    };
-    // Fully empty placeholder rows (no name, no description, $0) would render
-    // as orphan "$0.00" lines — drop them. Anything with text or money stays.
-    // Section headers are excluded before the empty-row filter: a header mirrors the total
-    // of the lines beneath it, so printing it would make the visible lines out-sum the
-    // subtotal the customer signs. (The send guard refuses such a CO outright; this keeps an
-    // unsent draft's preview honest.)
-    const coVisibleItems = billableCoItems(co.items).filter(it =>
-        (it.name || '').trim() || (it.description || '').trim() || Number(it.total) || Number(it.unitCost));
-    // Reserve through the first item so neither the cost-plus terms block nor
-    // the table header is left orphaned when the first row's preflight breaks.
-    const coFirstItemH = coVisibleItems.length ? coItemEstHeight(coVisibleItems[0]) : 30;
-
-    if (co.pricingType === 'COST_PLUS') {
-        // Terms block (40pt) + table header (22pt) + first item stay together.
-        checkNewPage(Math.min(margin + 62 + coFirstItemH, 500));
-        page.drawText(`COST + ${co.markupPercent ?? 10}% + TAX`, { x: margin, y, size: 12, font: helveticaBold, color: colors.primary });
-        y -= 16;
-        page.drawText('Billed from actual time and materials. Scope-line amounts below are non-binding estimates.', { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
-        y -= 24;
-    }
-
-    // Items table — a long description above may have flowed near the page
-    // bottom; keep the column header (22pt) with the complete first item.
-    checkNewPage(Math.min(margin + 22 + coFirstItemH, 500));
-    const coCols = { name: margin, qty: margin + contentWidth * 0.55, unitCost: margin + contentWidth * 0.75, total: pageWidth - margin };
-
-    page.drawText(co.pricingType === 'COST_PLUS' ? 'SCOPE ESTIMATE (NOT A FIXED PRICE)' : 'ITEM DESCRIPTION', { x: coCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
-    const coQtyLabel = 'QTY'; const coQtyW = helveticaBold.widthOfTextAtSize(coQtyLabel, 8);
-    page.drawText(coQtyLabel, { x: coCols.qty - coQtyW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-    const coUcLabel = 'UNIT COST'; const coUcW = helveticaBold.widthOfTextAtSize(coUcLabel, 8);
-    page.drawText(coUcLabel, { x: coCols.unitCost - coUcW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-    const coTLabel = 'TOTAL'; const coTW = helveticaBold.widthOfTextAtSize(coTLabel, 8);
-    page.drawText(coTLabel, { x: coCols.total - coTW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-
-    y -= 8;
-    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
-    y -= 14;
-
-    for (let itemIdx = 0; itemIdx < coVisibleItems.length; itemIdx++) {
-        const item = coVisibleItems[itemIdx];
-        const itemName = item.name || '';
-        const itemDesc = item.description || '';
-        const nameLines = measureWrappedLines(itemName, helvetica, 10, coNameWidth);
-        checkNewPage(Math.min(margin + coItemEstHeight(item), 500));
-
-        const qtyStr = String(item.quantity || 0);
-        const qtyStrW = helvetica.widthOfTextAtSize(qtyStr, 10);
-        page.drawText(qtyStr, { x: coCols.qty - qtyStrW, y, size: 10, font: helvetica, color: colors.textMuted });
-
-        const ucStr = formatCurrency(Number(item.unitCost) || 0);
-        const ucStrW = helvetica.widthOfTextAtSize(ucStr, 10);
-        page.drawText(ucStr, { x: coCols.unitCost - ucStrW, y, size: 10, font: helvetica, color: colors.textMuted });
-
-        const itemTotalStr = formatCurrency(Number(item.total) || 0);
-        const itemTotalW = helveticaBold.widthOfTextAtSize(itemTotalStr, 10);
-        page.drawText(itemTotalStr, { x: coCols.total - itemTotalW, y, size: 10, font: helveticaBold, color: colors.textMain });
-
-        if (nameLines > 0) flowText(itemName, { x: coCols.name, maxWidth: coNameWidth, size: 10, color: colors.textMain, lineHeight: 13 });
-        else y -= 13;
-        if (itemDesc) {
-            y -= 4;
-            flowText(itemDesc, { x: coCols.name, maxWidth: coDescWidth, size: 8.5, color: colors.textMuted, lineHeight: 11.5 });
-        }
-        // Hairline between items keeps long scope lists scannable; the totals
-        // rule already follows the last item, so skip it there.
-        if (itemIdx < coVisibleItems.length - 1) {
-            const ruleY = y + 5;
-            page.drawLine({ start: { x: margin, y: ruleY }, end: { x: pageWidth - margin, y: ruleY }, thickness: 0.5, color: colors.border });
-            y = ruleY - 16;
-        } else {
-            y -= 7;
-        }
-    }
-
-    // Total — reserve the whole Subtotal/Tax/Revised Amount block (rule + 3 rows)
-    // so it never straddles the bottom margin or splits across pages. Cost-plus
-    // shows a single terms row, so the smaller reserve avoids early page breaks.
-    y -= 10;
-    checkNewPage(co.pricingType === 'COST_PLUS' ? 80 : 125);
-    page.drawLine({ start: { x: margin + contentWidth * 0.5, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
-    y -= 25;
-
-    const coLabelX = coCols.unitCost - 60;
-    // co.totalAmount is the PRE-TAX subtotal (billChangeOrderCore semantic); show
-    // the same Subtotal / Tax / Revised Amount breakdown the customer signs on the
-    // portal page so the PDF and signature page never disagree.
-    const coSubtotal = Math.round((Number(co.totalAmount) || 0) * 100) / 100;
-    // `|| 0`: a tax-exempt credit would otherwise print "-$0.00" tax.
-    const coTax = Math.round(coSubtotal * coTaxRate(co.estimate) * 100) / 100 || 0;
-    const coTotal = Math.round((coSubtotal + coTax) * 100) / 100;
-
-    const drawCoTotalRow = (label: string, value: string, size: number, font: PDFFont, color: ReturnType<typeof rgb>) => {
-        page.drawText(label, { x: coLabelX, y, size, font, color });
-        const vw = font.widthOfTextAtSize(value, size);
-        page.drawText(value, { x: coCols.total - vw, y, size, font, color });
-    };
-
-    if (co.pricingType === 'COST_PLUS') {
-        drawCoTotalRow('Approved terms', `Cost + ${co.markupPercent ?? 10}% + tax`, 12, helveticaBold, colors.primary);
-    } else {
-        drawCoTotalRow('Subtotal', formatCurrency(coSubtotal), 10, helvetica, colors.textMain);
-        y -= 18;
-        drawCoTotalRow(coTaxLabel(co.estimate), formatCurrency(coTax), 10, helvetica, colors.textMain);
-        y -= 22;
-        checkNewPage(60);
-        // A negative fixed-price total is a credit; the numbers are already signed.
-        drawCoTotalRow(coTotal < 0 ? 'Credit Amount' : 'Revised Amount', formatCurrency(coTotal), 14, helveticaBold, colors.primary);
-    }
-
-    if (co.pricingType === 'FIXED' && co.paymentSchedules.length > 0) {
-        y -= 38;
-        checkNewPage(60 + co.paymentSchedules.length * 18);
-        page.drawText('PAYMENT SCHEDULE', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
-        y -= 18;
-        for (const schedule of co.paymentSchedules) {
-            page.drawText(`${schedule.name}${schedule.dueDate ? ` · ${new Date(schedule.dueDate).toLocaleDateString('en-US')}` : ''}`, { x: margin, y, size: 9, font: helvetica, color: colors.textMain });
-            const value = formatCurrency(Number(schedule.amount));
-            page.drawText(value, { x: pageWidth - margin - helveticaBold.widthOfTextAtSize(value, 9), y, size: 9, font: helveticaBold, color: colors.textMain });
-            y -= 18;
-        }
-    }
-
-    // Signatures — client approval and company countersignature are independent blocks.
-    if (co.status === 'Approved' && co.approvedBy) {
-        y -= 50;
-        checkNewPage(100);
-        page.drawText('Client Approval', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
-        y -= 20;
-        if (co.approvalSource === 'OFFLINE') {
-            // Office-recorded approval: no signature exists, so say so. The staff-only
-            // approvalNote is deliberately never printed (this PDF is served to the customer).
-            const { offlineApprovalSummary } = await import('./change-order-offline-approval');
-            const { resolveCompanyTimeZone } = await import('./company-timezone');
-            page.drawText(offlineApprovalSummary(co, await resolveCompanyTimeZone()), { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
-            y -= 15;
-            page.drawText('Recorded by the office. Not signed electronically.', { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
-        } else {
-            page.drawText(`Approved By: ${co.approvedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
-            y -= 15;
-            page.drawText(`Date: ${co.approvedAt ? new Date(co.approvedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
-        }
-    }
-
-    if (co.companySignedBy) {
-        y -= 30;
-        checkNewPage(100);
-        page.drawText('Company Countersignature', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
-        y -= 20;
-        page.drawText(`Signed By: ${co.companySignedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
-        y -= 15;
-        page.drawText(`Date: ${co.companySignedAt ? new Date(co.companySignedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
-    }
-
-    const coFooterText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
-    page.drawText(coFooterText, { x: margin, y: 30, size: 7, font: helvetica, color: colors.textMuted });
-
-    const pdfBytes = await doc.save();
-    return Buffer.from(pdfBytes);
+export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
+    return (await generateChangeOrderPdfWithAudit(coId)).bytes;
 }
 
 type BillingSnapshot = {
