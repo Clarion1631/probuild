@@ -36,7 +36,23 @@ import { itemsMissingCardRecord, recordCardOnIssues } from "@/lib/receipt-card-h
 import { recomputeCodesFor } from "@/app/api/cron/receipt-requests/route";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+/**
+ * TWO MINUTES, NOT ONE (2026-11-12, the first enabled morning).
+ *
+ * At 60s the run had room for ONE owner. It needed about 42 seconds before
+ * CJ's card went out (claims plus the pre-send re-check of ten items) and
+ * finished him at about 48, so Richard's turn began with less than the send
+ * headroom left and was deferred — every morning, since CJ is always first.
+ * `RUN_DEADLINE_MS` and `REVALIDATION_DEADLINE_MS` below moved out by the same
+ * 60 seconds; every margin between them is unchanged. An owner this still
+ * leaves behind can be picked up by the same-morning retry passes in
+ * vercel.json (14:34 and 14:42 UTC), minutes later, not two hours later —
+ * as long as the sweep's cycle is still certified when they run. 14:34 sits
+ * before the intake worker's 14:35 run, whose bookings restart that cycle.
+ * A claim a killed run left LIVE is not released, so only the 14:42 pass,
+ * after the 10-minute lease, can take that one.
+ */
+export const maxDuration = 120;
 
 /**
  * Per-owner missing-receipt Chat digest (Phase 2 §4). Weekday mornings, 14:30
@@ -133,16 +149,29 @@ export const CLAIM_LEASE_MS = 10 * 60_000;
  * per item, and each miss walks a whole competing component (up to
  * `MAX_COMPONENT_LINES` expansions) plus its own evidence queries — a backlog
  * of several owners' cards, each spanning a few components, can chain past the
- * cron's `maxDuration = 60` ceiling.
+ * cron's `maxDuration` ceiling.
  *
  * Once this much of the run is spent, remaining items are treated as NOT
  * sendable this run rather than risking a mid-write kill: the same
  * safe-direction bias `recomputeCodesFor`'s own doc comment describes — erring
  * toward not sending a chase that might already be answered beats a card that
- * never finishes going out at all. Left with headroom under 60s for the scan,
- * selection, and the webhook posts themselves, which this budget does not cover.
+ * never finishes going out at all. Left with headroom under `maxDuration` for
+ * the webhook posts themselves, which this budget does not cover.
+ *
+ * Ten seconds inside `RUN_DEADLINE_MS`, as it always was (45 against 55 when
+ * the ceiling was 60).
  */
-const REVALIDATION_DEADLINE_MS = 45_000;
+const REVALIDATION_DEADLINE_MS = 105_000;
+
+/**
+ * THE CANDIDATE SCAN KEEPS ITS OLD 45 SECONDS. It used to share the
+ * revalidation clock, which was 45s too. Leaving it on that clock when the
+ * clock moved to 105s would let a scan that takes a minute "finish", claim
+ * every owner's day, and then defer the sends for want of time — morning after
+ * morning, reporting ok. A scan this slow is a backlog to be told about
+ * (`scanIncomplete` fails the heartbeat), not something to absorb.
+ */
+const SCAN_DEADLINE_MS = 45_000;
 
 /** How much of the revalidation budget is left, measured from `startedAt`. */
 function remainingRevalidationBudgetMs(startedAt: number): number {
@@ -150,15 +179,15 @@ function remainingRevalidationBudgetMs(startedAt: number): number {
 }
 
 /**
- * THE INVOCATION'S HARD WALL. `maxDuration` is 60s; stopping at 55 leaves room
- * to serialise a summary instead of being killed with the answer unwritten.
+ * THE INVOCATION'S HARD WALL. `maxDuration` is 120s; stopping at 115 leaves
+ * room to serialise a summary instead of being killed with the answer unwritten.
  *
  * Wider than `REVALIDATION_DEADLINE_MS` on purpose: that budget bounds the
  * re-verification QUERIES, which are optional work that degrades safely (an
  * unverified item is simply not sent). This one bounds the SEND, which does not
  * degrade safely at all.
  */
-const RUN_DEADLINE_MS = 55_000;
+const RUN_DEADLINE_MS = 115_000;
 
 /**
  * What still has to happen after the webhook answers: the POSTED write, the
@@ -316,7 +345,7 @@ function toCandidate(issue: {
  * invocation to select.
  *
  * EXPORTED for the same reason `loadCardItemTruth` is: the run's own clock is a
- * 45-second budget with no injection seam at the route boundary, so the only way
+ * fixed budget with no injection seam at the route boundary, so the only way
  * to prove the scan STOPS on it — rather than to assert that the source contains
  * a check — is to call it with a deadline of the test's own.
  */
@@ -746,7 +775,8 @@ async function handleGET(request: Request) {
     }
 
     const date = pacificDate(now);
-    // RETRY PASS (?retry=1, the 2-hours-later cron). Its job is to re-post
+    // RETRY PASS (?retry=1: the same-morning passes a few minutes after the
+    // first run, and the 2-hours-later cron). Its job is to re-post
     // rows an earlier run claimed and failed to deliver, so a webhook outage
     // at 7:30 does not cost the crew their whole day — but it is not
     // selection-blind: if the chase finishes late and `selectionAllowed`
@@ -849,7 +879,7 @@ async function handleGET(request: Request) {
     const ownerEpochAtScan = selectionAllowed ? await readReceiptOwnerEpoch(prisma) : "0";
     const scanResumedFrom = selectionAllowed ? await readScanCursor() : null;
     const scan = selectionAllowed
-        ? await scanCandidates(() => remainingRevalidationBudgetMs(runStartedAt) <= 0, scanResumedFrom)
+        ? await scanCandidates(() => Date.now() - runStartedAt >= SCAN_DEADLINE_MS, scanResumedFrom)
         : { candidates: [] as CardCandidateIssue[], pages: 0, exhausted: true, deadlineHit: false, nextCursor: null, wrapped: false };
     // CHECKPOINTED IMMEDIATELY, before selection or any send. The whole value of
     // the cursor is that a run which spends its budget scanning still leaves the
@@ -1220,6 +1250,10 @@ async function handleGET(request: Request) {
      * that reports these every day means two schedules are overlapping.
      */
     const dayTaken: string[] = [];
+    // How long the run took to REACH the send loop (scan, claims, queued
+    // resends). With `elapsedMs` in the summary this is the only way to see,
+    // from the log, how close a morning came to deferring somebody.
+    const sendPhaseStartedMs = Date.now() - runStartedAt;
     for (const { card: claimedCard, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
         /**
          * ONE CACHE PER CARD, NOT PER RUN (Codex PR #443 gate round 37,
@@ -1727,6 +1761,10 @@ async function handleGET(request: Request) {
         // selected), and they need different fixes: one is a backlog, the
         // other is a slow run.
         scanDeadlineHit: scan.deadlineHit,
+        // The run's own clock, against RUN_DEADLINE_MS: when the send loop
+        // began, and when this summary was written.
+        sendPhaseStartedMs,
+        elapsedMs: Date.now() - runStartedAt,
         claimed: toPost.length,
         // Refused by claimOwnerDay's own re-check (§14.9) — the certification
         // or the owner epoch moved between the scan and the locked claim.

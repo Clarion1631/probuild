@@ -488,7 +488,7 @@ test("a read cut by the clock claims nothing, even for an owner it saw, and a ca
     // wants a second page.
     queue = [row("ri-rich-new", "Richard"), ...Array.from({ length: 500 }, (_, i) => officeRow(`ri-office-t5-${i}`))];
     seedTodayCard("CJ", "ri-cj-1");
-    onScanPage = () => { offsetMs = 50_000; };
+    onScanPage = () => { offsetMs = 110_000; };
 
     const summary = await runGET();
 
@@ -526,7 +526,7 @@ test("a complete read whose send is deferred for time is still ok", async () => 
     mode = "queue";
     queue = [row("ri-office-1", "office")];
     seedTodayCard("CJ", "ri-cj-1");
-    onScanPage = () => { offsetMs = 50_000; };
+    onScanPage = () => { offsetMs = 110_000; };
 
     const summary = await runGET();
 
