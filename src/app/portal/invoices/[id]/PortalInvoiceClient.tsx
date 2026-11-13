@@ -9,6 +9,8 @@ import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
 import { buildPdf } from "@/lib/build-pdf";
 import { formatMoneyDate } from "@/lib/payment-date";
+import { shouldUseServerPdf } from "@/lib/pdf-capture-policy";
+import { fetchExactServerPdf, saveBlobAs } from "@/lib/server-pdf-download";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -95,6 +97,23 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
         const element = document.getElementById("invoice-document-wrapper");
         if (!element) return;
         setIsDownloading(true);
+        // Narrow (phone) screens: a screenshot would be magnified, so save the server-made PDF when the server
+        // vouches it is exact (same route the staff editor uses; ?exact=1 answers 409 when anything was altered).
+        if (shouldUseServerPdf(element.getBoundingClientRect().width)) {
+            const qs = new URLSearchParams({ exact: "1" });
+            if (hasFocus) qs.set("milestone", focusedPayments.map((p: any) => p.id).join(","));
+            let saved = false;
+            try {
+                const blob = await fetchExactServerPdf(`/api/pdf/invoices/${encodeURIComponent(initialInvoice.id)}?${qs}`);
+                if (blob) { saveBlobAs(blob, `Invoice_${initialInvoice.code || initialInvoice.id}.pdf`); saved = true; }
+            } catch (serverPdfErr) {
+                // Saving threw: fall through to the screenshot, like the estimate page.
+                console.error("Server PDF download failed, falling back to screenshot:", serverPdfErr);
+            } finally {
+                if (saved) setIsDownloading(false);
+            }
+            if (saved) return;
+        }
         const prevShadow = element.style.boxShadow;
         const prevBorder = element.style.border;
         try {

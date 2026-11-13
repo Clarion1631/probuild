@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { generateInvoicePdf } from "@/lib/pdf";
+import { generateInvoicePdfWithAudit } from "@/lib/pdf";
 import { getPortalClientId, isStaffRequest } from "@/lib/pdf-route-auth";
 import { prisma } from "@/lib/prisma";
 
@@ -34,7 +34,17 @@ export async function GET(
     }
 
     try {
-        const pdfBuffer = await generateInvoicePdf(id);
+        // ?exact=1 (the phone Download): answer 409 instead of a PDF that would not match the page.
+        // ?milestone= is the payment-request focus; it only changes how the PDF is drawn.
+        const exact = req.nextUrl.searchParams.get("exact") === "1";
+        const requestedMilestoneIds = (req.nextUrl.searchParams.get("milestone") || "")
+            .split(",").map(s => s.trim()).filter(s => s.length > 0 && s.length <= 50).slice(0, 40);
+        const { bytes: pdfBuffer, lossy } = await generateInvoicePdfWithAudit(id, {
+            requestedMilestoneIds,
+            // The page hides the full-invoice Total Amount in focus mode; only the exact (phone Download) path mirrors that.
+            omitFocusedTotal: exact,
+        });
+        if (exact && lossy) return NextResponse.json({ error: "PDF would not match the page" }, { status: 409, headers: { "Cache-Control": "private, no-store" } });
         const inline = req.nextUrl.searchParams.get("inline") === "true";
 
         return new NextResponse(pdfBuffer as any, {

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { generateChangeOrderPdf } from "@/lib/pdf";
+import { generateChangeOrderPdfWithAudit } from "@/lib/pdf";
 import { getPortalClientId, isStaffRequest } from "@/lib/pdf-route-auth";
 import { prisma } from "@/lib/prisma";
 
@@ -35,7 +35,10 @@ export async function GET(
     }
 
     try {
-        const pdfBuffer = await generateChangeOrderPdf(id);
+        // ?exact=1 (the phone Download): answer 409 instead of a PDF that would not match the page.
+        const exact = req.nextUrl.searchParams.get("exact") === "1";
+        const { bytes: pdfBuffer, lossy } = await generateChangeOrderPdfWithAudit(id);
+        if (exact && lossy) return NextResponse.json({ error: "PDF would not match the page" }, { status: 409, headers: { "Cache-Control": "private, no-store" } });
         const inline = req.nextUrl.searchParams.get("inline") === "true";
 
         return new NextResponse(pdfBuffer as any, {
