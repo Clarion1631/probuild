@@ -645,10 +645,10 @@ test("with less than the send headroom left, no row is flipped to POSTING and Ch
      */
     const row = seedClaimedCard();
     const realNow = Date.now;
-    // The run reads its own start first; every read after that is 50 seconds
-    // later, which leaves 5s against the 55s wall — under the headroom.
+    // The run reads its own start first; every read after that is 110 seconds
+    // later, which leaves 5s against the 115s wall — under the headroom.
     let reads = 0;
-    Date.now = () => (reads++ === 0 ? realNow() : realNow() + 50_000);
+    Date.now = () => (reads++ === 0 ? realNow() : realNow() + 110_000);
     let summary: Record<string, unknown>;
     try {
         summary = await runCards();

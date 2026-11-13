@@ -81,6 +81,14 @@
       "schedule": "30 14 * * 1-5"
     },
     {
+      "path": "/api/cron/receipt-request-cards?retry=1&pass=2",
+      "schedule": "34 14 * * 1-5"
+    },
+    {
+      "path": "/api/cron/receipt-request-cards?retry=1&pass=3",
+      "schedule": "42 14 * * 1-5"
+    },
+    {
       "path": "/api/cron/receipt-request-cards?retry=1",
       "schedule": "30 16 * * 1-5"
     }
