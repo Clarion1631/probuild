@@ -17784,6 +17784,52 @@ export async function removeJobContact(contactId: string) {
     return { success: true };
 }
 
+/** The portal estimate page's two gates (shared by the PDF actions so they cannot drift); the id when allowed, else null. */
+async function portalEstimateIdForPdf(estimateId: string): Promise<string | null> {
+    const estimate = await getEstimateForPortal(estimateId);
+    if (!estimate) return null;
+    // Same extra gate as portal/estimates/[id]/page.tsx: a project that hides estimates from its portal.
+    if (estimate.projectId) {
+        const visibility = await getPortalVisibility(estimate.projectId);
+        if (!visibility.showEstimates) return null;
+    }
+    return estimate.id;
+}
+
+/**
+ * Server-made estimate PDF for the portal's phone "Download PDF". Access is exactly the
+ * portal estimate page's two gates, for staff and clients alike (portalEstimateIdForPdf).
+ * Returns null when either denies, or when the real render altered any text (the caller then
+ * falls back to the complete browser screenshot); otherwise the PDF bytes as base64.
+ */
+export async function getEstimatePdfForPortal(estimateId: string): Promise<string | null> {
+    const id = await portalEstimateIdForPdf(estimateId);
+    if (!id) return null;
+    const { generateEstimatePdfWithAudit } = await import("./pdf");
+    const { bytes, lossy } = await generateEstimatePdfWithAudit(id);
+    if (lossy) return null;
+    return Buffer.from(bytes).toString("base64");
+}
+
+/**
+ * True when the server-made PDF of this estimate would hold every character exactly as the portal shows
+ * it, so a phone signer may skip the browser screenshot. Same access checks as getEstimatePdfForPortal.
+ * Dry run: writes nothing, sends nothing, does not mark the estimate viewed. signerName (the typed
+ * signature, not saved yet) is included in the check. False on denial, an over-long name or any error.
+ */
+export async function canUseServerEstimatePdf(estimateId: string, signerName?: string | null): Promise<boolean> {
+    try {
+        const id = await portalEstimateIdForPdf(estimateId);
+        if (!id) return false;
+        const { auditEstimatePdfById, MAX_AUDIT_SIGNER_NAME_LENGTH } = await import("./pdf");
+        const name = typeof signerName === "string" ? signerName : null;
+        if (name && name.length > MAX_AUDIT_SIGNER_NAME_LENGTH) return false;
+        return !(await auditEstimatePdfById(id, name)).lossy;
+    } catch {
+        return false;
+    }
+}
+
 // ============ Change order offline approval (not payroll) ============
 // Office-side "Mark approved": the customer approved a change order outside
 // ProBuild (phone, text, email, in person). ADMIN/MANAGER only, same gate as the

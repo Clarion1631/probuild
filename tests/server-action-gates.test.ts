@@ -71,6 +71,18 @@ const ALLOWED: Record<string, string> = {
     "actions.ts:getPublicCompanySettings":
         "Deliberately public: the company name, logo and brand colour the portal " +
         "and the login page render before anyone has signed in.",
+    "actions.ts:getEstimatePdfForPortal":
+        "Authorizes by delegation: its first statement is portalEstimateIdForPdf, which calls getEstimateForPortal, the same " +
+        "single authority the portal estimate page uses (client ownership + shared-ness, or " +
+        "scoped staff), then the page's own second gate (the project's portal " +
+        "visibility, showEstimates). It returns null on either deny or when the render altered " +
+        "text, and only then generates the PDF for that same id. Read-only; no writes.",
+    "actions.ts:canUseServerEstimatePdf":
+        "Authorizes by delegation: it runs the same portalEstimateIdForPdf helper as " +
+        "getEstimatePdfForPortal (getEstimateForPortal: client ownership + shared-ness, or scoped " +
+        "staff, then the project's showEstimates visibility) and returns false on denial or any " +
+        "error. It only dry-run renders that same id and returns a boolean; it writes nothing, " +
+        "sends nothing and does not mark the estimate viewed.",
     "actions.ts:getPortalVisibility":
         "Reads one row of boolean feature flags saying which portal tabs a project " +
         "shows. Reachable by all THREE audiences — staff, a portal client, and a " +
@@ -148,7 +160,7 @@ test("round 49: the allowlist holds no mutations", () => {
     for (const key of Object.keys(ALLOWED)) {
         const name = key.split(":")[1];
         assert.ok(
-            /^(get|list|check|find|resolve|is|has)/.test(name),
+            /^(get|list|check|find|resolve|is|has|can)/.test(name),
             `${key} does not read as a query. An ungated MUTATION is never allowlistable.`,
         );
         assert.ok(ALLOWED[key].length > 40, `${key} needs a real reason, not a placeholder`);
