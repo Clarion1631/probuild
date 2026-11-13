@@ -347,7 +347,7 @@ test("the retry pass re-posts unposted rows, and selects only when it may", () =
     // when it may not (then it posts purely from the claimed snapshot). It is
     // handed the run's own clock (round-34 finding 3), so the skipped branch has
     // to supply the same shape — including `deadlineHit`.
-    assert.match(source, /const scan = selectionAllowed\s*\n\s*\? await scanCandidates\(\(\) => remainingRevalidationBudgetMs\(runStartedAt\) <= 0, scanResumedFrom\)\s*\n\s*: \{ candidates: \[\] as CardCandidateIssue\[\]/);
+    assert.match(source, /const scan = selectionAllowed\s*\n\s*\? await scanCandidates\(\(\) => Date\.now\(\) - runStartedAt >= SCAN_DEADLINE_MS, scanResumedFrom\)\s*\n\s*: \{ candidates: \[\] as CardCandidateIssue\[\]/);
     // And the position is READ before and WRITTEN after, so a run that
     // spends its budget scanning still leaves the next one further along.
     assert.match(source, /const scanResumedFrom = selectionAllowed \? await readScanCursor\(\) : null;/);
