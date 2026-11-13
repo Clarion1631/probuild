@@ -8,6 +8,8 @@ import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems } from "@/lib/co-tax";
 import { buildPdf } from "@/lib/build-pdf";
+import { shouldUseServerPdf } from "@/lib/pdf-capture-policy";
+import { fetchExactServerPdf, saveBlobAs } from "@/lib/server-pdf-download";
 
 export default function PortalChangeOrderClient({ initialData, companySettings, offlineApprovalLabel }: { initialData: any, companySettings?: any, offlineApprovalLabel?: string | null }) {
     const [isApproving, setIsApproving] = useState(false);
@@ -61,6 +63,21 @@ export default function PortalChangeOrderClient({ initialData, companySettings, 
         const element = document.getElementById("change-order-document-wrapper");
         if (!element) return;
         setIsDownloading(true);
+        // Narrow (phone) screens: a screenshot would be magnified, so save the server-made PDF when the server
+        // vouches it is exact (?exact=1 answers 409 when anything was altered). Nothing is touched on this path.
+        if (shouldUseServerPdf(element.getBoundingClientRect().width)) {
+            let saved = false;
+            try {
+                const blob = await fetchExactServerPdf(`/api/pdf/change-orders/${encodeURIComponent(initialData.id)}?exact=1`);
+                if (blob) { saveBlobAs(blob, `ChangeOrder_${initialData.code || initialData.id}.pdf`); saved = true; }
+            } catch (serverPdfErr) {
+                // Saving threw: fall through to the screenshot, like the estimate page.
+                console.error("Server PDF download failed, falling back to screenshot:", serverPdfErr);
+            } finally {
+                if (saved) setIsDownloading(false);
+            }
+            if (saved) return;
+        }
         const prevShadow = element.style.boxShadow;
         const prevBorder = element.style.border;
         // buildPdf measures element.offsetHeight BEFORE the html-to-image capture step,
