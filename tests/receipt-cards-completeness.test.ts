@@ -248,7 +248,7 @@ test("late-entered document holds the real queued-card adapter and cannot become
             const truth = await loadCardItemTruth(["ri-review"], { cache });
             assert.equal(truth.get("ri-review")?.evidenceSatisfied, false);
             assert.equal(truth.get("ri-review")?.outreachHold, "existing-evidence-review");
-            assert.deepEqual(rebuildCardItems([cardItem("ri-review", line.id)], truth, "Richard").dropped,
+            assert.deepEqual(rebuildCardItems([cardItem("ri-review", line.id)], truth, "Richard", "2026-01-20").dropped,
                 [{ issueId: "ri-review", reason: "existing-evidence-review" }]);
             assert.equal(cache.has(line.id), false);
         }
@@ -281,7 +281,7 @@ test("the scheduled default asks the STRICT question: recompute is called with s
     const verdict = truth.get("ri-strict")!;
     assert.equal(verdict.evidenceSatisfied, true);
     assert.deepEqual(
-        rebuildCardItems([cardItem("ri-strict", "bl-strict")], truth, verdict.owner).dropped,
+        rebuildCardItems([cardItem("ri-strict", "bl-strict")], truth, verdict.owner, "2026-01-20").dropped,
         [{ issueId: "ri-strict", reason: "evidence-found" }],
     );
 });
@@ -323,7 +323,7 @@ test("a genuinely missing receipt on a small component is still sendable through
     assert.equal(verdict.evidenceSatisfied, false, "no receipt, no booked intake, no signed memo: legitimately still missing");
     assert.equal(verdict.resolved, false);
     assert.equal(verdict.clearedAt, null);
-    const rebuilt = rebuildCardItems([cardItem("ri-missing", line.id)], truth, verdict.owner);
+    const rebuilt = rebuildCardItems([cardItem("ri-missing", line.id)], truth, verdict.owner, "2026-01-20");
     assert.deepEqual(rebuilt.dropped, []);
     assert.equal(rebuilt.items.length, 1, "a completed, genuinely missing item is exactly what a card is for");
 });
@@ -337,7 +337,7 @@ test("an item already answered by a bound signed memo is dropped as resolved wit
         const verdict = truth.get("ri-memo")!;
         assert.equal(verdict.resolved, true);
         assert.deepEqual(
-            rebuildCardItems([cardItem("ri-memo", line.id)], truth, verdict.owner).dropped,
+            rebuildCardItems([cardItem("ri-memo", line.id)], truth, verdict.owner, "2026-01-20").dropped,
             [{ issueId: "ri-memo", reason: "resolved" }],
         );
     } finally {
@@ -355,7 +355,7 @@ test("a spent revalidation budget is checked BEFORE the strict walk: the compone
     assert.equal(verdict.revalidationSkipped, true);
     assert.equal(verdict.evidenceSatisfied, false, "an unverified item must not read as answered");
     assert.deepEqual(
-        rebuildCardItems([cardItem("ri-late", line.id)], truth, verdict.owner).dropped,
+        rebuildCardItems([cardItem("ri-late", line.id)], truth, verdict.owner, "2026-01-20").dropped,
         [{ issueId: "ri-late", reason: "revalidation-deadline" }],
     );
 });

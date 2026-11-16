@@ -284,7 +284,7 @@ test("the cron drains queued resends by their own date, oldest first and bounded
     assert.ok(distinctAt > 0 && capAt > distinctAt, "one row per owner first, then the global cap");
     // Posted under ITS OWN date, so the request id — and the Chat thread —
     // stay the ones the operator was looking at.
-    assert.match(cron, /buildCardFromItems\(row\.owner, row\.pacificDate, items, row\.overflow, row\.overflowExact\)/);
+    assert.match(cron, /buildCardFromItems\(row\.owner, row\.pacificDate, items, 0\)/);
     assert.match(cron, /queuedDrained\.push\(/, "and the run reports what it picked up");
 
     // The claim is the same CAS every other path uses: unposted, unclaimed or

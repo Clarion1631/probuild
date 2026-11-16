@@ -34,6 +34,10 @@ import { TODO_COPY } from "../src/app/automation/receipts-todo";
 import type { IntakeRow, MissingReceiptRow, ReceiptQueue } from "../src/app/automation/receipts-data";
 import { LEGACY_URLS, legacyQueue, groupSections } from "./legacy-fixture-shared.mjs";
 
+// The clock the tab uses to decide which charges are too old for the crew list: fixed, so the fixtures
+// (charges posted 2026-09-02) stay inside the 14-day window whatever day this suite runs.
+const RENDER_NOW = new Date("2026-09-10T12:00:00Z");
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 function intake(id: string, over: Partial<IntakeRow> = {}): IntakeRow {
@@ -106,7 +110,7 @@ function recordingSigner() {
 const render = async (queue: ReceiptQueue, filters: ReceiptFilters, sign: ReceiptBatchSigner = recordingSigner().sign) =>
     renderToStaticMarkup(await ReceiptsTab({
         queue, filters, jobs: [{ id: "p1", name: "Mueller Remodel" }],
-        filterHref: () => "/automation?tab=receipts", nativeActive: false, sign,
+        filterHref: () => "/automation?tab=receipts", nativeActive: false, now: RENDER_NOW, sign,
     }));
 
 /**
@@ -117,7 +121,7 @@ const renderWithHrefs = async (queue: ReceiptQueue, filters: ReceiptFilters) =>
     renderToStaticMarkup(await ReceiptsTab({
         queue, filters, jobs: [],
         filterHref: overrides => receiptFilterHref(filters, overrides),
-        nativeActive: false, sign: recordingSigner().sign,
+        nativeActive: false, now: RENDER_NOW, sign: recordingSigner().sign,
     }));
 
 /**
@@ -179,6 +183,10 @@ const APPROVED_DIFFERENCES: Array<{ why: string; apply: (base: string) => string
         apply: base => base.replace("next try 9/21/26, 3:30 AM", "next try 9/20/26, 8:30 PM"),
     },
     {
+        why: "the unattributed note promised the card tomorrow morning, which stopped being true for a charge older than 14 days.",
+        apply: base => base.replace("it joins their card tomorrow morning.", "it joins their list if it was posted in the last 14 days. Older ones are not asked. Office follows up."),
+    },
+    {
         why: "a row with no read date fell back to the UTC calendar day, so an evening receipt read as tomorrow.",
         apply: base => base.replace(">2026-09-19 · chat<", ">2026-09-18 · chat<"),
     },
@@ -210,7 +218,7 @@ test("every legacy URL still draws what the base branch drew, bar the approved d
             queue: queueFactory ? queueFactory() : (legacyQueue() as ReceiptQueue),
             filters,
             jobs: [{ id: "p1", name: "Mueller Remodel" }],
-            filterHref: () => "/automation?tab=receipts", nativeActive: false, sign,
+            filterHref: () => "/automation?tab=receipts", nativeActive: false, now: RENDER_NOW, sign,
         }));
         const expected = APPROVED_DIFFERENCES.reduce((text, diff) => diff.apply(text), fixture[name]);
         assert.equal(groupSections(html), expected, `${name}: an unapproved change to a legacy view`);
@@ -388,13 +396,13 @@ test("nothing in the To-do view hides behind a hover", async () => {
 test("ten of the same errand are one line, expandable with no JavaScript", async () => {
     const html = await render(queueOf({
         missingReceipts: Array.from({ length: 10 }, (_unused, index) =>
-            request(`dump-${index}`, { postedDate: `2026-08-2${index}`.slice(0, 10) })),
+            request(`dump-${index}`, { postedDate: `2026-09-${String(index + 1).padStart(2, "0")}` })),
     }), parseReceiptFilters({}));
 
     assert.match(html, /<details/, "a native disclosure, so it works in a server component");
     assert.match(html, /<summary/);
     assert.ok(html.includes("$40.00 each · 10 charges · $400.00 total"));
-    assert.ok(html.includes("2026-08-20 to 2026-08-29 · card …8516"));
+    assert.ok(html.includes("2026-09-01 to 2026-09-10 · card …8516"));
     // Every child keeps its own CAS-gated ack: there is no bulk write.
     assert.equal((html.match(/Mark reviewed/g) ?? []).length, 10);
 });
@@ -618,7 +626,7 @@ test("the exceptions banner makes no claim about which rail is live", async () =
 const renderWithJobs = async (queue: ReceiptQueue, filters: ReceiptFilters, jobs: Array<{ id: string; name: string }>) =>
     renderToStaticMarkup(await ReceiptsTab({
         queue, filters, jobs,
-        filterHref: () => "/automation?tab=receipts", nativeActive: false, sign: recordingSigner().sign,
+        filterHref: () => "/automation?tab=receipts", nativeActive: false, now: RENDER_NOW, sign: recordingSigner().sign,
     }));
 
 test("Pick the job (To-do view): a folder that is a whole-word prefix of one open job draws a button", async () => {

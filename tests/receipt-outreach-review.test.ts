@@ -11,9 +11,9 @@ const candidate = (over: Partial<CardCandidateIssue> = {}): CardCandidateIssue =
 
 test('software invoices never enter crew cards, including OpenRouter and normalized OpenAI billing text', () => {
   for (const payee of ['OPENAI CHATGPT SUBSCR OPENAI.COM CA', 'OPENROUTER, INC OPENROUTER.AI NY']) {
-    assert.deepEqual(selectOwnerItems([candidate({ payee })], 'Richard'), { items: [], overflow: 0 });
+    assert.deepEqual(selectOwnerItems([candidate({ payee })], 'Richard', '2026-08-20'), { items: [], overflow: 0 });
   }
-  assert.equal(selectOwnerItems([candidate({ payee: 'LOCAL HARDWARE' })], 'Richard').items.length, 1);
+  assert.equal(selectOwnerItems([candidate({ payee: 'LOCAL HARDWARE' })], 'Richard', '2026-08-20').items.length, 1);
 });
 
 test('uncertain existing documents stay open for internal review instead of a crew request', () => {
@@ -44,9 +44,9 @@ test('different amount or distant document does not indefinitely block a missing
 });
 
 test('a queued card is dropped when internal evidence review or office policy now applies', () => {
-  const item = selectOwnerItems([candidate({ payee: 'HARDWARE' })], 'Richard').items[0];
+  const item = selectOwnerItems([candidate({ payee: 'HARDWARE' })], 'Richard', '2026-08-20').items[0];
   for (const outreachHold of ['existing-evidence-review', 'office-invoice'] as const) {
-    const result = rebuildCardItems([item], new Map([['issue', { clearedAt: null, acknowledged: false, resolved: false, evidenceSatisfied: false, owner: 'Richard', outreachHold }]]), 'Richard');
+    const result = rebuildCardItems([item], new Map([['issue', { clearedAt: null, acknowledged: false, resolved: false, evidenceSatisfied: false, owner: 'Richard', outreachHold }]]), 'Richard', '2026-08-20');
     assert.equal(result.items.length, 0);
     assert.equal(result.dropped[0].reason, outreachHold);
   }

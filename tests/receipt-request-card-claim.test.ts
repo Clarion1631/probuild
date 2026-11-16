@@ -133,7 +133,7 @@ async function runOnce(
             toPost.push({ owner, rowId: existing.id, token, items: JSON.parse(existing.itemsJson) as CardItem[] });
             continue;
         }
-        const { items, overflow } = selectOwnerItems(candidates, owner);
+        const { items, overflow } = selectOwnerItems(candidates, owner, DATE);
         if (items.length === 0) continue;
         try {
             const row = table.create(owner, DATE, items, overflow, now, token);
@@ -219,7 +219,7 @@ test("a crash mid-post is recovered only after the lease, and costs at most one 
     const now = new Date();
     // Claim taken, then the process dies: neither markPosted nor releaseClaim ran.
     const token = "crashed-CJ";
-    const { items, overflow } = selectOwnerItems([issue()], "CJ");
+    const { items, overflow } = selectOwnerItems([issue()], "CJ", DATE);
     table.create("CJ", DATE, items, overflow, now, token);
 
     // A run seconds later must NOT touch it — that is how you post twice.
@@ -279,7 +279,7 @@ test("completion is token-fenced in the real route, not just in this fake", () =
 });
 
 test("the request id and thread key are the same deterministic string", () => {
-    const { items, overflow } = selectOwnerItems([issue()], "CJ");
+    const { items, overflow } = selectOwnerItems([issue()], "CJ", DATE);
     const a = buildCardFromItems("CJ", DATE, items, overflow);
     const b = buildCardFromItems("CJ", DATE, items, overflow);
     assert.equal(a.requestId, "receipt-req-CJ-2026-08-20");

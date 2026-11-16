@@ -7,6 +7,10 @@ import { dirname, join } from "node:path";
 import { isCrewReceiptRequest } from "../src/lib/receipt-policy";
 import type { OwnerCard } from "../src/lib/receipt-request-cards";
 
+// A charge date inside the 14-day crew ask window on whatever day this suite runs: the cron under
+// test reads the real clock, and a fixed date would age out of the window.
+const RECENT_DAY = new Date(Date.now() - 5 * 86_400_000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+
 /**
  * cards-complete-scan-spec.md, Option A.
  *
@@ -119,7 +123,7 @@ let offsetMs: number;
 /** Every office row shares this exact string — one parse's worth of JSON,
  *  reused 100,000 times, is what keeps T1/T3 cheap. */
 const OFFICE_DETAILS = JSON.stringify({
-    amountCents: -4000, owner: "office", postedDate: "2026-01-05", payee: "SUPPLY CO", fingerprint: "pb-office",
+    amountCents: -4000, owner: "office", postedDate: RECENT_DAY, payee: "SUPPLY CO", fingerprint: "pb-office",
 });
 
 function officeRow(id: string): ScanRow {
@@ -133,7 +137,7 @@ function officeRow(id: string): ScanRow {
  */
 function row(id: string, owner: string, carded = false): ScanRow {
     const details: Record<string, unknown> = {
-        amountCents: -4000, owner, postedDate: "2026-01-05", payee: "SUPPLY CO", fingerprint: `pb-${id}`,
+        amountCents: -4000, owner, postedDate: RECENT_DAY, payee: "SUPPLY CO", fingerprint: `pb-${id}`,
     };
     if (carded) details.cards = [{ requestId: `receipt-req-${owner}-2026-01-02` }];
     const r: ScanRow = {
@@ -165,7 +169,7 @@ function seedTodayCard(owner: string, issueId: string): void {
         pacificDate: date,
         itemsJson: JSON.stringify([{
             n: 1, issueId, fingerprint: `pb-${issueId}`, cents: 4000, amount: "40.00",
-            date: "2026-01-05", vendor: "SUPPLY CO", cardTail: null, targetKey: `bl-${issueId}`,
+            date: RECENT_DAY, vendor: "SUPPLY CO", cardTail: null, targetKey: `bl-${issueId}`,
         }]),
         overflow: 0,
         overflowExact: true,

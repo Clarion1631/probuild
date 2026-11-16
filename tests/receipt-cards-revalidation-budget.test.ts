@@ -208,7 +208,7 @@ test("rebuildCardItems drops a revalidationSkipped item with reason revalidation
     const truth = new Map<string, CardItemTruth>([
         ["ri-1", { clearedAt: null, acknowledged: false, resolved: false, evidenceSatisfied: false, owner: "CJ", revalidationSkipped: true }],
     ]);
-    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    const rebuilt = rebuildCardItems(items, truth, "CJ", "2026-08-20");
     assert.deepEqual(rebuilt.items, []);
     assert.deepEqual(rebuilt.dropped, [{ issueId: "ri-1", reason: "revalidation-deadline" }]);
 });

@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { OwnerCard } from "../src/lib/receipt-request-cards";
 
+// A charge date inside the 14-day crew ask window on whatever day this suite runs: the cron under
+// test reads the real clock, and a fixed date would age out of the window.
+const RECENT_DAY = new Date(Date.now() - 5 * 86_400_000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+
 /**
  * Every owner gets their morning card, not only the first one in line.
  *
@@ -90,7 +94,7 @@ function row(id: string, owner: string): ScanRow {
     const r: ScanRow = {
         id, targetKey: `bl-${id}`, reasonCodes: '["MISSING_RECEIPT"]', acknowledgedCodes: "[]",
         displayDetails: JSON.stringify({
-            amountCents: -4000, owner, postedDate: "2026-01-05", payee: "SUPPLY CO", fingerprint: `pb-${id}`,
+            amountCents: -4000, owner, postedDate: RECENT_DAY, payee: "SUPPLY CO", fingerprint: `pb-${id}`,
         }),
     };
     byId.set(id, r);

@@ -7,6 +7,10 @@ import { dirname, join } from "node:path";
 import { requestIdFor, type OwnerCard } from "../src/lib/receipt-request-cards";
 import { evaluatePipelineHealth } from "../src/lib/pipeline-health";
 
+// A charge date inside the 14-day crew ask window on whatever day this suite runs: the cron under
+// test reads the real clock, and a fixed date would age out of the window.
+const RECENT_DAY = new Date(Date.now() - 5 * 86_400_000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+
 /**
  * Codex PR #443, adversarial gate round 41 — the holes round 40 left in the
  * queued-resend drain.
@@ -61,7 +65,7 @@ function scanRow(id: string, owner: string): ScanRow {
         targetKey: `bl-${id}`,
         reasonCodes: JSON.stringify(["MISSING_RECEIPT"]),
         acknowledgedCodes: "[]",
-        displayDetails: JSON.stringify({ amountCents: -100, owner, postedDate: "2026-08-16", payee: "LOWES", fingerprint: `pb-${id}` }),
+        displayDetails: JSON.stringify({ amountCents: -100, owner, postedDate: RECENT_DAY, payee: "LOWES", fingerprint: `pb-${id}` }),
     };
 }
 
@@ -253,7 +257,7 @@ function queuedCard(owner: string, date: string, itemIds: string[], over: Record
         owner,
         pacificDate: date,
         itemsJson: JSON.stringify(itemIds.map((id, i) => ({
-            n: i + 1, issueId: id, fingerprint: `pb-${id}`, cents: 100, date: "2026-08-16", vendor: "LOWES",
+            n: i + 1, issueId: id, fingerprint: `pb-${id}`, cents: 100, date: RECENT_DAY, vendor: "LOWES",
         }))),
         overflow: 0,
         overflowExact: true,

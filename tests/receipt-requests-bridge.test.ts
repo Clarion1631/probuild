@@ -786,7 +786,7 @@ test("the card snapshot is re-verified under the claim, immediately before the s
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     // Rebuild -> (cancel | POSTING) -> post. In that order, inside the loop
     // that already holds the claim token.
-    const rebuildAt = source.indexOf("const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner);");
+    const rebuildAt = source.indexOf("const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner, date);");
     // The POSTING write also takes the delivery-day claim now (round-43 gate,
     // finding 1) — the reservation and the "this run owns the send" commit are
     // deliberately the same write.

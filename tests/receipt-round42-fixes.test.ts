@@ -8,6 +8,10 @@ import { requestIdFor, rebuildCardItems, type CardItem, type CardItemTruth, type
 import { cursorUsableAt, formatSweepCursor, parseSweepCursor } from "../src/app/api/cron/receipt-requests/route";
 import { isComponentKey } from "../src/lib/receipt-requests";
 
+// A charge date inside the 14-day crew ask window on whatever day this suite runs: the cron under
+// test reads the real clock, and a fixed date would age out of the window.
+const RECENT_DAY = new Date(Date.now() - 5 * 86_400_000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+
 /**
  * Codex PR #443, adversarial gate round 42 — what rounds 40 and 41 left open.
  *
@@ -164,7 +168,7 @@ function scanRow(id: string, owner: string): ScanRow {
         targetKey: `bl-${id}`,
         reasonCodes: JSON.stringify(["MISSING_RECEIPT"]),
         acknowledgedCodes: "[]",
-        displayDetails: JSON.stringify({ amountCents: -100, owner, postedDate: "2026-08-16", payee: "LOWES", fingerprint: `pb-${id}` }),
+        displayDetails: JSON.stringify({ amountCents: -100, owner, postedDate: RECENT_DAY, payee: "LOWES", fingerprint: `pb-${id}` }),
     };
 }
 
@@ -357,7 +361,7 @@ function queuedCard(owner: string, date: string, itemIds: string[], over: Record
         owner,
         pacificDate: date,
         itemsJson: JSON.stringify(itemIds.map((id, i) => ({
-            n: i + 1, issueId: id, fingerprint: `pb-${id}`, cents: 100, date: "2026-08-16", vendor: "LOWES",
+            n: i + 1, issueId: id, fingerprint: `pb-${id}`, cents: 100, date: RECENT_DAY, vendor: "LOWES",
         }))),
         overflow: 0,
         overflowExact: true,
@@ -417,8 +421,8 @@ before(async () => {
             return {
                 ...realCards,
                 isPacificWeekday: () => true,
-                rebuildCardItems: (items: readonly CardItem[], truth: ReadonlyMap<string, CardItemTruth>, owner: string) =>
-                    (rebuildOverride ? rebuildOverride(items) : realCards.rebuildCardItems(items, truth, owner)),
+                rebuildCardItems: (items: readonly CardItem[], truth: ReadonlyMap<string, CardItemTruth>, owner: string, today: string) =>
+                    (rebuildOverride ? rebuildOverride(items) : realCards.rebuildCardItems(items, truth, owner, today)),
                 postOwnerCard: async (_url: string, card: OwnerCard) => {
                     // A test can park the send here to interleave two runs.
                     if (postBarrier) await postBarrier;
@@ -447,6 +451,7 @@ const run = () => cardsGET(new Request("https://probuild.test/api/cron/receipt-r
 const allUnverified = (items: readonly CardItem[]): RebuiltCard => ({
     items: [],
     dropped: items.map(item => ({ issueId: item.issueId, reason: "revalidation-deadline" as const })),
+    cut: 0,
 });
 
 // ── 3. An unfinished check decides nothing ─────────────────────────────────
@@ -484,6 +489,7 @@ test("PRE-FIX CONTROL: a real verdict on the same items DOES delete the row", as
     rebuildOverride = items => ({
         items: [],
         dropped: items.map(item => ({ issueId: item.issueId, reason: "cleared" as const })),
+        cut: 0,
     });
 
     const body = await (await run()).json() as { cancelledOwners?: string[]; deferredReason?: string };
@@ -503,6 +509,7 @@ test("a PARTIALLY verified card is deferred whole — no partial snapshot goes o
     rebuildOverride = items => ({
         items: [{ ...items[0], n: 1 }],
         dropped: [{ issueId: items[1].issueId, reason: "revalidation-deadline" }],
+        cut: 0,
     });
 
     const body = await (await run()).json() as { budgetDeferredOwners?: string[]; droppedItems?: unknown[] };
@@ -520,6 +527,7 @@ test("PRE-FIX CONTROL: a verified drop still rebuilds and sends the rest", async
     rebuildOverride = items => ({
         items: [{ ...items[0], n: 1 }],
         dropped: [{ issueId: items[1].issueId, reason: "resolved" }],
+        cut: 0,
     });
 
     const body = await (await run()).json() as { droppedItems?: Array<{ reason: string }> };
@@ -534,12 +542,12 @@ test("rebuildCardItems itself reports an unreached item as revalidation-deadline
     // The other half of the contract, on the real function: the caller can only
     // divert on this reason if the rebuild actually produces it.
     const items: CardItem[] = [
-        { n: 1, issueId: "a", targetKey: "bl-a", fingerprint: "pb-a", cents: 100, amount: "1.00", cardTail: null, date: "2026-08-16", vendor: "LOWES" },
+        { n: 1, issueId: "a", targetKey: "bl-a", fingerprint: "pb-a", cents: 100, amount: "1.00", cardTail: null, date: RECENT_DAY, vendor: "LOWES" },
     ];
     const truth = new Map<string, CardItemTruth>([
         ["a", { owner: "CJ", clearedAt: null, resolved: false, acknowledged: false, evidenceSatisfied: false, revalidationSkipped: true }],
     ]);
-    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    const rebuilt = rebuildCardItems(items, truth, "CJ", "2026-08-20");
     assert.deepEqual(rebuilt.dropped, [{ issueId: "a", reason: "revalidation-deadline" }]);
     assert.equal(rebuilt.items.length, 0, "which is exactly the all-dropped shape that used to delete the row");
 });
@@ -707,7 +715,7 @@ test("a POSTING write that fails for ANY OTHER reason is NOT read as 'someone be
 function resolvedUncertainCardForToday() {
     const row = {
         id: "card-uncertain", owner: "CJ", pacificDate: today,
-        itemsJson: JSON.stringify([{ n: 1, issueId: "ri-1", fingerprint: "pb-ri-1", cents: 100, date: "2026-08-16", vendor: "LOWES" }]),
+        itemsJson: JSON.stringify([{ n: 1, issueId: "ri-1", fingerprint: "pb-ri-1", cents: 100, date: RECENT_DAY, vendor: "LOWES" }]),
         overflow: 0, overflowExact: true,
         // What `resolveUncertainCard` leaves behind: PENDING again, claim
         // released, `deliveredOn` KEPT — and that last part is the bug, because
