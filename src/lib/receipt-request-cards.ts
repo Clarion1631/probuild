@@ -128,6 +128,20 @@ export function isPacificWeekday(now: Date = new Date()): boolean {
 }
 
 /**
+ * The last Mon–Fri Pacific day strictly BEFORE today. "Previous" because a card
+ * still pending for TODAY may yet be sent by a later pass, and the cron only
+ * runs Mon–Fri, so a Monday looks back to Friday.
+ */
+export function previousPacificWeekday(now: Date = new Date()): string {
+    const [y, m, d] = pacificDate(now).split("-").map(Number);
+    const day = new Date(Date.UTC(y, m - 1, d));
+    do {
+        day.setUTCDate(day.getUTCDate() - 1);
+    } while (day.getUTCDay() === 0 || day.getUTCDay() === 6);
+    return day.toISOString().slice(0, 10);
+}
+
+/**
  * THE MARKER A RESENT CARD CARRIES (Codex PR #443 gate round 40, finding 2).
  *
  * "Resend" puts an UNCERTAIN row back to PENDING and releases its claim — and

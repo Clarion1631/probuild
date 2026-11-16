@@ -1,6 +1,11 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { CARD_RESEND_QUEUED_REASON, CARD_RESEND_STALE_HOURS } from "@/lib/receipt-request-cards";
+import {
+    CARD_OWNERS_ASKED,
+    CARD_RESEND_QUEUED_REASON,
+    CARD_RESEND_STALE_HOURS,
+    previousPacificWeekday,
+} from "@/lib/receipt-request-cards";
 import { STAGING_SWEEP_MINUTES } from "./receipt-intake/worker";
 import {
     createRouteDeadline,
@@ -79,6 +84,14 @@ export interface CountProbe {
     status: ProbeStatus;
     reason?: ProbeFailure;
     count: number;
+}
+
+/** Crew cards picked for the last working day that were never sent. */
+export interface UnsentCardsProbe extends CountProbe {
+    /** The Pacific day looked at (YYYY-MM-DD), so the digest can name it. */
+    day: string | null;
+    /** Who went without, so the digest can name them. */
+    owners: string[];
 }
 
 export interface DuplicatePurchasesProbe {
@@ -233,6 +246,8 @@ export interface PipelineHealth {
     queuedCards?: CountProbe;
     /** Queued resends Chat rejected — never auto-retried, so a human owns them. */
     rejectedQueuedCards?: CountProbe;
+    /** Crew cards picked for the last working day and never sent. */
+    unsentCards?: UnsentCardsProbe;
     /** The missing-receipt sweep's marker, including why it is holding back. */
     chaser?: {
         status: ProbeStatus;
@@ -497,6 +512,13 @@ export function purchaseSyncStaleHours(): number {
  *    "mark delivered" and "resend". Left alone they are silent — the crew
  *    simply never got asked, which is the failure mode this whole feature
  *    exists to prevent.
+ *  - `cards-unsent:<n>` — on the last Pacific weekday a card was picked for an
+ *    owner and never sent (the run ran out of time and no later pass rescued
+ *    it). The cron reports those runs as healthy, so without this nobody is
+ *    told. It looks only at the PREVIOUS weekday because today's card can
+ *    still go out on a later pass, so it shows for one working day (through
+ *    the weekend for a Friday) and then clears by itself; any charges still
+ *    open are reselected by a later run.
  *  - `no-receipts-72h` — nothing has been booked in 72h. This used to
  *    auto-green as "a quiet week is quiet", which meant a permanently dead
  *    pipeline reported OK forever. It doesn't any more: the digest prints how
@@ -573,6 +595,8 @@ export function evaluatePipelineHealth(input: {
     queuedCards?: CountProbe;
     /** Queued resends Chat rejected — reported, never auto-retried. */
     rejectedQueuedCards?: CountProbe;
+    /** Optional so older callers and fixtures still type-check; absent = not measured. */
+    unsentCards?: CountProbe;
     /** Can we authenticate to Drive at all? Gates the signed-memo path. */
     driveCredentials: { status: ProbeStatus; reason?: string; configured: boolean; source: string };
     /**
@@ -637,6 +661,7 @@ export function evaluatePipelineHealth(input: {
         ["uncertainCards", input.uncertainCards],
         ...(input.queuedCards ? [["queuedCards", input.queuedCards] as [string, { status: ProbeStatus }]] : []),
         ...(input.rejectedQueuedCards ? [["rejectedQueuedCards", input.rejectedQueuedCards] as [string, { status: ProbeStatus }]] : []),
+        ...(input.unsentCards ? [["unsentCards", input.unsentCards] as [string, { status: ProbeStatus }]] : []),
         ["bankPull", input.bankPull],
         ["driveCredentials", input.driveCredentials],
         ["chaser", input.chaser],
@@ -939,6 +964,13 @@ export function evaluatePipelineHealth(input: {
     // pick up — and silently dropping it is what round-41 finding 3 was about.
     if (input.rejectedQueuedCards?.status === "ok" && input.rejectedQueuedCards.count > 0) {
         reasons.push(`cards-queued-rejected:${input.rejectedQueuedCards.count}`);
+    }
+
+    // A card PICKED for somebody on the last working day and never sent. The
+    // cron calls that run healthy (nothing failed, it only ran out of time), so
+    // this is the one place it is said out loud.
+    if (input.unsentCards?.status === "ok" && input.unsentCards.count > 0) {
+        reasons.push(`cards-unsent:${input.unsentCards.count}`);
     }
 
     return { ok: reasons.length === 0, reasons };
@@ -1570,6 +1602,53 @@ export async function newestStatementPostedDate(client: Pick<typeof prisma, "ban
     return newest._max.postedDate ?? null;
 }
 
+/**
+ * Owners whose crew card was picked and never sent. Exported so the scoping is
+ * testable without standing up every other probe.
+ *
+ * Excluded on purpose:
+ *  - UNCERTAIN / POSTING: they have their own alarm (`cards-uncertain`).
+ *  - a queued resend (`resendQueuedAt` set): the cron drains it whatever its
+ *    date, and `cards-queued-stale` covers it if it does not.
+ *  - an owner with a delivery row for the day: they did get a message that day
+ *    (a queued resend of an older card went out instead), so they were not
+ *    left unasked.
+ */
+export function unsentCardOwners(
+    cards: Array<{ owner: string; status: string; postedAt: Date | null; resendQueuedAt: Date | null }>,
+    deliveredOwners: Iterable<string>,
+): string[] {
+    const delivered = new Set(deliveredOwners);
+    const asked = new Set<string>(CARD_OWNERS_ASKED);
+    const owners = new Set<string>();
+    for (const card of cards) {
+        if (card.status !== "PENDING" || card.postedAt !== null || card.resendQueuedAt !== null) continue;
+        if (!asked.has(card.owner) || delivered.has(card.owner)) continue;
+        owners.add(card.owner);
+    }
+    return [...owners].sort();
+}
+
+/** Crew cards picked for the last working day and never sent, with who went without. */
+export async function loadUnsentCards(
+    client: Pick<typeof prisma, "receiptRequestCard" | "receiptRequestCardDelivery">,
+    now: Date,
+): Promise<{ day: string; owners: string[] }> {
+    const day = previousPacificWeekday(now);
+    // At most one row per owner: (owner, pacificDate) is unique.
+    const cards = await client.receiptRequestCard.findMany({
+        where: { pacificDate: day, owner: { in: CARD_OWNERS_ASKED } },
+        select: { owner: true, status: true, postedAt: true, resendQueuedAt: true },
+    });
+    const candidates = unsentCardOwners(cards, []);
+    if (candidates.length === 0) return { day, owners: [] };
+    const delivered = await client.receiptRequestCardDelivery.findMany({
+        where: { deliveryDay: day, owner: { in: candidates } },
+        select: { owner: true },
+    });
+    return { day, owners: unsentCardOwners(cards, delivered.map(row => row.owner)) };
+}
+
 export async function runProbe<T>(
     name: string,
     run: (db: ProbeDb) => Promise<T>,
@@ -1701,7 +1780,7 @@ export async function getPipelineHealth(deps: {
         intakeStuck, intakeNeedsReview, intakeUnassigned, intakeQuarantined,
         qboAuth, payLinksPending, payLinksMissing, parkedCreates,
         parkedDocumentSyncs, pendingDeletions, unreconciledMoney, maintenanceRun,
-        uncertainCards, queuedCards, rejectedQueuedCards, bankPull,
+        uncertainCards, queuedCards, rejectedQueuedCards, unsentCards, bankPull,
         chaser, driveCredentials, duplicatePurchases,
     ] = await Promise.all([
         fetchIntuitStatus(),
@@ -2064,6 +2143,15 @@ export async function getPipelineHealth(deps: {
             }),
             0,
         ),
+        // A card PICKED for the last working day and never sent. The cron
+        // reports an out-of-time run as healthy, so this is the only thing that
+        // names who went without. Uses the probe's own `db` handle so it
+        // shares the probe's statement timeout.
+        probe<{ day: string | null; owners: string[] }>(
+            "unsentCards",
+            (db) => loadUnsentCards(db, new Date(now)),
+            { day: null, owners: [] },
+        ),
         // IN the Promise.all, and probed: it used to be an unprobed `await`
         // after it, so a hung database held the whole health check open past
         // every other probe's deadline and then answered "switched off".
@@ -2173,6 +2261,13 @@ export async function getPipelineHealth(deps: {
             reason: rejectedQueuedCards.reason,
             count: rejectedQueuedCards.value,
         },
+        unsentCards: {
+            status: unsentCards.status,
+            reason: unsentCards.reason,
+            count: unsentCards.value.owners.length,
+            day: unsentCards.value.day,
+            owners: unsentCards.value.owners,
+        },
         chaser: {
             status: chaser.status,
             reason: chaser.reason,
@@ -2249,6 +2344,12 @@ export async function getPipelineHealth(deps: {
         // where somebody can see it, not only in a cron log.
         bankPull: snapshot.bankPull,
         chaser: snapshot.chaser,
+        // HANDED BACK, because the digest reads them. They were probed and
+        // judged and then left off this object, so "Cards queued for resend"
+        // printed "unavailable" every morning while the reasons still fired.
+        queuedCards: snapshot.queuedCards,
+        rejectedQueuedCards: snapshot.rejectedQueuedCards,
+        unsentCards: snapshot.unsentCards,
         qboAuth: snapshot.qboAuth,
         payLinksPending: snapshot.payLinksPending,
         payLinksMissing: snapshot.payLinksMissing,
@@ -2324,6 +2425,17 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
             health.queuedCards?.status === "error" ? "unavailable (probe failed)" : health.queuedCards?.count ?? "unavailable"
         }${
             (health.rejectedQueuedCards?.count ?? 0) > 0 ? ` (${health.rejectedQueuedCards?.count} rejected by Chat)` : ""
+        }`,
+        `Crew receipt lists picked but never sent (last working day): ${
+            health.unsentCards?.status === "error"
+                ? "unavailable (probe failed)"
+                : health.unsentCards === undefined
+                    ? "unavailable"
+                    : health.unsentCards.count > 0
+                        ? `${health.unsentCards.count} (${(health.unsentCards.owners ?? []).join(", ")}${
+                            health.unsentCards.day ? `, ${health.unsentCards.day}` : ""
+                        })`
+                        : "0"
         }`,
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
         // Optional-chained on purpose: a digest that THROWS means no morning
