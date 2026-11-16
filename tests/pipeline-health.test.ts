@@ -30,8 +30,11 @@ import {
     CHASER_STALE_HOURS,
     INTAKE_STAGING_STUCK_MINUTES,
     type ProbeRunner,
+    loadUnsentCards,
+    unsentCardOwners,
 } from "../src/lib/pipeline-health";
 import { QBBudgetExhaustedError, type QBTokens, type RouteDeadline } from "../src/lib/quickbooks";
+import { previousPacificWeekday } from "../src/lib/receipt-request-cards";
 
 const NOW = Date.parse("2026-09-01T14:00:00.000Z");
 
@@ -1823,4 +1826,176 @@ test("the chaser probe reads the sweep's own marker row", () => {
     );
     assert.match(source, /"chaser",\s*\n\s*async \(\) => \{[\s\S]{0,400}parseSweepMarker\(row\?\.value\)/);
     assert.match(source, /\{ phase: "unknown", completedAt: null, blockedReason: null \}/, "an unreadable marker is not 'done'");
+});
+
+// ---- cards-unsent: a card picked on the last working day and never sent ----
+
+type FakeCard = { owner: string; pacificDate: string; status: string; postedAt: Date | null; resendQueuedAt: Date | null };
+type FakeDelivery = { owner: string; deliveryDay: string };
+
+function fakeCardClient(cards: FakeCard[], deliveries: FakeDelivery[] = []) {
+    const client = {
+        receiptRequestCard: {
+            findMany: async ({ where }: { where: { pacificDate: string; owner: { in: string[] } } }) =>
+                cards.filter(c => c.pacificDate === where.pacificDate && where.owner.in.includes(c.owner)),
+        },
+        receiptRequestCardDelivery: {
+            findMany: async ({ where }: { where: { deliveryDay: string; owner: { in: string[] } } }) =>
+                deliveries.filter(d => d.deliveryDay === where.deliveryDay && where.owner.in.includes(d.owner)),
+        },
+    };
+    return client as never;
+}
+
+const POSTED_AT = new Date("2026-11-12T15:00:00Z");
+const NEXT_MORNING = new Date("2026-11-13T14:00:00Z");
+const cjPosted: FakeCard = { owner: "CJ", pacificDate: "2026-11-12", status: "POSTED", postedAt: POSTED_AT, resendQueuedAt: null };
+const richardUnsent: FakeCard = { owner: "Richard", pacificDate: "2026-11-12", status: "PENDING", postedAt: null, resendQueuedAt: null };
+const cjDelivery: FakeDelivery = { owner: "CJ", deliveryDay: "2026-11-12" };
+const UNSENT_LABEL = "Crew receipt lists picked but never sent \\(last working day\\): ";
+
+test("previousPacificWeekday is the last Mon-Fri strictly before today in Pacific", () => {
+    assert.equal(previousPacificWeekday(new Date("2026-11-13T14:00:00Z")), "2026-11-12");
+    assert.equal(previousPacificWeekday(new Date("2026-11-16T14:00:00Z")), "2026-11-13");
+    assert.equal(previousPacificWeekday(new Date("2026-11-14T20:00:00Z")), "2026-11-13");
+    assert.equal(previousPacificWeekday(new Date("2026-11-15T20:00:00Z")), "2026-11-13");
+    assert.equal(previousPacificWeekday(new Date("2026-11-13T05:00:00Z")), "2026-11-11");
+    // Clock changes do not move the calendar day: the Monday after the fall
+    // change and the Monday after the spring change both look back to Friday.
+    assert.equal(previousPacificWeekday(new Date("2026-11-02T08:30:00Z")), "2026-10-30");
+    assert.equal(previousPacificWeekday(new Date("2027-03-15T07:01:00Z")), "2027-03-12");
+});
+
+test("2026-11-12 reproduction: Richard's card left PENDING is named the next morning", async () => {
+    const found = await loadUnsentCards(fakeCardClient([cjPosted, richardUnsent], [cjDelivery]), NEXT_MORNING);
+    assert.deepEqual(found, { day: "2026-11-12", owners: ["Richard"] });
+
+    const verdict = evaluatePipelineHealth(snapshot({ unsentCards: { status: "ok", count: 1 } }));
+    assert.deepEqual(verdict, { ok: false, reasons: ["cards-unsent:1"] });
+
+    const text = formatPipelineDigest(sampleHealth({
+        ok: false,
+        reasons: ["cards-unsent:1"],
+        unsentCards: { status: "ok", count: 1, day: "2026-11-12", owners: ["Richard"] },
+    })).text;
+    assert.match(text, /Crew receipt lists picked but never sent \(last working day\): 1 \(Richard, 2026-11-12\)/);
+    assert.match(text, /Needs attention: cards-unsent:1/);
+});
+
+test("cards-unsent guards: only a card that is truly unsent for the previous weekday counts", async () => {
+    const owners = async (cards: FakeCard[], now: Date, deliveries: FakeDelivery[] = []) =>
+        (await loadUnsentCards(fakeCardClient(cards, deliveries), now)).owners;
+
+    // Thursday afternoon Pacific: the card is still TODAY's and a later pass may send it.
+    assert.deepEqual(await owners([cjPosted, richardUnsent], new Date("2026-11-12T23:00:00Z"), [cjDelivery]), []);
+    // Sent.
+    assert.deepEqual(
+        await owners([{ ...richardUnsent, status: "POSTED", postedAt: POSTED_AT }], NEXT_MORNING),
+        [],
+    );
+    // UNCERTAIN / POSTING have their own alarm.
+    assert.deepEqual(await owners([{ ...richardUnsent, status: "UNCERTAIN" }], NEXT_MORNING), []);
+    assert.deepEqual(await owners([{ ...richardUnsent, status: "POSTING" }], NEXT_MORNING), []);
+    // A queued resend is drained by the cron and has cards-queued-stale.
+    assert.deepEqual(
+        await owners([{ ...richardUnsent, resendQueuedAt: new Date("2026-11-12T20:00:00Z") }], NEXT_MORNING),
+        [],
+    );
+    // Not somebody the cron asks.
+    assert.deepEqual(await owners([{ ...richardUnsent, owner: "Justin" }], NEXT_MORNING), []);
+    // They did get a message that day (an older queued resend went out instead).
+    assert.deepEqual(
+        await owners([richardUnsent], NEXT_MORNING, [{ owner: "Richard", deliveryDay: "2026-11-12" }]),
+        [],
+    );
+    // Only the previous weekday counts.
+    assert.deepEqual(await owners([{ ...richardUnsent, pacificDate: "2026-11-10" }], NEXT_MORNING), []);
+});
+
+test("cards-unsent: Monday looks at Friday, and both owners are named", async () => {
+    const friday: FakeCard = { ...richardUnsent, pacificDate: "2026-11-13" };
+    const monday = new Date("2026-11-16T14:00:00Z");
+    assert.deepEqual(
+        await loadUnsentCards(fakeCardClient([friday]), monday),
+        { day: "2026-11-13", owners: ["Richard"] },
+    );
+
+    const both = await loadUnsentCards(
+        fakeCardClient([richardUnsent, { ...richardUnsent, owner: "CJ" }]),
+        NEXT_MORNING,
+    );
+    assert.deepEqual(both.owners, ["CJ", "Richard"]);
+    const verdict = evaluatePipelineHealth(snapshot({ unsentCards: { status: "ok", count: both.owners.length } }));
+    assert.deepEqual(verdict.reasons, ["cards-unsent:2"]);
+    assert.deepEqual(unsentCardOwners([], []), []);
+});
+
+test("cards-unsent verdict: zero and absent are quiet, a failed probe is probe-failed only", () => {
+    assert.deepEqual(evaluatePipelineHealth(snapshot({ unsentCards: { status: "ok", count: 0 } })).reasons, []);
+
+    const absent = evaluatePipelineHealth(snapshot());
+    assert.ok(!absent.reasons.includes("probe-failed:unsentCards"));
+    assert.deepEqual(absent.reasons, []);
+
+    const broken = evaluatePipelineHealth(snapshot({ unsentCards: { status: "error", reason: "error", count: 0 } }));
+    assert.ok(broken.reasons.includes("probe-failed:unsentCards"), broken.reasons.join(","));
+    assert.ok(!broken.reasons.some(r => r.startsWith("cards-unsent")));
+});
+
+test("cards-unsent digest line: zero, absent and failed probe", () => {
+    const zero = formatPipelineDigest(sampleHealth({ unsentCards: { status: "ok", count: 0, day: "2026-11-12", owners: [] } })).text;
+    assert.match(zero, new RegExp(UNSENT_LABEL + "0\\b"));
+    const absent = formatPipelineDigest(sampleHealth()).text;
+    assert.match(absent, new RegExp(UNSENT_LABEL + "unavailable\\s*(\\n|$)"));
+    const failed = formatPipelineDigest(sampleHealth({
+        unsentCards: { status: "error", reason: "error", count: 0, day: null, owners: [] },
+    })).text;
+    assert.match(failed, new RegExp(UNSENT_LABEL + "unavailable \\(probe failed\\)"));
+});
+
+test("cards-unsent is wired into getPipelineHealth and the returned object", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
+        "utf8",
+    );
+    assert.match(source, /"unsentCards",\s*\n\s*\(db\) => loadUnsentCards\(db, new Date\(now\)\)/);
+    assert.match(source, /unsentCards: snapshot\.unsentCards/);
+    // THE ORDER IS THE WIRING. The probes come back as a positional array, so
+    // a name one slot off silently reads its neighbour's answer. Pin both
+    // sides: the names taken out, and the probes put in.
+    assert.match(source, /uncertainCards, queuedCards, rejectedQueuedCards, unsentCards, bankPull,/);
+    const probeOrder = ["\"rejectedQueuedCards\",", "\"unsentCards\",", "\"bankPull\","].map(name => source.indexOf(`        ${name}`));
+    assert.ok(probeOrder.every(at => at > 0), `probe not found: ${probeOrder.join(",")}`);
+    assert.deepEqual([...probeOrder].sort((a, b) => a - b), probeOrder, "probes are not in the order they are destructured");
+    assert.match(source, /count: unsentCards\.value\.owners\.length,\s*\n\s*day: unsentCards\.value\.day,\s*\n\s*owners: unsentCards\.value\.owners,/);
+});
+
+test("the guide documents cards-unsent:N, identically in the doc and the generated copy", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const doc = readFileSync(join(root, "docs/qbo-expense-sync-flow.html"), "utf8");
+    const guide = readFileSync(join(root, "src/app/automation/guide/guide-html.ts"), "utf8");
+    const row = "      <tr><td><code>cards-unsent:N</code></td><td>On the last working day, a receipts-needed list was picked for N people and never sent to them. Any of those charges that still need a receipt get asked again on a later list.</td><td>Justin</td></tr>";
+    assert.ok(doc.includes(row), "doc row missing");
+    assert.ok(guide.includes(JSON.stringify(row).slice(1, -1)), "guide copy row missing");
+});
+
+test("the resend counts reach the digest: getPipelineHealth returns what the digest line reads", () => {
+    // The digest's "Cards queued for resend" line reads `health.queuedCards`
+    // and `health.rejectedQueuedCards`. Both were probed and judged, then left
+    // off the object handed back, so the line said "unavailable" every single
+    // morning — a count nobody could see is a count nobody acts on.
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
+        "utf8",
+    );
+    const returned = source.slice(source.indexOf("        ...verdict,"));
+    assert.match(returned, /queuedCards: snapshot\.queuedCards,/);
+    assert.match(returned, /rejectedQueuedCards: snapshot\.rejectedQueuedCards,/);
+
+    // And what that buys, end to end through the formatter.
+    const { text } = formatPipelineDigest(sampleHealth({
+        queuedCards: { status: "ok", count: 2 },
+        rejectedQueuedCards: { status: "ok", count: 1 },
+    }));
+    assert.match(text, /Cards queued for resend >6h: 2 \(1 rejected by Chat\)/);
 });
