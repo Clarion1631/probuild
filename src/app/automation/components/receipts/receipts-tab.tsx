@@ -7,6 +7,8 @@ import { retryTargetFor } from "@/lib/receipt-intake/route-state";
 import { describeStateReason, AMOUNT_NOT_READ_TEXT } from "@/lib/receipt-intake/reason-text";
 import { isPossibleOrphanReason } from "@/lib/receipt-intake/park";
 import { suggestJobsForFolder, folderFact, type FolderSuggestions } from "@/lib/receipt-intake/folder";
+import { isPersonToPersonPayment } from "@/lib/receipt-policy";
+import { CARD_OWNERS_ASKED, isTooOldForCrew, pacificDate } from "@/lib/receipt-request-cards";
 import { StatCard } from "../shared/stat-card";
 import MarkReviewedButton from "../register/mark-reviewed-button";
 import {
@@ -335,6 +337,7 @@ export async function ReceiptsTab({
     nativeActive,
     crewRequestsEnabled,
     sign,
+    now = new Date(),
 }: {
     queue: ReceiptQueue;
     filters: ReceiptFilters;
@@ -355,11 +358,14 @@ export async function ReceiptsTab({
     crewRequestsEnabled?: boolean;
     /** Injected only by tests: a production render takes the real signer. */
     sign?: ReceiptBatchSigner;
+    /** Injected only by tests: the clock that decides which charges are too old for the crew list. */
+    now?: Date;
 }) {
     // Marge's list is the default shape of this tab, so the plan comes first:
     // in that shape the rows worth signing are exactly the ones it says will be
     // drawn, which is a few dozen rather than five groups of a hundred.
-    const todo = showsTodoView(filters) ? planTodo(queue) : null;
+    const todo = showsTodoView(filters) ? planTodo(queue, now) : null;
+    const today = pacificDate(now);
 
     // ONE batched signing step for every row this render will draw, taken
     // before any of it is drawn, under ONE budget. Per-row signing here is five
@@ -675,10 +681,10 @@ export async function ReceiptsTab({
                                 {bucket.owner === "unattributed" && (
                                     <p className="px-4 py-2 text-xs text-amber-700 bg-amber-50 border-b border-amber-100">
                                         No card tail on these, so nobody can be asked yet. Set whose charge each one was
-                                        and it joins their card tomorrow morning.
+                                        and it joins their list if it was posted in the last 14 days. Older ones are not asked. Office follows up.
                                     </p>
                                 )}
-                                {bucket.rows.map(row => <MissingReceiptRowView key={row.id} row={row} />)}
+                                {bucket.rows.map(row => <MissingReceiptRowView key={row.id} row={row} today={today} />)}
                             </div>
                         ))
                     )}
@@ -992,7 +998,11 @@ function TodoDone({ plan }: { plan: TodoPlan }) {
     );
 }
 
-function MissingReceiptRowView({ row }: { row: MissingReceiptRow }) {
+function MissingReceiptRowView({ row, today }: { row: MissingReceiptRow; today: string }) {
+    // An open, unanswered crew charge past the ask window. A held row keeps its
+    // own sentence below, and a reviewed or answered one needs nobody.
+    const tooOld = !row.outreachHold && !row.acknowledged && row.resolution === null
+        && CARD_OWNERS_ASKED.includes(row.owner as never) && isTooOldForCrew(row.postedDate, today);
     return (
         <RowShell>
             <div className="min-w-[18rem]">
@@ -1012,12 +1022,15 @@ function MissingReceiptRowView({ row }: { row: MissingReceiptRow }) {
                             thing. The To-do strip links here by that raw value, so
                             it has to be findable, and true, once you arrive. */}
                         {row.outreachHold === "office-invoice"
-                            ? "Office invoice — collect from billing email. Crew request held."
+                            ? (isPersonToPersonPayment(row.rawDescriptor)
+                                ? TODO_COPY.personPaymentRow
+                                : "Office invoice — collect from billing email. Crew request held.")
                             : row.outreachHold === "existing-evidence-review"
                                 ? "Existing document needs reconciliation. Crew request held. Justin checks this one."
                                 : `Held for a reason this page has no words for: ${row.outreachHold}. Crew request held.`}
                     </p>
                 )}
+                {tooOld && <p className="text-xs text-amber-700 mt-1">{TODO_COPY.tooOldRow}</p>}
                 {row.resolution !== null && row.resolution !== "memo-signed" && (
                     <p className="text-xs text-amber-700 mt-1">
                         Answered in a way this page has no words for.
