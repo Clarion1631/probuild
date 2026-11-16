@@ -12,6 +12,10 @@ import {
 import { CARD_POST_TIMEOUT_MS, postOwnerCard, type OwnerCard } from "../src/lib/receipt-request-cards";
 import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_UNCERTIFIED_KEY } from "../src/lib/pipeline-health";
 
+// A charge date inside the 14-day crew ask window on whatever day this suite runs: the cron under
+// test reads the real clock, and a fixed date would age out of the window.
+const RECENT_DAY = new Date(Date.now() - 5 * 86_400_000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+
 /**
  * Codex PR #443, adversarial gate round 35.
  *
@@ -314,7 +318,7 @@ function scanRow(id: string, owner: string): ScanRow {
         targetKey: `bl-${id}`,
         reasonCodes: JSON.stringify(["MISSING_RECEIPT"]),
         acknowledgedCodes: "[]",
-        displayDetails: JSON.stringify({ amountCents: -100, owner, postedDate: "2026-08-16", payee: "LOWES", fingerprint: `pb-${id}` }),
+        displayDetails: JSON.stringify({ amountCents: -100, owner, postedDate: RECENT_DAY, payee: "LOWES", fingerprint: `pb-${id}` }),
     };
 }
 
@@ -599,7 +603,7 @@ function seedClaimedCard(): Record<string, unknown> {
         id: "card-1",
         owner: "CJ",
         pacificDate: date,
-        itemsJson: JSON.stringify([{ issueId: "ri-1", n: 1, fingerprint: "pb-ri-1", cents: 12_345, amount: "123.45", date: "2026-08-16", vendor: "LOWES", cardTail: null, targetKey: "bl-ri-1" }]),
+        itemsJson: JSON.stringify([{ issueId: "ri-1", n: 1, fingerprint: "pb-ri-1", cents: 12_345, amount: "123.45", date: RECENT_DAY, vendor: "LOWES", cardTail: null, targetKey: "bl-ri-1" }]),
         overflow: 0,
         overflowExact: true,
         status: "PENDING",

@@ -15,6 +15,10 @@ import { parseReceiptFilters, type ReceiptFilters } from "../src/app/automation/
 import { CREW_REQUESTS_OFF_NOTICE } from "../src/app/automation/receipts-todo";
 import type { IntakeRow, MissingReceiptRow, ReceiptQueue } from "../src/app/automation/receipts-data";
 
+// The clock the tab uses to decide which charges are too old for the crew list: fixed, so the fixtures
+// (charges posted 2026-09-02) stay inside the 14-day window whatever day this suite runs.
+const RENDER_NOW = new Date("2026-09-10T12:00:00Z");
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 const NOTICE_TEXT =
@@ -68,7 +72,7 @@ const sign: ReceiptBatchSigner = async paths =>
 
 const render = async (queue: ReceiptQueue, filters: ReceiptFilters, crewRequestsEnabled?: boolean) =>
     renderToStaticMarkup(await ReceiptsTab({
-        queue, filters, jobs: [], filterHref: () => "/automation?tab=receipts", nativeActive: false, sign,
+        queue, filters, jobs: [], filterHref: () => "/automation?tab=receipts", nativeActive: false, now: RENDER_NOW, sign,
         ...(crewRequestsEnabled === undefined ? {} : { crewRequestsEnabled }),
     }));
 

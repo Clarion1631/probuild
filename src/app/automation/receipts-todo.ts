@@ -52,13 +52,14 @@
  * every exported copy constant rather than trusting review.
  */
 import { normalizePayee } from "@/lib/bank-ledger";
-import { looksLikeCheckOrSubBill } from "@/lib/receipt-policy";
+import { isDuesInvoice, isPersonToPersonPayment, looksLikeCheckOrSubBill } from "@/lib/receipt-policy";
+import { CARD_OWNERS_ASKED, CREW_ASK_WINDOW_DAYS, isTooOldForCrew, pacificDate } from "@/lib/receipt-request-cards";
 import type { IntakeRow, MissingReceiptRow, ReceiptQueue } from "./receipts-data";
 import { RECEIPT_GROUP_TAKE, ownerRank, type ReceiptGroup } from "./receipts-filters";
 
 export type TodoPileKey =
     | "whose-card" | "pick-the-job" | "better-photo" | "tell-justin"
-    | "ask-for-these" | "checks-and-sub-bills";
+    | "ask-for-these" | "too-old-for-crew" | "checks-and-sub-bills";
 
 /** A rolled-up run of identical charges, or a single one (rows.length === 1). */
 export interface TodoRequestItem {
@@ -167,6 +168,10 @@ export const TODO_PILE_COPY: Record<TodoPileKey, { title: string; note: string }
         title: "Ask for these receipts",
         note: "A charge with no receipt behind it. Ask the person, then mark it reviewed so it drops off this list.",
     },
+    "too-old-for-crew": {
+        title: "Too old for the crew list",
+        note: `These are crew charges posted more than ${CREW_ASK_WINDOW_DAYS} days ago, so the crew is no longer asked about them. They are still open. Office follows up.`,
+    },
     "checks-and-sub-bills": {
         title: "Checks and sub bills",
         note: "A check needs two things: a photo of the front, and the bill it paid. Post both the way the guide says, then mark it reviewed. These are yours, not the crew's.",
@@ -200,6 +205,10 @@ export const TODO_COPY = {
     // claim the detector cannot make.
     cappedGroups: "Some receipt groups may have more rows than this page loads. Justin checks those.",
     noCard: "no card (office rail)",
+    // The same sentence the Receipts tab prints under an old open charge.
+    tooOldRow: "Too old for the crew list. Office follows up.",
+    // The tab's sentence for an office hold on a Venmo, Cash App or Zelle payment.
+    personPaymentRow: "Payment to a person. The office adds a note saying what it was for. Crew request held.",
     checkFacts: "check paid",
     checkSentence: "Needs the check photo and the bill it paid.",
     checkLink: "What to post ↗",
@@ -226,7 +235,7 @@ export const PILE_AGE_MIN_DAYS = 7;
 
 type FoldedKey =
     | "booking" | "booked-today" | "not-a-receipt" | "switched-off" | "retryable"
-    | "held" | "office-invoice" | "acknowledged" | "memo-signed" | "office-owner"
+    | "held" | "office-invoice" | "person-payment" | "acknowledged" | "memo-signed" | "office-owner"
     | "bookkeeping" | "duplicates" | "exceptions" | "uncertain-cards";
 
 interface FoldedCopy {
@@ -288,6 +297,11 @@ export const FOLDED_COPY: Record<FoldedKey, FoldedCopy> = {
     "office-invoice": {
         one: "1 is an office bill. The office collects that one from the billing email.",
         many: "{n} are office bills. The office collects those from the billing email.",
+        target: { group: "missing-receipts" },
+    },
+    "person-payment": {
+        one: "1 is a payment to a person. The office adds a note saying what it was for.",
+        many: "{n} are payments to people. The office adds a note saying what each was for.",
         target: { group: "missing-receipts" },
     },
     acknowledged: {
@@ -353,7 +367,7 @@ export const DYNAMIC_FOLDED_COPY = {
 
 const FOLDED_ORDER: FoldedKey[] = [
     "booking", "booked-today", "not-a-receipt", "switched-off", "retryable",
-    "held", "office-invoice", "acknowledged", "memo-signed",
+    "held", "office-invoice", "person-payment", "acknowledged", "memo-signed",
     "office-owner", "bookkeeping",
     "duplicates", "exceptions", "uncertain-cards",
 ];
@@ -709,18 +723,30 @@ export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan 
     const whoseCard: MissingReceiptRow[] = [];
     const askForThese: MissingReceiptRow[] = [];
     const checks: MissingReceiptRow[] = [];
+    // Open crew charges past the ask window. Still open, never folded or dropped:
+    // somebody in the office has to find the receipt.
+    const tooOldForCrew: MissingReceiptRow[] = [];
+    const today = pacificDate(now);
     for (const row of queue.missingReceipts) {
-        const hold = row.outreachHold ?? null;
+        // A hold that exists only because of the newer office rules (payments to
+        // people, dues) on a row with no crew owner is read as no hold, so it
+        // lands where it did before those rules: the visible whose-card pile for
+        // an unknown card, the office line for the office rail.
+        const newRuleHold = row.outreachHold === "office-invoice"
+            && !CARD_OWNERS_ASKED.includes(row.owner as never)
+            && (isPersonToPersonPayment(row.rawDescriptor) || isDuesInvoice(row.rawDescriptor));
+        const hold = newRuleHold ? null : (row.outreachHold ?? null);
         const resolution = row.resolution ?? null;
         if (row.acknowledged) fold("acknowledged", row.id);
         else if (resolution === "memo-signed") fold("memo-signed", row.id);
         else if (resolution !== null && !KNOWN_RESOLUTIONS.has(resolution)) fold(`unknown-resolution:${resolution}`, row.id);
         else if (hold === "existing-evidence-review") fold("held", row.id);
-        else if (hold === "office-invoice") fold("office-invoice", row.id);
+        else if (hold === "office-invoice") fold(isPersonToPersonPayment(row.rawDescriptor) ? "person-payment" : "office-invoice", row.id);
         else if (hold !== null && hold !== "" && !KNOWN_HOLDS.has(hold)) fold(`unknown-hold:${hold}`, row.id);
         else if (isCheckPileRow(row)) checks.push(row);
         else if (row.owner === "unattributed" || row.owner === "unassigned") whoseCard.push(row);
         else if (row.owner === "office") fold("office-owner", row.id);
+        else if (CARD_OWNERS_ASKED.includes(row.owner as never) && isTooOldForCrew(row.postedDate, today)) tooOldForCrew.push(row);
         else askForThese.push(row);
     }
 
@@ -731,6 +757,7 @@ export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan 
 
     const whoseCardItems = rollUpRepeats(whoseCard).sort(byOwnerThenAmount);
     const askItems = rollUpRepeats(askForThese).sort(byOwnerThenAmount);
+    const tooOldItems = rollUpRepeats(tooOldForCrew).sort(byOwnerThenAmount);
     const checkItems = rollUpRepeats(checks).sort(byAmountDesc);
     const pickJobRows = [...pickJob].sort(intakeByAmount);
     const betterPhotoRows = [...betterPhoto].sort(intakeByAmount);
@@ -745,6 +772,7 @@ export function planTodo(queue: ReceiptQueue, now: Date = new Date()): TodoPlan 
         pileOf("better-photo", betterPhotoRows.map(row => ({ kind: "intake" as const, row })), betterPhotoRows.map(intakeDay), now),
         pileOf("tell-justin", tellJustinRows.map(row => ({ kind: "intake" as const, row })), tellJustinRows.map(intakeDay), now),
         pileOf("ask-for-these", askItems.map(item => ({ kind: "request" as const, item })), requestDays(askItems), now),
+        pileOf("too-old-for-crew", tooOldItems.map(item => ({ kind: "request" as const, item })), requestDays(tooOldItems), now),
         // LAST, despite holding the biggest amounts. Every other pile finishes
         // inside the five minutes this page is for; a check waits on a third
         // party to send a bill. Sorting it by dollars to the top would bury the

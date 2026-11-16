@@ -12,9 +12,8 @@ import {
 } from "../src/lib/receipt-card-history";
 import {
     CARD_RATE_CEILING,
+    CREW_ASK_WINDOW_DAYS,
     MAX_ITEMS_PER_CARD,
-    RECENT_CHARGE_WINDOW_DAYS,
-    BACKLOG_RESERVED_SLOTS,
     buildCardFromItems,
     buildOwnerCards,
     centsToAmount,
@@ -87,27 +86,27 @@ test("requestId is deterministic per owner + Pacific date, and doubles as the th
     assert.equal(again[0].requestId, cards[0].requestId);
 });
 
-test("never-carded items outrank carded ones, however old the carded ones are", () => {
+test("never-carded items outrank carded ones, even when the carded ones are older", () => {
     // Ordering by age alone froze the list: once the ten oldest were on a card,
     // the same ten went out every morning and an eleventh newer charge was
     // never asked about at all.
     const cards = buildOwnerCards([
-        issue({ id: "old", targetKey: "bl-old", postedDate: "2026-08-01", everCarded: true }),
+        issue({ id: "old", targetKey: "bl-old", postedDate: "2026-08-10", everCarded: true }),
         issue({ id: "new", targetKey: "bl-new", postedDate: "2026-08-18", everCarded: false }),
     ], NOW);
     assert.deepEqual(cards[0].items.map(i => i.targetKey), ["bl-new", "bl-old"]);
 });
 
 test("yesterday's overflow is today's first candidate", () => {
-    const many = Array.from({ length: 12 }, (_, i) => issue({
+    const many = Array.from({ length: 7 }, (_, i) => issue({
         id: `ri-${i}`, targetKey: `bl-${i}`,
-        // All well outside the 10-day recent window, so only everCarded decides.
-        postedDate: `2026-06-${String(i + 1).padStart(2, "0")}`,
-        // The ten oldest were carded yesterday; two never were.
-        everCarded: i < 10,
+        // All inside the 14-day window, so only everCarded decides.
+        postedDate: `2026-08-${String(i + 8).padStart(2, "0")}`,
+        // The five oldest were carded yesterday; two never were.
+        everCarded: i < 5,
     }));
     const [card] = buildOwnerCards(many, NOW);
-    assert.deepEqual(card.items.slice(0, 2).map(i => i.targetKey), ["bl-10", "bl-11"],
+    assert.deepEqual(card.items.slice(0, 2).map(i => i.targetKey), ["bl-5", "bl-6"],
         "the two that did not fit yesterday lead today's card");
 });
 
@@ -122,14 +121,14 @@ test("selection is stable across runs — same inputs, same order", () => {
     assert.deepEqual(first, ["bl-a", "bl-b"], "the lowest targetKey breaks a same-date tie");
 });
 
-test("a card lists at most 10 items and says how many it held back", () => {
-    const many = Array.from({ length: 14 }, (_, i) =>
-        issue({ id: `ri-${i}`, targetKey: `bl-${i}`, postedDate: `2026-08-${String(i + 1).padStart(2, "0")}` }));
+test("a card lists at most 5 items and says how many more are waiting", () => {
+    const many = Array.from({ length: 8 }, (_, i) =>
+        issue({ id: `ri-${i}`, targetKey: `bl-${i}`, postedDate: `2026-08-${String(i + 10).padStart(2, "0")}` }));
     const [card] = buildOwnerCards(many, NOW);
     assert.equal(card.items.length, MAX_ITEMS_PER_CARD);
-    assert.equal(card.overflow, 4);
-    assert.match(card.text, /and 4 more/);
-    assert.deepEqual(card.items.map(i => i.n), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert.equal(card.overflow, 3);
+    assert.match(card.text, /and 3 more waiting/);
+    assert.deepEqual(card.items.map(i => i.n), [1, 2, 3, 4, 5]);
 });
 
 test("never more than CARD_RATE_CEILING cards per run", () => {
@@ -360,7 +359,7 @@ test("an item answered between selection and the send is dropped from the card",
         ["e", truthOf({ owner: "Richard" })],
     ]);
 
-    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    const rebuilt = rebuildCardItems(items, truth, "CJ", "2026-08-20");
     assert.deepEqual(rebuilt.items.map(i => i.issueId), ["a"]);
     assert.deepEqual(rebuilt.dropped, [
         { issueId: "b", reason: "cleared" },
@@ -381,7 +380,7 @@ test("evidence found after fingerprinting drops the item — the issue's own cle
         ["a", truthOf()],
         ["f", truthOf({ evidenceSatisfied: true })],
     ]);
-    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    const rebuilt = rebuildCardItems(items, truth, "CJ", "2026-08-20");
     assert.deepEqual(rebuilt.items.map(i => i.issueId), ["a"]);
     assert.deepEqual(rebuilt.dropped, [{ issueId: "f", reason: "evidence-found" }]);
 });
@@ -390,12 +389,12 @@ test("evidence-found is checked BEFORE acknowledged/owner — the strongest reas
     const truth = new Map<string, CardItemTruth>([
         ["a", truthOf({ evidenceSatisfied: true, acknowledged: true, owner: "Richard" })],
     ]);
-    const rebuilt = rebuildCardItems([cardItem("a", 1)], truth, "CJ");
+    const rebuilt = rebuildCardItems([cardItem("a", 1)], truth, "CJ", "2026-08-20");
     assert.deepEqual(rebuilt.dropped, [{ issueId: "a", reason: "evidence-found" }]);
 });
 
 test("an issue that no longer exists is dropped, not carried", () => {
-    const rebuilt = rebuildCardItems([cardItem("gone", 1)], new Map(), "CJ");
+    const rebuilt = rebuildCardItems([cardItem("gone", 1)], new Map(), "CJ", "2026-08-20");
     assert.deepEqual(rebuilt.items, []);
     assert.deepEqual(rebuilt.dropped, [{ issueId: "gone", reason: "missing" }]);
 });
@@ -409,7 +408,7 @@ test("survivors are RENUMBERED, because the numbers are what people reply with",
         ["b", truthOf()],
         ["c", truthOf()],
     ]);
-    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    const rebuilt = rebuildCardItems(items, truth, "CJ", "2026-08-20");
     assert.deepEqual(rebuilt.items.map(i => i.n), [1, 2]);
     assert.deepEqual(rebuilt.items.map(i => i.issueId), ["b", "c"]);
     // And the rendered card counts from 1 with no gaps.
@@ -426,14 +425,14 @@ test("nothing left to ask about produces an EMPTY rebuild, which cancels the car
         ["a", truthOf({ clearedAt: new Date() })],
         ["b", truthOf({ resolved: true })],
     ]);
-    assert.deepEqual(rebuildCardItems(items, truth, "CJ").items, []);
+    assert.deepEqual(rebuildCardItems(items, truth, "CJ", "2026-08-20").items, []);
 });
 
 test("an untouched snapshot rebuilds to itself, byte for byte", () => {
     // The common case must not churn the row or renumber anything.
     const items = [cardItem("a", 1), cardItem("b", 2)];
     const truth = new Map<string, CardItemTruth>([["a", truthOf()], ["b", truthOf()]]);
-    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    const rebuilt = rebuildCardItems(items, truth, "CJ", "2026-08-20");
     assert.deepEqual(rebuilt.items, items);
     assert.deepEqual(rebuilt.dropped, []);
 });
@@ -528,9 +527,9 @@ test("recording a delivered card marks its items CARDED, so tomorrow deprioritis
 
     // Which changes the ordering: a carded item yields to one nobody has asked
     // about yet.
-    const carded = issue({ id: "ri-carded", targetKey: "bl-carded", everCarded: true, postedDate: "2026-08-01" });
+    const carded = issue({ id: "ri-carded", targetKey: "bl-carded", everCarded: true, postedDate: "2026-08-10" });
     const fresh = issue({ id: "ri-fresh", targetKey: "bl-fresh", everCarded: false, postedDate: "2026-08-16" });
-    const { items } = selectOwnerItems([carded, fresh], "CJ");
+    const { items } = selectOwnerItems([carded, fresh], "CJ", "2026-08-20");
     assert.deepEqual(items.map(i => i.issueId), ["ri-fresh", "ri-carded"], "never-carded first, even though it is newer");
 });
 
@@ -647,7 +646,9 @@ test("the cron commits delivery+history together and repairs old gaps", () => {
     assert.match(source, /repairedHistory: repaired,/);
 });
 
-// ---- recent never-carded charges jump the backlog -------------------------
+// ---- only recent charges, five at most --------------------------------------
+// (spec receipt-asks-small-and-recent: the 10-day lead window and the backlog
+// reserve are gone; the card holds charges posted 0 to 14 days ago.)
 
 const TODAY = "2026-08-20";
 const dayBefore = (n: number): string => {
@@ -656,120 +657,62 @@ const dayBefore = (n: number): string => {
 };
 const ids = (r: { items: CardItem[] }): string[] => r.items.map(i => i.issueId);
 
-function backlogFixture(): CardCandidateIssue[] {
+test("CREW_ASK_WINDOW_DAYS is 14 and a card holds 5", () => {
+    assert.equal(CREW_ASK_WINDOW_DAYS, 14);
+    assert.equal(MAX_ITEMS_PER_CARD, 5);
+});
+
+test("the backlog never rides along: old charges are not selected at all", () => {
+    const cands = [
+        ...Array.from({ length: 12 }, (_, i) => issue({ id: `old-${i}`, targetKey: `bl-old-${String(i).padStart(2, "0")}`, postedDate: dayBefore(100 - i) })),
+        issue({ id: "recent-4", targetKey: "bl-r4", postedDate: dayBefore(4) }),
+        issue({ id: "recent-5", targetKey: "bl-r5", postedDate: dayBefore(5) }),
+    ];
+    const r = selectOwnerItems(cands, "CJ", TODAY);
+    assert.deepEqual(ids(r), ["recent-5", "recent-4"]);
+    assert.equal(r.overflow, 0);
+});
+
+test("the window edge: exactly CREW_ASK_WINDOW_DAYS old is asked, one day older is not", () => {
+    const edge = issue({ id: "edge", targetKey: "bl-z-edge", postedDate: dayBefore(CREW_ASK_WINDOW_DAYS) });
+    const past = issue({ id: "past", targetKey: "bl-a-past", postedDate: dayBefore(CREW_ASK_WINDOW_DAYS + 1) });
+    assert.deepEqual(ids(selectOwnerItems([past, edge], "CJ", TODAY)), ["edge"]);
+});
+
+test("more than 5 askable never-carded: the 5 oldest are listed and the rest are counted", () => {
     const cands: CardCandidateIssue[] = [];
-    for (let i = 0; i < 12; i++) {
-        cands.push(issue({ id: `old-${i}`, targetKey: `bl-old-${String(i).padStart(2, "0")}`, postedDate: dayBefore(100 - i) }));
-    }
-    cands.push(issue({ id: "recent-4", targetKey: "bl-r4", postedDate: dayBefore(4) }));
-    cands.push(issue({ id: "recent-5", targetKey: "bl-r5", postedDate: dayBefore(5) }));
-    return cands;
-}
-
-test("RECENT_CHARGE_WINDOW_DAYS is 10", () => {
-    assert.equal(RECENT_CHARGE_WINDOW_DAYS, 10);
-});
-
-test("recent never-carded charges go first, then the oldest backlog", () => {
-    const r = selectOwnerItems(backlogFixture(), "CJ", TODAY);
-    assert.equal(r.items.length, 10);
-    assert.deepEqual(ids(r), ["recent-5", "recent-4", "old-0", "old-1", "old-2", "old-3", "old-4", "old-5", "old-6", "old-7"]);
-    assert.equal(r.overflow, 4);
-});
-
-test("omitting today gives exactly the old order", () => {
-    const r = selectOwnerItems(backlogFixture(), "CJ");
-    assert.deepEqual(ids(r), ["old-0", "old-1", "old-2", "old-3", "old-4", "old-5", "old-6", "old-7", "old-8", "old-9"]);
-    assert.equal(r.overflow, 4);
-    assert.deepEqual(ids(selectOwnerItems(backlogFixture(), "CJ", "not-a-date")), ids(r));
-});
-
-test("the window edge: exactly RECENT_CHARGE_WINDOW_DAYS old is recent, one day older is not", () => {
-    const edge = issue({ id: "edge", targetKey: "bl-z-edge", postedDate: dayBefore(RECENT_CHARGE_WINDOW_DAYS) });
-    const past = issue({ id: "past", targetKey: "bl-a-past", postedDate: dayBefore(RECENT_CHARGE_WINDOW_DAYS + 1) });
-    assert.deepEqual(ids(selectOwnerItems([past, edge], "CJ", TODAY)), ["edge", "past"]);
-});
-
-test("an ever-carded item is not promoted by being recent", () => {
-    const oldFresh = issue({ id: "old-fresh", targetKey: "bl-old", postedDate: "2026-06-01" });
-    const recentCarded = issue({ id: "recent-carded", targetKey: "bl-rc", postedDate: dayBefore(4), everCarded: true });
-    assert.deepEqual(ids(selectOwnerItems([recentCarded, oldFresh], "CJ", TODAY)), ["old-fresh", "recent-carded"]);
-});
-
-test("more than 10 recent never-carded: the 10 oldest recent are listed", () => {
-    const cands: CardCandidateIssue[] = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 8; i++) {
         cands.push(issue({ id: `r-${i}`, targetKey: `bl-r-${String(i).padStart(2, "0")}`, postedDate: dayBefore(3 + (i % 8)) }));
     }
     const r = selectOwnerItems(cands, "CJ", TODAY);
-    assert.equal(r.items.length, 10);
-    assert.equal(r.overflow, 2);
+    assert.equal(r.items.length, 5);
+    assert.equal(r.overflow, 3);
     const listedDates = r.items.map(i => i.date);
     assert.deepEqual(listedDates, [...listedDates].sort());
     const dropped = cands.filter(c => !ids(r).includes(c.id)).map(c => c.postedDate);
-    assert.ok(dropped.every(d => d >= listedDates[listedDates.length - 1]), "only the newest recent ones wait");
+    assert.ok(dropped.every(d => d >= listedDates[listedDates.length - 1]), "only the newest ones wait");
 });
 
-test("an empty or malformed postedDate is never recent and does not throw", () => {
+test("an empty or malformed postedDate is never asked and does not throw", () => {
     const bad = issue({ id: "bad", targetKey: "bl-bad", postedDate: "garbage" });
     const empty = issue({ id: "empty", targetKey: "bl-empty", postedDate: "" });
     const recent = issue({ id: "recent", targetKey: "bl-z", postedDate: dayBefore(2) });
     const r = selectOwnerItems([bad, empty, recent], "CJ", TODAY);
-    assert.equal(r.items[0].issueId, "recent");
-    assert.equal(r.items.length, 3);
+    assert.deepEqual(ids(r), ["recent"]);
 });
 
-test("BACKLOG_RESERVED_SLOTS is 3", () => {
-    assert.equal(BACKLOG_RESERVED_SLOTS, 3);
-});
-
-const recentSet = (n: number): CardCandidateIssue[] =>
-    Array.from({ length: n }, (_, i) => issue({ id: `r-${String(i).padStart(2, "0")}`, targetKey: `bl-r-${String(i).padStart(2, "0")}`, postedDate: dayBefore(9 - (i % 7)) }));
-const oldSet = (n: number): CardCandidateIssue[] =>
-    Array.from({ length: n }, (_, i) => issue({ id: `o-${String(i).padStart(2, "0")}`, targetKey: `bl-o-${String(i).padStart(2, "0")}`, postedDate: dayBefore(100 - i) }));
-
-test("12 recent + 5 old never-carded: 7 oldest recent, then 3 oldest old, overflow 7", () => {
-    const cands = [...recentSet(12), ...oldSet(5)];
-    const r = selectOwnerItems(cands, "CJ", TODAY);
-    const recentOrder = recentSet(12).sort((a, b) => (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1 : a.targetKey < b.targetKey ? -1 : 1)).map(i => i.id);
-    assert.deepEqual(ids(r), [...recentOrder.slice(0, 7), "o-00", "o-01", "o-02"]);
-    assert.equal(r.overflow, 7);
-});
-
-test("12 recent + 0 old: the 10 oldest recent", () => {
-    const r = selectOwnerItems(recentSet(12), "CJ", TODAY);
-    assert.equal(r.items.length, 10);
-    assert.equal(r.overflow, 2);
-});
-
-test("2 recent + 12 old: 2 recent, then the 8 oldest old", () => {
-    const r = selectOwnerItems([...recentSet(2), ...oldSet(12)], "CJ", TODAY);
-    assert.equal(r.items.length, 10);
-    assert.deepEqual(ids(r).slice(2), ["o-00", "o-01", "o-02", "o-03", "o-04", "o-05", "o-06", "o-07"]);
-    assert.ok(ids(r).slice(0, 2).every(id => id.startsWith("r-")));
-    assert.equal(r.overflow, 4);
-});
-
-test("9 recent + 1 old: 9 recent then the 1 old", () => {
-    const r = selectOwnerItems([...recentSet(9), ...oldSet(1)], "CJ", TODAY);
-    assert.equal(r.items.length, 10);
-    assert.ok(ids(r).slice(0, 9).every(id => id.startsWith("r-")));
-    assert.equal(ids(r)[9], "o-00");
-    assert.equal(r.overflow, 0);
-});
-
-test("a charge dated after today is not recent", () => {
+test("a charge dated after today is not asked", () => {
     const future = issue({ id: "future", targetKey: "bl-a-future", postedDate: "2026-08-25" });
-    const oldFresh = issue({ id: "old-fresh", targetKey: "bl-z-old", postedDate: "2026-06-01" });
-    assert.deepEqual(ids(selectOwnerItems([future, oldFresh], "CJ", TODAY)), ["old-fresh", "future"]);
+    const fresh = issue({ id: "fresh", targetKey: "bl-z-fresh", postedDate: dayBefore(3) });
+    assert.deepEqual(ids(selectOwnerItems([future, fresh], "CJ", TODAY)), ["fresh"]);
 });
 
-test("buildOwnerCards puts a recent never-carded charge ahead of an older one", () => {
+test("buildOwnerCards leaves an older-than-14-days charge off the card", () => {
     const cards = buildOwnerCards([
         issue({ id: "old", targetKey: "bl-old", postedDate: "2026-06-01", payee: "OLD VENDOR" }),
         issue({ id: "new", targetKey: "bl-new", postedDate: "2026-08-17", payee: "NEW VENDOR" }),
     ], NOW);
-    assert.deepEqual(cards[0].items.map(i => i.vendor), ["NEW VENDOR", "OLD VENDOR"]);
+    assert.deepEqual(cards[0].items.map(i => i.vendor), ["NEW VENDOR"]);
 });
 
 test("the route passes the run's Pacific date to selectOwnerItems", () => {

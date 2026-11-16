@@ -57,7 +57,7 @@ function request(id: string, over: Partial<MissingReceiptRow> = {}): MissingRece
     return {
         id, version: 1, reasonHash: `hash-${id}`, acknowledged: false,
         targetKey: `bank-${id}`, owner: "CJ", ownerAssigned: false,
-        cardTail: "8516", postedDate: "2026-09-02", amountCents: -4_000,
+        cardTail: "8516", postedDate: "2026-09-12", amountCents: -4_000,
         payee: "THE ROCKERY NW", rawDescriptor: "THE ROCKERY NW POS DEB",
         fingerprint: `fp-${id}`, threadName: null, outreachHold: null,
         resolution: null, pdfUrl: null,
@@ -321,7 +321,7 @@ test("a reason nobody has words for is its own pile, in front of the crew chases
     assert.equal(plan.handledCount, 0, "nothing here is folded away");
     assert.deepEqual(
         plan.piles.map(entry => entry.key),
-        ["whose-card", "pick-the-job", "better-photo", "tell-justin", "ask-for-these", "checks-and-sub-bills"],
+        ["whose-card", "pick-the-job", "better-photo", "tell-justin", "ask-for-these", "too-old-for-crew", "checks-and-sub-bills"],
         "it sits in front of the crew chases, and checks stay last",
     );
 });
@@ -385,7 +385,7 @@ test("biggest dollars first, and a roll-up sorts by its TOTAL", () => {
             request("rent", { payee: "SUNBELT RENTALS", amountCents: -58_000, postedDate: "2026-09-10" }),
             request("middle", { payee: "LOWES", amountCents: -25_000, postedDate: "2026-09-11" }),
             ...Array.from({ length: 10 }, (_unused, index) =>
-                request(`dump-${index}`, { payee: "THE ROCKERY NW", amountCents: -4_000, postedDate: `2026-08-2${index}`.slice(0, 10) })),
+                request(`dump-${index}`, { payee: "THE ROCKERY NW", amountCents: -4_000, postedDate: `2026-09-1${index}` })),
         ],
     }), NOW);
 
@@ -426,9 +426,9 @@ test("the pile age line only appears once it is embarrassing", () => {
     assert.equal(pile(fresh, "ask-for-these").oldestDays, 1);
     assert.ok(pile(fresh, "ask-for-these").oldestDays! < PILE_AGE_MIN_DAYS);
 
-    const stale = planTodo(queueOf({ missingReceipts: [request("old", { postedDate: "2026-08-01" })] }), NOW);
-    assert.equal(pile(stale, "ask-for-these").oldestDays, 51);
-    assert.equal(fillCopy(TODO_COPY.pileAge, { n: 51 }), "Oldest here is 51 days old.");
+    const stale = planTodo(queueOf({ missingReceipts: [request("old", { postedDate: "2026-09-09" })] }), NOW);
+    assert.equal(pile(stale, "ask-for-these").oldestDays, 12);
+    assert.equal(fillCopy(TODO_COPY.pileAge, { n: 12 }), "Oldest here is 12 days old.");
 
     assert.equal(pile(fresh, "pick-the-job").oldestDays, null, "an empty pile has no age");
 });

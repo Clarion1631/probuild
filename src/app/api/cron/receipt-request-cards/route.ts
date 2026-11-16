@@ -16,6 +16,7 @@ import {
     CARD_RATE_CEILING,
     CARD_RESEND_QUEUED_REASON,
     buildCardFromItems,
+    cardAfterRebuild,
     isPacificWeekday,
     pacificDate,
     postOwnerCard,
@@ -1074,7 +1075,7 @@ async function handleGET(request: Request) {
         // ITS OWN DATE, not today's: the request id — and therefore the Chat
         // thread — belongs to the day the card was selected for.
         toPost.push({
-            card: buildCardFromItems(row.owner, row.pacificDate, items, row.overflow, row.overflowExact),
+            card: buildCardFromItems(row.owner, row.pacificDate, items, 0),
             rowId: row.id,
             token,
             resumed: true,
@@ -1167,7 +1168,7 @@ async function handleGET(request: Request) {
             // true when selection is not allowed this pass, and otherwise an
             // unrelated result — never the state the resumed row was
             // originally selected under.
-            toPost.push({ card: buildCardFromItems(owner, date, items, existing.overflow, existing.overflowExact), rowId: existing.id, token, resumed: true });
+            toPost.push({ card: buildCardFromItems(owner, date, items, 0), rowId: existing.id, token, resumed: true });
             continue;
         }
 
@@ -1337,7 +1338,10 @@ async function handleGET(request: Request) {
             incompleteDeferred.push(claimedCard.owner);
             continue;
         }
-        const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner);
+        // `date` is THIS run's Pacific day, not the card's: an item that aged
+        // out of the 14-day window since it was claimed (a retry hours later, a
+        // queued resend from an earlier day) is dropped like a held one.
+        const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner, date);
 
         /**
          * A REVALIDATION TIMEOUT IS NOT A VERDICT (Codex PR #443 gate round 42,
@@ -1406,9 +1410,8 @@ async function handleGET(request: Request) {
          * `matchCardAssociation` rejects, and it could collide with today's
          * own thread for that owner.
          */
-        const card = rebuilt.dropped.length === 0
-            ? claimedCard
-            : buildCardFromItems(claimedCard.owner, claimedCard.date, rebuilt.items, claimedCard.overflow, claimedCard.overflowExact);
+        // Totals only survive on a fresh card that lost and cut nothing; see cardAfterRebuild.
+        const card = cardAfterRebuild(claimedCard, rebuilt, !resumed);
 
         // HISTORY IS WRITTEN AFTER A VALIDATED POST, and only then.
         //

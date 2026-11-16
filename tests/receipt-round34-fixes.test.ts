@@ -343,7 +343,7 @@ test("the card cron reads a deadline abort as NOT SENDABLE, never as a verdict",
     const items: CardItem[] = [
         { issueId: "ri-1", n: 1, fingerprint: "pb-bl-1", cents: 12_345, amount: "123.45", date: "2026-08-16", vendor: "LOWES", cardTail: null, targetKey: "bl-1" },
     ];
-    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    const rebuilt = rebuildCardItems(items, truth, "CJ", "2026-08-20");
     assert.deepEqual(rebuilt.items, [], "nothing is sent");
     assert.deepEqual(rebuilt.dropped, [{ issueId: "ri-1", reason: "revalidation-deadline" }], "and the reason says which run ran out, not which charge was answered");
 });
