@@ -366,6 +366,7 @@
       <tr><th>Term</th><th>Plain English</th><th>Who handles it</th></tr>
       <tr><td><code>bank-pull-stale</code></td><td>The nightly read of the bank register has not succeeded in a while, so the missing-receipt check cannot trust its numbers yet</td><td>Justin</td></tr>
       <tr><td><code>chaser-blocked:reason</code></td><td>The missing-receipt lists are being held back on purpose. The reason after the colon says why, most often that the bank pull is stale.</td><td>Justin</td></tr>
+      <tr><td><code>cards-unsent:N</code></td><td>On the last working day, a receipts-needed list was picked for N people and never sent to them. Any of those charges that still need a receipt get asked again on a later list.</td><td>Justin</td></tr>
       <tr><td><code>possible-duplicate-purchases:N</code></td><td>N pairs of QuickBooks purchases look like the same charge booked twice</td><td>Vanessa or Justin, never delete one yourself</td></tr>
       <tr><td><code>no-receipts-72h</code></td><td>Nothing has booked automatically in the last 3 days, which can mean the pipeline stalled</td><td>Justin</td></tr>
       <tr><td><code>purchase-sync-stale</code></td><td>The QuickBooks to ProBuild sync has not run in a while. Expected right now, since that sync is paused on purpose</td><td>Nobody, this one is expected</td></tr>
