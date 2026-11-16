@@ -49,21 +49,19 @@ export const CARD_OWNERS_ASKED: ReceiptOwner[] = ["CJ", "Richard"];
 export const CARD_RATE_CEILING = 10;
 
 /** Max ITEMS listed on one card. A list nobody can finish gets muted. */
-export const MAX_ITEMS_PER_CARD = 10;
+export const MAX_ITEMS_PER_CARD = 5;
 
 /**
- * How far back a never-carded charge still counts as "recent" for ordering. A
- * charge becomes askable at 3 days old; 10 days leaves room for a weekend plus
- * a missed morning, so a new charge sits near the top of the next card instead
- * of queueing behind an old backlog.
+ * How far back a charge can still be asked about: posted 0 to this many days
+ * before the card's date, inclusive. Older open charges are the office's, not
+ * the crew's, whether or not anyone asked before. A charge becomes askable at 3
+ * days old (RECEIPT_REQUEST_GRACE_DAYS), so it has about 11 days on a card.
+ *
+ * ProBuild does not know when a month's books close. This limit is the whole
+ * rule: a charge from last month can still be asked in the first two weeks of
+ * this month.
  */
-export const RECENT_CHARGE_WINDOW_DAYS = 10;
-
-/**
- * When older never-carded charges are waiting, at least this many of the card's
- * slots go to them, so a steady stream of new charges can never starve the backlog.
- */
-export const BACKLOG_RESERVED_SLOTS = 3;
+export const CREW_ASK_WINDOW_DAYS = 14;
 
 export interface CardCandidateIssue {
     outreachHold?: ReceiptOutreachHold | null;
@@ -105,7 +103,7 @@ export interface OwnerCard {
     /** Pacific date the card is for. */
     date: string;
     items: CardItem[];
-    /** Items not on this card. They are tomorrow's FIRST candidates. */
+    /** Askable items (inside the window, not held) that did not fit on this card. */
     overflow: number;
     /** False when the scan stopped early, so `overflow` is a floor, not a total. */
     overflowExact: boolean;
@@ -190,9 +188,11 @@ export function cardText(
         lines.push(`${item.n}. ${item.date} · ${item.vendor || "unnamed charge"} · $${item.amount}${tail}`);
     }
     if (overflow > 0) {
+        // No promise about when: an old charge ages out of the window without
+        // ever being asked, so "tomorrow" would be a claim nobody keeps.
         lines.push("", overflowExact
-            ? `…and ${overflow} more — the rest come tomorrow.`
-            : "…and more — the rest come tomorrow.");
+            ? `…and ${overflow} more waiting.`
+            : "…and more waiting.");
     }
     lines.push("", `_${date}_`);
     return lines.join("\n");
@@ -222,56 +222,64 @@ function isoDayNumber(value: string): number | null {
     return Math.floor(ms / 86_400_000);
 }
 
+/** Whole days from `postedDate` to `today` (both YYYY-MM-DD), or null if either is unreadable. */
+function daysBetween(postedDate: string, today: string | undefined): number | null {
+    if (typeof today !== "string") return null;
+    const posted = isoDayNumber(postedDate);
+    const now = isoDayNumber(today);
+    return posted === null || now === null ? null : now - posted;
+}
+
 /**
- * The selection order for ONE owner. PURE.
+ * Can the crew still be asked about this charge on `today`? Posted 0 to
+ * CREW_ASK_WINDOW_DAYS days ago. A missing or unreadable date on either side is
+ * NOT askable: every caller fails closed rather than fall back to "any age".
+ */
+export function isWithinCrewAskWindow(postedDate: string, today: string | undefined): boolean {
+    const age = daysBetween(postedDate, today);
+    return age !== null && age >= 0 && age <= CREW_ASK_WINDOW_DAYS;
+}
+
+/** An open charge the crew is no longer asked about because it is older than the window. */
+export function isTooOldForCrew(postedDate: string, today: string | undefined): boolean {
+    const age = daysBetween(postedDate, today);
+    return age !== null && age > CREW_ASK_WINDOW_DAYS;
+}
+
+/**
+ * The selection for ONE owner. PURE.
  *
- * NEVER-CARDED ITEMS COME FIRST. Ordering by age alone meant that once the ten
- * oldest charges were on a card, the same ten went out every morning and an
- * eleventh, newer charge was never asked about at all — the queue looked busy
- * and nothing new ever moved. So an item that has never appeared on a card
- * outranks every item that has, and within each group the oldest charge wins
- * (the lowest targetKey breaks a tie, so the order is stable across runs).
- * Without `today`, yesterday's overflow is by construction tomorrow's first candidate.
+ * ONLY RECENT CHARGES (CREW_ASK_WINDOW_DAYS), and `today` (Pacific YYYY-MM-DD)
+ * is REQUIRED: without a readable one nothing is selected, never the old
+ * unlimited order. A list that reaches back to September is a list the crew
+ * stops reading.
  *
- * When `today` (Pacific YYYY-MM-DD) is given, never-carded charges posted in
- * the last RECENT_CHARGE_WINDOW_DAYS days lead (up to 10 minus the reserve
- * when older never-carded ones are waiting, see BACKLOG_RESERVED_SLOTS); then
- * the older never-carded ones, oldest first; then any remaining recent ones;
- * then ever-carded ones. Without `today` the order is exactly the one above.
+ * Inside the window, NEVER-CARDED ITEMS COME FIRST. Ordering by age alone meant
+ * the same few charges went out every morning and a newer one was never asked
+ * about. So an item that has never appeared on a card outranks every item that
+ * has, and within each group the oldest charge wins (the lowest targetKey
+ * breaks a tie, so the order is stable across runs).
+ *
+ * `overflow` counts only charges that could still be asked, so the card's
+ * "N of M" and "and N more" never include a charge that will never be sent.
  */
 export function selectOwnerItems(
     candidates: readonly CardCandidateIssue[],
     owner: string,
-    today?: string,
+    today: string,
 ): { items: CardItem[]; overflow: number } {
-    const todayDay = today === undefined ? null : isoDayNumber(today);
-    const recentCutoff = todayDay === null ? null : todayDay - RECENT_CHARGE_WINDOW_DAYS;
-    const isRecent = (issue: CardCandidateIssue): boolean => {
-        if (recentCutoff === null || issue.everCarded) return false;
-        const day = isoDayNumber(issue.postedDate);
-        return day !== null && day >= recentCutoff && day <= (todayDay as number);
-    };
     const eligible = candidates
         .filter(issue => issue.owner === owner && !issue.acknowledged && !issue.outreachHold
+            && isWithinCrewAskWindow(issue.postedDate, today)
             && isCrewReceiptRequest({ amountCents: issue.amountCents, rawDescriptor: issue.payee }));
     const byAge = (a: CardCandidateIssue, b: CardCandidateIssue): number => {
         if (a.postedDate !== b.postedDate) return a.postedDate < b.postedDate ? -1 : 1;
         return a.targetKey < b.targetKey ? -1 : a.targetKey > b.targetKey ? 1 : 0;
     };
-    let ordered: CardCandidateIssue[];
-    if (recentCutoff === null) {
-        ordered = eligible.sort((a, b) => {
-            if (a.everCarded !== b.everCarded) return a.everCarded ? 1 : -1;
-            return byAge(a, b);
-        });
-    } else {
-        const recentNever = eligible.filter(issue => !issue.everCarded && isRecent(issue)).sort(byAge);
-        const oldNever = eligible.filter(issue => !issue.everCarded && !isRecent(issue)).sort(byAge);
-        const carded = eligible.filter(issue => issue.everCarded).sort(byAge);
-        const reserved = Math.min(BACKLOG_RESERVED_SLOTS, oldNever.length);
-        const lead = recentNever.slice(0, MAX_ITEMS_PER_CARD - reserved);
-        ordered = [...lead, ...oldNever, ...recentNever.slice(lead.length), ...carded];
-    }
+    const ordered = [
+        ...eligible.filter(issue => !issue.everCarded).sort(byAge),
+        ...eligible.filter(issue => issue.everCarded).sort(byAge),
+    ];
     const listed = ordered.slice(0, MAX_ITEMS_PER_CARD);
     return { items: listed.map(toCardItem), overflow: ordered.length - listed.length };
 }
@@ -598,12 +606,15 @@ export type CardItemDropReason =
     | "resolved"
     | "evidence-found"
     | "owner-changed"
+    | "too-old"
     | "revalidation-deadline";
 
 export interface RebuiltCard {
     items: CardItem[];
     /** What was dropped and why, for the run summary. */
     dropped: Array<{ issueId: string; reason: CardItemDropReason }>;
+    /** Survivors cut because the card may hold only MAX_ITEMS_PER_CARD (a snapshot claimed under an older, larger cap). */
+    cut: number;
 }
 
 /**
@@ -630,6 +641,11 @@ export function rebuildCardItems(
     items: readonly CardItem[],
     truth: ReadonlyMap<string, CardItemTruth>,
     owner: string,
+    /**
+     * Pacific YYYY-MM-DD of the run. REQUIRED: an item that has aged out of the
+     * window since it was claimed is dropped, and no readable `today` drops all.
+     */
+    today: string,
 ): RebuiltCard {
     const kept: CardItem[] = [];
     const dropped: RebuiltCard["dropped"] = [];
@@ -649,14 +665,33 @@ export function rebuildCardItems(
                                 ? "acknowledged"
                                 : current.owner !== owner
                                     ? "owner-changed"
-                                    : current.outreachHold ?? (!isCrewReceiptRequest({ amountCents: -item.cents, rawDescriptor: item.vendor }) ? "office-invoice" : null);
+                                    : !isWithinCrewAskWindow(item.date, today)
+                                        ? "too-old"
+                                        : current.outreachHold ?? (!isCrewReceiptRequest({ amountCents: -item.cents, rawDescriptor: item.vendor }) ? "office-invoice" : null);
         if (reason) {
             dropped.push({ issueId: item.issueId, reason });
             continue;
         }
         kept.push({ ...item, n: kept.length + 1 });
     }
-    return { items: kept, dropped };
+    // A snapshot claimed earlier (a queued resend, a retry pass, a row written
+    // under the old 10-item cap) must not go out longer than a fresh card.
+    const cut = Math.max(0, kept.length - MAX_ITEMS_PER_CARD);
+    return { items: kept.slice(0, MAX_ITEMS_PER_CARD), dropped, cut };
+}
+
+/**
+ * The card to send after the pre-send rebuild. PURE.
+ *
+ * The header total ("3 of 8") and the "and N more waiting" line come from the
+ * overflow counted when the card was SELECTED. They are only true for a card
+ * selected fresh in this run that lost and cut nothing. A resumed row, a queued
+ * resend, or any card whose items changed since gets just its own item count and
+ * no more-line: a number that may be false is worse than none.
+ */
+export function cardAfterRebuild(claimed: OwnerCard, rebuilt: RebuiltCard, fresh: boolean): OwnerCard {
+    if (fresh && rebuilt.dropped.length === 0 && rebuilt.cut === 0) return claimed;
+    return buildCardFromItems(claimed.owner, claimed.date, rebuilt.items, 0, true);
 }
 
 // ── Chat resource names, as an operator types them ─────────────────────────

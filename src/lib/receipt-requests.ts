@@ -45,6 +45,18 @@ export const RECEIPT_MATCH_DATE_SLOP_DAYS = 2;
 
 /** A review window, never an automatic matching window. Includes late-entered receipts. */
 export const RECEIPT_REVIEW_WINDOW_DAYS = 30;
+
+/**
+ * A receipt still WAITING on a person (a ReceiptIntake that is not dead and not
+ * yet booked) from the SAME VENDOR this close to the posted date is a likely
+ * receipt whatever its total says (missing, different, negative), so the ask is
+ * held for the office instead of going to the crew. A split payment, a parked
+ * receipt with no total read, or a refund-shaped slip all miss the to-the-cent
+ * rule. A BOOKED intake or an Expense already answered some charge, so it never
+ * holds a different one by vendor alone: that held every charge from the same
+ * store within 7 days, for ever.
+ */
+export const RECEIPT_LIKELY_VENDOR_DAYS = 7;
 export type ReceiptOutreachHold = "existing-evidence-review" | "office-invoice";
 
 export class ReceiptOutreachHeldError extends Error {
@@ -1094,10 +1106,21 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
             const day = date ? dayNumber(date) : null;
             return day !== null && Math.abs(day - lineDay) <= RECEIPT_REVIEW_WINDOW_DAYS;
         };
+        // The same vendor test `satisfies` uses, so this cannot hold on a vendor
+        // the matcher would never accept. Any total counts, but the document
+        // date must sit within RECEIPT_LIKELY_VENDOR_DAYS of the posted date. Only
+        // unbooked intakes call this (see RECEIPT_LIKELY_VENDOR_DAYS).
+        const sourceEnabled = input.sourceRecognitionEnabled === true && isCanonicalReceiptSource(line);
+        const sameVendorNearby = (vendor: string | null, date: string | null) => {
+            const day = date ? dayNumber(date) : null;
+            return day !== null && Math.abs(day - lineDay) <= RECEIPT_LIKELY_VENDOR_DAYS
+                && (payeeMatches(payee, vendor) || (sourceEnabled && observedReceiptMerchantMatches(payee, vendor)));
+        };
         const existingEvidence = input.expenses.some(row => row.hasReceipt
             && row.amountCents === Math.abs(line.amountCents) && nearDate(row.date))
             || input.intakes.some(row => !DEAD_INTAKE_STATES.has(row.state)
-                && row.totalCents === Math.abs(line.amountCents) && nearDate(row.txnDate));
+                && ((row.totalCents === Math.abs(line.amountCents) && nearDate(row.txnDate))
+                    || (!row.expenseId && sameVendorNearby(row.vendor, row.txnDate))));
         const outreachHold: ReceiptOutreachHold | null = !isCrewReceiptRequest(line)
             ? "office-invoice" : existingEvidence ? "existing-evidence-review" : null;
         open.push({

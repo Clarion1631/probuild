@@ -111,7 +111,7 @@ const NO_RECEIPT_RULES: Array<{ key: string; test: RegExp; reason: string }> = [
  */
 const SUBSCRIPTION_RULE = {
     key: "software-subscription",
-    test: /\bANTHROPIC\b|\bGOOGLE\s*\*?\s*CLOUD\b|\bPLAID\b|\bOPENAI\b|\bOPENROUTER\b|\bMICROSOFT\b|\bADOBE\b|\bINTUIT\b(?!.*\bTRAN FEE\b)|\bGITHUB\b|\bVERCEL\b/i,
+    test: /\bANTHROPIC\b|\bGOOGLE\s*\*?\s*CLOUD\b|\bPLAID\b|\bOPENAI\b|\bOPENROUTER\b|\bMICROSOFT\b|\bADOBE\b|\bINTUIT\b(?!.*\bTRAN FEE\b)|\bGITHUB\b|\bVERCEL\b|\bDROPBOX\b|\bGROK\b|\bXAI\b/i,
     reason: "Software subscription — emailed invoice, overhead not job cost",
 };
 
@@ -195,10 +195,38 @@ export function looksLikeCheckOrSubBill(
     return typeof rawDescriptor === "string" && CHECK_DESCRIPTOR.test(rawDescriptor);
 }
 
-/** Collection stays active for office invoices; crew outreach does not. */
+/**
+ * Association dues invoices. A bill the office pays, not a store purchase the
+ * crew can find a receipt for.
+ */
+const DUES_INVOICE = /\bBIA OF CC\b/i;
+
+/** Venmo, Cash App or Zelle in the bank text (raw or normalized). The wording of the office hold depends on it. */
+export function isPersonToPersonPayment(rawDescriptor: string | null | undefined): boolean {
+    return P2P_RAIL.test(rawDescriptor ?? "");
+}
+
+/** An association dues invoice in the bank text. */
+export function isDuesInvoice(rawDescriptor: string | null | undefined): boolean {
+    return DUES_INVOICE.test(rawDescriptor ?? "");
+}
+
+/**
+ * Collection stays active for office invoices; crew outreach does not.
+ *
+ * Software subscriptions, person-to-person payments on a card (Venmo, Cash App,
+ * Zelle, to anyone) and association dues are NOT crew asks. They stay
+ * `receipt_expected` on purpose, so the sweep opens them as an `office-invoice`
+ * hold for the office instead of closing them: a payment to a person still needs
+ * a note saying what it was for (see classifyPersonToPersonPayment), and a
+ * `no_receipt_expected` verdict would close it and say nothing. The owner
+ * transfer rule above still answers `VENMO ... JUSTIN ADKINS` first.
+ */
 export function isCrewReceiptRequest(line: ReceiptPolicyLine): boolean {
     const verdict = classifyReceiptRequirement(line);
-    return verdict.requirement === "receipt_expected" && verdict.ruleKey !== "software-subscription";
+    if (verdict.requirement !== "receipt_expected" || verdict.ruleKey === "software-subscription") return false;
+    const descriptor = line.rawDescriptor ?? "";
+    return !isPersonToPersonPayment(descriptor) && !isDuesInvoice(descriptor);
 }
 
 // ── Card rails ───────────────────────────────────────────────────────────
