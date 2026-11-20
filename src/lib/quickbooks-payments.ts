@@ -64,6 +64,7 @@ import {
     isBlockedByAmbiguousCreate,
 } from "./qbo-create-markers";
 import { milestoneIssuanceHash, milestoneTaxSplit } from "./qbo-issuance";
+import { normalizeFillEmail } from "./client-email-fill";
 import {
     isPendingDeletion,
     PENDING_DELETION_MARKER,
@@ -1855,6 +1856,13 @@ export async function pushMilestoneToQuickBooks(
      * caller that subtracts it too leaves the QuickBooks calls 10s short.
      */
     deadline?: RouteDeadline,
+    /**
+     * `billEmailFallback`: an address the sender typed (send dialog) for a
+     * client with no saved email. Used as the QBO BillEmail ONLY when the saved
+     * client email is blank; the saved email always wins. Deliberately not part
+     * of the create identity / issuance hash / marker.
+     */
+    opts?: { billEmailFallback?: string | null },
 ): Promise<MilestonePushResult> {
     // The ROUTE deadline is the platform ceiling this push — and its possible
     // compensating delete — must fit inside. `pushDeadline` (the work budget)
@@ -2138,7 +2146,9 @@ export async function pushMilestoneToQuickBooks(
             amount,
             tax,
             dueDate: schedule.dueDate,
-            billEmail: invoice.client?.email || null,
+            // A malformed typed address is dropped (old behavior: no BillEmail)
+            // rather than handed to QuickBooks to reject the whole create.
+            billEmail: invoice.client?.email || normalizeFillEmail(opts?.billEmailFallback) || null,
             privateNote,
             // FROM THE IDENTITY. `createQBMilestoneInvoice` used to compute the
             // date itself from `new Date()`, so a replay of an unconfirmed

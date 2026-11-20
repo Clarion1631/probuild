@@ -70,6 +70,7 @@ import { computeInvoiceReceivable, type ReceivableInvoiceInput, type ReceivableM
 import { computeInvoiceAmountDue, type InvoiceAmountDue } from "./invoice-amount-due";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
+import { fillClientEmailIfBlank } from "./client-email-fill";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 
 // Session-free cores of the billing flows, shared by the permission-gated server
@@ -761,6 +762,13 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
         }
     }
 
+    // Sent and stamped: save a TYPED address onto a client that has none, so
+    // the QuickBooks invoice gets a BillEmail (pay link). Best-effort, never throws.
+    const fillTarget = invoice.client ?? invoice.project?.client;
+    if (overrideEmail && fillTarget && !fillTarget.email) {
+        await fillClientEmailIfBlank(fillTarget.id, overrideEmail);
+    }
+
     // Log to activity feed (project-scoped only)
     if (invoice.projectId) {
         await logActivityLazy({
@@ -897,7 +905,7 @@ export async function resendInvoiceCore(invoiceId: string, overrideEmail?: strin
                     // pushMilestoneToQuickBooks repairs voided/notFound state but reuses a
                     // stored link when one exists — fetch the CURRENT link from QBO so a
                     // stale stored value can't be handed back as "refreshed".
-                    const res = await pushMilestoneToQuickBooks(m.id, tokens, qbDeadline);
+                    const res = await pushMilestoneToQuickBooks(m.id, tokens, qbDeadline, overrideEmail ? { billEmailFallback: overrideEmail } : undefined);
                     let payLink = res.payLink || undefined;
                     if (res.qbInvoiceId) {
                         const liveLink = await getQBInvoicePaymentLink(tokens, res.qbInvoiceId, qbDeadline);
@@ -1267,7 +1275,9 @@ export async function sendMilestoneInvoicesCore(
                     const status = await getQBInvoiceStatus(tokens, qbInvoiceId, sendDeadline);
                     qbTotal = status?.total;
                 } else {
-                    const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens, sendDeadline);
+                    // Only a typed override is offered as the fallback — never the
+                    // project client's address, which may belong to someone else.
+                    const pushRes = await pushMilestoneToQuickBooks(schedule.id, tokens, sendDeadline, overrideEmail ? { billEmailFallback: overrideEmail } : undefined);
                     qbInvoiceId = pushRes.qbInvoiceId;
                     qbTotal = pushRes.qbTotal;
                 }
@@ -1452,6 +1462,15 @@ export async function sendMilestoneInvoicesCore(
                             console.error("[sendMilestoneInvoices] activity log failed for", schedule.name, e);
                         }
                     }
+                }
+
+                // Delivered and stamped: save a TYPED address onto a client with
+                // no email. Only an explicit override is saved — `recipient` can
+                // otherwise come from the project's client, which may be a
+                // different person than the invoice's client. Never throws.
+                const fillTarget = invoice.client ?? invoice.project?.client;
+                if (overrideEmail && fillTarget && !fillTarget.email) {
+                    await fillClientEmailIfBlank(fillTarget.id, overrideEmail);
                 }
             }
         }
