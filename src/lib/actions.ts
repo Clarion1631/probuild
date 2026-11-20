@@ -157,6 +157,7 @@ import {
 } from "./selection-item-thread-core";
 import { findThreadItem } from "./selection-item-thread-dependencies";
 import { bumpReceiptEvidenceEpoch, lockReceiptEvidence, withReceiptEvidenceLock } from "./receipt-evidence-lock";
+import { fillClientEmailIfBlank } from "./client-email-fill";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -6315,6 +6316,12 @@ export async function sendEstimateToClient(
 
     if (!sendResult.success) {
         return { success: false, error: "Failed to send estimate email. Please check the recipient address and try again." };
+    }
+
+    // The email went out. If the client has no saved email, keep the typed one
+    // so the QuickBooks invoice gets a BillEmail (and so a pay link). Best-effort.
+    if (client && !client.email) {
+        await fillClientEmailIfBlank(client.id, recipientEmail);
     }
 
     const updatedStatus = ["Draft", "Sent", "Viewed"].includes(estimate.status) ? "Sent" : estimate.status;
